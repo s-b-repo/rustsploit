@@ -1,38 +1,70 @@
-Building & Running
+Sure! Here's a polished and professional version of your `README.md` with the embedded screenshot and improved formatting, clarity, and consistency:
 
-    Clone or create this directory structure locally:
+---
 
+# R-RouterSploit 🛠️
+
+A Rust-based proof-of-concept modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
+
+![Screenshot](https://github.com/s-b-repo/r-routersploit/raw/main/Screenshot_20250409_010733.png)
+
+---
+
+## 🚀 Building & Running
+
+### 📦 Clone the Repository
+
+```bash
 git clone https://github.com/s-b-repo/r-routersploit.git
-
 cd r-routersploit
+```
 
-Build:
+### 🛠️ Build the Project
 
+```bash
 cargo build
+```
 
-Run (CLI mode), for example:
+### 🔧 Run in CLI Mode
 
-#  exploit subcommand
+You can run specific modules via CLI using subcommands:
+
+#### ▶ Exploit
+
+```bash
 cargo run -- --command exploit --module sample_exploit --target 192.168.1.1
+```
 
-#  scanner subcommand
+#### 🧪 Scanner
+
+```bash
 cargo run -- --command scanner --module sample_scanner --target 192.168.1.1
+```
 
-# : creds subcommand
-cargo run -- --command creds --module sample_cred_check -target 192.168.1.1
+#### 🔐 Credentials
 
-Run (interactive shell mode), no arguments:
+```bash
+cargo run -- --command creds --module sample_cred_check --target 192.168.1.1
+```
 
+### 🖥️ Run in Interactive Shell Mode
+
+Launch the interactive RSF shell:
+
+```bash
 cargo run
+```
 
-Within the shell, you can do:
+Once inside the shell, you can explore and execute modules:
 
+```shell
 rsf> help
-
 rsf> modules
-
 rsf> use exploits/sample_exploit
-
 rsf> set target 192.168.1.1
-
 rsf> run
+```
+
+---
+
+Let me know if you'd like badges, license info, or module dev docs added!
