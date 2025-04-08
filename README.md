@@ -66,4 +66,3 @@ rsf> run
 
 ---
 
-Let me know if you'd like badges, license info, or module dev docs added!
