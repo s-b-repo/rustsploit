@@ -28,7 +28,11 @@ cargo run
 Within the shell, you can do:
 
 rsf> help
+
 rsf> modules
+
 rsf> use exploits/sample_exploit
+
 rsf> set target 192.168.1.1
+
 rsf> run
