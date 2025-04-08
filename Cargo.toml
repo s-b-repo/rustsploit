@@ -11,7 +11,7 @@ reqwest = { version = "0.12.15", features = ["json"] }
 clap = { version = "4.5.35", features = ["derive"] }
 
 # Async runtime for networking
-tokio = { version = "1.44.2", features = ["macros"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
 
 # Easier error handling
 anyhow = "1.0.97"
