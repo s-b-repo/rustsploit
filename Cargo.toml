@@ -1,0 +1,17 @@
+[package]
+name = "r_routersploit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# For HTTP requests
+reqwest = { version = "0.12.15", features = ["json"] }
+
+# For CLI parsing
+clap = { version = "4.5.35", features = ["derive"] }
+
+# Async runtime for networking
+tokio = { version = "1.44.2", features = ["macros"] }
+
+# Easier error handling
+anyhow = "1.0.97"
