@@ -2,7 +2,8 @@ Building & Running
 
     Clone or create this directory structure locally:
 
-git clone https://github.com/s-b-repo/r-routersploit
+git clone https://github.com/s-b-repo/r-routersploit.git
+
 cd r-routersploit
 
 Build:
