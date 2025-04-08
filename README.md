@@ -1,4 +1,3 @@
-Sure! Here's a polished and professional version of your `README.md` with the embedded screenshot and improved formatting, clarity, and consistency:
 
 ---
 
