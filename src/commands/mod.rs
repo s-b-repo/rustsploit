@@ -1,6 +1,12 @@
+// src/commands/mod.rs
+
+pub mod exploit;
+pub mod scanner;
+pub mod creds;
+
 use anyhow::Result;
 use crate::cli::Cli;
-use crate::commands::{exploit, scanner, creds};
+
 
 pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     match command {
@@ -26,10 +32,8 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     Ok(())
 }
 
-// This function is also used by the shell:
+// Called from the interactive shell
 pub async fn run_module(module_path: &str, target: &str) -> Result<()> {
-    // Decide which "category" the module belongs to by the path
-    // e.g. "exploits/sample_exploit" -> exploit::run_exploit(...)
     if module_path.starts_with("exploits/") {
         let module_name = module_path.trim_start_matches("exploits/").to_string();
         exploit::run_exploit(&module_name, target).await?;
