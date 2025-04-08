@@ -3,7 +3,7 @@
 
 # R-RouterSploit 🛠️
 
-A Rust-based proof-of-concept modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
+A Rust-based modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
 
 ![Screenshot](https://github.com/s-b-repo/r-routersploit/raw/main/Screenshot_20250409_010733.png)
 
