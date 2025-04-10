@@ -19,6 +19,10 @@ add wordlists and brute forcing modules
 
 # completed
 
+telnet_bruteforce
+
+ftp anonymous login module
+
 ftp brute forcing  module
 
 dynamic modules listing and colored listing
