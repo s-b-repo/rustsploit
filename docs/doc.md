@@ -1,4 +1,4 @@
-Here's a full-blown `docs.md` file (meant for GitHub or developer onboarding) that explains how **everything works** in the custom RouterSploit-like Rust framework — not just a README, but **developer-level documentation** that explains the internal architecture, how to add or modify modules, and how the CLI and shell interact with the framework.
+ the internal architecture, how to add or modify modules, and how the CLI and shell interact with the framework.
 
 ---
 
