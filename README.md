@@ -21,7 +21,7 @@ add wordlists and brute forcing modules
 
 ftp brute forcing  module
 
-dynamic modules listing
+dynamic modules listing and colored listing
 
 
 ## 🚀 Building & Running
