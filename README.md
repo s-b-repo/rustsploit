@@ -11,9 +11,17 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 
 ### Goals & To Do lists
 
+docs
+
 convert exploits and add modules
 
 add wordlists and brute forcing modules
+
+# completed
+
+ftp brute forcing  module
+
+dynamic modules listing
 
 
 ## 🚀 Building & Running
