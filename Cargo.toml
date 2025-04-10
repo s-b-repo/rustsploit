@@ -15,3 +15,12 @@ tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
 
 # Easier error handling
 anyhow = "1.0.97"
+
+#teminal color
+colored = "3.0.0"
+
+#ftp brute force module
+async_ftp = "6.0.0"
+
+tokio-socks = "0.5.2"
+
