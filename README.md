@@ -9,11 +9,17 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 
 ---
 
+### Goals & To Do lists
+
+convert exploits and add modules
+add wordlists and brute forcing modules
+
+
 ## 🚀 Building & Running
 
 ### 📦 Clone the Repository
 
-```bash
+```
 git clone https://github.com/s-b-repo/r-routersploit.git
 cd r-routersploit
 ```
@@ -30,19 +36,19 @@ You can run specific modules via CLI using subcommands:
 
 #### ▶ Exploit
 
-```bash
+```
 cargo run -- --command exploit --module sample_exploit --target 192.168.1.1
 ```
 
 #### 🧪 Scanner
 
-```bash
+```
 cargo run -- --command scanner --module sample_scanner --target 192.168.1.1
 ```
 
 #### 🔐 Credentials
 
-```bash
+```
 cargo run -- --command creds --module sample_cred_check --target 192.168.1.1
 ```
 
@@ -50,7 +56,7 @@ cargo run -- --command creds --module sample_cred_check --target 192.168.1.1
 
 Launch the interactive RSF shell:
 
-```bash
+```
 cargo run
 ```
 
