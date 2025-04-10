@@ -1,5 +1,6 @@
 use anyhow::Result;
 use crate::modules::creds;
+use crate::modules::creds::telnet_bruteforce;
 
 pub async fn run_cred_check(module_name: &str, target: &str) -> Result<()> {
     match module_name {
@@ -12,6 +13,10 @@ pub async fn run_cred_check(module_name: &str, target: &str) -> Result<()> {
         "ftp_anonymous" => {
             creds::ftp_anonymous::run(target).await?;
         },
+
+        "telnet_bruteforce" =>  {
+        telnet_bruteforce::run_module(target).await?;
+         },
         // Add more creds modules here ...
         _ => {
             eprintln!("Creds module '{}' not found.", module_name);
