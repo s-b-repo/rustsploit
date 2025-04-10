@@ -8,7 +8,7 @@ use threadpool::ThreadPool;
 use crossbeam_channel::{unbounded};
 use telnet::Telnet;
 
-pub async fn run_module(target: &str) -> Result<()> {
+pub async fn run(target: &str) -> Result<()> {
     println!("\n=== Telnet Bruteforce Module (RustSploit) ===\n");
 
     let target = target.to_string();
