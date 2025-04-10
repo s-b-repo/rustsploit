@@ -24,3 +24,7 @@ async_ftp = "6.0.0"
 
 tokio-socks = "0.5.2"
 
+#telnet
+threadpool = "1.8.1"
+crossbeam-channel = "0.5.15"
+telnet = "0.2.3"
