@@ -18,7 +18,7 @@ anyhow = "1.0.97"
 
 #teminal color
 colored = "3.0.0"
-
+rustyline = "15.0.0"
 #ftp brute force module
 async_ftp = "6.0.0"
 
@@ -28,3 +28,5 @@ tokio-socks = "0.5.2"
 threadpool = "1.8.1"
 crossbeam-channel = "0.5.15"
 telnet = "0.2.3"
+
+walkdir = "2.5.0"
