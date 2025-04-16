@@ -45,27 +45,7 @@ cd r-routersploit
 cargo build
 ```
 
-### 🔧 Run in CLI Mode
 
-You can run specific modules via CLI using subcommands:
-
-#### ▶ Exploit
-
-```
-cargo run -- --command exploit --module sample_exploit --target 192.168.1.1
-```
-
-#### 🧪 Scanner
-
-```
-cargo run -- --command scanner --module sample_scanner --target 192.168.1.1
-```
-
-#### 🔐 Credentials
-
-```
-cargo run -- --command creds --module sample_cred_check --target 192.168.1.1
-```
 
 ### 🖥️ Run in Interactive Shell Mode
 
@@ -94,5 +74,26 @@ rsf> set target 192.168.1.1
 rsf> run
 ```
 
+### 🔧 Run in CLI Mode
+
+You can run specific modules via CLI using subcommands:
+
+#### ▶ Exploit
+
+```
+cargo run -- --command exploit --module sample_exploit --target 192.168.1.1
+```
+
+#### 🧪 Scanner
+
+```
+cargo run -- --command scanner --module sample_scanner --target 192.168.1.1
+```
+
+#### 🔐 Credentials
+
+```
+cargo run -- --command creds --module sample_cred_check --target 192.168.1.1
+```
 ---
 
