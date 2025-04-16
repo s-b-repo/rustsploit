@@ -1,11 +1,14 @@
 [package]
-name = "r_routersploit"
+name = "rustsploit"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 # For HTTP requests
-reqwest = { version = "0.12.15", features = ["json"] }
+reqwest = { version = "0.12.15", features = ["json", "socks"] }
+
+#proxy manager
+rand = "0.9.0"
 
 # For CLI parsing
 clap = { version = "4.5.35", features = ["derive"] }
@@ -33,3 +36,9 @@ walkdir = "2.5.0"
 
 #ssh
 ssh2 = "0.9.5"
+
+
+#for running in terminal uwu
+[[bin]]
+name = "rustsploit"
+path = "src/main.rs"
