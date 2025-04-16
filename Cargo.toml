@@ -30,3 +30,6 @@ crossbeam-channel = "0.5.15"
 telnet = "0.2.3"
 
 walkdir = "2.5.0"
+
+#ssh
+ssh2 = "0.9.5"
