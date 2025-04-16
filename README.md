@@ -11,22 +11,24 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 
 ### Goals & To Do lists
 
-docs
 
 convert exploits and add modules
 
-add wordlists and brute forcing modules
 
 # completed
+```
+created docs
 
-telnet_bruteforce
+telnet brute forcing  module
+ 
+ssh brute forcing  module
 
 ftp anonymous login module
 
 ftp brute forcing  module
 
 dynamic modules listing and colored listing
-
+```
 
 ## 🚀 Building & Running
 
@@ -39,7 +41,7 @@ cd r-routersploit
 
 ### 🛠️ Build the Project
 
-```bash
+```
 cargo build
 ```
 
@@ -75,7 +77,7 @@ cargo run
 
 Once inside the shell, you can explore and execute modules:
 
-```shell
+```
 rsf> help
 rsf> modules
 rsf> use exploits/sample_exploit
