@@ -72,7 +72,16 @@ cargo run -- --command creds --module sample_cred_check --target 192.168.1.1
 Launch the interactive RSF shell:
 
 ```
+cargo install
+rustsploit
+
+```
+if you just want to run the tool and see after builing run this command in folder
+
+```
 cargo run
+
+
 ```
 
 Once inside the shell, you can explore and execute modules:
