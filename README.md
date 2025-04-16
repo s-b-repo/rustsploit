@@ -43,6 +43,14 @@ cd r-routersploit
 
 ```
 cargo build
+
+or if you just want to run the tool and see after builing run this command in folder
+
+cargo run
+```
+if you want it installed run
+```
+cargo install
 ```
 
 
@@ -52,13 +60,11 @@ cargo build
 Launch the interactive RSF shell:
 
 ```
-cargo install
+
 rustsploit
 
-```
-if you just want to run the tool and see after builing run this command in folder
 
-```
+
 cargo run
 
 
