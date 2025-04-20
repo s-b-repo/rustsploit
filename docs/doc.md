@@ -260,8 +260,178 @@ If the exploit is based on open TCP/UDP, you can use `tokio::net::TcpStream` or 
 
 ---
 
-## 🧾 License
+Below is a **step-by-step** walkthrough of the proxy logic in the updated `shell.rs` whenever the user types `run`. It explains how the **retry mechanism** works, how a **new proxy** is selected after a failure, and how we **stop** when all proxies are exhausted.
 
 ---
 
-Would you like me to convert this into a Markdown file (`docs.md`) and drop it into your project as-is? Or would you like GitHub-flavored `.md` formatting tailored with headers, badges, collapsible trees, etc.?
+## 1. `run` Command Overview
+
+When the user types **`run`** in the shell:
+
+1. We check if there is a **selected module** (`current_module`) and a **target** (`current_target`). If either is missing, we prompt the user to set them.  
+
+2. If both are set:
+   - We look at whether **proxy usage** is **enabled** (`proxy_enabled = true`) and whether we have a **non-empty proxy list**.
+   - Based on this, we do one of the following:
+     - **Proxy is ON & we have proxies**: Attempt the exploit with **one or more** proxies in a loop (retrying).  
+     - **Proxy is ON & we have no proxies**: Just do a **direct** attempt (warn user).  
+     - **Proxy is OFF**: Only do a **direct** attempt.  
+
+---
+
+## 2. When Proxy is ON (and Proxies Are Loaded)
+
+If `proxy_enabled == true` and `proxy_list` is **not** empty, the `run` logic does this:
+
+1. **Create** a `HashSet<String>` called `tried_proxies` – this will track which proxies we have already used and failed on.
+
+2. **Loop** until either:
+   - We **succeed** with a proxy, or  
+   - We have tried **all** proxies in `proxy_list`.
+
+3. **Pick a Random Proxy**  
+   - We call `pick_random_untried_proxy(&ctx.proxy_list, &tried_proxies)`.  
+   - This function filters out any proxies that are already in `tried_proxies` (i.e., ones that failed previously).  
+   - It then chooses **one** from the remaining pool **at random**.  
+   - If all have been tried, it falls back to picking *any* random proxy from the full list (ensuring no panic).
+
+4. **Set `ALL_PROXY` Environment Variable**  
+   - We call `set_all_proxy_env(&chosen_proxy)`.  
+   - Inside that function, we do:  
+     ```rust
+     env::set_var("ALL_PROXY", proxy);
+     ```
+   - Because your exploit modules use `reqwest` (with the `socks` feature), **any** request they make automatically goes through that proxy (whether it’s HTTP, HTTPS, SOCKS4, or SOCKS5).
+
+5. **Run the Module**  
+   ```rust
+   match commands::run_module(module_path, t).await {
+       Ok(_) => { ... }
+       Err(e) => { ... }
+   }
+   ```
+   - This calls the real exploit/scanner/cred module. The module tries to send its requests.  
+   - Because `ALL_PROXY` is set, **all** of its traffic routes through the chosen proxy.  
+
+6. **Check the Result**  
+   - If it returns `Ok(())`, that means the exploit **did not** fail at the top level. We **break** the loop and stop retrying.  
+   - If it returns `Err(e)`, we:
+     1. Print an error message.  
+     2. Add the **chosen proxy** to `tried_proxies`.  
+     3. Repeat the loop, picking a new untried proxy.  
+
+7. **Exhausting All Proxies**  
+   - If we eventually try **every** proxy in `proxy_list` (i.e., `tried_proxies.len() == ctx.proxy_list.len()`) and **still** fail, we exit the loop.  
+
+8. **Final Fallback: Direct Attempt**  
+   - If we never got a success, we do a **final** attempt **without** any proxy:  
+     ```rust
+     clear_proxy_env_vars();
+     commands::run_module(module_path, t).await;
+     ```
+   - That either succeeds or fails. If it fails, we simply print the error and continue (or end).  
+
+---
+
+## 3. When Proxy is ON but No Proxies Are Loaded
+
+If `proxy_enabled == true` but `proxy_list` is empty:
+
+1. We **cannot** pick a proxy, so we simply show a warning:
+   ```
+   [!] No proxies loaded, but proxy is ON. Doing direct attempt...
+   ```
+2. We call `clear_proxy_env_vars()` to ensure we’re not using a stale proxy environment variable.
+3. We run the module once. No retries occur here.
+
+---
+
+## 4. When Proxy is OFF
+
+If `proxy_enabled == false`, we do a **single** direct attempt:
+
+1. `clear_proxy_env_vars()` is called to remove any existing proxy environment variables.  
+2. `commands::run_module(module_path, t).await` is called.  
+3. If it fails, we just print the error. We do **not** retry.
+
+---
+
+## 5. Summarizing the Retry Logic
+
+Below is a simplified flowchart of the “**Proxy is ON & Proxies Are Loaded**” scenario:
+
+```
++--------------------------+
+| Start 'run' command      |
++--------------------------+
+          |   (Check if module & target are set)
+          v
++-------------------------------+
+| tried_proxies = empty set    |
++-------------------------------+
+          |
+          | while tried_proxies.len() < proxy_list.len():
+          v
++--------------------------------------------------+
+| pick_random_untried_proxy(proxy_list, tried_set) |
++--------------------------------------------------+
+          |
+          | set_all_proxy_env(chosen_proxy)
+          v
++-----------------------------------------+
+| run_module(module_path, target) => Err? |
++-----------------------------------------+
+          |            |
+      (Ok) |            | (Err)
+          v            v
+        (Stop)     tried_proxies.insert(chosen_proxy)
+                        (loop again)
+
+If we exit the loop with no success:
+  => clear_proxy_env_vars()
+  => do a final direct run_module()
+```
+
+Hence, after each failure, we remove that proxy from the candidate pool and pick a new one. We do **not** pick the same failing proxy again. If, after exhausting **all** proxies, everything fails, we do one **direct** attempt with no proxy.
+
+---
+
+## 6. Why This Requires No Changes to Exploit Modules
+
+- **All** changes happen at the shell level (the `run` command).  
+- Each time we call `commands::run_module(...)`, we have **already** set the environment variable `ALL_PROXY`.  
+- The exploit modules (e.g., `sample_exploit.rs`) simply use `reqwest` without knowing or caring about proxies.  
+- `reqwest` automatically checks `ALL_PROXY` and routes traffic accordingly.  
+- If that proxy fails for any reason (connection refused, times out, etc.), `run_module(...)` returns an error to the shell, triggering the **retry** logic.  
+
+---
+
+## 7. Practical Considerations
+
+1. **Module-Level vs. Shell-Level Retries**  
+   - We do an entire “exploit run” in one attempt. If the exploit tries multiple sub-requests and fails halfway, from the shell’s perspective it’s just one run that failed.  
+   - We then pick a new proxy and re-run from scratch.  
+
+2. **Timeouts**  
+   - If a proxy is **very** slow or dead, you may not get an error for a while (unless your module sets timeouts).  
+   - Consider setting a **short** timeout in your modules if you want to quickly detect non-functional proxies.  
+
+3. **Full Proxy Exhaustion**  
+   - If every proxy fails, we do a final direct attempt. If that also fails, we give up.  
+
+4. **Thread-Safety**  
+   - Because we’re doing everything in a single-threaded loop, environment-variable changes are straightforward.  
+   - In a multi-threaded scenario, changing `ALL_PROXY` globally might cause conflicts or race conditions.  
+
+---
+
+## 8. Final Summary
+
+1. **User** types `run`.  
+2. If **proxy is on** and there are proxies in the list, the shell tries them **one by one** (random order), setting `ALL_PROXY` each time and calling `run_module`.  
+3. On each **failure**, the shell adds that proxy to a “tried” set and repeats with a **new** proxy.  
+4. If the user **exhausts** all proxies (they all fail), the shell **finally** attempts a **direct** run (no proxy).  
+5. If the exploit **succeeds** at any point, we **stop** retrying.  
+6. This entire sequence requires **no changes** to the exploit modules, as they already rely on `reqwest`, which automatically respects `ALL_PROXY`.
+
+That’s the logic behind automatic proxy retries for failing requests!
