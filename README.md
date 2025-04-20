@@ -19,6 +19,12 @@ convert exploits and add modules
 ```
 created docs
 
+added acti camera module
+
+created bat payload generator for malware
+
+added proxy support https/http socks4/socks5
+
 telnet brute forcing  module
  
 ssh brute forcing  module
@@ -27,7 +33,10 @@ ftp anonymous login module
 
 ftp brute forcing  module
 
+added rtsp_bruteforce module
+
 dynamic modules listing and colored listing
+
 ```
 
 ## 🚀 Building & Running
@@ -62,8 +71,6 @@ Launch the interactive RSF shell:
 ```
 
 rustsploit
-
-
 
 cargo run
 
