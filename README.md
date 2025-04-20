@@ -19,6 +19,10 @@ convert exploits and add modules
 ```
 created docs
 
+updated docs
+
+added wordlist for camera paths
+
 added acti camera module
 
 created bat payload generator for malware
