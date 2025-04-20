@@ -37,8 +37,10 @@ walkdir = "2.5.0"
 #ssh
 ssh2 = "0.9.5"
 
+# rstp brute forcing
+base64 = "0.22.1"
 
-#for running in terminal uwu
+
 [[bin]]
 name = "rustsploit"
 path = "src/main.rs"
