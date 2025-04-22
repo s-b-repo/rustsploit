@@ -1,6 +1,4 @@
 
----
-
 # Rustsploit 🛠️
 
 A Rust-based modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
@@ -17,6 +15,11 @@ convert exploits and add modules
 
 # completed
 ```
+
+
+
+
+added uniview_nvr_pwd_disclosure
 
 added ssdp_msearch
 
@@ -93,6 +96,12 @@ cargo run
 Once inside the shell, you can explore and execute modules:
 
 ```
+rsf> Available commands
+rsf> show_proxies 
+rsf> proxy_off  
+rsf> proxy_on 
+rsf> proxy_load <file>
+rsf> find
 rsf> help
 rsf> modules
 rsf> use exploits/sample_exploit
