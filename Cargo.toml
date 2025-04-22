@@ -14,7 +14,7 @@ rand = "0.9.0"
 clap = { version = "4.5.35", features = ["derive"] }
 
 # Async runtime for networking
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "process"] }
 
 # Easier error handling
 anyhow = "1.0.97"
@@ -40,6 +40,14 @@ ssh2 = "0.9.5"
 # rstp brute forcing
 base64 = "0.22.1"
 
+# RDP brute forcing module
+rdp = "0.12.8"
+
+# ssdp moudle scanner
+regex = "1.11.1"
+
+#camera uniview exploit
+quick-xml = "0.37.4"
 
 [[bin]]
 name = "rustsploit"
