@@ -54,7 +54,8 @@ pub async fn interactive_shell() -> Result<()> {
                 println!("  set target <value>  - Set the target IP/host");
                 println!("  run                 - Run the current module (with proxy retries if enabled)");
                 println!("  modules             - List available modules");
-                println!("  proxy_load <file>   - Load a list of proxies (http://ip:port, http://ip:port, socks4://ip:port, socks5://ip:port.)");
+                println!("  find <keyword>      - Search for a module by keyword");
+                println!("  proxy_load <file>   - Load a list of proxies (http://ip:port, socks5://ip:port, etc)");
                 println!("  proxy_on            - Enable proxy usage");
                 println!("  proxy_off           - Disable proxy usage");
                 println!("  show_proxies        - Show loaded proxies & current proxy status");
@@ -62,6 +63,14 @@ pub async fn interactive_shell() -> Result<()> {
             },
             "modules" => {
                 utils::list_all_modules();
+            },
+            cmd if cmd.starts_with("find ") => {
+                let keyword = cmd.trim_start_matches("find ").trim();
+                if keyword.is_empty() {
+                    println!("Usage: find <keyword>");
+                } else {
+                    utils::find_modules(keyword);
+                }
             },
             cmd if cmd.starts_with("proxy_load ") => {
                 let file = cmd.trim_start_matches("proxy_load ").trim();
@@ -120,12 +129,10 @@ pub async fn interactive_shell() -> Result<()> {
                         // NEW: Proxy Retry Logic
                         // -----------------------------
                         if ctx.proxy_enabled && !ctx.proxy_list.is_empty() {
-                            // We'll keep trying different proxies until we succeed or run out
                             let mut tried_proxies = HashSet::new();
                             let mut success = false;
 
                             while tried_proxies.len() < ctx.proxy_list.len() {
-                                // pick a random proxy that we haven't tried yet
                                 let chosen_proxy = pick_random_untried_proxy(&ctx.proxy_list, &tried_proxies);
                                 set_all_proxy_env(&chosen_proxy);
                                 println!("[*] Using proxy: {}", chosen_proxy);
@@ -133,7 +140,6 @@ pub async fn interactive_shell() -> Result<()> {
                                 println!("Running module '{}' against target '{}'", module_path, t);
                                 match commands::run_module(module_path, t).await {
                                     Ok(_) => {
-                                        // If exploit was successful, break
                                         success = true;
                                         break;
                                     }
@@ -145,8 +151,6 @@ pub async fn interactive_shell() -> Result<()> {
                                 }
                             }
 
-                            // if we never succeeded and we've tried all proxies,
-                            // let's do a final fallback: direct connection (or just stop)
                             if !success {
                                 println!("[!] All proxies failed. Trying direct connection...");
                                 clear_proxy_env_vars();
@@ -155,14 +159,12 @@ pub async fn interactive_shell() -> Result<()> {
                                 }
                             }
                         } else if ctx.proxy_enabled && ctx.proxy_list.is_empty() {
-                            // Proxy is on, but no proxies loaded => do a direct attempt
                             println!("[!] No proxies loaded, but proxy is ON. Doing direct attempt...");
                             clear_proxy_env_vars();
                             if let Err(e) = commands::run_module(module_path, t).await {
                                 eprintln!("[!] Module failed: {:?}", e);
                             }
                         } else {
-                            // Proxy is off => direct single attempt
                             clear_proxy_env_vars();
                             if let Err(e) = commands::run_module(module_path, t).await {
                                 eprintln!("[!] Module failed: {:?}", e);
