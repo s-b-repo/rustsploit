@@ -71,6 +71,49 @@ pub fn list_all_modules() {
     }
 }
 
+/// Finds and displays modules matching a keyword
+pub fn find_modules(keyword: &str) {
+    let keyword_lower = keyword.to_lowercase();
+    let modules = collect_module_paths(Path::new("src/modules"), 0);
+
+    let filtered: Vec<String> = modules
+        .into_iter()
+        .filter(|m| m.to_lowercase().contains(&keyword_lower))
+        .collect();
+
+    if filtered.is_empty() {
+        println!(
+            "{}",
+            format!("No modules found matching '{}'.", keyword).red()
+        );
+        return;
+    }
+
+    println!(
+        "{}",
+        format!("Modules matching '{}':", keyword).bold().underline()
+    );
+
+    let mut grouped = std::collections::BTreeMap::new();
+    for module in filtered {
+        let parts: Vec<&str> = module.split('/').collect();
+        let category = parts.get(0).unwrap_or(&"Other").to_string();
+        grouped
+            .entry(category)
+            .or_insert_with(Vec::new)
+            .push(module.clone());
+    }
+
+    for (category, paths) in grouped {
+        println!("\n{}:", category.blue().bold());
+        for path in paths {
+            println!("  - {}", path.green());
+        }
+    }
+}
+
+
+
 /// Parses a single proxy line (e.g., "1.2.3.4:9050" -> "http://1.2.3.4:9050")
 /// or "socks5://127.0.0.1:9050" -> "socks5://127.0.0.1:9050"
 fn parse_proxy_line(line: &str) -> String {
