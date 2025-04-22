@@ -46,6 +46,8 @@ rdp = "0.12.8"
 # ssdp moudle scanner
 regex = "1.11.1"
 
+#camera uniview exploit
+quick-xml = "0.37.4"
 
 [[bin]]
 name = "rustsploit"
