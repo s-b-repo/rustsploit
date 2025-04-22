@@ -55,7 +55,7 @@ pub async fn interactive_shell() -> Result<()> {
                 println!("  run                 - Run the current module (with proxy retries if enabled)");
                 println!("  modules             - List available modules");
                 println!("  find <keyword>      - Search for a module by keyword");
-                println!("  proxy_load <file>   - Load a list of proxies (http://ip:port, socks5://ip:port, etc)");
+                println!("  proxy_load <file>   - Load a list of proxies (http://ip:port, https://ip:port, socks4://ip:port, socks5://ip:port.)");
                 println!("  proxy_on            - Enable proxy usage");
                 println!("  proxy_off           - Disable proxy usage");
                 println!("  show_proxies        - Show loaded proxies & current proxy status");
