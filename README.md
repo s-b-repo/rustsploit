@@ -17,9 +17,18 @@ convert exploits and add modules
 
 # completed
 ```
-created docs
+
+added ssdp_msearch
+
+added hearbleed
+
+added port scanner
+
+added find command
 
 updated docs
+
+created docs
 
 added wordlist for camera paths
 
