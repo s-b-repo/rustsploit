@@ -17,7 +17,8 @@ Convert exploits and add modules
 
 # completed
 ```
-added exploit openssh server race condition 9.8.p1 |Server Destruction fork | bomb Persistence create SSH user | Remote Root Shell
+added exploit openssh server race condition 9.8.p1 |Server Destruction fork |
+bomb Persistence create SSH user | Remote Root Shell
 
 added exploit tplink_wr740n Buffer Overflow 'DOS'
 added exploit tp_link_vn020  Denial Of Service (DOS) 
