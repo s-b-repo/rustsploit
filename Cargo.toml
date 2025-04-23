@@ -2,6 +2,7 @@
 name = "rustsploit"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 # For HTTP requests
@@ -48,6 +49,10 @@ regex = "1.11.1"
 
 #camera uniview exploit
 quick-xml = "0.37.4"
+
+
+[build-dependencies]
+regex = "1.11.1"         # required for use in build.rs
 
 [[bin]]
 name = "rustsploit"
