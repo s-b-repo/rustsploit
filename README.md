@@ -15,11 +15,15 @@ Convert exploits and add modules
 
 # completed
 ```
+added exploit tp_link_vn020  Denial Of Service (DOS) 
+added exploit abussecurity_camera_cve 2023 26609 variant2 RCE and SSH Root Access adds persistant account
+added exploit abussecurity_camera_cve 2023 26609 variant1 LFI, RCE and SSH Root Access
+added exploit uniview_nvr_pwd_disclosure password disclore 
 updated docs again and readme
 rework command system to automaticly detect new modules
 added uniview_nvr_pwd_disclosure  
 added ssdp_msearch  
-added hearbleed  
+added hearbleed  info leak from server saved to a bin file
 added port scanner  
 added find command  
 updated docs  
