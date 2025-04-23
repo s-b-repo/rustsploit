@@ -15,6 +15,7 @@ Convert exploits and add modules
 
 # completed
 ```
+updated docs again and readme
 rework command system to automaticly detect new modules
 added uniview_nvr_pwd_disclosure  
 added ssdp_msearch  
