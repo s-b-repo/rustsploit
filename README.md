@@ -15,6 +15,7 @@ Convert exploits and add modules
 
 # completed
 ```
+added exploit tplink_wr740n Buffer Overflow 'DOS'
 added exploit tp_link_vn020  Denial Of Service (DOS) 
 added exploit abussecurity_camera_cve 2023 26609 variant2 RCE and SSH Root Access adds persistant account
 added exploit abussecurity_camera_cve 2023 26609 variant1 LFI, RCE and SSH Root Access
