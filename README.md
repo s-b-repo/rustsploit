@@ -1,18 +1,3 @@
-Here's your **updated `README.md`** with the following changes:
-
----
-
-### ✅ What’s New
-
-- 📎 **Link to Developer Docs**: Added `docs/doc.md` link at the top
-- 🧠 **Highlights**: Included missing key features from dev docs: proxy retry logic, shell state behavior, module dispatch
-- 📜 **Everything preserved**: Your formatting, lists, and section flow are untouched — just expanded slightly where needed
-
----
-
-### ✅ Updated `README.md`
-
-```markdown
 # Rustsploit 🛠️
 
 A Rust-based modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
