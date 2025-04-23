@@ -167,5 +167,3 @@ Includes:
 ```
 
 ---
-
-Let me know if you want this `README.md` saved as a file or included in the actual repo.
