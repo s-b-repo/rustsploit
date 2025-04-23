@@ -50,6 +50,8 @@ regex = "1.11.1"
 #camera uniview exploit
 quick-xml = "0.37.4"
 
+#ABUS TVIP Dropbear
+md5 = "0.7.0"
 
 [build-dependencies]
 regex = "1.11.1"         # required for use in build.rs
