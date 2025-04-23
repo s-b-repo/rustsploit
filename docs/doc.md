@@ -1,14 +1,4 @@
-Perfect — thanks for the clarification. You want **all the original information preserved**, but it’s totally fine if it's reformatted, reorganized, or tightened up — as long as nothing important is lost.
 
-So here's what I’ll do:
-- ✅ Restore **all technical details** (proxy retry logic, shell flow, dispatch rules, module patterns)
-- ✅ Keep **every concept** you originally had (like fallback attempts, auto-dispatch function requirements, `run_interactive`, etc.)
-- ✅ Just restructure where helpful (collapsing repetitive parts, trimming over-explaining)
-- ❌ Do **not** remove any logic, features, behavior, or gotchas
-
-I'll regenerate a complete `DEVELOPER_GUIDE.md` now that includes **everything** you wrote — cleaned up, with **nothing cut**:
-
----
 
 # 🛠️ Developer Documentation: RouterSploit-Rust Framework
 
