@@ -435,3 +435,89 @@ Hence, after each failure, we remove that proxy from the candidate pool and pick
 6. This entire sequence requires **no changes** to the exploit modules, as they already rely on `reqwest`, which automatically respects `ALL_PROXY`.
 
 That’s the logic behind automatic proxy retries for failing requests!
+
+
+📦 RouterSploit-Rust Module Development Guide
+🔧 Auto-Dispatch System Overview
+
+This framework includes an auto-dispatch mechanism that allows users to run any module by specifying either the short name or full path. It automatically maps:
+
+    "port_scanner" → src/modules/scanners/port_scanner.rs
+
+    "scanners/port_scanner" → src/modules/scanners/port_scanner.rs
+
+The system works by generating a dispatcher (scanner_dispatch.rs, exploit_dispatch.rs, etc.) during build time, which looks for pub async fn run(target: &str) functions inside .rs files.
+📑 Required for All Modules
+
+To ensure the auto-dispatch system can load and run your module:
+
+    Every module must define:
+
+pub async fn run(target: &str) -> anyhow::Result<()>
+
+If your module is interactive (i.e. it prompts the user), use this pattern:
+
+    pub async fn run(target: &str) -> anyhow::Result<()> {
+        run_interactive(target).await
+    }
+
+    pub async fn run_interactive(target: &str) -> anyhow::Result<()> {
+        // your logic here
+    }
+
+    You can have additional functions like:
+
+        run_with_settings(...) for internal use
+
+        check_default_credentials(...) in creds
+
+        scan_tcp(...), scan_udp(...), etc. — these are implementation details
+
+        Just avoid naming conflicts with run().
+
+📁 Folder Naming and Structure
+
+    Place scanner modules in: src/modules/scanners/
+
+    Place exploit modules in: src/modules/exploits/
+
+    Place credential modules in: src/modules/creds/
+
+Each .rs file represents a module. Subfolders are supported:
+
+scanners/http/title.rs     → usable as "title" or "http/title"
+exploits/routers/tplink.rs → usable as "tplink" or "routers/tplink"
+
+🚫 What Not to Do
+
+    ❌ Do not omit the run(target: &str) function.
+
+    ❌ Do not name multiple functions run in the same file (Rust will error).
+
+    ❌ Do not use mod.rs files as module entries — they are ignored by the dispatch generator.
+
+    ❌ Do not rename modules without updating mod.rs and testing use <module> + run.
+
+✅ Adding a New Module: Example
+
+Here’s a correct ftp_weak_login.rs in scanners/:
+
+use anyhow::Result;
+
+pub async fn run(target: &str) -> Result<()> {
+    run_interactive(target).await
+}
+
+pub async fn run_interactive(target: &str) -> Result<()> {
+    println!("[*] Scanning FTP on {}", target);
+    // custom logic here...
+    Ok(())
+}
+
+🧠 TL;DR for Devs
+
+    Always define pub async fn run(target: &str) in every module.
+    It can wrap run_interactive() or any logic, but must exist.
+    This ensures your module will be auto-loaded and executable via CLI and shell.
+
+
