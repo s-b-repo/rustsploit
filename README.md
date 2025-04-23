@@ -8,9 +8,6 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 → [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/r-routersploit/blob/main/docs/doc.md)
 
 ---
-    println!(" 1.
-    println!(" 2. 
-    println!(" 3. 
 ### Goals & To Do lists
 
 Convert exploits and add modules
