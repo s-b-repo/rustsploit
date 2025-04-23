@@ -8,13 +8,17 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 → [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/r-routersploit/blob/main/docs/doc.md)
 
 ---
-
+    println!(" 1.
+    println!(" 2. 
+    println!(" 3. 
 ### Goals & To Do lists
 
 Convert exploits and add modules
 
 # completed
 ```
+added exploit openssh server race condition 9.8.p1 |Server Destruction fork | bomb Persistence create SSH user | Remote Root Shell
+
 added exploit tplink_wr740n Buffer Overflow 'DOS'
 added exploit tp_link_vn020  Denial Of Service (DOS) 
 added exploit abussecurity_camera_cve 2023 26609 variant2 RCE and SSH Root Access adds persistant account
