@@ -11,21 +11,7 @@ use tokio::{
     time::{timeout, Duration},
 };
 
-/// Public interface to prompt user and run the scan
-pub async fn run_interactive(target: &str) -> Result<()> {
-    let settings = prompt_settings()?;
-    run(
-        target,
-        settings.concurrency,
-        settings.timeout_secs,
-        settings.show_only_open,
-        settings.verbose,
-        settings.scan_udp_enabled,
-        &settings.output_file,
-    )
-    .await
-}
-
+#[allow(dead_code)]
 pub struct ScanSettings {
     pub concurrency: usize,
     pub timeout_secs: u64,
@@ -35,6 +21,8 @@ pub struct ScanSettings {
     pub output_file: String,
 }
 
+#[allow(dead_code)]
+/// Prompt user for scan configuration
 pub fn prompt_settings() -> Result<ScanSettings> {
     Ok(ScanSettings {
         concurrency: prompt_usize("Concurrency: ")?,
@@ -46,8 +34,30 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     })
 }
 
-/// Main scanner logic
-pub async fn run(
+#[allow(dead_code)]
+/// Interactive entry point
+pub async fn run_interactive(target: &str) -> Result<()> {
+    let settings = prompt_settings()?;
+    run_with_settings(
+        target,
+        settings.concurrency,
+        settings.timeout_secs,
+        settings.show_only_open,
+        settings.verbose,
+        settings.scan_udp_enabled,
+        &settings.output_file,
+    )
+    .await
+}
+
+/// Dispatch-compatible wrapper
+#[allow(dead_code)]
+pub async fn run(target: &str) -> Result<()> {
+    run_interactive(target).await
+}
+
+/// Renamed internal function to avoid clash
+pub async fn run_with_settings(
     target: &str,
     concurrency: usize,
     timeout_secs: u64,
@@ -120,7 +130,7 @@ pub async fn run(
     Ok(())
 }
 
-/// TCP banner grabbing scanner
+/// TCP connect scan + banner grab
 async fn scan_tcp(ip: &str, port: u16, timeout_secs: u64) -> Option<(String, String)> {
     let addr = format!("{}:{}", ip, port);
     match timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&addr)).await {
@@ -142,7 +152,7 @@ async fn scan_tcp(ip: &str, port: u16, timeout_secs: u64) -> Option<(String, Str
     }
 }
 
-/// UDP port scanner (null packet, timeout-based)
+/// UDP scan (null packet, timeout-based)
 async fn scan_udp(ip: &str, port: u16, timeout_secs: u64) -> Option<String> {
     let local = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
     let remote = format!("{}:{}", ip, port).parse::<SocketAddr>().ok()?;
@@ -157,7 +167,7 @@ async fn scan_udp(ip: &str, port: u16, timeout_secs: u64) -> Option<String> {
     }
 }
 
-/// Prompt for string
+/// Prompt for string input
 fn prompt(message: &str) -> Result<String> {
     print!("{}", message);
     io::stdout().flush()?;
@@ -178,7 +188,7 @@ fn prompt_bool(message: &str) -> Result<bool> {
     }
 }
 
-/// Prompt for number
+/// Prompt for number input
 fn prompt_usize(message: &str) -> Result<usize> {
     loop {
         let input = prompt(message)?;
