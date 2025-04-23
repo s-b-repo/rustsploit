@@ -1,4 +1,4 @@
-Refactor this code to a Rust module  so that it fully integrates into my RouterSploit-inspired Rust auto-dispatch framework and .
+Refactor this code to a Rust module  so that it fully integrates into my RouterSploit-inspired Rust auto-dispatch framework.
 
     ✅ Preserve all functionality and existing logic — do not remove or simplify any capabilities.
 
@@ -19,6 +19,8 @@ Refactor this code to a Rust module  so that it fully integrates into my RouterS
     ✅ If necessary, clean up variable scoping or imports, but never remove real features.
 
     ✅ keep all comments from the orginal but add two / before comments
+
+    ✅ only use the poc and it must be a 1 to 1 convertion
 
 Here is the original module that needs to be refactored:
 
