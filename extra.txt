@@ -1,0 +1,23 @@
+Refactor this code to a Rust module  so that it fully integrates into my RouterSploit-inspired Rust auto-dispatch framework and .
+
+    ✅ Preserve all functionality and existing logic — do not remove or simplify any capabilities.
+
+    ✅ Ensure the module defines a pub async fn run(target: &str) -> Result<()> entry point.
+
+        All internal logic must be routed through this function.
+
+    ✅ If any internal function is named run and conflicts with the dispatch entry, rename it (e.g. to execute, exploit, etc.) — but do not change logic.
+
+    ✅ The module must compile, follow anyhow::Result<()>, and use proper error propagation (? operator).
+
+    ✅ Do not add placeholders, pseudocode, or stubs — this must be real working Rust code.
+
+    ✅ Use async/await and retain all networking, parsing, and exploit behavior from the original logic.
+
+    ✅ Keep the code idiomatic and modular — preserve structure, variable naming, and async HTTP usage.
+
+    ✅ If necessary, clean up variable scoping or imports, but never remove real features.
+
+    ✅ keep all comments from the orginal but add two / before comments
+
+Here is the original module that needs to be refactored:
