@@ -53,6 +53,10 @@ quick-xml = "0.37.4"
 #ABUS TVIP Dropbear
 md5 = "0.7.0"
 
+#ssh rce race condition
+libc = "0.2.172"
+
+
 [build-dependencies]
 regex = "1.11.1"         # required for use in build.rs
 
