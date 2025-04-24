@@ -17,6 +17,7 @@ Convert exploits and add modules
 added exploit openssh server race condition 9.8.p1 |Server Destruction fork |
 bomb Persistence create SSH user | Remote Root Shell
 
+added spotube exploit zero day exploit as of 24 april reported to spotube
 added exploit tplink_wr740n Buffer Overflow 'DOS'
 added exploit tp_link_vn020  Denial Of Service (DOS) 
 added exploit abussecurity_camera_cve 2023 26609 variant2 RCE and SSH Root Access adds persistant account
