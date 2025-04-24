@@ -6,14 +6,15 @@ use anyhow::Result;
 use crate::cli::Cli;
 use walkdir::WalkDir;
 
-/// Handle CLI commands like: --command exploit --module creds/generic/ftp_anonymous --target x.x.x.x
+/// Handle CLI arguments like:
+/// --command scanner --module scanners/port_scanner --target 192.168.1.1
 pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     let target = cli_args.target.clone().unwrap_or_default();
     let module = cli_args.module.clone().unwrap_or_default();
 
     match command {
         "exploit" => {
-            let trimmed = module.trim_start_matches("exploits/"); // normalize
+            let trimmed = module.trim_start_matches("exploits/");
             exploit::run_exploit(trimmed, &target).await?;
         },
         "scanner" => {
@@ -32,45 +33,50 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Called from the interactive shell (e.g. 'use creds/generic/ftp_anonymous' + 'run')
+/// Handle `run` in the interactive shell after `use <module>`
+/// Supports both full paths like "scanners/port_scanner" and short names like "port_scanner"
 pub async fn run_module(module_path: &str, target: &str) -> Result<()> {
     let available = discover_modules();
 
-    if !available.contains(&module_path.to_string()) {
-        eprintln!("Unknown module '{}'. Available modules:", module_path);
+    // Exact match (e.g. "scanners/port_scanner")
+    let full_match = available.iter().find(|m| m == &module_path);
+
+    // Short match (e.g. "port_scanner" from "scanners/port_scanner")
+    let short_match = available.iter().find(|m| {
+        m.rsplit_once('/')
+            .map(|(_, short)| short == module_path)
+            .unwrap_or(false)
+    });
+
+    let resolved = if let Some(m) = full_match {
+        m
+    } else if let Some(m) = short_match {
+        m
+    } else {
+        eprintln!("❌ Unknown module '{}'. Available modules:", module_path);
         for module in available {
             println!("  {}", module);
         }
         return Ok(());
-    }
+    };
 
-    // Split path like "creds/generic/ftp_anonymous" -> ("creds", "generic/ftp_anonymous")
-    let mut parts = module_path.splitn(2, '/');
+    let mut parts = resolved.splitn(2, '/');
     let category = parts.next().unwrap_or("");
     let module_name = parts.next().unwrap_or("");
 
     match category {
-        "exploits" => {
-            exploit::run_exploit(module_name, target).await?;
-        },
-        "scanners" => {
-            scanner::run_scan(module_name, target).await?;
-        },
-        "creds" => {
-            creds::run_cred_check(module_name, target).await?;
-        },
-        _ => {
-            eprintln!("Category '{}' is not supported.", category);
-        }
+        "exploits" => exploit::run_exploit(module_name, target).await?,
+        "scanners" => scanner::run_scan(module_name, target).await?,
+        "creds" => creds::run_cred_check(module_name, target).await?,
+        _ => eprintln!("❌ Category '{}' is not supported.", category),
     }
 
     Ok(())
 }
 
-/// Discover modules in src/modules/{exploits,scanners,creds} recursively up to 6 levels deep
+/// Walks src/modules/{exploits,scanners,creds} recursively and returns all `.rs` modules (excluding mod.rs)
 pub fn discover_modules() -> Vec<String> {
     let mut modules = Vec::new();
-
     let categories = ["exploits", "scanners", "creds"];
 
     for category in categories {
@@ -80,7 +86,10 @@ pub fn discover_modules() -> Vec<String> {
         for entry in walker.into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
 
-            if path.is_file() && path.extension().map(|e| e == "rs").unwrap_or(false) {
+            if path.is_file()
+                && path.extension().map_or(false, |e| e == "rs")
+                && path.file_name().map_or(true, |n| n != "mod.rs")
+            {
                 if let Ok(relative) = path.strip_prefix("src/modules") {
                     let module_path = relative
                         .with_extension("") // remove .rs
