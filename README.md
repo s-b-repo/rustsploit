@@ -14,6 +14,9 @@ Convert exploits and add modules
 
 # completed
 ```
+added ftps support
+added ipv6 support to ftp anon and brute
+
 added exploit openssh server race condition 9.8.p1 |Server Destruction fork |
 bomb Persistence create SSH user | Remote Root Shell
 
