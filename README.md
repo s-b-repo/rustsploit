@@ -16,7 +16,7 @@ Convert exploits and add modules
 ```
 added ftps support
 added ipv6 support to ftp anon and brute
-
+added rdp ipv6 support unable to find rpd ipv6 device to test on with shodan
 added exploit openssh server race condition 9.8.p1 |Server Destruction fork |
 bomb Persistence create SSH user | Remote Root Shell
 
