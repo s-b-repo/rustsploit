@@ -1,3 +1,21 @@
+Required Signature
+
+The module must contain this exact public async function:
+
+pub async fn run(target: &str) -> anyhow::Result<()>
+
+Or any variant like:
+
+pub async fn run(_target: &str) -> anyhow::Result<()>
+
+Or even:
+
+pub async fn run(host: &str) -> anyhow::Result<()>
+
+
+Refactor this module to work with the auto-dispatch system. Do not remove any functionality or features. Make sure it defines a pub async fn run(target: &str) -> Result<()> entry point that internally calls the correct logic. Rename any conflicting functions if needed, but preserve all capabilities and structure.
+
+
 Refactor this code to a Rust module  so that it fully integrates into my RouterSploit-inspired Rust auto-dispatch framework.
 
     ✅ Preserve all functionality and existing logic — do not remove or simplify any capabilities.
@@ -24,4 +42,32 @@ Refactor this code to a Rust module  so that it fully integrates into my RouterS
 
 Here is the original module that needs to be refactored:
 
-.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Would you like a Dynamic/Auto-Scaler version too? 🚀
+(Example: start at 500 concurrency, grow to 5000 if CPU/RAM is good.)
+
+Want me to show it too? 🔥
+You said:
+yes Dynamic/Auto-Scaler  show function to add
