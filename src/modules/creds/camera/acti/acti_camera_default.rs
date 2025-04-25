@@ -25,6 +25,16 @@ pub struct Config {
     pub verbosity: bool,
 }
 
+/// Helper to normalize IPv4, IPv6 (with any amount of brackets)
+fn normalize_target(target: &str, port: u16) -> String {
+    let cleaned = target.trim_matches(|c| c == '[' || c == ']');
+    if cleaned.contains(':') && !cleaned.contains('.') {
+        format!("[{}]:{}", cleaned, port) // IPv6
+    } else {
+        format!("{}:{}", cleaned, port) // IPv4 or hostname
+    }
+}
+
 /// FTP check (async)
 pub async fn check_ftp(config: &Config) -> Result<()> {
     println!("[*] Checking FTP credentials on {}:{}", config.target, config.port);
@@ -34,7 +44,7 @@ pub async fn check_ftp(config: &Config) -> Result<()> {
             println!("[*] Trying FTP: {}:{}", username, password);
         }
 
-        let address = format!("{}:{}", config.target, config.port);
+        let address = normalize_target(&config.target, config.port);
         match FtpStream::connect(address).await {
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
@@ -53,7 +63,7 @@ pub async fn check_ftp(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// SSH check (blocking, so we use spawn_blocking in our run function)
+/// SSH check (blocking, so we use spawn_blocking)
 pub fn check_ssh_blocking(config: &Config) -> Result<()> {
     println!("[*] Checking SSH credentials on {}:{}", config.target, config.port);
 
@@ -62,7 +72,7 @@ pub fn check_ssh_blocking(config: &Config) -> Result<()> {
             println!("[*] Trying SSH: {}:{}", username, password);
         }
 
-        let address = format!("{}:{}", config.target, config.port);
+        let address = normalize_target(&config.target, config.port);
         if let Ok(stream) = TcpStream::connect(address) {
             let mut session = Session::new().context("Failed to create SSH session")?;
             session.set_tcp_stream(stream);
@@ -81,7 +91,7 @@ pub fn check_ssh_blocking(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Telnet check (blocking, so we use spawn_blocking in our run function)
+/// Telnet check (blocking)
 pub fn check_telnet_blocking(config: &Config) -> Result<()> {
     println!("[*] Checking Telnet credentials on {}:{}", config.target, config.port);
 
@@ -90,7 +100,15 @@ pub fn check_telnet_blocking(config: &Config) -> Result<()> {
             println!("[*] Trying Telnet: {}:{}", username, password);
         }
 
-        if let Ok(mut telnet) = Telnet::connect((config.target.as_str(), config.port), 500) {
+        let address = normalize_target(&config.target, config.port);
+        let parts: Vec<&str> = address.rsplitn(2, ':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let host = parts[1];
+        let port: u16 = parts[0].parse().unwrap_or(23);
+
+        if let Ok(mut telnet) = Telnet::connect((host, port), 500) {
             let _ = telnet.write(format!("{}\r\n", username).as_bytes());
             let _ = telnet.write(format!("{}\r\n", password).as_bytes());
 
@@ -122,7 +140,7 @@ pub async fn check_http_form(config: &Config) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
-    let url = format!("http://{}:{}/video.htm", config.target, config.port);
+    let url = format!("http://{}:{}/video.htm", config.target.trim_matches(|c| c == '[' || c == ']'), config.port);
 
     for (username, password) in &config.credentials {
         if config.verbosity {
@@ -179,21 +197,17 @@ pub async fn run(target: &str) -> Result<()> {
     let telnet_conf = Config { port: 23, ..base_config.clone() };
     let http_conf   = Config { port: 80, ..base_config.clone() };
 
-    // Start all checks in parallel
     let (ftp_res, ssh_res, telnet_res, http_res) = join!(
         check_ftp(&ftp_conf),
         async {
-            // run blocking ssh check in separate thread
             task::spawn_blocking(move || check_ssh_blocking(&ssh_conf)).await?
         },
         async {
-            // run blocking telnet check in separate thread
             task::spawn_blocking(move || check_telnet_blocking(&telnet_conf)).await?
         },
         check_http_form(&http_conf),
     );
 
-    // Evaluate results
     ftp_res?;
     ssh_res?;
     telnet_res?;
