@@ -5,3 +5,4 @@
     pub mod telnet_bruteforce;
     pub mod ssh_bruteforce;
     pub mod rtsp_bruteforce_advanced;
+    pub mod rdp_bruteforce;
