@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::{
     fs::File,
     io::{self, Write},
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     sync::Arc,
 };
 use tokio::{
@@ -66,6 +66,7 @@ pub async fn run_with_settings(
     scan_udp_enabled: bool,
     output_file: &str,
 ) -> Result<()> {
+    let target = normalize_target(target)?;
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = vec![];
     let mut file = File::create(output_file)?;
@@ -74,7 +75,7 @@ pub async fn run_with_settings(
     println!("[*] Starting TCP scan...");
     for port in 1..=65535 {
         let permit = semaphore.clone().acquire_owned().await?;
-        let target = target.to_string();
+        let target = target.clone();
         let mut file = file.try_clone()?;
 
         let handle = tokio::spawn(async move {
@@ -103,7 +104,7 @@ pub async fn run_with_settings(
         println!("[*] Starting UDP scan...");
         for port in 1..=65535 {
             let permit = semaphore.clone().acquire_owned().await?;
-            let target = target.to_string();
+            let target = target.clone();
             let mut file = file.try_clone()?;
 
             let handle = tokio::spawn(async move {
@@ -155,16 +156,46 @@ async fn scan_tcp(ip: &str, port: u16, timeout_secs: u64) -> Option<(String, Str
 /// UDP scan (null packet, timeout-based)
 async fn scan_udp(ip: &str, port: u16, timeout_secs: u64) -> Option<String> {
     let local = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-    let remote = format!("{}:{}", ip, port).parse::<SocketAddr>().ok()?;
-    let socket = UdpSocket::bind(local).await.ok()?;
+    let remote = format!("{}:{}", ip, port);
+    let remote = match normalize_addr(&remote) {
+        Ok(addr) => addr,
+        Err(_) => return None,
+    };
 
-    let _ = socket.send_to(b"\x00", remote).await;
+    let socket = UdpSocket::bind(local).await.ok()?;
+    let _ = socket.send_to(b"\x00", &remote).await;
     let mut buf = [0u8; 512];
 
     match timeout(Duration::from_secs(timeout_secs), socket.recv_from(&mut buf)).await {
         Ok(Ok((_n, _))) => Some("OPEN".into()),
         _ => None,
     }
+}
+
+/// Normalize IP/hostname for bracket handling and clean input
+fn normalize_target(input: &str) -> Result<String> {
+    let input = input.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    if input.contains(':') && !input.contains('.') {
+        // Likely IPv6, re-add brackets
+        Ok(format!("[{}]", input))
+    } else {
+        Ok(input.to_string())
+    }
+}
+
+/// Normalize and parse into a real SocketAddr
+fn normalize_addr(input: &str) -> Result<SocketAddr> {
+    // Remove extra brackets first
+    let cleaned = input.trim().trim_start_matches('[').trim_end_matches(']');
+    // If IPv6, wrap again properly
+    let formatted = if cleaned.contains(':') && !cleaned.contains('.') {
+        format!("[{}]", cleaned)
+    } else {
+        cleaned.to_string()
+    };
+
+    let addrs = formatted.to_socket_addrs()?;
+    addrs.into_iter().next().ok_or_else(|| anyhow::anyhow!("Invalid address"))
 }
 
 /// Prompt for string input

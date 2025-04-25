@@ -14,6 +14,10 @@ Convert exploits and add modules
 
 # completed
 ```
+added ipv6 support for rstp rdp and ssh cant find any ipv6 address i cant test on so untested
+added ftps support
+added ipv6 support to ftp anon and brute
+added rdp ipv6 support unable to find rpd ipv6 device to test on with shodan
 added exploit openssh server race condition 9.8.p1 |Server Destruction fork |
 bomb Persistence create SSH user | Remote Root Shell
 
@@ -45,9 +49,19 @@ dynamic modules listing and colored listing
 ```
 
 ---
-
+```
 ## 🚀 Building & Running
+## 📦🛠️  requirements 
+```
+```
+sudo apt update
+sudo apt install freerdp2-x11  
 
+for rdp bruteforce modudle
+
+
+```
+```
 ### 📦 Clone the Repository
 
 ```
