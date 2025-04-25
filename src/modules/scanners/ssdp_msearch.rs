@@ -5,11 +5,15 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration};
 
-pub async fn run(target_ip: &str) -> Result<()> {
-    let port = 1900;
-    println!("[*] Sending SSDP M-SEARCH to {}:{}...", target_ip, port);
+pub async fn run(target: &str) -> Result<()> {
+    let port = prompt_port().unwrap_or(1900);
 
-    let addr = format!("{}:{}", target_ip, port);
+    let target = clean_ipv6_brackets(target);
+
+    let addr = normalize_target(&target, port)?;
+
+    println!("[*] Sending SSDP M-SEARCH to {}...", addr);
+
     let local_bind: SocketAddr = "0.0.0.0:0".parse()?;
     let socket = UdpSocket::bind(local_bind).await?;
     socket.connect(&addr).await?;
@@ -20,7 +24,7 @@ pub async fn run(target_ip: &str) -> Result<()> {
          MAN: \"ssdp:discover\"\r\n\
          MX: 2\r\n\
          ST: upnp:rootdevice\r\n\r\n",
-        target_ip, port
+        target, port
     );
 
     socket.send(request.as_bytes()).await?;
@@ -29,7 +33,7 @@ pub async fn run(target_ip: &str) -> Result<()> {
     match timeout(Duration::from_secs(3), socket.recv(&mut buf)).await {
         Ok(Ok(size)) => {
             let response = String::from_utf8_lossy(&buf[..size]);
-            parse_ssdp_response(&response, target_ip, port);
+            parse_ssdp_response(&response, &target, port);
         }
         _ => {
             println!("[-] Target did not respond to M-SEARCH request");
@@ -37,6 +41,44 @@ pub async fn run(target_ip: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Normalize the target: IPv6 -> [ipv6]:port, IPv4 stays as ipv4:port
+fn normalize_target(target: &str, port: u16) -> Result<String> {
+    let addr = if target.contains(':') && !target.contains(']') {
+        // Plain IPv6 without brackets
+        format!("[{}]:{}", target, port)
+    } else if target.contains('[') {
+        // Already bracketed IPv6 (sanitize just in case)
+        format!("[{}]:{}", target.trim_matches(&['[', ']'][..]), port)
+    } else {
+        // IPv4 or hostname
+        format!("{}:{}", target, port)
+    };
+    Ok(addr)
+}
+
+/// Cleans up accidental double or triple brackets like [[::1]] → ::1
+fn clean_ipv6_brackets(ip: &str) -> String {
+    ip.trim_start_matches('[')
+      .trim_end_matches(']')
+      .to_string()
+}
+
+/// Ask user for port (optional), fallback to 1900 if empty
+fn prompt_port() -> Option<u16> {
+    println!("[*] Enter custom port (default 1900): ");
+    let mut input = String::new();
+    if let Ok(_) = std::io::stdin().read_line(&mut input) {
+        let input = input.trim();
+        if input.is_empty() {
+            return None;
+        }
+        if let Ok(p) = input.parse::<u16>() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn parse_ssdp_response(response: &str, target_ip: &str, port: u16) {

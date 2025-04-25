@@ -1,10 +1,32 @@
+// src/utils.rs
+
 use colored::*;
 use std::fs;
 use std::io::{BufRead, BufReader, Error};
-use std::path::{Path};
+use std::path::Path;
+use anyhow::{Result};
 
 /// Maximum folder depth to traverse
 const MAX_DEPTH: usize = 6;
+
+/// Take “1.2.3.4”, “::1”, “[::1]:8080” or “hostname” and
+/// always return a valid “host:port” or “[ipv6]:port” string.
+pub fn normalize_target(raw: &str) -> Result<String> {
+    if raw.contains("]:") || raw.starts_with('[') {
+        // Already normalized, like [::1]:8080 or [2001:db8::1]
+        return Ok(raw.to_string());
+    }
+
+    // Looks like an unwrapped IPv6 address if it has multiple colons
+    let is_ipv6 = raw.matches(':').count() >= 2;
+
+    if is_ipv6 {
+        Ok(format!("[{}]", raw))
+    } else {
+        Ok(raw.to_string())
+    }
+}
+
 
 /// Recursively list .rs files up to a certain depth (unchanged)
 fn collect_module_paths(dir: &Path, depth: usize) -> Vec<String> {
@@ -71,7 +93,7 @@ pub fn list_all_modules() {
     }
 }
 
-/// Finds and displays modules matching a keyword
+/// Finds and displays modules matching a keyword (unchanged)
 pub fn find_modules(keyword: &str) {
     let keyword_lower = keyword.to_lowercase();
     let modules = collect_module_paths(Path::new("src/modules"), 0);
@@ -112,10 +134,7 @@ pub fn find_modules(keyword: &str) {
     }
 }
 
-
-
-/// Parses a single proxy line (e.g., "1.2.3.4:9050" -> "http://1.2.3.4:9050")
-/// or "socks5://127.0.0.1:9050" -> "socks5://127.0.0.1:9050"
+/// Parses a single proxy line (unchanged)
 fn parse_proxy_line(line: &str) -> String {
     let trimmed = line.trim().to_lowercase();
     if trimmed.starts_with("http://")
@@ -123,16 +142,13 @@ fn parse_proxy_line(line: &str) -> String {
         || trimmed.starts_with("socks4://")
         || trimmed.starts_with("socks5://")
     {
-        // User specified a scheme, keep as is (but restore original case if you want).
         line.to_string()
     } else {
-        // Default to HTTP if no scheme is provided
         format!("http://{}", line)
     }
 }
 
-/// Load proxies from a file, returning lines like:
-/// [ "http://1.2.3.4:8080", "socks4://5.6.7.8:1080", "socks5://..." ] etc.
+/// Load proxies from a file, returning normalized proxy URLs (unchanged)
 pub fn load_proxies_from_file(filename: &str) -> Result<Vec<String>, Error> {
     let file = fs::File::open(filename)?;
     let reader = BufReader::new(file);
@@ -141,8 +157,7 @@ pub fn load_proxies_from_file(filename: &str) -> Result<Vec<String>, Error> {
     for line in reader.lines() {
         let line = line?.trim().to_string();
         if !line.is_empty() {
-            let parsed = parse_proxy_line(&line);
-            proxies.push(parsed);
+            proxies.push(parse_proxy_line(&line));
         }
     }
 

