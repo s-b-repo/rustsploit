@@ -30,6 +30,7 @@ rustls = "0.23.26"
 webpki-roots = "0.26.8"
 suppaftp   = { version = "6.2.0", features = ["async", "async-native-tls","native-tls"] }
 native-tls = "0.2.14"
+sysinfo = { version = "0.34.2", features = ["multithread"] }
 
 #telnet
 threadpool = "1.8.1"
@@ -58,7 +59,7 @@ md5 = "0.7.0"
 
 #ssh rce race condition
 libc = "0.2.172"
-
+futures = "0.3.31"
 #spotube exploit
 serde_json = "1.0.140"
 futures-util = "0.3.31"
