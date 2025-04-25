@@ -141,14 +141,14 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 async fn try_ssh_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
-    let addr = addr.to_string();
+    let normalized = format_host_port(addr)?;
     let user = user.to_string();
     let pass = pass.to_string();
 
     let result = spawn_blocking(move || {
-        match TcpStream::connect(&addr) {
+        match TcpStream::connect(&normalized) {
             Ok(tcp) => {
-                let mut sess = Session::new()?; // ✅ fixed here
+                let mut sess = Session::new()?; // ✅ SSH session
                 sess.set_tcp_stream(tcp);
                 sess.handshake()?;
                 match sess.userauth_password(&user, &pass) {
@@ -162,6 +162,30 @@ async fn try_ssh_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
     .await??;
 
     Ok(result)
+}
+
+/// 💡 Format IP/hostname into `host:port` with safe IPv6 wrapping
+fn format_host_port(input: &str) -> Result<String> {
+    // [ipv6]:port is already correct
+    if input.starts_with('[') && input.contains("]:") {
+        return Ok(input.to_string());
+    }
+
+    // Split by last `:`
+    let parts: Vec<&str> = input.rsplitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(anyhow!("Invalid target address format: '{}'", input));
+    }
+
+    let port = parts[0];
+    let host = parts[1];
+
+    // IPv6 detection (contains multiple ':')
+    if host.contains(':') && !host.starts_with('[') {
+        Ok(format!("[{}]:{}", host, port))
+    } else {
+        Ok(format!("{}:{}", host, port))
+    }
 }
 
 // === Utility Functions ===
