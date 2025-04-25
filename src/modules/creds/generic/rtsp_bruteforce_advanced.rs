@@ -185,11 +185,12 @@ async fn resolve_targets(addr: &str) -> Result<Vec<SocketAddr>> {
         (addr.to_string(), 554)
     };
 
-    // 3) Format bracketed IPv6 or plain host
-    let host_port = if host.contains(':') && !host.starts_with('[') {
-        format!("[{}]:{}", host, port)
+    // 3) Clean any nested brackets and format bracketed IPv6 or plain host
+    let host_clean = host.trim_matches(|c| c == '[' || c == ']').to_string();
+    let host_port = if host_clean.contains(':') {
+        format!("[{}]:{}", host_clean, port)
     } else {
-        format!("{}:{}", host, port)
+        format!("{}:{}", host_clean, port)
     };
 
     // 4) DNS lookup (handles A + AAAA)
@@ -217,18 +218,27 @@ async fn try_rtsp_login(
     let addrs = resolve_targets(addr).await?;
     let mut last_err = None;
     let mut stream = None;
+    let mut connected_sa = None;
 
     // Try each candidate address
     for sa in addrs {
         match TcpStream::connect(sa).await {
-            Ok(s) => { stream = Some(s); break; }
-            Err(e) => { last_err = Some(e); continue; }
+            Ok(s) => {
+                stream = Some(s);
+                connected_sa = Some(sa);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
         }
     }
 
-    let mut stream = match stream {
-        Some(s) => s,
-        None => {
+    // Unwrap the successful connection and SocketAddr
+    let (mut stream, sa) = match (stream, connected_sa) {
+        (Some(s), Some(sa)) => (s, sa),
+        _ => {
             return Err(anyhow!(
                 "All connection attempts failed: {}",
                 last_err.map(|e| e.to_string()).unwrap_or_default()
@@ -236,14 +246,22 @@ async fn try_rtsp_login(
         }
     };
 
+    // Build a proper host:port string for the RTSP URI, handling IPv6 correctly
+    let ip_str = sa.ip().to_string();
+    let host_for_uri = if ip_str.contains(':') {
+        format!("[{}]:{}", ip_str, sa.port())
+    } else {
+        format!("{}:{}", ip_str, sa.port())
+    };
+
     let rtsp_method = method.unwrap_or("OPTIONS");
     let path_str = if path.is_empty() { "" } else { path };
     let credentials = Base64.encode(format!("{}:{}", user, pass));
 
     let mut request = format!(
-        "{method} rtsp://{addr}/{path} RTSP/1.0\r\nCSeq: 1\r\nAuthorization: Basic {auth}\r\n",
+        "{method} rtsp://{host}/{path} RTSP/1.0\r\nCSeq: 1\r\nAuthorization: Basic {auth}\r\n",
         method = rtsp_method,
-        addr = addr,
+        host = host_for_uri,
         path = path_str.trim_start_matches('/'),
         auth = credentials,
     );
@@ -272,6 +290,8 @@ async fn try_rtsp_login(
         Err(anyhow!("Unexpected RTSP response:\n{}", response))
     }
 }
+
+// ─── Prompt and utility functions unchanged ───────────────────────────────────
 
 fn prompt_required(msg: &str) -> Result<String> {
     loop {
