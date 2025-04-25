@@ -227,10 +227,14 @@ fn get_filename_in_current_dir(input: &str) -> PathBuf {
     PathBuf::from(format!("./{}", name))
 }
 
+// —— updated helper to handle any number of brackets —— 
 fn format_socket_address(ip: &str, port: u16) -> String {
-    if ip.contains(':') && !ip.starts_with('[') {
-        format!("[{}]:{}", ip, port)
+    // Strip all existing brackets from the ends, no matter how many layers
+    let trimmed = ip.trim_matches(|c| c == '[' || c == ']').to_string();
+    // If it still contains a colon, assume IPv6 and wrap in one pair of brackets
+    if trimmed.contains(':') {
+        format!("[{}]:{}", trimmed, port)
     } else {
-        format!("{}:{}", ip, port)
+        format!("{}:{}", trimmed, port)
     }
 }
