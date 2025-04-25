@@ -14,6 +14,7 @@ Convert exploits and add modules
 
 # completed
 ```
+added ipv6 support for rstp rdp and ssh cant find any ipv6 address i cant test on so untested
 added ftps support
 added ipv6 support to ftp anon and brute
 added rdp ipv6 support unable to find rpd ipv6 device to test on with shodan
