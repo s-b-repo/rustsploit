@@ -164,24 +164,32 @@ async fn try_ssh_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
     Ok(result)
 }
 
-/// 💡 Format IP/hostname into `host:port` with safe IPv6 wrapping
+/// 💡 Format IP/hostname into `host:port` with safe IPv6 wrapping,
+/// stripping any extra nesting of `[`/`]`.
 fn format_host_port(input: &str) -> Result<String> {
-    // [ipv6]:port is already correct
-    if input.starts_with('[') && input.contains("]:") {
-        return Ok(input.to_string());
+    // If it’s already exactly "[ipv6]:port" (no nested brackets inside), accept it as-is.
+    if input.starts_with('[') {
+        if let Some(end) = input.find("]:") {
+            let inner = &input[1..end];
+            if !inner.contains('[') && !inner.contains(']') {
+                return Ok(input.to_string());
+            }
+        }
     }
 
-    // Split by last `:`
+    // Otherwise, split off the port by the last ':'.
     let parts: Vec<&str> = input.rsplitn(2, ':').collect();
     if parts.len() != 2 {
         return Err(anyhow!("Invalid target address format: '{}'", input));
     }
-
     let port = parts[0];
-    let host = parts[1];
+    let raw_host = parts[1];
 
-    // IPv6 detection (contains multiple ':')
-    if host.contains(':') && !host.starts_with('[') {
+    // Strip _all_ leading '[' and trailing ']' from the host part
+    let host = raw_host.trim_matches(|c| c == '[' || c == ']');
+
+    // If it’s an IPv6 (contains ':'), wrap exactly once.
+    if host.contains(':') {
         Ok(format!("[{}]:{}", host, port))
     } else {
         Ok(format!("{}:{}", host, port))
