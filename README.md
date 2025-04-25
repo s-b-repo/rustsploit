@@ -52,8 +52,7 @@ dynamic modules listing and colored listing
 ```
 ## 🚀 Building & Running
 ## 📦🛠️  requirements 
-```
-```
+`
 sudo apt update
 sudo apt install freerdp2-x11  
 
@@ -148,12 +147,12 @@ Modules are automatically detected using `build.rs` and registered as:
 - Full: `scanners/port_scanner`
 
 Each module must define:
-```rust
+```
 pub async fn run(target: &str) -> Result<()>
 ```
 
 Optional:
-```rust
+```
 pub async fn run_interactive(target: &str) -> Result<()>
 ```
 
@@ -187,6 +186,6 @@ Includes:
 - **Main Developer**: me.
 - **Language**: 100% Rust.
 - **Inspired by**: RouterSploit, Metasploit, pwntools
-```
+
 
 ---
