@@ -48,9 +48,19 @@ dynamic modules listing and colored listing
 ```
 
 ---
-
+```
 ## 🚀 Building & Running
+## 📦🛠️  requirements 
+```
+```
+sudo apt update
+sudo apt install freerdp2-x11  
 
+for rdp bruteforce modudle
+
+
+```
+```
 ### 📦 Clone the Repository
 
 ```
