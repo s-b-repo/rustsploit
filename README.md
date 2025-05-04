@@ -15,6 +15,7 @@ Convert exploits and add modules
 # completed
 ```
 
+added acm_5611_rce
 added zabbix_7_0_0_sql_injection
 added cve_2024_7029_avtech_camera
 added pachev_ftp_path_traversal_1_0
