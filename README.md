@@ -14,6 +14,10 @@ Convert exploits and add modules
 
 # completed
 ```
+
+added zabbix_7_0_0_sql_injection
+added cve_2024_7029_avtech_camera
+added pachev_ftp_path_traversal_1_0
 added ipv6 support for rstp rdp and ssh cant find any ipv6 address i cant test on so untested
 added ftps support
 added ipv6 support to ftp anon and brute
