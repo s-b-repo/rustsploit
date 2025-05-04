@@ -15,7 +15,7 @@ rand = "0.9.0"
 clap = { version = "4.5.35", features = ["derive"] }
 
 # Async runtime for networking
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "process"] }
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "process","rt","fs", "io-std"] }
 
 # Easier error handling
 anyhow = "1.0.97"
@@ -56,7 +56,7 @@ quick-xml = "0.37.4"
 
 #ABUS TVIP Dropbear
 md5 = "0.7.0"
-
+ftp = "3.0.1"
 #ssh rce race condition
 libc = "0.2.172"
 futures = "0.3.31"
