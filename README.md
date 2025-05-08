@@ -192,5 +192,9 @@ Includes:
 - **Language**: 100% Rust.
 - **Inspired by**: RouterSploit, Metasploit, pwntools
 
+## 👥 Credits
+
+- **wordlists*: seclists & me
+
 
 ---
