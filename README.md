@@ -14,7 +14,11 @@ Convert exploits and add modules
 
 # completed
 ```
-
+added zte zte_zxv10_h201l_rce_authenticationbypass
+added ivanti ivanti_connect_secure_stack_based_buffer_overflow
+added apache_tomcat cve_2025_24813_apache_tomcat_rce
+added apache_tomcat catkiller_cve_2025_31650
+added palto_alto CVE-2025-0108. auth bypass
 added acm_5611_rce
 added zabbix_7_0_0_sql_injection
 added cve_2024_7029_avtech_camera
