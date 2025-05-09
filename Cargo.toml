@@ -73,6 +73,9 @@ aes = "0.8.3"
 cipher = "0.4.4"
 flate2 = "1.0.30"
 
+#avanti
+url = "2.5.4"
+semver = "1.0.26"
 
 
 [build-dependencies]
