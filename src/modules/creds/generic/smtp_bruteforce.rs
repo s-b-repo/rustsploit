@@ -106,6 +106,7 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     Ok(())
 }
 
+/// Try login with both AUTH PLAIN and AUTH LOGIN, returns Ok(true) if success, Ok(false) if auth fail, Err on connection/protocol error.
 fn try_smtp_login(addr: &str, username: &str, password: &str) -> Result<bool> {
     use base64::{engine::general_purpose, Engine as _};
     let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("Could not resolve address"))?;
@@ -122,8 +123,7 @@ fn try_smtp_login(addr: &str, username: &str, password: &str) -> Result<bool> {
         }
     }
     if !banner_ok { return Err(anyhow::anyhow!("No 220 banner")); }
-    telnet.write(b"EHLO scanner
-\n")?;
+    telnet.write(b"EHLO scanner\r\n")?;
     let mut login_ok = false;
     let mut plain_ok = false;
     let mut ehlo_seen = false;
@@ -139,6 +139,7 @@ fn try_smtp_login(addr: &str, username: &str, password: &str) -> Result<bool> {
         }
     }
     if !ehlo_seen { return Ok(false); }
+    // Try AUTH PLAIN
     if plain_ok {
         let mut blob = vec![0];
         blob.extend(username.as_bytes()); blob.push(0); blob.extend(password.as_bytes());
@@ -153,6 +154,7 @@ fn try_smtp_login(addr: &str, username: &str, password: &str) -> Result<bool> {
             }
         }
     }
+    // Try AUTH LOGIN
     if login_ok {
         telnet.write(b"AUTH LOGIN\r\n")?;
         let mut expect_user = false;
