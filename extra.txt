@@ -76,28 +76,4 @@ Strict Requirements:
 
     The output must be a single, fully compilable Rust source file, containing all necessary use statements, async functions, modules, structs, enums, and logic to support end-to-end operation.
 
-    The driver must:
-
-        Discover Lovense devices over all officially supported transports for Linux (such as Bluetooth Low Energy and/or USB, as specified in Lovense documentation).
-
-        Establish connections to detected devices using async routines.
-
-        Implement the entire official Lovense protocol, including all necessary authentication, handshake, command, and data transfer steps for features such as vibration control, movement patterns, real-time status updates, and device querying.
-
-        Support management of multiple simultaneous device sessions, with safe concurrency for all async operations.
-
-        Handle connection lifecycle, error handling, reconnection, and safe cleanup.
-
-        Use only stable, production-quality Rust crates for Linux BLE/USB communication (such as btleplug for BLE and/or others required by the protocol).
-
-        Correctly parse and construct all protocol messages per the official documentation, with no omissions, stubs, or mockups.
-
-        Provide all logic as truly working, production-grade code—no placeholders, pseudo-code, or simplified routines.
-
-    Ensure best practices for error handling, concurrency, and system resource management according to Rust and async standards.
-
-    Output only the actual, working, fully async Rust code for the Linux driver, and nothing else.
-
-You must rely solely on the official Lovense technical documentation for protocol, device capabilities, packet formats, and any device-specific logic.
-
-Repeat: Do not include any comments, documentation, explanations, placeholders, or example usage. Output only the final, production-ready, fully async Rust code for a Linux Lovense device driver.
+ 
