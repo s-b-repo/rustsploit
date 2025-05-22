@@ -185,7 +185,7 @@ No session state is saved — everything resets on restart.
 
 ## 💡 Want to Add a Module?
 
-See the full [Developer Guide](https://github.com/s-b-repo/r-routersploit/blob/main/docs/doc.md)  
+See the full [Developer Guide](https://github.com/s-b-repo/r-routersploit/blob/main/docs/readme.md)  
 Includes:
 - ✅ How to write modules
 - 🧠 Auto-dispatch system explained
