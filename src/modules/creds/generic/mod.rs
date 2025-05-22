@@ -8,3 +8,4 @@
     pub mod rdp_bruteforce;
     pub mod enablebruteforce;
     pub mod smtp_bruteforce;
+    pub mod pop3_bruteforce;
