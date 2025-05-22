@@ -2,10 +2,10 @@
 
 A Rust-based modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
 
-![Screenshot](https://github.com/s-b-repo/r-routersploit/raw/main/lat.png)
+![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/lat.png)
 
 📚 **Developer Documentation**:  
-→ [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/r-routersploit/blob/main/docs/doc.md)
+→ [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/rustsploit/blob/main/docs/doc.md)
 
 ---
 ### Goals & To Do lists
@@ -78,8 +78,8 @@ for rdp bruteforce modudle
 ### 📦 Clone the Repository
 
 ```
-git clone https://github.com/s-b-repo/r-routersploit.git
-cd r-routersploit
+git clone https://github.com/s-b-repo/rustsploit.git
+cd rustsploit
 ```
 
 ### 🛠️ Build the Project
@@ -185,7 +185,7 @@ No session state is saved — everything resets on restart.
 
 ## 💡 Want to Add a Module?
 
-See the full [Developer Guide](https://github.com/s-b-repo/r-routersploit/blob/main/docs/readme.md)  
+See the full [Developer Guide](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)  
 Includes:
 - ✅ How to write modules
 - 🧠 Auto-dispatch system explained
