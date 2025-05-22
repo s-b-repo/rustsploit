@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, Write, BufWriter},
     net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tokio::{
     net::{TcpStream, UdpSocket},
@@ -11,7 +11,7 @@ use tokio::{
     time::{timeout, Duration},
 };
 
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct ScanSettings {
     pub concurrency: usize,
     pub timeout_secs: u64,
@@ -21,8 +21,7 @@ pub struct ScanSettings {
     pub output_file: String,
 }
 
-#[allow(dead_code)]
-/// Prompt user for scan configuration
+/// Interactive config prompt
 pub fn prompt_settings() -> Result<ScanSettings> {
     Ok(ScanSettings {
         concurrency: prompt_usize("Concurrency: ")?,
@@ -34,8 +33,7 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     })
 }
 
-#[allow(dead_code)]
-/// Interactive entry point
+/// Main entrypoint for interactive CLI mode
 pub async fn run_interactive(target: &str) -> Result<()> {
     let settings = prompt_settings()?;
     run_with_settings(
@@ -50,13 +48,11 @@ pub async fn run_interactive(target: &str) -> Result<()> {
     .await
 }
 
-/// Dispatch-compatible wrapper
-#[allow(dead_code)]
 pub async fn run(target: &str) -> Result<()> {
     run_interactive(target).await
 }
 
-/// Renamed internal function to avoid clash
+/// === Core Scanner Logic ===
 pub async fn run_with_settings(
     target: &str,
     concurrency: usize,
@@ -66,63 +62,77 @@ pub async fn run_with_settings(
     scan_udp_enabled: bool,
     output_file: &str,
 ) -> Result<()> {
-    let target = normalize_target(target)?;
+    // Resolve domain or IP
+    let (resolved_ip_str, resolved_ip) = resolve_target(target)?;
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    let file = Arc::new(Mutex::new(BufWriter::new(File::create(output_file)?)));
     let mut tasks = vec![];
-    let mut file = File::create(output_file)?;
-    writeln!(file, "Scan Results for {}\n", target)?;
 
+    println!("[*] Starting scan for target: {} (resolved: {})", target, resolved_ip_str);
+    writeln!(file.lock().unwrap(), "Scan Results for {} ({})\n", target, resolved_ip_str)?;
+
+    let progress_bar = Arc::new(Mutex::new(ProgressBar::new(65535 * (1 + scan_udp_enabled as usize))));
+
+    // TCP Scan loop
     println!("[*] Starting TCP scan...");
-    for port in 1..=65535 {
+    for port in 1..=65535u16 {
         let permit = semaphore.clone().acquire_owned().await?;
-        let target = target.clone();
-        let mut file = file.try_clone()?;
+        let file = file.clone();
+        let progress_bar = progress_bar.clone();
+        let ip = resolved_ip;
+        let ip_str = resolved_ip_str.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            if let Some((status, banner)) = scan_tcp(&target, port, timeout_secs).await {
-                let line = format!("[TCP] {}:{} => {}", target, port, status);
+            if let Some((status, banner)) = scan_tcp(&ip, port, timeout_secs).await {
+                let line = format!("[TCP] {}:{} => {}", ip_str, port, status);
                 if status == "OPEN" || !show_only_open {
                     if !banner.is_empty() {
-                        writeln!(file, "{} | Banner: {}", line, banner).ok();
+                        let _ = writeln!(file.lock().unwrap(), "{} | Banner: {}", line, banner);
                         if verbose {
                             println!("{} | Banner: {}", line, banner);
                         }
                     } else {
-                        writeln!(file, "{}", line).ok();
+                        let _ = writeln!(file.lock().unwrap(), "{}", line);
                         if verbose {
                             println!("{}", line);
                         }
                     }
                 }
             }
+            progress_bar.lock().unwrap().increment();
         });
         tasks.push(handle);
     }
 
+    // UDP Scan loop
     if scan_udp_enabled {
         println!("[*] Starting UDP scan...");
-        for port in 1..=65535 {
+        for port in 1..=65535u16 {
             let permit = semaphore.clone().acquire_owned().await?;
-            let target = target.clone();
-            let mut file = file.try_clone()?;
+            let file = file.clone();
+            let progress_bar = progress_bar.clone();
+            let ip = resolved_ip;
+            let ip_str = resolved_ip_str.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
-                if let Some(status) = scan_udp(&target, port, timeout_secs).await {
-                    let line = format!("[UDP] {}:{} => {}", target, port, status);
+                if let Some(status) = scan_udp(&ip, port, timeout_secs).await {
+                    let line = format!("[UDP] {}:{} => {}", ip_str, port, status);
                     if status == "OPEN" || !show_only_open {
-                        writeln!(file, "{}", line).ok();
+                        let _ = writeln!(file.lock().unwrap(), "{}", line);
                         if verbose {
                             println!("{}", line);
                         }
                     }
                 }
+                progress_bar.lock().unwrap().increment();
             });
             tasks.push(handle);
         }
     }
 
+    // Await all tasks
     for task in tasks {
         let _ = task.await;
     }
@@ -131,12 +141,13 @@ pub async fn run_with_settings(
     Ok(())
 }
 
-/// TCP connect scan + banner grab
-async fn scan_tcp(ip: &str, port: u16, timeout_secs: u64) -> Option<(String, String)> {
-    let addr = format!("{}:{}", ip, port);
-    match timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&addr)).await {
+/// === TCP Port Scanner (Banner Grab) ===
+async fn scan_tcp(ip: &std::net::IpAddr, port: u16, timeout_secs: u64) -> Option<(String, String)> {
+    let addr = SocketAddr::new(*ip, port);
+    match timeout(Duration::from_secs(timeout_secs), TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => {
-            let mut buf = [0; 1024];
+            let mut buf = [0u8; 1024];
+            // Try reading immediately if service gives banner (FTP, SMTP, HTTP, etc)
             match timeout(Duration::from_secs(2), stream.readable()).await {
                 Ok(Ok(())) => match stream.try_read(&mut buf) {
                     Ok(n) if n > 0 => {
@@ -153,52 +164,42 @@ async fn scan_tcp(ip: &str, port: u16, timeout_secs: u64) -> Option<(String, Str
     }
 }
 
-/// UDP scan (null packet, timeout-based)
-async fn scan_udp(ip: &str, port: u16, timeout_secs: u64) -> Option<String> {
-    let local = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-    let remote = format!("{}:{}", ip, port);
-    let remote = match normalize_addr(&remote) {
-        Ok(addr) => addr,
-        Err(_) => return None,
+/// === UDP Port Scanner (Stateless "Fire-and-Forget") ===
+async fn scan_udp(ip: &std::net::IpAddr, port: u16, timeout_secs: u64) -> Option<String> {
+    // We bind to a random UDP port on localhost
+    let bind_addr = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = match UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(_) => return Some("ERROR".into()),
     };
 
-    let socket = UdpSocket::bind(local).await.ok()?;
-    let _ = socket.send_to(b"\x00", &remote).await;
+    let target = SocketAddr::new(*ip, port);
+    let payload = b"\x00\x00\x10\x10"; // Random small packet
+    let _ = sock.send_to(payload, target).await;
+    // Set a timeout: if port is closed, we should get "Connection refused"
     let mut buf = [0u8; 512];
-
-    match timeout(Duration::from_secs(timeout_secs), socket.recv_from(&mut buf)).await {
-        Ok(Ok((_n, _))) => Some("OPEN".into()),
-        _ => None,
+    match timeout(Duration::from_secs(timeout_secs), sock.recv_from(&mut buf)).await {
+        Ok(Ok((_len, _src))) => Some("OPEN".into()),  // Got a response!
+        Ok(Err(_)) => Some("CLOSED".into()),         // ICMP port unreachable
+        Err(_) => Some("FILTERED".into()),           // No response
     }
 }
 
-/// Normalize IP/hostname for bracket handling and clean input
-fn normalize_target(input: &str) -> Result<String> {
-    let input = input.trim().trim_start_matches('[').trim_end_matches(']').trim();
-    if input.contains(':') && !input.contains('.') {
-        // Likely IPv6, re-add brackets
-        Ok(format!("[{}]", input))
-    } else {
-        Ok(input.to_string())
-    }
-}
-
-/// Normalize and parse into a real SocketAddr
-fn normalize_addr(input: &str) -> Result<SocketAddr> {
-    // Remove extra brackets first
+/// === Target Resolution ===
+fn resolve_target(input: &str) -> Result<(String, std::net::IpAddr)> {
     let cleaned = input.trim().trim_start_matches('[').trim_end_matches(']');
-    // If IPv6, wrap again properly
-    let formatted = if cleaned.contains(':') && !cleaned.contains('.') {
-        format!("[{}]", cleaned)
+    let addrs: Vec<_> = (cleaned, 0).to_socket_addrs()?.collect();
+    // Prefer IPv4, else fallback to first address
+    if let Some(addr) = addrs.iter().find(|a| a.is_ipv4()) {
+        Ok((addr.ip().to_string(), addr.ip()))
+    } else if let Some(addr) = addrs.first() {
+        Ok((addr.ip().to_string(), addr.ip()))
     } else {
-        cleaned.to_string()
-    };
-
-    let addrs = formatted.to_socket_addrs()?;
-    addrs.into_iter().next().ok_or_else(|| anyhow::anyhow!("Invalid address"))
+        Err(anyhow!("Could not resolve target '{}'", input))
+    }
 }
 
-/// Prompt for string input
+/// === Prompt Utilities ===
 fn prompt(message: &str) -> Result<String> {
     print!("{}", message);
     io::stdout().flush()?;
@@ -207,7 +208,6 @@ fn prompt(message: &str) -> Result<String> {
     Ok(buf.trim().to_string())
 }
 
-/// Prompt for boolean yes/no
 fn prompt_bool(message: &str) -> Result<bool> {
     loop {
         let input = prompt(message)?;
@@ -219,7 +219,6 @@ fn prompt_bool(message: &str) -> Result<bool> {
     }
 }
 
-/// Prompt for number input
 fn prompt_usize(message: &str) -> Result<usize> {
     loop {
         let input = prompt(message)?;
@@ -227,5 +226,22 @@ fn prompt_usize(message: &str) -> Result<usize> {
             return Ok(n);
         }
         println!("Please enter a valid number.");
+    }
+}
+
+/// === Progress Bar Struct ===
+struct ProgressBar {
+    total: usize,
+    current: usize,
+}
+impl ProgressBar {
+    fn new(total: usize) -> Self {
+        ProgressBar { total, current: 0 }
+    }
+    fn increment(&mut self) {
+        self.current += 1;
+        if self.current % 1000 == 0 || self.current == self.total {
+            println!("[*] Progress: {}/{}", self.current, self.total);
+        }
     }
 }
