@@ -14,6 +14,11 @@ Convert exploits and add modules
 
 # completed
 ```
+
+added refactored and fixed and improve alot of modules
+added added new version of payloadgen
+added smtp bruteforcer
+added pop3 bruteforcer
 added zte zte_zxv10_h201l_rce_authenticationbypass
 added ivanti ivanti_connect_secure_stack_based_buffer_overflow
 added apache_tomcat cve_2025_24813_apache_tomcat_rce
