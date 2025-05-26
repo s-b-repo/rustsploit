@@ -15,6 +15,8 @@ Convert exploits and add modules
 # completed
 ```
 
+added stalkroute a traceroute with firewall evasion requires root 
+added malware dropper narruto dropper
 added refactored and fixed and improve alot of modules
 added added new version of payloadgen
 added smtp bruteforcer
