@@ -23,6 +23,7 @@ anyhow = "1.0.97"
 #teminal color
 colored = "3.0.0"
 rustyline = "15.0.0"
+
 #ftp brute force module
 async_ftp = "6.0.0"
 tokio-socks = "0.5.2"
@@ -77,6 +78,9 @@ flate2 = "1.0.30"
 url = "2.5.4"
 semver = "1.0.26"
 
+#stalk route full traceroute
+pnet_packet = "0.34" # Or the latest compatible version
+socket2 = { version = "0.5", features = ["all"] } # Or the latest compatible version
 
 [build-dependencies]
 regex = "1.11.1"         # required for use in build.rs
