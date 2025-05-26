@@ -2,7 +2,7 @@
 
 A Rust-based modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
 
-![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/lat.png)
+![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
 📚 **Developer Documentation**:  
 → [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/rustsploit/blob/main/docs/doc.md)
