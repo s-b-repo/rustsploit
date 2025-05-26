@@ -5,7 +5,7 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
 📚 **Developer Documentation**:  
-→ [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/rustsploit/blob/main/docs/doc.md)
+→ [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
 
 ---
 ### Goals & To Do lists
