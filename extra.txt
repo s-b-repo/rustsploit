@@ -62,12 +62,18 @@ Here is the original module that needs to be refactored:
 
 
 
+gemini
 
+You are a senior Rust developer specializing in cross-platform, asynchronous hardware drivers. Your assignment is to develop a complete, production-grade Lovense device driver for Linux, written in Rust, using only information from official Lovense documentation and protocol references.
 
+Strict Requirements:
 
-Would you like a Dynamic/Auto-Scaler version too? 🚀
-(Example: start at 500 concurrency, grow to 5000 if CPU/RAM is good.)
+    The code must be 100% pure Rust, fully compatible with Linux operating systems.
 
-Want me to show it too? 🔥
-You said:
-yes Dynamic/Auto-Scaler  show function to add
+    The entire driver must use asynchronous Rust throughout (async/await and appropriate crates), enabling non-blocking, concurrent communication with multiple devices.
+
+    Do not include any comments, explanations, docstrings, sample usage, placeholder code, TODOs, or example outputs. The output must be only the actual source code required for a complete and functional driver.
+
+    The output must be a single, fully compilable Rust source file, containing all necessary use statements, async functions, modules, structs, enums, and logic to support end-to-end operation.
+
+ 
