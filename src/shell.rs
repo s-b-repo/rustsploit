@@ -1,7 +1,7 @@
 use crate::commands;
 use crate::utils;
 use anyhow::Result;
-use rand::prelude::*;  // Updated for rand 0.10
+use rand::prelude::*; // rand 0.9 prelude provides rng() and SliceRandom
 use std::env;
 use std::io::{self, Write};
 use std::collections::HashSet;
@@ -188,20 +188,17 @@ pub async fn interactive_shell() -> Result<()> {
 
 /// Picks a random proxy from `proxy_list` that is NOT in `tried_proxies`.
 fn pick_random_untried_proxy(proxy_list: &[String], tried_proxies: &HashSet<String>) -> String {
-    let untried: Vec<&String> = proxy_list.iter()
+    let mut rng = rand::rng();
+    let choices: Vec<&String> = proxy_list
+        .iter()
         .filter(|p| !tried_proxies.contains(*p))
         .collect();
 
-    if untried.is_empty() {
-        // Fall back if somehow there's nothing untried
-        let mut rng = rand::rng();
-        let idx = rng.random_range(0..proxy_list.len());
-        return proxy_list[idx].clone();
+    if let Some(choice) = choices.choose(&mut rng) {
+        choice.to_string()
+    } else {
+        proxy_list.choose(&mut rng).unwrap().to_string()
     }
-
-    let mut rng = rand::rng();
-    let idx = rng.random_range(0..untried.len());
-    untried[idx].clone()
 }
 
 /// Sets ALL_PROXY so reqwest uses it for all requests (including socks4, socks5, http, https)
