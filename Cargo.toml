@@ -83,6 +83,9 @@ semver = "1.0.26"
 pnet_packet = "0.34" # Or the latest compatible version
 socket2 = { version = "0.5", features = ["all"] } # Or the latest compatible version
 
+#pingsweep
+which = "8.0.0"
+
 [build-dependencies]
 regex = "1.11.1"         # required for use in build.rs
 
