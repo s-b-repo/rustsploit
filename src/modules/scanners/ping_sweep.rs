@@ -2,14 +2,19 @@ use anyhow::{Result, Context};
 use ipnet::IpNet;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::io::{self, Write};
 use tokio::{process::Command, sync::Semaphore, time::{timeout, Duration}};
 
 pub async fn run(target: &str) -> Result<()> {
     run_interactive(target).await
 }
 
-pub async fn run_interactive(target: &str) -> Result<()> {
-    let net: IpNet = target.parse().context("Use CIDR notation like 192.168.1.0/24")?;
+pub async fn run_interactive(_target: &str) -> Result<()> {
+    print!("Enter CIDR range to sweep: ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let net: IpNet = input.trim().parse().context("Use CIDR notation like 192.168.1.0/24")?;
     let hosts: Vec<IpAddr> = net.hosts().collect();
     let semaphore = Arc::new(Semaphore::new(50));
     let mut tasks = Vec::new();

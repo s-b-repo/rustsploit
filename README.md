@@ -48,12 +48,14 @@ rework command system to automaticly detect new modules
 added uniview_nvr_pwd_disclosure  
 added ssdp_msearch  
 added hearbleed  info leak from server saved to a bin file
-added port scanner  
+added port scanner
 added ping_sweep network scanner
 added http_title_scanner
-added find command  
-updated docs  
-created docs  
+added log4j_scanner
+added heartbleed_scanner
+added find command
+updated docs
+created docs
 added wordlist for camera paths  
 added acti camera module  
 created bat payload generator for malware  
