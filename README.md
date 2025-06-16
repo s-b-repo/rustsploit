@@ -49,6 +49,8 @@ added uniview_nvr_pwd_disclosure
 added ssdp_msearch  
 added hearbleed  info leak from server saved to a bin file
 added port scanner  
+added ping_sweep network scanner
+added http_title_scanner
 added find command  
 updated docs  
 created docs  

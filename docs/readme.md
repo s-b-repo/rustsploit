@@ -163,7 +163,7 @@ Then:
 ```
 rsf> help
 rsf> modules
-rsf> use scanners/port_scanner
+rsf> use scanners/ping_sweep
 rsf> set target 192.168.0.1
 rsf> run
 ```
