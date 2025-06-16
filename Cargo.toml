@@ -75,6 +75,9 @@ aes = "0.8.3"
 cipher = "0.4.4"
 flate2 = "1.0.30"
 
+# for Roundcube exploit payload encoding
+data-encoding = "2.5.0"
+
 #avanti
 url = "2.5.4"
 semver = "1.0.26"
