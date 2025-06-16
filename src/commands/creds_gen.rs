@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("cred_dispatch.rs");
+    // Keep dispatch file naming consistent with build.rs
+    let dest_path = Path::new(&out_dir).join("creds_dispatch.rs");
     let mut file = File::create(&dest_path).unwrap();
 
     let creds_root = Path::new("src/modules/creds");
