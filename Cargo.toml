@@ -51,6 +51,7 @@ rdp = "0.12.8"
 
 # ssdp moudle scanner
 regex = "1.11.1"
+ipnet = "2.11.0"
 
 #camera uniview exploit
 quick-xml = "0.37.4"
