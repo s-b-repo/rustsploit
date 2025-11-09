@@ -4,7 +4,7 @@ A Rust-based modular exploitation framework inspired by RouterSploit. This tool 
 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
-📚 **Developer Documentation**:  
+ **Developer Documentation**:  
 → [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
 
 ---
@@ -64,27 +64,27 @@ added rtsp_bruteforce module
 dynamic modules listing and colored listing  
 ```
 
----
+
+
+##  Building & Running
+##  requirements 
 ```
-## 🚀 Building & Running
-## 📦🛠️  requirements 
-`
 sudo apt update
 sudo apt install freerdp2-x11  
-
+```
 for rdp bruteforce modudle
 
 
-```
-```
-### 📦 Clone the Repository
+
+
+###  Clone the Repository
 
 ```
 git clone https://github.com/s-b-repo/rustsploit.git
 cd rustsploit
 ```
 
-### 🛠️ Build the Project
+###  Build the Project
 
 ```
 cargo build
@@ -100,9 +100,9 @@ To install:
 cargo install
 ```
 
----
 
-### 🖥️ Run in Interactive Shell Mode
+
+###  Run in Interactive Shell Mode
 
 Launch the interactive RSF shell:
 
@@ -112,7 +112,7 @@ cargo run
 
 Once inside the shell:
 
-```text
+```
 rsf> help
 rsf> modules
 rsf> show_proxies
@@ -124,30 +124,30 @@ rsf> set target 192.168.1.1
 rsf> run
 ```
 
-🌀 Supports retrying proxies until one works (if proxy_on is enabled).
+Supports retrying proxies until one works (if proxy_on is enabled).
 
----
 
-### 🔧 Run in CLI Mode
+
+###  Run in CLI Mode
 
 #### ▶ Exploit
 ```
 cargo run -- --command exploit --module heartbleed --target 192.168.1.1
 ```
 
-#### 🧪 Scanner
+####  Scanner
 ```
 cargo run -- --command scanner --module port_scanner --target 192.168.1.1
 ```
 
-#### 🔐 Credentials
+####  Credentials
 ```
 cargo run -- --command creds --module ssh_brute --target 192.168.1.1
 ```
 
 ---
 
-## 🌐 Proxy Retry Logic (Shell Mode)
+##  Proxy Retry Logic (Shell Mode)
 
 - If proxies are loaded and `proxy_on` is active:
   - Random proxy is used from list
@@ -156,7 +156,7 @@ cargo run -- --command creds --module ssh_brute --target 192.168.1.1
 
 ---
 
-## 📂 Module System
+## Module System
 
 Modules are automatically detected using `build.rs` and registered as:
 - Short: `port_scanner`
@@ -174,7 +174,7 @@ pub async fn run_interactive(target: &str) -> Result<()>
 
 ---
 
-## 🧼 Shell State
+##  Shell State
 
 The shell keeps:
 - Current module
@@ -185,27 +185,25 @@ No session state is saved — everything resets on restart.
 
 ---
 
-## 💡 Want to Add a Module?
+##  Want to Add a Module?
 
 See the full [Developer Guide](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)  
 Includes:
-- ✅ How to write modules
-- 🧠 Auto-dispatch system explained
-- 📦 Module placement
-- 🌐 Proxy logic details
-- 🔍 Scanner vs Exploit vs Credential paths
+- How to write modules
+- Auto-dispatch system explained
+- Module placement
+- Proxy logic details
+- Scanner vs Exploit vs Credential paths
 
 ---
 
-## 👥 Contributors
+##  Contributors
 
 - **Main Developer**: me.
 - **Language**: 100% Rust.
 - **Inspired by**: RouterSploit, Metasploit, pwntools
 
-## 👥 Credits
+## Credits
 
 - **wordlists*: seclists & me
 
-
----
