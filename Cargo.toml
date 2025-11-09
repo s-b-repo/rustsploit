@@ -1,6 +1,6 @@
 [package]
 name = "rustsploit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 build = "build.rs"
 
@@ -31,7 +31,7 @@ rustls = "0.23.26"
 webpki-roots = "0.26.8"
 suppaftp   = { version = "6.2.0", features = ["async", "async-native-tls","native-tls"] }
 native-tls = "0.2.14"
-sysinfo = { version = "0.34.2", features = ["multithread"] }
+sysinfo = { version = "0.37.2", features = ["multithread"] }
 
 #telnet
 threadpool = "1.8.1"
@@ -51,6 +51,7 @@ rdp = "0.12.8"
 
 # ssdp moudle scanner
 regex = "1.11.1"
+ipnet = "2.11.0"
 
 #camera uniview exploit
 quick-xml = "0.37.4"
@@ -74,6 +75,9 @@ aes = "0.8.3"
 cipher = "0.4.4"
 flate2 = "1.0.30"
 
+# for Roundcube exploit payload encoding
+data-encoding = "2.5.0"
+
 #avanti
 url = "2.5.4"
 semver = "1.0.26"
@@ -81,6 +85,9 @@ semver = "1.0.26"
 #stalk route full traceroute
 pnet_packet = "0.34" # Or the latest compatible version
 socket2 = { version = "0.5", features = ["all"] } # Or the latest compatible version
+
+#pingsweep
+which = "8.0.0"
 
 [build-dependencies]
 regex = "1.11.1"         # required for use in build.rs
