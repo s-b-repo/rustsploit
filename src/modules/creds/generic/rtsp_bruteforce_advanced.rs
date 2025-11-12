@@ -64,12 +64,16 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
-    let paths = if brute_force_paths {
+    let mut paths = if brute_force_paths {
         let paths_file = prompt_required("Path to RTSP paths file")?;
         load_lines(&paths_file)?
     } else {
         vec!["".to_string()]
     };
+    if paths.is_empty() {
+        println!("[!] RTSP paths list is empty. Falling back to default root path.");
+        paths.push(String::new());
+    }
 
     let addr = format!("{}:{}", target, port);
     let found = Arc::new(Mutex::new(Vec::new()));
@@ -78,10 +82,20 @@ pub async fn run(target: &str) -> Result<()> {
     println!("\n[*] Starting brute-force on {}", addr);
 
     let users = load_lines(&usernames_file)?;
-    let pass_lines: Vec<_> = BufReader::new(File::open(&passwords_file)?)
+    if users.is_empty() {
+        println!("[!] Username wordlist is empty or invalid. Exiting.");
+        return Ok(());
+    }
+
+    let pass_lines: Vec<String> = BufReader::new(File::open(&passwords_file)?)
         .lines()
-        .filter_map(Result::ok)
+        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
+        .filter(|line| !line.is_empty())
         .collect();
+    if pass_lines.is_empty() {
+        println!("[!] Password wordlist is empty or invalid. Exiting.");
+        return Ok(());
+    }
 
     let mut idx = 0;
     for pass in pass_lines {

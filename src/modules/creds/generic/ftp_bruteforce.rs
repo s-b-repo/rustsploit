@@ -107,16 +107,16 @@ pub async fn run(target: &str) -> Result<()> {
     println!("\n[*] Starting brute-force on {}", addr);
 
     let users = load_lines(&usernames_file)?;
-    let passes = load_lines(&passwords_file)?;
-
-    if !combo_mode && users.is_empty() && !passes.is_empty() {
-        return Err(anyhow!(
-            "Username wordlist ('{}') is empty, but password wordlist ('{}') is not. \
-            Cannot proceed in line-by-line (non-combo) mode as it requires usernames to pair with passwords.",
-            usernames_file, passwords_file
-        ));
+    if users.is_empty() {
+        println!("[!] Username wordlist is empty or invalid. Exiting.");
+        return Ok(());
     }
-    // (Optional: notifications for empty lists can remain here)
+
+    let passes = load_lines(&passwords_file)?;
+    if passes.is_empty() {
+        println!("[!] Password wordlist is empty or invalid. Exiting.");
+        return Ok(());
+    }
 
     let mut tasks = FuturesUnordered::new();
 
@@ -377,7 +377,11 @@ fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
 fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let file = File::open(path.as_ref()).map_err(|e| anyhow!("Failed to open file '{}': {}", path.as_ref().display(), e))?;
     let reader = BufReader::new(file);
-    Ok(reader.lines().filter_map(Result::ok).collect())
+    Ok(reader
+        .lines()
+        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
+        .filter(|line| !line.is_empty())
+        .collect())
 }
 
 fn log(verbose: bool, msg: &str) {

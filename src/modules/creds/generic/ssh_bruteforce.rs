@@ -55,10 +55,24 @@ pub async fn run(target: &str) -> Result<()> {
 
     println!("\n[*] Starting brute-force on {}", connect_addr);
 
-    let users = Arc::new(load_lines(&usernames_file)?);
+    let user_list = load_lines(&usernames_file)?;
+    if user_list.is_empty() {
+        println!("[!] Username wordlist is empty or invalid. Exiting.");
+        return Ok(());
+    }
+    let users = Arc::new(user_list);
+
     let pass_file = File::open(&passwords_file)?;
     let pass_buf = BufReader::new(pass_file);
-    let pass_lines: Vec<_> = pass_buf.lines().filter_map(Result::ok).collect();
+    let pass_lines: Vec<String> = pass_buf
+        .lines()
+        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if pass_lines.is_empty() {
+        println!("[!] Password wordlist is empty or invalid. Exiting.");
+        return Ok(());
+    }
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::new();
