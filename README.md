@@ -1,209 +1,202 @@
 # Rustsploit 🛠️
 
-A Rust-based modular exploitation framework inspired by RouterSploit. This tool allows for running modules such as exploits, scanners, and credential checkers against embedded devices like routers.
+Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
- **Developer Documentation**:  
-→ [Full Dev Guide (modules, proxy logic, shell flow, dispatch system)](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
+-  **Developer Docs:** [Full guide covering module lifecycle, proxy logic, shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
+-  **Interactive Shell:** Ergonomic command palette with shortcuts (e.g., `f1 ssh`, `u exploits/heartbleed`, `go`)
+-  **Proxy Smartness:** Supports HTTP(S), SOCKS4/4a/5 (with hostname resolution), validation, and automatic rotation
+-  **IPv4/IPv6 Ready:** Credential modules and sockets normalize targets so both address families work out-of-the-box
 
 ---
-### Goals & To Do lists
 
-Convert exploits and add modules
+## Table of Contents
 
-# completed
-```
+1. [Highlights](#highlights)
+2. [Module Catalog](#module-catalog)
+3. [Quick Start](#quick-start)
+4. [Interactive Shell Walkthrough](#interactive-shell-walkthrough)
+5. [CLI Usage](#cli-usage)
+6. [Proxy Workflow](#proxy-workflow)
+7. [How Modules Are Discovered](#how-modules-are-discovered)
+8. [Contributing](#contributing)
+9. [Credits](#credits)
 
-added stalkroute a traceroute with firewall evasion requires root 
-added malware dropper narruto dropper
-added refactored and fixed and improve alot of modules
-added added new version of payloadgen
-added smtp bruteforcer
-added pop3 bruteforcer
-added zte zte_zxv10_h201l_rce_authenticationbypass
-added ivanti ivanti_connect_secure_stack_based_buffer_overflow
-added apache_tomcat cve_2025_24813_apache_tomcat_rce
-added apache_tomcat catkiller_cve_2025_31650
-added palto_alto CVE-2025-0108. auth bypass
-added acm_5611_rce
-added zabbix_7_0_0_sql_injection
-added cve_2024_7029_avtech_camera
-added pachev_ftp_path_traversal_1_0
-added ipv6 support for rstp rdp and ssh cant find any ipv6 address i cant test on so untested
-added ftps support
-added ipv6 support to ftp anon and brute
-added rdp ipv6 support unable to find rpd ipv6 device to test on with shodan
-added exploit openssh server race condition 9.8.p1 |Server Destruction fork |
-bomb Persistence create SSH user | Remote Root Shell
+---
 
-added spotube exploit zero day exploit as of 24 april reported to spotube
-added exploit tplink_wr740n Buffer Overflow 'DOS'
-added exploit tp_link_vn020  Denial Of Service (DOS) 
-added exploit abussecurity_camera_cve 2023 26609 variant2 RCE and SSH Root Access adds persistant account
-added exploit abussecurity_camera_cve 2023 26609 variant1 LFI, RCE and SSH Root Access
-added exploit uniview_nvr_pwd_disclosure password disclore 
-updated docs again and readme
-rework command system to automaticly detect new modules
-added uniview_nvr_pwd_disclosure  
-added ssdp_msearch  
-added hearbleed  info leak from server saved to a bin file
-added port scanner  
-added find command  
-updated docs  
-created docs  
-added wordlist for camera paths  
-added acti camera module  
-created bat payload generator for malware  
-added proxy support https/http socks4/socks5  
-telnet brute forcing module  
-ssh brute forcing module  
-ftp anonymous login module  
-ftp brute forcing module  
-added rtsp_bruteforce module  
-dynamic modules listing and colored listing  
-```
+## Highlights
 
+- ✅ **Auto-discovered modules:** `build.rs` indexes `src/modules/**` so new code drops in without manual registration
+- ✅ **Interactive shell with color and shortcuts:** Quick command palette, target/module state tracking, alias commands (`help/?`, `modules/m`, `run/go`, etc.)
+- ✅ **Ergonomic proxy system:** Load lists, validate availability, choose concurrency/timeouts, and rotate automatically on failure
+- ✅ **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP brute force modules with IPv6 and TLS support where applicable
+- ✅ **Exploit coverage:** Apache Tomcat, Abus security cameras, Ivanti Connect Secure, TP-Link, Zabbix, Avtech cameras, Spotube, OpenSSH race condition, and more
+- ✅ **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, StalkRoute traceroute (root), sample modules for extension
+- ✅ **Payload generation:** Batch malware dropper (`narutto_dropper`), BAT payload generator, custom credential checkers
+- ✅ **Readable output:** Colored prompts, structured status messages, optional verbose logs and result persistence
 
+---
 
-##  Building & Running
-##  requirements 
+## Module Catalog
+
+Rustsploit ships categorized modules under `src/modules/`, automatically exposed to the shell/CLI. A non-exhaustive snapshot:
+
+| Category | Highlights |
+|----------|------------|
+| `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, Telnet brute force, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), RDP auth-only brute |
+| `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE |
+| `scanners` | Port scanner, ping sweep, SSDP M-SEARCH enumerator, HTTP title fetcher, StalkRoute traceroute (firewall evasion) |
+| `payloadgens` | `narutto_dropper`, BAT payload generator |
+| `lists` | RTSP wordlists and helper files |
+
+Run `modules` or `find <keyword>` in the shell for the authoritative list.
+
+---
+
+## Quick Start
+
+### Requirements
+
 ```
 sudo apt update
-sudo apt install freerdp2-x11  
+sudo apt install freerdp2-x11    # Required for the RDP brute force module
 ```
-for rdp bruteforce modudle
 
+Ensure Rust and Cargo are installed (https://www.rust-lang.org/tools/install).
 
-
-
-###  Clone the Repository
+### Clone + Build
 
 ```
 git clone https://github.com/s-b-repo/rustsploit.git
 cd rustsploit
-```
-
-###  Build the Project
-
-```
 cargo build
 ```
 
-To build and run:
-```
-cargo run
-```
-
-To install:
-```
-cargo install
-```
-
-
-
-###  Run in Interactive Shell Mode
-
-Launch the interactive RSF shell:
+### Run (Interactive Shell)
 
 ```
 cargo run
 ```
 
-Once inside the shell:
+### Install (optional)
 
 ```
-rsf> help
-rsf> modules
-rsf> show_proxies
-rsf> proxy_on / proxy_off
-rsf> proxy_load proxies.txt
-rsf> find
-rsf> use exploits/heartbleed
-rsf> set target 192.168.1.1
-rsf> run
+cargo install --path .
 ```
 
-Supports retrying proxies until one works (if proxy_on is enabled).
+---
 
+## Interactive Shell Walkthrough
 
+The shell tracks current module, target, and proxy state. All commands are case-insensitive and support aliases:
 
-###  Run in CLI Mode
-
-#### ▶ Exploit
 ```
+RustSploit Command Palette
+Command          Shortcuts                Description
+--------------- ------------------------- ------------------------------
+help             help | h | ?             Show this screen
+modules          modules | ls | m         List discovered modules
+find             find <kw> | f1 <kw>      Search modules by keyword
+use              use <path> | u <path>    Select module (ex: u exploits/heartbleed)
+set target       set target <value>       Set current target (IPv4/IPv6/hostname)
+run              run | go                 Execute current module (honors proxy mode)
+proxy_load       proxy_load [file] | pl   Load proxies from file (HTTP/HTTPS/SOCKS)
+proxy_on/off     proxy_on | pon / ...     Toggle proxy usage
+proxy_test       proxy_test | ptest       Validate proxies (URL, timeout, concurrency)
+show_proxies     show_proxies | proxies   View proxy status
+exit             exit | quit | q          Leave shell
+```
+
+Example session:
+
+```
+rsf> f1 ssh
+rsf> u creds/generic/ssh_bruteforce
+rsf> set target 10.10.10.10
+rsf> pl data/proxies.txt    # prompts if omitted
+rsf> pon
+rsf> proxy_test             # optional validation / filtering
+rsf> go
+```
+
+If proxy mode is enabled, Rustsploit rotates through validated proxies, falls back to direct mode only after exhaustion, and politely reports successes or errors.
+
+---
+
+## CLI Usage
+
+Modules can be executed without the shell using the `--command`, `--module`, and `--target` flags:
+
+```
+# Exploit
 cargo run -- --command exploit --module heartbleed --target 192.168.1.1
-```
 
-####  Scanner
-```
+# Scanner
 cargo run -- --command scanner --module port_scanner --target 192.168.1.1
+
+# Credentials
+cargo run -- --command creds --module ssh_bruteforce --target 192.168.1.1
 ```
 
-####  Credentials
-```
-cargo run -- --command creds --module ssh_brute --target 192.168.1.1
-```
+Any module exposed to the shell can be called here. Use the `modules` shell command or browse `src/modules/**` for canonical names.
 
 ---
 
-##  Proxy Retry Logic (Shell Mode)
+## Proxy Workflow
 
-- If proxies are loaded and `proxy_on` is active:
-  - Random proxy is used from list
-  - On failure, tries another until successful
-  - If all fail, it runs once **without proxy**
+Rustsploit treats proxy lists as first-class citizens:
 
----
+- Accepts HTTP, HTTPS, SOCKS4, SOCKS4a, SOCKS5, and SOCKS5h entries
+- Loads from user-supplied files, skipping invalid lines with reasons
+- Optional connectivity test prompts allow tuning:
+  - Test URL (default `https://example.com`)
+  - Timeout (seconds)
+  - Max concurrent checks
+- Keeps only working proxies when validation is requested
+- Rotates at run time; if all proxies fail, reverts to direct host attempts automatically
 
-## Module System
-
-Modules are automatically detected using `build.rs` and registered as:
-- Short: `port_scanner`
-- Full: `scanners/port_scanner`
-
-Each module must define:
-```
-pub async fn run(target: &str) -> Result<()>
-```
-
-Optional:
-```
-pub async fn run_interactive(target: &str) -> Result<()>
-```
+Environment variables (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`) are managed transparently per attempt.
 
 ---
 
-##  Shell State
+## How Modules Are Discovered
 
-The shell keeps:
-- Current module
-- Current target
-- Proxy list + state
+Rustsploit scans `src/modules/` recursively during build. Each module should expose:
 
-No session state is saved — everything resets on restart.
+```
+pub async fn run(target: &str) -> anyhow::Result<()>;
+```
 
----
+Optional interactive entry points (`run_interactive`) can coexist. Module paths are referenced relative to `src/modules/`, for example:
 
-##  Want to Add a Module?
+- File: `src/modules/exploits/sample_exploit.rs`
+- Shell path: `exploits/sample_exploit`
 
-See the full [Developer Guide](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)  
-Includes:
-- How to write modules
-- Auto-dispatch system explained
-- Module placement
-- Proxy logic details
-- Scanner vs Exploit vs Credential paths
+See the [Developer Guide](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md) for scaffolding templates, async guidance, and tips on logging/persistence.
 
 ---
 
-##  Contributors
+## Contributing
 
-- **Main Developer**: me.
-- **Language**: 100% Rust.
-- **Inspired by**: RouterSploit, Metasploit, pwntools
+Contributions are welcome! High-level suggestions:
+
+1. Fork + branch from `main`
+2. Add your module under the appropriate category
+3. Keep outputs concise, leverage `.yellow()/.green()` for status, and wrap heavy loops in async tasks when appropriate
+4. Document usage patterns in module comments
+5. Run `cargo fmt` and `cargo check` before opening a PR
+
+Bug reports, feature requests, and module ideas are appreciated. Feel free to log issues or reach out with PoCs.
+
+---
 
 ## Credits
 
-- **wordlists*: seclists & me
+- **Project Lead:** s-b-repo
+- **Language:** 100% Rust
+- **Wordlists:** Seclists + custom additions (`lists/` directory)
+- **Inspired by:** RouterSploit, Metasploit Framework, pwntools
+
+> ⚠️ Rustsploit is intended for authorized security testing and research purposes only. Obtain explicit permission before targeting any system you do not own.
 
