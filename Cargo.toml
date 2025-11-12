@@ -2,10 +2,6 @@
 name = "rustsploit"
 version = "0.2.0"
 edition = "2021"
-build = "build.rs"[package]
-name = "rustsploit"
-version = "0.2.0"
-edition = "2021"
 build = "build.rs"
 
 [dependencies]
@@ -102,100 +98,6 @@ serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.10", features = ["v4"] }
 sha2 = "0.10"
 hex = "0.4"
-
-[build-dependencies]
-regex = "1.11.1"         # required for use in build.rs
-
-[[bin]]
-name = "rustsploit"
-path = "src/main.rs"
-
-
-
-[dependencies]
-# For HTTP requests
-reqwest = { version = "0.12.15", features = ["json", "cookies", "socks"] }
-
-#proxy manager
-rand = "0.9.0"
-
-# For CLI parsing
-clap = { version = "4.5.35", features = ["derive"] }
-
-# Async runtime for networking
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "process","rt","fs", "io-std"] }
-
-# Easier error handling
-anyhow = "1.0.97"
-
-#teminal color
-colored = "3.0.0"
-rustyline = "15.0.0"
-
-#ftp brute force module
-async_ftp = "6.0.0"
-tokio-socks = "0.5.2"
-rustls = "0.23.26"
-webpki-roots = "0.26.8"
-suppaftp   = { version = "6.2.0", features = ["async", "async-native-tls","native-tls"] }
-native-tls = "0.2.14"
-sysinfo = { version = "0.37.2", features = ["multithread"] }
-
-#telnet
-threadpool = "1.8.1"
-crossbeam-channel = "0.5.15"
-telnet = "0.2.3"
-
-walkdir = "2.5.0"
-
-#ssh
-ssh2 = "0.9.5"
-
-# rstp brute forcing
-base64 = "0.22.1"
-
-# RDP brute forcing module
-rdp = "0.12.8"
-
-# ssdp moudle scanner
-regex = "1.11.1"
-ipnet = "2.11.0"
-
-#camera uniview exploit
-quick-xml = "0.37.4"
-
-#ABUS TVIP Dropbear
-md5 = "0.7.0"
-ftp = "3.0.1"
-
-#ssh rce race condition
-libc = "0.2.172"
-futures = "0.3.31"
-
-#spotube exploit
-serde_json = "1.0.140"
-futures-util = "0.3.31"
-tokio-tungstenite = "0.26.2"
-
-#zte rce
-# Add these to [dependencies]
-aes = "0.8.3"
-cipher = "0.4.4"
-flate2 = "1.0.30"
-
-# for Roundcube exploit payload encoding
-data-encoding = "2.5.0"
-
-#avanti
-url = "2.5.4"
-semver = "1.0.26"
-
-#stalk route full traceroute
-pnet_packet = "0.34" # Or the latest compatible version
-socket2 = { version = "0.5", features = ["all"] } # Or the latest compatible version
-
-#pingsweep
-which = "8.0.0"
 
 [build-dependencies]
 regex = "1.11.1"         # required for use in build.rs
