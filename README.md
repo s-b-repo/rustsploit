@@ -4,10 +4,10 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
--  **Developer Docs:** [Full guide covering module lifecycle, proxy logic, shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
--  **Interactive Shell:** Ergonomic command palette with shortcuts (e.g., `f1 ssh`, `u exploits/heartbleed`, `go`)
--  **Proxy Smartness:** Supports HTTP(S), SOCKS4/4a/5 (with hostname resolution), validation, and automatic rotation
--  **IPv4/IPv6 Ready:** Credential modules and sockets normalize targets so both address families work out-of-the-box
+- 📚 **Developer Docs:** [Full guide covering module lifecycle, proxy logic, shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
+- 💬 **Interactive Shell:** Ergonomic command palette with shortcuts (e.g., `f1 ssh`, `u exploits/heartbleed`, `go`)
+- 🌐 **Proxy Smartness:** Supports HTTP(S), SOCKS4/4a/5 (with hostname resolution), validation, and automatic rotation
+- 🧱 **IPv4/IPv6 Ready:** Credential modules and sockets normalize targets so both address families work out-of-the-box
 
 ---
 
@@ -18,10 +18,11 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 3. [Quick Start](#quick-start)
 4. [Interactive Shell Walkthrough](#interactive-shell-walkthrough)
 5. [CLI Usage](#cli-usage)
-6. [Proxy Workflow](#proxy-workflow)
-7. [How Modules Are Discovered](#how-modules-are-discovered)
-8. [Contributing](#contributing)
-9. [Credits](#credits)
+6. [API Server Mode](#api-server-mode)
+7. [Proxy Workflow](#proxy-workflow)
+8. [How Modules Are Discovered](#how-modules-are-discovered)
+9. [Contributing](#contributing)
+10. [Credits](#credits)
 
 ---
 
@@ -35,6 +36,7 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 - ✅ **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, StalkRoute traceroute (root), sample modules for extension
 - ✅ **Payload generation:** Batch malware dropper (`narutto_dropper`), BAT payload generator, custom credential checkers
 - ✅ **Readable output:** Colored prompts, structured status messages, optional verbose logs and result persistence
+- ✅ **REST API Server:** Launch a secure API server with authentication, rate limiting, IP tracking, and dynamic key rotation
 
 ---
 
@@ -58,7 +60,7 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
 
 ### Requirements
 
-```
+```bash
 sudo apt update
 sudo apt install freerdp2-x11    # Required for the RDP brute force module
 ```
@@ -67,7 +69,7 @@ Ensure Rust and Cargo are installed (https://www.rust-lang.org/tools/install).
 
 ### Clone + Build
 
-```
+```bash
 git clone https://github.com/s-b-repo/rustsploit.git
 cd rustsploit
 cargo build
@@ -75,13 +77,13 @@ cargo build
 
 ### Run (Interactive Shell)
 
-```
+```bash
 cargo run
 ```
 
 ### Install (optional)
 
-```
+```bash
 cargo install --path .
 ```
 
@@ -91,7 +93,7 @@ cargo install --path .
 
 The shell tracks current module, target, and proxy state. All commands are case-insensitive and support aliases:
 
-```
+```text
 RustSploit Command Palette
 Command          Shortcuts                Description
 --------------- ------------------------- ------------------------------
@@ -110,7 +112,7 @@ exit             exit | quit | q          Leave shell
 
 Example session:
 
-```
+```text
 rsf> f1 ssh
 rsf> u creds/generic/ssh_bruteforce
 rsf> set target 10.10.10.10
@@ -128,7 +130,7 @@ If proxy mode is enabled, Rustsploit rotates through validated proxies, falls ba
 
 Modules can be executed without the shell using the `--command`, `--module`, and `--target` flags:
 
-```
+```bash
 # Exploit
 cargo run -- --command exploit --module heartbleed --target 192.168.1.1
 
@@ -140,6 +142,146 @@ cargo run -- --command creds --module ssh_bruteforce --target 192.168.1.1
 ```
 
 Any module exposed to the shell can be called here. Use the `modules` shell command or browse `src/modules/**` for canonical names.
+
+---
+
+## API Server Mode
+
+Rustsploit includes a REST API server mode that allows remote control of the tool via HTTP endpoints. The API includes authentication, rate limiting, IP tracking, and security hardening features.
+
+### Starting the API Server
+
+```bash
+# Basic API server (defaults to 0.0.0.0:8080)
+cargo run -- --api --api-key your-secret-key-here
+
+# With hardening enabled (auto-rotate API key on suspicious activity)
+cargo run -- --api --api-key your-secret-key-here --harden
+
+# Custom interface and IP limit
+cargo run -- --api --api-key your-secret-key-here --harden --interface 127.0.0.1 --ip-limit 5
+
+# Custom port
+cargo run -- --api --api-key your-secret-key-here --interface 0.0.0.0:9000
+```
+
+### API Flags
+
+| Flag | Description | Required |
+|------|-------------|----------|
+| `--api` | Enable API server mode | Yes |
+| `--api-key <key>` | API key for authentication | Yes (when using `--api`) |
+| `--harden` | Enable hardening mode (auto-rotate key on suspicious activity) | No |
+| `--interface <addr>` | Network interface/IP to bind to (default: `0.0.0.0`) | No |
+| `--ip-limit <num>` | Maximum unique IPs before auto-rotation (default: 10, requires `--harden`) | No |
+
+### API Endpoints
+
+All endpoints except `/health` require authentication via the `Authorization` header:
+
+```bash
+# Bearer token format
+Authorization: Bearer your-api-key-here
+
+# Or ApiKey format
+Authorization: ApiKey your-api-key-here
+```
+
+#### Public Endpoints
+
+- **`GET /health`** - Health check (no authentication required)
+  ```bash
+  curl http://localhost:8080/health
+  ```
+
+#### Protected Endpoints
+
+- **`GET /api/modules`** - List all available modules
+  ```bash
+  curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/modules
+  ```
+
+- **`POST /api/run`** - Execute a module on a target
+  ```bash
+  curl -X POST -H "Authorization: Bearer your-api-key" \
+       -H "Content-Type: application/json" \
+       -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
+       http://localhost:8080/api/run
+  ```
+
+- **`GET /api/status`** - Get API server status and statistics
+  ```bash
+  curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/status
+  ```
+
+- **`POST /api/rotate-key`** - Manually rotate the API key
+  ```bash
+  curl -X POST -H "Authorization: Bearer your-api-key" \
+       http://localhost:8080/api/rotate-key
+  ```
+
+- **`GET /api/ips`** - Get all tracked IP addresses with details
+  ```bash
+  curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/ips
+  ```
+
+- **`GET /api/auth-failures`** - Get authentication failure statistics
+  ```bash
+  curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/auth-failures
+  ```
+
+### Security Features
+
+#### Rate Limiting
+- IPs are automatically blocked for **30 seconds** after **3 failed authentication attempts**
+- Blocked IPs receive HTTP `429 Too Many Requests` responses
+- Failed attempts are logged to both terminal and log file
+- Counter resets automatically after the block period expires
+- Successful authentication resets the failure counter for that IP
+
+#### Hardening Mode
+When `--harden` is enabled:
+- Tracks unique IP addresses accessing the API
+- Automatically rotates the API key when the number of unique IPs exceeds the limit (default: 10)
+- Logs all rotation events to terminal and `rustsploit_api.log`
+- Clears IP tracking after key rotation
+
+#### Logging
+All API activity is logged to:
+- **Terminal:** Real-time console output with colored status messages
+- **Log File:** `rustsploit_api.log` in the current working directory
+
+Log entries include:
+- API requests and responses
+- Authentication failures and rate limiting events
+- IP tracking and hardening actions
+- Key rotation events
+- Module execution results
+
+### Example API Workflow
+
+```bash
+# 1. Start the API server
+cargo run -- --api --api-key my-secret-key --harden --ip-limit 5
+
+# 2. Check health
+curl http://localhost:8080/health
+
+# 3. List available modules
+curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/modules
+
+# 4. Run a port scan
+curl -X POST -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
+     -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
+     http://localhost:8080/api/run
+
+# 5. Check status
+curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/status
+
+# 6. View tracked IPs
+curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/ips
+```
 
 ---
 
@@ -164,7 +306,7 @@ Environment variables (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`) are managed tra
 
 Rustsploit scans `src/modules/` recursively during build. Each module should expose:
 
-```
+```rust
 pub async fn run(target: &str) -> anyhow::Result<()>;
 ```
 
