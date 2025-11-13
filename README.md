@@ -1,6 +1,6 @@
 # Rustsploit 🛠️
 
-Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
+Modular offensive tooling for Pentesting, internal and external networks. written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
