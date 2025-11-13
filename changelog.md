@@ -428,7 +428,22 @@ Locked down proxy usage by deduplicating/truncating large lists before activatio
 
 Added explicit sanitizers for module paths/targets to block traversal attempts and exotic characters before they ever touch utils::module_exists or shared state.
 
+Docker Setup Utility
 
+Added scripts/setup_docker.py, a standalone interactive helper that:
+Detects repo root, validates Docker/Docker Compose availability, and guides users through binding address selection (loopback, 0.0.0.0, detected LAN IP, or custom).
+Prompts for API key (custom or securely generated), optional hardening toggle, and IP-limit.
+Generates a multi-stage Dockerfile (docker/Dockerfile.api) matching the requested build/serve stages, a hardened entrypoint (docker/entrypoint.sh), a project-specific compose file (docker-compose.rustsploit.yml), and an environment file (.env.rustsploit-docker).
+Optionally runs docker compose up -d --build to bring the API online with the chosen configuration.
+
+Usage
+
+From the repo root, run python3 scripts/setup_docker.py.
+Follow the prompts to select interface, API key, and hardening settings.
+Allow the script to generate files and (optionally) launch the Docker stack.
+If you skip the final step, start the stack later with:
+docker compose -f docker-compose.rustsploit.yml up -d --build
+All new files are created only after confirmation when existing content is detected, preventing accidental overwrites.
 
 
 
