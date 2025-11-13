@@ -12,12 +12,13 @@
 4. [Shell Architecture](#shell-architecture)  
 5. [Proxy Subsystem](#proxy-subsystem)  
 6. [Command-Line Interface](#command-line-interface)  
-7. [Authoring Modules](#authoring-modules)  
-8. [Credential Modules: Best Practices](#credential-modules-best-practices)  
-9. [Exploit Modules: Best Practices](#exploit-modules-best-practices)  
-10. [Utilities & Helpers](#utilities--helpers)  
-11. [Testing & QA](#testing--qa)  
-12. [Roadmap & Ideas](#roadmap--ideas)  
+7. [API Server Architecture](#api-server-architecture)  
+8. [Authoring Modules](#authoring-modules)  
+9. [Credential Modules: Best Practices](#credential-modules-best-practices)  
+10. [Exploit Modules: Best Practices](#exploit-modules-best-practices)  
+11. [Utilities & Helpers](#utilities--helpers)  
+12. [Testing & QA](#testing--qa)  
+13. [Roadmap & Ideas](#roadmap--ideas)  
 
 ---
 
@@ -41,9 +42,10 @@ rustsploit/
 ├── Cargo.toml
 ├── build.rs                 # Generates dispatcher code by scanning src/modules
 ├── src/
-│   ├── main.rs              # Entry point, selects CLI or shell mode
+│   ├── main.rs              # Entry point, selects CLI, shell, or API mode
 │   ├── cli.rs               # Clap-based CLI parser and dispatcher
 │   ├── shell.rs             # Interactive shell loop + UX helpers
+│   ├── api.rs               # REST API server with auth, rate limiting, hardening
 │   ├── commands/            # Dispatch glue for exploits/scanners/creds
 │   │   ├── mod.rs
 │   │   ├── exploit.rs
@@ -57,6 +59,8 @@ rustsploit/
 │   │   ├── scanners/
 │   │   └── creds/
 │   └── utils.rs             # Shared helpers (proxy parsing, module lookup, etc.)
+├── scripts/
+│   └── setup_docker.py      # Docker/Compose provisioning helper (interactive + CLI)
 ├── docs/
 │   └── readme.md            # This document
 ├── lists/
@@ -131,6 +135,134 @@ cargo run -- --command exploit --module heartbleed --target 203.0.113.12
 ```
 
 If the module needs additional parameters, it can prompt interactively (e.g., brute-force modules ask for wordlists even in CLI mode). For automated pipelines, modules should provide sensible defaults or accept environment variables.
+
+---
+
+## API Server Architecture
+
+The API server (`src/api.rs`) provides a REST API for remote control of Rustsploit. It's built on Axum and includes comprehensive security features.
+
+### Architecture Overview
+
+- **State Management:** `ApiState` holds shared state including:
+  - Current API key (with rotation support)
+  - IP tracker for hardening mode
+  - Authentication failure tracker for rate limiting
+  - Logging configuration
+
+- **Authentication Middleware:** All protected routes go through `auth_middleware` which:
+  - Extracts client IP from headers or connection info
+  - Checks rate limiting before processing
+  - Validates API key from `Authorization` header
+  - Records failures and resets counters on success
+  - Tracks IPs for hardening mode
+
+- **Rate Limiting:** 
+  - Tracks failed authentication attempts per IP
+  - Blocks IPs for 30 seconds after 3 failed attempts
+  - Automatically expires blocks and resets counters
+  - Logs all rate limit events
+
+- **Hardening Mode:**
+  - Tracks unique IP addresses accessing the API
+  - Auto-rotates API key when unique IP count exceeds limit
+  - Clears IP tracking after rotation
+  - Notifies via terminal and log file
+
+### Key Components
+
+**`ApiState`** - Central state container:
+```rust
+pub struct ApiState {
+    pub current_key: Arc<RwLock<ApiKey>>,
+    pub ip_tracker: Arc<RwLock<HashMap<String, IpTracker>>>,
+    pub auth_failures: Arc<RwLock<HashMap<String, AuthFailureTracker>>>,
+    pub harden_enabled: bool,
+    pub ip_limit: u32,
+    pub log_file: PathBuf,
+}
+```
+
+**`auth_middleware`** - Authentication and rate limiting:
+- Runs before all protected routes
+- Extracts IP from `x-forwarded-for`, `x-real-ip`, or connection info
+- Checks if IP is rate-limited
+- Validates API key
+- Records failures or resets on success
+
+**Module Execution:**
+- Modules run in separate OS threads with their own Tokio runtime
+- This allows non-Send modules to execute asynchronously
+- Results are logged to both terminal and log file
+
+### API Endpoints
+
+- **Public:** `/health` - No authentication required
+- **Protected:** All `/api/*` endpoints require valid API key
+  - `GET /api/modules` - List available modules
+  - `POST /api/run` - Execute module on target
+  - `GET /api/status` - Server status and statistics
+  - `POST /api/rotate-key` - Manually rotate API key
+  - `GET /api/ips` - Tracked IP addresses
+  - `GET /api/auth-failures` - Authentication failure stats
+
+### Logging
+
+All API activity is logged to:
+- Terminal: Real-time colored output
+- File: `rustsploit_api.log` in current working directory
+
+Log entries include timestamps, IP addresses, authentication events, rate limiting actions, and module execution results.
+
+### Usage from CLI
+
+```bash
+# Start API server
+cargo run -- --api --api-key secret-key
+
+# With hardening
+cargo run -- --api --api-key secret-key --harden --ip-limit 5
+
+# Custom interface/port
+cargo run -- --api --api-key secret-key --interface 127.0.0.1:9000
+```
+
+---
+
+### Docker & Container Deployment
+
+Rustsploit’s API can be containerised without hand-authoring Dockerfiles by using `scripts/setup_docker.py`. The tool is designed for both interactive operators and CI pipelines:
+
+- Validates repository root, Docker availability, and Compose tooling.
+- Accepts either prompts or CLI flags (`--bind`, `--generate-key`, `--enable-hardening`, `--ip-limit`, `--skip-up`, `--force`, `--non-interactive`, etc.).
+- Emits the following artefacts (overwriting only with consent):
+  - `docker/Dockerfile.api` – multi-stage builder + runtime image
+  - `docker/entrypoint.sh` – passes API flags safely (enforces API key)
+  - `.env.rustsploit-docker` – stores generated/selected secrets (0600 mode)
+  - `docker-compose.rustsploit.yml` – production-ready stack with `no-new-privileges` and `tmpfs /tmp`
+- Optionally runs `docker compose up -d --build` (BuildKit enabled).
+
+Example scripted run:
+
+```bash
+python3 scripts/setup_docker.py \
+  --bind 192.168.1.50 \
+  --port 8443 \
+  --generate-key \
+  --enable-hardening \
+  --ip-limit 3 \
+  --skip-up \
+  --force \
+  --non-interactive
+```
+
+Later, launch the stack manually:
+
+```bash
+docker compose -f docker-compose.rustsploit.yml up -d --build
+```
+
+This section is intentionally high level—consult `python3 scripts/setup_docker.py --help` for the latest flag list.
 
 ---
 
