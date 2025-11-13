@@ -375,3 +375,62 @@ run_module validates module and target before dispatch; logs use sanitized value
 All log messages are passed through sanitize_for_log to avoid log injection
 
 
+#### api mode and bug fixes and new modules etc Latest end
+
+Improved the telnet bruteforce module with safer inputs and sturdier execution:
+
+Added guarded prompts for port, thread count, yes/no answers, and wordlist paths (loops until valid input, checks file existence). Blank or invalid inputs now fall back to sensible defaults or re-prompt instead of panicking.
+Wordlists are trimmed and filtered, with explicit errors when the files are empty—preventing silent no-op bruteforcing.
+Swapped the shared stop flag to an AtomicBool so workers react immediately when a credential is found while stop_on_success is enabled.
+Counted queued combinations up front and log the total attempts for visibility.
+
+
+Added a powerful raw brute-force option to the Telnet module:
+Prompts now support programmatic password generation: answer “yes” to “Enable raw brute-force password generation?” to supply a character set (default a-zA-Z0-9) and a maximum length (bounded to 1–6).
+Wordlists became optional when raw mode is on (leave the password wordlist blank to skip it); the module still accepts wordlists and can combine them with raw guesses.
+Queue building now streams through a background generator thread that respects the shared stop_on_success flag (AtomicBool) and counts attempts via an AtomicUsize.
+Improved input validation for ports, thread counts, yes/no answers, and file paths; empty lists now raise clear errors.
+Logged attempt counts and status messages highlight usernames/passwords loaded and total credentials queued.
+
+
+
+Credential Modules
+Hardened the SSH brute-force runner with validated host normalization, atomic stop control, and a bounded async work queue so we no longer pile up tasks or contend on a mutex; workers now exit immediately once a hit is found while still honoring combo mode and verbose logging.
+
+FTP Bruteforce Fixes
+Swapped the shared stop flag to an Arc<AtomicBool> and tightened the worker loops so we stop queuing attempts immediately after a hit while still letting outstanding tasks exit cleanly under the semaphore cap.
+
+Simplified throttling: we dropped the expensive system-polling loop and now rely on the semaphore for connection pressure, plus clearer panic logging in the join loop.
+Extended try_ftp_login with a verbose toggle so noisy connection failures only print when requested, while still surfacing TLS fallbacks or critical errors.
+
+Replaced the brute-force loop with a semaphore-guarded task queue so concurrency stays bounded, tasks bail fast once a hit is found, and DNS results are resolved once and reused across attempts.
+
+Added shared header storage plus richer error messages that identify the target when RTSP replies are unexpected or connections fail.
+
+Advanced headers are now shared via Arc, and the stop flag moved to AtomicBool so threads don’t block on a mutex when cancelling runs.
+
+RTSP Target Support Updates
+Added centralized target normalization so the module now accepts domains, IPv4, IPv6 (with or without brackets), optional schemes, and inline RTSP paths; inferred paths are queued first in the brute-force list.
+
+Introduced normalize_target_input to standardize host/port handling and trim any implicit path/query fragments before resolution.
+
+No automated tests were run; consider a quick RTSP smoke test against known IPv4/IPv6 endpoints to confirm resolution and path detection behave as expected.
+
+Introduced shared prompt utilities for ports, thread counts, yes/no answers, and wordlists so SMTP input handling now mirrors the other modules and gives consistent feedback on bad values.
+
+Reworked the SMTP brute-force module to match our richer prompt UX and concurrency story: inputs are validated, wordlists must exist, and worker threads respect an AtomicBool stop flag while reporting loaded counts and draining the queue on success.
+
+Added reusable helpers for SSH input validation—targets are normalized through DNS-safe bracket handling and wordlists must exist before continuing—so mis-typed hosts or files fail fast with actionable feedback.
+
+Hardened the REPL inputs: we now cap command length, sanitize module paths, and refuse targets with whitespace/control chars so only vetted values reach the module runner and env vars.
+
+Locked down proxy usage by deduplicating/truncating large lists before activation, making it harder to feed an unbounded or repeated proxy set into env vars.
+
+Added explicit sanitizers for module paths/targets to block traversal attempts and exotic characters before they ever touch utils::module_exists or shared state.
+
+
+
+
+
+
+
