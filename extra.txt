@@ -62,10 +62,6 @@ Here is the original module that needs to be refactored:
 
 
 
-gemini
-
-You are a senior Rust developer specializing in cross-platform, asynchronous hardware drivers. Your assignment is to develop a complete, production-grade Lovense device driver for Linux, written in Rust, using only information from official Lovense documentation and protocol references.
-
 Strict Requirements:
 
     The code must be 100% pure Rust, fully compatible with Linux operating systems.

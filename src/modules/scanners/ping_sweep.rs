@@ -292,11 +292,15 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     let verbose = config.verbose;
     let success_counter = Arc::new(AtomicUsize::new(0));
 
+    let processed_counter = Arc::new(AtomicUsize::new(0));
+    let start_time = std::time::Instant::now();
     let mut tasks = Vec::new();
+    
     for ip in hosts {
         let sem = semaphore.clone();
         let methods_clone = methods.clone();
         let success_clone = success_counter.clone();
+        let processed_clone = processed_counter.clone();
         tasks.push(tokio::spawn(async move {
             let permit = match sem.acquire_owned().await {
                 Ok(p) => p,
@@ -326,11 +330,32 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
             }
 
             drop(permit);
+            
+            let processed = processed_clone.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            // Progress indicator every 100 hosts or at completion
+            if processed % 100 == 0 || processed == total_hosts {
+                let elapsed = start_time.elapsed().as_secs();
+                let rate = if elapsed > 0 { (processed as u64) / elapsed } else { 0 };
+                print!(
+                    "\r{}",
+                    format!(
+                        "[*] Progress: {}/{} hosts ({:.1}%) | Up: {} | Rate: {}/s",
+                        processed,
+                        total_hosts,
+                        (processed as f64 / total_hosts as f64) * 100.0,
+                        success_clone.load(Ordering::Relaxed),
+                        rate
+                    )
+                    .dimmed()
+                );
+                io::stdout().flush().ok();
+            }
 
             if !successes.is_empty() {
                 success_clone.fetch_add(1, Ordering::Relaxed);
                 println!(
-                    "{}",
+                    "\r{}",
                     format!(
                         "[+] Host {} is up ({})",
                         ip_string,
@@ -339,7 +364,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     .green()
                 );
             } else if verbose {
-                println!("{}", format!("[-] Host {} is down", ip_string).dimmed());
+                println!("\r{}", format!("[-] Host {} is down", ip_string).dimmed());
             }
         }));
     }
@@ -347,6 +372,10 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     for task in tasks {
         let _ = task.await;
     }
+    
+    // Clear progress line
+    print!("\r{}\r", " ".repeat(80));
+    io::stdout().flush().ok();
 
     let up_hosts = success_counter.load(Ordering::Relaxed);
     println!(
@@ -362,14 +391,35 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 }
 
 async fn icmp_probe(ip: &IpAddr, timeout: Duration) -> Result<Vec<String>> {
-    let cmd = if ip.is_ipv4() { "ping" } else { "ping6" };
+    // Try to detect the OS and use appropriate ping command
     let wait_secs = timeout.as_secs().max(1).to_string();
     let ip_str = ip.to_string();
+    
+    let (cmd, args_vec) = if ip.is_ipv4() {
+        // Try ping first, fallback to ping6 for IPv4 if ping doesn't exist
+        if which::which("ping").is_ok() {
+            ("ping", vec!["-c", "1", "-W", &wait_secs, &ip_str])
+        } else if which::which("ping6").is_ok() {
+            ("ping6", vec!["-c", "1", "-W", &wait_secs, &ip_str])
+        } else {
+            return Err(anyhow!("Neither 'ping' nor 'ping6' command found. Install ping utility."));
+        }
+    } else {
+        // IPv6
+        if which::which("ping6").is_ok() {
+            ("ping6", vec!["-c", "1", "-W", &wait_secs, &ip_str])
+        } else if which::which("ping").is_ok() {
+            // Some systems use ping -6 for IPv6
+            ("ping", vec!["-6", "-c", "1", "-W", &wait_secs, &ip_str])
+        } else {
+            return Err(anyhow!("Neither 'ping' nor 'ping6' command found. Install ping utility."));
+        }
+    };
 
     let result = tokio::time::timeout(
         timeout,
         Command::new(cmd)
-            .args(["-c", "1", "-W", &wait_secs, &ip_str])
+            .args(args_vec)
             .output(),
     )
     .await;
@@ -382,24 +432,40 @@ async fn icmp_probe(ip: &IpAddr, timeout: Duration) -> Result<Vec<String>> {
                 Ok(Vec::new())
             }
         }
-        Ok(Err(err)) => Err(err.into()),
+        Ok(Err(err)) => Err(anyhow!("Ping command failed: {}", err)),
         Err(_) => Ok(Vec::new()),
     }
 }
 
 async fn tcp_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<String>> {
-    let mut successes = Vec::new();
+    // Probe ports in parallel for better performance
+    let mut tasks = Vec::new();
+    
     for port in ports {
-        let socket = SocketAddr::new(*ip, *port);
-        match tokio::time::timeout(timeout, TcpStream::connect(socket)).await {
-            Ok(Ok(stream)) => {
-                successes.push(format!("TCP/{}", port));
-                drop(stream);
+        let ip = *ip;
+        let port = *port;
+        let timeout = timeout;
+        
+        tasks.push(tokio::spawn(async move {
+            let socket = SocketAddr::new(ip, port);
+            match tokio::time::timeout(timeout, TcpStream::connect(socket)).await {
+                Ok(Ok(_stream)) => {
+                    // Connection successful - drop stream immediately
+                    Some(format!("TCP/{}", port))
+                }
+                Ok(Err(_)) => None,
+                Err(_) => None,
             }
-            Ok(Err(_)) => {}
-            Err(_) => {}
+        }));
+    }
+    
+    let mut successes = Vec::new();
+    for task in tasks {
+        if let Ok(Some(label)) = task.await {
+            successes.push(label);
         }
     }
+    
     Ok(successes)
 }
 
