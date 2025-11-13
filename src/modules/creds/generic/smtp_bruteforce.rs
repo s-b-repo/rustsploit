@@ -1,9 +1,12 @@
-use anyhow::{Result, Context};
+use anyhow::{anyhow, Context, Result};
+use colored::Colorize;
 use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use telnet::{Telnet, Event};
 use threadpool::ThreadPool;
@@ -23,13 +26,13 @@ struct SmtpBruteforceConfig {
 
 pub async fn run(target: &str) -> Result<()> {
     println!("\n=== SMTP Bruteforce ===\n");
-    let port = prompt("Port (default 25): ").parse().unwrap_or(25);
-    let username_wordlist = prompt("Username wordlist file: ");
-    let password_wordlist = prompt("Password wordlist file: ");
-    let threads = prompt("Threads (default 8): ").parse().unwrap_or(8);
-    let stop_on_success = prompt("Stop on first valid login? (y/n): ").trim().eq_ignore_ascii_case("y");
-    let full_combo = prompt("Try all combos? (y/n): ").trim().eq_ignore_ascii_case("y");
-    let verbose = prompt("Verbose? (y/n): ").trim().eq_ignore_ascii_case("y");
+    let port = prompt_port(25);
+    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
+    let password_wordlist = prompt_wordlist("Password wordlist file: ")?;
+    let threads = prompt_threads(8);
+    let stop_on_success = prompt_yes_no("Stop on first valid login?", true);
+    let full_combo = prompt_yes_no("Try every username with every password?", false);
+    let verbose = prompt_yes_no("Verbose mode?", false);
     let config = SmtpBruteforceConfig {
         target: target.to_string(),
         port,
@@ -48,10 +51,12 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     let usernames = read_lines(&config.username_wordlist)?;
     let passwords = read_lines(&config.password_wordlist)?;
     if usernames.is_empty() || passwords.is_empty() {
-        return Err(anyhow::anyhow!("Empty user or pass wordlist."));
+        return Err(anyhow!("Username or password wordlist is empty."));
     }
+    println!("[*] Loaded {} username(s).", usernames.len());
+    println!("[*] Loaded {} password(s).", passwords.len());
     let found = Arc::new(Mutex::new(Vec::new()));
-    let stop_flag = Arc::new(Mutex::new(false));
+    let stop_flag = Arc::new(AtomicBool::new(false));
     let pool = ThreadPool::new(config.threads);
     let (tx, rx) = unbounded();
     if config.full_combo {
@@ -72,14 +77,14 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
         let config = config.clone();
         pool.execute(move || {
             while let Ok((user, pass)) = rx.recv() {
-                if *stop_flag.lock().unwrap() { break; }
+                if stop_flag.load(Ordering::Relaxed) { break; }
                 if config.verbose { println!("[*] {}:{}", user, pass); }
                 match try_smtp_login(&addr, &user, &pass) {
                     Ok(true) => {
                         println!("[+] VALID: {}:{}", user, pass);
                         let mut creds = found.lock().unwrap(); creds.push((user.clone(), pass.clone()));
                         if config.stop_on_success {
-                            *stop_flag.lock().unwrap() = true;
+                            stop_flag.store(true, Ordering::Relaxed);
                             while rx.try_recv().is_ok() {}
                             break;
                         }
@@ -203,7 +208,81 @@ fn save_results(path: &str, creds: &[(String, String)]) -> Result<()> {
 }
 
 fn prompt(msg: &str) -> String {
-    print!("{}", msg); io::stdout().flush().unwrap(); let mut b = String::new(); io::stdin().read_line(&mut b).unwrap(); b.trim().to_string()
+    print!("{}", msg);
+    if let Err(e) = io::stdout().flush() {
+        eprintln!("[!] Failed to flush stdout: {}", e);
+    }
+    let mut b = String::new();
+    match io::stdin().read_line(&mut b) {
+        Ok(_) => b.trim().to_string(),
+        Err(e) => {
+            eprintln!("[!] Failed to read input: {}", e);
+            String::new()
+        }
+    }
+}
+
+fn prompt_port(default: u16) -> u16 {
+    loop {
+        let input = prompt(&format!("Port (default {}): ", default));
+        if input.is_empty() {
+            return default;
+        }
+        match input.parse::<u16>() {
+            Ok(0) => println!("[!] Port cannot be zero. Please enter a value between 1 and 65535."),
+            Ok(port) => return port,
+            Err(_) => println!("[!] Invalid port. Please enter a number between 1 and 65535."),
+        }
+    }
+}
+
+fn prompt_threads(default: usize) -> usize {
+    loop {
+        let input = prompt(&format!("Threads (default {}): ", default));
+        if input.is_empty() {
+            return default.max(1);
+        }
+        if let Ok(value) = input.parse::<usize>() {
+            if value >= 1 && value <= 1024 {
+                return value;
+            }
+        }
+        println!("[!] Invalid thread count. Please enter a value between 1 and 1024.");
+    }
+}
+
+fn prompt_yes_no(message: &str, default_yes: bool) -> bool {
+    let default_char = if default_yes { "y" } else { "n" };
+    loop {
+        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char));
+        if input.is_empty() {
+            return default_yes;
+        }
+        match input.to_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "n" | "no" => return false,
+            _ => println!("[!] Please respond with y or n."),
+        }
+    }
+}
+
+fn prompt_wordlist(message: &str) -> Result<String> {
+    loop {
+        let response = prompt(message);
+        if response.is_empty() {
+            println!("[!] Path cannot be empty.");
+            continue;
+        }
+        let trimmed = response.trim();
+        if Path::new(trimmed).is_file() {
+            return Ok(trimmed.to_string());
+        } else {
+            println!(
+                "{}",
+                format!("File '{}' does not exist or is not a regular file.", trimmed).yellow()
+            );
+        }
+    }
 }
 
 fn normalize_target(host: &str, port: u16) -> Result<String> {
