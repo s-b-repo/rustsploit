@@ -6,93 +6,109 @@ build = "build.rs"
 
 [dependencies]
 # For HTTP requests
-reqwest = { version = "0.12.15", features = ["json", "cookies", "socks"] }
+reqwest = { version = "0.12", features = ["json", "cookies", "socks"] }
 
 #proxy manager
-rand = "0.9.0"
+rand = "0.9"
 
 # For CLI parsing
-clap = { version = "4.5.35", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 
 # Async runtime for networking
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "process","rt","fs", "io-std"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "process","rt","fs", "io-std"] }
 
 # Easier error handling
-anyhow = "1.0.97"
+anyhow = "1.0"
 
 #teminal color
-colored = "3.0.0"
-rustyline = "15.0.0"
+colored = "3.0"
+rustyline = "15.0"
 
 #ftp brute force module
-async_ftp = "6.0.0"
-tokio-socks = "0.5.2"
-rustls = "0.23.26"
-webpki-roots = "0.26.8"
-suppaftp   = { version = "6.2.0", features = ["async", "async-native-tls","native-tls"] }
-native-tls = "0.2.14"
-sysinfo = { version = "0.37.2", features = ["multithread"] }
+async_ftp = "6.0"
+tokio-socks = "0.5"
+rustls = "0.23"
+webpki-roots = "0.26"
+suppaftp   = { version = "6.2", features = ["async", "async-native-tls","native-tls"] }
+native-tls = "0.2"
+sysinfo = { version = "0.37", features = ["multithread"] }
 
 #telnet
-threadpool = "1.8.1"
-crossbeam-channel = "0.5.15"
-telnet = "0.2.3"
+threadpool = "1.8"
+crossbeam-channel = "0.5"
+telnet = "0.2"
 
-walkdir = "2.5.0"
+walkdir = "2.5"
 
 #ssh
-ssh2 = "0.9.5"
+ssh2 = "0.9"
 
 # rstp brute forcing
-base64 = "0.22.1"
+base64 = "0.22"
 
 # RDP brute forcing module
-rdp = "0.12.8"
+rdp = "0.12"
 
 # ssdp moudle scanner
-regex = "1.11.1"
-ipnet = "2.11.0"
+regex = "1.11"
+ipnet = "2.11"
 
 #camera uniview exploit
-quick-xml = "0.37.4"
+quick-xml = "0.37"
 
 #ABUS TVIP Dropbear
-md5 = "0.7.0"
-ftp = "3.0.1"
+md5 = "0.7"
+ftp = "3.0"
 
 #ssh rce race condition
-libc = "0.2.172"
-futures = "0.3.31"
+libc = "0.2"
+futures = "0.3"
+futures-util = "0.3"
 
 #spotube exploit
-serde_json = "1.0.140"
-futures-util = "0.3.31"
-tokio-tungstenite = "0.26.2"
+serde_json = "1.0"
+tokio-tungstenite = "0.26"
 
 #zte rce
 # Add these to [dependencies]
-aes = "0.8.3"
-cipher = "0.4.4"
-flate2 = "1.0.30"
+aes = "0.8"
+cipher = "0.4"
+flate2 = "1.0"
 
 # for Roundcube exploit payload encoding
-data-encoding = "2.5.0"
+data-encoding = "2.5"
 
 #avanti
-url = "2.5.4"
-semver = "1.0.26"
+url = "2.5"
+semver = "1.0"
 
 #stalk route full traceroute
-pnet_packet = "0.34" # Or the latest compatible version
-socket2 = { version = "0.5", features = ["all"] } # Or the latest compatible version
+pnet_packet = "0.34"
+socket2 = { version = "0.5", features = ["all"] }
+
+# HTTP/2 Rapid Reset DoS
+# Note: h2 0.3 requires http 0.2. Upgrading to h2 0.4 would require http 1.0+ and code changes
+h2 = "0.3"
+tokio-rustls = "0.24"
+http = "0.2"
+bytes = "1.0"
 
 #pingsweep
-which = "8.0.0"
+which = "8.0"
+
+# API server
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.10", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
 
 [build-dependencies]
-regex = "1.11.1"         # required for use in build.rs
+regex = "1.11"         # required for use in build.rs
 
 [[bin]]
 name = "rustsploit"
 path = "src/main.rs"
-

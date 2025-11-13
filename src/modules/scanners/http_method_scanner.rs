@@ -1,11 +1,35 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use regex::Regex;
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, Method, StatusCode, Url};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::time::Duration;
+
+const METHODS: &[&str] = &[
+    "GET",
+    "POST",
+    "HEAD",
+    "OPTIONS",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "TRACE",
+    "CONNECT",
+];
+
+struct MethodResult {
+    method: &'static str,
+    status: Option<StatusCode>,
+    ok: bool,
+    error: Option<String>,
+    duration_ms: u128,
+}
+
+struct TargetResult {
+    target: String,
+    results: Vec<MethodResult>,
+}
 
 pub async fn run(initial_target: &str) -> Result<()> {
     banner();
@@ -23,13 +47,11 @@ pub async fn run(initial_target: &str) -> Result<()> {
         targets.extend(file_targets);
     }
 
-    let check_http = prompt_bool("Check HTTP (http://)? (yes/no, default yes): ", true)?;
-    let check_https = prompt_bool("Check HTTPS (https://)? (yes/no, default yes): ", true)?;
-
-    if !check_http && !check_https {
-        println!("[!] Neither HTTP nor HTTPS selected; nothing to scan.");
-        return Ok(());
-    }
+    let default_scheme_input = prompt("Preferred scheme (http/https, default https): ")?;
+    let default_scheme = match default_scheme_input.to_lowercase().as_str() {
+        "http" => "http",
+        _ => "https",
+    };
 
     let use_ports = prompt_bool(
         "Test via specific ports (port tunneling)? (yes/no, default no): ",
@@ -41,11 +63,17 @@ pub async fn run(initial_target: &str) -> Result<()> {
         Vec::new()
     };
 
-    let timeout_secs = prompt_timeout()?;
-    let save_output = prompt_bool("Save results to file? (yes/no, default yes): ", true)?;
-    let verbose = prompt_bool("Enable verbose output? (yes/no, default no): ", false)?;
+    let timeout_input = prompt("Request timeout in seconds (default 10): ")?;
+    let timeout_secs: u64 = timeout_input
+        .parse()
+        .ok()
+        .filter(|val| *val > 0)
+        .unwrap_or(10);
 
-    let mut normalized = normalize_targets(targets, check_http, check_https);
+    let verbose = prompt_bool("Enable verbose output? (yes/no, default no): ", false)?;
+    let save_output = prompt_bool("Save results to file? (yes/no, default yes): ", true)?;
+
+    let mut normalized = normalize_targets(targets, default_scheme);
     if !ports.is_empty() {
         let expanded = expand_targets_with_ports(&normalized, &ports);
         if expanded.is_empty() {
@@ -60,49 +88,92 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
-        .user_agent("RustSploit-HTTP-Title-Scanner/1.0")
+        .user_agent("RustSploit-HTTP-Method-Scanner/1.0")
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("Failed to build HTTP client")?;
 
-    let title_re = Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>")?;
     let mut all_results = Vec::new();
 
-    for url in &normalized {
-        match fetch_title(&client, url, &title_re).await {
-            Ok(result) => {
-                if let Some(title) = &result.title {
-                    println!("[+] {} -> {}" , url, title);
-                } else if let Some(status) = result.status {
-                    println!("[+] {} -> <no title> (status: {})", url, status);
-                } else {
-                    println!("[+] {} -> <no title>", url);
-                }
-                if verbose {
-                    if let Some(status) = result.status {
-                        println!("    Status: {}", status);
+    for target in &normalized {
+        println!("\n=== Target: {} ===", target);
+        let mut method_results = Vec::new();
+
+        for &method_name in METHODS {
+            let method = Method::from_bytes(method_name.as_bytes()).unwrap_or(Method::GET);
+            let body = match method_name {
+                "POST" | "PUT" | "PATCH" => Some("RustSploit HTTP method scanner test".to_string()),
+                _ => None,
+            };
+
+            let start = std::time::Instant::now();
+            let response = if let Some(ref payload) = body {
+                client
+                    .request(method.clone(), target)
+                    .body(payload.clone())
+                    .send()
+                    .await
+            } else {
+                client.request(method.clone(), target).send().await
+            };
+            let elapsed = start.elapsed();
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let ok = status.is_success();
+                    if verbose {
+                        println!(
+                            "  [{}] {} -> {} ({:.2?})",
+                            method_name,
+                            target,
+                            status,
+                            elapsed
+                        );
+                    } else {
+                        println!("  [{}] {}", method_name, status);
                     }
-                    println!("    Duration: {} ms", result.duration_ms);
+                    method_results.push(MethodResult {
+                        method: method_name,
+                        status: Some(status),
+                        ok,
+                        error: None,
+                        duration_ms: elapsed.as_millis(),
+                    });
                 }
-                all_results.push(result);
-            }
-            Err(err) => {
-                println!("[-] {} -> error: {}", url, err);
-                all_results.push(TitleResult {
-                    url: url.clone(),
-                    status: None,
-                    title: None,
-                    error: Some(err.to_string()),
-                    duration_ms: 0,
-                });
+                Err(err) => {
+                    if verbose {
+                        println!(
+                            "  [{}] {} -> error: {} ({:.2?})",
+                            method_name,
+                            target,
+                            err,
+                            elapsed
+                        );
+                    } else {
+                        println!("  [{}] error: {}", method_name, err);
+                    }
+                    method_results.push(MethodResult {
+                        method: method_name,
+                        status: None,
+                        ok: false,
+                        error: Some(err.to_string()),
+                        duration_ms: elapsed.as_millis(),
+                    });
+                }
             }
         }
+
+        all_results.push(TargetResult {
+            target: target.clone(),
+            results: method_results,
+        });
     }
 
     if save_output {
         let default_name = format!(
-            "http_title_scan_{}.txt",
+            "http_method_scan_{}.txt",
             Utc::now().format("%Y%m%d_%H%M%S")
         );
         let output_path = prompt_with_default(
@@ -117,60 +188,22 @@ pub async fn run(initial_target: &str) -> Result<()> {
     Ok(())
 }
 
-struct TitleResult {
-    url: String,
-    status: Option<StatusCode>,
-    title: Option<String>,
-    error: Option<String>,
-    duration_ms: u128,
-}
-
-impl TitleResult {
-    fn display_title(&self) -> String {
-        match (&self.title, &self.error) {
-            (Some(title), _) => title.clone(),
-            (None, Some(err)) => format!("error: {}", err),
-            (None, None) => "<no title>".to_string(),
-        }
-    }
-}
-
-async fn fetch_title(client: &Client, url: &str, title_re: &Regex) -> Result<TitleResult> {
-    let start = std::time::Instant::now();
-    let response = client.get(url).send().await.context("Request failed")?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    let title = title_re
-        .captures(&text)
-        .and_then(|cap| cap.get(1))
-        .map(|m| sanitize_title(m.as_str()));
-    let duration = start.elapsed().as_millis();
-
-    Ok(TitleResult {
-        url: url.to_string(),
-        status: Some(status),
-        title,
-        error: None,
-        duration_ms: duration,
-    })
-}
-
-fn sanitize_title(raw: &str) -> String {
-    raw
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(200)
-        .collect()
+fn banner() {
+    println!(
+        "{}",
+        r#"
+╔══════════════════════════════════════════════════════╗
+║         HTTP METHOD CAPABILITY SCANNER               ║
+║          Checks support for common verbs             ║
+╚══════════════════════════════════════════════════════╝
+"#
+    );
 }
 
 fn collect_initial_targets(initial_target: &str) -> Vec<String> {
     let mut targets = Vec::new();
     let trimmed = initial_target.trim();
-    if !trimmed.is_empty() && trimmed != "http_title_scanner" {
+    if !trimmed.is_empty() && trimmed != "http_method_scanner" {
         targets.extend(split_targets(trimmed));
     }
     targets
@@ -190,7 +223,7 @@ fn load_targets_from_file(path: &str) -> Result<Vec<String>> {
     Ok(split_targets(&data))
 }
 
-fn normalize_targets(targets: Vec<String>, check_http: bool, check_https: bool) -> Vec<String> {
+fn normalize_targets(targets: Vec<String>, default_scheme: &str) -> Vec<String> {
     let mut unique = HashSet::new();
     let mut normalized = Vec::new();
 
@@ -199,26 +232,16 @@ fn normalize_targets(targets: Vec<String>, check_http: bool, check_https: bool) 
         if target.is_empty() {
             continue;
         }
-
-        if target.starts_with("http://") || target.starts_with("https://") {
-            if unique.insert(target.to_string()) {
-                normalized.push(target.to_string());
-            }
-            continue;
-        }
-
-        if check_https {
-            let https = format!("https://{}", target);
-            if unique.insert(https.clone()) {
-                normalized.push(https);
-            }
-        }
-
-        if check_http {
-            let http = format!("http://{}", target);
-            if unique.insert(http.clone()) {
-                normalized.push(http);
-            }
+        let formatted = if target.starts_with("http://")
+            || target.starts_with("https://")
+            || target.contains("://")
+        {
+            target.to_string()
+        } else {
+            format!("{}://{}", default_scheme, target)
+        };
+        if unique.insert(formatted.clone()) {
+            normalized.push(formatted);
         }
     }
 
@@ -265,7 +288,7 @@ fn prompt(message: &str) -> Result<String> {
 
 fn prompt_bool(message: &str, default: bool) -> Result<bool> {
     let default_text = if default { "yes" } else { "no" };
-    let input = prompt(message)?;
+    let input = prompt(&format!("{}", message))?;
     if input.is_empty() {
         return Ok(default);
     }
@@ -285,20 +308,6 @@ fn prompt_with_default(message: &str, default: &str) -> Result<String> {
         Ok(default.to_string())
     } else {
         Ok(input)
-    }
-}
-
-fn prompt_timeout() -> Result<u64> {
-    let input = prompt("Request timeout in seconds (default 10): ")?;
-    if input.is_empty() {
-        return Ok(10);
-    }
-    match input.parse::<u64>() {
-        Ok(val) if val > 0 => Ok(val),
-        _ => {
-            println!("[!] Invalid timeout, using default (10s)");
-            Ok(10)
-        }
     }
 }
 
@@ -335,39 +344,34 @@ fn prompt_ports() -> Result<Vec<u16>> {
     Ok(ports)
 }
 
-fn write_report(path: &str, results: &[TitleResult]) -> Result<()> {
+fn write_report(path: &str, results: &[TargetResult]) -> Result<()> {
     let mut lines = Vec::new();
-    lines.push("HTTP Title Scanner Report".to_string());
+    lines.push("HTTP Method Scanner Report".to_string());
     lines.push(format!("Generated at: {}", Utc::now()));
     lines.push(String::new());
 
-    for result in results {
-        let status_text = result
-            .status
-            .map(|s| s.as_u16().to_string())
-            .unwrap_or_else(|| "n/a".to_string());
-        lines.push(format!(
-            "{} | status: {:<5} | title: {}",
-            result.url,
-            status_text,
-            result.display_title()
-        ));
-        if result.duration_ms > 0 {
-            lines.push(format!("    duration: {} ms", result.duration_ms));
+    for target in results {
+        lines.push(format!("Target: {}", target.target));
+        for method in &target.results {
+            if let Some(status) = method.status {
+                lines.push(format!(
+                    "  - {:<7} status: {:<5} success: {:<5} time: {} ms",
+                    method.method,
+                    status.as_u16(),
+                    method.ok,
+                    method.duration_ms
+                ));
+            } else if let Some(ref error) = method.error {
+                lines.push(format!(
+                    "  - {:<7} error: {} time: {} ms",
+                    method.method,
+                    error,
+                    method.duration_ms
+                ));
+            }
         }
+        lines.push(String::new());
     }
 
     fs::write(path, lines.join("\n")).with_context(|| format!("Failed to write report to {}", path))
-}
-
-fn banner() {
-    println!(
-        "{}",
-        r#"
-╔══════════════════════════════════════════════════╗
-║             HTTP TITLE SCANNER (RustSploit)      ║
-║  Enumerate page titles over HTTP/HTTPS endpoints ║
-╚══════════════════════════════════════════════════╝
-"#
-    );
 }
