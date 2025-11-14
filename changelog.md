@@ -455,7 +455,3 @@ Supports BuildKit-enabled docker compose up -d --build, or skips launch when --s
 Reworked run to drive a multi-target workflow: it now gathers sanitized targets from CLI, interactive prompts, or files, applies per-target ports (including ip:port forms), and iterates through them while reusing a single DNS query configuration.
 
 Added robust parsing, validation, and de-duplication helpers for targets, with stop handling, file support, and strict host/port sanitization so mixed IPs/domains and custom ports are accepted safely.
-
-Verification
-cargo fmt (fails: rustup reports unknown proxy Cursor-2.0.64-x86_64; rustfmt toolchain may need installation or different RUSTUP_TOOLCHAIN)
-
