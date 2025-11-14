@@ -7,6 +7,10 @@ use std::env;
 use std::io::{self, Write};
 use std::collections::HashSet;
 
+const MAX_INPUT_LENGTH: usize = 4096;
+const MAX_PROXY_LIST_SIZE: usize = 10_000;
+const MAX_TARGET_LENGTH: usize = 512;
+
 /// Simple interactive shell context
 struct ShellContext {
     current_module: Option<String>,
@@ -38,6 +42,18 @@ pub async fn interactive_shell() -> Result<()> {
 
         let mut raw_input = String::new();
         io::stdin().read_line(&mut raw_input)?;
+
+        if raw_input.len() > MAX_INPUT_LENGTH {
+            println!(
+                "{}",
+                format!(
+                    "[!] Input length exceeds {} characters and was ignored.",
+                    MAX_INPUT_LENGTH
+                )
+                .yellow()
+            );
+            continue;
+        }
         let trimmed = raw_input.trim();
 
         if trimmed.is_empty() {
@@ -50,6 +66,7 @@ pub async fn interactive_shell() -> Result<()> {
                 match command_key.as_str() {
                     "exit" => {
                         println!("Exiting...");
+                        clear_proxy_env_vars();
                         break;
                     }
                     "help" => render_help(),
@@ -70,7 +87,40 @@ pub async fn interactive_shell() -> Result<()> {
 
                         match utils::load_proxies_from_file(&file_path) {
                             Ok(summary) => {
-                                ctx.proxy_list = summary.proxies;
+                                let mut unique = HashSet::new();
+                                let mut deduped = Vec::new();
+                                for proxy in summary.proxies.iter() {
+                                    if unique.insert(proxy.clone()) {
+                                        deduped.push(proxy.clone());
+                                    }
+                                }
+
+                                if deduped.len() > MAX_PROXY_LIST_SIZE {
+                                    println!(
+                                        "{}",
+                                        format!(
+                                            "[!] Loaded proxy list exceeded {} entries. Truncating.",
+                                            MAX_PROXY_LIST_SIZE
+                                        )
+                                        .yellow()
+                                    );
+                                    deduped.truncate(MAX_PROXY_LIST_SIZE);
+                                }
+
+                                let removed = summary.proxies.len().saturating_sub(deduped.len());
+                                if removed > 0 {
+                                    println!(
+                                        "{}",
+                                        format!(
+                                            "[*] Removed {} duplicate proxy entr{}.",
+                                            removed,
+                                            if removed == 1 { "y" } else { "ies" }
+                                        )
+                                        .dimmed()
+                                    );
+                                }
+
+                                ctx.proxy_list = deduped;
                                 println!(
                                     "Loaded {} proxies from '{}'.",
                                     ctx.proxy_list.len(),
@@ -143,18 +193,32 @@ pub async fn interactive_shell() -> Result<()> {
                     "use" => {
                         if rest.is_empty() {
                             println!("{}", "Usage: use <module_path>".yellow());
-                        } else if utils::module_exists(&rest) {
-                            ctx.current_module = Some(rest.to_string());
-                            println!("{}", format!("Module '{}' selected.", rest).green());
+                        } else if let Some(safe_path) = sanitize_module_path(&rest) {
+                            if utils::module_exists(&safe_path) {
+                                ctx.current_module = Some(safe_path.clone());
+                                println!("{}", format!("Module '{}' selected.", safe_path).green());
+                            } else {
+                                println!("{}", format!("Module '{}' not found.", rest).red());
+                            }
                         } else {
-                            println!("{}", format!("Module '{}' not found.", rest).red());
+                            println!(
+                                "{}",
+                                "Module path contains invalid characters or traversal attempts."
+                                    .red()
+                            );
                         }
                     }
                     "set" => {
-                        let parts: Vec<&str> = rest.split_whitespace().collect();
-                        if parts.len() >= 2 && parts[0] == "target" {
-                            ctx.current_target = Some(parts[1].to_string());
-                            println!("{}", format!("Target set to {}", parts[1]).green());
+                        if let Some(raw_value) = rest.strip_prefix("target").map(|s| s.trim()) {
+                            match sanitize_target(raw_value) {
+                                Ok(valid_target) => {
+                                    ctx.current_target = Some(valid_target.clone());
+                                    println!("{}", format!("Target set to {}", valid_target).green());
+                                }
+                                Err(reason) => {
+                                    println!("{}", format!("[!] {}", reason).yellow());
+                                }
+                            }
                         } else {
                             println!("{}", "Usage: set target <value>".yellow());
                         }
@@ -276,6 +340,45 @@ fn resolve_command(cmd: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+fn sanitize_module_path(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("..") || trimmed.contains('\\') {
+        return None;
+    }
+    let valid = trimmed.chars().all(|c| {
+        matches!(
+            c,
+            'a'..='z'
+                | 'A'..='Z'
+                | '0'..='9'
+                | '/'
+                | '_'
+        )
+    });
+    if valid {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn sanitize_target(input: &str) -> std::result::Result<String, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Target cannot be empty.");
+    }
+    if trimmed.len() > MAX_TARGET_LENGTH {
+        return Err("Target value is too long.");
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("Target cannot contain whitespace or control characters.");
+    }
+    Ok(trimmed.to_string())
 }
 
 fn render_help() {

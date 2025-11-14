@@ -31,7 +31,7 @@ rustls = "0.23"
 webpki-roots = "0.26"
 suppaftp   = { version = "6.2", features = ["async", "async-native-tls","native-tls"] }
 native-tls = "0.2"
-sysinfo = { version = "0.37", features = ["multithread"] }
+sysinfo = { version = "0.36", features = ["multithread"] }
 
 #telnet
 threadpool = "1.8"
@@ -105,6 +105,14 @@ serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.10", features = ["v4"] }
 sha2 = "0.10"
 hex = "0.4"
+
+# DNS tooling
+trust-dns-client = { version = "0.23", features = ["dnssec"] }
+trust-dns-proto = "0.23"
+
+# Pin transitive dependencies to edition-2021-compatible releases
+# (newer versions require unstable edition2024 feature)
+home = "=0.5.11"
 
 [build-dependencies]
 regex = "1.11"         # required for use in build.rs

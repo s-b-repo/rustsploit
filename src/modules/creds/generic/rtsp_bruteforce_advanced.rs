@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
 use colored::*;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -9,10 +10,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
     time::{sleep, Duration},
 };
 
@@ -62,24 +64,22 @@ pub async fn run(target: &str) -> Result<()> {
     } else {
         None
     };
+    let advanced_headers = Arc::new(advanced_headers);
 
-    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
-    let mut paths = if brute_force_paths {
-        let paths_file = prompt_required("Path to RTSP paths file")?;
-        load_lines(&paths_file)?
-    } else {
-        vec!["".to_string()]
-    };
-    if paths.is_empty() {
-        println!("[!] RTSP paths list is empty. Falling back to default root path.");
-        paths.push(String::new());
-    }
-
-    let addr = format!("{}:{}", target, port);
+    let (addr, implicit_path) = normalize_target_input(target, port)?;
     let found = Arc::new(Mutex::new(Vec::new()));
-    let stop = Arc::new(Mutex::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let semaphore = Arc::new(Semaphore::new(concurrency));
 
     println!("\n[*] Starting brute-force on {}", addr);
+
+    let resolved_addrs = match resolve_targets(&addr).await {
+        Ok(addrs) => Arc::new(addrs),
+        Err(e) => {
+            eprintln!("[!] Failed to resolve '{}': {}", addr, e);
+            return Err(e);
+        }
+    };
 
     let users = load_lines(&usernames_file)?;
     if users.is_empty() {
@@ -97,71 +97,118 @@ pub async fn run(target: &str) -> Result<()> {
         return Ok(());
     }
 
-    let mut idx = 0;
+    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
+    let mut paths = if brute_force_paths {
+        let paths_file = prompt_required("Path to RTSP paths file")?;
+        load_lines(&paths_file)?
+    } else {
+        vec!["".to_string()]
+    };
+    if paths.is_empty() {
+        println!("[!] RTSP paths list is empty. Falling back to default root path.");
+        paths.push(String::new());
+    }
+    if let Some(p) = implicit_path {
+        if !paths.iter().any(|existing| existing == &p) {
+            paths.insert(0, p);
+        }
+    }
+    let mut tasks = FuturesUnordered::new();
+    let mut idx = 0usize;
+
     for pass in pass_lines {
-        if *stop.lock().await {
+        if stop_on_success && stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let userlist = if combo_mode {
+        let userlist: Vec<String> = if combo_mode {
             users.clone()
         } else {
             vec![users.get(idx % users.len()).unwrap_or(&users[0]).to_string()]
         };
 
-        let mut handles = vec![];
-
         for user in userlist {
+            if stop_on_success && stop.load(Ordering::Relaxed) {
+                break;
+            }
             for path in &paths {
-                if *stop.lock().await {
+                if stop_on_success && stop.load(Ordering::Relaxed) {
                     break;
                 }
 
-                let addr = addr.clone();
-                let user = user.clone();
-                let pass = pass.clone();
-                let path = path.clone();
-                let found = Arc::clone(&found);
-                let stop = Arc::clone(&stop);
+                let addr_clone = addr.clone();
+                let user_clone = user.clone();
+                let pass_clone = pass.clone();
+                let path_clone = path.clone();
+                let found_clone = Arc::clone(&found);
+                let stop_clone = Arc::clone(&stop);
                 let command = advanced_command.clone();
-                let headers = advanced_headers.clone();
+                let headers = Arc::clone(&advanced_headers);
+                let semaphore_clone = Arc::clone(&semaphore);
+                let addrs_clone = Arc::clone(&resolved_addrs);
+                let stop_flag = stop_on_success;
+                let verbose_flag = verbose;
 
-                let handle = tokio::spawn(async move {
-                    if *stop.lock().await {
+                tasks.push(tokio::spawn(async move {
+                    if stop_flag && stop_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let permit = match semaphore_clone.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    if stop_flag && stop_clone.load(Ordering::Relaxed) {
+                        drop(permit);
                         return;
                     }
 
-                    match try_rtsp_login(&addr, &user, &pass, &path, command.as_deref(), &headers).await {
+                    match try_rtsp_login(
+                        addrs_clone.as_slice(),
+                        &addr_clone,
+                        &user_clone,
+                        &pass_clone,
+                        &path_clone,
+                        command.as_deref(),
+                        &headers,
+                    )
+                    .await
+                    {
                         Ok(true) => {
-                            let path_str = if path.is_empty() { "NO_PATH" } else { &path };
-                            println!("[+] {} -> {}:{} [path={}]", addr, user, pass, path_str);
-                            found.lock().await.push((addr.clone(), user.clone(), pass.clone(), path_str.to_string()));
-                            if stop_on_success {
-                                *stop.lock().await = true;
+                            let path_str = if path_clone.is_empty() { "NO_PATH" } else { &path_clone };
+                            println!("[+] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_str);
+                            found_clone
+                                .lock()
+                                .await
+                                .push((addr_clone.clone(), user_clone.clone(), pass_clone.clone(), path_str.to_string()));
+                            if stop_flag {
+                                stop_clone.store(true, Ordering::Relaxed);
                             }
                         }
-                        Ok(false) => log(verbose, &format!("[-] {} -> {}:{} [path={}]", addr, user, pass, path)),
-                        Err(e) => log(verbose, &format!("[!] {} -> error: {}", addr, e)),
+                        Ok(false) => log(verbose_flag, &format!("[-] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_clone)),
+                        Err(e) => log(verbose_flag, &format!("[!] {} -> error: {}", addr_clone, e)),
                     }
 
+                    drop(permit);
                     sleep(Duration::from_millis(10)).await;
-                });
+                }));
 
-                handles.push(handle);
-
-                if handles.len() >= concurrency {
-                    for h in handles.drain(..) {
-                        let _ = h.await;
+                if tasks.len() >= concurrency {
+                    if let Some(res) = tasks.next().await {
+                        if let Err(e) = res {
+                            log(verbose, &format!("[!] Task join error: {}", e));
+                        }
                     }
                 }
             }
         }
 
-        for h in handles {
-            let _ = h.await;
-        }
-
         idx += 1;
+    }
+
+    while let Some(res) = tasks.next().await {
+        if let Err(e) = res {
+            log(verbose, &format!("[!] Task join error: {}", e));
+        }
     }
 
     let creds = found.lock().await;
@@ -223,24 +270,24 @@ async fn resolve_targets(addr: &str) -> Result<Vec<SocketAddr>> {
 
 /// Attempt RTSP login, trying each resolved address until one succeeds or all fail.
 async fn try_rtsp_login(
-    addr: &str,
+    addrs: &[SocketAddr],
+    addr_display: &str,
     user: &str,
     pass: &str,
     path: &str,
     method: Option<&str>,
     extra_headers: &[String],
 ) -> Result<bool> {
-    let addrs = resolve_targets(addr).await?;
     let mut last_err = None;
     let mut stream = None;
-    let mut connected_sa = None;
+    let mut connected_sa: Option<SocketAddr> = None;
 
     // Try each candidate address
     for sa in addrs {
-        match TcpStream::connect(sa).await {
+        match TcpStream::connect(*sa).await {
             Ok(s) => {
                 stream = Some(s);
-                connected_sa = Some(sa);
+                connected_sa = Some(*sa);
                 break;
             }
             Err(e) => {
@@ -255,7 +302,8 @@ async fn try_rtsp_login(
         (Some(s), Some(sa)) => (s, sa),
         _ => {
             return Err(anyhow!(
-                "All connection attempts failed: {}",
+                "All connection attempts to {} failed: {}",
+                addr_display,
                 last_err.map(|e| e.to_string()).unwrap_or_default()
             ))
         }
@@ -293,7 +341,7 @@ async fn try_rtsp_login(
     let mut buffer = [0u8; 2048];
     let n = stream.read(&mut buffer).await?;
     if n == 0 {
-        return Err(anyhow!("Server closed connection unexpectedly."));
+        return Err(anyhow!("{}: server closed connection unexpectedly.", addr_display));
     }
     let response = String::from_utf8_lossy(&buffer[..n]);
 
@@ -302,8 +350,71 @@ async fn try_rtsp_login(
     } else if response.contains("401") || response.contains("403") {
         Ok(false)
     } else {
-        Err(anyhow!("Unexpected RTSP response:\n{}", response))
+        Err(anyhow!("{}: unexpected RTSP response:\n{}", addr_display, response))
     }
+}
+
+fn normalize_target_input(target: &str, default_port: u16) -> Result<(String, Option<String>)> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Target cannot be empty."));
+    }
+
+    let without_scheme = trimmed.strip_prefix("rtsp://").unwrap_or(trimmed);
+    let (host_part, path_part) = if let Some((host, path)) = without_scheme.split_once('/') {
+        (host.trim(), Some(path.to_string()))
+    } else {
+        (without_scheme.trim(), None)
+    };
+
+    if host_part.is_empty() {
+        return Err(anyhow!("Target host cannot be empty."));
+    }
+
+    let normalized_host = if host_part.starts_with('[') {
+        if host_part.contains("]:") {
+            host_part.to_string()
+        } else {
+            format!("{}:{}", host_part, default_port)
+        }
+    } else {
+        let colon_count = host_part.matches(':').count();
+        if colon_count == 0 {
+            format!("{}:{}", host_part, default_port)
+        } else if colon_count == 1 {
+            if let Some((host_only, port_str)) = host_part.rsplit_once(':') {
+                if port_str.parse::<u16>().is_ok() {
+                    if host_only.contains(':') {
+                        format!("[{}]:{}", host_only, port_str)
+                    } else {
+                        host_part.to_string()
+                    }
+                } else {
+                    format!("{}:{}", host_part, default_port)
+                }
+            } else {
+                format!("{}:{}", host_part, default_port)
+            }
+        } else {
+            format!("[{}]:{}", host_part, default_port)
+        }
+    };
+
+    let normalized_path = path_part.and_then(|p| {
+        let truncated = p.split(|c| c == '?' || c == '#').next().unwrap_or_default();
+        let trimmed = truncated.trim();
+        if trimmed.is_empty() || trimmed == "/" {
+            None
+        } else {
+            let mut path = trimmed.to_string();
+            if !path.starts_with('/') {
+                path.insert(0, '/');
+            }
+            Some(path)
+        }
+    });
+
+    Ok((normalized_host, normalized_path))
 }
 
 // ─── Prompt and utility functions unchanged ───────────────────────────────────
