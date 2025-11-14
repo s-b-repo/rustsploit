@@ -375,3 +375,87 @@ run_module validates module and target before dispatch; logs use sanitized value
 All log messages are passed through sanitize_for_log to avoid log injection
 
 
+#### api mode and bug fixes and new modules etc Latest end
+
+Improved the telnet bruteforce module with safer inputs and sturdier execution:
+
+Added guarded prompts for port, thread count, yes/no answers, and wordlist paths (loops until valid input, checks file existence). Blank or invalid inputs now fall back to sensible defaults or re-prompt instead of panicking.
+Wordlists are trimmed and filtered, with explicit errors when the files are empty—preventing silent no-op bruteforcing.
+Swapped the shared stop flag to an AtomicBool so workers react immediately when a credential is found while stop_on_success is enabled.
+Counted queued combinations up front and log the total attempts for visibility.
+
+
+Added a powerful raw brute-force option to the Telnet module:
+Prompts now support programmatic password generation: answer “yes” to “Enable raw brute-force password generation?” to supply a character set (default a-zA-Z0-9) and a maximum length (bounded to 1–6).
+Wordlists became optional when raw mode is on (leave the password wordlist blank to skip it); the module still accepts wordlists and can combine them with raw guesses.
+Queue building now streams through a background generator thread that respects the shared stop_on_success flag (AtomicBool) and counts attempts via an AtomicUsize.
+Improved input validation for ports, thread counts, yes/no answers, and file paths; empty lists now raise clear errors.
+Logged attempt counts and status messages highlight usernames/passwords loaded and total credentials queued.
+
+
+
+Credential Modules
+Hardened the SSH brute-force runner with validated host normalization, atomic stop control, and a bounded async work queue so we no longer pile up tasks or contend on a mutex; workers now exit immediately once a hit is found while still honoring combo mode and verbose logging.
+
+FTP Bruteforce Fixes
+Swapped the shared stop flag to an Arc<AtomicBool> and tightened the worker loops so we stop queuing attempts immediately after a hit while still letting outstanding tasks exit cleanly under the semaphore cap.
+
+Simplified throttling: we dropped the expensive system-polling loop and now rely on the semaphore for connection pressure, plus clearer panic logging in the join loop.
+Extended try_ftp_login with a verbose toggle so noisy connection failures only print when requested, while still surfacing TLS fallbacks or critical errors.
+
+Replaced the brute-force loop with a semaphore-guarded task queue so concurrency stays bounded, tasks bail fast once a hit is found, and DNS results are resolved once and reused across attempts.
+
+Added shared header storage plus richer error messages that identify the target when RTSP replies are unexpected or connections fail.
+
+Advanced headers are now shared via Arc, and the stop flag moved to AtomicBool so threads don’t block on a mutex when cancelling runs.
+
+RTSP Target Support Updates
+Added centralized target normalization so the module now accepts domains, IPv4, IPv6 (with or without brackets), optional schemes, and inline RTSP paths; inferred paths are queued first in the brute-force list.
+
+Introduced normalize_target_input to standardize host/port handling and trim any implicit path/query fragments before resolution.
+
+No automated tests were run; consider a quick RTSP smoke test against known IPv4/IPv6 endpoints to confirm resolution and path detection behave as expected.
+
+Introduced shared prompt utilities for ports, thread counts, yes/no answers, and wordlists so SMTP input handling now mirrors the other modules and gives consistent feedback on bad values.
+
+Reworked the SMTP brute-force module to match our richer prompt UX and concurrency story: inputs are validated, wordlists must exist, and worker threads respect an AtomicBool stop flag while reporting loaded counts and draining the queue on success.
+
+Added reusable helpers for SSH input validation—targets are normalized through DNS-safe bracket handling and wordlists must exist before continuing—so mis-typed hosts or files fail fast with actionable feedback.
+
+Hardened the REPL inputs: we now cap command length, sanitize module paths, and refuse targets with whitespace/control chars so only vetted values reach the module runner and env vars.
+
+Locked down proxy usage by deduplicating/truncating large lists before activation, making it harder to feed an unbounded or repeated proxy set into env vars.
+
+Added explicit sanitizers for module paths/targets to block traversal attempts and exotic characters before they ever touch utils::module_exists or shared state.
+
+Docker Setup Utility
+
+Added scripts/setup_docker.py, a standalone interactive helper that:
+Detects repo root, validates Docker/Docker Compose availability, and guides users through binding address selection (loopback, 0.0.0.0, detected LAN IP, or custom).
+Prompts for API key (custom or securely generated), optional hardening toggle, and IP-limit.
+Generates a multi-stage Dockerfile (docker/Dockerfile.api) matching the requested build/serve stages, a hardened entrypoint (docker/entrypoint.sh), a project-specific compose file (docker-compose.rustsploit.yml), and an environment file (.env.rustsploit-docker).
+Optionally runs docker compose up -d --build to bring the API online with the chosen configuration.
+
+Usage
+
+From the repo root, run python3 scripts/setup_docker.py.
+Follow the prompts to select interface, API key, and hardening settings.
+Allow the script to generate files and (optionally) launch the Docker stack.
+If you skip the final step, start the stack later with:
+docker compose -f docker-compose.rustsploit.yml up -d --build
+All new files are created only after confirmation when existing content is detected, preventing accidental overwrites.
+
+Rebuilt scripts/setup_docker.py into a safer CLI/interactive hybrid:
+Validates repo root, docker/docker‑compose availability, and enforces printable API keys with optional random generation.
+Adds flags (--bind, --port, --api-key, --generate-key, --enable-hardening, --disable-hardening, --ip-limit, --compose-cmd, --skip-up, --force, --non-interactive) so the tool can be scripted or used interactively.
+Normalizes host/port selection (loopback, all interfaces, detected LAN, or custom) and applies strict parsing for non-interactive use.
+Generates Dockerfile, entrypoint, Compose file, and env file with restricted permissions (.env written 0600), docker security options (no-new-privileges, tmpfs /tmp), and port bindings derived from user choices.
+Supports BuildKit-enabled docker compose up -d --build, or skips launch when --skip-up is set.
+
+Reworked run to drive a multi-target workflow: it now gathers sanitized targets from CLI, interactive prompts, or files, applies per-target ports (including ip:port forms), and iterates through them while reusing a single DNS query configuration.
+
+Added robust parsing, validation, and de-duplication helpers for targets, with stop handling, file support, and strict host/port sanitization so mixed IPs/domains and custom ports are accepted safely.
+
+Verification
+cargo fmt (fails: rustup reports unknown proxy Cursor-2.0.64-x86_64; rustfmt toolchain may need installation or different RUSTUP_TOOLCHAIN)
+
