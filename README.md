@@ -1,6 +1,6 @@
 # Rustsploit 🛠️
 
-Modular offensive tooling for Pentesting, internal and external networks. written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
+Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 
@@ -16,13 +16,14 @@ Modular offensive tooling for Pentesting, internal and external networks. writte
 1. [Highlights](#highlights)
 2. [Module Catalog](#module-catalog)
 3. [Quick Start](#quick-start)
-4. [Interactive Shell Walkthrough](#interactive-shell-walkthrough)
-5. [CLI Usage](#cli-usage)
-6. [API Server Mode](#api-server-mode)
-7. [Proxy Workflow](#proxy-workflow)
-8. [How Modules Are Discovered](#how-modules-are-discovered)
-9. [Contributing](#contributing)
-10. [Credits](#credits)
+4. [Docker Deployment](#docker-deployment)
+5. [Interactive Shell Walkthrough](#interactive-shell-walkthrough)
+6. [CLI Usage](#cli-usage)
+7. [API Server Mode](#api-server-mode)
+8. [Proxy Workflow](#proxy-workflow)
+9. [How Modules Are Discovered](#how-modules-are-discovered)
+10. [Contributing](#contributing)
+11. [Credits](#credits)
 
 ---
 
@@ -48,7 +49,7 @@ Rustsploit ships categorized modules under `src/modules/`, automatically exposed
 |----------|------------|
 | `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, Telnet brute force, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), RDP auth-only brute |
 | `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE |
-| `scanners` | Port scanner, ping sweep, SSDP M-SEARCH enumerator, HTTP title fetcher, StalkRoute traceroute (firewall evasion) |
+| `scanners` | Port scanner, ping sweep, SSDP M-SEARCH enumerator, HTTP title fetcher, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion) |
 | `payloadgens` | `narutto_dropper`, BAT payload generator |
 | `lists` | RTSP wordlists and helper files |
 
@@ -86,6 +87,62 @@ cargo run
 ```bash
 cargo install --path .
 ```
+
+---
+
+## Docker Deployment
+
+Rustsploit ships with a standalone provisioning script that builds and launches the API inside Docker (mirroring the multi-stage workflow used in vxcontrol/pentagi).
+
+### Requirements
+
+- Docker Engine 24+ (or Docker Desktop)
+- Docker Compose plugin (`docker compose`) or legacy `docker-compose`
+- Python 3.8+
+
+### Interactive Setup
+
+```bash
+python3 scripts/setup_docker.py
+```
+
+The helper will:
+
+1. Confirm you are in the repository root (`Cargo.toml` present).
+2. Ask how the API should bind (`127.0.0.1`, `0.0.0.0`, detected LAN IP, or custom host:port).
+3. Let you enter or auto-generate an API key (printable ASCII, 128 chars max).
+4. Toggle hardening mode and tune the IP limit if desired.
+5. Generate:
+   - `docker/Dockerfile.api` (build + serve stages)
+   - `docker/entrypoint.sh` (passes CLI flags / hardening state)
+   - `.env.rustsploit-docker` (API key, bind address, hardening settings)
+   - `docker-compose.rustsploit.yml`
+6. Optionally run `docker compose up -d --build` with BuildKit enabled.
+
+Existing files are never overwritten without confirmation (use `--force` for scripted deployments).
+
+### Non-Interactive / CI Usage
+
+All prompts have CLI equivalents:
+
+```bash
+python3 scripts/setup_docker.py \
+  --bind 0.0.0.0:8443 \
+  --generate-key \
+  --enable-hardening \
+  --ip-limit 5 \
+  --skip-up \
+  --force \
+  --non-interactive
+```
+
+This produces the Docker assets but skips the compose launch. To start the stack later:
+
+```bash
+docker compose -f docker-compose.rustsploit.yml up -d --build
+```
+
+Environment variables are written with 0600 permissions so secrets stay private. Re-run the script any time you want to regenerate artefacts or rotate the API key.
 
 ---
 
