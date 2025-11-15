@@ -37,7 +37,7 @@ sysinfo = { version = "0.36", features = ["multithread"] }
 threadpool = "1.8"
 crossbeam-channel = "0.5"
 telnet = "0.2"
-
+async-stream = "0.3.6"
 walkdir = "2.5"
 
 #ssh
@@ -109,6 +109,8 @@ hex = "0.4"
 # DNS tooling
 trust-dns-client = { version = "0.23", features = ["dnssec"] }
 trust-dns-proto = "0.23"
+
+# SNMP bruteforce - using manual encoding for reliability
 
 # Pin transitive dependencies to edition-2021-compatible releases
 # (newer versions require unstable edition2024 feature)
