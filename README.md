@@ -287,6 +287,37 @@ Authorization: ApiKey your-api-key-here
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/auth-failures
   ```
 
+### telnet config example
+
+{
+  "port": 23,
+  "username_wordlist": "usernames.txt",
+  "password_wordlist": "passwords.txt",
+  "threads": 10,
+  "delay_ms": 50,
+  "connection_timeout": 3,
+  "read_timeout": 1,
+  "stop_on_success": true,
+  "verbose": false,
+  "full_combo": true,
+  "raw_bruteforce": false,
+  "raw_charset": "",
+  "raw_min_length": 0,
+  "raw_max_length": 0,
+  "output_file": "results.txt",
+  "append_mode": false,
+  "pre_validate": true,
+  "retry_on_error": true,
+  "max_retries": 2,
+  "login_prompts": ["login:", "username:"],
+  "password_prompts": ["password:"],
+  "success_indicators": ["$", "#", "welcome"],
+  "failure_indicators": ["incorrect", "failed"]
+}
+  
+  
+  
+  
 ### Security Features
 
 #### Rate Limiting
