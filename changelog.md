@@ -907,3 +907,475 @@ Line-by-line reading for sequential mode: Password file is now read line-by-line
 Added count_lines() function: Efficiently counts lines without loading them into memory, used for displaying wordlist sizes
 Improved error handling: Better handling of file read errors with proper Result checks instead of relying on unwrap()
 Fixed task limiting: Properly drains tasks during iteration to prevent unbounded task accumulation
+
+
+# dns 
+
+
+ Changed report_result() signature to pass display_target instead of name - The function was displaying the queried domain name instead of the target server address in messages
+ 
+ 
+## http method scanner 
+ 
+Bugs Fixed
+
+Line 249 in expand_targets_with_ports(): Removed unnecessary clone() on url - This was creating a clone on each iteration when modifying the URL's port. The fix removes the clone and modifies url directly since we parse it fresh for each target anyway.
+
+This was the only bug in the code. The rest of the code is functioning correctly.
+
+# api mode
+
+Bugs Fixed
+
+Line 362-377 in auth_middleware() function signature and IP extraction: The middleware was trying to extract ConnectInfo<SocketAddr> from request.extensions() which doesn't work reliably because the extension is consumed during request processing. Fixed by adding ConnectInfo<SocketAddr> as a proper extractor parameter to the function signature, which is the correct way to access the client's socket address in Axum.
+Line 656 in start_api_server() - ServiceBuilder chain: Removed unnecessary .into_inner() call which was incorrect - ServiceBuilder::new().layer(TraceLayer::new_for_http()) already returns the correct type that can be used directly with .layer().
+
+
+## ssh
+
+Incomplete packet sending in attempt_race_condition - splits the packet incorrectly
+Missing packet length in public key packet construction
+Improper error handling that swallows important errors
+Race condition timing logic issues
+Fixed Exploit CodeCode 
+
+Key fixes applied:
+
+Fixed send_packet function: Corrected packet length calculation - now properly computes len + 4 for the total packet size and uses proper async write methods.
+Fixed attempt_race_condition:
+
+Properly writes packet header (length + type) before payload
+Correctly splits payload at len - 1 position
+Ensures flush after partial write before timing sleep
+
+
+Fixed prepare_heap: Adjusted large_fill size to MAX_PACKET_SIZE - 9 to account for packet overhead (4 bytes length + 1 byte type + 4 bytes padding).
+Improved error handling: Removed warning message about negative wait times and just clamps to 0 silently.
+
+
+Key Changes:
+
+Fixed send_packet: Now uses proper async write methods (write_u32, write_u8) and includes flush after each packet
+Fixed prepare_heap: Follows C version's exact sequence - 10 tcache chunks, 27 pairs of large/small holes, 27 fake file structures, then one large fill
+Fixed create_fake_file_structure: Now sets _vtable_offset at correct position (0x30) before setting vtable/codecvt pointers
+Fixed attempt_race_condition:
+
+Sends raw packet bytes (not wrapped in send_packet)
+Properly splits at len - 1
+Adds flush calls to ensure timing accuracy
+Uses correct LOGIN_GRACE_TIME calculation
+
+
+Added delays: 100ms sleep between attempts matching the C version's usleep(100000)
+Improved error handling: Uses recv_retry for SSH version/KEX_INIT to handle non-blocking reads properly
+
+The exploit now f
+
+Fixed both errors:
+
+    Array size mismatch: Changed the variable to explicitly use &[u8] slice type instead of letting Rust infer different array sizes (40 vs 42 bytes)
+    Non-exhaustive pattern: Reordered the match arms to handle all cases:
+        Ok(Ok(0)) - connection closed
+        Ok(Ok(n)) if n > 0 - data received
+        Ok(Ok(_)) - catch-all for any other Ok values
+        Ok(Err(_)) - read error
+        Err(_) - timeout
+
+        
+        
+        created a Rust version of the Jenkins LFI exploit that matches the Python implementation's functionality:
+        
+Key Features:
+
+Async HTTP client using reqwest for network operations
+Threading simulation using Arc<Mutex<bool>> for state management
+Interactive mode - prompts for files to download
+Single file mode - provide filepath as argument
+Automatic path resolution - converts relative paths to absolute using /proc/self/cwd/
+Regex parsing - extracts file contents from error messages
+Proper error handling - timeout detection and formatted output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# hearbleed
+
+Fixes Applied:
+
+Added flush calls after sending Client Hello and Heartbeat to ensure data is sent immediately
+Fixed empty target check - added bail for empty target strings
+Improved IPv6 detection - checks for both : and no . to avoid false positives
+Added vulnerability confirmation - checks if response is > 5 bytes to confirm leak
+Safe filename generation - sanitizes / and \ characters in addition to :
+Better error handling - unwrap_or_default for timestamp to avoid panic
+Added preview limit - shows only first 1024 bytes in terminal to avoid spam
+Preserve newlines in printable dump for better readability
+Better status messages - added byte count for Server Hello and vulnerability confirmation
+
+
+New Features Added:
+1. Search for Patterns - analyze_leaked_data()
+
+Detects passwords (password=, passwd=, pwd=, pass=)
+Finds cookies (Cookie: headers)
+Identifies session tokens (PHPSESSID, JSESSIONID, etc.)
+Alerts on private keys (RSA, EC, DSA, OpenSSH)
+Captures authorization headers
+Extracts email addresses (with deduplication)
+
+2. Multiple Heartbeat Attempts (Default: 5)
+
+Sends 5 heartbeat requests per target by default
+Collects and combines all leaked data
+Shows progress for each attempt
+Configurable via ScanConfig.heartbeat_attempts
+
+3. Custom Payload Size
+
+Configurable via ScanConfig.payload_size
+Default: 0x4000 (16KB)
+Can request larger/smaller payloads
+
+4. Batch Mode
+
+Reads targets from file (one per line)
+Supports # comments in batch file
+Skips empty lines
+Set via ScanConfig.batch_file
+
+5. Concurrent Scanning
+
+Scans up to 10 targets simultaneously
+Uses semaphore for concurrency control
+Processes batch files in parallel
+
+6. Retry Logic with Exponential Backoff
+
+3 retry attempts per connection (configurable)
+Starts with 500ms backoff, doubles each retry
+Handles network failures gracefully
+
+
+New Features Added:
+1. Search for Patterns - analyze_leaked_data()
+
+Detects passwords (password=, passwd=, pwd=, pass=)
+Finds cookies (Cookie: headers)
+Identifies session tokens (PHPSESSID, JSESSIONID, etc.)
+Alerts on private keys (RSA, EC, DSA, OpenSSH)
+Captures authorization headers
+Extracts email addresses (with deduplication)
+
+2. Multiple Heartbeat Attempts (Default: 5)
+
+Sends 5 heartbeat requests per target by default
+Collects and combines all leaked data
+Shows progress for each attempt
+Configurable via ScanConfig.heartbeat_attempts
+
+3. Custom Payload Size
+
+Configurable via ScanConfig.payload_size
+Default: 0x4000 (16KB)
+Can request larger/smaller payloads
+
+4. Batch Mode
+
+Reads targets from file (one per line)
+Supports # comments in batch file
+Skips empty lines
+Set via ScanConfig.batch_file
+
+5. Concurrent Scanning
+
+Scans up to 10 targets simultaneously
+Uses semaphore for concurrency control
+Processes batch files in parallel
+
+6. Retry Logic with Exponential Backoff
+
+3 retry attempts per connection (configurable)
+Starts with 500ms backoff, doubles each retry
+Handles network failures gracefully
+
+
+Color-Coded Output:
+
+Cyan - Info messages and headers
+Green - Success messages
+Yellow - Warnings and retry messages
+Red - Errors and vulnerability alerts
+Red on Yellow - Critical findings (private keys)
+
+### telnet 
+
+
+Key Fixes Implemented:
+1. Double Counting Fixed ✅
+
+Removed the counter increment from the producer side
+Only counts attempts when actually processed by workers
+Uses atomic AtomicU64 for better statistics tracking
+
+2. Efficient File Reading ✅
+
+Loads password wordlist once into memory in full_combo mode
+No more reopening the same file repeatedly
+Streaming for large files, in-memory for repeated access
+
+3. Better Login Detection ✅
+
+Improved pattern matching with more indicators
+Accumulates response after password submission
+Better timeout handling with final analysis
+Detects more success/failure patterns
+
+4. Rate Limiting ✅
+
+Added configurable delay between attempts (prompt_delay)
+Uses Semaphore for controlled concurrency
+Prevents overwhelming the target
+
+5. Progress Statistics ✅
+
+New Statistics struct tracks:
+
+Total attempts
+Successes, failures, errors separately
+Attempts per second
+Elapsed time
+
+
+Live progress updates every 2 seconds
+Final summary report
+
+6. Target Validation ✅
+
+Pre-validates target before bruteforce starts
+validate_telnet_target() checks for telnet service
+Option to continue if validation fails
+
+7. Memory Efficiency ✅
+
+True streaming for all file operations
+Loads wordlists into memory only when beneficial
+Async stream for raw password generation with backpressure
+
+8. Credential Deduplication ✅
+
+Uses HashSet instead of Vec for credentials
+Automatically prevents duplicate entries
+Sorted output for better readability
+
+9. Graceful Shutdown ✅
+
+Workers properly check stop flag
+Progress task cleanly terminates
+Channel closure handled correctly
+
+10. Better Timeout Handling ✅
+
+Timeouts on connection, reads, and writes
+Final analysis after all reads complete
+No indefinite hangs
+
+Major Improvements Implemented:
+1. All Questions Asked Upfront ✅
+
+Complete configuration phase before attack starts
+All prompts collected in Phase 1
+Configuration summary displayed for user confirmation
+User must approve before proceeding
+
+2. Instant Append Mode Output ✅
+
+Results saved immediately when found (not at end)
+Uses append_result() function with OpenOptions::append()
+Each credential written instantly to prevent data loss
+File header created with timestamp and target info
+Option to append to existing file or overwrite
+
+3. User-Configurable Variables ✅
+Added prompts for:
+
+Connection timeout - How long to wait for connection
+Read timeout - How long to wait for each read
+Min/max password length - For raw bruteforce
+Retry on error - Automatic retry failed connections
+Max retries - Number of retry attempts
+Custom login prompts - User-defined login/username prompts
+Custom password prompts - User-defined password prompts
+Success indicators - Custom success detection strings
+Failure indicators - Custom failure detection strings
+Pre-validation - Optional target validation before attack
+
+4. Enhanced Statistics ✅
+
+Tracks retry attempts separately
+Success rate percentage
+Better formatted progress display
+Worker ID in verbose mode
+Emoji indicators in final report
+
+5. Connection Pooling Concept ✅
+
+Uses Semaphore for controlled concurrency
+Rate limiting with configurable delays
+Prevents overwhelming target
+
+6. Banner Grabbing ✅
+
+validate_telnet_target() grabs initial banner
+Checks for telnet-specific responses
+Optional pre-validation with user override
+
+7. Better Error Handling ✅
+
+Automatic retry mechanism for failed connections
+Retry counter in statistics
+Exponential backoff on retries (2x delay)
+Graceful degradation
+
+8. Output Features ✅
+
+Timestamped header in output file
+Target info in header
+Format documentation
+Append mode support with file existence check
+Immediate write on success (no data loss)
+
+9. Custom Prompts ✅
+
+User can define custom login/password prompts
+User can define custom success/failure indicators
+Supports multiple indicators (comma-separated lists)
+Flexible detection for non-standard telnet services
+
+10. Better UX ✅
+
+Colored section headers
+Configuration summary table
+Confirmation before proceeding
+Better progress display with emoji
+Sorted credential output
+Worker IDs in verbose mode
+
+
+🎯 Major New Features:
+1. Config File Support ✅
+
+At startup, asks user: "Do you have a configuration file?"
+If yes: displays the JSON format template
+If no: proceeds with interactive prompts
+
+2. JSON Configuration Format ✅
+Shows users exactly what the config should look like:
+
+
+Configuration Phase - Collect all input
+Execution Phase - Run attack with no interruptions
+
+{
+  "port": 23,
+  "username_wordlist": "/path/to/usernames.txt",
+  "password_wordlist": "/path/to/passwords.txt",
+  "threads": 8,
+  "delay_ms": 100,
+  // ... all fields documented
+}
+
+
+
+### 3. **Comprehensive Validation** ✅
+The `load_and_validate_config()` function validates **everything**:
+
+**Network Settings:**
+- ✓ Port must be > 0
+- ✓ Threads: 1-256
+- ✓ Connection timeout: 1-60 seconds
+- ✓ Read timeout: 1-60 seconds
+- ✓ Delay: ≤ 10000ms
+- ✓ Max retries: ≤ 10
+
+**Files:**
+- ✓ Username wordlist exists and is a file
+- ✓ Username wordlist is not empty
+- ✓ Password wordlist exists (if specified)
+- ✓ Password wordlist not empty (if not using raw bruteforce)
+- ✓ Output file path is valid
+
+**Raw Bruteforce:**
+- ✓ Charset not empty when enabled
+- ✓ Min length ≥ 1
+- ✓ Max length ≥ 1
+- ✓ Min ≤ Max
+- ✓ Max ≤ 8 (performance limit)
+
+**Prompts & Indicators:**
+- ✓ At least one login prompt
+- ✓ At least one password prompt
+- ✓ At least one success indicator
+- ✓ At least one failure indicator
+
+### 4. **Detailed Error Reporting** ✅
+If validation fails, shows **ALL** errors at once:
+
+[!] Configuration validation failed:
+    - Port must be greater than 0
+    - Username wordlist '/bad/path.txt' does not exist
+    - Raw bruteforce max length cannot exceed 8
+    - At least one success indicator is required
+
+5. Save Configuration ✅
+After interactive setup, offers to save config:
+
+User can save current configuration for reuse
+JSON format with pretty-printing
+Reusable for future attacks
+
+6. User Experience Flow ✅
+Config Mode:
+
+"Do you have a configuration file?"
+Shows JSON format example
+"Path to configuration file:"
+Validates all fields
+Shows summary
+"Proceed?"
+
+Interactive Mode:
+
+Asks all questions upfront
+Shows summary
+"Proceed?"
+"Save this configuration?"
+
+7. Serde Integration ✅
+
+Uses serde for JSON serialization/deserialization
+Clean struct with #[serde(skip)] for runtime fields
+Pretty-printed JSON output
+
+8. File Validation ✅
+
+Checks file existence asynchronously
+Counts lines to ensure wordlists aren't empty
+Validates before starting attack (prevents wasted time)
