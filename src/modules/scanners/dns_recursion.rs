@@ -124,12 +124,12 @@ async fn query_target(
         .with_context(|| format!("DNS query to {} failed", display_target))?;
 
     let (message, _) = response.into_parts();
-    report_result(&message, name, record_type);
+    report_result(&message, display_target, record_type);
 
     Ok(())
 }
 
-fn report_result(message: &Message, name: &Name, record_type: RecordType) {
+fn report_result(message: &Message, display_target: &str, record_type: RecordType) {
     let recursion_available = message.recursion_available();
     let recursion_desired = message.recursion_desired();
     let authoritative = message.authoritative();
@@ -162,7 +162,7 @@ fn report_result(message: &Message, name: &Name, record_type: RecordType) {
             "{}",
             format!(
                 "[+] {} appears to allow recursion (RA flag set) for {} {} queries.",
-                name,
+                display_target,
                 record_type,
                 if authoritative { "(authoritative data returned)" } else { "" }
             )
@@ -178,7 +178,7 @@ fn report_result(message: &Message, name: &Name, record_type: RecordType) {
             "{}",
             format!(
                 "[-] {} reports recursion available but refused the request (likely ACL protected).",
-                name
+                display_target
             )
             .yellow()
         );
@@ -187,7 +187,7 @@ fn report_result(message: &Message, name: &Name, record_type: RecordType) {
             "{}",
             format!(
                 "[-] {} does not appear to allow recursion (RA flag unset or query refused).",
-                name
+                display_target
             )
             .red()
         );
@@ -633,6 +633,3 @@ fn validate_domain_input(input: &str) -> Result<String> {
     }
     Ok(without_dot.to_lowercase())
 }
-
-
-

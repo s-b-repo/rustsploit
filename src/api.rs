@@ -350,11 +350,12 @@ impl ApiState {
 
 async fn auth_middleware(
     State(state): State<ApiState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     request: Request,
     next: Next,
 ) -> Response {
-    // Extract IP address first - try to get from headers first (for proxied requests)
+    // Extract IP address - try to get from headers first (for proxied requests)
     let client_ip = headers
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
@@ -366,16 +367,8 @@ async fn auth_middleware(
                 .trim()
                 .to_string()
         })
-        .filter(|s| !s.is_empty());
-
-    // Fall back to direct connection IP from request extensions
-    let client_ip = if let Some(ip) = client_ip {
-        ip
-    } else if let Some(addr) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        addr.ip().to_string()
-    } else {
-        "unknown".to_string()
-    };
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| addr.ip().to_string());
 
     // Check rate limit before processing authentication
     if client_ip != "unknown" {
@@ -702,7 +695,7 @@ pub async fn start_api_server(
     let app = Router::new()
         .route("/health", get(health_check))
         .merge(protected_routes)
-        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()).into_inner())
+        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_address)
@@ -721,4 +714,3 @@ pub async fn start_api_server(
 
     Ok(())
 }
-

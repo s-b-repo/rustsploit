@@ -61,7 +61,7 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
 
 ### Requirements
 
-```bash
+ ```
 sudo apt update
 sudo apt install freerdp2-x11    # Required for the RDP brute force module
 ```
@@ -70,7 +70,7 @@ Ensure Rust and Cargo are installed (https://www.rust-lang.org/tools/install).
 
 ### Clone + Build
 
-```bash
+ ```
 git clone https://github.com/s-b-repo/rustsploit.git
 cd rustsploit
 cargo build
@@ -78,13 +78,13 @@ cargo build
 
 ### Run (Interactive Shell)
 
-```bash
+ ```
 cargo run
 ```
 
 ### Install (optional)
 
-```bash
+ ```
 cargo install --path .
 ```
 
@@ -102,7 +102,7 @@ Rustsploit ships with a standalone provisioning script that builds and launches 
 
 ### Interactive Setup
 
-```bash
+ ```
 python3 scripts/setup_docker.py
 ```
 
@@ -125,7 +125,7 @@ Existing files are never overwritten without confirmation (use `--force` for scr
 
 All prompts have CLI equivalents:
 
-```bash
+ ```
 python3 scripts/setup_docker.py \
   --bind 0.0.0.0:8443 \
   --generate-key \
@@ -138,7 +138,7 @@ python3 scripts/setup_docker.py \
 
 This produces the Docker assets but skips the compose launch. To start the stack later:
 
-```bash
+ ```
 docker compose -f docker-compose.rustsploit.yml up -d --build
 ```
 
@@ -187,7 +187,7 @@ If proxy mode is enabled, Rustsploit rotates through validated proxies, falls ba
 
 Modules can be executed without the shell using the `--command`, `--module`, and `--target` flags:
 
-```bash
+ ```
 # Exploit
 cargo run -- --command exploit --module heartbleed --target 192.168.1.1
 
@@ -208,7 +208,7 @@ Rustsploit includes a REST API server mode that allows remote control of the too
 
 ### Starting the API Server
 
-```bash
+ ```
 # Basic API server (defaults to 0.0.0.0:8080)
 cargo run -- --api --api-key your-secret-key-here
 
@@ -236,7 +236,7 @@ cargo run -- --api --api-key your-secret-key-here --interface 0.0.0.0:9000
 
 All endpoints except `/health` require authentication via the `Authorization` header:
 
-```bash
+ ```
 # Bearer token format
 Authorization: Bearer your-api-key-here
 
@@ -247,19 +247,19 @@ Authorization: ApiKey your-api-key-here
 #### Public Endpoints
 
 - **`GET /health`** - Health check (no authentication required)
-  ```bash
+  ```
   curl http://localhost:8080/health
   ```
 
 #### Protected Endpoints
 
 - **`GET /api/modules`** - List all available modules
-  ```bash
+  ```
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/modules
   ```
 
 - **`POST /api/run`** - Execute a module on a target
-  ```bash
+  ```
   curl -X POST -H "Authorization: Bearer your-api-key" \
        -H "Content-Type: application/json" \
        -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
@@ -267,26 +267,57 @@ Authorization: ApiKey your-api-key-here
   ```
 
 - **`GET /api/status`** - Get API server status and statistics
-  ```bash
+  ```
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/status
   ```
 
 - **`POST /api/rotate-key`** - Manually rotate the API key
-  ```bash
+  ```
   curl -X POST -H "Authorization: Bearer your-api-key" \
        http://localhost:8080/api/rotate-key
   ```
 
 - **`GET /api/ips`** - Get all tracked IP addresses with details
-  ```bash
+  ```
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/ips
   ```
 
 - **`GET /api/auth-failures`** - Get authentication failure statistics
-  ```bash
+  ```
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/auth-failures
   ```
 
+### telnet config example
+ ```
+{
+  "port": 23,
+  "username_wordlist": "usernames.txt",
+  "password_wordlist": "passwords.txt",
+  "threads": 10,
+  "delay_ms": 50,
+  "connection_timeout": 3,
+  "read_timeout": 1,
+  "stop_on_success": true,
+  "verbose": false,
+  "full_combo": true,
+  "raw_bruteforce": false,
+  "raw_charset": "",
+  "raw_min_length": 0,
+  "raw_max_length": 0,
+  "output_file": "results.txt",
+  "append_mode": false,
+  "pre_validate": true,
+  "retry_on_error": true,
+  "max_retries": 2,
+  "login_prompts": ["login:", "username:"],
+  "password_prompts": ["password:"],
+  "success_indicators": ["$", "#", "welcome"],
+  "failure_indicators": ["incorrect", "failed"]
+}
+```
+  
+  
+  
 ### Security Features
 
 #### Rate Limiting
@@ -317,7 +348,7 @@ Log entries include:
 
 ### Example API Workflow
 
-```bash
+ ```
 # 1. Start the API server
 cargo run -- --api --api-key my-secret-key --harden --ip-limit 5
 
