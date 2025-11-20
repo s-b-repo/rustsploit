@@ -1946,15 +1946,6 @@ Success Rate: Moderate to high
 
 ---
 
-## How to Use It Safely:
-
-```bash
-# Test on your own lab environment
-cargo run -- telnet 127.0.0.1
-
-# Select mode 3 for quick test
-# Use a small wordlist first
-```
 
 ## Bottom Line:
 
