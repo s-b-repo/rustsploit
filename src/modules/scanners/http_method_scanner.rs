@@ -8,14 +8,14 @@ use std::time::Duration;
 
 const METHODS: &[&str] = &[
     "GET",
-    "POST",
-    "HEAD",
-    "OPTIONS",
-    "PUT",
-    "DELETE",
-    "PATCH",
-    "TRACE",
-    "CONNECT",
+"POST",
+"HEAD",
+"OPTIONS",
+"PUT",
+"DELETE",
+"PATCH",
+"TRACE",
+"CONNECT",
 ];
 
 struct MethodResult {
@@ -55,7 +55,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let use_ports = prompt_bool(
         "Test via specific ports (port tunneling)? (yes/no, default no): ",
-        false,
+                                false,
     )?;
     let ports = if use_ports {
         prompt_ports()?
@@ -65,10 +65,10 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let timeout_input = prompt("Request timeout in seconds (default 10): ")?;
     let timeout_secs: u64 = timeout_input
-        .parse()
-        .ok()
-        .filter(|val| *val > 0)
-        .unwrap_or(10);
+    .parse()
+    .ok()
+    .filter(|val| *val > 0)
+    .unwrap_or(10);
 
     let verbose = prompt_bool("Enable verbose output? (yes/no, default no): ", false)?;
     let save_output = prompt_bool("Save results to file? (yes/no, default yes): ", true)?;
@@ -88,11 +88,11 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
-        .user_agent("RustSploit-HTTP-Method-Scanner/1.0")
-        .timeout(Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .context("Failed to build HTTP client")?;
+    .user_agent("RustSploit-HTTP-Method-Scanner/1.0")
+    .timeout(Duration::from_secs(timeout_secs))
+    .redirect(reqwest::redirect::Policy::limited(5))
+    .build()
+    .context("Failed to build HTTP client")?;
 
     let mut all_results = Vec::new();
 
@@ -110,10 +110,10 @@ pub async fn run(initial_target: &str) -> Result<()> {
             let start = std::time::Instant::now();
             let response = if let Some(ref payload) = body {
                 client
-                    .request(method.clone(), target)
-                    .body(payload.clone())
-                    .send()
-                    .await
+                .request(method.clone(), target)
+                .body(payload.clone())
+                .send()
+                .await
             } else {
                 client.request(method.clone(), target).send().await
             };
@@ -126,10 +126,10 @@ pub async fn run(initial_target: &str) -> Result<()> {
                     if verbose {
                         println!(
                             "  [{}] {} -> {} ({:.2?})",
-                            method_name,
-                            target,
-                            status,
-                            elapsed
+                                 method_name,
+                                 target,
+                                 status,
+                                 elapsed
                         );
                     } else {
                         println!("  [{}] {}", method_name, status);
@@ -137,19 +137,19 @@ pub async fn run(initial_target: &str) -> Result<()> {
                     method_results.push(MethodResult {
                         method: method_name,
                         status: Some(status),
-                        ok,
-                        error: None,
-                        duration_ms: elapsed.as_millis(),
+                                        ok,
+                                        error: None,
+                                        duration_ms: elapsed.as_millis(),
                     });
                 }
                 Err(err) => {
                     if verbose {
                         println!(
                             "  [{}] {} -> error: {} ({:.2?})",
-                            method_name,
-                            target,
-                            err,
-                            elapsed
+                                 method_name,
+                                 target,
+                                 err,
+                                 elapsed
                         );
                     } else {
                         println!("  [{}] error: {}", method_name, err);
@@ -159,7 +159,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
                         status: None,
                         ok: false,
                         error: Some(err.to_string()),
-                        duration_ms: elapsed.as_millis(),
+                                        duration_ms: elapsed.as_millis(),
                     });
                 }
             }
@@ -167,7 +167,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
         all_results.push(TargetResult {
             target: target.clone(),
-            results: method_results,
+                         results: method_results,
         });
     }
 
@@ -178,7 +178,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
         );
         let output_path = prompt_with_default(
             "Enter output file path (press Enter for default): ",
-            &default_name,
+                                              &default_name,
         )?;
         write_report(&output_path, &all_results)?;
         println!("[*] Results saved to {}", output_path);
@@ -192,11 +192,11 @@ fn banner() {
     println!(
         "{}",
         r#"
-╔══════════════════════════════════════════════════════╗
-║         HTTP METHOD CAPABILITY SCANNER               ║
-║          Checks support for common verbs             ║
-╚══════════════════════════════════════════════════════╝
-"#
+        ╔══════════════════════════════════════════════════════╗
+        ║         HTTP METHOD CAPABILITY SCANNER               ║
+        ║          Checks support for common verbs             ║
+        ╚══════════════════════════════════════════════════════╝
+        "#
     );
 }
 
@@ -211,15 +211,15 @@ fn collect_initial_targets(initial_target: &str) -> Vec<String> {
 
 fn split_targets(input: &str) -> Vec<String> {
     input
-        .split(|c| c == ',' || c == '\n' || c == ';')
-        .map(|item| item.trim().trim_end_matches('/').to_string())
-        .filter(|item| !item.is_empty())
-        .collect()
+    .split(|c| c == ',' || c == '\n' || c == ';')
+    .map(|item| item.trim().trim_end_matches('/').to_string())
+    .filter(|item| !item.is_empty())
+    .collect()
 }
 
 fn load_targets_from_file(path: &str) -> Result<Vec<String>> {
     let data = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read target file: {}", path))?;
+    .with_context(|| format!("Failed to read target file: {}", path))?;
     Ok(split_targets(&data))
 }
 
@@ -233,8 +233,8 @@ fn normalize_targets(targets: Vec<String>, default_scheme: &str) -> Vec<String> 
             continue;
         }
         let formatted = if target.starts_with("http://")
-            || target.starts_with("https://")
-            || target.contains("://")
+        || target.starts_with("https://")
+        || target.contains("://")
         {
             target.to_string()
         } else {
@@ -253,11 +253,10 @@ fn expand_targets_with_ports(targets: &[String], ports: &[u16]) -> Vec<String> {
     let mut seen = HashSet::new();
 
     for target in targets {
-        if let Ok(url) = Url::parse(target) {
+        if let Ok(mut url) = Url::parse(target) {
             for port in ports {
-                let mut candidate = url.clone();
-                if candidate.set_port(Some(*port)).is_ok() {
-                    let final_url = candidate.to_string();
+                if url.set_port(Some(*port)).is_ok() {
+                    let final_url = url.to_string();
                     if seen.insert(final_url.clone()) {
                         expanded.push(final_url);
                     }
@@ -281,14 +280,14 @@ fn prompt(message: &str) -> Result<String> {
     io::stdout().flush().context("Failed to flush stdout")?;
     let mut input = String::new();
     io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read user input")?;
+    .read_line(&mut input)
+    .context("Failed to read user input")?;
     Ok(input.trim().to_string())
 }
 
 fn prompt_bool(message: &str, default: bool) -> Result<bool> {
     let default_text = if default { "yes" } else { "no" };
-    let input = prompt(&format!("{}", message))?;
+    let input = prompt(message)?;
     if input.is_empty() {
         return Ok(default);
     }
@@ -358,20 +357,19 @@ fn write_report(path: &str, results: &[TargetResult]) -> Result<()> {
                     "  - {:<7} status: {:<5} success: {:<5} time: {} ms",
                     method.method,
                     status.as_u16(),
-                    method.ok,
-                    method.duration_ms
+                                   method.ok,
+                                   method.duration_ms
                 ));
             } else if let Some(ref error) = method.error {
                 lines.push(format!(
                     "  - {:<7} error: {} time: {} ms",
-                    method.method,
-                    error,
-                    method.duration_ms
+                    method.method, error, method.duration_ms
                 ));
             }
         }
         lines.push(String::new());
     }
 
-    fs::write(path, lines.join("\n")).with_context(|| format!("Failed to write report to {}", path))
+    fs::write(path, lines.join("\n"))
+    .with_context(|| format!("Failed to write report to {}", path))
 }
