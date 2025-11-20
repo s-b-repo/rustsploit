@@ -882,6 +882,7 @@ async fn check_port(ip: &str, port: u16, timeout_duration: Duration) -> Result<O
 // WORKER AND PRODUCER FUNCTIONS
 // ============================================================
 
+
 fn spawn_worker(
     worker_id: usize,
     rx: Arc<Mutex<mpsc::Receiver<(Arc<str>, Arc<str>)>>>,
@@ -895,18 +896,61 @@ fn spawn_worker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            // ✅ FIX #1: Check stop flag BEFORE attempting to receive work
+            if stop_flag.load(Ordering::SeqCst) {
+                if config.verbose {
+                    println!("[*] Worker {} stopping (stop flag set)", worker_id);
+                }
+                break;
+            }
+
             let pair = {
                 let mut guard = rx.lock().await;
-                guard.recv().await
+
+                // ✅ FIX #2: Use try_recv with timeout to avoid blocking indefinitely
+                match guard.try_recv() {
+                    Ok(p) => Some(p),
+                 Err(mpsc::error::TryRecvError::Empty) => {
+                     // Channel empty but not closed, check if we should wait
+                     drop(guard);
+
+                     // Quick check before waiting
+                     if stop_flag.load(Ordering::SeqCst) {
+                         break;
+                     }
+
+                     // Small sleep to avoid busy waiting
+                     sleep(Duration::from_millis(10)).await;
+                     continue;
+                 }
+                 Err(mpsc::error::TryRecvError::Disconnected) => None,
+                }
             };
 
-            let Some((user, pass)) = pair else { break };
+            let Some((user, pass)) = pair else {
+                if config.verbose {
+                    println!("[*] Worker {} stopping (channel closed)", worker_id);
+                }
+                break;
+            };
 
-            if stop_flag.load(Ordering::Relaxed) {
+            // ✅ FIX #3: Check again after receiving work (double-check pattern)
+            if stop_flag.load(Ordering::SeqCst) {
+                if config.verbose {
+                    println!("[*] Worker {} dropping work {}:{} (stopped)", worker_id, user, pass);
+                }
                 break;
             }
 
             let _permit = semaphore.acquire().await.unwrap();
+
+            // ✅ FIX #4: Check one more time after acquiring semaphore
+            if stop_flag.load(Ordering::SeqCst) {
+                if config.verbose {
+                    println!("[*] Worker {} aborting attempt {}:{} (stopped)", worker_id, user, pass);
+                }
+                break;
+            }
 
             if config.verbose {
                 println!("{} [Worker {}] Trying {}:{}", "[*]".bright_blue(), worker_id, user, &pass);
@@ -916,6 +960,11 @@ fn spawn_worker(
 
             let mut retry_count = 0;
             while config.retry_on_error && retry_count < config.max_retries && attempt_result.is_err() {
+                // Check stop flag before retry
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 retry_count += 1;
                 stats.record_retry();
                 sleep(Duration::from_millis(config.delay_ms * 2)).await;
@@ -937,7 +986,22 @@ fn spawn_worker(
                         }
 
                         if config.stop_on_success {
-                            stop_flag.store(true, Ordering::Relaxed);
+                            // ✅ FIX #5: Use SeqCst ordering for critical stop flag
+                            stop_flag.store(true, Ordering::SeqCst);
+
+                            // ✅ FIX #6: Drain the channel to prevent other workers from processing queued work
+                            let mut rx_guard = rx.lock().await;
+                            let mut drained = 0;
+                            while rx_guard.try_recv().is_ok() {
+                                drained += 1;
+                            }
+                            drop(rx_guard);
+
+                            if config.verbose && drained > 0 {
+                                println!("[*] Worker {} drained {} queued attempts", worker_id, drained);
+                            }
+
+                            println!("[*] Worker {} stopping (success, stop_on_success=true)", worker_id);
                             break;
                         }
                     }
