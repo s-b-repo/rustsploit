@@ -1960,3 +1960,30 @@ Success Rate: Moderate to high
 - Legal authorization obtained
 
 
+
+
+#### minor telnet logic flaw fix 
+
+When you set stop_on_success: true, here's what happens:
+
+Worker 0 finds valid credentials admin:admin123
+Worker 0 sets the stop flag: stop_flag.store(true, Ordering::Relaxed)
+But Workers 1, 2, and 3 are already processing their attempts (admin:test123, admin:root, admin:toor)
+They complete those attempts even after the stop flag is set
+The module stops, but it only tested 4 combinations instead of stopping immediately after the first success
+
+The Root Cause
+Look at this code in the spawn_worker function:
+
+
+let pair = {
+    let mut guard = rx.lock().await;
+    guard.recv().await
+};
+
+let Some((user, pass)) = pair else { break };
+
+if stop_flag.load(Ordering::Relaxed) {  // ❌ Check happens AFTER receiving work
+    break;
+}
+
