@@ -1,4 +1,4 @@
-// src/modules/telnet.rs
+// src/modules/creds/generic/telnet_bruteforce.rs - PART 1/4
 // Comprehensive Telnet Security Testing Module
 //
 // ⚠️ LEGAL NOTICE ⚠️
@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{sleep, timeout};
+use once_cell::sync::Lazy;
 
 // ============================================================
 // CONSTANTS
@@ -58,6 +59,185 @@ const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
 ];
 
 // ============================================================
+// CONFIGURATION STRUCTURES
+// ============================================================
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TelnetBruteforceConfig {
+    #[serde(skip)]
+    pub target: String,
+    pub port: u16,
+    pub username_wordlist: String,
+    pub password_wordlist: Option<String>,
+    pub threads: usize,
+    pub delay_ms: u64,
+    pub connection_timeout: u64,
+    pub read_timeout: u64,
+    pub stop_on_success: bool,
+    pub verbose: bool,
+    pub full_combo: bool,
+    pub raw_bruteforce: bool,
+    pub raw_charset: String,
+    pub raw_min_length: usize,
+    pub raw_max_length: usize,
+    pub output_file: String,
+    pub append_mode: bool,
+    pub pre_validate: bool,
+    pub retry_on_error: bool,
+    pub max_retries: usize,
+    pub login_prompts: Vec<String>,
+    pub password_prompts: Vec<String>,
+    pub success_indicators: Vec<String>,
+    pub failure_indicators: Vec<String>,
+
+    #[serde(skip)]
+    pub login_prompts_lower: Vec<String>,
+    #[serde(skip)]
+    pub password_prompts_lower: Vec<String>,
+    #[serde(skip)]
+    pub success_indicators_lower: Vec<String>,
+    #[serde(skip)]
+    pub failure_indicators_lower: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct BatchScanConfig {
+    pub targets: Vec<String>,
+    pub ports: Vec<u16>,
+    pub credentials: Vec<(String, String)>,
+    pub timeout: Duration,
+    pub max_concurrent: usize,
+    pub output_file: String,
+    pub verbose: bool,
+}
+
+impl Default for BatchScanConfig {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            ports: DEFAULT_TELNET_PORTS.to_vec(),
+            credentials: DEFAULT_CREDENTIALS
+            .iter()
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+            .collect(),
+            timeout: Duration::from_secs(3),
+            max_concurrent: 50,
+            output_file: "telnet_scan_results.txt".to_string(),
+            verbose: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanResult {
+    pub ip: String,
+    pub port: u16,
+    pub banner: String,
+    pub credentials: Option<(String, String)>,
+    pub timestamp: String,
+}
+
+impl TelnetBruteforceConfig {
+    #[inline]
+    pub fn preprocess_prompts(&mut self) {
+        self.login_prompts_lower = self.login_prompts.iter().map(|s| s.to_lowercase()).collect();
+        self.password_prompts_lower = self.password_prompts.iter().map(|s| s.to_lowercase()).collect();
+        self.success_indicators_lower = self.success_indicators.iter().map(|s| s.to_lowercase()).collect();
+        self.failure_indicators_lower = self.failure_indicators.iter().map(|s| s.to_lowercase()).collect();
+    }
+}
+
+// ============================================================
+// STATISTICS TRACKING
+// ============================================================
+
+pub struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    retried_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            retried_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    #[inline]
+    pub fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn record_retry(&self) {
+        self.retried_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let retries = self.retried_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {} retry | {:.1}/s    ",
+            "[Progress]".cyan(),
+               total.to_string().bold(),
+               success.to_string().green(),
+               failed,
+               errors.to_string().red(),
+               retries,
+               rate
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    pub fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let retries = self.retried_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        println!("\n{}", "[Final Statistics]".bold().cyan());
+        println!("  Total attempts:  {}", total.to_string().bold());
+        println!("  Successful:      {}", success.to_string().green().bold());
+        println!("  Failed:          {}", failed);
+        println!("  Errors:          {}", errors.to_string().yellow());
+        println!("  Retries:         {}", retries);
+        println!("  Time elapsed:    {:.2}s", elapsed);
+        println!("  Average rate:    {:.2} attempts/sec", rate);
+        if success > 0 {
+            let success_rate = (success as f64 / total as f64) * 100.0;
+            println!("  Success rate:    {:.2}%", success_rate);
+        }
+    }
+}
+
+// ============================================================
 // MAIN ENTRY POINT
 // ============================================================
 
@@ -66,16 +246,20 @@ pub async fn run(target: &str) -> Result<()> {
 
     println!("Select operation mode:");
     println!("  1. Single Target Bruteforce (advanced)");
-    println!("  2. Batch Scanner (multiple targets)");
-    println!("  3. Quick Default Credential Check");
+    println!("  2. Subnet Bruteforce (CIDR notation)");
+    println!("  3. Batch Scanner (multiple targets)");
+    println!("  4. Quick Default Check (single target)");
+    println!("  5. Subnet Default Check (CIDR)");
     println!();
 
-    let mode = prompt_required("Select mode [1-3]: ");
+    let mode = prompt_required("Select mode [1-5]: ");
 
     match mode.as_str() {
-        "1" => run_single_target_bruteforce(target).await,
-        "2" => run_batch_scanner(target).await,
-        "3" => run_quick_check(target).await,
+        "1" => run_single_target_bruteforce(target, false).await,
+        "2" => run_single_target_bruteforce(target, true).await,
+        "3" => run_batch_scanner(target).await,
+        "4" => run_quick_check(target, false).await,
+        "5" => run_quick_check(target, true).await,
         _ => {
             println!("[!] Invalid selection");
             Ok(())
@@ -84,15 +268,27 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 // ============================================================
-// MODE 1: SINGLE TARGET ADVANCED BRUTEFORCE
+// MODE 1 & 2: SINGLE TARGET / SUBNET BRUTEFORCE
 // ============================================================
 
-async fn run_single_target_bruteforce(target: &str) -> Result<()> {
-    println!("\n{}", "=== Single Target Bruteforce Mode ===".bold().cyan());
+async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<()> {
+    println!("\n{}", if is_subnet {
+        "=== Subnet Bruteforce Mode ==="
+    } else {
+        "=== Single Target Bruteforce Mode ==="
+    }.bold().cyan());
     println!();
 
-    let target = target.trim().to_string();
+    let targets = parse_single_target(target)?;
 
+    if targets.len() > 1 {
+        println!("[*] Expanded to {} hosts", targets.len());
+        if !prompt_yes_no("Continue with all hosts? (y/n): ", true) {
+            return Ok(());
+        }
+    }
+
+    let target_primary = targets[0].clone();
     let use_config = prompt_yes_no("Do you have a configuration file? (y/n): ", false);
 
     let mut config = if use_config {
@@ -103,7 +299,7 @@ async fn run_single_target_bruteforce(target: &str) -> Result<()> {
         let config_path = prompt_wordlist("Path to configuration file: ")?;
 
         println!("[*] Loading configuration from '{}'...", config_path);
-        match load_and_validate_config(&config_path, &target).await {
+        match load_and_validate_config(&config_path, &target_primary).await {
             Ok(cfg) => {
                 println!("{}", "[+] Configuration loaded and validated!".green().bold());
                 cfg
@@ -115,7 +311,7 @@ async fn run_single_target_bruteforce(target: &str) -> Result<()> {
             }
         }
     } else {
-        build_interactive_config(&target).await?
+        build_interactive_config(&target_primary).await?
     };
 
     config.preprocess_prompts();
@@ -139,11 +335,65 @@ async fn run_single_target_bruteforce(target: &str) -> Result<()> {
     println!("{}", "[Starting Attack]".bold().yellow());
     println!();
 
-    run_telnet_bruteforce(config).await
+    if targets.len() > 1 {
+        let parallel = prompt_yes_no("Run targets in parallel? (y/n): ", false);
+        if parallel {
+            run_parallel_bruteforce(targets, config).await
+        } else {
+            run_sequential_bruteforce(targets, config).await
+        }
+    } else {
+        run_telnet_bruteforce(config).await
+    }
+}
+
+async fn run_sequential_bruteforce(targets: Vec<String>, base_config: TelnetBruteforceConfig) -> Result<()> {
+    for (idx, target) in targets.iter().enumerate() {
+        println!("\n{}", format!("=== Target {}/{}: {} ===", idx + 1, targets.len(), target).bright_cyan());
+        let mut config = base_config.clone();
+        config.target = target.clone();
+
+        if let Err(e) = run_telnet_bruteforce(config).await {
+            eprintln!("[!] Error with target {}: {}", target, e);
+        }
+
+        if idx < targets.len() - 1 {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn run_parallel_bruteforce(targets: Vec<String>, base_config: TelnetBruteforceConfig) -> Result<()> {
+    let max_concurrent = prompt_threads(5);
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let mut tasks = Vec::new();
+
+    for target in targets {
+        let sem = semaphore.clone();
+        let config = base_config.clone();
+
+        let task = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let mut target_config = config;
+            target_config.target = target.clone();
+            run_telnet_bruteforce(target_config).await
+        });
+
+        tasks.push(task);
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            eprintln!("[!] Task error: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================
-// MODE 2: BATCH SCANNER
+// MODE 3: BATCH SCANNER
 // ============================================================
 
 async fn run_batch_scanner(target: &str) -> Result<()> {
@@ -152,7 +402,6 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
 
     let mut config = BatchScanConfig::default();
 
-    // Load targets
     if Path::new(target).exists() {
         let content = tokio::fs::read_to_string(target).await?;
         config.targets = parse_targets(&content)?;
@@ -166,7 +415,6 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
 
     println!("Loaded {} target(s)", config.targets.len());
 
-    // Configure ports
     if prompt_yes_no("Use default ports (23, 2323, 23231)? (y/n): ", true) {
         config.ports = DEFAULT_TELNET_PORTS.to_vec();
     } else {
@@ -177,7 +425,6 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
         .collect();
     }
 
-    // Configure credentials
     if prompt_yes_no("Use default credential list? (y/n): ", true) {
         config.credentials = DEFAULT_CREDENTIALS
         .iter()
@@ -210,14 +457,20 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
 }
 
 // ============================================================
-// MODE 3: QUICK DEFAULT CREDENTIAL CHECK
+// MODE 4 & 5: QUICK DEFAULT CHECK
 // ============================================================
 
-async fn run_quick_check(target: &str) -> Result<()> {
-    println!("\n{}", "=== Quick Default Credential Check ===".bold().cyan());
+async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
+    println!("\n{}", if is_subnet {
+        "=== Subnet Quick Default Check ==="
+    } else {
+        "=== Quick Default Credential Check ==="
+    }.bold().cyan());
     println!();
 
-    let targets = if Path::new(target).exists() {
+    let targets = if is_subnet {
+        parse_single_target(target)?
+    } else if Path::new(target).exists() {
         let content = tokio::fs::read_to_string(target).await?;
         parse_targets(&content)?
     } else {
@@ -234,6 +487,7 @@ async fn run_quick_check(target: &str) -> Result<()> {
     println!();
 
     let mut found_any = false;
+    let mut results = Vec::new();
 
     for target_ip in targets {
         println!("[*] Testing {}:{}", target_ip, port);
@@ -241,17 +495,20 @@ async fn run_quick_check(target: &str) -> Result<()> {
         for (username, password) in DEFAULT_CREDENTIALS {
             match try_telnet_login_simple(&target_ip, port, username, password, 3).await {
                 Ok(true) => {
+                    let result = format!("{}:{} - {}/{}",
+                                         target_ip, port, username,
+                                         if password.is_empty() { "(blank)" } else { password });
+
                     println!(
                         "  {} Valid: {}/{}",
                         "✓".bright_green().bold(),
                              username,
                              if password.is_empty() { "(blank)" } else { password }
                     );
+                    results.push(result);
                     found_any = true;
                 }
-                Ok(false) => {
-                    // Silent fail for quick check - only show errors in verbose mode
-                }
+                Ok(false) => {}
                 Err(e) => {
                     println!("  {} Error: {}", "!".yellow(), e);
                     break;
@@ -264,189 +521,28 @@ async fn run_quick_check(target: &str) -> Result<()> {
 
     if !found_any {
         println!("{}", "[-] No valid credentials found".yellow());
+    } else if prompt_yes_no("Save results to file? (y/n): ", true) {
+        let output_path = prompt_required("Output file path: ");
+        save_quick_check_results(&output_path, &results).await?;
+        println!("[+] Results saved to '{}'", output_path);
     }
 
     Ok(())
 }
 
-// ============================================================
-// CONFIGURATION STRUCTURES
-// ============================================================
-
-#[derive(Clone, Serialize, Deserialize)]
-struct TelnetBruteforceConfig {
-    #[serde(skip)]
-    target: String,
-    port: u16,
-    username_wordlist: String,
-    password_wordlist: Option<String>,
-    threads: usize,
-    delay_ms: u64,
-    connection_timeout: u64,
-    read_timeout: u64,
-    stop_on_success: bool,
-    verbose: bool,
-    full_combo: bool,
-    raw_bruteforce: bool,
-    raw_charset: String,
-    raw_min_length: usize,
-    raw_max_length: usize,
-    output_file: String,
-    append_mode: bool,
-    pre_validate: bool,
-    retry_on_error: bool,
-    max_retries: usize,
-    login_prompts: Vec<String>,
-    password_prompts: Vec<String>,
-    success_indicators: Vec<String>,
-    failure_indicators: Vec<String>,
-
-    #[serde(skip)]
-    login_prompts_lower: Vec<String>,
-    #[serde(skip)]
-    password_prompts_lower: Vec<String>,
-    #[serde(skip)]
-    success_indicators_lower: Vec<String>,
-    #[serde(skip)]
-    failure_indicators_lower: Vec<String>,
+async fn save_quick_check_results(path: &str, results: &[String]) -> Result<()> {
+    let mut f = File::create(path).await?;
+    f.write_all(b"# Quick Check Results\n").await?;
+    f.write_all(format!("# Date: {}\n\n", chrono::Local::now()).as_bytes()).await?;
+    for result in results {
+        f.write_all(format!("{}\n", result).as_bytes()).await?;
+    }
+    f.flush().await?;
+    Ok(())
 }
 
-#[derive(Clone)]
-struct BatchScanConfig {
-    targets: Vec<String>,
-    ports: Vec<u16>,
-    credentials: Vec<(String, String)>,
-    timeout: Duration,
-    max_concurrent: usize,
-    output_file: String,
-    verbose: bool,
-}
-
-impl Default for BatchScanConfig {
-    fn default() -> Self {
-        Self {
-            targets: Vec::new(),
-            ports: DEFAULT_TELNET_PORTS.to_vec(),
-            credentials: DEFAULT_CREDENTIALS
-            .iter()
-            .map(|(u, p)| (u.to_string(), p.to_string()))
-            .collect(),
-            timeout: Duration::from_secs(3),
-            max_concurrent: 50,
-            output_file: "telnet_scan_results.txt".to_string(),
-            verbose: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ScanResult {
-    ip: String,
-    port: u16,
-    banner: String,
-    credentials: Option<(String, String)>,
-    timestamp: String,
-}
-
-impl TelnetBruteforceConfig {
-    #[inline]
-    fn preprocess_prompts(&mut self) {
-        self.login_prompts_lower = self.login_prompts.iter().map(|s| s.to_lowercase()).collect();
-        self.password_prompts_lower = self.password_prompts.iter().map(|s| s.to_lowercase()).collect();
-        self.success_indicators_lower = self.success_indicators.iter().map(|s| s.to_lowercase()).collect();
-        self.failure_indicators_lower = self.failure_indicators.iter().map(|s| s.to_lowercase()).collect();
-    }
-}
-
-// ============================================================
-// STATISTICS TRACKING
-// ============================================================
-
-struct Statistics {
-    total_attempts: AtomicU64,
-    successful_attempts: AtomicU64,
-    failed_attempts: AtomicU64,
-    error_attempts: AtomicU64,
-    retried_attempts: AtomicU64,
-    start_time: Instant,
-}
-
-impl Statistics {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            total_attempts: AtomicU64::new(0),
-            successful_attempts: AtomicU64::new(0),
-            failed_attempts: AtomicU64::new(0),
-            error_attempts: AtomicU64::new(0),
-            retried_attempts: AtomicU64::new(0),
-            start_time: Instant::now(),
-        }
-    }
-
-    #[inline]
-    fn record_attempt(&self, success: bool, error: bool) {
-        self.total_attempts.fetch_add(1, Ordering::Relaxed);
-        if error {
-            self.error_attempts.fetch_add(1, Ordering::Relaxed);
-        } else if success {
-            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    fn record_retry(&self) {
-        self.retried_attempts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn print_progress(&self) {
-        let total = self.total_attempts.load(Ordering::Relaxed);
-        let success = self.successful_attempts.load(Ordering::Relaxed);
-        let failed = self.failed_attempts.load(Ordering::Relaxed);
-        let errors = self.error_attempts.load(Ordering::Relaxed);
-        let retries = self.retried_attempts.load(Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
-
-        print!(
-            "\r{} {} attempts | {} OK | {} fail | {} err | {} retry | {:.1}/s    ",
-            "[Progress]".cyan(),
-               total.to_string().bold(),
-               success.to_string().green(),
-               failed,
-               errors.to_string().red(),
-               retries,
-               rate
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-
-    fn print_final(&self) {
-        println!();
-        let total = self.total_attempts.load(Ordering::Relaxed);
-        let success = self.successful_attempts.load(Ordering::Relaxed);
-        let failed = self.failed_attempts.load(Ordering::Relaxed);
-        let errors = self.error_attempts.load(Ordering::Relaxed);
-        let retries = self.retried_attempts.load(Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
-
-        println!("\n{}", "[Final Statistics]".bold().cyan());
-        println!("  Total attempts:  {}", total.to_string().bold());
-        println!("  Successful:      {}", success.to_string().green().bold());
-        println!("  Failed:          {}", failed);
-        println!("  Errors:          {}", errors.to_string().yellow());
-        println!("  Retries:         {}", retries);
-        println!("  Time elapsed:    {:.2}s", elapsed);
-        println!("  Average rate:    {:.2} attempts/sec", rate);
-        if success > 0 {
-            let success_rate = (success as f64 / total as f64) * 100.0;
-            println!("  Success rate:    {:.2}%", success_rate);
-        }
-    }
-}
+// src/modules/creds/generic/telnet_bruteforce.rs - PART 2/4
+// Core Login Functions and Execution Logic
 
 // ============================================================
 // CORE TELNET LOGIN FUNCTIONS
@@ -882,7 +978,6 @@ async fn check_port(ip: &str, port: u16, timeout_duration: Duration) -> Result<O
 // WORKER AND PRODUCER FUNCTIONS
 // ============================================================
 
-
 fn spawn_worker(
     worker_id: usize,
     rx: Arc<Mutex<mpsc::Receiver<(Arc<str>, Arc<str>)>>>,
@@ -896,7 +991,6 @@ fn spawn_worker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            // ✅ FIX #1: Check stop flag BEFORE attempting to receive work
             if stop_flag.load(Ordering::SeqCst) {
                 if config.verbose {
                     println!("[*] Worker {} stopping (stop flag set)", worker_id);
@@ -907,19 +1001,15 @@ fn spawn_worker(
             let pair = {
                 let mut guard = rx.lock().await;
 
-                // ✅ FIX #2: Use try_recv with timeout to avoid blocking indefinitely
                 match guard.try_recv() {
                     Ok(p) => Some(p),
                  Err(mpsc::error::TryRecvError::Empty) => {
-                     // Channel empty but not closed, check if we should wait
                      drop(guard);
 
-                     // Quick check before waiting
                      if stop_flag.load(Ordering::SeqCst) {
                          break;
                      }
 
-                     // Small sleep to avoid busy waiting
                      sleep(Duration::from_millis(10)).await;
                      continue;
                  }
@@ -934,7 +1024,6 @@ fn spawn_worker(
                 break;
             };
 
-            // ✅ FIX #3: Check again after receiving work (double-check pattern)
             if stop_flag.load(Ordering::SeqCst) {
                 if config.verbose {
                     println!("[*] Worker {} dropping work {}:{} (stopped)", worker_id, user, pass);
@@ -944,7 +1033,6 @@ fn spawn_worker(
 
             let _permit = semaphore.acquire().await.unwrap();
 
-            // ✅ FIX #4: Check one more time after acquiring semaphore
             if stop_flag.load(Ordering::SeqCst) {
                 if config.verbose {
                     println!("[*] Worker {} aborting attempt {}:{} (stopped)", worker_id, user, pass);
@@ -960,7 +1048,6 @@ fn spawn_worker(
 
             let mut retry_count = 0;
             while config.retry_on_error && retry_count < config.max_retries && attempt_result.is_err() {
-                // Check stop flag before retry
                 if stop_flag.load(Ordering::SeqCst) {
                     break;
                 }
@@ -986,10 +1073,8 @@ fn spawn_worker(
                         }
 
                         if config.stop_on_success {
-                            // ✅ FIX #5: Use SeqCst ordering for critical stop flag
                             stop_flag.store(true, Ordering::SeqCst);
 
-                            // ✅ FIX #6: Drain the channel to prevent other workers from processing queued work
                             let mut rx_guard = rx.lock().await;
                             let mut drained = 0;
                             while rx_guard.try_recv().is_ok() {
@@ -1060,6 +1145,9 @@ fn spawn_producers(
     }
     drop(tx);
 }
+
+// src/modules/creds/generic/telnet_bruteforce.rs - PART 3/4
+// Producer Functions and Combo Generation Logic
 
 fn spawn_streaming_producers(
     config: &TelnetBruteforceConfig,
@@ -1144,413 +1232,6 @@ fn spawn_memory_producers(
             }
         });
     }
-}
-
-// ============================================================
-// CONFIGURATION FUNCTIONS
-// ============================================================
-
-async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig> {
-    println!();
-    println!("{}", "[Interactive Configuration]".bold().green());
-    println!();
-
-    let port = prompt_port(23);
-    let threads = prompt_threads(8);
-    let delay_ms = prompt_delay(100);
-    let connection_timeout = prompt_timeout("Connection timeout (seconds, default 3): ", 3);
-    let read_timeout = prompt_timeout("Read timeout (seconds, default 1): ", 1);
-
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
-    let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false);
-
-    let password_wordlist = if raw_bruteforce {
-        prompt_optional_wordlist("Password wordlist (leave blank to skip): ")?
-    } else {
-        Some(prompt_wordlist("Password wordlist file: ")?)
-    };
-
-    let (raw_charset, raw_min_length, raw_max_length) = if raw_bruteforce {
-        let charset = prompt_charset("Character set (default: lowercase): ", "abcdefghijklmnopqrstuvwxyz");
-        let min_len = prompt_min_length(1, 1, 8);
-        let max_len = prompt_max_length(4, min_len, 8);
-        (charset, min_len, max_len)
-    } else {
-        (String::new(), 0, 0)
-    };
-
-    let full_combo = prompt_yes_no("Try every username with every password? (y/n): ", false);
-    let stop_on_success = prompt_yes_no("Stop on first valid login? (y/n): ", false);
-
-    let output_file = prompt_required("Output file: ");
-    let append_mode = if tokio::fs::metadata(&output_file).await.is_ok() {
-        prompt_yes_no(&format!("File exists. Append? (y/n): "), true)
-    } else {
-        false
-    };
-
-    let verbose = prompt_yes_no("Verbose mode? (y/n): ", false);
-    let pre_validate = prompt_yes_no("Pre-validate target? (y/n): ", true);
-    let retry_on_error = prompt_yes_no("Retry failed connections? (y/n): ", true);
-    let max_retries = if retry_on_error { prompt_retries(2) } else { 0 };
-
-    let use_custom_prompts = prompt_yes_no("Use custom prompts? (y/n): ", false);
-
-    let (login_prompts, password_prompts, success_indicators, failure_indicators) =
-    if use_custom_prompts {
-        (
-            prompt_list("Login prompts (comma-separated): "),
-         prompt_list("Password prompts (comma-separated): "),
-         prompt_list("Success indicators (comma-separated): "),
-         prompt_list("Failure indicators (comma-separated): "),
-        )
-    } else {
-        get_default_prompts()
-    };
-
-    Ok(TelnetBruteforceConfig {
-        target: target.to_string(),
-       port, username_wordlist, password_wordlist, threads, delay_ms,
-       connection_timeout, read_timeout, stop_on_success, verbose, full_combo,
-       raw_bruteforce, raw_charset, raw_min_length, raw_max_length,
-       output_file, append_mode, pre_validate, retry_on_error, max_retries,
-       login_prompts, password_prompts, success_indicators, failure_indicators,
-       login_prompts_lower: Vec::new(),
-       password_prompts_lower: Vec::new(),
-       success_indicators_lower: Vec::new(),
-       failure_indicators_lower: Vec::new(),
-    })
-}
-
-fn get_default_prompts() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    (
-        vec!["login:".to_string(), "username:".to_string(), "user:".to_string()],
-     vec!["password:".to_string()],
-     vec![
-         "$", "#", "> ", "~ ", "% ", "~$", "~#", "last login", "welcome",
-     "welcome to", "logged in", "login successful", "authentication successful",
-     "successfully authenticated", "motd", "message of the day",
-     "have a lot of fun", "you have mail", "you have new mail", "user@",
-     "root@", "admin@", "ubuntu", "debian", "centos", "red hat", "fedora",
-     "freebsd", "openbsd", "router>", "router#", "switch>", "switch#",
-     "cisco", "ios>", "ios#", "[root@", "[admin@", "bash-", "sh-",
-     "press any key", "continue", "enter command", "available commands", "type help"
-     ].iter().map(|s| s.to_string()).collect(),
-     vec![
-         "incorrect", "failed", "denied", "invalid", "authentication failed",
-     "% authentication", "% bad", "access denied", "login incorrect",
-     "permission denied", "not authorized", "authentication error",
-     "bad password", "wrong password", "authentication failure",
-     "login failed", "invalid login", "invalid password", "invalid username",
-     "bad username", "user unknown", "unknown user", "connection refused",
-     "connection closed", "connection reset", "too many", "maximum"
-     ].iter().map(|s| s.to_string()).collect(),
-    )
-}
-
-async fn load_and_validate_config(path: &str, target: &str) -> Result<TelnetBruteforceConfig> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let mut config: TelnetBruteforceConfig = serde_json::from_str(&content)?;
-    config.target = target.to_string();
-    config.preprocess_prompts();
-
-    let mut errors = Vec::new();
-
-    if config.port == 0 { errors.push("Port must be > 0".to_string()); }
-    if config.threads == 0 || config.threads > 256 {
-        errors.push("Threads must be 1-256".to_string());
-    }
-    if !(1..=60).contains(&config.connection_timeout) {
-        errors.push("Connection timeout: 1-60s".to_string());
-    }
-
-    if !errors.is_empty() {
-        return Err(anyhow!("Validation errors:\n  - {}", errors.join("\n  - ")));
-    }
-
-    Ok(config)
-}
-
-async fn save_config(config: &TelnetBruteforceConfig, path: &str) -> Result<()> {
-    let json = serde_json::to_string_pretty(config)?;
-    tokio::fs::write(path, json).await?;
-    Ok(())
-}
-
-fn print_config_summary(config: &TelnetBruteforceConfig) {
-    println!("\n{}", "=== Configuration ===".bold().cyan());
-    println!("  Target:     {}:{}", config.target, config.port);
-    println!("  Threads:    {}", config.threads);
-    println!("  Delay:      {}ms", config.delay_ms);
-    println!("  Output:     {}", config.output_file);
-    println!("{}", "====================".cyan());
-}
-
-fn print_config_format() {
-    println!("{}", "=== JSON Configuration Format ===".bold().cyan());
-    println!("{}", r##"{
-    "port": 23,
-    "username_wordlist": "users.txt",
-    "password_wordlist": "passwords.txt",
-    "threads": 8,
-    "delay_ms": 100,
-    "connection_timeout": 3,
-    "read_timeout": 1,
-    "stop_on_success": false,
-    "verbose": false,
-    "full_combo": false,
-    "raw_bruteforce": false,
-    "raw_charset": "abcdefghijklmnopqrstuvwxyz",
-    "raw_min_length": 1,
-    "raw_max_length": 4,
-    "output_file": "results.txt",
-    "append_mode": false,
-    "pre_validate": true,
-    "retry_on_error": true,
-    "max_retries": 2,
-    "login_prompts": ["login:", "username:"],
-    "password_prompts": ["password:"],
-    "success_indicators": ["$", "#", "welcome"],
-    "failure_indicators": ["incorrect", "failed", "denied"]
-}
-"##);
-    println!("{}", "================================".cyan());
-}
-
-// ============================================================
-// UTILITY FUNCTIONS
-// ============================================================
-
-fn should_use_streaming(total_size: u64) -> bool {
-    if total_size > MAX_MEMORY_SIZE {
-        let size_mb = total_size as f64 / (1024.0 * 1024.0);
-        println!("\n{}", format!("[!] Large wordlists: {:.1} MB", size_mb).yellow());
-        println!("Options:");
-        println!("  1. Load into memory (faster, ~{:.0} MB RAM)", size_mb);
-        println!("  2. Streaming mode (slower, minimal memory)");
-        println!();
-        !prompt_yes_no("Load into memory? (y/n): ", true)
-    } else {
-        false
-    }
-}
-
-async fn load_wordlists_streaming(
-    config: &TelnetBruteforceConfig,
-) -> Result<(Vec<String>, Vec<String>, usize, usize)> {
-    println!("[*] Using streaming mode...");
-    let user_count = count_nonempty_lines(&config.username_wordlist).await?;
-    let pass_count = if let Some(ref path) = config.password_wordlist {
-        count_nonempty_lines(path).await?
-    } else {
-        0
-    };
-    Ok((Vec::new(), Vec::new(), user_count, pass_count))
-}
-
-async fn load_wordlists_memory(
-    config: &TelnetBruteforceConfig,
-) -> Result<(Vec<String>, Vec<String>, usize, usize)> {
-    println!("[*] Loading wordlists into memory...");
-    let (usernames, passwords) = tokio::join!(
-        load_wordlist(&config.username_wordlist),
-                                              async {
-                                                  if let Some(ref path) = config.password_wordlist {
-                                                      load_wordlist(path).await
-                                                  } else {
-                                                      Ok(Vec::new())
-                                                  }
-                                              }
-    );
-
-    let usernames = usernames?;
-    let passwords = passwords?;
-    Ok((usernames.clone(), passwords.clone(), usernames.len(), passwords.len()))
-}
-
-fn calculate_estimated_attempts(
-    config: &TelnetBruteforceConfig,
-    username_count: usize,
-    password_count: usize,
-) -> usize {
-    let mut estimated = if config.full_combo {
-        username_count * password_count
-    } else if username_count == 1 {
-        password_count
-    } else if password_count == 1 {
-        username_count
-    } else {
-        password_count
-    };
-
-    if config.raw_bruteforce {
-        let charset_len = config.raw_charset.chars().count();
-        let mut raw_total = 0u64;
-        for len in config.raw_min_length..=config.raw_max_length {
-            raw_total += charset_len.pow(len as u32) as u64;
-        }
-        println!("[*] Raw bruteforce: ~{} passwords", raw_total);
-
-        let users_for_raw = if config.full_combo || username_count == 1 {
-            username_count as u64
-        } else {
-            1
-        };
-        estimated += (raw_total * users_for_raw) as usize;
-    }
-
-    estimated
-}
-
-async fn initialize_output_file(output_file: &str, config: &TelnetBruteforceConfig) -> Result<()> {
-    if !config.append_mode {
-        let mut f = File::create(output_file).await?;
-        f.write_all(format!("# Telnet Results - {}\n", chrono::Local::now()).as_bytes()).await?;
-        f.write_all(format!("# Target: {}:{}\n", config.target, config.port).as_bytes()).await?;
-        f.write_all(b"# Format: username:password\n\n").await?;
-    }
-    Ok(())
-}
-
-async fn validate_telnet_target(addr: &str, config: &TelnetBruteforceConfig) -> Result<()> {
-    let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
-
-    let mut stream = timeout(
-        Duration::from_secs(config.connection_timeout),
-                             TcpStream::connect(socket)
-    ).await??;
-
-    let mut buf = vec![0u8; 1024];
-    match timeout(Duration::from_secs(config.read_timeout), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            let response = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-            if response.contains("login") || response.contains("username") ||
-                response.contains("telnet") || response.contains("password") {
-                    Ok(())
-                } else {
-                    Err(anyhow!("No telnet prompts detected"))
-                }
-        }
-        _ => Err(anyhow!("No response from target")),
-    }
-}
-
-async fn append_result(output_file: &str, username: &str, password: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(output_file)
-    .await?;
-
-    file.write_all(format!("{}:{}\n", username, password).as_bytes()).await?;
-    file.flush().await?;
-    Ok(())
-}
-
-async fn print_final_report(
-    found_creds: &Arc<Mutex<HashSet<(String, String)>>>,
-                            output_file: &str,
-) {
-    let found = found_creds.lock().await;
-    println!();
-    if found.is_empty() {
-        println!("{}", "[-] No valid credentials found".yellow());
-    } else {
-        println!("{}", format!("[+] Found {} credential(s):", found.len()).green().bold());
-        let mut sorted: Vec<_> = found.iter().collect();
-        sorted.sort();
-        for (u, p) in sorted.iter() {
-            println!("  {}  {}:{}", "✓".green(), u, p);
-        }
-        println!("\n[*] Results saved to: {}", output_file);
-    }
-}
-
-async fn load_wordlist(path: &str) -> Result<Vec<String>> {
-    let content = tokio::fs::read_to_string(path).await?;
-    Ok(content
-    .lines()
-    .filter_map(|s| {
-        let trimmed = s.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
-    .collect())
-}
-
-async fn count_nonempty_lines(path: &str) -> Result<usize> {
-    let content = tokio::fs::read_to_string(path).await?;
-    Ok(content.lines().filter(|line| !line.trim().is_empty()).count())
-}
-
-fn parse_targets(input: &str) -> Result<Vec<String>> {
-    let mut targets = Vec::new();
-
-    for line in input.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if line.contains('/') {
-            match line.parse::<ipnetwork::IpNetwork>() {
-                Ok(network) => {
-                    for ip in network.iter() {
-                        targets.push(ip.to_string());
-                    }
-                }
-                Err(_) => println!("{} Invalid CIDR: {}", "[!]".yellow(), line),
-            }
-        } else {
-            targets.push(line.to_string());
-        }
-    }
-
-    Ok(targets)
-}
-
-async fn load_credentials_file(path: &str) -> Result<Vec<(String, String)>> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let mut creds = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some((user, pass)) = line.split_once(':') {
-            creds.push((user.trim().to_string(), pass.trim().to_string()));
-        }
-    }
-
-    Ok(creds)
-}
-
-fn save_batch_results(results: &[ScanResult], filename: &str) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(filename)?;
-
-    use std::io::Write;
-    for result in results {
-        let creds_str = match &result.credentials {
-            Some((u, p)) => format!("{}/{}", u, if p.is_empty() { "(blank)" } else { p }),
-            None => "none".to_string(),
-        };
-
-        writeln!(
-            file,
-            "[{}] {}:{} - {} - banner: {}",
-            result.timestamp,
-            result.ip,
-            result.port,
-            creds_str,
-            result.banner.replace('\n', " ").replace('\r', "")
-        )?;
-    }
-
-    Ok(())
 }
 
 // ============================================================
@@ -1833,6 +1514,464 @@ async fn generate_raw_combos_streaming(
 }
 
 // ============================================================
+// CONFIGURATION FUNCTIONS
+// ============================================================
+
+async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig> {
+    println!();
+    println!("{}", "[Interactive Configuration]".bold().green());
+    println!();
+
+    let port = prompt_port(23);
+    let threads = prompt_threads(8);
+    let delay_ms = prompt_delay(100);
+    let connection_timeout = prompt_timeout("Connection timeout (seconds, default 3): ", 3);
+    let read_timeout = prompt_timeout("Read timeout (seconds, default 1): ", 1);
+
+    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
+    let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false);
+
+    let password_wordlist = if raw_bruteforce {
+        prompt_optional_wordlist("Password wordlist (leave blank to skip): ")?
+    } else {
+        Some(prompt_wordlist("Password wordlist file: ")?)
+    };
+
+    let (raw_charset, raw_min_length, raw_max_length) = if raw_bruteforce {
+        let charset = prompt_charset("Character set (default: lowercase): ", "abcdefghijklmnopqrstuvwxyz");
+        let min_len = prompt_min_length(1, 1, 8);
+        let max_len = prompt_max_length(4, min_len, 8);
+        (charset, min_len, max_len)
+    } else {
+        (String::new(), 0, 0)
+    };
+
+    let full_combo = prompt_yes_no("Try every username with every password? (y/n): ", false);
+    let stop_on_success = prompt_yes_no("Stop on first valid login? (y/n): ", false);
+
+    let output_file = prompt_required("Output file: ");
+    let append_mode = if tokio::fs::metadata(&output_file).await.is_ok() {
+        prompt_yes_no(&format!("File exists. Append? (y/n): "), true)
+    } else {
+        false
+    };
+
+    let verbose = prompt_yes_no("Verbose mode? (y/n): ", false);
+    let pre_validate = prompt_yes_no("Pre-validate target? (y/n): ", true);
+    let retry_on_error = prompt_yes_no("Retry failed connections? (y/n): ", true);
+    let max_retries = if retry_on_error { prompt_retries(2) } else { 0 };
+
+    let use_custom_prompts = prompt_yes_no("Use custom prompts? (y/n): ", false);
+
+    let (login_prompts, password_prompts, success_indicators, failure_indicators) =
+    if use_custom_prompts {
+        (
+            prompt_list("Login prompts (comma-separated): "),
+         prompt_list("Password prompts (comma-separated): "),
+         prompt_list("Success indicators (comma-separated): "),
+         prompt_list("Failure indicators (comma-separated): "),
+        )
+    } else {
+        get_default_prompts()
+    };
+
+    Ok(TelnetBruteforceConfig {
+        target: target.to_string(),
+       port, username_wordlist, password_wordlist, threads, delay_ms,
+       connection_timeout, read_timeout, stop_on_success, verbose, full_combo,
+       raw_bruteforce, raw_charset, raw_min_length, raw_max_length,
+       output_file, append_mode, pre_validate, retry_on_error, max_retries,
+       login_prompts, password_prompts, success_indicators, failure_indicators,
+       login_prompts_lower: Vec::new(),
+       password_prompts_lower: Vec::new(),
+       success_indicators_lower: Vec::new(),
+       failure_indicators_lower: Vec::new(),
+    })
+}
+
+fn get_default_prompts() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    (
+        vec!["login:".to_string(), "username:".to_string(), "user:".to_string()],
+     vec!["password:".to_string()],
+     vec![
+         "$", "#", "> ", "~ ", "% ", "~$", "~#", "last login", "welcome",
+     "welcome to", "logged in", "login successful", "authentication successful",
+     "successfully authenticated", "motd", "message of the day",
+     "have a lot of fun", "you have mail", "you have new mail", "user@",
+     "root@", "admin@", "ubuntu", "debian", "centos", "red hat", "fedora",
+     "freebsd", "openbsd", "router>", "router#", "switch>", "switch#",
+     "cisco", "ios>", "ios#", "[root@", "[admin@", "bash-", "sh-",
+     "press any key", "continue", "enter command", "available commands", "type help"
+     ].iter().map(|s| s.to_string()).collect(),
+     vec![
+         "incorrect", "failed", "denied", "invalid", "authentication failed",
+     "% authentication", "% bad", "access denied", "login incorrect",
+     "permission denied", "not authorized", "authentication error",
+     "bad password", "wrong password", "authentication failure",
+     "login failed", "invalid login", "invalid password", "invalid username",
+     "bad username", "user unknown", "unknown user", "connection refused",
+     "connection closed", "connection reset", "too many", "maximum"
+     ].iter().map(|s| s.to_string()).collect(),
+    )
+}
+
+async fn load_and_validate_config(path: &str, target: &str) -> Result<TelnetBruteforceConfig> {
+    let content = tokio::fs::read_to_string(path).await?;
+    let mut config: TelnetBruteforceConfig = serde_json::from_str(&content)?;
+    config.target = target.to_string();
+    config.preprocess_prompts();
+
+    let mut errors = Vec::new();
+
+    if config.port == 0 { errors.push("Port must be > 0".to_string()); }
+    if config.threads == 0 || config.threads > 256 {
+        errors.push("Threads must be 1-256".to_string());
+    }
+    if !(1..=60).contains(&config.connection_timeout) {
+        errors.push("Connection timeout: 1-60s".to_string());
+    }
+
+    if !errors.is_empty() {
+        return Err(anyhow!("Validation errors:\n  - {}", errors.join("\n  - ")));
+    }
+
+    Ok(config)
+}
+
+async fn save_config(config: &TelnetBruteforceConfig, path: &str) -> Result<()> {
+    let json = serde_json::to_string_pretty(config)?;
+    tokio::fs::write(path, json).await?;
+    Ok(())
+}
+
+fn print_config_summary(config: &TelnetBruteforceConfig) {
+    println!("\n{}", "=== Configuration ===".bold().cyan());
+    println!("  Target:     {}:{}", config.target, config.port);
+    println!("  Threads:    {}", config.threads);
+    println!("  Delay:      {}ms", config.delay_ms);
+    println!("  Output:     {}", config.output_file);
+    println!("{}", "====================".cyan());
+}
+
+fn print_config_format() {
+    println!("{}", "=== JSON Configuration Format ===".bold().cyan());
+    println!("{}", r##"{
+    "port": 23,
+    "username_wordlist": "users.txt",
+    "password_wordlist": "passwords.txt",
+    "threads": 8,
+    "delay_ms": 100,
+    "connection_timeout": 3,
+    "read_timeout": 1,
+    "stop_on_success": false,
+    "verbose": false,
+    "full_combo": false,
+    "raw_bruteforce": false,
+    "raw_charset": "abcdefghijklmnopqrstuvwxyz",
+    "raw_min_length": 1,
+    "raw_max_length": 4,
+    "output_file": "results.txt",
+    "append_mode": false,
+    "pre_validate": true,
+    "retry_on_error": true,
+    "max_retries": 2,
+    "login_prompts": ["login:", "username:"],
+    "password_prompts": ["password:"],
+    "success_indicators": ["$", "#", "welcome"],
+    "failure_indicators": ["incorrect", "failed", "denied"]
+}
+"##);
+    println!("{}", "================================".cyan());
+}
+
+// src/modules/creds/generic/telnet_bruteforce.rs - PART 4/4
+// Utility Functions, Prompts, and Helper Functions
+
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
+
+fn should_use_streaming(total_size: u64) -> bool {
+    if total_size > MAX_MEMORY_SIZE {
+        let size_mb = total_size as f64 / (1024.0 * 1024.0);
+        println!("\n{}", format!("[!] Large wordlists: {:.1} MB", size_mb).yellow());
+        println!("Options:");
+        println!("  1. Load into memory (faster, ~{:.0} MB RAM)", size_mb);
+        println!("  2. Streaming mode (slower, minimal memory)");
+        println!();
+        !prompt_yes_no("Load into memory? (y/n): ", true)
+    } else {
+        false
+    }
+}
+
+async fn load_wordlists_streaming(
+    config: &TelnetBruteforceConfig,
+) -> Result<(Vec<String>, Vec<String>, usize, usize)> {
+    println!("[*] Using streaming mode...");
+    let user_count = count_nonempty_lines(&config.username_wordlist).await?;
+    let pass_count = if let Some(ref path) = config.password_wordlist {
+        count_nonempty_lines(path).await?
+    } else {
+        0
+    };
+    Ok((Vec::new(), Vec::new(), user_count, pass_count))
+}
+
+async fn load_wordlists_memory(
+    config: &TelnetBruteforceConfig,
+) -> Result<(Vec<String>, Vec<String>, usize, usize)> {
+    println!("[*] Loading wordlists into memory...");
+    let (usernames, passwords) = tokio::join!(
+        load_wordlist(&config.username_wordlist),
+                                              async {
+                                                  if let Some(ref path) = config.password_wordlist {
+                                                      load_wordlist(path).await
+                                                  } else {
+                                                      Ok(Vec::new())
+                                                  }
+                                              }
+    );
+
+    let usernames = usernames?;
+    let passwords = passwords?;
+    Ok((usernames.clone(), passwords.clone(), usernames.len(), passwords.len()))
+}
+
+fn calculate_estimated_attempts(
+    config: &TelnetBruteforceConfig,
+    username_count: usize,
+    password_count: usize,
+) -> usize {
+    let mut estimated = if config.full_combo {
+        username_count * password_count
+    } else if username_count == 1 {
+        password_count
+    } else if password_count == 1 {
+        username_count
+    } else {
+        password_count
+    };
+
+    if config.raw_bruteforce {
+        let charset_len = config.raw_charset.chars().count();
+        let mut raw_total = 0u64;
+        for len in config.raw_min_length..=config.raw_max_length {
+            raw_total += charset_len.pow(len as u32) as u64;
+        }
+        println!("[*] Raw bruteforce: ~{} passwords", raw_total);
+
+        let users_for_raw = if config.full_combo || username_count == 1 {
+            username_count as u64
+        } else {
+            1
+        };
+        estimated += (raw_total * users_for_raw) as usize;
+    }
+
+    estimated
+}
+
+async fn initialize_output_file(output_file: &str, config: &TelnetBruteforceConfig) -> Result<()> {
+    if !config.append_mode {
+        let mut f = File::create(output_file).await?;
+        f.write_all(format!("# Telnet Results - {}\n", chrono::Local::now()).as_bytes()).await?;
+        f.write_all(format!("# Target: {}:{}\n", config.target, config.port).as_bytes()).await?;
+        f.write_all(b"# Format: username:password\n\n").await?;
+    }
+    Ok(())
+}
+
+async fn validate_telnet_target(addr: &str, config: &TelnetBruteforceConfig) -> Result<()> {
+    let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
+
+    let mut stream = timeout(
+        Duration::from_secs(config.connection_timeout),
+                             TcpStream::connect(socket)
+    ).await??;
+
+    let mut buf = vec![0u8; 1024];
+    match timeout(Duration::from_secs(config.read_timeout), stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let response = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+            if response.contains("login") || response.contains("username") ||
+                response.contains("telnet") || response.contains("password") {
+                    Ok(())
+                } else {
+                    Err(anyhow!("No telnet prompts detected"))
+                }
+        }
+        _ => Err(anyhow!("No response from target")),
+    }
+}
+
+async fn append_result(output_file: &str, username: &str, password: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(output_file)
+    .await?;
+
+    file.write_all(format!("{}:{}\n", username, password).as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+async fn print_final_report(
+    found_creds: &Arc<Mutex<HashSet<(String, String)>>>,
+                            output_file: &str,
+) {
+    let found = found_creds.lock().await;
+    println!();
+    if found.is_empty() {
+        println!("{}", "[-] No valid credentials found".yellow());
+    } else {
+        println!("{}", format!("[+] Found {} credential(s):", found.len()).green().bold());
+        let mut sorted: Vec<_> = found.iter().collect();
+        sorted.sort();
+        for (u, p) in sorted.iter() {
+            println!("  {}  {}:{}", "✓".green(), u, p);
+        }
+        println!("\n[*] Results saved to: {}", output_file);
+    }
+}
+
+async fn load_wordlist(path: &str) -> Result<Vec<String>> {
+    let content = tokio::fs::read_to_string(path).await?;
+    Ok(content
+    .lines()
+    .filter_map(|s| {
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+    .collect())
+}
+
+async fn count_nonempty_lines(path: &str) -> Result<usize> {
+    let content = tokio::fs::read_to_string(path).await?;
+    Ok(content.lines().filter(|line| !line.trim().is_empty()).count())
+}
+
+fn parse_single_target(input: &str) -> Result<Vec<String>> {
+    let input = input.trim();
+
+    if input.contains('/') {
+        match input.parse::<ipnetwork::IpNetwork>() {
+            Ok(network) => {
+                let mut ips = Vec::new();
+                for ip in network.iter() {
+                    ips.push(ip.to_string());
+                }
+                println!("[*] Expanded {} to {} hosts", input, ips.len());
+                Ok(ips)
+            }
+            Err(_) => Err(anyhow!("Invalid CIDR: {}", input)),
+        }
+    } else {
+        Ok(vec![input.to_string()])
+    }
+}
+
+fn parse_targets(input: &str) -> Result<Vec<String>> {
+    let mut targets = Vec::new();
+
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if line.contains('/') {
+            match line.parse::<ipnetwork::IpNetwork>() {
+                Ok(network) => {
+                    for ip in network.iter() {
+                        targets.push(ip.to_string());
+                    }
+                }
+                Err(_) => println!("{} Invalid CIDR: {}", "[!]".yellow(), line),
+            }
+        } else {
+            targets.push(line.to_string());
+        }
+    }
+
+    Ok(targets)
+}
+
+async fn load_credentials_file(path: &str) -> Result<Vec<(String, String)>> {
+    let content = tokio::fs::read_to_string(path).await?;
+    let mut creds = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((user, pass)) = line.split_once(':') {
+            creds.push((user.trim().to_string(), pass.trim().to_string()));
+        }
+    }
+
+    Ok(creds)
+}
+
+fn save_batch_results(results: &[ScanResult], filename: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(filename)?;
+
+    use std::io::Write;
+    for result in results {
+        let creds_str = match &result.credentials {
+            Some((u, p)) => format!("{}/{}", u, if p.is_empty() { "(blank)" } else { p }),
+            None => "none".to_string(),
+        };
+
+        writeln!(
+            file,
+            "[{}] {}:{} - {} - banner: {}",
+            result.timestamp,
+            result.ip,
+            result.port,
+            creds_str,
+            result.banner.replace('\n', " ").replace('\r', "")
+        )?;
+    }
+
+    Ok(())
+}
+
+fn normalize_target(host: &str, default_port: u16) -> Result<String> {
+    static TARGET_REGEX: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^\[*(?P<addr>[^\]]+?)\]*(?::(?P<port>\d{1,5}))?$")
+        .expect("Invalid regex")
+    });
+
+    let caps = TARGET_REGEX
+    .captures(host.trim())
+    .ok_or_else(|| anyhow!("Invalid target format"))?;
+
+    let addr = caps.name("addr").unwrap().as_str();
+    let port = if let Some(m) = caps.name("port") {
+        m.as_str().parse::<u16>()?
+    } else {
+        default_port
+    };
+
+    let formatted = if addr.contains(':') && !addr.contains('.') {
+        format!("[{}]:{}", addr, port)
+    } else {
+        format!("{}:{}", addr, port)
+    };
+
+    formatted.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
+
+    Ok(formatted)
+}
+
+// ============================================================
 // PROMPT/INPUT FUNCTIONS
 // ============================================================
 
@@ -1840,7 +1979,7 @@ fn display_banner() {
     println!();
     println!("{}", "╔══════════════════════════════════════════════╗".bright_cyan());
     println!("{}", "║   TELNET SECURITY TESTING MODULE            ║".bright_cyan());
-    println!("{}", "║   Advanced Bruteforce & Batch Scanner       ║".bright_cyan());
+    println!("{}", "║   Advanced Bruteforce & Subnet Scanner      ║".bright_cyan());
     println!("{}", "╚══════════════════════════════════════════════╝".bright_cyan());
     println!();
     println!("{}", "⚠️  AUTHORIZED USE ONLY".yellow().bold());
@@ -2023,31 +2162,3 @@ fn prompt_list(prompt_text: &str) -> Vec<String> {
     .collect()
 }
 
-fn normalize_target(host: &str, default_port: u16) -> Result<String> {
-    use once_cell::sync::Lazy;
-    static TARGET_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^\[*(?P<addr>[^\]]+?)\]*(?::(?P<port>\d{1,5}))?$")
-        .expect("Invalid regex")
-    });
-
-    let caps = TARGET_REGEX
-    .captures(host.trim())
-    .ok_or_else(|| anyhow!("Invalid target format"))?;
-
-    let addr = caps.name("addr").unwrap().as_str();
-    let port = if let Some(m) = caps.name("port") {
-        m.as_str().parse::<u16>()?
-    } else {
-        default_port
-    };
-
-    let formatted = if addr.contains(':') && !addr.contains('.') {
-        format!("[{}]:{}", addr, port)
-    } else {
-        format!("{}:{}", addr, port)
-    };
-
-    formatted.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
-
-    Ok(formatted)
-}
