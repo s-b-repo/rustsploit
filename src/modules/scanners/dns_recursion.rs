@@ -7,12 +7,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
-use trust_dns_client::client::{AsyncClient, ClientHandle};
-use trust_dns_client::proto::op::ResponseCode;
-use trust_dns_client::rr::{DNSClass, Name, RecordType};
-use trust_dns_client::udp::UdpClientStream;
-use trust_dns_proto::op::Message;
-use trust_dns_proto::xfer::DnsResponse;
+use hickory_client::client::{AsyncClient, ClientHandle};
+use hickory_client::proto::op::ResponseCode;
+use hickory_client::rr::{DNSClass, Name, RecordType};
+use hickory_client::udp::UdpClientStream;
+use hickory_proto::op::Message;
+use hickory_proto::xfer::DnsResponse;
 use tokio::net::UdpSocket;
 
 #[derive(Clone, Debug)]

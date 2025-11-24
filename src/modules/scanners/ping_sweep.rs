@@ -1,17 +1,25 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use ipnet::IpNet;
+use libc;
+use pnet_packet::ip::IpNextHeaderProtocols;
+use pnet_packet::ipv4::{self, MutableIpv4Packet};
+use pnet_packet::tcp::{self, MutableTcpPacket, TcpFlags};
+use pnet_packet::Packet;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashSet,
     fs::File,
     io::{self, BufRead, BufReader, Write},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
-use tokio::{net::TcpStream, process::Command, sync::Semaphore, time::Duration};
+use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Duration};
+use rand::Rng;
+use std::mem::MaybeUninit;
 
 #[derive(Clone, Debug)]
 struct PingConfig {
@@ -20,12 +28,16 @@ struct PingConfig {
     concurrency: usize,
     timeout_secs: u64,
     verbose: bool,
+    save_up_hosts: Option<String>,
+    save_down_hosts: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 enum PingMethod {
     Icmp,
     Tcp { ports: Vec<u16> },
+    Syn { ports: Vec<u16> },
+    Ack { ports: Vec<u16> },
 }
 
 impl PingMethod {
@@ -46,6 +58,34 @@ impl PingMethod {
                     )
                 }
             }
+            PingMethod::Syn { ports } => {
+                if ports.len() == 1 {
+                    format!("SYN/{}", ports[0])
+                } else {
+                    format!(
+                        "SYN [{}]",
+                        ports
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
+            PingMethod::Ack { ports } => {
+                if ports.len() == 1 {
+                    format!("ACK/{}", ports[0])
+                } else {
+                    format!(
+                        "ACK [{}]",
+                        ports
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
         }
     }
 
@@ -53,6 +93,8 @@ impl PingMethod {
         match self {
             PingMethod::Icmp => "ICMP",
             PingMethod::Tcp { .. } => "TCP",
+            PingMethod::Syn { .. } => "SYN",
+            PingMethod::Ack { .. } => "ACK",
         }
     }
 
@@ -60,6 +102,8 @@ impl PingMethod {
         match self {
             PingMethod::Icmp => icmp_probe(ip, timeout).await,
             PingMethod::Tcp { ports } => tcp_probe(ip, ports, timeout).await,
+            PingMethod::Syn { ports } => syn_probe(ip, ports, timeout).await,
+            PingMethod::Ack { ports } => ack_probe(ip, ports, timeout).await,
         }
     }
 }
@@ -174,6 +218,23 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
         prompt_usize("Max concurrent hosts", 100, Some(1), Some(10_000))?;
     let verbose = prompt_yes_no("Verbose output (show down hosts/errors)?", false)?;
 
+    // Ask about saving results
+    let save_up_hosts = if prompt_yes_no("Save up hosts to file?", false)? {
+        let default_file = "ping_sweep_up_hosts.txt";
+        let file_path = prompt_with_default("Output file for up hosts", default_file)?;
+        Some(file_path)
+    } else {
+        None
+    };
+
+    let save_down_hosts = if prompt_yes_no("Save down hosts to file?", false)? {
+        let default_file = "ping_sweep_down_hosts.txt";
+        let file_path = prompt_with_default("Output file for down hosts", default_file)?;
+        Some(file_path)
+    } else {
+        None
+    };
+
     let methods = loop {
         let mut methods = Vec::new();
 
@@ -190,6 +251,30 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
                 println!("{}", "    No valid ports provided.".yellow());
             } else {
                 methods.push(PingMethod::Tcp { ports });
+            }
+        }
+
+        if prompt_yes_no("Use SYN scan (stealth scan, requires root)?", false)? {
+            let default_ports = "80,443";
+            let port_input =
+                prompt_with_default("TCP ports for SYN scan (comma separated)", default_ports)?;
+            let ports = parse_ports(&port_input)?;
+            if ports.is_empty() {
+                println!("{}", "    No valid ports provided.".yellow());
+            } else {
+                methods.push(PingMethod::Syn { ports });
+            }
+        }
+
+        if prompt_yes_no("Use ACK scan (filter detection, requires root)?", false)? {
+            let default_ports = "80,443";
+            let port_input =
+                prompt_with_default("TCP ports for ACK scan (comma separated)", default_ports)?;
+            let ports = parse_ports(&port_input)?;
+            if ports.is_empty() {
+                println!("{}", "    No valid ports provided.".yellow());
+            } else {
+                methods.push(PingMethod::Ack { ports });
             }
         }
 
@@ -218,6 +303,8 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
         concurrency,
         timeout_secs,
         verbose,
+        save_up_hosts,
+        save_down_hosts,
     })
 }
 
@@ -294,6 +381,11 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 
     let processed_counter = Arc::new(AtomicUsize::new(0));
     let start_time = std::time::Instant::now();
+    
+    // Collections for saving results
+    let up_hosts_list = Arc::new(Mutex::new(Vec::<String>::new()));
+    let down_hosts_list = Arc::new(Mutex::new(Vec::<String>::new()));
+    
     let mut tasks = Vec::new();
     
     for ip in hosts {
@@ -301,6 +393,8 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
         let methods_clone = methods.clone();
         let success_clone = success_counter.clone();
         let processed_clone = processed_counter.clone();
+        let up_list = up_hosts_list.clone();
+        let down_list = down_hosts_list.clone();
         tasks.push(tokio::spawn(async move {
             let permit = match sem.acquire_owned().await {
                 Ok(p) => p,
@@ -363,8 +457,18 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     )
                     .green()
                 );
-            } else if verbose {
-                println!("\r{}", format!("[-] Host {} is down", ip_string).dimmed());
+                // Add to up hosts list
+                if let Ok(mut list) = up_list.lock() {
+                    list.push(ip_string.clone());
+                }
+            } else {
+                // Add to down hosts list
+                if let Ok(mut list) = down_list.lock() {
+                    list.push(ip_string.clone());
+                }
+                if verbose {
+                    println!("\r{}", format!("[-] Host {} is down", ip_string).dimmed());
+                }
             }
         }));
     }
@@ -387,6 +491,54 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
         .bold()
     );
 
+    // Save results to files if requested
+    if let Some(ref up_file) = config.save_up_hosts {
+        let up_list = up_hosts_list.lock().unwrap();
+        if !up_list.is_empty() {
+            match save_hosts_to_file(&up_list, up_file) {
+                Ok(_) => {
+                    println!("{}", format!("[+] Saved {} up hosts to '{}'", up_list.len(), up_file).green());
+                }
+                Err(e) => {
+                    eprintln!("{}", format!("[!] Failed to save up hosts to '{}': {}", up_file, e).red());
+                }
+            }
+        } else {
+            println!("{}", format!("[*] No up hosts to save to '{}'", up_file).yellow());
+        }
+    }
+
+    if let Some(ref down_file) = config.save_down_hosts {
+        let down_list = down_hosts_list.lock().unwrap();
+        if !down_list.is_empty() {
+            match save_hosts_to_file(&down_list, down_file) {
+                Ok(_) => {
+                    println!("{}", format!("[+] Saved {} down hosts to '{}'", down_list.len(), down_file).green());
+                }
+                Err(e) => {
+                    eprintln!("{}", format!("[!] Failed to save down hosts to '{}': {}", down_file, e).red());
+                }
+            }
+        } else {
+            println!("{}", format!("[*] No down hosts to save to '{}'", down_file).yellow());
+        }
+    }
+
+    Ok(())
+}
+
+fn save_hosts_to_file(hosts: &[String], file_path: &str) -> Result<()> {
+    let mut file = File::create(file_path)
+        .with_context(|| format!("Failed to create file '{}'", file_path))?;
+    
+    for host in hosts {
+        writeln!(file, "{}", host)
+            .with_context(|| format!("Failed to write to file '{}'", file_path))?;
+    }
+    
+    file.flush()
+        .with_context(|| format!("Failed to flush file '{}'", file_path))?;
+    
     Ok(())
 }
 
@@ -467,6 +619,368 @@ async fn tcp_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<
     }
     
     Ok(successes)
+}
+
+async fn syn_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<String>> {
+    // SYN scan only works with IPv4
+    let ipv4 = match ip {
+        IpAddr::V4(addr) => *addr,
+        IpAddr::V6(_) => {
+            return Err(anyhow!("SYN scan only supports IPv4 addresses"));
+        }
+    };
+
+    let mut successes = Vec::new();
+    
+    for port in ports {
+        match syn_probe_single(&ipv4, *port, timeout).await {
+            Ok(true) => successes.push(format!("SYN/{}", port)),
+            Ok(false) => {}
+            Err(e) => {
+                // Silently continue on errors (permission denied, etc.)
+                if e.to_string().contains("Permission denied") {
+                    return Err(anyhow!("SYN scan requires root privileges. Run with sudo or use TCP connect scan instead."));
+                }
+            }
+        }
+    }
+    
+    Ok(successes)
+}
+
+async fn syn_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result<bool> {
+    use std::net::Ipv4Addr as StdIpv4Addr;
+    use std::net::IpAddr as StdIpAddr;
+    
+    // Create raw socket for sending
+    let sender = Socket::new(
+        Domain::IPV4,
+        Type::RAW,
+        Some(Protocol::from(libc::IPPROTO_RAW)),
+    )
+    .context("Failed to create raw socket for SYN scan")?;
+    
+    sender
+        .set_header_included_v4(true)
+        .context("Failed to set IP_HDRINCL")?;
+    
+    // Create raw socket for receiving TCP responses
+    let receiver = Socket::new(
+        Domain::IPV4,
+        Type::RAW,
+        Some(Protocol::TCP),
+    )
+    .context("Failed to create receiver socket for SYN scan")?;
+    
+    receiver
+        .set_read_timeout(Some(timeout))
+        .context("Failed to set read timeout")?;
+    
+    // Get source IP (use a dummy IP if we can't determine it)
+    let src_ip = get_local_ipv4().unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
+    
+    // Craft SYN packet - generate all random values before any await
+    let (src_port, seq_num, ip_id) = {
+        let mut rng = rand::rng();
+        (
+            rng.random_range(49152..=65535),
+            rng.random::<u32>(),
+            rng.random::<u16>(),
+        )
+    };
+    
+    let tcp_header_len = 20;
+    let mut tcp_buf = vec![0u8; tcp_header_len];
+    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    tcp_pkt.set_source(src_port);
+    tcp_pkt.set_destination(port);
+    tcp_pkt.set_sequence(seq_num);
+    tcp_pkt.set_acknowledgement(0);
+    tcp_pkt.set_data_offset(5);
+    tcp_pkt.set_flags(TcpFlags::SYN);
+    tcp_pkt.set_window(65535);
+    tcp_pkt.set_urgent_ptr(0);
+    
+    let tcp_immutable = tcp_pkt.to_immutable();
+    tcp_pkt.set_checksum(tcp::ipv4_checksum(&tcp_immutable, &src_ip, ip));
+    
+    // Craft IP packet
+    const IPV4_HEADER_LEN: usize = 20;
+    let total_len = (IPV4_HEADER_LEN + tcp_header_len) as u16;
+    let mut ip_buf = vec![0u8; total_len as usize];
+    let mut ip_pkt = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    ip_pkt.set_version(4);
+    ip_pkt.set_header_length(5);
+    ip_pkt.set_total_length(total_len);
+    ip_pkt.set_identification(ip_id);
+    ip_pkt.set_ttl(64);
+    ip_pkt.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+    ip_pkt.set_source(src_ip);
+    ip_pkt.set_destination(*ip);
+    ip_pkt.set_flags(ipv4::Ipv4Flags::DontFragment);
+    ip_pkt.set_payload(tcp_pkt.packet());
+    ip_pkt.set_checksum(ipv4::checksum(&ip_pkt.to_immutable()));
+    
+    // Send packet (blocking operation)
+    let dst_addr = SocketAddr::new(StdIpAddr::V4(StdIpv4Addr::from(*ip)), 0);
+    sender
+        .send_to(ip_pkt.packet(), &dst_addr.into())
+        .context("Failed to send SYN packet")?;
+    
+    // Listen for response using spawn_blocking for async compatibility
+    let receiver_arc = Arc::new(receiver);
+    let start = std::time::Instant::now();
+    
+    while start.elapsed() < timeout {
+        let sock_clone = receiver_arc.try_clone().map_err(|e| anyhow!("Failed to clone socket: {}", e))?;
+        let ip_clone = *ip;
+        let port_clone = port;
+        let src_ip_clone = src_ip;
+        let src_port_clone = src_port;
+        
+        let recv_result = task::spawn_blocking(move || -> Result<Option<(Vec<u8>, SocketAddr)>, std::io::Error> {
+            let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
+            match sock_clone.recv_from(&mut buf) {
+                Ok((len, addr)) => {
+                    let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
+                    let sock_addr = addr.as_socket().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "convert"))?;
+                    Ok(Some((slice.to_vec(), sock_addr)))
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .context("Blocking task for recv_from failed")?;
+        
+        match recv_result {
+            Ok(Some((data, _))) => {
+                if data.len() < IPV4_HEADER_LEN {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                
+                // Parse IP header
+                if let Some(ip_recv) = ipv4::Ipv4Packet::new(&data) {
+                    if ip_recv.get_source() == ip_clone && ip_recv.get_destination() == src_ip_clone {
+                        // Parse TCP header
+                        let tcp_offset = (ip_recv.get_header_length() as usize) * 4;
+                        if data.len() >= tcp_offset + 20 {
+                            if let Some(tcp_recv) = tcp::TcpPacket::new(&data[tcp_offset..]) {
+                                if tcp_recv.get_source() == port_clone && tcp_recv.get_destination() == src_port_clone {
+                                    let flags = tcp_recv.get_flags();
+                                    // SYN-ACK means port is open
+                                    if flags & (TcpFlags::SYN | TcpFlags::ACK) == (TcpFlags::SYN | TcpFlags::ACK) {
+                                        return Ok(true);
+                                    }
+                                    // RST means port is closed but host is up
+                                    if flags & TcpFlags::RST == TcpFlags::RST {
+                                        return Ok(true); // Host is up
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // Timeout or would block - continue waiting
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
+async fn ack_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<String>> {
+    // ACK scan only works with IPv4
+    let ipv4 = match ip {
+        IpAddr::V4(addr) => *addr,
+        IpAddr::V6(_) => {
+            return Err(anyhow!("ACK scan only supports IPv4 addresses"));
+        }
+    };
+
+    let mut successes = Vec::new();
+    
+    for port in ports {
+        match ack_probe_single(&ipv4, *port, timeout).await {
+            Ok(true) => successes.push(format!("ACK/{}", port)),
+            Ok(false) => {}
+            Err(e) => {
+                // Silently continue on errors (permission denied, etc.)
+                if e.to_string().contains("Permission denied") {
+                    return Err(anyhow!("ACK scan requires root privileges. Run with sudo or use TCP connect scan instead."));
+                }
+            }
+        }
+    }
+    
+    Ok(successes)
+}
+
+async fn ack_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result<bool> {
+    use std::net::Ipv4Addr as StdIpv4Addr;
+    use std::net::IpAddr as StdIpAddr;
+    
+    // Create raw socket for sending
+    let sender = Socket::new(
+        Domain::IPV4,
+        Type::RAW,
+        Some(Protocol::from(libc::IPPROTO_RAW)),
+    )
+    .context("Failed to create raw socket for ACK scan")?;
+    
+    sender
+        .set_header_included_v4(true)
+        .context("Failed to set IP_HDRINCL")?;
+    
+    // Create raw socket for receiving TCP responses
+    let receiver = Socket::new(
+        Domain::IPV4,
+        Type::RAW,
+        Some(Protocol::TCP),
+    )
+    .context("Failed to create receiver socket for ACK scan")?;
+    
+    receiver
+        .set_read_timeout(Some(timeout))
+        .context("Failed to set read timeout")?;
+    
+    // Get source IP
+    let src_ip = get_local_ipv4().unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
+    
+    // Craft ACK packet - generate all random values before any await
+    let (src_port, seq_num, ip_id) = {
+        let mut rng = rand::rng();
+        (
+            rng.random_range(49152..=65535),
+            rng.random::<u32>(),
+            rng.random::<u16>(),
+        )
+    };
+    
+    let tcp_header_len = 20;
+    let mut tcp_buf = vec![0u8; tcp_header_len];
+    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    tcp_pkt.set_source(src_port);
+    tcp_pkt.set_destination(port);
+    tcp_pkt.set_sequence(seq_num);
+    tcp_pkt.set_acknowledgement(0);
+    tcp_pkt.set_data_offset(5);
+    tcp_pkt.set_flags(TcpFlags::ACK);
+    tcp_pkt.set_window(65535);
+    tcp_pkt.set_urgent_ptr(0);
+    
+    let tcp_immutable = tcp_pkt.to_immutable();
+    tcp_pkt.set_checksum(tcp::ipv4_checksum(&tcp_immutable, &src_ip, ip));
+    
+    // Craft IP packet
+    const IPV4_HEADER_LEN: usize = 20;
+    let total_len = (IPV4_HEADER_LEN + tcp_header_len) as u16;
+    let mut ip_buf = vec![0u8; total_len as usize];
+    let mut ip_pkt = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    ip_pkt.set_version(4);
+    ip_pkt.set_header_length(5);
+    ip_pkt.set_total_length(total_len);
+    ip_pkt.set_identification(ip_id);
+    ip_pkt.set_ttl(64);
+    ip_pkt.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+    ip_pkt.set_source(src_ip);
+    ip_pkt.set_destination(*ip);
+    ip_pkt.set_flags(ipv4::Ipv4Flags::DontFragment);
+    ip_pkt.set_payload(tcp_pkt.packet());
+    ip_pkt.set_checksum(ipv4::checksum(&ip_pkt.to_immutable()));
+    
+    // Send packet (blocking operation)
+    let dst_addr = SocketAddr::new(StdIpAddr::V4(StdIpv4Addr::from(*ip)), 0);
+    sender
+        .send_to(ip_pkt.packet(), &dst_addr.into())
+        .context("Failed to send ACK packet")?;
+    
+    // Listen for response using spawn_blocking for async compatibility
+    let receiver_arc = Arc::new(receiver);
+    let start = std::time::Instant::now();
+    
+    while start.elapsed() < timeout {
+        let sock_clone = receiver_arc.try_clone().map_err(|e| anyhow!("Failed to clone socket: {}", e))?;
+        let ip_clone = *ip;
+        let port_clone = port;
+        let src_ip_clone = src_ip;
+        let src_port_clone = src_port;
+        
+        let recv_result = task::spawn_blocking(move || -> Result<Option<(Vec<u8>, SocketAddr)>, std::io::Error> {
+            let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
+            match sock_clone.recv_from(&mut buf) {
+                Ok((len, addr)) => {
+                    let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
+                    let sock_addr = addr.as_socket().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "convert"))?;
+                    Ok(Some((slice.to_vec(), sock_addr)))
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .context("Blocking task for recv_from failed")?;
+        
+        match recv_result {
+            Ok(Some((data, _))) => {
+                if data.len() < IPV4_HEADER_LEN {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                
+                // Parse IP header
+                if let Some(ip_recv) = ipv4::Ipv4Packet::new(&data) {
+                    if ip_recv.get_source() == ip_clone && ip_recv.get_destination() == src_ip_clone {
+                        // Parse TCP header
+                        let tcp_offset = (ip_recv.get_header_length() as usize) * 4;
+                        if data.len() >= tcp_offset + 20 {
+                            if let Some(tcp_recv) = tcp::TcpPacket::new(&data[tcp_offset..]) {
+                                if tcp_recv.get_source() == port_clone && tcp_recv.get_destination() == src_port_clone {
+                                    let flags = tcp_recv.get_flags();
+                                    // RST means port is unfiltered (host is up)
+                                    if flags & TcpFlags::RST == TcpFlags::RST {
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // Timeout or would block - continue waiting
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
+fn get_local_ipv4() -> Option<Ipv4Addr> {
+    // Try to get a local IPv4 address for the source IP
+    // This is a simple implementation - in production you might want more sophisticated logic
+    use std::net::UdpSocket;
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local_addr) = socket.local_addr() {
+                if let IpAddr::V4(ipv4) = local_addr.ip() {
+                    return Some(ipv4);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn prompt_line(message: &str, allow_empty: bool) -> Result<String> {
