@@ -2398,3 +2398,10 @@ if stop_flag.load(Ordering::Relaxed) {  // ❌ Check happens AFTER receiving wor
     break;
 }
 
+Removed the unused rdp dependency, which should eliminate the atomic-polyfill and atty warnings. The RDP bruteforce module uses external commands (xfreerdp/rdesktop), not the rdp crate.
+For the async-std warning from suppaftp, it's a transitive dependency and only a warning (not a vulnerability). We can wait for suppaftp to update or consider alternatives later.
+Summary of fixes:
+Removed unused rdp dependency — eliminates atomic-polyfill and atty warnings
+Updated suppaftp to version 6.3 — may help with async-std if a newer version addresses it
+Added comments explaining the remaining async-std warning
+The remaining async-std warning is from suppaftp's transitive dependencies and is a maintenance warning, not a security vulnerability. It should be addressed upstream by the suppaftp maintainers.
