@@ -101,3 +101,10 @@ home = "=0.5.11"               # pinned for edition 2021 compatibility
 
 [build-dependencies]
 regex = "1.11"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
