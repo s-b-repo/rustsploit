@@ -7,6 +7,7 @@ mod commands;
 mod modules;
 mod utils;
 mod api;
+mod config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,6 +34,12 @@ async fn main() -> Result<()> {
 
         api::start_api_server(&bind_address, api_key, harden, ip_limit).await?;
         return Ok(());
+    }
+
+    // Set global target if provided
+    if let Some(ref target) = cli_args.set_target {
+        config::GLOBAL_CONFIG.set_target(target)?;
+        println!("✓ Global target set to: {}", target);
     }
 
     // If user provided subcommands (e.g., "exploit", "scan", etc.) from CLI, handle them directly:

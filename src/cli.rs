@@ -39,4 +39,8 @@ pub struct Cli {
     /// IP limit for hardening mode (default: 10 unique IPs)
     #[arg(long, requires = "harden", default_value = "10")]
     pub ip_limit: Option<u32>,
+
+    /// Set global target IP/subnet for all modules
+    #[arg(long)]
+    pub set_target: Option<String>,
 }

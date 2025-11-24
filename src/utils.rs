@@ -113,8 +113,8 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             return Err(anyhow!("Invalid target format: contains spaces"));
         }
         
-        // Check for valid hostname/IPv4 characters
-        let host_re = Regex::new(r"^[a-zA-Z0-9.\-_:]+$").unwrap();
+        // Check for valid hostname/IPv4/CIDR characters (allow / for CIDR notation)
+        let host_re = Regex::new(r"^[a-zA-Z0-9.\-_:/]+$").unwrap();
         if !host_re.is_match(&sanitized) {
             return Err(anyhow!("Invalid target format: contains invalid characters"));
         }

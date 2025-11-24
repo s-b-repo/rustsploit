@@ -4,12 +4,30 @@ pub mod creds;
 
 use anyhow::Result;
 use crate::cli::Cli;
+use crate::config;
 use walkdir::WalkDir;
 use crate::utils::normalize_target;
 
 /// CLI dispatcher: e.g. --command scanner --target "::1" --module scanners/port_scanner
 pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
-    let raw = cli_args.target.clone().unwrap_or_default();
+    // Use CLI target if provided, otherwise try global target
+    let raw = if let Some(ref t) = cli_args.target {
+        t.clone()
+    } else if config::GLOBAL_CONFIG.has_target() {
+        // Use single IP from global target (handles subnets intelligently)
+        match config::GLOBAL_CONFIG.get_single_target_ip() {
+            Ok(ip) => {
+                println!("[*] Using global target: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default());
+                ip
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("No target specified and global target error: {}", e));
+            }
+        }
+    } else {
+        return Err(anyhow::anyhow!("No target specified. Use --target <ip> or --set-target <ip/subnet>"));
+    };
+    
     let target = normalize_target(&raw)?; // IPv6 wrap only, no port
     let module = cli_args.module.clone().unwrap_or_default();
 
@@ -35,6 +53,7 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
 }
 
 /// Interactive shell: handles `run` with raw target string
+/// If raw_target is empty, uses global target if available
 pub async fn run_module(module_path: &str, raw_target: &str) -> Result<()> {
     let available = discover_modules();
 
@@ -57,7 +76,26 @@ pub async fn run_module(module_path: &str, raw_target: &str) -> Result<()> {
         return Ok(());
     };
 
-    let target = normalize_target(raw_target)?;
+    // Use provided target, or fall back to global target
+    let target_str = if raw_target.is_empty() {
+        if config::GLOBAL_CONFIG.has_target() {
+            match config::GLOBAL_CONFIG.get_single_target_ip() {
+                Ok(ip) => {
+                    println!("[*] Using global target: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default());
+                    ip
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("No target specified and global target error: {}", e));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("No target specified. Use 'set target <ip/subnet>' or provide target when running module"));
+        }
+    } else {
+        raw_target.to_string()
+    };
+
+    let target = normalize_target(&target_str)?;
 
     let mut parts = resolved.splitn(2, '/');
     let category = parts.next().unwrap_or("");

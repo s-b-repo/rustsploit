@@ -1,5 +1,6 @@
 use crate::commands;
 use crate::utils;
+use crate::config;
 use anyhow::Result;
 use colored::*;
 use rand::prelude::*;
@@ -34,6 +35,20 @@ impl ShellContext {
 pub async fn interactive_shell() -> Result<()> {
     println!("Welcome to RustSploit Shell (inspired by RouterSploit)");
     println!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
+    
+    // Show global target if set
+    if config::GLOBAL_CONFIG.has_target() {
+        let target_str = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
+        if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+            if size > 1 {
+                println!("{}", format!("[*] Global target set: {} ({} IPs)", target_str, size).cyan());
+            } else {
+                println!("{}", format!("[*] Global target set: {}", target_str).cyan());
+            }
+        } else {
+            println!("{}", format!("[*] Global target set: {}", target_str).cyan());
+        }
+    }
 
     let mut ctx = ShellContext::new();
 
@@ -95,6 +110,32 @@ pub async fn interactive_shell() -> Result<()> {
                             ctx.current_module = None;
                             ctx.current_target = None;
                             println!("{}", "Cleared current module and target.".green());
+                        }
+                        "show_target" | "target" => {
+                            if let Some(ref t) = ctx.current_target {
+                                println!("{}", format!("Local target: {}", t).cyan());
+                            } else {
+                                println!("{}", "No local target set.".dimmed());
+                            }
+                            if config::GLOBAL_CONFIG.has_target() {
+                                let target_str = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
+                                if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+                                    if size > 1 {
+                                        println!("{}", format!("Global target (subnet): {} ({} IPs)", target_str, size).green());
+                                    } else {
+                                        println!("{}", format!("Global target: {}", target_str).green());
+                                    }
+                                } else {
+                                    println!("{}", format!("Global target: {}", target_str).green());
+                                }
+                            } else {
+                                println!("{}", "No global target set.".dimmed());
+                            }
+                        }
+                        "clear_target" => {
+                            ctx.current_target = None;
+                            config::GLOBAL_CONFIG.clear_target();
+                            println!("{}", "Cleared local and global targets.".green());
                         }
                         "help" => render_help(),
                         "modules" => utils::list_all_modules(),
@@ -252,11 +293,36 @@ pub async fn interactive_shell() -> Result<()> {
                             }
                         }
                         "set" => {
-                            if let Some(raw_value) = rest.strip_prefix("target").map(|s| s.trim()) {
+                            // Handle "set target <value>" - require "target " prefix with space
+                            if rest.starts_with("target ") {
+                                let raw_value = rest.strip_prefix("target ").unwrap().trim();
+                                if raw_value.is_empty() {
+                                    println!("{}", "Usage: set target <value>".yellow());
+                                    println!("{}", "  Examples:".dimmed());
+                                    println!("{}", "    set target 192.168.1.1".dimmed());
+                                    println!("{}", "    set target 192.168.1.0/24".dimmed());
+                                    println!("{}", "    set target example.com".dimmed());
+                                    continue;
+                                }
                                 match sanitize_target(raw_value) {
                                     Ok(valid_target) => {
+                                        // Set both local context and global config
                                         ctx.current_target = Some(valid_target.clone());
-                                        println!("{}", format!("Target set to {}", valid_target).green());
+                                        match config::GLOBAL_CONFIG.set_target(&valid_target) {
+                                            Ok(_) => {
+                                                if config::GLOBAL_CONFIG.is_subnet() {
+                                                    println!("{}", format!("Global target set to subnet: {}", valid_target).green());
+                                                } else {
+                                                    println!("{}", format!("Global target set to: {}", valid_target).green());
+                                                }
+                                                println!("{}", format!("Local target set to: {}", valid_target).green());
+                                            }
+                                            Err(e) => {
+                                                println!("{}", format!("[!] Failed to set global target: {}", e).red());
+                                                // Still set local target
+                                                println!("{}", format!("Local target set to: {}", valid_target).green());
+                                            }
+                                        }
                                     }
                                     Err(reason) => {
                                         println!("{}", format!("[!] {}", reason).yellow());
@@ -264,11 +330,34 @@ pub async fn interactive_shell() -> Result<()> {
                                 }
                             } else {
                                 println!("{}", "Usage: set target <value>".yellow());
+                                println!("{}", "  Examples:".dimmed());
+                                println!("{}", "    set target 192.168.1.1".dimmed());
+                                println!("{}", "    set target 192.168.1.0/24".dimmed());
+                                println!("{}", "    set target example.com".dimmed());
                             }
                         }
                         "run" => {
                             if let Some(ref module_path) = ctx.current_module {
-                                if let Some(ref t) = ctx.current_target {
+                                // Try to get target from local context, then global config
+                                let target = if let Some(ref t) = ctx.current_target {
+                                    Some(t.clone())
+                                } else if config::GLOBAL_CONFIG.has_target() {
+                                    // Use single IP from global target (handles subnets intelligently)
+                                    match config::GLOBAL_CONFIG.get_single_target_ip() {
+                                        Ok(ip) => {
+                                            println!("{}", format!("[*] Using global target: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default()).cyan());
+                                            Some(ip)
+                                        }
+                                        Err(e) => {
+                                            println!("{}", format!("[!] Error getting global target: {}", e).red());
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some(ref t) = target {
                                     if ctx.proxy_enabled && !ctx.proxy_list.is_empty() {
                                         let mut tried_proxies = HashSet::new();
                                         let mut success = false;
@@ -313,6 +402,90 @@ pub async fn interactive_shell() -> Result<()> {
                                     }
                                 } else {
                                     println!("{}", "No target set. Use 'set target <value>' first.".yellow());
+                                    println!("{}", "  Examples:".dimmed());
+                                    println!("{}", "    set target 192.168.1.1".dimmed());
+                                    println!("{}", "    set target 192.168.1.0/24".dimmed());
+                                }
+                            } else {
+                                println!("{}", "No module selected. Use 'use <module>' first.".yellow());
+                            }
+                        }
+                        "run_all" => {
+                            if let Some(ref module_path) = ctx.current_module {
+                                // Check if we have a subnet target
+                                if !config::GLOBAL_CONFIG.has_target() {
+                                    println!("{}", "No global target set. Use 'set target <ip/subnet>' first.".yellow());
+                                    continue;
+                                }
+
+                                if !config::GLOBAL_CONFIG.is_subnet() {
+                                    println!("{}", "Global target is not a subnet. Use 'run' for single targets.".yellow());
+                                    continue;
+                                }
+
+                                // Get all IPs from the subnet
+                                match config::GLOBAL_CONFIG.get_target_ips() {
+                                    Ok(ips) => {
+                                        let total = ips.len();
+                                        println!("{}", format!("[*] Running module '{}' against all {} IPs in subnet", module_path, total).cyan().bold());
+                                        println!("{}", format!("[*] Subnet: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default()).cyan());
+                                        
+                                        let mut success_count = 0;
+                                        let mut fail_count = 0;
+
+                                        for (idx, ip) in ips.iter().enumerate() {
+                                            println!("\n{}", format!("[{}/{}] Running against: {}", idx + 1, total, ip).yellow());
+                                            
+                                            if ctx.proxy_enabled && !ctx.proxy_list.is_empty() {
+                                                let mut tried_proxies = HashSet::new();
+                                                let mut success = false;
+
+                                                while tried_proxies.len() < ctx.proxy_list.len() {
+                                                    let chosen_proxy = pick_random_untried_proxy(&ctx.proxy_list, &tried_proxies);
+                                                    set_all_proxy_env(&chosen_proxy);
+
+                                                    match commands::run_module(module_path, ip).await {
+                                                        Ok(_) => {
+                                                            success = true;
+                                                            success_count += 1;
+                                                            break;
+                                                        }
+                                                        Err(e) => {
+                                                            if tried_proxies.is_empty() {
+                                                                eprintln!("[!] Module failed: {:?}", e);
+                                                            }
+                                                            tried_proxies.insert(chosen_proxy);
+                                                        }
+                                                    }
+                                                }
+
+                                                if !success {
+                                                    fail_count += 1;
+                                                    if ctx.proxy_list.len() == tried_proxies.len() {
+                                                        println!("{}", "[!] All proxies failed for this target".red());
+                                                    }
+                                                }
+                                            } else {
+                                                clear_proxy_env_vars();
+                                                match commands::run_module(module_path, ip).await {
+                                                    Ok(_) => success_count += 1,
+                                                    Err(e) => {
+                                                        eprintln!("[!] Module failed: {:?}", e);
+                                                        fail_count += 1;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        println!("\n{}", "=== Run All Summary ===".cyan().bold());
+                                        println!("{}", format!("Total IPs: {}", total).green());
+                                        println!("{}", format!("Successful: {}", success_count).green());
+                                        println!("{}", format!("Failed: {}", fail_count).red());
+                                    }
+                                    Err(e) => {
+                                        println!("{}", format!("[!] Error getting target IPs: {}", e).red());
+                                        println!("{}", "Note: Subnets larger than 65536 IPs are not supported for run_all. Use a smaller subnet.".yellow());
+                                    }
                                 }
                             } else {
                                 println!("{}", "No module selected. Use 'use <module>' first.".yellow());
@@ -382,7 +555,10 @@ fn resolve_command(cmd: &str) -> String {
         "show_proxies" | "proxies" | "pshow" | "proxy_show" => "show_proxies",
         "use" | "u" => "use",
         "set" | "target" => "set",
-        "run" | "go" | "exec" => "run",
+        "show_target" | "showtarget" | "st" => "show_target",
+        "clear_target" | "cleartarget" | "ct" => "clear_target",
+                        "run" | "go" | "exec" => "run",
+                        "run_all" | "runall" | "ra" => "run_all",
         "back" | "b" | "clear" | "reset" => "back",
         "exit" | "quit" | "q" => "exit",
         other => other,
@@ -445,8 +621,11 @@ fn render_help() {
         ("modules", "modules | ls | m", "List available modules"),
         ("find", "find <kw> | f1 <kw>", "Search modules by keyword"),
         ("use", "use <path> | u <path>", "Select a module to run"),
-        ("set target", "set target <value>", "Set current target host/IP"),
+        ("set target", "set target <value>", "Set global target (IP/subnet) for all modules"),
+        ("show_target", "show_target | target", "Show current local and global targets"),
+        ("clear_target", "clear_target", "Clear local and global targets"),
         ("run", "run | go", "Execute selected module (with proxy rotation)"),
+        ("run_all", "run_all | runall | ra", "Run module against all IPs in subnet (max 65536)"),
         ("back", "back | b | clear | reset", "Clear current module and target"),
         ("proxy_load", "proxy_load [file] | pl", "Load proxy list from file"),
         ("proxy_on", "proxy_on | pon", "Enable proxy usage"),
