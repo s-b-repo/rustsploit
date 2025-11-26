@@ -247,6 +247,10 @@ async fn send_and_receive_one(
             let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
             match sock_clone.recv_from(&mut buf) {
                 Ok((len, addr)) => {
+                    // Safe conversion: we know len is valid and within buf bounds
+                    if len > buf.len() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid buffer length"));
+                    }
                     let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
                     let sock_addr = addr.as_socket().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "convert"))?;
                     Ok(Some((slice.to_vec(), sock_addr)))
@@ -416,6 +420,7 @@ pub async fn run(target: &str) -> Result<()> {
     stdin().read_line(&mut user_input).expect("Failed to read line");
 
     if user_input.trim().to_lowercase() == "yes" {
+        // Safe wrapper for geteuid - it's a simple system call that cannot fail
         let euid = unsafe { libc::geteuid() };
         if euid != 0 {
             println!("don't lie");

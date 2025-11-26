@@ -293,13 +293,13 @@ async fn try_fortinet_login(
     form_data.insert("password", password.to_string());
     form_data.insert("ajax", "1".to_string());
     
-    if let Some(ref r) = realm {
+    if let Some(r) = realm {
         if !r.is_empty() {
             form_data.insert("realm", r.clone());
         }
     }
     
-    if let Some(ref token) = csrf_token {
+    if let Some(token) = csrf_token {
         form_data.insert("magic", token.clone());
     }
 
@@ -368,7 +368,7 @@ async fn try_fortinet_login(
 
     // Check redirect location
     if status.as_u16() == 302 {
-        if let Some(ref loc_str) = location_header {
+        if let Some(loc_str) = location_header {
             if loc_str.contains("/remote/index") 
                 || loc_str.contains("portal")
                 || loc_str.contains("index")
