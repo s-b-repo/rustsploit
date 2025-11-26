@@ -7,6 +7,7 @@ use rand::prelude::*;
 use std::env;
 use std::io::{self, Write};
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 const MAX_INPUT_LENGTH: usize = 4096;
 const MAX_PROXY_LIST_SIZE: usize = 10_000;
@@ -524,16 +525,27 @@ fn pick_random_untried_proxy(proxy_list: &[String], tried_proxies: &HashSet<Stri
     }
 }
 
+// Thread-safe environment variable access
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
 /// Sets ALL_PROXY so reqwest uses it for all requests (including socks4, socks5, http, https)
+/// Thread-safe wrapper around env::set_var
 fn set_all_proxy_env(proxy: &str) {
-    env::set_var("ALL_PROXY", proxy);
+    let _guard = ENV_MUTEX.lock().unwrap();
+    unsafe {
+        env::set_var("ALL_PROXY", proxy);
+    }
 }
 
 /// Clears environment variables for direct connection
+/// Thread-safe wrapper around env::remove_var
 fn clear_proxy_env_vars() {
-    env::remove_var("ALL_PROXY");
-    env::remove_var("HTTP_PROXY");
-    env::remove_var("HTTPS_PROXY");
+    let _guard = ENV_MUTEX.lock().unwrap();
+    unsafe {
+        env::remove_var("ALL_PROXY");
+        env::remove_var("HTTP_PROXY");
+        env::remove_var("HTTPS_PROXY");
+    }
 }
 
 fn split_command(input: &str) -> Option<(String, String)> {

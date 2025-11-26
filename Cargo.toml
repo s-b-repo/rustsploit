@@ -1,7 +1,7 @@
 [package]
 name = "rustsploit"
 version = "0.3.5"
-edition = "2021"
+edition = "2024"
 build = "build.rs"
 
 [[bin]]
@@ -96,7 +96,7 @@ hickory-proto = "0.24"
 
 # Misc utilities
 once_cell = "1.19"
-home = "=0.5.11"               # pinned for edition 2021 compatibility
+home = "0.5"                   # updated for edition 2024 compatibility
 
 [build-dependencies]
 regex = "1.11"
