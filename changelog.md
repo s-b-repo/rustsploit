@@ -1981,11 +1981,10 @@ let pair = {
     guard.recv().await
 };
 
-let Some((user, pass)) = pair else { break };
 
-if stop_flag.load(Ordering::Relaxed) {  // ❌ Check happens AFTER receiving work
-    break;
-}
+
+
+
 
 
 
@@ -2393,6 +2392,12 @@ Removed unused import: Removed Read from the imports since it's not directly use
 Fixed error type: FtpError::ConnectionError expects an Error type, not a String. Changed it to use std::io::Error::new() to create a proper error from the I/O error.
 
 
+let Some((user, pass)) = pair else { break };
+
+if stop_flag.load(Ordering::Relaxed) {  // ❌ Check happens AFTER receiving work
+    break;
+}
+
 Removed the unused rdp dependency, which should eliminate the atomic-polyfill and atty warnings. The RDP bruteforce module uses external commands (xfreerdp/rdesktop), not the rdp crate.
 For the async-std warning from suppaftp, it's a transitive dependency and only a warning (not a vulnerability). We can wait for suppaftp to update or consider alternatives later.
 Summary of fixes:
@@ -2415,46 +2420,6 @@ The remaining async-std warning is from suppaftp's transitive dependencies and i
 
 
 
-### migration to 2024
-
-Fixed the Rust 2024 edition compatibility issues:
-
-Fixed binding modifiers in fortinet_bruteforce.rs:
-
-Removed ref from pattern matches (if let Some(ref r) = realm → if let Some(r) = realm)
-Rust 2024's improved match ergonomics automatically handle references, so ref is no longer needed
-
-Fixed unsafe function calls in shell.rs:
-Wrapped env::set_var and env::remove_var calls in unsafe blocks
-In Rust 2024, these functions are marked unsafe because they can cause data races in multi-threaded contexts
-
-The code should now compile with Rust 2024 edition. The changes are:
-Match ergonomics: Rust 2024 automatically infers when you need a reference, so explicit ref is unnecessary
-Unsafe environment variables: Environment variable manipulation is now unsafe to prevent data races
-
-Environment variables (thread-safe):
-Added a Mutex to synchronize access to environment variable operations
-Prevents data races when multiple threads access env vars
-The unsafe block is still needed (Rust 2024 requirement), but it's now thread-safe
-
-Buffer conversions (bounds-checked):
-Added bounds checking before converting MaybeUninit buffers to slices
-Prevents buffer overflows
-The unsafe block is still needed for the raw pointer conversion, but it's now validated
-
-System calls (documented):
-libc::geteuid() is a simple read-only system call that can't cause memory safety issues
-Added a comment explaining it's safe in practice
-
-Why we can't completely eliminate unsafe:
-
-env::set_var/remove_var: Marked unsafe in Rust 2024 due to potential data races; we use a Mutex to make it thread-safe
-std::slice::from_raw_parts: Required for converting uninitialized buffers from raw sockets; we validate bounds first
-libc::geteuid(): Required for system calls; it's a safe read-only operation
-The code is now as safe as possible while still performing these low-level operations. The unsafe blocks are guarded with synchronization and validation.
-If you want to avoid unsafe entirely, we'd need to:
-Use a different approach for proxy configuration (e.g., pass proxy settings directly to reqwest instead of using env vars)
-Use higher-level socket APIs that don't require raw buffer manipulation
 
 
 
@@ -2472,196 +2437,646 @@ Use higher-level socket APIs that don't require raw buffer manipulation
 
 
 
-Summary of API fixes
-hickory-client 0.25.2:
-Changed AsyncClient → Client
-Moved rr imports from hickory_client::rr to hickory_proto::rr
-Moved ResponseCode from hickory_client::proto::op to hickory_proto::op
-suppaftp 7.0.7:
-Changed imports from suppaftp::{AsyncFtpStream, ...} to suppaftp::tokio::{AsyncFtpStream, ...}
-Changed suppaftp::async_native_tls::TlsConnector to suppaftp::tokio::native_tls::TlsConnector
-rustls (via tokio-rustls 0.26.4):
-Added use rustls::pki_types::ServerName;
-Changed tokio_rustls::rustls::ServerName to ServerName
-Removed .with_safe_defaults() (no longer needed in newer rustls)
-All compilation errors should be resolved. Try running cargo build or cargo run again. If there are remaining issues, share the error messages.
-
-
-hickory-client UdpClientStream import:
-Changed from hickory_client::udp::UdpClientStream to hickory_proto::udp::UdpClientStream
-In version 0.25, the UDP module moved to hickory_proto
-suppaftp TlsConnector import:
-Changed from suppaftp::tokio::native_tls::TlsConnector to native_tls::TlsConnector
-TlsConnector comes from the native-tls crate, not from suppaftp
-rustls ServerName lifetime issue:
-ServerName::try_from() requires a 'static lifetime
-Converted host to an owned String first: let host_owned = host.to_string();
-Then used: ServerName::try_from(host_owned.as_str())
-Applied to both occurrences in the HTTP/2 exploit module
-
-1. Async architecture
-Replaced threadpool and crossbeam-channel with tokio async runtime
-Converted all I/O operations to async/await
-Uses tokio::net::TcpStream for async networking
-2. Statistics tracking
-Added Statistics struct to track attempts, successes, failures, errors, and retries
-Real-time progress reporting with colored output
-Final statistics summary with success rates
-3. Multiple operation modes
-Mode 1: Single Target Bruteforce (advanced)
-Mode 2: Subnet Bruteforce (CIDR notation)
-Mode 3: Batch Scanner (multiple targets)
-Mode 4: Quick Default Check (single target)
-Mode 5: Subnet Default Check (CIDR)
-4. Configuration management
-JSON configuration file support (save/load)
-Interactive configuration builder
-Configuration validation
-5. Advanced features
-Retry on error with configurable max retries
-Pre-validation of SMTP targets
-Configurable delays between attempts
-Connection and read timeouts
-Custom auth method selection (PLAIN, LOGIN)
-Append mode for output files
-6. Streaming mode
-Automatic detection of large wordlists (>500MB)
-Streaming mode for memory efficiency
-Memory mode for faster processing
-7. Improved output
-Colored output with better formatting
-Progress indicators
-Better error messages
-Banner display
-The module now matches the telnet module's functionality while keeping SMTP-specific authentication logic (AUTH PLAIN and AUTH LOGIN). All code compiles without errors or warnings.
-
-
-Refactored the FTP bruteforce module to match the telnet module's features. Changes:
-1. Async architecture
-Uses tokio async runtime with channels
-Worker/producer pattern for concurrent execution
-Async I/O operations throughout
-2. Statistics tracking
-Added Statistics struct to track attempts, successes, failures, errors, and retries
-Real-time progress reporting with colored output
-Final statistics summary with success rates
-3. Multiple operation modes
-Mode 1: Single Target Bruteforce (advanced)
-Mode 2: Subnet Bruteforce (CIDR notation)
-Mode 3: Batch Scanner (multiple targets)
-Mode 4: Quick Default Check (single target)
-Mode 5: Subnet Default Check (CIDR)
-4. Configuration management
-JSON configuration file support (save/load)
-Interactive configuration builder
-Configuration validation
-5. Advanced features
-Retry on error with configurable max retries
-Pre-validation of FTP targets
-Configurable delays between attempts
-Connection and read timeouts
-FTPS support (optional)
-Append mode for output files
-6. Streaming mode
-Automatic detection of large wordlists (>500MB)
-Streaming mode for memory efficiency
-Memory mode for faster processing
-7. Improved output
-Colored output with better formatting
-Progress indicators
-Better error messages
-Banner display
-The module now matches the telnet module's functionality while preserving FTP-specific features (plain FTP and FTPS support). All code compiles with only minor warnings about unused imports that can be cleaned up if needed.
-
-
-Dead Code Removal Summary
-Removed format_addr() — replaced by normalize_target() used throughout
-Removed BUFFER_SIZE constant — unused
-Removed unused SocketAddr import — no longer needed after removing format_addr()
-Fixed unused socket variable in check_port() — removed unused parsing
-Verification
-All functions are wired up and used:
-run() → mode selection functions
-Mode functions → execution functions (run_ftp_bruteforce, execute_batch_scan, etc.)
-Execution functions → worker/producer functions
-All utility functions are called from the execution paths
-All configuration functions are used in interactive mode
-All prompt functions are used for user input
-The module compiles with no linter errors or warnings. All code is implemented and wired up.
-
-
-
-ONVIF Bruteforce Module Complete
-
-Created an ONVIF bruteforce module similar to telnet_bruteforce.rs with:
-
-Features implemented:
-HTTP Authentication Support:
-HTTP Digest authentication (MD5-based)
-HTTP Basic authentication (Base64-encoded)
-Automatic fallback between methods
-
-Operation Modes:
-Single Target Bruteforce (advanced)
-Subnet Bruteforce (CIDR notation)
-Batch Scanner (multiple targets)
-Quick Default Check (single target)
-Subnet Default Check (CIDR)
-
-Advanced Features:
-Async architecture using tokio
-Statistics tracking with atomic counters
-Configuration management (JSON save/load)
-Wordlist streaming for large files
-Retry logic with configurable attempts
-Progress reporting
-Concurrent worker threads
-Stop-on-success option
-
-ONVIF-Specific:
-Default ports: 8000, 8888, 8999
-Configurable ONVIF path (default: /onvif/device_service)
-Default credentials for security cameras/NVRs
-HTTP Digest challenge parsing and response generation
-
-Module Integration:
-Added to mod.rs for proper module registration
-Follows the same structure as other bruteforce modules
-No linting errors
-The module is ready to use and will be automatically discovered by the build system since it has the pub async fn run(target: &str) signature.
-
-Bugs Fixed:
-MD5 import issue: Changed from use md5::{Md5, Digest} to use md5; and updated all Md5::digest() calls to md5::compute() to match the md5 crate version 0.8.0 API used in the codebase.
-Address handling bug: Fixed URL construction where normalize_target returns "host:port" but the code was using it directly in URLs, causing malformed URLs like "http://host:port:8000/...". Now extracts just the IP/hostname using socket_addr.ip().to_string().
-Missing chrono import: Added use chrono; for chrono::Local::now() and chrono::Utc::now() calls.
-Parameter naming: Updated spawn_worker function parameter from addr to host to match the corrected usage.
 
 
 
 
+###  arc 2 nimla patching
 
 
-Summary of fixes
-Removed unused imports:
-Removed SocketAddr from top-level imports (used locally where needed)
-Removed AsyncReadExt from top-level imports (used locally where needed)
-Removed unused constant:
-Removed BUFFER_SIZE constant that was never used
-Fixed unused variable warning:
-Changed return_code to _return_code in validate_mqtt_target to indicate it's intentionally unused
-Module wiring verified:
-Module registered in src/modules/creds/generic/mod.rs
-Public run function exists with correct signature: pub async fn run(target: &str) -> Result<()>
-Worker functions correctly call try_mqtt_login
-All prompt functions are defined and accessible
-All helper functions are implemented
-The MQTT bruteforce module is now:
-Warning-free
-Properly wired into the module system
-Ready to be discovered by the build script
-Fully functional with all features implemented
-The module can be used via:
-Interactive shell: run creds/generic/mqtt_bruteforce <target>
-CLI: --command creds --module generic/mqtt_bruteforce --target <target>
-API: Through the API endpoint for running modules
-All code is working and properly integrated.
+
+Analyze and fix ABUS variant1 module - add colored output, standardize features
+Analyze and fix ABUS variant2 module - add colored output, standardize features
+Review and standardize other exploit modules for consistency
+Verify all modules compile and logic is correct
+Based on my analysis, here are the key features that should be standardized across exploit modules where compatible:
+Colored output using the colored crate for better UX
+Timeout configuration for HTTP clients
+IPv6 normalization
+SSL certificate skip for testing targets with self-signed certs
+Informative banners/output with status indicators
+Let me update the ABUS variant1 module to have these standardized features:
+
+
+ABUS Security Camera CVE-2023-26609 Modules
+Variant 1 (abussecurity_camera_cve202326609variant1.rs)
+
+Features added:
+
+Colored output using the colored crate for better UX
+Display banner with module information
+Timeout configuration (10 second default)
+Improved prompts with colored formatting
+Stage indicators (Stage 1/2/3) for the SSH persistence flow
+Better error messages with red coloring for failures
+Status-based output - green for success, red for failure
+Variant 2 (abussecurity_camera_cve202326609variant2.rs)
+
+Features added:
+
+Colored output using the colored crate
+Display banner with module information
+Timeout configuration (10 second default)
+Input validation - checks for empty username/password
+Stage indicators for the SSH persistence flow
+Improved user feedback with colored status messages
+Other Modules Updated
+I also standardized these modules with colored output, banners, timeouts, and improved UX:
+ACTi ACM-5611 RCE - Added banner, colored output, port prompts, vulnerability check feedback
+AVTech Camera CVE-2024-7029 - Added banner, colored output, improved shell interface
+TP-Link WR740N DoS - Added banner, colored output, improved prompts
+Zabbix SQL Injection - Added banner, colored output, timing-based detection improvement
+Uniview NVR Password Disclosure - Added banner, colored output, improved feedback
+Sample Exploit - Added banner, colored output for demonstration
+Standardized Features Across All Modules
+
+The following features are now consistently available where compatible:
+
+Feature	Description
+Colored Output	Using colored crate for cyan info, yellow warnings, green success, red errors
+Display Banners	ASCII art banners showing module name, CVE, and description
+Timeout Configuration	Configurable HTTP timeouts (default 10 seconds)
+SSL Certificate Skip	danger_accept_invalid_certs(true) for testing self-signed certs
+IPv6 Normalization	Proper handling of IPv6 addresses with bracket normalization
+Input Validation	Checking for empty required fields
+Stage Indicators	Yellow stage markers for multi-step exploits
+All modules compile successfully with no warnings from cargo clippy. The code logic remains intact and all original functionality is preserved.
+
+
+Credential Modules Standardized
+Camera Modules
+acti_camera_default.rs - Added colored output, display banner, timeout constant, and colored status messages for FTP/SSH/Telnet/HTTP checks
+Generic Modules
+Module	Changes
+ftp_anonymous.rs	Added display_banner(), colored output, timeout constant
+ftp_bruteforce.rs	Added display_banner(), updated header styling
+sample_cred_check.rs	Added display_banner(), colored output, timeout with danger_accept_invalid_certs
+ssh_bruteforce.rs	Already had banner and statistics - unchanged
+telnet_bruteforce.rs	Already had comprehensive banner and statistics - unchanged
+rdp_bruteforce.rs	Added display_banner(), updated header styling
+smtp_bruteforce.rs	Added display_banner(), improved colored output for success/failure
+pop3_bruteforce.rs	Already had banner and statistics - unchanged
+snmp_bruteforce.rs	Added display_banner(), updated header styling
+rtsp_bruteforce_advanced.rs	Added display_banner(), updated header styling
+l2tp_bruteforce.rs	Added display_banner(), updated header styling
+fortinet_bruteforce.rs	Added display_banner(), updated header styling
+enablebruteforce.rs	Added display_banner(), full colored output
+Standard Features Added
+
+All modules now have:
+
+✅ Cyan-bordered ASCII banner with module title
+✅ Colored target information ([*] in cyan)
+✅ Green success messages ([+])
+✅ Yellow warning/failure messages ([-])
+✅ Red error messages ([!])
+✅ Consistent use of colored crate
+✅ IPv6 address handling where applicable
+✅ Timeout constants where applicable
+The project compiles cleanly with cargo build and passes cargo clippy with no warnings.
+
+Critical Issues Found:
+SSH Bruteforce - Semaphore acquired BEFORE spawning task (blocks task creation)
+FTP/RDP/SNMP Bruteforce - Missing progress statistics
+Several modules - Missing retry logic and connection rate limit handling
+Let me fix these:
+
+
+Critical Fixes:
+
+1. SSH Bruteforce - Fixed concurrency bug
+
+The semaphore was being acquired BEFORE spawning the task, which serialized task creation. Now acquires permit INSIDE the spawned task for true concurrent execution.
+
+2. Enable Bruteforce (ulimit) - Fixed non-functional code
+
+Running ulimit -n 65535 in a subprocess does NOT affect the parent process. Rewrote to use setrlimit() syscall directly, which actually raises the file descriptor limit in the current process.
+Standardized Features Added
+
+Added Statistics tracking and real-time progress reporting to:
+Module	Concurrency Model	Progress Reporting Added
+FTP Bruteforce	tokio async + Semaphore	✅
+RDP Bruteforce	tokio async + Semaphore	✅
+SNMP Bruteforce	tokio async + spawn_blocking	✅
+RTSP Bruteforce	tokio async + Semaphore	✅
+L2TP Bruteforce	tokio async + Semaphore	✅
+Fortinet Bruteforce	tokio async + Semaphore	✅
+SMTP Bruteforce	ThreadPool + crossbeam	✅
+Already Correctly Implemented
+
+Module	Notes:
+
+Telnet Bruteforce	Uses tokio async TcpStream (correctly async), already has statistics
+POP3 Bruteforce	Uses ThreadPool + crossbeam (correct for blocking I/O), already has statistics
+Concurrency Models Verified
+Async modules (FTP, RDP, SSH, RTSP, L2TP, Fortinet, Telnet): Use tokio::net::TcpStream or spawn_blocking for blocking libraries - 
+
+this is correct
+
+Blocking modules (POP3, SMTP): Use ThreadPool with crossbeam_channel - this is correct for blocking socket I/O
+
+All modules now have consistent:
+
+Real-time progress reporting (attempts/s rate)
+Statistics summary at completion
+Colored output for success/failure/errors
+
+
+
+All fixed. The warnings are resolved:
+
+enablebruteforce.rs - Removed unused std::process::Command import (no longer needed since we now use the libc syscalls directly)
+ftp_bruteforce.rs - Removed unused log function (replaced with inline colored output)
+fortinet_bruteforce.rs - Removed unused log function (replaced with inline colored output)
+
+
+Standardized Features Added:
+
+Scanner	Banner	Colored Output	Statistics	Progress	Save Results
+sample_scanner.rs	✅ Added	✅ Added	✅ Added	✅	✅ Added
+http_title_scanner.rs	✅ Enhanced	✅ Enhanced	✅ Added	✅ Added	✅ Already had
+http_method_scanner.rs	✅ Enhanced	✅ Enhanced	✅ Added	N/A	✅ Already had
+dns_recursion.rs	✅ Added	✅ Enhanced	✅ Added	N/A	N/A (targets output)
+ssdp_msearch.rs	✅ Added	✅ Already had	✅ Added	N/A	✅ Added
+port_scanner.rs	✅ Already had	✅ Already had	✅ Already had	✅ Already had	✅ Already had
+ping_sweep.rs	✅ Already had	✅ Already had	✅ Already had	✅ Already had	✅ Already had
+
+Key Improvements:
+
+Consistent Banners - All scanners now display a cyan-colored ASCII banner with module description
+Colored Output - Success (green), warnings (yellow), errors (red), info (cyan)
+Statistics - All scanners report:
+Total items scanned
+Successful/Failed counts
+Duration
+Rate (where applicable)
+Save Results - Option to save scan results to file
+Progress Reporting - Real-time progress for longer scans
+All modules compile cleanly with no warnings.
+
+
+Security Enhancements Summary
+
+main.rs
+
+Added validate_bind_address() - validates bind address format using SocketAddr::parse(), checks length limits, control characters
+Added validate_api_key() - validates API key length (max 256 chars), ensures only printable ASCII
+Added validate_ip_limit() - validates IP limit range (1-10,000)
+All CLI inputs are now validated before use
+
+shell.rs
+
+Added new constants: MAX_URL_LENGTH, MAX_PATH_LENGTH, MAX_PROMPT_INPUT_LENGTH
+
+Enhanced prompt_for_path():
+
+Length validation
+Control character rejection
+Path traversal prevention (.. blocked)
+
+Enhanced prompt_string_default():
+
+Length validation
+Control character rejection
+URL format validation (if input looks like URL)
+
+Enhanced prompt_yes_no():
+
+Max attempt limiting (10 attempts)
+Length validation
+Enhanced prompt_u64() and prompt_usize():
+Max attempt limiting
+Length validation
+Strict digit-only validation
+Overflow protection with saturating_add()
+
+config.rs
+
+Added MAX_TARGET_LENGTH and MAX_HOSTNAME_LENGTH constants
+
+Enhanced set_target():
+
+Length validation
+Control character rejection
+Path traversal prevention
+
+Added validate_hostname_or_ip():
+
+Hostname length validation (DNS max 253)
+Valid character regex check
+Format validation (no leading/trailing special chars)
+Consecutive dot detection
+
+api.rs
+
+Added RequestBodyLimitLayer (1MB max) to prevent DoS via large payloads
+Added MAX_TRACKED_IPS (100,000) and MAX_AUTH_FAILURE_ENTRIES (100,000) limits
+
+Enhanced track_ip():
+
+IP string length validation
+Automatic cleanup when tracker exceeds limits
+saturating_add() for overflow protection
+
+Enhanced record_auth_failure():
+
+IP string length validation
+Automatic cleanup of expired/old entries
+saturating_add() for overflow protection
+utils.rs (already well-secured)
+Already had comprehensive validation:
+MAX_TARGET_LENGTH, MAX_MODULE_PATH_LENGTH, MAX_FILE_SIZE
+Path traversal checks
+File size limits
+Proxy URL validation
+
+
+---
+
+## v0.4.0 - Comprehensive Security Hardening (November 2025)
+
+###  Input Validation & Security (All Core Files)
+
+#### main.rs
+
+- **NEW:** `validate_bind_address()` - Validates bind address format using `SocketAddr::parse()`:
+  - Length limits (max 128 characters)
+  - Control character rejection
+  - Socket address format validation
+- **NEW:** `validate_api_key()` - Validates API key:
+  - Length limits (max 256 characters)
+  - Only printable ASCII characters allowed
+  - Empty/whitespace rejection
+- **NEW:** `validate_ip_limit()` - Validates hardening IP limit:
+  - Range validation (1-10,000)
+  - Prevents resource exhaustion
+
+#### shell.rs
+
+- **NEW Constants:**
+  - `MAX_URL_LENGTH` (2048) - URL input length limit
+  - `MAX_PATH_LENGTH` (4096) - File path length limit
+  - `MAX_PROMPT_INPUT_LENGTH` (1024) - General prompt input limit
+
+- **Enhanced `prompt_for_path()`:**
+  - Length validation
+  - Control character rejection
+  - Path traversal prevention (`..` blocked)
+
+- **Enhanced `prompt_string_default()`:**
+  - Length validation
+  - Control character rejection
+  - Automatic URL format validation when input looks like URL
+
+- **Enhanced `prompt_yes_no()`:**
+  - Max attempt limiting (10 attempts before default)
+  - Length validation (max 10 chars)
+  - Prevents infinite loops on bad input
+
+- **Enhanced `prompt_u64()` and `prompt_usize()`:**
+  - Max attempt limiting (10 attempts)
+  - Length validation (max 20 chars)
+  - Strict digit-only validation
+  - Overflow protection
+  - Better error messages
+
+#### config.rs
+
+- **NEW Constants:**
+  - `MAX_TARGET_LENGTH` (2048) - Target string limit
+  - `MAX_HOSTNAME_LENGTH` (253) - DNS hostname limit
+
+- **Enhanced `set_target()`:**
+  - Length validation
+  - Control character rejection
+  - Path traversal prevention (`..`, `//` blocked)
+  - Hostname/IP format validation
+
+- **NEW:** `validate_hostname_or_ip()` - Validates hostname/IP:
+  - Hostname length validation (DNS max 253)
+  - Valid character regex check (`[a-zA-Z0-9.\-_:\[\]]+`)
+  - Format validation (no leading/trailing special chars)
+  - Consecutive dot detection
+
+#### api.rs
+
+- **NEW:** `RequestBodyLimitLayer` (1MB max) - Prevents DoS via large request bodies
+- **NEW Constants:**
+  - `MAX_REQUEST_BODY_SIZE` (1MB)
+  - `MAX_TRACKED_IPS` (100,000)
+  - `MAX_AUTH_FAILURE_ENTRIES` (100,000)
+
+- **Enhanced `track_ip()`:**
+  - IP string length validation (max 128 chars)
+  - Automatic cleanup when tracker exceeds limits
+  - Prunes oldest entries, keeps most recent half
+  - `saturating_add()` for overflow protection
+
+- **Enhanced `record_auth_failure()`:**
+  - IP string length validation (max 128 chars)
+  - Automatic cleanup of expired blocks and old entries (>1 hour)
+  - `saturating_add()` for overflow protection
+  - Memory-efficient housekeeping
+
+#### Cargo.toml
+
+- Added `limit` feature to `tower-http` for request body limiting
+
+###  Summary
+
+All user-facing input paths now have:
+
+- ✅ Length limits to prevent memory exhaustion
+- ✅ Control character rejection
+- ✅ Path traversal prevention
+- ✅ Format validation where applicable
+- ✅ Overflow protection
+- ✅ Maximum attempt limits on prompts
+- ✅ Automatic resource cleanup in API
+
+
+Documentation Updates Summary
+
+
+README.md (Main README)
+
+
+Highlights Section: Added security hardening to feature list, expanded credential modules to include SNMP, L2TP, Fortinet
+Module Catalog: Updated with all new modules (Flowise RCE, HTTP/2 Rapid Reset, Jenkins LFI, PAN-OS Auth Bypass, Heartbleed) and expanded scanner capabilities (SYN/ACK scans)
+Security Features Section: Added new "Input Validation & Security" subsection documenting:
+Request body limiting (1MB)
+API key validation
+Target validation
+Module path sanitization
+Resource limits with automatic cleanup
+Enhanced rate limiting with auto-cleanup
+Enhanced hardening mode with auto-pruning
+docs/readme.md (Developer Guide)
+Table of Contents: Added new "Security & Input Validation" section
+Code Layout: Updated to include api.rs, config.rs, and telnet-default/ directory
+NEW Section - Security & Input Validation: Comprehensive developer guide including:
+Input validation constants table (all limits across files)
+
+Security patterns with code examples:
+
+Input length validation
+Control character rejection
+Path traversal prevention
+Hostname/target validation
+Overflow protection
+Prompt attempt limiting
+API security implementation details
+File operations security guidelines
+lists/readme.md (Data Files Catalog)
+Available Files: Added telnet-default/ directory with its files (usernames.txt, passwords.txt, empty.txt)
+Ideas Section: Added suggestions for SNMP, Fortinet, and SSH default credential lists
+NEW Section - Security Notes: Guidelines for contributing wordlists:
+No malicious payloads
+File size limits
+UTF-8 encoding requirements
+Line format standards
+
+changelog.md
+
+NEW Section - v0.4.0: Complete documentation of all security enhancements:
+main.rs validation functions
+shell.rs prompt hardening
+config.rs target validation
+api.rs resource limits and cleanup
+Cargo.toml changes
+
+---
+
+## v0.4.1 - SSHPWN Integration (November 2025)
+
+###  New SSH Attack Modules
+
+Integrated comprehensive SSH attack framework based on OpenSSH 10.0p1 vulnerability analysis.
+
+#### SFTP Attack Module (`exploits/ssh/sshpwn_sftp_attacks`)
+
+Based on sftp-server.c vulnerabilities:
+
+- **Symlink Injection** (process_symlink) - Create symlinks to sensitive files, bypass chroot
+- **Setuid Bit Attack** (process_setstat 07777) - Set setuid/setgid bits on uploaded files
+- **Path Traversal** (process_open) - Escape chroot restrictions
+- **Partial Write Race** (process_write) - Exploit write atomicity issues
+
+#### SCP Attack Module (`exploits/ssh/sshpwn_scp_attacks`)
+
+Based on scp.c vulnerabilities:
+
+- **Path Traversal** (sink function) - Write outside target directory
+- **Username Shell Injection** (okname) - Shell metacharacter injection
+- **Brace Expansion DoS** (brace_expand) - Client-side memory exhaustion
+- **Command Injection** (do_cmd) - Inject commands via arguments
+
+#### Session Attack Module (`exploits/ssh/sshpwn_session`)
+
+Based on session.c vulnerabilities:
+
+- **Environment Variable Injection** (do_setup_env) - Inject LD_PRELOAD, PATH, etc.
+- **Command Execution** - Execute commands on authenticated targets
+- **Reverse Shell** - Multiple payload types (bash, python, nc, perl, php, ruby)
+- **File Upload/Download** - SFTP-based file transfer
+
+###  New SSH Scanner (`scanners/ssh_scanner`)
+
+Network reconnaissance for SSH services:
+
+- CIDR range support
+- IPv4/IPv6 support  
+- Banner grabbing
+- Concurrent scanning (configurable threads)
+- Results export
+
+###  New SSH Credential Modules
+
+#### SSH User Enumeration (`creds/generic/ssh_user_enum`)
+
+Timing attack for user enumeration (CVE-2018-15473 style):
+
+- Measures authentication response timing
+- Compares against baseline for invalid users
+- Configurable samples and threshold
+- Wordlist support
+
+#### SSH Password Spray (`creds/generic/ssh_spray`)
+
+Spray single password across multiple targets:
+
+- Avoids account lockouts
+- CIDR range support
+- Concurrent spraying
+- Results export
+
+###  Module Summary
+
+| Module | Path | Type |
+|--------|------|------|
+| SFTP Attacks | `exploits/ssh/sshpwn_sftp_attacks` | Exploit |
+| SCP Attacks | `exploits/ssh/sshpwn_scp_attacks` | Exploit |
+| Session Attacks | `exploits/ssh/sshpwn_session` | Exploit |
+| SSH Scanner | `scanners/ssh_scanner` | Scanner |
+| SSH User Enum | `creds/generic/ssh_user_enum` | Credential |
+| SSH Spray | `creds/generic/ssh_spray` | Credential |
+
+All modules feature:
+s
+- ✅ Colored output with status indicators
+- ✅ Interactive configuration prompts
+- ✅ Input validation
+- ✅ IPv4/IPv6 support
+- ✅ Results export capability
+
+
+
+SSHPWN Integration Summary
+
+New SSH Exploit Modules (src/modules/exploits/ssh/)
+
+1. sshpwn_sftp_attacks.rs - SFTP Attacks
+
+Based on sftp-server.c vulnerabilities:
+
+Symlink Injection - Create symlinks to read sensitive files like /etc/passwd, /etc/shadow
+Setuid Bit Attack - Set setuid/setgid bits on uploaded files (07777 mask vulnerability)
+Path Traversal - Escape chroot restrictions via traversal paths
+Partial Write Race - Exploit write atomicity issues
+
+2. sshpwn_scp_attacks.rs - SCP Attacks
+
+Based on scp.c vulnerabilities:
+
+Path Traversal - Protocol injection, null byte injection, newline injection
+Username Shell Injection - Exploit incomplete okname() filtering ($(), backticks, pipes)
+Brace Expansion DoS - Client-side memory exhaustion via {a,b}^n patterns
+Command Injection - ProxyCommand, rsync-path, ControlPath injection
+
+3. sshpwn_session.rs - Session Attacks
+
+Based on session.c vulnerabilities:
+
+Environment Injection - LD_PRELOAD, LD_LIBRARY_PATH, PATH, BASH_ENV injection
+Command Execution - Execute arbitrary commands
+Reverse Shells - 8 payload types (bash, python, python3, nc, perl, php, ruby)
+File Upload/Download - SFTP-based transfer
+New SSH Scanner (src/modules/scanners/)
+
+ssh_scanner.rs - SSH Service Scanner
+
+CIDR range support (192.168.1.0/24)
+IP range support (192.168.1.1-254)
+IPv4/IPv6 support
+Banner grabbing
+Concurrent scanning with configurable threads
+Results export to file
+New SSH Credential Modules (src/modules/creds/generic/)
+
+ssh_user_enum.rs - User Enumeration (Timing Attack)
+
+CVE-2018-15473 style timing attack
+Measures authentication response times
+Compares against baseline timing
+Configurable samples and threshold
+Wordlist support
+
+ssh_spray.rs - Password Spray
+
+Spray single password across multiple targets/users
+Avoids account lockouts
+CIDR range support
+Concurrent spraying
+Results export
+Module Access Paths
+Module	Full Path	Short Name
+SFTP Attacks	exploits/ssh/sshpwn_sftp_attacks	sshpwn_sftp_attacks
+SCP Attacks	exploits/ssh/sshpwn_scp_attacks	sshpwn_scp_attacks
+Session Attacks	exploits/ssh/sshpwn_session	sshpwn_session
+SSH Scanner	scanners/ssh_scanner	ssh_scanner
+User Enumeration	creds/generic/ssh_user_enum	ssh_user_enum
+Password Spray	creds/generic/ssh_spray	ssh_spray
+All modules compile cleanly and follow the RustSploit patterns with colored output, interactive prompts, and input validation.
+
+
+Summary of fixes:
+
+Fixed format string error in sshpwn_scp_attacks.rs:227:
+Rust doesn't support Python's {:,} format for thousands separators
+Added a format_number() helper function that formats numbers with comma separators
+Removed unused import in sshpwn_sftp_attacks.rs:15:
+Changed use ssh2::{Session, Sftp} → use ssh2::Session
+Fixed unused variable in sshpwn_scp_attacks.rs:176:
+Changed port: u16 → _port: u16
+Fixed unused variable in sshpwn_session.rs:94:
+Changed timeout: u64 → _timeout: u64
+Build result: Finished dev profile [unoptimized + debuginfo] target(s) in 24.64s with exit code 0 - no warnings or errors!
+
+New sshpwn_auth_passwd.rs Features:
+
+Password Length DoS Test - Tests auth2-passwd.c's lack of explicit password length limit
+Password Change Information Leak - Documents server fingerprinting via password change responses
+Auth Timing Attack - User enumeration via mm_auth_password timing differences
+Bcrypt 72-byte Truncation Test - Detects if server uses bcrypt's password truncation
+Added Interactive Shell to sshpwn_session.rs:
+Continuous command execution loop
+Tracks current working directory
+Built-in !upload and !download commands
+exit/quit to disconnect
+
+✅ Complete SSH Module Implementation
+
+Module	Path	Attacks Implemented
+
+SFTP Attacks	exploits/ssh/sshpwn_sftp_attacks.rs	Symlink injection, Setuid bit, Path traversal, Partial write
+SCP Attacks	exploits/ssh/sshpwn_scp_attacks.rs	Path traversal, Username injection, Brace DoS, Command injection
+Session Attacks	exploits/ssh/sshpwn_session.rs	Env injection, Command exec, Interactive shell, Reverse shell, Upload/Download
+Auth Password	exploits/ssh/sshpwn_auth_passwd.rs	Password length DoS, Password change info leak, Auth timing attack, Bcrypt truncation
+SSH Scanner	scanners/ssh_scanner.rs	CIDR scan, Banner grab, Concurrent scanning
+SSH User Enum	creds/generic/ssh_user_enum.rs	Timing-based user enumeration
+SSH Spray	creds/generic/ssh_spray.rs	Password spray across targets
+SSH Bruteforce	creds/generic/ssh_bruteforce.rs	Credential bruteforce
+
+New sshpwn_auth_passwd.rs Features:
+
+Password Length DoS Test - Tests auth2-passwd.c's lack of explicit password length limit
+Password Change Information Leak - Documents server fingerprinting via password change responses
+Auth Timing Attack - User enumeration via mm_auth_password timing differences
+Bcrypt 72-byte Truncation Test - Detects if server uses bcrypt's password truncation
+Added Interactive Shell to sshpwn_session.rs:
+Continuous command execution loop
+Tracks current working directory
+Built-in !upload and !download commands
+exit/quit to disconnect
+
+✅ Build Complete - All Warnings Fixed
+
+SSH Modules Wired:
+
+Exploit Modules (6):
+
+Module	Description
+sshpwn_auth_passwd	Auth password attacks (length DoS, timing, bcrypt truncation)
+sshpwn_pam	PAM attacks (memory exhaustion, env injection, timing)
+sshpwn_session	Session attacks (exec, revshell, interactive shell, upload/download)
+sshpwn_scp_attacks	SCP attacks (traversal, username injection, brace DoS, cmd injection)
+sshpwn_sftp_attacks	SFTP attacks (symlink, setuid, traversal, partial write)
+opensshserver_9_8p1race_condition	Race condition exploit
+Credential Modules (3):
+Module	Description
+ssh_bruteforce	SSH credential brute force
+ssh_spray	SSH password spraying
+ssh_user_enum	SSH user enumeration (timing attack)
+Scanner Modules (1):
+Module	Description
+ssh_scanner	SSH service discovery and banner grabbing
+
+Fixes Applied:
+
+✅ Removed unused HashMap import from sshpwn_pam.rs
+✅ Removed unused Read import from sshpwn_auth_passwd.rs
+✅ Fixed unused port variable - now used in output
+✅ Removed unused DEFAULT_TIMEOUT_SECS constant
+✅ Removed unused prompt() function
+✅ Removed unused PathBuf imports from generator files
+✅ Added sshpwn_pam to mod.rs
