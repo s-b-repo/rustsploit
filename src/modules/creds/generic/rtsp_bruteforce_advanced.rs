@@ -9,8 +9,9 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -18,10 +19,91 @@ use tokio::{
     time::{sleep, Duration},
 };
 
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
+            "[Progress]".cyan(),
+            total.to_string().bold(),
+            success.to_string().green(),
+            failed,
+            errors.to_string().red(),
+            rate
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+
+        println!("{}", "=== Statistics ===".bold());
+        println!("  Total attempts:    {}", total);
+        println!("  Successful:        {}", success.to_string().green().bold());
+        println!("  Failed:            {}", failed);
+        println!("  Errors:            {}", errors.to_string().red());
+        println!("  Elapsed time:      {:.2}s", elapsed);
+        if elapsed > 0.0 {
+            println!("  Average rate:      {:.1} attempts/s", total as f64 / elapsed);
+        }
+    }
+}
+
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   Advanced RTSP Brute Force Module                        ║".cyan());
+    println!("{}", "║   IP Camera and Streaming Server Credential Testing       ║".cyan());
+    println!("{}", "║   Supports path enumeration and custom headers            ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
+
 /// Main entry point for the advanced RTSP brute force module.
 pub async fn run(target: &str) -> Result<()> {
-    println!("=== Advanced RTSP Brute Force Module ===");
-    println!("[*] Target: {}", target);
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
         let input = prompt_default("RTSP Port", "554")?;
@@ -69,6 +151,7 @@ pub async fn run(target: &str) -> Result<()> {
     let (addr, implicit_path) = normalize_target_input(target, port)?;
     let found = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Statistics::new());
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     println!("\n[*] Starting brute-force on {}", addr);
@@ -113,6 +196,21 @@ pub async fn run(target: &str) -> Result<()> {
             paths.insert(0, p);
         }
     }
+    println!();
+
+    // Start progress reporter
+    let stats_clone = stats.clone();
+    let stop_clone = stop.clone();
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            stats_clone.print_progress();
+            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+        }
+    });
+
     let mut tasks = FuturesUnordered::new();
     let mut idx = 0usize;
 
@@ -142,6 +240,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let path_clone = path.clone();
                 let found_clone = Arc::clone(&found);
                 let stop_clone = Arc::clone(&stop);
+                let stats_clone = Arc::clone(&stats);
                 let command = advanced_command.clone();
                 let headers = Arc::clone(&advanced_headers);
                 let semaphore_clone = Arc::clone(&semaphore);
@@ -175,17 +274,28 @@ pub async fn run(target: &str) -> Result<()> {
                     {
                         Ok(true) => {
                             let path_str = if path_clone.is_empty() { "NO_PATH" } else { &path_clone };
-                            println!("[+] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_str);
+                            println!("\r{}", format!("[+] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_str).green().bold());
                             found_clone
                                 .lock()
                                 .await
                                 .push((addr_clone.clone(), user_clone.clone(), pass_clone.clone(), path_str.to_string()));
+                            stats_clone.record_attempt(true, false);
                             if stop_flag {
                                 stop_clone.store(true, Ordering::Relaxed);
                             }
                         }
-                        Ok(false) => log(verbose_flag, &format!("[-] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_clone)),
-                        Err(e) => log(verbose_flag, &format!("[!] {} -> error: {}", addr_clone, e)),
+                        Ok(false) => {
+                            stats_clone.record_attempt(false, false);
+                            if verbose_flag {
+                                println!("\r{}", format!("[-] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_clone).dimmed());
+                            }
+                        }
+                        Err(e) => {
+                            stats_clone.record_attempt(false, true);
+                            if verbose_flag {
+                                println!("\r{}", format!("[!] {} -> error: {}", addr_clone, e).red());
+                            }
+                        }
                     }
 
                     drop(permit);
@@ -207,15 +317,24 @@ pub async fn run(target: &str) -> Result<()> {
 
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
-            log(verbose, &format!("[!] Task join error: {}", e));
+            if verbose {
+                println!("\r{}", format!("[!] Task join error: {}", e).red());
+            }
         }
     }
 
+    // Stop progress reporter
+    stop.store(true, Ordering::Relaxed);
+    let _ = progress_handle.await;
+
+    // Print final statistics
+    stats.print_final();
+
     let creds = found.lock().await;
     if creds.is_empty() {
-        println!("\n[-] No credentials found (with these paths).");
+        println!("{}", "[-] No credentials found (with these paths).".yellow());
     } else {
-        println!("\n[+] Valid credentials (and paths):");
+        println!("{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
         for (host, user, pass, path) in creds.iter() {
             println!("    {} -> {}:{} [path={}]", host, user, pass, path);
         }

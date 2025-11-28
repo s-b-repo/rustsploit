@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();

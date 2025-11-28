@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use colored::*;
 use regex::Regex;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout as tokio_timeout, Duration};
 
@@ -25,11 +27,24 @@ impl SearchTarget {
     }
 }
 
+fn display_banner() {
+    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   SSDP M-SEARCH Scanner                                      ║".cyan());
+    println!("{}", "║   Discovers UPnP devices via SSDP protocol                   ║".cyan());
+    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
+
 pub async fn run(target: &str) -> Result<()> {
+    display_banner();
+    
+    println!("{}", format!("[*] Target: {}", target).cyan());
+    
     let port = prompt_port().unwrap_or(1900);
     let timeout_secs = prompt_timeout().unwrap_or(3);
     let retries = prompt_retries().unwrap_or(1);
     let verbose = prompt_verbose().unwrap_or(false);
+    let save_results = prompt_save_results().unwrap_or(false);
 
     let target = clean_ipv6_brackets(target);
     // Validate target format
@@ -39,9 +54,12 @@ pub async fn run(target: &str) -> Result<()> {
     // Determine search targets
     let search_targets = prompt_search_targets()?;
 
+    println!();
     println!("{}", format!("[*] Sending SSDP M-SEARCH to {}:{}...", target, port).bold());
 
     let mut found_any = false;
+    let mut results = Vec::new();
+    let start_time = Instant::now();
 
     for (idx, st) in search_targets.iter().enumerate() {
         if search_targets.len() > 1 {
@@ -60,7 +78,10 @@ pub async fn run(target: &str) -> Result<()> {
             match send_ssdp_request(&target, port, st, Duration::from_secs(timeout_secs), verbose).await {
                 Ok(Some(response)) => {
                     found_any = true;
-                    parse_ssdp_response(&response, &target, port, st.st_header());
+                    let result = parse_ssdp_response(&response, &target, port, st.st_header());
+                    if let Some(r) = result {
+                        results.push(r);
+                    }
                     break; // Success, no need to retry
                 }
                 Ok(None) => {
@@ -82,8 +103,39 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
+    let elapsed = start_time.elapsed();
+
+    // Print statistics
+    println!();
+    println!("{}", "=== Scan Statistics ===".bold());
+    println!("  Target:           {}:{}", target, port);
+    println!("  Search types:     {}", search_targets.len());
+    println!("  Retries:          {}", retries);
+    println!("  Devices found:    {}", if found_any { 
+        results.len().to_string().green().to_string() 
+    } else { 
+        "0".red().to_string() 
+    });
+    println!("  Duration:         {:.2}s", elapsed.as_secs_f64());
+
     if !found_any {
+        println!();
         println!("{}", "[-] Target did not respond to any M-SEARCH requests".yellow());
+    }
+
+    // Save results if requested
+    if save_results && !results.is_empty() {
+        let filename = format!("ssdp_scan_{}.txt", target.replace([':', '.', '[', ']'], "_"));
+        if let Ok(mut file) = File::create(&filename) {
+            writeln!(file, "SSDP M-SEARCH Scan Results").ok();
+            writeln!(file, "Target: {}:{}", target, port).ok();
+            writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()).ok();
+            writeln!(file).ok();
+            for result in &results {
+                writeln!(file, "{}", result).ok();
+            }
+            println!("{}", format!("[+] Results saved to '{}'", filename).green());
+        }
     }
 
     Ok(())
@@ -232,6 +284,22 @@ fn prompt_verbose() -> Option<bool> {
     None
 }
 
+/// Ask user to save results
+fn prompt_save_results() -> Option<bool> {
+    print!("{}", "[*] Save results to file? [y/N]: ".cyan().bold());
+    std::io::stdout().flush().ok();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        let input = input.trim().to_lowercase();
+        match input.as_str() {
+            "y" | "yes" => return Some(true),
+            "n" | "no" | "" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Ask user for search targets
 fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
     let mut targets = Vec::new();
@@ -282,7 +350,7 @@ fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
     Ok(targets)
 }
 
-fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) {
+fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> Option<String> {
     let regexps = vec![
         ("server", r"(?i)Server:\s*(.*?)\r\n"),
         ("location", r"(?i)Location:\s*(.*?)\r\n"),
@@ -314,19 +382,17 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) {
     let status_ok = status_line.contains("200") || status_line.contains("HTTP/1.1");
 
     if status_ok {
-        println!(
-            "{}",
-            format!(
-                "[+] {}:{} | ST: {} | Server: {} | Location: {} | USN: {}",
-                target_ip,
-                port,
-                results.get("st").or(results.get("nt")).unwrap_or(&st.to_string()),
-                results.get("server").unwrap_or(&String::new()),
-                results.get("location").unwrap_or(&String::new()),
-                results.get("usn").unwrap_or(&String::new())
-            )
-            .green()
+        let st_value = results.get("st").or(results.get("nt")).unwrap_or(&st.to_string()).clone();
+        let server = results.get("server").unwrap_or(&String::new()).clone();
+        let location = results.get("location").unwrap_or(&String::new()).clone();
+        let usn = results.get("usn").unwrap_or(&String::new()).clone();
+        
+        let result_line = format!(
+            "{}:{} | ST: {} | Server: {} | Location: {} | USN: {}",
+            target_ip, port, st_value, server, location, usn
         );
+        
+        println!("{}", format!("[+] {}", result_line).green());
 
         // Show additional headers if present
         if let Some(cache) = results.get("cache-control") {
@@ -334,11 +400,14 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) {
                 println!("  {} Cache-Control: {}", "  |".dimmed(), cache.dimmed());
             }
         }
+        
+        Some(result_line)
     } else {
         println!(
             "{}",
             format!("[!] {}:{} | Unexpected response: {}", target_ip, port, status_line)
                 .yellow()
         );
+        None
     }
 }

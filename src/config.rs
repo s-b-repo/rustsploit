@@ -1,6 +1,13 @@
 use anyhow::{Result, anyhow};
 use std::sync::{Arc, RwLock};
 use ipnetwork::IpNetwork;
+use regex::Regex;
+
+/// Maximum length for target strings
+const MAX_TARGET_LENGTH: usize = 2048;
+
+/// Maximum length for hostname
+const MAX_HOSTNAME_LENGTH: usize = 253;
 
 /// Global configuration for the framework
 #[derive(Clone, Debug)]
@@ -29,8 +36,27 @@ impl GlobalConfig {
     pub fn set_target(&self, target: &str) -> Result<()> {
         let trimmed = target.trim();
         
+        // Basic validation
         if trimmed.is_empty() {
             return Err(anyhow!("Target cannot be empty"));
+        }
+        
+        // Length check
+        if trimmed.len() > MAX_TARGET_LENGTH {
+            return Err(anyhow!(
+                "Target too long (max {} characters)",
+                MAX_TARGET_LENGTH
+            ));
+        }
+        
+        // Check for control characters
+        if trimmed.chars().any(|c| c.is_control()) {
+            return Err(anyhow!("Target cannot contain control characters"));
+        }
+        
+        // Check for path traversal attempts
+        if trimmed.contains("..") || trimmed.contains("//") {
+            return Err(anyhow!("Target contains invalid characters (path traversal)"));
         }
 
         // Try to parse as CIDR subnet first
@@ -40,9 +66,53 @@ impl GlobalConfig {
             return Ok(());
         }
 
+        // Validate hostname/IP format
+        Self::validate_hostname_or_ip(trimmed)?;
+
         // Otherwise, treat as single IP or hostname
         let mut target_guard = self.target.write().unwrap();
         *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+        Ok(())
+    }
+    
+    /// Validates a hostname or IP address format
+    fn validate_hostname_or_ip(target: &str) -> Result<()> {
+        // Length check for hostname
+        if target.len() > MAX_HOSTNAME_LENGTH {
+            return Err(anyhow!(
+                "Hostname too long (max {} characters)",
+                MAX_HOSTNAME_LENGTH
+            ));
+        }
+        
+        // Check for valid characters
+        // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
+        let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").unwrap();
+        if !valid_chars.is_match(target) {
+            return Err(anyhow!(
+                "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"
+            ));
+        }
+        
+        // Check for spaces
+        if target.contains(' ') {
+            return Err(anyhow!("Target cannot contain spaces"));
+        }
+        
+        // Basic hostname format check (not starting/ending with special chars)
+        if target.starts_with('.') || target.starts_with('-') {
+            return Err(anyhow!("Target cannot start with '.' or '-'"));
+        }
+        
+        if target.ends_with('.') && !target.ends_with("..") {
+            // Allow trailing dot for FQDN, but not double dots
+        }
+        
+        // Check for consecutive dots (invalid in hostnames)
+        if target.contains("..") {
+            return Err(anyhow!("Target cannot contain consecutive dots"));
+        }
+        
         Ok(())
     }
 

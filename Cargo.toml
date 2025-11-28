@@ -87,7 +87,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # API Server (Axum)
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
 uuid = { version = "1.10", features = ["v4"] }
 
 # DNS

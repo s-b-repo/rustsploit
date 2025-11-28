@@ -7,15 +7,95 @@ use std::{
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use regex::Regex;
 use tokio::{sync::Mutex, task::spawn_blocking, time::sleep};
 
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
+            "[Progress]".cyan(),
+            total.to_string().bold(),
+            success.to_string().green(),
+            failed,
+            errors.to_string().red(),
+            rate
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+
+        println!("{}", "=== Statistics ===".bold());
+        println!("  Total attempts:    {}", total);
+        println!("  Valid communities: {}", success.to_string().green().bold());
+        println!("  Invalid:           {}", failed);
+        println!("  Errors:            {}", errors.to_string().red());
+        println!("  Elapsed time:      {:.2}s", elapsed);
+        if elapsed > 0.0 {
+            println!("  Average rate:      {:.1} attempts/s", total as f64 / elapsed);
+        }
+    }
+}
+
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   SNMPv1/v2c Brute Force Module                           ║".cyan());
+    println!("{}", "║   Community String Discovery Tool                         ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
+
 pub async fn run(target: &str) -> Result<()> {
-    println!("=== SNMPv1 & SNMPv2c Brute Force Module ===");
-    println!("[*] Target: {}", target);
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
         let input = prompt_default("SNMP Port", "161")?;
@@ -89,6 +169,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     let found = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Statistics::new());
 
     println!("\n[*] Starting SNMP brute-force on {}", connect_addr);
     println!("[*] SNMP Version: {}", if snmp_version == 0 { "v1" } else { "v2c" });
@@ -98,6 +179,21 @@ pub async fn run(target: &str) -> Result<()> {
         println!("[!] Community wordlist is empty or invalid. Exiting.");
         return Ok(());
     }
+    println!("{}", format!("[*] Loaded {} community strings", communities.len()).cyan());
+    println!();
+
+    // Start progress reporter
+    let stats_clone = stats.clone();
+    let stop_clone = stop.clone();
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            stats_clone.print_progress();
+            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+        }
+    });
 
     let communities = Arc::new(communities);
     let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
@@ -111,6 +207,7 @@ pub async fn run(target: &str) -> Result<()> {
         let community_clone = community.clone();
         let found_clone = Arc::clone(&found);
         let stop_clone = Arc::clone(&stop);
+        let stats_clone = Arc::clone(&stats);
         let stop_flag = stop_on_success;
         let verbose_flag = verbose;
         let version = snmp_version;
@@ -123,20 +220,27 @@ pub async fn run(target: &str) -> Result<()> {
 
             match try_snmp_community(&addr_clone, &community_clone, version, timeout).await {
                 Ok(true) => {
-                    println!("[+] {} -> community: '{}'", addr_clone, community_clone);
+                    println!("\r{}", format!("[+] {} -> community: '{}'", addr_clone, community_clone).green().bold());
                     found_clone
                         .lock()
                         .await
                         .push((addr_clone.clone(), community_clone.clone()));
+                    stats_clone.record_attempt(true, false);
                     if stop_flag {
                         stop_clone.store(true, Ordering::Relaxed);
                     }
                 }
                 Ok(false) => {
-                    log(verbose_flag, &format!("[-] {} -> community: '{}'", addr_clone, community_clone));
+                    stats_clone.record_attempt(false, false);
+                    if verbose_flag {
+                        println!("\r{}", format!("[-] {} -> community: '{}'", addr_clone, community_clone).dimmed());
+                    }
                 }
                 Err(e) => {
-                    log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
+                    stats_clone.record_attempt(false, true);
+                    if verbose_flag {
+                        println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                    }
                 }
             }
 
@@ -154,15 +258,24 @@ pub async fn run(target: &str) -> Result<()> {
 
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
-            log(verbose, &format!("[!] Task join error: {}", e));
+            if verbose {
+                println!("\r{}", format!("[!] Task join error: {}", e).red());
+            }
         }
     }
 
+    // Stop progress reporter
+    stop.store(true, Ordering::Relaxed);
+    let _ = progress_handle.await;
+
+    // Print final statistics
+    stats.print_final();
+
     let creds = found.lock().await;
     if creds.is_empty() {
-        println!("\n[-] No valid community strings found.");
+        println!("{}", "[-] No valid community strings found.".yellow());
     } else {
-        println!("\n[+] Valid community strings:");
+        println!("{}", format!("[+] Found {} valid community string(s):", creds.len()).green().bold());
         for (host, community) in creds.iter() {
             println!("     {} -> community: '{}'", host, community);
         }

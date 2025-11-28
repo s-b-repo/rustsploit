@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use colored::*;
 use reqwest::{Client, Method, StatusCode, Url};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const METHODS: &[&str] = &[
     "GET",
@@ -95,9 +96,15 @@ pub async fn run(initial_target: &str) -> Result<()> {
     .context("Failed to build HTTP client")?;
 
     let mut all_results = Vec::new();
+    let mut total_success = 0usize;
+    let mut total_errors = 0usize;
+    let start_time = Instant::now();
+
+    println!("{}", format!("[*] Scanning {} target(s) with {} methods each...", 
+        normalized.len(), METHODS.len()).cyan().bold());
 
     for target in &normalized {
-        println!("\n=== Target: {} ===", target);
+        println!("\n{}", format!("=== Target: {} ===", target).bold());
         let mut method_results = Vec::new();
 
         for &method_name in METHODS {
@@ -123,43 +130,41 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 Ok(resp) => {
                     let status = resp.status();
                     let ok = status.is_success();
-                    if verbose {
-                        println!(
-                            "  [{}] {} -> {} ({:.2?})",
-                                 method_name,
-                                 target,
-                                 status,
-                                 elapsed
-                        );
+                    if ok {
+                        total_success += 1;
+                        if verbose {
+                            println!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).green());
+                        } else {
+                            println!("{}", format!("  [{}] {}", method_name, status).green());
+                        }
                     } else {
-                        println!("  [{}] {}", method_name, status);
+                        if verbose {
+                            println!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).yellow());
+                        } else {
+                            println!("{}", format!("  [{}] {}", method_name, status).yellow());
+                        }
                     }
                     method_results.push(MethodResult {
                         method: method_name,
                         status: Some(status),
-                                        ok,
-                                        error: None,
-                                        duration_ms: elapsed.as_millis(),
+                        ok,
+                        error: None,
+                        duration_ms: elapsed.as_millis(),
                     });
                 }
                 Err(err) => {
+                    total_errors += 1;
                     if verbose {
-                        println!(
-                            "  [{}] {} -> error: {} ({:.2?})",
-                                 method_name,
-                                 target,
-                                 err,
-                                 elapsed
-                        );
+                        println!("{}", format!("  [{}] {} -> error: {} ({:.2?})", method_name, target, err, elapsed).red());
                     } else {
-                        println!("  [{}] error: {}", method_name, err);
+                        println!("{}", format!("  [{}] error: {}", method_name, err).red());
                     }
                     method_results.push(MethodResult {
                         method: method_name,
                         status: None,
                         ok: false,
                         error: Some(err.to_string()),
-                                        duration_ms: elapsed.as_millis(),
+                        duration_ms: elapsed.as_millis(),
                     });
                 }
             }
@@ -167,8 +172,24 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
         all_results.push(TargetResult {
             target: target.clone(),
-                         results: method_results,
+            results: method_results,
         });
+    }
+
+    let total_elapsed = start_time.elapsed();
+    let total_requests = normalized.len() * METHODS.len();
+
+    // Print statistics
+    println!();
+    println!("{}", "=== Scan Statistics ===".bold());
+    println!("  Targets:        {}", normalized.len());
+    println!("  Methods tested: {}", METHODS.len());
+    println!("  Total requests: {}", total_requests);
+    println!("  Successful:     {}", total_success.to_string().green());
+    println!("  Errors:         {}", total_errors.to_string().red());
+    println!("  Duration:       {:.2}s", total_elapsed.as_secs_f64());
+    if total_elapsed.as_secs() > 0 {
+        println!("  Rate:           {:.1} requests/s", total_requests as f64 / total_elapsed.as_secs_f64());
     }
 
     if save_output {
@@ -189,15 +210,11 @@ pub async fn run(initial_target: &str) -> Result<()> {
 }
 
 fn banner() {
-    println!(
-        "{}",
-        r#"
-        ╔══════════════════════════════════════════════════════╗
-        ║         HTTP METHOD CAPABILITY SCANNER               ║
-        ║          Checks support for common verbs             ║
-        ╚══════════════════════════════════════════════════════╝
-        "#
-    );
+    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   HTTP Method Capability Scanner                             ║".cyan());
+    println!("{}", "║   Checks support for common HTTP verbs (GET, POST, etc.)     ║".cyan());
+    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    println!();
 }
 
 fn collect_initial_targets(initial_target: &str) -> Vec<String> {

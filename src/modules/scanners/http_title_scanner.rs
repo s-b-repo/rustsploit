@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use colored::*;
 use regex::Regex;
 use reqwest::{Client, StatusCode, Url};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub async fn run(initial_target: &str) -> Result<()> {
     banner();
@@ -68,16 +69,36 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let title_re = Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>")?;
     let mut all_results = Vec::new();
+    let mut success_count = 0usize;
+    let mut error_count = 0usize;
+    let start_time = Instant::now();
+    let total_targets = normalized.len();
 
-    for url in &normalized {
+    println!("{}", format!("[*] Scanning {} target(s)...", total_targets).cyan().bold());
+    println!();
+
+    for (idx, url) in normalized.iter().enumerate() {
+        // Progress indicator
+        if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
+            print!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)", 
+                idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
+            io::stdout().flush().ok();
+        }
+
         match fetch_title(&client, url, &title_re).await {
             Ok(result) => {
                 if let Some(title) = &result.title {
-                    println!("[+] {} -> {}" , url, title);
+                    println!("\r{}", format!("[+] {} -> {}", url, title).green());
+                    success_count += 1;
                 } else if let Some(status) = result.status {
-                    println!("[+] {} -> <no title> (status: {})", url, status);
+                    if status.is_success() {
+                        println!("\r{}", format!("[+] {} -> <no title> (status: {})", url, status).green());
+                        success_count += 1;
+                    } else {
+                        println!("\r{}", format!("[~] {} -> <no title> (status: {})", url, status).yellow());
+                    }
                 } else {
-                    println!("[+] {} -> <no title>", url);
+                    println!("\r{}", format!("[~] {} -> <no title>", url).yellow());
                 }
                 if verbose {
                     if let Some(status) = result.status {
@@ -88,7 +109,8 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 all_results.push(result);
             }
             Err(err) => {
-                println!("[-] {} -> error: {}", url, err);
+                println!("\r{}", format!("[-] {} -> error: {}", url, err).red());
+                error_count += 1;
                 all_results.push(TitleResult {
                     url: url.clone(),
                     status: None,
@@ -98,6 +120,19 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 });
             }
         }
+    }
+
+    let elapsed = start_time.elapsed();
+    
+    // Print statistics
+    println!();
+    println!("{}", "=== Scan Statistics ===".bold());
+    println!("  Total scanned:  {}", total_targets);
+    println!("  Successful:     {}", success_count.to_string().green());
+    println!("  Errors:         {}", error_count.to_string().red());
+    println!("  Duration:       {:.2}s", elapsed.as_secs_f64());
+    if elapsed.as_secs() > 0 {
+        println!("  Rate:           {:.1} requests/s", total_targets as f64 / elapsed.as_secs_f64());
     }
 
     if save_output {
@@ -361,13 +396,9 @@ fn write_report(path: &str, results: &[TitleResult]) -> Result<()> {
 }
 
 fn banner() {
-    println!(
-        "{}",
-        r#"
-╔══════════════════════════════════════════════════╗
-║             HTTP TITLE SCANNER (RustSploit)      ║
-║  Enumerate page titles over HTTP/HTTPS endpoints ║
-╚══════════════════════════════════════════════════╝
-"#
-    );
+    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   HTTP Title Scanner                                         ║".cyan());
+    println!("{}", "║   Enumerate page titles over HTTP/HTTPS endpoints            ║".cyan());
+    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    println!();
 }

@@ -21,10 +21,22 @@ use tokio::{
     sync::RwLock,
 };
 use tower::ServiceBuilder;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    trace::TraceLayer,
+    limit::RequestBodyLimitLayer,
+};
 use uuid::Uuid;
 
 use crate::commands;
+
+/// Maximum request body size (1MB) to prevent DoS
+const MAX_REQUEST_BODY_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of tracked IPs before cleanup
+const MAX_TRACKED_IPS: usize = 100_000;
+
+/// Maximum number of auth failure entries
+const MAX_AUTH_FAILURE_ENTRIES: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct ApiKey {
@@ -161,14 +173,35 @@ impl ApiState {
         if !self.harden_enabled {
             return Ok(false);
         }
+        
+        // Validate IP string length
+        if ip.len() > 128 {
+            return Ok(false);
+        }
 
         let mut tracker_guard = self.ip_tracker.write().await;
         let now = Utc::now();
+        
+        // Cleanup old entries if we have too many tracked IPs (memory protection)
+        if tracker_guard.len() >= MAX_TRACKED_IPS {
+            // Remove oldest entries (keep most recent half)
+            let mut entries: Vec<_> = tracker_guard.drain().collect();
+            entries.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+            entries.truncate(MAX_TRACKED_IPS / 2);
+            for (k, v) in entries {
+                tracker_guard.insert(k, v);
+            }
+            let _ = self.log_message(&format!(
+                "[CLEANUP] Pruned IP tracker from {} to {} entries",
+                MAX_TRACKED_IPS,
+                tracker_guard.len()
+            )).await;
+        }
 
         if let Some(tracker) = tracker_guard.get_mut(ip) {
             // Update existing tracker - use all fields
             tracker.last_seen = now;
-            tracker.request_count += 1;
+            tracker.request_count = tracker.request_count.saturating_add(1);
             
             // Log detailed tracking info using first_seen
             let duration = now.signed_duration_since(tracker.first_seen);
@@ -279,8 +312,27 @@ impl ApiState {
     }
 
     pub async fn record_auth_failure(&self, ip: &str) -> Result<()> {
+        // Validate IP string length
+        if ip.len() > 128 {
+            return Ok(());
+        }
+        
         let mut failures_guard = self.auth_failures.write().await;
         let now = Utc::now();
+        
+        // Cleanup old entries if we have too many (memory protection)
+        if failures_guard.len() >= MAX_AUTH_FAILURE_ENTRIES {
+            // Remove expired blocks and oldest entries
+            let cutoff = now - chrono::Duration::hours(1);
+            failures_guard.retain(|_, v| {
+                v.blocked_until.map(|b| b > now).unwrap_or(false) ||
+                v.first_failure > cutoff
+            });
+            let _ = self.log_message(&format!(
+                "[CLEANUP] Pruned auth failure tracker to {} entries",
+                failures_guard.len()
+            )).await;
+        }
 
         let tracker = failures_guard.entry(ip.to_string()).or_insert_with(|| {
             AuthFailureTracker {
@@ -296,7 +348,7 @@ impl ApiState {
             tracker.first_failure = now;
         }
 
-        tracker.failed_attempts += 1;
+        tracker.failed_attempts = tracker.failed_attempts.saturating_add(1);
 
         // Block after 3 failed attempts for 30 seconds
         if tracker.failed_attempts >= 3 {
@@ -695,7 +747,11 @@ pub async fn start_api_server(
     let app = Router::new()
         .route("/health", get(health_check))
         .merge(protected_routes)
-        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
+        .layer(
+            ServiceBuilder::new()
+                .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_SIZE))
+                .layer(TraceLayer::new_for_http())
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_address)
