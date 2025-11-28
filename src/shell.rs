@@ -8,11 +8,15 @@ use std::env;
 use std::io::{self, Write};
 use std::collections::HashSet;
 use std::sync::Mutex;
+use url::Url;
 
 const MAX_INPUT_LENGTH: usize = 4096;
 const MAX_PROXY_LIST_SIZE: usize = 10_000;
 const MAX_TARGET_LENGTH: usize = 512;
 const MAX_COMMAND_CHAIN_LENGTH: usize = 10;
+const MAX_URL_LENGTH: usize = 2048;
+const MAX_PATH_LENGTH: usize = 4096;
+const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
 
 /// Simple interactive shell context
 struct ShellContext {
@@ -721,11 +725,33 @@ fn prompt_for_path(message: &str) -> io::Result<String> {
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        let value = input.trim();
-        if !value.is_empty() {
-            return Ok(value.to_string());
+        
+        // Length check
+        if input.len() > MAX_PATH_LENGTH {
+            println!("{}", format!("Path too long (max {} characters).", MAX_PATH_LENGTH).yellow());
+            continue;
         }
-        println!("Path cannot be empty. Please try again.");
+        
+        let value = input.trim();
+        
+        if value.is_empty() {
+            println!("Path cannot be empty. Please try again.");
+            continue;
+        }
+        
+        // Check for control characters
+        if value.chars().any(|c| c.is_control()) {
+            println!("{}", "Path cannot contain control characters.".yellow());
+            continue;
+        }
+        
+        // Basic path traversal check
+        if value.contains("..") {
+            println!("{}", "Path cannot contain '..' (path traversal).".yellow());
+            continue;
+        }
+        
+        return Ok(value.to_string());
     }
 }
 
@@ -734,21 +760,64 @@ fn prompt_string_default(message: &str, default: &str) -> io::Result<String> {
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed.to_string())
+    
+    // Length check
+    if input.len() > MAX_PROMPT_INPUT_LENGTH {
+        println!("{}", format!("Input too long (max {} characters). Using default.", MAX_PROMPT_INPUT_LENGTH).yellow());
+        return Ok(default.to_string());
     }
+    
+    let trimmed = input.trim();
+    
+    if trimmed.is_empty() {
+        return Ok(default.to_string());
+    }
+    
+    // Check for control characters
+    if trimmed.chars().any(|c| c.is_control()) {
+        println!("{}", "Input cannot contain control characters. Using default.".yellow());
+        return Ok(default.to_string());
+    }
+    
+    // If this looks like a URL, validate it
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        if trimmed.len() > MAX_URL_LENGTH {
+            println!("{}", format!("URL too long (max {} characters). Using default.", MAX_URL_LENGTH).yellow());
+            return Ok(default.to_string());
+        }
+        
+        if Url::parse(trimmed).is_err() {
+            println!("{}", "Invalid URL format. Using default.".yellow());
+            return Ok(default.to_string());
+        }
+    }
+    
+    Ok(trimmed.to_string())
 }
 
 fn prompt_yes_no(message: &str, default_yes: bool) -> io::Result<bool> {
     let default_hint = if default_yes { "Y/n" } else { "y/N" };
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u8 = 10;
+    
     loop {
+        attempts += 1;
+        if attempts > MAX_ATTEMPTS {
+            println!("{}", "Too many invalid attempts. Using default.".yellow());
+            return Ok(default_yes);
+        }
+        
         print!("{} [{}]: ", message, default_hint);
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+        
+        // Length check - y/n should be very short
+        if input.len() > 10 {
+            println!("{}", "Please answer with 'y' or 'n'.".yellow());
+            continue;
+        }
+        
         let trimmed = input.trim().to_lowercase();
         match trimmed.as_str() {
             "" => return Ok(default_yes),
@@ -760,35 +829,83 @@ fn prompt_yes_no(message: &str, default_yes: bool) -> io::Result<bool> {
 }
 
 fn prompt_u64(message: &str, default: u64) -> io::Result<u64> {
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u8 = 10;
+    
     loop {
+        attempts += 1;
+        if attempts > MAX_ATTEMPTS {
+            println!("{}", "Too many invalid attempts. Using default.".yellow());
+            return Ok(default);
+        }
+        
         print!("{} [{}]: ", message, default);
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+        
+        // Length check - numbers shouldn't be too long
+        if input.len() > 20 {
+            println!("{}", "Number too long. Please enter a valid positive integer.".yellow());
+            continue;
+        }
+        
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Ok(default);
         }
+        
+        // Only allow digits
+        if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+            println!("Invalid number. Please enter a positive integer.");
+            continue;
+        }
+        
         match trimmed.parse::<u64>() {
             Ok(value) if value > 0 => return Ok(value),
-            _ => println!("Invalid number. Please enter a positive integer."),
+            Ok(_) => println!("Number must be greater than 0."),
+            Err(_) => println!("Number too large. Please enter a smaller value."),
         }
     }
 }
 
 fn prompt_usize(message: &str, default: usize) -> io::Result<usize> {
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u8 = 10;
+    
     loop {
+        attempts += 1;
+        if attempts > MAX_ATTEMPTS {
+            println!("{}", "Too many invalid attempts. Using default.".yellow());
+            return Ok(default);
+        }
+        
         print!("{} [{}]: ", message, default);
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+        
+        // Length check - numbers shouldn't be too long
+        if input.len() > 20 {
+            println!("{}", "Number too long. Please enter a valid positive integer.".yellow());
+            continue;
+        }
+        
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Ok(default);
         }
+        
+        // Only allow digits
+        if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+            println!("Invalid number. Please enter a positive integer.");
+            continue;
+        }
+        
         match trimmed.parse::<usize>() {
             Ok(value) if value > 0 => return Ok(value),
-            _ => println!("Invalid number. Please enter a positive integer."),
+            Ok(_) => println!("Number must be greater than 0."),
+            Err(_) => println!("Number too large. Please enter a smaller value."),
         }
     }
 }

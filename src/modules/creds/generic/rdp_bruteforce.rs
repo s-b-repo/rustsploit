@@ -6,7 +6,8 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Instant,
 };
 use tokio::{
     process::Command,
@@ -14,9 +15,90 @@ use tokio::{
     time::{sleep, Duration, timeout},
 };
 
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
+            "[Progress]".cyan(),
+            total.to_string().bold(),
+            success.to_string().green(),
+            failed,
+            errors.to_string().red(),
+            rate
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+
+        println!("{}", "=== Statistics ===".bold());
+        println!("  Total attempts:    {}", total);
+        println!("  Successful:        {}", success.to_string().green().bold());
+        println!("  Failed:            {}", failed);
+        println!("  Errors:            {}", errors.to_string().red());
+        println!("  Elapsed time:      {:.2}s", elapsed);
+        if elapsed > 0.0 {
+            println!("  Average rate:      {:.1} attempts/s", total as f64 / elapsed);
+        }
+    }
+}
+
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   RDP Brute Force Module                                  ║".cyan());
+    println!("{}", "║   Remote Desktop Protocol Credential Testing              ║".cyan());
+    println!("{}", "║   Requires xfreerdp or rdesktop                           ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
+
 pub async fn run(target: &str) -> Result<()> {
-    println!("=== RDP Brute Force Module ===");
-    println!("[*] Target: {}", target);
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
         let input = prompt_default("RDP Port", "3389")?;
@@ -100,6 +182,7 @@ pub async fn run(target: &str) -> Result<()> {
     let addr = format_socket_address(target, port);
     let found_credentials = Arc::new(Mutex::new(Vec::new()));
     let stop_signal = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Statistics::new());
 
     println!("\n[*] Starting brute-force on {}", addr);
     println!("[*] Timeout: {} seconds", timeout_secs);
@@ -118,6 +201,23 @@ pub async fn run(target: &str) -> Result<()> {
         return Ok(());
     }
     println!("[*] Loaded {} passwords", password_count);
+
+    let total_attempts = if combo_mode { user_count * password_count } else { password_count };
+    println!("{}", format!("[*] Total attempts: {}", total_attempts).cyan());
+    println!();
+
+    // Start progress reporter
+    let stats_clone = stats.clone();
+    let stop_clone = stop_signal.clone();
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            stats_clone.print_progress();
+            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+        }
+    });
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
@@ -165,6 +265,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let found_credentials_clone = Arc::clone(&found_credentials);
                 let stop_signal_clone = Arc::clone(&stop_signal);
                 let semaphore_clone = Arc::clone(&semaphore);
+                let stats_clone = Arc::clone(&stats);
                 let verbose_flag = verbose;
                 let stop_on_success_flag = stop_on_success;
                 let timeout_duration = Duration::from_secs(timeout_secs);
@@ -183,18 +284,25 @@ pub async fn run(target: &str) -> Result<()> {
 
                     match try_rdp_login(&addr_clone, &user_clone, &pass_clone, timeout_duration).await {
                         Ok(true) => {
-                            println!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone);
+                            println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone).green().bold());
                             let mut found = found_credentials_clone.lock().await;
                             found.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
+                            stats_clone.record_attempt(true, false);
                             if stop_on_success_flag {
                                 stop_signal_clone.store(true, Ordering::Relaxed);
                             }
                         }
                         Ok(false) => {
-                            log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone));
+                            stats_clone.record_attempt(false, false);
+                            if verbose_flag {
+                                println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
+                            }
                         }
                         Err(e) => {
-                            log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
+                            stats_clone.record_attempt(false, true);
+                            if verbose_flag {
+                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                            }
                         }
                     }
                     drop(permit);
@@ -235,46 +343,54 @@ pub async fn run(target: &str) -> Result<()> {
             
             let user = users[i % users.len()].clone();
 
-            let addr_clone = addr.clone();
-            let pass_clone = pass.clone();
-            let found_credentials_clone = Arc::clone(&found_credentials);
-            let stop_signal_clone = Arc::clone(&stop_signal);
-            let semaphore_clone = Arc::clone(&semaphore);
-            let verbose_flag = verbose;
-            let stop_on_success_flag = stop_on_success;
-            let timeout_duration = Duration::from_secs(timeout_secs);
+                let addr_clone = addr.clone();
+                let pass_clone = pass.clone();
+                let found_credentials_clone = Arc::clone(&found_credentials);
+                let stop_signal_clone = Arc::clone(&stop_signal);
+                let semaphore_clone = Arc::clone(&semaphore);
+                let stats_clone = Arc::clone(&stats);
+                let verbose_flag = verbose;
+                let stop_on_success_flag = stop_on_success;
+                let timeout_duration = Duration::from_secs(timeout_secs);
 
-            tasks.push(tokio::spawn(async move {
-                if stop_on_success_flag && stop_signal_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-                let permit = match semaphore_clone.acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                };
-                if stop_on_success_flag && stop_signal_clone.load(Ordering::Relaxed) {
-                    return;
-                }
+                tasks.push(tokio::spawn(async move {
+                    if stop_on_success_flag && stop_signal_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let permit = match semaphore_clone.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    if stop_on_success_flag && stop_signal_clone.load(Ordering::Relaxed) {
+                        return;
+                    }
 
-                match try_rdp_login(&addr_clone, &user, &pass_clone, timeout_duration).await {
-                    Ok(true) => {
-                        println!("[+] {} -> {}:{}", addr_clone, user, pass_clone);
-                        let mut found = found_credentials_clone.lock().await;
-                        found.push((addr_clone.clone(), user.clone(), pass_clone.clone()));
-                        if stop_on_success_flag {
-                            stop_signal_clone.store(true, Ordering::Relaxed);
+                    match try_rdp_login(&addr_clone, &user, &pass_clone, timeout_duration).await {
+                        Ok(true) => {
+                            println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user, pass_clone).green().bold());
+                            let mut found = found_credentials_clone.lock().await;
+                            found.push((addr_clone.clone(), user.clone(), pass_clone.clone()));
+                            stats_clone.record_attempt(true, false);
+                            if stop_on_success_flag {
+                                stop_signal_clone.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(false) => {
+                            stats_clone.record_attempt(false, false);
+                            if verbose_flag {
+                                println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user, pass_clone).dimmed());
+                            }
+                        }
+                        Err(e) => {
+                            stats_clone.record_attempt(false, true);
+                            if verbose_flag {
+                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                            }
                         }
                     }
-                    Ok(false) => {
-                        log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user, pass_clone));
-                    }
-                    Err(e) => {
-                        log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
-                    }
-                }
-                drop(permit);
-                sleep(Duration::from_millis(10)).await;
-            }));
+                    drop(permit);
+                    sleep(Duration::from_millis(10)).await;
+                }));
 
             // Limit concurrent tasks
             if tasks.len() >= concurrency {
@@ -290,15 +406,24 @@ pub async fn run(target: &str) -> Result<()> {
     // Wait for remaining tasks
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
-            log(verbose, &format!("[!] Task join error: {}", e));
+            if verbose {
+                println!("\r{}", format!("[!] Task join error: {}", e).red());
+            }
         }
     }
 
+    // Stop progress reporter
+    stop_signal.store(true, Ordering::Relaxed);
+    let _ = progress_handle.await;
+
+    // Print final statistics
+    stats.print_final();
+
     let creds = found_credentials.lock().await;
     if creds.is_empty() {
-        println!("\n[-] No credentials found.");
+        println!("{}", "[-] No credentials found.".yellow());
     } else {
-        println!("\n[+] Valid credentials found:");
+        println!("{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
         for (host_addr, user, pass) in creds.iter() {
             println!("    {} -> {}:{}", host_addr, user, pass);
         }

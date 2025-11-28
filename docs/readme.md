@@ -12,12 +12,13 @@
 4. [Shell Architecture](#shell-architecture)  
 5. [Proxy Subsystem](#proxy-subsystem)  
 6. [Command-Line Interface](#command-line-interface)  
-7. [Authoring Modules](#authoring-modules)  
-8. [Credential Modules: Best Practices](#credential-modules-best-practices)  
-9. [Exploit Modules: Best Practices](#exploit-modules-best-practices)  
-10. [Utilities & Helpers](#utilities--helpers)  
-11. [Testing & QA](#testing--qa)  
-12. [Roadmap & Ideas](#roadmap--ideas)  
+7. [Security & Input Validation](#security--input-validation)  
+8. [Authoring Modules](#authoring-modules)  
+9. [Credential Modules: Best Practices](#credential-modules-best-practices)  
+10. [Exploit Modules: Best Practices](#exploit-modules-best-practices)  
+11. [Utilities & Helpers](#utilities--helpers)  
+12. [Testing & QA](#testing--qa)  
+13. [Roadmap & Ideas](#roadmap--ideas)  
 
 ---
 
@@ -41,9 +42,11 @@ rustsploit/
 ├── Cargo.toml
 ├── build.rs                 # Generates dispatcher code by scanning src/modules
 ├── src/
-│   ├── main.rs              # Entry point, selects CLI or shell mode
+│   ├── main.rs              # Entry point, selects CLI or shell mode (includes input validation)
 │   ├── cli.rs               # Clap-based CLI parser and dispatcher
-│   ├── shell.rs             # Interactive shell loop + UX helpers
+│   ├── shell.rs             # Interactive shell loop + UX helpers (includes sanitization)
+│   ├── api.rs               # REST API server with auth, rate limiting, and security
+│   ├── config.rs            # Global configuration with target validation
 │   ├── commands/            # Dispatch glue for exploits/scanners/creds
 │   │   ├── mod.rs
 │   │   ├── exploit.rs
@@ -56,13 +59,14 @@ rustsploit/
 │   │   ├── exploits/
 │   │   ├── scanners/
 │   │   └── creds/
-│   └── utils.rs             # Shared helpers (proxy parsing, module lookup, etc.)
+│   └── utils.rs             # Shared helpers (proxy parsing, module lookup, validation)
 ├── docs/
 │   └── readme.md            # This document
 ├── lists/
 │   ├── readme.md            # Wordlist + data file catalogue
 │   ├── rtsp-paths.txt
-│   └── rtsphead.txt
+│   ├── rtsphead.txt
+│   └── telnet-default/      # Default telnet credentials
 └── README.md                # Product overview
 ```
 
@@ -134,6 +138,100 @@ If the module needs additional parameters, it can prompt interactively (e.g., br
 
 ---
 
+## Security & Input Validation
+
+RustSploit implements comprehensive security measures throughout the codebase. When contributing, follow these guidelines:
+
+### Input Validation Constants
+
+Located across core modules, these constants enforce safe limits:
+
+| File | Constant | Value | Purpose |
+|------|----------|-------|---------|
+| `shell.rs` | `MAX_INPUT_LENGTH` | 4096 | Maximum shell input length |
+| `shell.rs` | `MAX_TARGET_LENGTH` | 512 | Maximum target string length |
+| `shell.rs` | `MAX_URL_LENGTH` | 2048 | Maximum URL length |
+| `shell.rs` | `MAX_PATH_LENGTH` | 4096 | Maximum file path length |
+| `shell.rs` | `MAX_PROXY_LIST_SIZE` | 10,000 | Maximum proxy entries |
+| `utils.rs` | `MAX_FILE_SIZE` | 10MB | Maximum file size to read |
+| `utils.rs` | `MAX_PROXIES` | 100,000 | Maximum proxies to process |
+| `config.rs` | `MAX_HOSTNAME_LENGTH` | 253 | DNS hostname limit |
+| `api.rs` | `MAX_REQUEST_BODY_SIZE` | 1MB | API request body limit |
+| `api.rs` | `MAX_TRACKED_IPS` | 100,000 | IP tracker limit |
+
+### Security Patterns
+
+When writing modules or core code, follow these patterns:
+
+#### 1. Input Length Validation
+```rust
+if input.len() > MAX_INPUT_LENGTH {
+    return Err(anyhow!("Input too long (max {} characters)", MAX_INPUT_LENGTH));
+}
+```
+
+#### 2. Control Character Rejection
+```rust
+if input.chars().any(|c| c.is_control()) {
+    return Err(anyhow!("Input cannot contain control characters"));
+}
+```
+
+#### 3. Path Traversal Prevention
+```rust
+if input.contains("..") || input.contains("//") {
+    return Err(anyhow!("Path traversal detected"));
+}
+```
+
+#### 4. Hostname/Target Validation
+```rust
+use regex::Regex;
+let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").unwrap();
+if !valid_chars.is_match(target) {
+    return Err(anyhow!("Invalid characters in target"));
+}
+```
+
+#### 5. Overflow Protection
+```rust
+// Use saturating_add to prevent overflow
+counter = counter.saturating_add(1);
+```
+
+#### 6. Prompt Attempt Limiting
+```rust
+const MAX_ATTEMPTS: u8 = 10;
+let mut attempts = 0;
+loop {
+    attempts += 1;
+    if attempts > MAX_ATTEMPTS {
+        println!("Too many invalid attempts. Using default.");
+        return Ok(default);
+    }
+    // ... prompt logic
+}
+```
+
+### API Security
+
+The API server (`api.rs`) implements:
+
+- **Request Body Limiting:** `RequestBodyLimitLayer` prevents DoS via large payloads
+- **Rate Limiting:** 3 failed auth attempts = 30 second block
+- **Auto-cleanup:** Old entries purged when limits exceeded
+- **IP Tracking:** With automatic rotation when suspicious activity detected
+
+### File Operations
+
+When reading files, always:
+1. Validate the path doesn't contain `..`
+2. Use `canonicalize()` to resolve the real path
+3. Check file size before reading
+4. Skip symlinks for security
+
+---
+
 ## Authoring Modules
 
 Every module must export:
@@ -157,7 +255,7 @@ Guidelines:
 6. **Wordlists / resources:** store under `lists/` and document them in `lists/readme.md`.
 7. **Optional interactive mode:** If the module benefits from multiple code paths, optionally expose `run_interactive` and call it from `run`.
 
-### Example skeleton
+### skeleton
 
 ```rust
 use anyhow::{Context, Result};
@@ -250,4 +348,4 @@ Contributions are welcome—open an issue or start a discussion before large ref
 
 ---
 
-Happy hacking, and remember: **authorized testing only**. Commit messages and module descriptions should always reflect controlled research usage. !*** End Patch
+Happy hacking, and remember: **authorized testing only**. Commit messages and module descriptions should always reflect controlled research usage. !*** 

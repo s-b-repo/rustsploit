@@ -34,12 +34,13 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 - ✅ **Auto-discovered modules:** `build.rs` indexes `src/modules/**` so new code drops in without manual registration
 - ✅ **Interactive shell with color and shortcuts:** Quick command palette, target/module state tracking, alias commands (`help/?`, `modules/m`, `run/go`, etc.)
 - ✅ **Ergonomic proxy system:** Load lists, validate availability, choose concurrency/timeouts, and rotate automatically on failure
-- ✅ **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP brute force modules with IPv6 and TLS support where applicable
+- ✅ **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, Fortinet brute force modules with IPv6 and TLS support where applicable
 - ✅ **Exploit coverage:** Apache Tomcat, Abus security cameras, Ivanti Connect Secure, TP-Link, Zabbix, Avtech cameras, Spotube, OpenSSH race condition, and more
-- ✅ **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, StalkRoute traceroute (root), sample modules for extension
+- ✅ **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, DNS recursion tester, HTTP method scanner, StalkRoute traceroute (root)
 - ✅ **Payload generation:** Batch malware dropper (`narutto_dropper`), BAT payload generator, custom credential checkers
 - ✅ **Readable output:** Colored prompts, structured status messages, optional verbose logs and result persistence
 - ✅ **REST API Server:** Launch a secure API server with authentication, rate limiting, IP tracking, and dynamic key rotation
+- ✅ **Security hardened:** Comprehensive input validation, path traversal protection, length limits, and memory-safe operations throughout
 
 ---
 
@@ -49,11 +50,11 @@ Rustsploit ships categorized modules under `src/modules/`, automatically exposed
 
 | Category | Highlights |
 |----------|------------|
-| `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, Telnet brute force, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), RDP auth-only brute |
-| `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE |
-| `scanners` | Port scanner, ping sweep, SSDP M-SEARCH enumerator, HTTP title fetcher, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion) |
+| `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, SSH user enumeration (timing attack), SSH password spray, Telnet brute force, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), RDP auth-only brute, SNMP community string brute force, L2TP/IPsec brute force, Fortinet SSL VPN brute force |
+| `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE, Flowise CVE-2025-59528 RCE, HTTP/2 Rapid Reset DoS, Jenkins LFI, PAN-OS Auth Bypass, Heartbleed, **SSHPWN Framework** (SFTP symlink/setuid/traversal, SCP injection/DoS, Session env injection) |
+| `scanners` | Port scanner (TCP/UDP/SYN/ACK), ping sweep (ICMP/TCP/UDP/SYN/ACK), SSDP M-SEARCH enumerator, HTTP title fetcher, HTTP method scanner, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion), **SSH scanner** (banner grabbing, CIDR support) |
 | `payloadgens` | `narutto_dropper`, BAT payload generator |
-| `lists` | RTSP wordlists and helper files |
+| `lists` | RTSP wordlists, telnet default credentials, and helper files |
 
 Run `modules` or `find <keyword>` in the shell for the authoritative list.
 
@@ -322,12 +323,20 @@ Authorization: ApiKey your-api-key-here
   
 ### Security Features
 
+#### Input Validation & Security
+- **Request Body Limiting:** Maximum 1MB request body to prevent DoS attacks
+- **API Key Validation:** Keys must be printable ASCII, max 256 characters
+- **Target Validation:** All targets are validated for length, control characters, and path traversal
+- **Module Path Sanitization:** Module names are validated against path traversal and injection attacks
+- **Resource Limits:** Automatic cleanup when tracked IPs or auth failures exceed 100,000 entries
+
 #### Rate Limiting
 - IPs are automatically blocked for **30 seconds** after **3 failed authentication attempts**
 - Blocked IPs receive HTTP `429 Too Many Requests` responses
 - Failed attempts are logged to both terminal and log file
 - Counter resets automatically after the block period expires
 - Successful authentication resets the failure counter for that IP
+- Automatic cleanup of expired blocks and entries older than 1 hour
 
 #### Hardening Mode
 When `--harden` is enabled:
@@ -335,6 +344,7 @@ When `--harden` is enabled:
 - Automatically rotates the API key when the number of unique IPs exceeds the limit (default: 10)
 - Logs all rotation events to terminal and `rustsploit_api.log`
 - Clears IP tracking after key rotation
+- Automatic pruning when tracker exceeds 100,000 entries
 
 #### Logging
 All API activity is logged to:
@@ -347,6 +357,7 @@ Log entries include:
 - IP tracking and hardening actions
 - Key rotation events
 - Module execution results
+- Resource cleanup operations
 
 ### Example API Workflow
 

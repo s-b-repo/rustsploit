@@ -1,12 +1,21 @@
 use anyhow::{Context, Result};
 use async_ftp::FtpStream;
+use colored::*;
 use reqwest::Client;
 use ssh2::Session;
 use telnet::{Telnet, Event};
 use std::{net::TcpStream, time::Duration};
 use tokio::{join, task};
 
+const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
+fn display_banner() {
+    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   ACTi Camera Default Credentials Checker                 ║".cyan());
+    println!("{}", "║   Multi-Protocol Scanner (FTP/SSH/Telnet/HTTP)            ║".cyan());
+    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
 
 #[allow(dead_code)]
 /// Supported Acti services
@@ -39,18 +48,18 @@ fn normalize_target(target: &str, port: u16) -> String {
 
 /// FTP check (async)
 pub async fn check_ftp(config: &Config) -> Result<()> {
-    println!("[*] Checking FTP credentials on {}:{}", config.target, config.port);
+    println!("{}", format!("[*] Checking FTP credentials on {}:{}", config.target, config.port).cyan());
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            println!("[*] Trying FTP: {}:{}", username, password);
+            println!("{}", format!("[*] Trying FTP: {}:{}", username, password).dimmed());
         }
 
         let address = normalize_target(&config.target, config.port);
         match FtpStream::connect(address).await {
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
-                    println!("[+] FTP credentials valid: {}:{}", username, password);
+                    println!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
                     if config.stop_on_success {
                         return Ok(());
                     }
@@ -61,17 +70,17 @@ pub async fn check_ftp(config: &Config) -> Result<()> {
         }
     }
 
-    println!("[-] No valid FTP credentials found on {}:{}", config.target, config.port);
+    println!("{}", format!("[-] No valid FTP credentials found on {}:{}", config.target, config.port).yellow());
     Ok(())
 }
 
 /// SSH check (blocking, so we use spawn_blocking)
 pub fn check_ssh_blocking(config: &Config) -> Result<()> {
-    println!("[*] Checking SSH credentials on {}:{}", config.target, config.port);
+    println!("{}", format!("[*] Checking SSH credentials on {}:{}", config.target, config.port).cyan());
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            println!("[*] Trying SSH: {}:{}", username, password);
+            println!("{}", format!("[*] Trying SSH: {}:{}", username, password).dimmed());
         }
 
         let address = normalize_target(&config.target, config.port);
@@ -81,7 +90,7 @@ pub fn check_ssh_blocking(config: &Config) -> Result<()> {
             session.handshake().context("SSH handshake failed")?;
 
             if session.userauth_password(username, password).is_ok() && session.authenticated() {
-                println!("[+] SSH credentials valid: {}:{}", username, password);
+                println!("{}", format!("[+] SSH credentials valid: {}:{}", username, password).green().bold());
                 if config.stop_on_success {
                     return Ok(());
                 }
@@ -89,17 +98,17 @@ pub fn check_ssh_blocking(config: &Config) -> Result<()> {
         }
     }
 
-    println!("[-] No valid SSH credentials found on {}:{}", config.target, config.port);
+    println!("{}", format!("[-] No valid SSH credentials found on {}:{}", config.target, config.port).yellow());
     Ok(())
 }
 
 /// Telnet check (blocking)
 pub fn check_telnet_blocking(config: &Config) -> Result<()> {
-    println!("[*] Checking Telnet credentials on {}:{}", config.target, config.port);
+    println!("{}", format!("[*] Checking Telnet credentials on {}:{}", config.target, config.port).cyan());
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            println!("[*] Trying Telnet: {}:{}", username, password);
+            println!("{}", format!("[*] Trying Telnet: {}:{}", username, password).dimmed());
         }
 
         let address = normalize_target(&config.target, config.port);
@@ -120,7 +129,7 @@ pub fn check_telnet_blocking(config: &Config) -> Result<()> {
             if let Ok(Event::Data(buffer)) = telnet.read_timeout(Duration::from_millis(800)) {
                 let response = String::from_utf8_lossy(&buffer);
                 if !response.contains("incorrect") && !response.contains("failed") {
-                    println!("[+] Telnet credentials valid: {}:{}", username, password);
+                    println!("{}", format!("[+] Telnet credentials valid: {}:{}", username, password).green().bold());
                     if config.stop_on_success {
                         return Ok(());
                     }
@@ -129,24 +138,24 @@ pub fn check_telnet_blocking(config: &Config) -> Result<()> {
         }
     }
 
-    println!("[-] No valid Telnet credentials found on {}:{}", config.target, config.port);
+    println!("{}", format!("[-] No valid Telnet credentials found on {}:{}", config.target, config.port).yellow());
     Ok(())
 }
 
 /// HTTP Web Login check (async)
 pub async fn check_http_form(config: &Config) -> Result<()> {
-    println!("[*] Checking HTTP Web Form credentials on {}:{}", config.target, config.port);
+    println!("{}", format!("[*] Checking HTTP Web Form credentials on {}:{}", config.target, config.port).cyan());
 
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .build()?;
 
     let url = format!("http://{}:{}/video.htm", config.target.trim_matches(|c| c == '[' || c == ']'), config.port);
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            println!("[*] Trying HTTP: {}:{}", username, password);
+            println!("{}", format!("[*] Trying HTTP: {}:{}", username, password).dimmed());
         }
 
         let data = [
@@ -166,19 +175,23 @@ pub async fn check_http_form(config: &Config) -> Result<()> {
         let body = res.text().await.unwrap_or_default();
 
         if !body.contains(">Password<") {
-            println!("[+] HTTP credentials valid: {}:{}", username, password);
+            println!("{}", format!("[+] HTTP credentials valid: {}:{}", username, password).green().bold());
             if config.stop_on_success {
                 return Ok(());
             }
         }
     }
 
-    println!("[-] No valid HTTP credentials found on {}:{}", config.target, config.port);
+    println!("{}", format!("[-] No valid HTTP credentials found on {}:{}", config.target, config.port).yellow());
     Ok(())
 }
 
 /// Entrypoint for module - parallel checks
 pub async fn run(target: &str) -> Result<()> {
+    display_banner();
+    println!("{}", format!("[*] Target: {}", target).cyan());
+    println!();
+
     let creds = vec![
         ("admin", "12345"),
         ("admin", "123456"),

@@ -22,9 +22,17 @@ struct TargetSpec {
     port: Option<u16>,
 }
 
+fn display_banner() {
+    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║   DNS Recursion & Amplification Scanner                      ║".cyan());
+    println!("{}", "║   Detects open resolvers that may be abused for DoS attacks  ║".cyan());
+    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    println!();
+}
+
 /// Scan DNS resolvers for open recursion with improved input validation.
 pub async fn run(initial_target: &str) -> Result<()> {
-    println!("\n=== DNS Recursion & Amplification Scanner ===");
+    display_banner();
 
     let mut targets = collect_targets(initial_target)?;
     if targets.is_empty() {
@@ -60,6 +68,11 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let mut any_success = false;
     let mut last_error: Option<anyhow::Error> = None;
+    let mut vulnerable_count = 0usize;
+    let mut tested_count = 0usize;
+    let start_time = std::time::Instant::now();
+
+    println!();
 
     for spec in targets.drain(..) {
         let port = spec.port.unwrap_or(default_port);
@@ -70,10 +83,12 @@ pub async fn run(initial_target: &str) -> Result<()> {
             spec.input
         );
 
+        tested_count += 1;
+        
         match resolve_target(&spec.host, port).await {
             Ok((socket_addr, resolved_display)) => {
-                println!("[*] Target resolver: {}", resolved_display);
-                match query_target(socket_addr, &resolved_display, &name, record_type).await {
+                println!("{}", format!("[*] Target resolver: {}", resolved_display).cyan());
+                match query_target(socket_addr, &resolved_display, &name, record_type, &mut vulnerable_count).await {
                     Ok(()) => any_success = true,
                     Err(err) => {
                         eprintln!(
@@ -94,6 +109,25 @@ pub async fn run(initial_target: &str) -> Result<()> {
         }
     }
 
+    let elapsed = start_time.elapsed();
+
+    // Print statistics
+    println!();
+    println!("{}", "=== Scan Statistics ===".bold());
+    println!("  Targets tested:       {}", tested_count);
+    println!("  Vulnerable (open):    {}", if vulnerable_count > 0 { 
+        vulnerable_count.to_string().red().bold().to_string() 
+    } else { 
+        "0".green().to_string() 
+    });
+    println!("  Duration:             {:.2}s", elapsed.as_secs_f64());
+
+    if vulnerable_count > 0 {
+        println!();
+        println!("{}", "[!] WARNING: Open recursive DNS resolvers detected!".red().bold());
+        println!("{}", "    These can be abused for DNS amplification attacks.".yellow());
+    }
+
     if any_success {
         Ok(())
     } else {
@@ -106,6 +140,7 @@ async fn query_target(
     display_target: &str,
     name: &Name,
     record_type: RecordType,
+    vulnerable_count: &mut usize,
 ) -> Result<()> {
     println!(
         "[*] Sending {} query (timeout 5s) to {}",
@@ -124,12 +159,16 @@ async fn query_target(
         .with_context(|| format!("DNS query to {} failed", display_target))?;
 
     let (message, _) = response.into_parts();
-    report_result(&message, display_target, record_type);
+    let is_vulnerable = report_result(&message, display_target, record_type);
+    
+    if is_vulnerable {
+        *vulnerable_count += 1;
+    }
 
     Ok(())
 }
 
-fn report_result(message: &Message, display_target: &str, record_type: RecordType) {
+fn report_result(message: &Message, display_target: &str, record_type: RecordType) -> bool {
     let recursion_available = message.recursion_available();
     let recursion_desired = message.recursion_desired();
     let authoritative = message.authoritative();
@@ -145,16 +184,16 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
             message.answers().len(),
             message.name_servers().len(),
             message.additionals().len()
-        )
+        ).dimmed()
     );
 
     if truncated {
-        println!("[!] Response was truncated (TC flag set).");
+        println!("{}", "[!] Response was truncated (TC flag set).".yellow());
     }
 
     println!(
-        "[*] Flags: RD={} RA={} AA={}",
-        recursion_desired, recursion_available, authoritative
+        "{}",
+        format!("[*] Flags: RD={} RA={} AA={}", recursion_desired, recursion_available, authoritative).dimmed()
     );
 
     if recursion_available && rcode != ResponseCode::Refused {
@@ -167,12 +206,14 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
                 if authoritative { "(authoritative data returned)" } else { "" }
             )
             .green()
+            .bold()
         );
         println!(
             "{}",
             "    This resolver may be abused for reflection/amplification attacks (ANY/DNSSEC)."
                 .yellow()
         );
+        true
     } else if recursion_available && rcode == ResponseCode::Refused {
         println!(
             "{}",
@@ -182,6 +223,7 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
             )
             .yellow()
         );
+        false
     } else {
         println!(
             "{}",
@@ -189,8 +231,9 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
                 "[-] {} does not appear to allow recursion (RA flag unset or query refused).",
                 display_target
             )
-            .red()
+            .dimmed()
         );
+        false
     }
 }
 

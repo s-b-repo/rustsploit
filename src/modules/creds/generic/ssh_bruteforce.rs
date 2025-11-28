@@ -302,9 +302,17 @@ pub async fn run(target: &str) -> Result<()> {
             let retry_flag = retry_on_error;
             let max_retries_clone = max_retries;
 
-            let permit = semaphore_clone.acquire_owned().await.unwrap();
+            // Spawn task immediately - acquire permit INSIDE the task for true concurrency
             tasks.push(tokio::spawn(async move {
-                let _permit = permit;
+                if stop_flag && stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // Acquire semaphore permit inside the spawned task
+                let _permit = match semaphore_clone.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
                 
                 if stop_flag && stop_clone.load(Ordering::Relaxed) {
                     return;
@@ -353,9 +361,9 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    // Wait for all tasks
-    for task in tasks {
-        let _ = task.await;
+    // Wait for all tasks with bounded concurrency
+    while let Some(result) = tasks.pop() {
+        let _ = result.await;
     }
 
     stop.store(true, Ordering::Relaxed);
