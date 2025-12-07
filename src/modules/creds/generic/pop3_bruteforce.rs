@@ -454,6 +454,7 @@ fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     initialize_output_file(&config)?;
 
     let found = Arc::new(Mutex::new(HashSet::new()));
+    let unknown = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Statistics::new());
     let output_file = Arc::new(config.output_file.clone());
@@ -489,6 +490,7 @@ fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
         host,
         stop_flag.clone(),
                   found.clone(),
+        unknown.clone(),
                   output_file,
                   stats.clone(),
     );
@@ -497,7 +499,7 @@ fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     stop_flag.store(true, Ordering::Relaxed);
 
     stats.print_final();
-    print_final_report(&found, &config.output_file);
+    print_final_report(&found, &unknown, &config.output_file);
 
     Ok(())
 }
@@ -682,6 +684,7 @@ fn spawn_workers(
                  host: String,
                  stop_flag: Arc<AtomicBool>,
                  found: Arc<Mutex<HashSet<(String, String)>>>,
+                 unknown: Arc<Mutex<Vec<(String, String, String)>>>,
                  output_file: Arc<String>,
                  stats: Arc<Statistics>,
 ) {
@@ -691,6 +694,7 @@ fn spawn_workers(
         let host = host.clone();
         let stop_flag = stop_flag.clone();
         let found = found.clone();
+        let unknown = unknown.clone();
         let output_file = output_file.clone();
         let stats = stats.clone();
         let config = config.clone();
@@ -704,6 +708,7 @@ fn spawn_workers(
                 &config,
                 &stop_flag,
                 &found,
+                &unknown,
                 &output_file,
                 &stats,
             );
@@ -719,6 +724,7 @@ fn worker_loop(
                config: &Pop3BruteforceConfig,
                stop_flag: &Arc<AtomicBool>,
                found: &Arc<Mutex<HashSet<(String, String)>>>,
+               unknown: &Arc<Mutex<Vec<(String, String, String)>>>,
                output_file: &str,
                stats: &Arc<Statistics>,
 ) {
@@ -746,6 +752,7 @@ fn worker_loop(
             config,
             stop_flag,
             found,
+            unknown,
             output_file,
             stats,
             &rx,
@@ -797,6 +804,7 @@ fn process_login_result(
     config: &Pop3BruteforceConfig,
     stop_flag: &Arc<AtomicBool>,
     found: &Arc<Mutex<HashSet<(String, String)>>>,
+    unknown: &Arc<Mutex<Vec<(String, String, String)>>>,
                         output_file: &str,
                         stats: &Arc<Statistics>,
                         rx: &crossbeam_channel::Receiver<(String, String)>,
@@ -832,14 +840,23 @@ fn process_login_result(
         }
         Err(e) => {
             stats.record_attempt(false, true);
+            let msg = e.to_string();
+            {
+                let mut unk = unknown.lock().unwrap();
+                unk.push((user.to_string(), pass.to_string(), msg.clone()));
+            }
             if config.verbose {
-                eprintln!("{} Error ({}): {}:{}", "[!]".yellow(), e, user, pass);
+                eprintln!("{} Error/unknown ({}): {}:{}", "[?]".yellow(), msg, user, pass);
             }
         }
     }
 }
 
-fn print_final_report(found: &Arc<Mutex<HashSet<(String, String)>>>, output_file: &str) {
+fn print_final_report(
+    found: &Arc<Mutex<HashSet<(String, String)>>>,
+    unknown: &Arc<Mutex<Vec<(String, String, String)>>>,
+    output_file: &str,
+) {
     let found = found.lock().unwrap();
     println!();
     if found.is_empty() {
@@ -851,7 +868,39 @@ fn print_final_report(found: &Arc<Mutex<HashSet<(String, String)>>>, output_file
         for (u, p) in sorted.iter() {
             println!("  {}  {}:{}", "✓".green(), u, p);
         }
-        println!("\n[*] All results saved to: {}", output_file);
+        println!("\n[*] All valid results saved to: {}", output_file);
+    }
+
+    drop(found);
+
+    let unknown_guard = unknown.lock().unwrap();
+    if !unknown_guard.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "[?] Collected {} unknown/errored POP3 responses.",
+                unknown_guard.len()
+            )
+            .yellow()
+            .bold()
+        );
+        if prompt_yes_no("Save unknown responses to file? (y/n): ", true) {
+            let default_name = "pop3_unknown_responses.txt";
+            let fname = prompt_required(&format!(
+                "What should the unknown results be saved as? (default: {}): ",
+                default_name
+            ));
+            let chosen = if fname.trim().is_empty() {
+                default_name.to_string()
+            } else {
+                fname.trim().to_string()
+            };
+            if let Err(e) = save_unknown_pop3(&chosen, &unknown_guard) {
+                println!("{}", format!("[!] Failed to save unknown responses: {}", e).red());
+            } else {
+                println!("{}", format!("[+] Unknown responses saved to {}", chosen).green());
+            }
+        }
     }
 }
 
@@ -986,6 +1035,24 @@ fn append_result(output_file: &str, username: &str, password: &str) -> Result<()
 
     writeln!(file, "{}:{}", username, password)?;
     file.flush()?;
+    Ok(())
+}
+
+fn save_unknown_pop3(path: &str, entries: &[(String, String, String)]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+
+    writeln!(file, "# POP3 Bruteforce Unknown/Errored Responses")?;
+    writeln!(file, "# Format: username:password - error/response")?;
+    writeln!(file)?;
+
+    for (user, pass, msg) in entries {
+        writeln!(file, "{}:{} - {}", user, pass, msg)?;
+    }
+
     Ok(())
 }
 

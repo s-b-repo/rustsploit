@@ -245,6 +245,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!();
 
     let found = Arc::new(Mutex::new(HashSet::new()));
+    let unknown = Arc::new(Mutex::new(Vec::<(String, String, String, String)>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Statistics::new());
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -293,6 +294,7 @@ pub async fn run(target: &str) -> Result<()> {
             let user_clone = user.clone();
             let pass_clone = pass.clone();
             let found_clone = Arc::clone(&found);
+            let unknown_clone = Arc::clone(&unknown);
             let stop_clone = Arc::clone(&stop);
             let stats_clone = Arc::clone(&stats);
             let semaphore_clone = semaphore.clone();
@@ -340,17 +342,46 @@ pub async fn run(target: &str) -> Result<()> {
                         }
                         Err(e) => {
                             stats_clone.record_attempt(false, true);
+                            let msg = e.to_string();
                             if retry_flag && retries < max_retries_clone {
                                 retries += 1;
                                 stats_clone.record_retry();
                                 if verbose_flag {
-                                    println!("\r{}", format!("[!] {} -> {}:{} (retry {}/{})", addr_clone, user_clone, pass_clone, retries, max_retries_clone).yellow());
+                                    println!(
+                                        "\r{}",
+                                        format!(
+                                            "[!] {} -> {}:{} (retry {}/{}) - {}",
+                                            addr_clone,
+                                            user_clone,
+                                            pass_clone,
+                                            retries,
+                                            max_retries_clone,
+                                            msg
+                                        )
+                                        .yellow()
+                                    );
                                 }
                                 sleep(Duration::from_millis(500)).await;
                                 continue;
                             } else {
+                                {
+                                    let mut unk = unknown_clone.lock().await;
+                                    unk.push((
+                                        addr_clone.clone(),
+                                        user_clone.clone(),
+                                        pass_clone.clone(),
+                                        msg.clone(),
+                                    ));
+                                }
                                 if verbose_flag {
-                                    println!("\r{}", format!("[!] {} -> {}:{} error: {}", addr_clone, user_clone, pass_clone, e).red());
+                                    println!(
+                                        "\r{}",
+                                        format!(
+                                            "[?] {} -> {}:{} error/unknown: {}",
+                                            addr_clone, user_clone, pass_clone, msg
+                                        )
+                                        .yellow()
+                                    );
                                 }
                                 break;
                             }
@@ -388,6 +419,60 @@ pub async fn run(target: &str) -> Result<()> {
             }
             file.flush()?;
             println!("{}", format!("[+] Results saved to '{}'", filename.display()).green());
+        }
+    }
+
+    drop(creds);
+
+    // Unknown / errored attempts
+    let unknown_guard = unknown.lock().await;
+    if !unknown_guard.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "[?] Collected {} unknown/errored SSH responses.",
+                unknown_guard.len()
+            )
+            .yellow()
+            .bold()
+        );
+        if prompt_yes_no("Save unknown responses to file?", true)? {
+            let default_name = "ssh_unknown_responses.txt";
+            let fname = prompt_default(
+                &format!(
+                    "What should the unknown results be saved as? (default: {})",
+                    default_name
+                ),
+                default_name,
+            )?;
+            let filename = get_filename_in_current_dir(&fname);
+            match File::create(&filename) {
+                Ok(mut file) => {
+                    writeln!(
+                        file,
+                        "# SSH Bruteforce Unknown/Errored Responses (host,user,pass,error)"
+                    )?;
+                    for (host, user, pass, msg) in unknown_guard.iter() {
+                        writeln!(file, "{} -> {}:{} - {}", host, user, pass, msg)?;
+                    }
+                    file.flush()?;
+                    println!(
+                        "{}",
+                        format!("[+] Unknown responses saved to '{}'", filename.display()).green()
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "{}",
+                        format!(
+                            "[!] Could not create unknown response file '{}': {}",
+                            filename.display(),
+                            e
+                        )
+                        .red()
+                    );
+                }
+            }
         }
     }
 

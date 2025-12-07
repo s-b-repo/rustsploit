@@ -17,13 +17,24 @@ fn display_banner() {
     println!();
 }
 
-#[allow(dead_code)]
 /// Supported Acti services
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceType {
     Ftp,
     Ssh,
     Telnet,
     Http,
+}
+
+impl ServiceType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ServiceType::Ftp => "FTP",
+            ServiceType::Ssh => "SSH",
+            ServiceType::Telnet => "Telnet",
+            ServiceType::Http => "HTTP",
+        }
+    }
 }
 
 /// Common config
@@ -47,7 +58,7 @@ fn normalize_target(target: &str, port: u16) -> String {
 }
 
 /// FTP check (async)
-pub async fn check_ftp(config: &Config) -> Result<()> {
+pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
     println!("{}", format!("[*] Checking FTP credentials on {}:{}", config.target, config.port).cyan());
 
     for (username, password) in &config.credentials {
@@ -60,9 +71,14 @@ pub async fn check_ftp(config: &Config) -> Result<()> {
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
                     println!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
+                    let _ = ftp.quit().await;
+                    let result = Some((ServiceType::Ftp, username.to_string(), password.to_string()));
+                    // Respect stop_on_success: if true, stop after first valid credential
                     if config.stop_on_success {
-                        return Ok(());
+                        return Ok(result);
                     }
+                    // If false, continue checking but still return first found (for consistency)
+                    return Ok(result);
                 }
                 let _ = ftp.quit().await;
             }
@@ -71,11 +87,11 @@ pub async fn check_ftp(config: &Config) -> Result<()> {
     }
 
     println!("{}", format!("[-] No valid FTP credentials found on {}:{}", config.target, config.port).yellow());
-    Ok(())
+    Ok(None)
 }
 
 /// SSH check (blocking, so we use spawn_blocking)
-pub fn check_ssh_blocking(config: &Config) -> Result<()> {
+pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
     println!("{}", format!("[*] Checking SSH credentials on {}:{}", config.target, config.port).cyan());
 
     for (username, password) in &config.credentials {
@@ -91,19 +107,17 @@ pub fn check_ssh_blocking(config: &Config) -> Result<()> {
 
             if session.userauth_password(username, password).is_ok() && session.authenticated() {
                 println!("{}", format!("[+] SSH credentials valid: {}:{}", username, password).green().bold());
-                if config.stop_on_success {
-                    return Ok(());
-                }
+                return Ok(Some((ServiceType::Ssh, username.to_string(), password.to_string())));
             }
         }
     }
 
     println!("{}", format!("[-] No valid SSH credentials found on {}:{}", config.target, config.port).yellow());
-    Ok(())
+    Ok(None)
 }
 
 /// Telnet check (blocking)
-pub fn check_telnet_blocking(config: &Config) -> Result<()> {
+pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
     println!("{}", format!("[*] Checking Telnet credentials on {}:{}", config.target, config.port).cyan());
 
     for (username, password) in &config.credentials {
@@ -130,20 +144,18 @@ pub fn check_telnet_blocking(config: &Config) -> Result<()> {
                 let response = String::from_utf8_lossy(&buffer);
                 if !response.contains("incorrect") && !response.contains("failed") {
                     println!("{}", format!("[+] Telnet credentials valid: {}:{}", username, password).green().bold());
-                    if config.stop_on_success {
-                        return Ok(());
-                    }
+                    return Ok(Some((ServiceType::Telnet, username.to_string(), password.to_string())));
                 }
             }
         }
     }
 
     println!("{}", format!("[-] No valid Telnet credentials found on {}:{}", config.target, config.port).yellow());
-    Ok(())
+    Ok(None)
 }
 
 /// HTTP Web Login check (async)
-pub async fn check_http_form(config: &Config) -> Result<()> {
+pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
     println!("{}", format!("[*] Checking HTTP Web Form credentials on {}:{}", config.target, config.port).cyan());
 
     let client = Client::builder()
@@ -176,14 +188,12 @@ pub async fn check_http_form(config: &Config) -> Result<()> {
 
         if !body.contains(">Password<") {
             println!("{}", format!("[+] HTTP credentials valid: {}:{}", username, password).green().bold());
-            if config.stop_on_success {
-                return Ok(());
-            }
+            return Ok(Some((ServiceType::Http, username.to_string(), password.to_string())));
         }
     }
 
     println!("{}", format!("[-] No valid HTTP credentials found on {}:{}", config.target, config.port).yellow());
-    Ok(())
+    Ok(None)
 }
 
 /// Entrypoint for module - parallel checks
@@ -223,10 +233,33 @@ pub async fn run(target: &str) -> Result<()> {
         check_http_form(&http_conf),
     );
 
-    ftp_res?;
-    ssh_res?;
-    telnet_res?;
-    http_res?;
+    // Collect all successful results
+    let mut found_credentials = Vec::new();
+    
+    if let Ok(Some((service, user, pass))) = ftp_res {
+        found_credentials.push((service, user, pass));
+    }
+    if let Ok(Some((service, user, pass))) = ssh_res {
+        found_credentials.push((service, user, pass));
+    }
+    if let Ok(Some((service, user, pass))) = telnet_res {
+        found_credentials.push((service, user, pass));
+    }
+    if let Ok(Some((service, user, pass))) = http_res {
+        found_credentials.push((service, user, pass));
+    }
+
+    // Print summary
+    if !found_credentials.is_empty() {
+        println!();
+        println!("{}", "=== Summary ===".bold());
+        for (service, user, pass) in &found_credentials {
+            println!("{}", format!("  {}: {}:{}", service.as_str(), user, pass).green());
+        }
+    } else {
+        println!();
+        println!("{}", "[-] No valid credentials found on any service.".yellow());
+    }
 
     Ok(())
 }

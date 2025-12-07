@@ -363,6 +363,9 @@ pub async fn interactive_shell() -> Result<()> {
                                 };
 
                                 if let Some(ref t) = target {
+                                    // Perform honeypot check before running module
+                                    utils::basic_honeypot_check(t).await;
+                                    
                                     if ctx.proxy_enabled && !ctx.proxy_list.is_empty() {
                                         let mut tried_proxies = HashSet::new();
                                         let mut success = false;
@@ -396,11 +399,13 @@ pub async fn interactive_shell() -> Result<()> {
                                     } else if ctx.proxy_enabled && ctx.proxy_list.is_empty() {
                                         println!("[!] No proxies loaded, but proxy is ON. Doing direct attempt...");
                                         clear_proxy_env_vars();
+                                        // Honeypot check already done above
                                         if let Err(e) = commands::run_module(module_path, t).await {
                                             eprintln!("[!] Module failed: {:?}", e);
                                         }
                                     } else {
                                         clear_proxy_env_vars();
+                                        // Honeypot check already done above
                                         if let Err(e) = commands::run_module(module_path, t).await {
                                             eprintln!("[!] Module failed: {:?}", e);
                                         }
@@ -440,6 +445,9 @@ pub async fn interactive_shell() -> Result<()> {
 
                                         for (idx, ip) in ips.iter().enumerate() {
                                             println!("\n{}", format!("[{}/{}] Running against: {}", idx + 1, total, ip).yellow());
+                                            
+                                            // Perform honeypot check before running module
+                                            utils::basic_honeypot_check(ip).await;
                                             
                                             if ctx.proxy_enabled && !ctx.proxy_list.is_empty() {
                                                 let mut tried_proxies = HashSet::new();
@@ -656,6 +664,18 @@ fn render_help() {
     for (cmd, shortcuts, desc) in entries {
         println!("{:<16} {:<25} {}", cmd.green(), shortcuts.cyan(), desc);
     }
+    println!();
+    println!("{}", "Shell extras & command combining:".bold());
+    println!(
+        "  - Commands can be chained with '&' and are executed left-to-right (max {}).",
+        MAX_COMMAND_CHAIN_LENGTH
+    );
+    println!("  - Example: {}", "set target 10.0.0.1 & use scanners/smtp_user_enum & run".cyan());
+    println!("  - Spacing around '&' is optional: {}", "use exploits/sample&run".cyan());
+    println!("  - Targets and paths must not contain control characters or '..' (basic safety checks).");
+    println!("  - Proxy rotation is automatic when 'proxy_on' is enabled and a proxy list is loaded.");
+    println!("  - Honeypot detection runs automatically before module execution to warn about suspicious targets.");
+    println!("  - Target normalization supports IPv4, IPv6, hostnames, URLs, and CIDR notation.");
     println!();
     println!(
         "{}",

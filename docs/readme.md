@@ -37,7 +37,7 @@ Rustsploit is a Rust-first re-imagining of RouterSploit:
 
 ## Code Layout
 
-```text
+```
 rustsploit/
 ├── Cargo.toml
 ├── build.rs                 # Generates dispatcher code by scanning src/modules
@@ -130,7 +130,7 @@ Proxies are set globally via environment variables so both module HTTP requests 
 
 Example:
 
-```bash
+```
 cargo run -- --command exploit --module heartbleed --target 203.0.113.12
 ```
 
@@ -164,28 +164,37 @@ Located across core modules, these constants enforce safe limits:
 When writing modules or core code, follow these patterns:
 
 #### 1. Input Length Validation
-```rust
+```
 if input.len() > MAX_INPUT_LENGTH {
     return Err(anyhow!("Input too long (max {} characters)", MAX_INPUT_LENGTH));
 }
 ```
 
 #### 2. Control Character Rejection
-```rust
+```
 if input.chars().any(|c| c.is_control()) {
     return Err(anyhow!("Input cannot contain control characters"));
 }
 ```
 
 #### 3. Path Traversal Prevention
-```rust
+```
 if input.contains("..") || input.contains("//") {
     return Err(anyhow!("Path traversal detected"));
 }
 ```
 
 #### 4. Hostname/Target Validation
-```rust
+```
+// Use the framework's normalize_target function for comprehensive validation
+use crate::utils::normalize_target;
+
+let normalized = normalize_target(raw_target)?;
+// This handles IPv4, IPv6, hostnames, URLs, CIDR notation with full validation
+```
+
+For manual validation:
+```
 use regex::Regex;
 let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").unwrap();
 if !valid_chars.is_match(target) {
@@ -194,13 +203,13 @@ if !valid_chars.is_match(target) {
 ```
 
 #### 5. Overflow Protection
-```rust
+```
 // Use saturating_add to prevent overflow
 counter = counter.saturating_add(1);
 ```
 
 #### 6. Prompt Attempt Limiting
-```rust
+```
 const MAX_ATTEMPTS: u8 = 10;
 let mut attempts = 0;
 loop {
@@ -230,13 +239,24 @@ When reading files, always:
 3. Check file size before reading
 4. Skip symlinks for security
 
+### Honeypot Detection
+
+The framework automatically runs honeypot detection before module execution when a target is set. The `basic_honeypot_check` function in `utils.rs`:
+
+- Scans 200 common ports with 250ms timeout per port
+- If 11+ ports are open, warns that the target is likely a honeypot
+- Runs automatically in the shell's `run` and `run_all` commands
+- Can be called manually: `utils::basic_honeypot_check(&ip).await`
+
+This helps operators identify potentially deceptive targets before spending time on them.
+
 ---
 
 ## Authoring Modules
 
 Every module must export:
 
-```rust
+```
 use anyhow::Result;
 
 pub async fn run(target: &str) -> Result<()> {
@@ -257,7 +277,7 @@ Guidelines:
 
 ### skeleton
 
-```rust
+```
 use anyhow::{Context, Result};
 
 pub async fn run(target: &str) -> Result<()> {
@@ -285,17 +305,39 @@ pub async fn run(target: &str) -> Result<()> {
 
 ## Credential Modules: Best Practices
 
-Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP follow shared patterns:
+Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
 
 - **Input prompts:** ask for port, username/password wordlists, concurrency limit, stop-on-success toggle, output file, verbose logging.
 - **Sanitation:** trim wordlist entries, skip blanks, provide early exits if lists are empty.
 - **Concurrency:**
-  - Use `tokio::Semaphore` for asynchronous modules (FTP, SSH).
+  - Use `tokio::Semaphore` for asynchronous modules (FTP, SSH, MQTT).
   - Use `threadpool` + `crossbeam-channel` for synchronous protocols (Telnet, POP3, SMTP).
 - **Adaptive throttling:** Some modules (FTP) sample CPU/RAM to avoid saturating the host.
 - **TLS/STARTTLS:** Accept invalid certs for offensive tooling convenience, but note this clearly.
 - **Result persistence:** Offer to write `host -> user:pass` pairs to a local file (in `./` by default).
 - **IPv6:** Use helpers like `format_addr` to wrap IPv6 addresses in brackets and support port suffixes.
+- **Error classification:** Implement comprehensive error types (ConnectionFailed, AuthenticationFailed, Timeout, etc.) for better debugging and reporting.
+- **Memory management:** For large wordlists (>150MB), implement streaming mode to prevent memory exhaustion (see RDP module for reference).
+- **Protocol compliance:** Implement full protocol support where applicable (e.g., Telnet IAC negotiation, MQTT 3.1.1).
+
+### Recent Module Enhancements
+
+- **Telnet Module**: 
+  - Full IAC (Interpret As Command) negotiation with proper option handling
+  - Enhanced error classification with specific error types
+  - Verbose mode for quick checks with detailed attempt reporting
+  - Improved buffer handling using `BytesMut` with size limits
+
+- **RDP Module**:
+  - Streaming failover for password files >150MB
+  - Comprehensive error classification with 8 error types
+  - Multiple security level support (Auto, NLA, TLS, RDP, Negotiate)
+  - Command injection prevention via argument sanitization
+
+- **MQTT Module**:
+  - Full MQTT 3.1.1 protocol implementation
+  - Proper variable-length encoding and UTF-8 string encoding
+  - CONNACK response parsing with error classification
 
 ---
 
@@ -313,9 +355,22 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP follow shared patterns:
 
 `src/utils.rs` provides:
 
-- `normalize_target`: wrap IPv6 addresses in brackets, pass through IPv4/hosts untouched.
-- `module_exists` / `list_all_modules` / `find_modules`: used by shell to present module inventory.
-- Proxy helpers described earlier (`load_proxies_from_file`, `test_proxies`, etc.).
+- **`normalize_target`**: Comprehensive target normalization supporting:
+  - IPv4: `192.168.1.1`, `192.168.1.1:8080`
+  - IPv6: `::1`, `[::1]`, `[::1]:8080`, `2001:db8::1`
+  - Hostnames: `example.com`, `example.com:443`
+  - URLs: `http://example.com:8080` (extracts host:port)
+  - CIDR notation: `192.168.1.0/24`, `2001:db8::/32`
+  
+  Includes comprehensive validation (DoS prevention, path traversal protection, format validation).
+
+- **`extract_ip_from_target`**: Extracts IP address or hostname from normalized target strings, handling ports, brackets, and CIDR notation.
+
+- **`basic_honeypot_check`**: Framework-level honeypot detection that scans 200 common ports. If 11+ ports are open, warns that the target is likely a honeypot. This runs automatically before module execution when a target is set.
+
+- **`module_exists` / `list_all_modules` / `find_modules`**: Used by shell to present module inventory.
+
+- **Proxy helpers**: `load_proxies_from_file`, `test_proxies`, etc. (described earlier).
 
 Feel free to expand this file with reusable pieces (e.g., credential loader, HTTP header templates) to avoid duplication inside modules.
 

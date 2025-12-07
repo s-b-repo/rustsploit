@@ -13,7 +13,12 @@ fn display_banner() {
 }
 
 /// Module entry point for raising ulimit
-pub async fn run(_target: &str) -> Result<()> {
+pub async fn run(target: &str) -> Result<()> {
+    // Target parameter is part of standard module interface
+    // For ulimit operations, target is informational only
+    if !target.is_empty() {
+        println!("{}", format!("[*] Target context: {}", target).dimmed());
+    }
     raise_ulimit().await
 }
 

@@ -1,0 +1,15 @@
+public
+guest
+sysadmin
+hivemq
+emonpimqtt2016
+mosquitto
+mqttpassword
+password
+[auto-generated]
+[empty]
+[printed on PLC]
+password
+password
+password
+bitnami
