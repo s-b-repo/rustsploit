@@ -34,13 +34,25 @@ const MAX_PARALLEL_PROXIES: usize = 1000;
 /// Maximum timeout for proxy tests (5 minutes)
 const MAX_PROXY_TIMEOUT_SECS: u64 = 300;
 
-/// Take "1.2.3.4", "::1", "[::1]:8080" or "hostname" and
-/// always return a valid "host:port" or "[ipv6]:port" string.
+/// Comprehensive target normalization function.
+/// 
+/// Supports multiple input formats:
+/// - IPv4: "192.168.1.1", "192.168.1.1:8080"
+/// - IPv6: "::1", "[::1]", "[::1]:8080", "2001:db8::1"
+/// - Hostnames: "example.com", "example.com:443"
+/// - URLs: "http://example.com:8080" (extracts host:port)
+/// - CIDR: "192.168.1.0/24", "2001:db8::/32"
+/// 
+/// Returns normalized format:
+/// - IPv4/hostname: "host:port" or "host" (if no port)
+/// - IPv6: "[ipv6]:port" or "[ipv6]" (if no port)
+/// - CIDR: "network/prefix" (preserved as-is)
 /// 
 /// # Security
 /// - Validates input length to prevent DoS
 /// - Sanitizes input to prevent injection
-/// - Validates hostname format
+/// - Validates hostname/IP format
+/// - Prevents path traversal attempts
 pub fn normalize_target(raw: &str) -> Result<String> {
     // Input validation
     let trimmed = raw.trim();
@@ -58,7 +70,26 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         ));
     }
     
-    // Basic sanitization - remove control characters and excessive whitespace
+    // Check for path traversal attempts early
+    if trimmed.contains("..") || trimmed.contains("//") {
+        return Err(anyhow!("Invalid target format: contains path traversal characters"));
+    }
+    
+    // Try to parse as URL first (handles http://, https://, etc.)
+    if let Ok(url) = Url::parse(trimmed) {
+        if let Some(host) = url.host_str() {
+            let port = url.port().unwrap_or(0);
+            let normalized = if port > 0 {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+            // Recursively normalize to handle IPv6 wrapping
+            return normalize_target(&normalized);
+        }
+    }
+    
+    // Basic sanitization - remove control characters except space/tab
     let sanitized: String = trimmed
         .chars()
         .filter(|c| !c.is_control() || *c == ' ' || *c == '\t')
@@ -71,56 +102,278 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         return Err(anyhow!("Target contains only invalid characters"));
     }
     
-    // Check for path traversal attempts
-    if sanitized.contains("..") || sanitized.contains("//") {
-        return Err(anyhow!("Invalid target format: contains path traversal characters"));
+    // Check for CIDR notation (contains /)
+    if sanitized.contains('/') {
+        // Validate CIDR format
+        let parts: Vec<&str> = sanitized.split('/').collect();
+        if parts.len() != 2 {
+            return Err(anyhow!("Invalid CIDR format: expected 'network/prefix'"));
+        }
+        
+        let network = parts[0].trim();
+        let prefix_str = parts[1].trim();
+        
+        // Validate prefix is a number
+        let prefix: u8 = prefix_str.parse()
+            .map_err(|_| anyhow!("Invalid CIDR prefix: '{}' (must be 0-128 for IPv6, 0-32 for IPv4)", prefix_str))?;
+        
+        // Normalize the network part (without prefix)
+        let normalized_network = normalize_target(network)?;
+        
+        // Validate prefix range based on IP version
+        let is_ipv6 = normalized_network.starts_with('[') || normalized_network.matches(':').count() >= 2;
+        if is_ipv6 {
+            if prefix > 128 {
+                return Err(anyhow!("Invalid IPv6 CIDR prefix: {} (max 128)", prefix));
+            }
+        } else {
+            if prefix > 32 {
+                return Err(anyhow!("Invalid IPv4 CIDR prefix: {} (max 32)", prefix));
+            }
+        }
+        
+        return Ok(format!("{}/{}", normalized_network, prefix));
     }
     
-    // Handle already normalized formats
-    if sanitized.contains("]:") || sanitized.starts_with('[') {
-        // Validate the format
-        if sanitized.starts_with('[') && !sanitized.contains(']') {
+    // Handle already normalized IPv6 with brackets: [::1]:8080 or [::1]
+    if sanitized.starts_with('[') {
+        if let Some(bracket_end) = sanitized.find(']') {
+            let ipv6_part = &sanitized[1..bracket_end];
+            let after_bracket = &sanitized[bracket_end + 1..];
+            
+            // Validate IPv6 address
+            if !is_valid_ipv6(ipv6_part) {
+                return Err(anyhow!("Invalid IPv6 address: '{}'", ipv6_part));
+            }
+            
+            // Check for port after bracket
+            if after_bracket.starts_with(':') {
+                let port_str = &after_bracket[1..].trim();
+                if port_str.is_empty() {
+                    return Err(anyhow!("Invalid port format: missing port number"));
+                }
+                let port: u16 = port_str.parse()
+                    .map_err(|_| anyhow!("Invalid port number: '{}'", port_str))?;
+                if port == 0 {
+                    return Err(anyhow!("Port cannot be 0"));
+                }
+                return Ok(format!("[{}]:{}", ipv6_part, port));
+            } else if !after_bracket.is_empty() {
+                return Err(anyhow!("Invalid format after IPv6 address: '{}'", after_bracket));
+            }
+            return Ok(format!("[{}]", ipv6_part));
+        } else {
             return Err(anyhow!("Invalid IPv6 format: missing closing bracket"));
         }
-        // Basic validation - check it's not just brackets
-        let inner = sanitized.trim_matches(|c| c == '[' || c == ']');
-        if inner.is_empty() {
-            return Err(anyhow!("Invalid target: empty address"));
-        }
-        return Ok(sanitized.to_string());
     }
-
-    // Detect IPv6 addresses (multiple colons, no dots)
+    
+    // Check if it contains a port (format: host:port or ip:port)
     let colon_count = sanitized.matches(':').count();
     let has_dots = sanitized.contains('.');
     
-    // IPv6 detection: multiple colons and no dots (or dots only in port)
-    let is_ipv6 = colon_count >= 2 && !has_dots;
+    // IPv6 detection: multiple colons typically indicates IPv6
+    let is_likely_ipv6 = colon_count >= 2 && !has_dots;
     
-    // Additional IPv6 validation
-    if is_ipv6 {
-        // Check for valid IPv6 characters
-        let ipv6_re = Regex::new(r"^[0-9a-fA-F:]+$").unwrap();
-        let addr_part = sanitized.split(':').next().unwrap_or("");
-        if !ipv6_re.is_match(addr_part) && !addr_part.is_empty() {
+    if is_likely_ipv6 {
+        // IPv6 address (may or may not have port)
+        if let Some(last_colon_pos) = sanitized.rfind(':') {
+            // Check if last colon is part of IPv6 or port separator
+            let before_colon = &sanitized[..last_colon_pos];
+            let after_colon = &sanitized[last_colon_pos + 1..];
+            
+            // If after colon is all digits, it's likely a port
+            if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
+                let port: u16 = after_colon.parse()
+                    .map_err(|_| anyhow!("Invalid port number: '{}'", after_colon))?;
+                if port == 0 {
+                    return Err(anyhow!("Port cannot be 0"));
+                }
+                
+                // Validate IPv6 part
+                if !is_valid_ipv6(before_colon) {
+                    return Err(anyhow!("Invalid IPv6 address: '{}'", before_colon));
+                }
+                return Ok(format!("[{}]:{}", before_colon, port));
+            }
+        }
+        
+        // IPv6 without port
+        if !is_valid_ipv6(&sanitized) {
             return Err(anyhow!("Invalid IPv6 address format: '{}'", sanitized));
         }
-        Ok(format!("[{}]", sanitized))
-    } else {
-        // Validate hostname/IPv4 format
-        // Basic validation: no spaces, reasonable characters
-        if sanitized.contains(' ') {
-            return Err(anyhow!("Invalid target format: contains spaces"));
-        }
-        
-        // Check for valid hostname/IPv4/CIDR characters (allow / for CIDR notation)
-        let host_re = Regex::new(r"^[a-zA-Z0-9.\-_:/]+$").unwrap();
-        if !host_re.is_match(&sanitized) {
-            return Err(anyhow!("Invalid target format: contains invalid characters"));
-        }
-        
-        Ok(sanitized.to_string())
+        return Ok(format!("[{}]", sanitized));
     }
+    
+    // IPv4 or hostname (may have port)
+    if sanitized.contains(':') {
+        if let Some(colon_pos) = sanitized.rfind(':') {
+            let host_part = &sanitized[..colon_pos];
+            let port_str = &sanitized[colon_pos + 1..];
+            
+            if port_str.is_empty() {
+                return Err(anyhow!("Invalid port format: missing port number"));
+            }
+            
+            let port: u16 = port_str.parse()
+                .map_err(|_| anyhow!("Invalid port number: '{}'", port_str))?;
+            if port == 0 {
+                return Err(anyhow!("Port cannot be 0"));
+            }
+            
+            // Validate host part
+            if host_part.is_empty() {
+                return Err(anyhow!("Invalid target: empty hostname/IP"));
+            }
+            
+            // Validate hostname/IPv4 format
+            if !is_valid_hostname_or_ipv4(host_part) {
+                return Err(anyhow!("Invalid hostname or IPv4 address: '{}'", host_part));
+            }
+            
+            return Ok(format!("{}:{}", host_part, port));
+        }
+    }
+    
+    // No port - just hostname or IPv4
+    if sanitized.contains(' ') {
+        return Err(anyhow!("Invalid target format: contains spaces (did you mean to include a port?)"));
+    }
+    
+    // Validate hostname/IPv4 format
+    if !is_valid_hostname_or_ipv4(&sanitized) {
+        return Err(anyhow!("Invalid hostname or IPv4 address format: '{}'", sanitized));
+    }
+    
+    Ok(sanitized.to_string())
+}
+
+/// Validate IPv6 address format (basic validation)
+/// Supports compressed notation (::), mixed IPv4/IPv6 (::ffff:192.168.1.1), etc.
+fn is_valid_ipv6(addr: &str) -> bool {
+    if addr.is_empty() {
+        return false;
+    }
+    
+    // Check for valid IPv6 characters: hex digits, colons, and dots (for IPv4-mapped)
+    let ipv6_char_re = Regex::new(r"^[0-9a-fA-F:.]+$").unwrap();
+    if !ipv6_char_re.is_match(addr) {
+        return false;
+    }
+    
+    // Check for valid :: usage (only one allowed, and not at start/end unless it's ::1 style)
+    let double_colon_count = addr.matches("::").count();
+    if double_colon_count > 1 {
+        return false;
+    }
+    
+    // Handle special cases
+    if addr == "::" || addr == "::1" {
+        return true;
+    }
+    
+    // Check for IPv4-mapped IPv6 (::ffff:192.168.1.1 or similar)
+    if addr.contains('.') {
+        // Must be in format like ::ffff:192.168.1.1
+        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+        if parts.len() == 2 {
+            let ipv4_part = parts[0];
+            // Validate IPv4 part
+            let ipv4_parts: Vec<&str> = ipv4_part.split('.').collect();
+            if ipv4_parts.len() == 4 {
+                let is_valid_ipv4 = ipv4_parts.iter().all(|part| {
+                    part.parse::<u8>().is_ok()
+                });
+                if is_valid_ipv4 {
+                    // Valid IPv4-mapped IPv6
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    
+    // Split by colons to validate segments
+    let segments: Vec<&str> = addr.split(':').collect();
+    
+    // With :: compression, we can have fewer than 8 segments
+    // Without ::, we need exactly 8 segments
+    if double_colon_count == 0 {
+        // No compression - must have exactly 8 segments
+        if segments.len() != 8 {
+            return false;
+        }
+    } else {
+        // With compression - can have 2-7 segments
+        if segments.len() < 2 || segments.len() > 7 {
+            return false;
+        }
+    }
+    
+    // Validate each segment (except empty ones from ::)
+    for segment in &segments {
+        if segment.is_empty() {
+            continue; // Empty segment from :: compression
+        }
+        if segment.len() > 4 {
+            return false; // Each segment max 4 hex digits
+        }
+        // Validate hex digits
+        if !segment.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    
+    true
+}
+
+/// Validate hostname or IPv4 address format
+fn is_valid_hostname_or_ipv4(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    
+    // Check for valid characters (alphanumeric, dots, hyphens, underscores)
+    let host_re = Regex::new(r"^[a-zA-Z0-9.\-_]+$").unwrap();
+    if !host_re.is_match(host) {
+        return false;
+    }
+    
+    // Check if it looks like IPv4 (contains dots and all segments are numeric)
+    if host.contains('.') {
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() == 4 {
+            // Could be IPv4 - validate each octet
+            let is_ipv4 = parts.iter().all(|part| {
+                part.parse::<u8>().is_ok()
+            });
+            if is_ipv4 {
+                return true; // Valid IPv4
+            }
+        }
+    }
+    
+    // Hostname validation: must start and end with alphanumeric
+    if host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    
+    if host.starts_with('-') || host.ends_with('-') {
+        return false;
+    }
+    
+    // Check hostname length (max 253 characters per RFC)
+    if host.len() > 253 {
+        return false;
+    }
+    
+    // Check individual label length (max 63 characters per RFC)
+    for label in host.split('.') {
+        if label.len() > 63 {
+            return false;
+        }
+    }
+    
+    true
 }
 
 /// Recursively list .rs files up to a certain depth with security checks
@@ -641,4 +894,144 @@ async fn check_proxy(proxy: &str, test_url: &str, timeout: Duration) -> Result<(
     }
 
     Ok(())
+}
+
+/// Extract IP address or hostname from target string.
+/// Handles formats: IP:port, [IPv6]:port, hostname:port, CIDR notation
+/// Returns the host/IP part without port or brackets.
+fn extract_ip_from_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    
+    // Handle CIDR notation: extract network part before /
+    if let Some(slash_pos) = trimmed.find('/') {
+        let network_part = &trimmed[..slash_pos];
+        return extract_ip_from_target(network_part);
+    }
+    
+    // Handle IPv6 with brackets: [::1]:8080 or [::1]
+    if trimmed.starts_with('[') {
+        if let Some(bracket_end) = trimmed.find(']') {
+            let ipv6_part = &trimmed[1..bracket_end];
+            return Some(ipv6_part.to_string());
+        }
+        // Malformed - missing closing bracket, but try to extract anyway
+        return Some(trimmed.trim_start_matches('[').to_string());
+    }
+    
+    // Handle IPv4 or hostname with port: 192.168.1.1:8080 or hostname:8080
+    if let Some(colon_pos) = trimmed.rfind(':') {
+        let before_colon = &trimmed[..colon_pos];
+        let after_colon = &trimmed[colon_pos + 1..];
+        
+        // Check if after colon is a port (all digits)
+        if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
+            // It's a port - extract host part
+            // But check if before_colon is IPv6 (multiple colons)
+            let colon_count = before_colon.matches(':').count();
+            if colon_count >= 2 {
+                // IPv6 address - return as is (without brackets)
+                return Some(before_colon.to_string());
+            }
+            // IPv4 or hostname - return host part
+            return Some(before_colon.to_string());
+        }
+    }
+    
+    // No port or malformed - check if it's IPv6 (multiple colons)
+    let colon_count = trimmed.matches(':').count();
+    if colon_count >= 2 {
+        // IPv6 without brackets - return as is
+        return Some(trimmed.to_string());
+    }
+    
+    // No port - return as is (IPv4 or hostname)
+    Some(trimmed.to_string())
+}
+
+/// Perform a lightweight honeypot check by probing common ports.
+/// If 11 or more ports are open, warns that the target is likely a honeypot.
+pub async fn basic_honeypot_check(target: &str) {
+    // Extract IP address from target (handles IP:port format)
+    let ip = match extract_ip_from_target(target) {
+        Some(ip) => ip,
+        None => {
+            // If we can't extract IP, skip check
+            return;
+        }
+    };
+    
+    // Skip check for hostnames (contains non-IP characters)
+    if ip.contains(|c: char| c.is_alphabetic() && c != ':') && !ip.contains(':') {
+        // Likely a hostname, skip honeypot check
+        return;
+    }
+    
+    println!();
+    println!("{}", "╔══════════════════════════════════════════════╗".bright_yellow());
+    println!("{}", "║   HONEYPOT DETECTION CHECK                  ║".bright_yellow());
+    println!("{}", "╚══════════════════════════════════════════════╝".bright_yellow());
+    println!();
+    println!("[*] Scanning {} common ports on {}...", 200, ip);
+    
+    // Common ports typically exposed by network services.
+    const COMMON_PORTS: &[u16] = &[
+        11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 26, 37, 38, 43, 49, 53, 70, 79, 80, 81, 82, 83, 84, 86, 88, 89, 91, 92, 94, 95, 97, 99,
+        101, 102, 104, 110, 111, 113, 119, 143, 154, 161, 175, 177, 179, 180, 189, 195, 221, 234, 243, 263, 264, 285, 311, 314, 385, 389,
+        400, 427, 440, 441, 442, 443, 444, 446, 447, 449, 450, 451, 452, 462, 465, 480, 485, 488, 502, 503, 513, 515, 541, 548, 554, 556,
+        587, 591, 593, 602, 631, 636, 646, 666, 685, 700, 743, 771, 777, 785, 789, 805, 806, 811, 832, 833, 843, 873, 880, 886, 887, 902,
+        953, 990, 992, 993, 995, 998, 999, 1013, 1022, 1023, 1024, 1027, 1080, 1099, 1110, 1111, 1153, 1181, 1188, 1195, 1198, 1200, 1207,
+        1234, 1291, 1292, 1311, 1337, 1366, 1370, 1377, 1388, 1400, 1414, 1433, 1444, 1447, 1451, 1453, 1454, 1457, 1460, 1471, 1521, 1554,
+        1599, 1604, 1605, 1650, 1723, 1741, 1820, 1830, 1883
+    ];
+
+    let mut open_count = 0usize;
+    let mut open_ports = Vec::new();
+
+    for &port in COMMON_PORTS {
+        let addr = format!("{}:{}", ip, port);
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await;
+
+        if let Ok(Ok(stream)) = conn {
+            // We only care that the TCP handshake completed; drop immediately.
+            drop(stream);
+            open_count += 1;
+            if open_ports.len() < 20 {
+                open_ports.push(port);
+            }
+        }
+    }
+
+    println!("[*] Found {} open port(s) out of {} scanned", open_count, COMMON_PORTS.len());
+    
+    // Threshold: if 11 or more common ports are open, likely a honeypot
+    if open_count >= 11 {
+        println!();
+        println!("{}", "╔══════════════════════════════════════════════╗".red().bold());
+        println!("{}", "║   ⚠️  HONEYPOT DETECTED                     ║".red().bold());
+        println!("{}", "╚══════════════════════════════════════════════╝".red().bold());
+        println!();
+        println!(
+            "{}",
+            format!(
+                "[!] Target {} has {} / {} common ports open - likely honeypot",
+                ip,
+                open_count,
+                COMMON_PORTS.len()
+            )
+            .yellow()
+            .bold()
+        );
+        println!("{}", "    This is likely a honeypot system".yellow().bold());
+        if open_count <= 20 && !open_ports.is_empty() {
+            println!("{}", format!("    Open ports: {:?}", &open_ports[..open_count.min(20)]).yellow());
+        }
+        println!();
+    } else {
+        println!("{}", "[+] No honeypot indicators detected".green());
+        println!();
+    }
 }

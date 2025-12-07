@@ -7,3 +7,4 @@ pub mod ping_sweep;
 pub mod http_method_scanner;
 pub mod dns_recursion;
 pub mod ssh_scanner;
+pub mod smtp_user_enum;

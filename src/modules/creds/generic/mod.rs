@@ -14,3 +14,4 @@
     pub mod snmp_bruteforce;
     pub mod fortinet_bruteforce;
     pub mod l2tp_bruteforce;
+    pub mod mqtt_bruteforce;

@@ -149,6 +149,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     let addr = format_addr(target, port);
     let found = Arc::new(Mutex::new(Vec::new()));
+    let unknown = Arc::new(Mutex::new(Vec::<(String, String, String, String)>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Statistics::new());
 
@@ -197,6 +198,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let user_clone = user.clone();
                 let pass_clone = pass.clone();
                 let found_clone = Arc::clone(&found);
+                let unknown_clone = Arc::clone(&unknown);
                 let stop_clone = Arc::clone(&stop);
                 let semaphore_clone = Arc::clone(&semaphore);
                 let stats_clone = Arc::clone(&stats);
@@ -231,8 +233,25 @@ pub async fn run(target: &str) -> Result<()> {
                         }
                         Err(e) => {
                             stats_clone.record_attempt(false, true);
+                            let msg = e.to_string();
+                            {
+                                let mut unk = unknown_clone.lock().await;
+                                unk.push((
+                                    addr_clone.clone(),
+                                    user_clone.clone(),
+                                    pass_clone.clone(),
+                                    msg.clone(),
+                                ));
+                            }
                             if verbose_flag {
-                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                                println!(
+                                    "\r{}",
+                                    format!(
+                                        "[?] {} -> {}:{} error/unknown: {}",
+                                        addr_clone, user_clone, pass_clone, msg
+                                    )
+                                    .yellow()
+                                );
                             }
                         }
                     }
@@ -249,6 +268,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let addr_clone = addr.clone();
                 let pass_clone = pass.clone();
                 let found_clone = Arc::clone(&found);
+                let unknown_clone = Arc::clone(&unknown);
                 let stop_clone = Arc::clone(&stop);
                 let semaphore_clone = Arc::clone(&semaphore);
                 let stats_clone = Arc::clone(&stats);
@@ -283,8 +303,25 @@ pub async fn run(target: &str) -> Result<()> {
                         }
                         Err(e) => {
                             stats_clone.record_attempt(false, true);
+                            let msg = e.to_string();
+                            {
+                                let mut unk = unknown_clone.lock().await;
+                                unk.push((
+                                    addr_clone.clone(),
+                                    user.clone(),
+                                    pass_clone.clone(),
+                                    msg.clone(),
+                                ));
+                            }
                             if verbose_flag {
-                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                                println!(
+                                    "\r{}",
+                                    format!(
+                                        "[?] {} -> {}:{} error/unknown: {}",
+                                        addr_clone, user, pass_clone, msg
+                                    )
+                                    .yellow()
+                                );
                             }
                         }
                     }
@@ -335,6 +372,53 @@ pub async fn run(target: &str) -> Result<()> {
             }
         }
     }
+
+    drop(creds);
+
+    // Unknown / errored attempts
+    let unknown_guard = unknown.lock().await;
+    if !unknown_guard.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "[?] Collected {} unknown/errored FTP responses.",
+                unknown_guard.len()
+            )
+            .yellow()
+            .bold()
+        );
+        if prompt_yes_no("Save unknown responses to file?", true)? {
+            let default_name = "ftp_unknown_responses.txt";
+            let fname = prompt_default(
+                &format!(
+                    "What should the unknown results be saved as? (default: {})",
+                    default_name
+                ),
+                default_name,
+            )?;
+            let file_path = get_filename_in_current_dir(&fname);
+            match File::create(&file_path) {
+                Ok(mut file) => {
+                    writeln!(
+                        file,
+                        "# FTP Bruteforce Unknown/Errored Responses (host,user,pass,error)"
+                    )?;
+                    for (host, user, pass, msg) in unknown_guard.iter() {
+                        writeln!(file, "{} -> {}:{} - {}", host, user, pass, msg)?;
+                    }
+                    println!("[+] Unknown responses saved to '{}'", file_path.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[!] Could not create or write unknown response file '{}': {}",
+                        file_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
