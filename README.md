@@ -34,13 +34,19 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 - ✅ **Auto-discovered modules:** `build.rs` indexes `src/modules/**` so new code drops in without manual registration
 - ✅ **Interactive shell with color and shortcuts:** Quick command palette, target/module state tracking, alias commands (`help/?`, `modules/m`, `run/go`, etc.)
 - ✅ **Ergonomic proxy system:** Load lists, validate availability, choose concurrency/timeouts, and rotate automatically on failure
-- ✅ **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, Fortinet brute force modules with IPv6 and TLS support where applicable
+- ✅ **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, MQTT, Fortinet brute force modules with IPv6 and TLS support where applicable
+- ✅ **Enhanced Telnet module:** Full IAC (Interpret As Command) negotiation, advanced error classification, verbose quick-check mode, robust buffer handling
+- ✅ **Improved RDP module:** Streaming failover for large password files (>150MB), comprehensive error classification, multiple security level support (NLA/TLS/RDP/Negotiate/Auto)
+- ✅ **Framework-level honeypot detection:** Automatic detection before scans using 200 common ports (warns if 11+ ports open)
+- ✅ **Advanced target normalization:** Supports IPv4, IPv6, hostnames, URLs, CIDR notation with comprehensive validation
 - ✅ **Exploit coverage:** Apache Tomcat, Abus security cameras, Ivanti Connect Secure, TP-Link, Zabbix, Avtech cameras, Spotube, OpenSSH race condition, and more
 - ✅ **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, DNS recursion tester, HTTP method scanner, StalkRoute traceroute (root)
 - ✅ **Payload generation:** Batch malware dropper (`narutto_dropper`), BAT payload generator, custom credential checkers
 - ✅ **Readable output:** Colored prompts, structured status messages, optional verbose logs and result persistence
 - ✅ **REST API Server:** Launch a secure API server with authentication, rate limiting, IP tracking, and dynamic key rotation
 - ✅ **Security hardened:** Comprehensive input validation, path traversal protection, length limits, and memory-safe operations throughout
+- ✅ **Honeypot detection:** Framework-level automatic detection before module execution to warn about potentially deceptive targets
+- ✅ **Enhanced target handling:** Advanced normalization supporting IPv4, IPv6 (with brackets), hostnames, URLs, CIDR notation, and port extraction
 
 ---
 
@@ -50,7 +56,7 @@ Rustsploit ships categorized modules under `src/modules/`, automatically exposed
 
 | Category | Highlights |
 |----------|------------|
-| `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, SSH user enumeration (timing attack), SSH password spray, Telnet brute force, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), RDP auth-only brute, SNMP community string brute force, L2TP/IPsec brute force, Fortinet SSL VPN brute force |
+| `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, SSH user enumeration (timing attack), SSH password spray, **Telnet brute force (with IAC negotiation)**, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), **RDP auth-only brute (streaming mode, multiple security levels)**, **MQTT brute force**, SNMP community string brute force, L2TP/IPsec brute force, Fortinet SSL VPN brute force |
 | `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE, Flowise CVE-2025-59528 RCE, HTTP/2 Rapid Reset DoS, Jenkins LFI, PAN-OS Auth Bypass, Heartbleed, **SSHPWN Framework** (SFTP symlink/setuid/traversal, SCP injection/DoS, Session env injection) |
 | `scanners` | Port scanner (TCP/UDP/SYN/ACK), ping sweep (ICMP/TCP/UDP/SYN/ACK), SSDP M-SEARCH enumerator, HTTP title fetcher, HTTP method scanner, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion), **SSH scanner** (banner grabbing, CIDR support) |
 | `payloadgens` | `narutto_dropper`, BAT payload generator |
@@ -148,6 +154,40 @@ docker compose -f docker-compose.rustsploit.yml up -d --build
 Environment variables are written with 0600 permissions so secrets stay private. Re-run the script any time you want to regenerate artefacts or rotate the API key.
 
 ---
+
+## New Features & Improvements
+
+### Framework-Level Enhancements
+
+- **Honeypot Detection**: Automatically scans 200 common ports before module execution. If 11+ ports are open, warns that the target is likely a honeypot. This check runs universally on every target after it's set.
+
+- **Advanced Target Normalization**: The framework now supports:
+  - IPv4: `192.168.1.1`, `192.168.1.1:8080`
+  - IPv6: `::1`, `[::1]`, `[::1]:8080`, `2001:db8::1`
+  - Hostnames: `example.com`, `example.com:443`
+  - URLs: `http://example.com:8080` (extracts host:port)
+  - CIDR notation: `192.168.1.0/24`, `2001:db8::/32`
+  
+  All targets are validated for security (DoS prevention, path traversal protection, format validation).
+
+### Module Improvements
+
+- **Telnet Bruteforce**: 
+  - Full Telnet IAC (Interpret As Command) negotiation support
+  - Enhanced error classification (connection, DNS, authentication, protocol, I/O, timeout errors)
+  - Verbose mode for quick checks showing all attempts and detailed statistics
+  - Improved buffer handling and memory management
+
+- **RDP Bruteforce**:
+  - Automatic streaming failover for password files >150MB to prevent memory exhaustion
+  - Comprehensive error classification (ConnectionFailed, AuthenticationFailed, CertificateError, Timeout, NetworkError, ProtocolError, ToolNotFound, Unknown)
+  - Support for multiple RDP security levels: Auto, NLA, TLS, RDP, Negotiate
+  - Command injection prevention in external tool calls
+
+- **MQTT Bruteforce**: 
+  - Full MQTT 3.1.1 protocol implementation
+  - Proper CONNECT packet construction with variable-length encoding
+  - CONNACK response parsing and error classification
 
 ## Interactive Shell Walkthrough
 
