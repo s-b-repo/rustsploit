@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
@@ -10,6 +10,7 @@ use std::{
     time::Instant,
 };
 use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
     process::Command,
     sync::{Mutex, Semaphore},
     time::{sleep, Duration, timeout},
@@ -140,7 +141,7 @@ impl RdpSecurityLevel {
         }
     }
 
-    fn prompt_selection() -> Result<Self> {
+    async fn prompt_selection() -> Result<Self> {
         println!("\nRDP Security Level Options:");
         println!("  1. Auto (let client negotiate)");
         println!("  2. NLA (Network Level Authentication)");
@@ -149,7 +150,7 @@ impl RdpSecurityLevel {
         println!("  5. Negotiate (try all methods)");
 
         loop {
-            let input = prompt_default("Security level", "1")?;
+            let input = prompt_default("Security level", "1").await?;
             match input.trim() {
                 "1" => return Ok(RdpSecurityLevel::Auto),
                 "2" => return Ok(RdpSecurityLevel::Nla),
@@ -209,7 +210,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -246,7 +247,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
-        let input = prompt_default("RDP Port", "3389")?;
+        let input = prompt_default("RDP Port", "3389").await?;
         match input.trim().parse::<u16>() {
             Ok(p) if p > 0 => break p,
             Ok(_) => println!("{}", "Port must be between 1 and 65535.".yellow()),
@@ -255,7 +256,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let usernames_file_path = loop {
-        let input = prompt_required("Username wordlist path")?;
+        let input = prompt_required("Username wordlist path").await?;
         let path = Path::new(&input);
         if !path.exists() {
             println!("{}", format!("File '{}' does not exist.", input).yellow());
@@ -275,7 +276,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let passwords_file_path = loop {
-        let input = prompt_required("Password wordlist path")?;
+        let input = prompt_required("Password wordlist path").await?;
         let path = Path::new(&input);
         if !path.exists() {
             println!("{}", format!("File '{}' does not exist.", input).yellow());
@@ -295,7 +296,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "10")?;
+        let input = prompt_default("Max concurrent tasks", "10").await?;
         match input.trim().parse::<usize>() {
             Ok(n) if n > 0 && n <= 10000 => break n,
             Ok(n) if n == 0 => println!("{}", "Concurrency must be greater than 0.".yellow()),
@@ -305,7 +306,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let timeout_secs: u64 = loop {
-        let input = prompt_default("Connection timeout (seconds)", "10")?;
+        let input = prompt_default("Connection timeout (seconds)", "10").await?;
         match input.trim().parse::<u64>() {
             Ok(n) if n > 0 && n <= 300 => break n,
             Ok(n) if n == 0 => println!("{}", "Timeout must be greater than 0.".yellow()),
@@ -314,17 +315,17 @@ pub async fn run(target: &str) -> Result<()> {
         }
     };
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
+    let save_results = prompt_yes_no("Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(prompt_default("Output file name", "rdp_results.txt")?)
+        Some(prompt_default("Output file name", "rdp_results.txt").await?)
     } else {
         None
     };
 
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false)?;
-    let security_level = RdpSecurityLevel::prompt_selection()?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false).await?;
+    let security_level = RdpSecurityLevel::prompt_selection().await?;
 
     let addr = format_socket_address(target, port);
 
@@ -1024,12 +1025,18 @@ async fn try_rdp_login_rdesktop(addr: &str, user: &str, pass: &str, timeout_dura
     }
 }
 
-fn prompt_required(msg: &str) -> Result<String> {
+async fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        std::io::stdout().flush().map_err(|e| anyhow!("Failed to flush stdout: {}", e))?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -1039,11 +1046,17 @@ fn prompt_required(msg: &str) -> Result<String> {
     }
 }
 
-fn prompt_default(msg: &str, default_val: &str) -> Result<String> {
+async fn prompt_default(msg: &str, default_val: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default_val).cyan().bold());
-    std::io::stdout().flush().map_err(|e| anyhow!("Failed to flush stdout: {}", e))?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut s)
+        .await
+        .context("Failed to read input")?;
     let trimmed = s.trim();
     Ok(if trimmed.is_empty() {
         default_val.to_string()
@@ -1052,13 +1065,19 @@ fn prompt_default(msg: &str, default_val: &str) -> Result<String> {
     })
 }
 
-fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default_char).cyan().bold());
-        std::io::stdout().flush().map_err(|e| anyhow!("Failed to flush stdout: {}", e))?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let input = s.trim().to_lowercase();
         if input.is_empty() {
             return Ok(default_yes);

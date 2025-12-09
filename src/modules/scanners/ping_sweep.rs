@@ -10,7 +10,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashSet,
     fs::File,
-    io::{self, BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -18,6 +18,7 @@ use std::{
     },
 };
 use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Duration};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use rand::Rng;
 use std::mem::MaybeUninit;
 
@@ -110,7 +111,7 @@ impl PingMethod {
 
 /// Main entry point triggered via the dispatcher
 pub async fn run(initial_target: &str) -> Result<()> {
-    let config = gather_configuration(initial_target)?;
+    let config = gather_configuration(initial_target).await?;
     execute_ping_sweep(&config).await
 }
 
@@ -134,7 +135,7 @@ fn parse_target(input: &str) -> Result<IpNet> {
     Err(anyhow!("Invalid target '{}'. Use IP or IP/CIDR.", input))
 }
 
-fn gather_configuration(initial: &str) -> Result<PingConfig> {
+async fn gather_configuration(initial: &str) -> Result<PingConfig> {
     println!("{}", "=== Ping Sweep Configuration ===".bold());
 
     let mut nets: Vec<IpNet> = Vec::new();
@@ -159,12 +160,12 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
         }
     }
 
-    if prompt_yes_no("Add additional targets manually?", false)? {
+    if prompt_yes_no("Add additional targets manually?", false).await? {
         loop {
             let entry = prompt_line(
                 "Enter target (IP or CIDR, leave blank to stop): ",
                 true,
-            )?;
+            ).await?;
             if entry.is_empty() {
                 break;
             }
@@ -180,8 +181,8 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
         }
     }
 
-    if prompt_yes_no("Load targets from file?", false)? {
-        let path = prompt_line("Path to file: ", false)?;
+    if prompt_yes_no("Load targets from file?", false).await? {
+        let path = prompt_line("Path to file: ", false).await?;
         let file_targets = load_targets_from_file(&path)?;
         if file_targets.is_empty() {
             println!("{}", "    No targets parsed from file.".yellow());
@@ -213,23 +214,23 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
     let targets: Vec<IpNet> = unique.into_iter().collect();
 
     let timeout_secs =
-        prompt_u64("Probe timeout (seconds)", 3, Some(1), Some(60))?;
+        prompt_u64("Probe timeout (seconds)", 3, Some(1), Some(60)).await?;
     let concurrency =
-        prompt_usize("Max concurrent hosts", 100, Some(1), Some(10_000))?;
-    let verbose = prompt_yes_no("Verbose output (show down hosts/errors)?", false)?;
+        prompt_usize("Max concurrent hosts", 100, Some(1), Some(10_000)).await?;
+    let verbose = prompt_yes_no("Verbose output (show down hosts/errors)?", false).await?;
 
     // Ask about saving results
-    let save_up_hosts = if prompt_yes_no("Save up hosts to file?", false)? {
+    let save_up_hosts = if prompt_yes_no("Save up hosts to file?", false).await? {
         let default_file = "ping_sweep_up_hosts.txt";
-        let file_path = prompt_with_default("Output file for up hosts", default_file)?;
+        let file_path = prompt_with_default("Output file for up hosts", default_file).await?;
         Some(file_path)
     } else {
         None
     };
 
-    let save_down_hosts = if prompt_yes_no("Save down hosts to file?", false)? {
+    let save_down_hosts = if prompt_yes_no("Save down hosts to file?", false).await? {
         let default_file = "ping_sweep_down_hosts.txt";
-        let file_path = prompt_with_default("Output file for down hosts", default_file)?;
+        let file_path = prompt_with_default("Output file for down hosts", default_file).await?;
         Some(file_path)
     } else {
         None
@@ -238,14 +239,14 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
     let methods = loop {
         let mut methods = Vec::new();
 
-        if prompt_yes_no("Use ICMP ping (system ping/ping6)?", true)? {
+        if prompt_yes_no("Use ICMP ping (system ping/ping6)?", true).await? {
             methods.push(PingMethod::Icmp);
         }
 
-        if prompt_yes_no("Use TCP connect probes?", false)? {
+        if prompt_yes_no("Use TCP connect probes?", false).await? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports (comma separated)", default_ports)?;
+                prompt_with_default("TCP ports (comma separated)", default_ports).await?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
                 println!("{}", "    No valid ports provided.".yellow());
@@ -254,10 +255,10 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
             }
         }
 
-        if prompt_yes_no("Use SYN scan (stealth scan, requires root)?", false)? {
+        if prompt_yes_no("Use SYN scan (stealth scan, requires root)?", false).await? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports for SYN scan (comma separated)", default_ports)?;
+                prompt_with_default("TCP ports for SYN scan (comma separated)", default_ports).await?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
                 println!("{}", "    No valid ports provided.".yellow());
@@ -266,10 +267,10 @@ fn gather_configuration(initial: &str) -> Result<PingConfig> {
             }
         }
 
-        if prompt_yes_no("Use ACK scan (filter detection, requires root)?", false)? {
+        if prompt_yes_no("Use ACK scan (filter detection, requires root)?", false).await? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports for ACK scan (comma separated)", default_ports)?;
+                prompt_with_default("TCP ports for ACK scan (comma separated)", default_ports).await?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
                 println!("{}", "    No valid ports provided.".yellow());
@@ -443,7 +444,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     )
                     .dimmed()
                 );
-                io::stdout().flush().ok();
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
 
             if !successes.is_empty() {
@@ -479,7 +480,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     
     // Clear progress line
     print!("\r{}\r", " ".repeat(80));
-    io::stdout().flush().ok();
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     let up_hosts = success_counter.load(Ordering::Relaxed);
     println!(
@@ -991,11 +992,17 @@ fn get_local_ipv4() -> Option<Ipv4Addr> {
     None
 }
 
-fn prompt_line(message: &str, allow_empty: bool) -> Result<String> {
+async fn prompt_line(message: &str, allow_empty: bool) -> Result<String> {
     print!("{}", message.cyan().bold());
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim().to_string();
     if !allow_empty && trimmed.is_empty() {
         return Err(anyhow!("Input cannot be empty."));
@@ -1003,14 +1010,20 @@ fn prompt_line(message: &str, allow_empty: bool) -> Result<String> {
     Ok(trimmed)
 }
 
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
+async fn prompt_with_default(message: &str, default: &str) -> Result<String> {
     print!(
         "{}",
         format!("{} [{}]: ", message, default).cyan().bold()
     );
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_string())
@@ -1019,16 +1032,22 @@ fn prompt_with_default(message: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     let default_hint = if default_yes { "Y/n" } else { "y/N" };
     loop {
         print!(
             "{}",
             format!("{} [{}]: ", message, default_hint).cyan().bold()
         );
-        io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut input)
+            .await
+            .context("Failed to read input")?;
         let trimmed = input.trim().to_lowercase();
         match trimmed.as_str() {
             "" => return Ok(default_yes),
@@ -1039,14 +1058,14 @@ fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
-fn prompt_usize(
+async fn prompt_usize(
     message: &str,
     default: usize,
     min: Option<usize>,
     max: Option<usize>,
 ) -> Result<usize> {
     loop {
-        let response = prompt_with_default(message, &default.to_string())?;
+        let response = prompt_with_default(message, &default.to_string()).await?;
         match response.parse::<usize>() {
             Ok(value) => {
                 if let Some(minimum) = min {
@@ -1074,14 +1093,14 @@ fn prompt_usize(
     }
 }
 
-fn prompt_u64(
+async fn prompt_u64(
     message: &str,
     default: u64,
     min: Option<u64>,
     max: Option<u64>,
 ) -> Result<u64> {
     loop {
-        let response = prompt_with_default(message, &default.to_string())?;
+        let response = prompt_with_default(message, &default.to_string()).await?;
         match response.parse::<u64>() {
             Ok(value) => {
                 if let Some(minimum) = min {

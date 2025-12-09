@@ -14,6 +14,8 @@ use std::{
     net::TcpStream,
     time::{Duration, Instant},
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use anyhow::Context;
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -149,7 +151,7 @@ pub async fn enumerate_users(
     
     for (i, user) in usernames.iter().enumerate() {
         print!("\r[{}/{}] Testing: {}          ", i + 1, usernames.len(), user);
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         
         match sample_auth_timing(host, port, user, samples, timeout_secs) {
             Some(t) => {
@@ -181,19 +183,31 @@ pub async fn enumerate_users(
 }
 
 /// Prompt helper
-fn prompt(message: &str) -> Result<String> {
+async fn prompt(message: &str) -> Result<String> {
     print!("{}: ", message);
-    std::io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     Ok(input.trim().to_string())
 }
 
-fn prompt_default(message: &str, default: &str) -> Result<String> {
+async fn prompt_default(message: &str, default: &str) -> Result<String> {
     print!("{} [{}]: ", message, default);
-    std::io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_string())
@@ -202,12 +216,18 @@ fn prompt_default(message: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
+async fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
     let hint = if default { "Y/n" } else { "y/N" };
     print!("{} [{}]: ", message, hint);
-    std::io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim().to_lowercase();
     match trimmed.as_str() {
         "" => Ok(default),
@@ -233,16 +253,16 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", host).cyan());
     
     // Get parameters
-    let port: u16 = prompt_default("SSH Port", "22")?.parse().unwrap_or(DEFAULT_SSH_PORT);
-    let samples: usize = prompt_default("Samples per username", "3")?.parse().unwrap_or(DEFAULT_SAMPLES);
-    let timeout: u64 = prompt_default("Connection timeout (seconds)", "10")?.parse().unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let threshold: f64 = prompt_default("Timing threshold (seconds)", "0.3")?.parse().unwrap_or(TIMING_THRESHOLD);
+    let port: u16 = prompt_default("SSH Port", "22").await?.parse().unwrap_or(DEFAULT_SSH_PORT);
+    let samples: usize = prompt_default("Samples per username", "3").await?.parse().unwrap_or(DEFAULT_SAMPLES);
+    let timeout: u64 = prompt_default("Connection timeout (seconds)", "10").await?.parse().unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let threshold: f64 = prompt_default("Timing threshold (seconds)", "0.3").await?.parse().unwrap_or(TIMING_THRESHOLD);
     
     // Get usernames
     let mut usernames: Vec<String> = Vec::new();
     
-    if prompt_yes_no("Load usernames from file?", false)? {
-        let file_path = prompt("Username file path")?;
+    if prompt_yes_no("Load usernames from file?", false).await? {
+        let file_path = prompt("Username file path").await?;
         if !file_path.is_empty() {
             match load_usernames(&file_path) {
                 Ok(loaded) => {
@@ -257,7 +277,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Add default usernames?
-    if usernames.is_empty() || prompt_yes_no("Also test default usernames?", true)? {
+    if usernames.is_empty() || prompt_yes_no("Also test default usernames?", true).await? {
         for user in DEFAULT_USERNAMES {
             if !usernames.contains(&user.to_string()) {
                 usernames.push(user.to_string());
@@ -277,8 +297,8 @@ pub async fn run(target: &str) -> Result<()> {
     let valid_users = enumerate_users(&host, port, &usernames, samples, timeout, threshold).await;
     
     // Save results?
-    if !valid_users.is_empty() && prompt_yes_no("Save valid users to file?", true)? {
-        let output_path = prompt_default("Output file", "valid_ssh_users.txt")?;
+    if !valid_users.is_empty() && prompt_yes_no("Save valid users to file?", true).await? {
+        let output_path = prompt_default("Output file", "valid_ssh_users.txt").await?;
         let mut file = File::create(&output_path)?;
         writeln!(file, "# Valid SSH users for {}:{}", host, port)?;
         for user in &valid_users {

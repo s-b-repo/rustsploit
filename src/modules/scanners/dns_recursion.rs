@@ -3,7 +3,8 @@ use colored::*;
 use rand::Rng;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
@@ -34,7 +35,7 @@ fn display_banner() {
 pub async fn run(initial_target: &str) -> Result<()> {
     display_banner();
 
-    let mut targets = collect_targets(initial_target)?;
+    let mut targets = collect_targets(initial_target).await?;
     if targets.is_empty() {
         return Err(anyhow!(
             "No valid targets provided. Supply at least one IP/hostname."
@@ -43,17 +44,17 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let needs_default_port = targets.iter().any(|t| t.port.is_none());
     let default_port = if needs_default_port {
-        prompt_port("Default DNS port for targets without port", 53)?
+        prompt_port("Default DNS port for targets without port", 53).await?
     } else {
         53
     };
 
     let default_domain = random_test_domain();
-    let query_name_input = prompt_default("Domain to query", &default_domain)?;
+    let query_name_input = prompt_default("Domain to query", &default_domain).await?;
     let query_name = validate_domain_input(&query_name_input)?;
 
     let record_input =
-        prompt_default("Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY")?;
+        prompt_default("Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY").await?;
     let record_type = parse_record_type(&record_input)?;
 
     println!(
@@ -279,11 +280,17 @@ fn random_test_domain() -> String {
     format!("{}.rustsploit.test", random_label)
 }
 
-fn prompt_default(message: &str, default: &str) -> Result<String> {
+async fn prompt_default(message: &str, default: &str) -> Result<String> {
     print!("{} [{}]: ", message, default);
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut buf)
+        .await
+        .context("Failed to read input")?;
     let trimmed = buf.trim();
     if trimmed.is_empty() {
         Ok(default.to_string())
@@ -294,13 +301,19 @@ fn prompt_default(message: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_port(message: &str, default: u16) -> Result<u16> {
+async fn prompt_port(message: &str, default: u16) -> Result<u16> {
     loop {
         let prompt = format!("{} [{}]: ", message, default);
         print!("{}", prompt);
-        io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut buf)
+            .await
+            .context("Failed to read input")?;
         let trimmed = buf.trim();
         if trimmed.is_empty() {
             return Ok(default);
@@ -314,11 +327,17 @@ fn prompt_port(message: &str, default: u16) -> Result<u16> {
     }
 }
 
-fn prompt_line(message: &str) -> Result<String> {
+async fn prompt_line(message: &str) -> Result<String> {
     print!("{}", message);
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut buf)
+        .await
+        .context("Failed to read input")?;
     let trimmed = buf.trim();
     if trimmed.len() > 255 {
         return Err(anyhow!("Input too long (max 255 characters)."));
@@ -326,14 +345,20 @@ fn prompt_line(message: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     let hint = if default_yes { "Y/n" } else { "y/N" };
     loop {
         let prompt = format!("{} [{}]: ", message, hint);
         print!("{}", prompt);
-        io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut buf)
+            .await
+            .context("Failed to read input")?;
         let trimmed = buf.trim().to_lowercase();
         match trimmed.as_str() {
             "" => return Ok(default_yes),
@@ -345,7 +370,7 @@ fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
-fn collect_targets(initial: &str) -> Result<Vec<TargetSpec>> {
+async fn collect_targets(initial: &str) -> Result<Vec<TargetSpec>> {
     let mut targets = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -389,9 +414,9 @@ fn collect_targets(initial: &str) -> Result<Vec<TargetSpec>> {
     if prompt_yes_no(
         "Add additional targets manually? (type 'stop' to finish)",
         targets.is_empty(),
-    )? {
+    ).await? {
         loop {
-            let entry = prompt_line("Target (IP/host[:port], 'stop' to finish): ")?;
+            let entry = prompt_line("Target (IP/host[:port], 'stop' to finish): ").await?;
             if entry.is_empty() {
                 continue;
             }
@@ -402,9 +427,9 @@ fn collect_targets(initial: &str) -> Result<Vec<TargetSpec>> {
         }
     }
 
-    if prompt_yes_no("Load targets from file?", false)? {
+    if prompt_yes_no("Load targets from file?", false).await? {
         loop {
-            let path_input = prompt_line("Path to file ('stop' to finish): ")?;
+            let path_input = prompt_line("Path to file ('stop' to finish): ").await?;
             if path_input.is_empty() {
                 continue;
             }

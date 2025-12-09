@@ -9,7 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use colored::*;
 use regex::Regex;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -73,7 +74,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -131,13 +132,13 @@ pub async fn run(target: &str) -> Result<()> {
     println!("  2. Targets from file (ignore current target)");
     println!("  3. Current target + targets from file");
     println!();
-    let mode = prompt("Select mode [1-3] (default 1): ");
+    let mode = prompt("Select mode [1-3] (default 1): ").await?;
 
     // Build initial target list based on selected mode
     let mut targets: Vec<String> = Vec::new();
     match mode.trim() {
         "2" => {
-            let file_path = prompt("Targets file (one IP/hostname per line): ");
+            let file_path = prompt("Targets file (one IP/hostname per line): ").await?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 2"));
             }
@@ -151,7 +152,7 @@ pub async fn run(target: &str) -> Result<()> {
             if !target.trim().is_empty() {
                 targets.push(target.trim().to_string());
             }
-            let file_path = prompt("Additional targets file (one IP/hostname per line): ");
+            let file_path = prompt("Additional targets file (one IP/hostname per line): ").await?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 3"));
             }
@@ -169,11 +170,11 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    let port = prompt_port(DEFAULT_SMTP_PORT);
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
-    let threads = prompt_threads(DEFAULT_THREADS);
-    let timeout_ms = prompt_timeout(DEFAULT_TIMEOUT_MS);
-    let verbose = prompt_yes_no("Verbose mode?", false);
+    let port = prompt_port(DEFAULT_SMTP_PORT).await?;
+    let username_wordlist = prompt_wordlist("Username wordlist file: ").await?;
+    let threads = prompt_threads(DEFAULT_THREADS).await?;
+    let timeout_ms = prompt_timeout(DEFAULT_TIMEOUT_MS).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
 
     if targets.is_empty() {
         return Err(anyhow!("No targets specified for SMTP enumeration"));
@@ -188,10 +189,10 @@ pub async fn run(target: &str) -> Result<()> {
         verbose,
     };
     
-    run_smtp_user_enum(config)
+    run_smtp_user_enum(config).await
 }
 
-fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
+async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
     // Normalize and validate all targets
     let mut normalized_targets: Vec<(String, String)> = Vec::new();
     for raw in &config.targets {
@@ -343,7 +344,7 @@ fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         let _ = progress_handle.join();
 
         // Final reporting including unknown responses
-        return finalize_and_report(found, unknown, stats);
+        return finalize_and_report(found, unknown, stats).await;
     }
 
     // Streaming mode for very large username lists
@@ -486,7 +487,7 @@ fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
     let _ = progress_handle.join();
     
     // Final reporting including unknown responses
-    finalize_and_report(found, unknown, stats)
+    finalize_and_report(found, unknown, stats).await
 }
 
 /// Verify a username using SMTP VRFY command
@@ -632,7 +633,7 @@ fn load_targets_from_file(path: &str) -> Result<Vec<String>> {
     Ok(targets)
 }
 
-fn finalize_and_report(
+async fn finalize_and_report(
     found: Arc<Mutex<Vec<(String, String)>>>,
     unknown: Arc<Mutex<Vec<(String, String)>>>,
     stats: Arc<Statistics>,
@@ -654,11 +655,11 @@ fn finalize_and_report(
             println!("  {}  {} - {}", "✓".green(), username, response);
         }
 
-        if prompt("\nSave valid usernames? (y/n): ")
+        if prompt("\nSave valid usernames? (y/n): ").await?
             .trim()
             .eq_ignore_ascii_case("y")
         {
-            let filename = prompt("What should the valid results be saved as?: ");
+            let filename = prompt("What should the valid results be saved as?: ").await?;
             if filename.is_empty() {
                 println!("{}", "[-] Filename cannot be empty.".red());
             } else {
@@ -681,13 +682,13 @@ fn finalize_and_report(
             .bold()
         );
 
-        if prompt("Save unknown responses to file? (y/n): ")
+        if prompt("Save unknown responses to file? (y/n): ").await?
             .trim()
             .eq_ignore_ascii_case("y")
         {
             let default_name = "smtp_unknown_responses.txt";
             let filename =
-                prompt(&format!("What should the unknown results be saved as? [{}]: ", default_name));
+                prompt(&format!("What should the unknown results be saved as? [{}]: ", default_name)).await?;
             let chosen = if filename.trim().is_empty() {
                 default_name.to_string()
             } else {
@@ -749,82 +750,81 @@ fn save_unknown_responses(path: &str, entries: &[(String, String)]) -> Result<()
     Ok(())
 }
 
-fn prompt(msg: &str) -> String {
+async fn prompt(msg: &str) -> Result<String> {
     print!("{}", msg);
-    if let Err(e) = io::stdout().flush() {
-        eprintln!("[!] Failed to flush stdout: {}", e);
-    }
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut buffer = String::new();
-    match io::stdin().read_line(&mut buffer) {
-        Ok(_) => buffer.trim().to_string(),
-        Err(e) => {
-            eprintln!("[!] Failed to read input: {}", e);
-            String::new()
-        }
-    }
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut buffer)
+        .await
+        .context("Failed to read input")?;
+    Ok(buffer.trim().to_string())
 }
 
-fn prompt_port(default: u16) -> u16 {
+async fn prompt_port(default: u16) -> Result<u16> {
     loop {
-        let input = prompt(&format!("SMTP Port (default {}): ", default));
+        let input = prompt(&format!("SMTP Port (default {}): ", default)).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<u16>() {
             Ok(0) => println!("{}", "[!] Port cannot be zero. Please enter a value between 1 and 65535.".yellow()),
-            Ok(port) => return port,
+            Ok(port) => return Ok(port),
             Err(_) => println!("{}", "[!] Invalid port. Please enter a number between 1 and 65535.".yellow()),
         }
     }
 }
 
-fn prompt_threads(default: usize) -> usize {
+async fn prompt_threads(default: usize) -> Result<usize> {
     loop {
-        let input = prompt(&format!("Threads (default {}): ", default));
+        let input = prompt(&format!("Threads (default {}): ", default)).await?;
         if input.is_empty() {
-            return default.max(1);
+            return Ok(default.max(1));
         }
         if let Ok(value) = input.parse::<usize>() {
             if value >= 1 && value <= 1024 {
-                return value;
+                return Ok(value);
             }
         }
         println!("{}", "[!] Invalid thread count. Please enter a value between 1 and 1024.".yellow());
     }
 }
 
-fn prompt_timeout(default: u64) -> u64 {
+async fn prompt_timeout(default: u64) -> Result<u64> {
     loop {
-        let input = prompt(&format!("Timeout in milliseconds (default {}): ", default));
+        let input = prompt(&format!("Timeout in milliseconds (default {}): ", default)).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<u64>() {
-            Ok(value) if value >= 100 && value <= 60000 => return value,
+            Ok(value) if value >= 100 && value <= 60000 => return Ok(value),
             Ok(_) => println!("{}", "[!] Timeout must be between 100 and 60000 milliseconds.".yellow()),
             Err(_) => println!("{}", "[!] Invalid timeout. Please enter a number.".yellow()),
         }
     }
 }
 
-fn prompt_yes_no(message: &str, default_yes: bool) -> bool {
+async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
-        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char));
+        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char)).await?;
         if input.is_empty() {
-            return default_yes;
+            return Ok(default_yes);
         }
         match input.to_lowercase().as_str() {
-            "y" | "yes" => return true,
-            "n" | "no" => return false,
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
             _ => println!("{}", "[!] Please respond with y or n.".yellow()),
         }
     }
 }
 
-fn prompt_wordlist(message: &str) -> Result<String> {
+async fn prompt_wordlist(message: &str) -> Result<String> {
     loop {
-        let response = prompt(message);
+        let response = prompt(message).await?;
         if response.is_empty() {
             println!("{}", "[!] Path cannot be empty.".yellow());
             continue;

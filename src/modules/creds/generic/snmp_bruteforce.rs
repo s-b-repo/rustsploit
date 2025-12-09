@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
@@ -11,7 +11,12 @@ use std::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use regex::Regex;
-use tokio::{sync::Mutex, task::spawn_blocking, time::sleep};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    sync::Mutex,
+    task::spawn_blocking,
+    time::sleep,
+};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
@@ -62,7 +67,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -98,7 +103,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
-        let input = prompt_default("SNMP Port", "161")?;
+        let input = prompt_default("SNMP Port", "161").await?;
         match input.trim().parse::<u16>() {
             Ok(p) if p > 0 => break p,
             Ok(_) => println!("{}", "Port must be between 1 and 65535.".yellow()),
@@ -107,7 +112,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let communities_file = loop {
-        let input = prompt_required("Community string wordlist file path")?;
+        let input = prompt_required("Community string wordlist file path").await?;
         let path = Path::new(&input);
         if !path.exists() {
             println!("{}", format!("File '{}' does not exist.", input).yellow());
@@ -129,7 +134,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let snmp_version = loop {
-        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
+        let input = prompt_default("SNMP Version (1 or 2c)", "2c").await?;
         match input.trim().to_lowercase().as_str() {
             "1" => break 0,  // SNMPv1
             "2c" | "2" => break 1,  // SNMPv2c
@@ -138,7 +143,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "50")?;
+        let input = prompt_default("Max concurrent tasks", "50").await?;
         match input.trim().parse::<usize>() {
             Ok(n) if n > 0 && n <= 10000 => break n,
             Ok(n) if n == 0 => println!("{}", "Concurrency must be greater than 0.".yellow()),
@@ -147,16 +152,16 @@ pub async fn run(target: &str) -> Result<()> {
         }
     };
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
+    let save_results = prompt_yes_no("Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "snmp_brute_results.txt")?)
+        Some(prompt_default("Output file", "snmp_brute_results.txt").await?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
     let timeout_secs: u64 = loop {
-        let input = prompt_default("Timeout (seconds)", "3")?;
+        let input = prompt_default("Timeout (seconds)", "3").await?;
         match input.trim().parse::<u64>() {
             Ok(n) if n > 0 && n <= 300 => break n,
             Ok(n) if n == 0 => println!("{}", "Timeout must be greater than 0.".yellow()),
@@ -678,12 +683,18 @@ fn normalize_target(host: &str, default_port: u16) -> Result<String> {
 }
 
 
-fn prompt_required(msg: &str) -> Result<String> {
+async fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        std::io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -693,11 +704,17 @@ fn prompt_required(msg: &str) -> Result<String> {
     }
 }
 
-fn prompt_default(msg: &str, default: &str) -> Result<String> {
+async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    std::io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut s)
+        .await
+        .context("Failed to read input")?;
     let trimmed = s.trim();
     Ok(if trimmed.is_empty() {
         default.to_string()
@@ -706,13 +723,19 @@ fn prompt_default(msg: &str, default: &str) -> Result<String> {
     })
 }
 
-fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default_char).cyan().bold());
-        std::io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let input = s.trim().to_lowercase();
         if input.is_empty() {
             return Ok(default_yes);

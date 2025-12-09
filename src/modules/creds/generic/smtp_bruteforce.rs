@@ -2,7 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use colored::*;
 use regex::Regex;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -61,7 +62,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -108,13 +109,13 @@ pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
     println!();
-    let port = prompt_port(25);
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
-    let password_wordlist = prompt_wordlist("Password wordlist file: ")?;
-    let threads = prompt_threads(8);
-    let stop_on_success = prompt_yes_no("Stop on first valid login?", true);
-    let full_combo = prompt_yes_no("Try every username with every password?", false);
-    let verbose = prompt_yes_no("Verbose mode?", false);
+    let port = prompt_port(25).await?;
+    let username_wordlist = prompt_wordlist("Username wordlist file: ").await?;
+    let password_wordlist = prompt_wordlist("Password wordlist file: ").await?;
+    let threads = prompt_threads(8).await?;
+    let stop_on_success = prompt_yes_no("Stop on first valid login?", true).await?;
+    let full_combo = prompt_yes_no("Try every username with every password?", false).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
     let config = SmtpBruteforceConfig {
         target: target.to_string(),
         port,
@@ -125,10 +126,10 @@ pub async fn run(target: &str) -> Result<()> {
         verbose,
         full_combo,
     };
-    run_smtp_bruteforce(config)
+    run_smtp_bruteforce(config).await
 }
 
-fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
+async fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     let addr = normalize_target(&config.target, config.port)?;
     let usernames = read_lines(&config.username_wordlist)?;
     let passwords = read_lines(&config.password_wordlist)?;
@@ -230,8 +231,8 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     } else {
         println!("{}", format!("[+] Found {} valid credential(s):", found_guard.len()).green().bold());
         for (u,p) in found_guard.iter() { println!("  {}  {}:{}", "✓".green(), u, p); }
-        if prompt("\nSave found credentials? (y/n): ").trim().eq_ignore_ascii_case("y") {
-            let f = prompt("What should the valid results be saved as?: ");
+        if prompt("\nSave found credentials? (y/n): ").await?.trim().eq_ignore_ascii_case("y") {
+            let f = prompt("What should the valid results be saved as?: ").await?;
             if !f.trim().is_empty() {
                 save_results(&f, &found_guard)?;
             println!("{}", format!("[+] Results saved to {}", f).green());
@@ -254,6 +255,7 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
             .bold()
         );
         if prompt("Save unknown responses to file? (y/n): ")
+            .await?
             .trim()
             .eq_ignore_ascii_case("y")
         {
@@ -261,7 +263,7 @@ fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
             let fname = prompt(&format!(
                 "What should the unknown results be saved as? [{}]: ",
                 default_name
-            ));
+            )).await?;
             let chosen = if fname.trim().is_empty() {
                 default_name.to_string()
             } else {
@@ -392,68 +394,67 @@ fn save_unknown_smtp(path: &str, entries: &[(String, String, String)]) -> Result
     Ok(())
 }
 
-fn prompt(msg: &str) -> String {
+async fn prompt(msg: &str) -> Result<String> {
     print!("{}", msg);
-    if let Err(e) = io::stdout().flush() {
-        eprintln!("[!] Failed to flush stdout: {}", e);
-    }
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut b = String::new();
-    match io::stdin().read_line(&mut b) {
-        Ok(_) => b.trim().to_string(),
-        Err(e) => {
-            eprintln!("[!] Failed to read input: {}", e);
-            String::new()
-        }
-    }
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut b)
+        .await
+        .context("Failed to read input")?;
+    Ok(b.trim().to_string())
 }
 
-fn prompt_port(default: u16) -> u16 {
+async fn prompt_port(default: u16) -> Result<u16> {
     loop {
-        let input = prompt(&format!("Port (default {}): ", default));
+        let input = prompt(&format!("Port (default {}): ", default)).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<u16>() {
             Ok(0) => println!("[!] Port cannot be zero. Please enter a value between 1 and 65535."),
-            Ok(port) => return port,
+            Ok(port) => return Ok(port),
             Err(_) => println!("[!] Invalid port. Please enter a number between 1 and 65535."),
         }
     }
 }
 
-fn prompt_threads(default: usize) -> usize {
+async fn prompt_threads(default: usize) -> Result<usize> {
     loop {
-        let input = prompt(&format!("Threads (default {}): ", default));
+        let input = prompt(&format!("Threads (default {}): ", default)).await?;
         if input.is_empty() {
-            return default.max(1);
+            return Ok(default.max(1));
         }
         if let Ok(value) = input.parse::<usize>() {
             if value >= 1 && value <= 1024 {
-                return value;
+                return Ok(value);
             }
         }
         println!("[!] Invalid thread count. Please enter a value between 1 and 1024.");
     }
 }
 
-fn prompt_yes_no(message: &str, default_yes: bool) -> bool {
+async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
-        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char));
+        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char)).await?;
         if input.is_empty() {
-            return default_yes;
+            return Ok(default_yes);
         }
         match input.to_lowercase().as_str() {
-            "y" | "yes" => return true,
-            "n" | "no" => return false,
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
             _ => println!("[!] Please respond with y or n."),
         }
     }
 }
 
-fn prompt_wordlist(message: &str) -> Result<String> {
+async fn prompt_wordlist(message: &str) -> Result<String> {
     loop {
-        let response = prompt(message);
+        let response = prompt(message).await?;
         if response.is_empty() {
             println!("[!] Path cannot be empty.");
             continue;

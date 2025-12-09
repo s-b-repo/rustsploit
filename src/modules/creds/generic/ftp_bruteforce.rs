@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use suppaftp::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
 use suppaftp::async_native_tls::TlsConnector;
@@ -11,7 +11,11 @@ use std::{
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::{sync::{Mutex, Semaphore}, time::{sleep, Duration}};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    sync::{Mutex, Semaphore},
+    time::{sleep, Duration},
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
@@ -64,7 +68,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -120,14 +124,14 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
-        let input = prompt_default("FTP Port", "21")?;
+        let input = prompt_default("FTP Port", "21").await?;
         if let Ok(p) = input.parse() { break p }
         println!("Invalid port. Try again.");
     };
-    let usernames_file = prompt_required("Username wordlist")?;
-    let passwords_file = prompt_required("Password wordlist")?;
+    let usernames_file = prompt_required("Username wordlist").await?;
+    let passwords_file = prompt_required("Password wordlist").await?;
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "500")?;
+        let input = prompt_default("Max concurrent tasks", "500").await?;
         if let Ok(n) = input.parse::<usize>() {
             if n > 0 { break n }
         }
@@ -137,15 +141,15 @@ pub async fn run(target: &str) -> Result<()> {
     // Create a semaphore to limit concurrent network operations
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
+    let save_results = prompt_yes_no("Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "ftp_results.txt")?)
+        Some(prompt_default("Output file", "ftp_results.txt").await?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode (user × pass)?", false)?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let combo_mode = prompt_yes_no("Combination mode (user × pass)?", false).await?;
 
     let addr = format_addr(target, port);
     let found = Arc::new(Mutex::new(Vec::new()));
@@ -387,15 +391,13 @@ pub async fn run(target: &str) -> Result<()> {
             .yellow()
             .bold()
         );
-        if prompt_yes_no("Save unknown responses to file?", true)? {
+        if prompt_yes_no("Save unknown responses to file?", true).await? {
             let default_name = "ftp_unknown_responses.txt";
-            let fname = prompt_default(
-                &format!(
-                    "What should the unknown results be saved as? (default: {})",
-                    default_name
-                ),
-                default_name,
-            )?;
+            let prompt_msg = format!(
+                "What should the unknown results be saved as? (default: {})",
+                default_name
+            );
+            let fname = prompt_default(&prompt_msg, default_name).await?;
             let file_path = get_filename_in_current_dir(&fname);
             match File::create(&file_path) {
                 Ok(mut file) => {
@@ -524,12 +526,18 @@ async fn try_ftp_login(addr: &str, user: &str, pass: &str, verbose: bool) -> Res
 
 // === Helpers === (prompt_required, prompt_default, prompt_yes_no, load_lines, log, get_filename_in_current_dir remain unchanged)
 
-fn prompt_required(msg: &str) -> Result<String> {
+async fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        std::io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -538,11 +546,17 @@ fn prompt_required(msg: &str) -> Result<String> {
     }
 }
 
-fn prompt_default(msg: &str, default: &str) -> Result<String> {
+async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    std::io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut s)
+        .await
+        .context("Failed to read input")?;
     let trimmed = s.trim();
     Ok(if trimmed.is_empty() {
         default.to_string()
@@ -551,13 +565,19 @@ fn prompt_default(msg: &str, default: &str) -> Result<String> {
     })
 }
 
-fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default_char).cyan().bold());
-        std::io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let input = s.trim().to_lowercase();
         match input.as_str() {
             "" => return Ok(default_yes),

@@ -4,7 +4,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{
@@ -105,7 +106,7 @@ impl Statistics {
                retries,
                rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -138,7 +139,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!();
 
     let target = target.trim().to_string();
-    let use_config = prompt_yes_no("Do you have a configuration file? (y/n): ", false);
+    let use_config = prompt_yes_no("Do you have a configuration file? (y/n): ", false).await?;
 
     let config = if use_config {
         load_config_from_file(&target).await?
@@ -148,20 +149,20 @@ pub async fn run(target: &str) -> Result<()> {
 
     print_config_summary(&config);
 
-    if !prompt_yes_no("\nProceed with this configuration? (y/n): ", true) {
+    if !prompt_yes_no("\nProceed with this configuration? (y/n): ", true).await? {
         println!("[*] Aborted by user.");
         return Ok(());
     }
 
-    if !use_config && prompt_yes_no("\nSave this configuration? (y/n): ", false) {
-        save_configuration(&config)?;
+    if !use_config && prompt_yes_no("\nSave this configuration? (y/n): ", false).await? {
+        save_configuration(&config).await?;
     }
 
     println!();
     println!("{}", "[Starting Attack]".bold().yellow());
     println!();
 
-    run_pop3_bruteforce(config)
+    run_pop3_bruteforce(config).await
 }
 
 async fn load_config_from_file(target: &str) -> Result<Pop3BruteforceConfig> {
@@ -169,7 +170,7 @@ async fn load_config_from_file(target: &str) -> Result<Pop3BruteforceConfig> {
     print_config_format();
     println!();
 
-    let config_path = prompt_wordlist("Path to configuration file: ")?;
+    let config_path = prompt_wordlist("Path to configuration file: ").await?;
     println!("[*] Loading configuration from '{}'...", config_path);
 
     match load_and_validate_config(&config_path, target).await {
@@ -189,26 +190,26 @@ async fn build_interactive_config(target: &str) -> Result<Pop3BruteforceConfig> 
     println!("{}", "[Interactive Configuration Mode]".bold().green());
     println!();
 
-    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)? (y/n): ", false);
+    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)? (y/n): ", false).await?;
     let default_port = if use_ssl { 995 } else { 110 };
-    let port = prompt_port(default_port);
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
-    let password_wordlist = prompt_wordlist("Password wordlist file: ")?;
-    let threads = prompt_threads(16);
-    let delay_ms = prompt_delay(50);
-    let connection_timeout = prompt_timeout("Connection timeout (seconds, default 4): ", 4);
-    let read_timeout = prompt_timeout("Read timeout (seconds, default 4): ", 4);
-    let full_combo = prompt_yes_no("Try every username with every password? (y/n): ", false);
-    let stop_on_success = prompt_yes_no("Stop on first valid login? (y/n): ", false);
-    let output_file = prompt_required("Output file for results: ");
+    let port = prompt_port(default_port).await?;
+    let username_wordlist = prompt_wordlist("Username wordlist file: ").await?;
+    let password_wordlist = prompt_wordlist("Password wordlist file: ").await?;
+    let threads = prompt_threads(16).await?;
+    let delay_ms = prompt_delay(50).await?;
+    let connection_timeout = prompt_timeout("Connection timeout (seconds, default 4): ", 4).await?;
+    let read_timeout = prompt_timeout("Read timeout (seconds, default 4): ", 4).await?;
+    let full_combo = prompt_yes_no("Try every username with every password? (y/n): ", false).await?;
+    let stop_on_success = prompt_yes_no("Stop on first valid login? (y/n): ", false).await?;
+    let output_file = prompt_required("Output file for results: ").await?;
     let append_mode = if Path::new(&output_file).exists() {
-        prompt_yes_no(&format!("File '{}' exists. Append? (y/n): ", output_file), true)
+        prompt_yes_no(&format!("File '{}' exists. Append? (y/n): ", output_file), true).await?
     } else {
         false
     };
-    let verbose = prompt_yes_no("Verbose mode? (y/n): ", false);
-    let retry_on_error = prompt_yes_no("Retry failed connections? (y/n): ", true);
-    let max_retries = if retry_on_error { prompt_retries(2) } else { 0 };
+    let verbose = prompt_yes_no("Verbose mode? (y/n): ", false).await?;
+    let retry_on_error = prompt_yes_no("Retry failed connections? (y/n): ", true).await?;
+    let max_retries = if retry_on_error { prompt_retries(2).await? } else { 0 };
 
     Ok(Pop3BruteforceConfig {
         target: target.to_string(),
@@ -230,8 +231,8 @@ async fn build_interactive_config(target: &str) -> Result<Pop3BruteforceConfig> 
     })
 }
 
-fn save_configuration(config: &Pop3BruteforceConfig) -> Result<()> {
-    let save_path = prompt_required("Configuration file path: ");
+async fn save_configuration(config: &Pop3BruteforceConfig) -> Result<()> {
+    let save_path = prompt_required("Configuration file path: ").await?;
     if let Err(e) = save_config(config, &save_path) {
         eprintln!("[!] Failed to save config: {}", e);
         Err(e)
@@ -369,7 +370,7 @@ fn print_config_summary(config: &Pop3BruteforceConfig) {
     println!("{}", "=============================".cyan());
 }
 
-fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
+async fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     let addr = normalize_target(&config.target, config.port)?;
     let host = get_hostname(&config.target);
 
@@ -394,7 +395,7 @@ fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
         println!();
 
         loop {
-            let choice = prompt("Select option (1/2/3): ");
+            let choice = prompt("Select option (1/2/3): ").await?;
             match choice.trim() {
                 "1" => {
                     println!("[*] Using memory mode...");
@@ -499,7 +500,7 @@ fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     stop_flag.store(true, Ordering::Relaxed);
 
     stats.print_final();
-    print_final_report(&found, &unknown, &config.output_file);
+    print_final_report(&found, &unknown, &config.output_file).await?;
 
     Ok(())
 }
@@ -852,11 +853,11 @@ fn process_login_result(
     }
 }
 
-fn print_final_report(
+async fn print_final_report(
     found: &Arc<Mutex<HashSet<(String, String)>>>,
     unknown: &Arc<Mutex<Vec<(String, String, String)>>>,
     output_file: &str,
-) {
+) -> Result<()> {
     let found = found.lock().unwrap();
     println!();
     if found.is_empty() {
@@ -884,12 +885,12 @@ fn print_final_report(
             .yellow()
             .bold()
         );
-        if prompt_yes_no("Save unknown responses to file? (y/n): ", true) {
+        if prompt_yes_no("Save unknown responses to file? (y/n): ", true).await? {
             let default_name = "pop3_unknown_responses.txt";
             let fname = prompt_required(&format!(
                 "What should the unknown results be saved as? (default: {}): ",
                 default_name
-            ));
+            )).await?;
             let chosen = if fname.trim().is_empty() {
                 default_name.to_string()
             } else {
@@ -902,6 +903,7 @@ fn print_final_report(
             }
         }
     }
+    Ok(())
 }
 
 #[inline]
@@ -1082,106 +1084,112 @@ fn count_nonempty_lines(path: &str) -> Result<usize> {
 // ============================================================
 
 #[inline]
-fn prompt(msg: &str) -> String {
+async fn prompt(msg: &str) -> Result<String> {
     print!("{}", msg);
-    io::stdout().flush().unwrap();
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf).unwrap();
-    buf.trim().to_string()
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut buf)
+        .await
+        .context("Failed to read input")?;
+    Ok(buf.trim().to_string())
 }
 
-fn prompt_required(msg: &str) -> String {
+async fn prompt_required(msg: &str) -> Result<String> {
     loop {
-        let input = prompt(msg);
+        let input = prompt(msg).await?;
         if !input.trim().is_empty() {
-            return input.trim().to_string();
+            return Ok(input.trim().to_string());
         }
         println!("[!] This field is required.");
     }
 }
 
-fn prompt_port(default: u16) -> u16 {
+async fn prompt_port(default: u16) -> Result<u16> {
     loop {
-        let input = prompt(&format!("Port (default {}): ", default));
+        let input = prompt(&format!("Port (default {}): ", default)).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<u16>() {
-            Ok(port) if port > 0 => return port,
+            Ok(port) if port > 0 => return Ok(port),
             _ => println!("[!] Invalid port value."),
         }
     }
 }
 
-fn prompt_delay(default: u64) -> u64 {
+async fn prompt_delay(default: u64) -> Result<u64> {
     loop {
-        let input = prompt(&format!("Delay between attempts in ms (default {}): ", default));
+        let input = prompt(&format!("Delay between attempts in ms (default {}): ", default)).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<u64>() {
-            Ok(val) if val <= MAX_DELAY_MS => return val,
+            Ok(val) if val <= MAX_DELAY_MS => return Ok(val),
             _ => println!("[!] Invalid delay (max {}ms).", MAX_DELAY_MS),
         }
     }
 }
 
-fn prompt_timeout(msg: &str, default: u64) -> u64 {
+async fn prompt_timeout(msg: &str, default: u64) -> Result<u64> {
     loop {
-        let input = prompt(msg);
+        let input = prompt(msg).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<u64>() {
-            Ok(val) if (TIMEOUT_MIN..=TIMEOUT_MAX).contains(&val) => return val,
+            Ok(val) if (TIMEOUT_MIN..=TIMEOUT_MAX).contains(&val) => return Ok(val),
             _ => println!("[!] Invalid timeout ({}-{} seconds).", TIMEOUT_MIN, TIMEOUT_MAX),
         }
     }
 }
 
-fn prompt_threads(default: usize) -> usize {
+async fn prompt_threads(default: usize) -> Result<usize> {
     loop {
-        let input = prompt(&format!("Number of threads (default {}): ", default));
+        let input = prompt(&format!("Number of threads (default {}): ", default)).await?;
         if input.is_empty() {
-            return default.max(1);
+            return Ok(default.max(1));
         }
         match input.parse::<usize>() {
-            Ok(val) if val >= 1 && val <= MAX_THREADS => return val,
+            Ok(val) if val >= 1 && val <= MAX_THREADS => return Ok(val),
             _ => println!("[!] Invalid thread count (1-{}).", MAX_THREADS),
         }
     }
 }
 
-fn prompt_retries(default: usize) -> usize {
+async fn prompt_retries(default: usize) -> Result<usize> {
     loop {
-        let input = prompt(&format!("Max retries per attempt (default {}): ", default));
+        let input = prompt(&format!("Max retries per attempt (default {}): ", default)).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.parse::<usize>() {
-            Ok(val) if val <= MAX_RETRIES_LIMIT => return val,
+            Ok(val) if val <= MAX_RETRIES_LIMIT => return Ok(val),
             _ => println!("[!] Invalid retry count (max {}).", MAX_RETRIES_LIMIT),
         }
     }
 }
 
-fn prompt_yes_no(message: &str, default: bool) -> bool {
+async fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
     loop {
-        let input = prompt(message);
+        let input = prompt(message).await?;
         if input.is_empty() {
-            return default;
+            return Ok(default);
         }
         match input.to_lowercase().as_str() {
-            "y" | "yes" => return true,
-            "n" | "no" => return false,
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
             _ => println!("[!] Please respond with y or n."),
         }
     }
 }
 
-fn prompt_wordlist(prompt_text: &str) -> Result<String> {
+async fn prompt_wordlist(prompt_text: &str) -> Result<String> {
     loop {
-        let path = prompt(prompt_text);
+        let path = prompt(prompt_text).await?;
         if path.is_empty() {
             println!("[!] Path cannot be empty.");
             continue;

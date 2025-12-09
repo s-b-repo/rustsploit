@@ -2,7 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use colored::*;
 use reqwest::Client;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::Write;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use std::time::{Duration, Instant};
 
 fn display_banner() {
@@ -18,11 +19,11 @@ pub async fn run(target: &str) -> Result<()> {
     
     println!("{}", format!("[*] Target: {}", target).cyan());
     
-    let timeout_secs = prompt_timeout()?;
-    let check_http = prompt_bool("Check HTTP (port 80)?", true)?;
-    let check_https = prompt_bool("Check HTTPS (port 443)?", true)?;
-    let verbose = prompt_bool("Verbose output?", false)?;
-    let save_results = prompt_bool("Save results to file?", false)?;
+    let timeout_secs = prompt_timeout().await?;
+    let check_http = prompt_bool("Check HTTP (port 80)?", true).await?;
+    let check_https = prompt_bool("Check HTTPS (port 443)?", true).await?;
+    let verbose = prompt_bool("Verbose output?", false).await?;
+    let save_results = prompt_bool("Save results to file?", false).await?;
     
     if !check_http && !check_https {
         return Err(anyhow!("At least one protocol must be selected"));
@@ -145,7 +146,7 @@ pub async fn run(target: &str) -> Result<()> {
     
     // Save results
     if save_results && !results.is_empty() {
-        let filename = prompt_with_default("Output filename", "http_scan_results.txt")?;
+        let filename = prompt_with_default("Output filename", "http_scan_results.txt").await?;
         let mut file = File::create(&filename).context("Failed to create output file")?;
         writeln!(file, "HTTP Connectivity Scan Results")?;
         writeln!(file, "Target: {}", target)?;
@@ -160,12 +161,18 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn prompt_bool(message: &str, default: bool) -> Result<bool> {
+async fn prompt_bool(message: &str, default: bool) -> Result<bool> {
     let hint = if default { "Y/n" } else { "y/N" };
     print!("{}", format!("{} [{}]: ", message, hint).cyan().bold());
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim().to_lowercase();
     match trimmed.as_str() {
         "" => Ok(default),
@@ -175,11 +182,17 @@ fn prompt_bool(message: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
+async fn prompt_with_default(message: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", message, default).cyan().bold());
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_string())
@@ -188,11 +201,17 @@ fn prompt_with_default(message: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_timeout() -> Result<u64> {
+async fn prompt_timeout() -> Result<u64> {
     print!("{}", "Timeout in seconds [10]: ".cyan().bold());
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read input")?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(10)
