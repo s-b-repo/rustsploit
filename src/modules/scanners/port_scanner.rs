@@ -1,14 +1,14 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use colored::*;
 use std::{
     fs::File,
-    io::{self, Write, BufWriter},
+    io::{Write, BufWriter},
     net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
     time::Instant,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt},
     net::{TcpStream, UdpSocket},
     sync::Semaphore,
     time::{timeout, Duration},
@@ -77,7 +77,7 @@ fn get_service_name(port: u16) -> &'static str {
 }
 
 /// Interactive config prompt
-pub fn prompt_settings() -> Result<ScanSettings> {
+pub async fn prompt_settings() -> Result<ScanSettings> {
     println!("{}", "\n=== Port Scanner Configuration ===".cyan().bold());
     
     // Port range selection
@@ -87,14 +87,14 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     println!("  3. Top 1000 ports");
     println!("  4. Custom range");
     
-    let range_choice = prompt_usize("Select option (1-4) [1]: ")?;
+    let range_choice = prompt_usize("Select option (1-4) [1]: ").await?;
     let port_range = match range_choice {
         1 | 0 => PortRange::All,
         2 => PortRange::Common,
         3 => PortRange::Top1000,
         4 => {
-            let start_val: usize = prompt_usize("Start port: ")?;
-            let end_val: usize = prompt_usize("End port: ")?;
+            let start_val: usize = prompt_usize("Start port: ").await?;
+            let end_val: usize = prompt_usize("End port: ").await?;
             
             if start_val > 65535 || start_val == 0 {
                 return Err(anyhow!("Start port must be between 1 and 65535"));
@@ -118,19 +118,19 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     println!("{}", format!("[*] Selected {} ports to scan", ports.len()).green());
     
     Ok(ScanSettings {
-        concurrency: prompt_usize("Concurrency [100]: ").unwrap_or(100),
-        timeout_secs: prompt_usize("Timeout (in seconds) [3]: ").unwrap_or(3) as u64,
-        show_only_open: prompt_bool("Show only open ports? (y/n) [y]: ").unwrap_or(true),
-        verbose: prompt_bool("Verbose output? (y/n) [n]: ").unwrap_or(false),
-        scan_udp_enabled: prompt_bool("Include UDP scan? (y/n) [n]: ").unwrap_or(false),
-        output_file: prompt("Output filename [scan_results.txt]: ").unwrap_or_else(|_| "scan_results.txt".to_string()),
+        concurrency: prompt_usize("Concurrency [100]: ").await.unwrap_or(100),
+        timeout_secs: prompt_usize("Timeout (in seconds) [3]: ").await.unwrap_or(3) as u64,
+        show_only_open: prompt_bool("Show only open ports? (y/n) [y]: ").await.unwrap_or(true),
+        verbose: prompt_bool("Verbose output? (y/n) [n]: ").await.unwrap_or(false),
+        scan_udp_enabled: prompt_bool("Include UDP scan? (y/n) [n]: ").await.unwrap_or(false),
+        output_file: prompt("Output filename [scan_results.txt]: ").await.unwrap_or_else(|_| "scan_results.txt".to_string()),
         port_range,
     })
 }
 
 /// Main entrypoint for interactive CLI mode
 pub async fn run_interactive(target: &str) -> Result<()> {
-    let settings = prompt_settings()?;
+    let settings = prompt_settings().await?;
     run_with_settings(
         target,
         settings.concurrency,
@@ -464,17 +464,23 @@ fn resolve_target(input: &str) -> Result<(String, std::net::IpAddr)> {
 }
 
 /// === Prompt Utilities ===
-fn prompt(message: &str) -> Result<String> {
+async fn prompt(message: &str) -> Result<String> {
     print!("{}", message.cyan().bold());
-    io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut buf)
+        .await
+        .context("Failed to read input")?;
     Ok(buf.trim().to_string())
 }
 
-fn prompt_bool(message: &str) -> Result<bool> {
+async fn prompt_bool(message: &str) -> Result<bool> {
     loop {
-        let input = prompt(message)?;
+        let input = prompt(message).await?;
         if input.is_empty() {
             return Ok(false);
         }
@@ -486,9 +492,9 @@ fn prompt_bool(message: &str) -> Result<bool> {
     }
 }
 
-fn prompt_usize(message: &str) -> Result<usize> {
+async fn prompt_usize(message: &str) -> Result<usize> {
     loop {
-        let input = prompt(message)?;
+        let input = prompt(message).await?;
         if input.is_empty() {
             return Err(anyhow!("Input required"));
         }
@@ -580,7 +586,9 @@ impl ProgressTracker {
             rate,
             remaining
         ).cyan());
-        io::stdout().flush().unwrap();
+        // Note: This is in a sync context (ProgressTracker), so we use blocking flush
+        // The ProgressTracker is called from async context but uses sync printing
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         
         if self.current == self.total {
             println!();

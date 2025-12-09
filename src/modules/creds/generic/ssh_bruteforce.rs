@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use ssh2::Session;
 use std::{
@@ -15,6 +15,7 @@ use std::{
 };
 use regex::Regex;
 use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
     sync::{Mutex, Semaphore},
     task::spawn_blocking,
     time::{sleep, Duration, timeout},
@@ -125,7 +126,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("[*] Target: {}", target);
 
     let port: u16 = loop {
-        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string())?;
+        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string()).await?;
         match input.parse() {
             Ok(p) if p > 0 => break p,
             _ => println!("{}", "Invalid port. Must be between 1 and 65535.".yellow()),
@@ -133,16 +134,16 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     // Ask about default credentials
-    let use_defaults = prompt_yes_no("Try default credentials first?", true)?;
+    let use_defaults = prompt_yes_no("Try default credentials first?", true).await?;
     
-    let usernames_file = if prompt_yes_no("Use username wordlist?", true)? {
-        Some(prompt_existing_file("Username wordlist")?)
+    let usernames_file = if prompt_yes_no("Use username wordlist?", true).await? {
+        Some(prompt_existing_file("Username wordlist").await?)
     } else {
         None
     };
     
-    let passwords_file = if prompt_yes_no("Use password wordlist?", true)? {
-        Some(prompt_existing_file("Password wordlist")?)
+    let passwords_file = if prompt_yes_no("Use password wordlist?", true).await? {
+        Some(prompt_existing_file("Password wordlist").await?)
     } else {
         None
     };
@@ -152,7 +153,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "10")?;
+        let input = prompt_default("Max concurrent tasks", "10").await?;
         match input.parse() {
             Ok(n) if n > 0 && n <= 256 => break n,
             _ => println!("{}", "Invalid number. Must be between 1 and 256.".yellow()),
@@ -160,17 +161,17 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let connection_timeout: u64 = loop {
-        let input = prompt_default("Connection timeout (seconds)", "5")?;
+        let input = prompt_default("Connection timeout (seconds)", "5").await?;
         match input.parse() {
             Ok(n) if n >= 1 && n <= 60 => break n,
             _ => println!("{}", "Invalid timeout. Must be between 1 and 60 seconds.".yellow()),
         }
     };
 
-    let retry_on_error = prompt_yes_no("Retry on connection errors?", true)?;
+    let retry_on_error = prompt_yes_no("Retry on connection errors?", true).await?;
     let max_retries: usize = if retry_on_error {
         loop {
-            let input = prompt_default("Max retries per attempt", "2")?;
+            let input = prompt_default("Max retries per attempt", "2").await?;
             match input.parse() {
                 Ok(n) if n > 0 && n <= 10 => break n,
                 _ => println!("{}", "Invalid retries. Must be between 1 and 10.".yellow()),
@@ -180,15 +181,15 @@ pub async fn run(target: &str) -> Result<()> {
         0
     };
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
+    let save_results = prompt_yes_no("Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "ssh_brute_results.txt")?)
+        Some(prompt_default("Output file", "ssh_brute_results.txt").await?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false).await?;
 
     let connect_addr = normalize_target(target, port)?;
 
@@ -436,7 +437,7 @@ pub async fn run(target: &str) -> Result<()> {
             .yellow()
             .bold()
         );
-        if prompt_yes_no("Save unknown responses to file?", true)? {
+        if prompt_yes_no("Save unknown responses to file?", true).await? {
             let default_name = "ssh_unknown_responses.txt";
             let fname = prompt_default(
                 &format!(
@@ -444,7 +445,7 @@ pub async fn run(target: &str) -> Result<()> {
                     default_name
                 ),
                 default_name,
-            )?;
+            ).await?;
             let filename = get_filename_in_current_dir(&fname);
             match File::create(&filename) {
                 Ok(mut file) => {
@@ -543,9 +544,9 @@ fn normalize_target(host: &str, default_port: u16) -> Result<String> {
     Ok(formatted)
 }
 
-fn prompt_existing_file(msg: &str) -> Result<String> {
+async fn prompt_existing_file(msg: &str) -> Result<String> {
     loop {
-        let candidate = prompt_required(msg)?;
+        let candidate = prompt_required(msg).await?;
         if Path::new(&candidate).is_file() {
             return Ok(candidate);
         } else {
@@ -557,12 +558,18 @@ fn prompt_existing_file(msg: &str) -> Result<String> {
     }
 }
 
-fn prompt_required(msg: &str) -> Result<String> {
+async fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        std::io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -572,11 +579,17 @@ fn prompt_required(msg: &str) -> Result<String> {
     }
 }
 
-fn prompt_default(msg: &str, default: &str) -> Result<String> {
+async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    std::io::stdout().flush()?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut s)
+        .await
+        .context("Failed to read input")?;
     let trimmed = s.trim();
     Ok(if trimmed.is_empty() {
         default.to_string()
@@ -585,13 +598,19 @@ fn prompt_default(msg: &str, default: &str) -> Result<String> {
     })
 }
 
-fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default_char).cyan().bold());
-        std::io::stdout().flush()?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let input = s.trim().to_lowercase();
         if input.is_empty() {
             return Ok(default_yes);

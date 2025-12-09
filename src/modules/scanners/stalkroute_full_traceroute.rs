@@ -11,7 +11,7 @@ use rand::Rng;
 use rand::distr::Alphanumeric;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::io::{stdin, stdout, Write};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 
 use tokio::time::{Instant, Duration};
@@ -416,8 +416,14 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 pub async fn run(target: &str) -> Result<()> {
     let mut user_input = String::new();
     print!("Are you running this as sudo? (yes/no): ");
-    stdout().flush().unwrap();
-    stdin().read_line(&mut user_input).expect("Failed to read line");
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut user_input)
+        .await
+        .context("Failed to read input")?;
 
     if user_input.trim().to_lowercase() == "yes" {
         // Safe wrapper for geteuid - it's a simple system call that cannot fail

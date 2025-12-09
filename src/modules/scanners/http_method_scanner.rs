@@ -4,7 +4,7 @@ use colored::*;
 use reqwest::{Client, Method, StatusCode, Url};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use std::time::{Duration, Instant};
 
 const METHODS: &[&str] = &[
@@ -37,18 +37,18 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let mut targets = collect_initial_targets(initial_target);
 
-    let additional = prompt("Enter additional comma-separated targets (optional): ")?;
+    let additional = prompt("Enter additional comma-separated targets (optional): ").await?;
     if !additional.is_empty() {
         targets.extend(split_targets(&additional));
     }
 
-    let file_path = prompt("Path to file with targets (optional): ")?;
+    let file_path = prompt("Path to file with targets (optional): ").await?;
     if !file_path.is_empty() {
         let file_targets = load_targets_from_file(&file_path)?;
         targets.extend(file_targets);
     }
 
-    let default_scheme_input = prompt("Preferred scheme (http/https, default https): ")?;
+    let default_scheme_input = prompt("Preferred scheme (http/https, default https): ").await?;
     let default_scheme = match default_scheme_input.to_lowercase().as_str() {
         "http" => "http",
         _ => "https",
@@ -57,22 +57,22 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let use_ports = prompt_bool(
         "Test via specific ports (port tunneling)? (yes/no, default no): ",
                                 false,
-    )?;
+    ).await?;
     let ports = if use_ports {
-        prompt_ports()?
+        prompt_ports().await?
     } else {
         Vec::new()
     };
 
-    let timeout_input = prompt("Request timeout in seconds (default 10): ")?;
+    let timeout_input = prompt("Request timeout in seconds (default 10): ").await?;
     let timeout_secs: u64 = timeout_input
     .parse()
     .ok()
     .filter(|val| *val > 0)
     .unwrap_or(10);
 
-    let verbose = prompt_bool("Enable verbose output? (yes/no, default no): ", false)?;
-    let save_output = prompt_bool("Save results to file? (yes/no, default yes): ", true)?;
+    let verbose = prompt_bool("Enable verbose output? (yes/no, default no): ", false).await?;
+    let save_output = prompt_bool("Save results to file? (yes/no, default yes): ", true).await?;
 
     let mut normalized = normalize_targets(targets, default_scheme);
     if !ports.is_empty() {
@@ -200,7 +200,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
         let output_path = prompt_with_default(
             "Enter output file path (press Enter for default): ",
                                               &default_name,
-        )?;
+        ).await?;
         write_report(&output_path, &all_results)?;
         println!("[*] Results saved to {}", output_path);
     }
@@ -292,19 +292,23 @@ fn expand_targets_with_ports(targets: &[String], ports: &[u16]) -> Vec<String> {
     expanded
 }
 
-fn prompt(message: &str) -> Result<String> {
+async fn prompt(message: &str) -> Result<String> {
     print!("{}", message);
-    io::stdout().flush().context("Failed to flush stdout")?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut input = String::new();
-    io::stdin()
-    .read_line(&mut input)
-    .context("Failed to read user input")?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut input)
+        .await
+        .context("Failed to read user input")?;
     Ok(input.trim().to_string())
 }
 
-fn prompt_bool(message: &str, default: bool) -> Result<bool> {
+async fn prompt_bool(message: &str, default: bool) -> Result<bool> {
     let default_text = if default { "yes" } else { "no" };
-    let input = prompt(message)?;
+    let input = prompt(message).await?;
     if input.is_empty() {
         return Ok(default);
     }
@@ -318,8 +322,8 @@ fn prompt_bool(message: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
-    let input = prompt(message)?;
+async fn prompt_with_default(message: &str, default: &str) -> Result<String> {
+    let input = prompt(message).await?;
     if input.is_empty() {
         Ok(default.to_string())
     } else {
@@ -327,10 +331,10 @@ fn prompt_with_default(message: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_ports() -> Result<Vec<u16>> {
+async fn prompt_ports() -> Result<Vec<u16>> {
     let input = prompt(
         "Enter port(s) to tunnel through (comma-separated, e.g., 80,8080; leave blank to skip): ",
-    )?;
+    ).await?;
     if input.is_empty() {
         println!("[!] No ports provided; skipping port tunneling.");
         return Ok(Vec::new());

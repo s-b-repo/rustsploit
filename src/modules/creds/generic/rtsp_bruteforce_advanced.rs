@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
 use colored::*;
@@ -13,7 +13,7 @@ use std::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{Mutex, Semaphore},
     time::{sleep, Duration},
@@ -68,7 +68,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -106,40 +106,40 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", target).cyan());
 
     let port: u16 = loop {
-        let input = prompt_default("RTSP Port", "554")?;
+        let input = prompt_default("RTSP Port", "554").await?;
         match input.parse() {
             Ok(p) => break p,
             Err(_) => println!("Invalid port. Try again."),
         }
     };
 
-    let usernames_file = prompt_required("Username wordlist")?;
-    let passwords_file = prompt_required("Password wordlist")?;
+    let usernames_file = prompt_required("Username wordlist").await?;
+    let passwords_file = prompt_required("Password wordlist").await?;
 
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "10")?;
+        let input = prompt_default("Max concurrent tasks", "10").await?;
         match input.parse() {
             Ok(n) if n > 0 => break n,
             _ => println!("Invalid number. Try again."),
         }
     };
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
+    let save_results = prompt_yes_no("Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "rtsp_results.txt")?)
+        Some(prompt_default("Output file", "rtsp_results.txt").await?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false).await?;
 
-    let advanced_mode = prompt_yes_no("Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false)?;
+    let advanced_mode = prompt_yes_no("Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false).await?;
     let mut advanced_headers: Vec<String> = Vec::new();
     let advanced_command = if advanced_mode {
-        let method = prompt_default("RTSP method to use (e.g. DESCRIBE)", "DESCRIBE")?;
-        if prompt_yes_no("Load extra RTSP headers from a file?", false)? {
-            let headers_path = prompt_required("Path to RTSP headers file")?;
+        let method = prompt_default("RTSP method to use (e.g. DESCRIBE)", "DESCRIBE").await?;
+        if prompt_yes_no("Load extra RTSP headers from a file?", false).await? {
+            let headers_path = prompt_required("Path to RTSP headers file").await?;
             advanced_headers = load_lines(&headers_path)?;
         }
         Some(method)
@@ -180,9 +180,9 @@ pub async fn run(target: &str) -> Result<()> {
         return Ok(());
     }
 
-    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
+    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false).await?;
     let mut paths = if brute_force_paths {
-        let paths_file = prompt_required("Path to RTSP paths file")?;
+        let paths_file = prompt_required("Path to RTSP paths file").await?;
         load_lines(&paths_file)?
     } else {
         vec!["".to_string()]
@@ -538,12 +538,18 @@ fn normalize_target_input(target: &str, default_port: u16) -> Result<(String, Op
 
 // ─── Prompt and utility functions unchanged ───────────────────────────────────
 
-fn prompt_required(msg: &str) -> Result<String> {
+async fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        std::io::Write::flush(&mut std::io::stdout())?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -552,22 +558,34 @@ fn prompt_required(msg: &str) -> Result<String> {
     }
 }
 
-fn prompt_default(msg: &str, default: &str) -> Result<String> {
+async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    std::io::Write::flush(&mut std::io::stdout())?;
+    tokio::io::stdout()
+        .flush()
+        .await
+        .context("Failed to flush stdout")?;
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut s)
+        .await
+        .context("Failed to read input")?;
     let trimmed = s.trim();
     Ok(if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() })
 }
 
-fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
-        std::io::Write::flush(&mut std::io::stdout())?;
+        tokio::io::stdout()
+            .flush()
+            .await
+            .context("Failed to flush stdout")?;
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s)?;
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut s)
+            .await
+            .context("Failed to read input")?;
         match s.trim().to_lowercase().as_str() {
             ""        => return Ok(default_yes),
             "y" | "yes" => return Ok(true),

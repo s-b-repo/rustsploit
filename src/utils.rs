@@ -34,6 +34,15 @@ const MAX_PARALLEL_PROXIES: usize = 1000;
 /// Maximum timeout for proxy tests (5 minutes)
 const MAX_PROXY_TIMEOUT_SECS: u64 = 300;
 
+/// Maximum length for command inputs to prevent DoS
+const MAX_COMMAND_LENGTH: usize = 8192;
+
+/// Maximum length for file paths to prevent DoS
+const MAX_PATH_LENGTH: usize = 4096;
+
+/// Dangerous command characters that should be sanitized or rejected
+const DANGEROUS_CMD_CHARS: &[char] = &['\x00', '\n', '\r', '\t'];
+
 /// Comprehensive target normalization function.
 /// 
 /// Supports multiple input formats:
@@ -1034,4 +1043,275 @@ pub async fn basic_honeypot_check(target: &str) {
         println!("{}", "[+] No honeypot indicators detected".green());
         println!();
     }
+}
+
+/// Validates and sanitizes command input to prevent injection attacks and DoS
+/// 
+/// # Security Features
+/// - Length limits to prevent DoS
+/// - Dangerous character filtering
+/// - Control character removal
+/// 
+/// # Arguments
+/// - `command`: The command string to validate
+/// 
+/// # Returns
+/// - `Ok(String)`: Sanitized command if valid
+/// - `Err`: Error if validation fails
+pub fn validate_command_input(command: &str) -> Result<String> {
+    let trimmed = command.trim();
+    
+    // Check if empty
+    if trimmed.is_empty() {
+        return Err(anyhow!("Command cannot be empty"));
+    }
+    
+    // Check length to prevent DoS
+    if trimmed.len() > MAX_COMMAND_LENGTH {
+        return Err(anyhow!(
+            "Command too long (max {} characters, got {})",
+            MAX_COMMAND_LENGTH,
+            trimmed.len()
+        ));
+    }
+    
+    // Remove dangerous control characters
+    let sanitized: String = trimmed
+        .chars()
+        .filter(|c| !DANGEROUS_CMD_CHARS.contains(c))
+        .collect();
+    
+    if sanitized.is_empty() {
+        return Err(anyhow!("Command contains only invalid characters"));
+    }
+    
+    Ok(sanitized)
+}
+
+/// Validates file path to prevent path traversal attacks
+/// 
+/// # Security Features
+/// - Path traversal detection (.., //, etc.)
+/// - Length limits to prevent DoS
+/// - Control character filtering
+/// - Absolute path validation (optional)
+/// 
+/// # Arguments
+/// - `path`: The file path to validate
+/// - `allow_absolute`: Whether to allow absolute paths
+/// 
+/// # Returns
+/// - `Ok(String)`: Sanitized path if valid
+/// - `Err`: Error if validation fails
+pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
+    let trimmed = path.trim();
+    
+    // Check if empty
+    if trimmed.is_empty() {
+        return Err(anyhow!("File path cannot be empty"));
+    }
+    
+    // Check length to prevent DoS
+    if trimmed.len() > MAX_PATH_LENGTH {
+        return Err(anyhow!(
+            "File path too long (max {} characters, got {})",
+            MAX_PATH_LENGTH,
+            trimmed.len()
+        ));
+    }
+    
+    // Check for path traversal attempts
+    if trimmed.contains("..") {
+        return Err(anyhow!("Path traversal detected: '..' not allowed"));
+    }
+    
+    // Check for double slashes (potential traversal)
+    if trimmed.contains("//") {
+        return Err(anyhow!("Invalid path format: double slashes not allowed"));
+    }
+    
+    // Check for control characters
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("File path cannot contain control characters"));
+    }
+    
+    // Check for absolute paths if not allowed
+    if !allow_absolute {
+        if trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':')) {
+            return Err(anyhow!("Absolute paths not allowed"));
+        }
+    }
+    
+    // Basic path validation - ensure it's a reasonable path
+    let _path_obj = Path::new(trimmed);
+    
+    // Check for null bytes (shouldn't happen after trim, but double-check)
+    if trimmed.contains('\x00') {
+        return Err(anyhow!("File path cannot contain null bytes"));
+    }
+    
+    // On Windows, check for invalid characters
+    #[cfg(windows)]
+    {
+        const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+        if trimmed.chars().any(|c| INVALID_CHARS.contains(&c)) {
+            return Err(anyhow!("File path contains invalid characters for Windows"));
+        }
+    }
+    
+    Ok(trimmed.to_string())
+}
+
+/// Escapes shell metacharacters in a command string to prevent command injection
+/// 
+/// # Security Features
+/// - Escapes all shell metacharacters: $, `, |, &, ;, >, <, (, ), {, }, [, ], *, ?, ~, !, #
+/// - Handles quotes and backslashes
+/// - Prevents command chaining and injection
+/// 
+/// # Arguments
+/// - `cmd`: The command string to escape
+/// 
+/// # Returns
+/// - Escaped command string safe for shell execution
+pub fn escape_shell_command(cmd: &str) -> String {
+    let mut escaped = String::with_capacity(cmd.len() * 2);
+    
+    for ch in cmd.chars() {
+        match ch {
+            // Shell metacharacters that need escaping
+            '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Quotes and backslashes
+            '"' | '\'' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Newlines and other control characters
+            '\n' => {
+                escaped.push_str("\\n");
+            }
+            '\r' => {
+                escaped.push_str("\\r");
+            }
+            '\t' => {
+                escaped.push_str("\\t");
+            }
+            // Regular characters
+            _ => {
+                escaped.push(ch);
+            }
+        }
+    }
+    
+    escaped
+}
+
+/// Escapes command for JavaScript/Node.js execSync context
+/// 
+/// # Security Features
+/// - Escapes backslashes, quotes, and newlines for JavaScript strings
+/// - Escapes shell metacharacters if the command will be executed in a shell
+/// - Handles both single and double quotes
+/// 
+/// # Arguments
+/// - `cmd`: The command string to escape
+/// - `escape_shell_meta`: Whether to also escape shell metacharacters (default: true)
+/// 
+/// # Returns
+/// - Escaped command string safe for JavaScript execSync
+pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
+    let mut escaped = String::with_capacity(cmd.len() * 2);
+    
+    for ch in cmd.chars() {
+        match ch {
+            // JavaScript string escaping
+            '\\' => {
+                escaped.push_str("\\\\");
+            }
+            '"' => {
+                escaped.push_str("\\\"");
+            }
+            '\'' => {
+                escaped.push_str("\\'");
+            }
+            '\n' => {
+                escaped.push_str("\\n");
+            }
+            '\r' => {
+                escaped.push_str("\\r");
+            }
+            '\t' => {
+                escaped.push_str("\\t");
+            }
+            // Shell metacharacters (if execSync uses shell)
+            ch if escape_shell_meta && matches!(ch, '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#') => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Regular characters
+            _ => {
+                escaped.push(ch);
+            }
+        }
+    }
+    
+    escaped
+}
+
+/// Validates URL input to prevent injection and ensure proper format
+/// 
+/// # Security Features
+/// - Length limits
+/// - URL format validation
+/// - Dangerous protocol filtering (optional)
+/// 
+/// # Arguments
+/// - `url`: The URL string to validate
+/// - `allowed_schemes`: Optional list of allowed URL schemes (e.g., ["http", "https"])
+/// 
+/// # Returns
+/// - `Ok(String)`: Validated URL if valid
+/// - `Err`: Error if validation fails
+pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<String> {
+    let trimmed = url.trim();
+    
+    // Check if empty
+    if trimmed.is_empty() {
+        return Err(anyhow!("URL cannot be empty"));
+    }
+    
+    // Check length
+    if trimmed.len() > MAX_COMMAND_LENGTH {
+        return Err(anyhow!(
+            "URL too long (max {} characters, got {})",
+            MAX_COMMAND_LENGTH,
+            trimmed.len()
+        ));
+    }
+    
+    // Parse URL
+    let parsed_url = Url::parse(trimmed)
+        .map_err(|e| anyhow!("Invalid URL format: {}", e))?;
+    
+    // Check scheme if restrictions provided
+    if let Some(schemes) = allowed_schemes {
+        let scheme = parsed_url.scheme();
+        if !schemes.iter().any(|&s| s == scheme) {
+            return Err(anyhow!(
+                "URL scheme '{}' not allowed. Allowed schemes: {:?}",
+                scheme,
+                schemes
+            ));
+        }
+    }
+    
+    // Validate host exists
+    if parsed_url.host_str().is_none() {
+        return Err(anyhow!("URL must contain a host"));
+    }
+    
+    Ok(trimmed.to_string())
 }
