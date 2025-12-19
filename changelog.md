@@ -6247,3 +6247,52 @@ Payload Generation: The payload generation is now robust and fully functional, c
 
 Enhanced the anti-VM logic with checks for uptime, RAM size, and virtualization artifacts (VMware, VirtualBox, QEMU, Xen), all with randomized variable names to evade static signatures.
 Payload Generation: The payload generation is now robust and fully functional, creating a 3-stage chain-linked batch dropper.
+
+
+1. React Server Components Exploit (
+react2shell.rs
+)
+Fix: Implemented the verified CVE-2025-55182 payload (5 chunks, gadget chain).
+Fix: Added X-Action-Redirect header parsing for correct output extraction.
+Enhancement: Added Self-Diagnostics mode (Option 5) which runs runtime checks on payload generation and logic.
+Enhancement: Added Safe Check, Windows mode, and WAF bypass.
+2. Telnet Bruteforce (
+telnet_bruteforce.rs
+)
+Cleanup: Replaced placeholder code with functional Adaptive Delay logic.
+Logic: Now monitors resource pressure and throttles requests appropriately.
+3. Ping Sweep (
+ping_sweep.rs
+)
+Cleanup: Replaced dummy IP detection with robust pnet::datalink logic.
+Improvement: Accurately identifies local interface IP for scanning.
+4. LNK Generator (
+lnkgen.rs
+)
+Cleanup: Removed unreachable code and "demo" warnings.
+Improvement: Clarified manual LNK generation as the production implementation.
+5. Naruto Dropper Refactor (
+narutto_dropper.rs
+)
+Refactor: Completely rewrote the module using a 
+DropperContext
+ for robust variable randomization.
+New Feature: Added LOLBAS download methods:
+Certutil: Bypasses some restrictions by using certificate utility for downloads.
+Bitsadmin: Uses BITS service for stealthy background transfers.
+PowerShell: Standard download crate.
+Enhancement: Improved Anti-VM checks (uptime, RAM, virtualization artifacts) with randomized batch logic.
+6. TP-Link Tapo C200 Exploit (
+tplink_tapo_c200.rs
+)
+New Module: Implemented CVE-2021-4045 exploit.
+Modes:
+Reverse Shell: Injects 
+nc
+ reverse connection via command injection.
+RTSP Takeover: Injects uci set commands to create a new RTSP user/password.
+Features: Automatic MD5 password hashing for RTSP config compatibility.
+7. TP-Link Module Audits
+Audited: Checked all tplink modules (vn020_dos, wr740n_dos, tapo_c200).
+Polished: Ensured all modules run with clear, consistent banners and user instructions.
+Secured: Enforced utils::normalize_target across all TP-Link modules to ensure robust IP/Hostname handling.
