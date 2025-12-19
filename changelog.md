@@ -6244,3 +6244,6 @@ Architecture: Rewrote the module to use a DropperContext struct. This cleanly se
 LOLBAS Support: Added support for Certutil and Bitsadmin as download methods, alongside PowerShell. This provides alternative ways to download payloads if PowerShell is restricted.
 Anti-VM Improvements: Enhanced the anti-VM logic with checks for uptime, RAM size, and virtualization artifacts (VMware, VirtualBox, QEMU, Xen), all with randomized variable names to evade static signatures.
 Payload Generation: The payload generation is now robust and fully functional, creating a 3-stage chain-linked batch dropper.
+
+Enhanced the anti-VM logic with checks for uptime, RAM size, and virtualization artifacts (VMware, VirtualBox, QEMU, Xen), all with randomized variable names to evade static signatures.
+Payload Generation: The payload generation is now robust and fully functional, creating a 3-stage chain-linked batch dropper.
