@@ -1129,32 +1129,32 @@ Red on Yellow - Critical findings (private keys)
 
 
 Key Fixes Implemented:
-1. Double Counting Fixed ✅
+1. Double Counting Fixed 
 
 Removed the counter increment from the producer side
 Only counts attempts when actually processed by workers
 Uses atomic AtomicU64 for better statistics tracking
 
-2. Efficient File Reading ✅
+2. Efficient File Reading 
 
 Loads password wordlist once into memory in full_combo mode
 No more reopening the same file repeatedly
 Streaming for large files, in-memory for repeated access
 
-3. Better Login Detection ✅
+3. Better Login Detection 
 
 Improved pattern matching with more indicators
 Accumulates response after password submission
 Better timeout handling with final analysis
 Detects more success/failure patterns
 
-4. Rate Limiting ✅
+4. Rate Limiting 
 
 Added configurable delay between attempts (prompt_delay)
 Uses Semaphore for controlled concurrency
 Prevents overwhelming the target
 
-5. Progress Statistics ✅
+5. Progress Statistics 
 
 New Statistics struct tracks:
 
@@ -1167,45 +1167,45 @@ Elapsed time
 Live progress updates every 2 seconds
 Final summary report
 
-6. Target Validation ✅
+6. Target Validation 
 
 Pre-validates target before bruteforce starts
 validate_telnet_target() checks for telnet service
 Option to continue if validation fails
 
-7. Memory Efficiency ✅
+7. Memory Efficiency 
 
 True streaming for all file operations
 Loads wordlists into memory only when beneficial
 Async stream for raw password generation with backpressure
 
-8. Credential Deduplication ✅
+8. Credential Deduplication 
 
 Uses HashSet instead of Vec for credentials
 Automatically prevents duplicate entries
 Sorted output for better readability
 
-9. Graceful Shutdown ✅
+9. Graceful Shutdown 
 
 Workers properly check stop flag
 Progress task cleanly terminates
 Channel closure handled correctly
 
-10. Better Timeout Handling ✅
+10. Better Timeout Handling 
 
 Timeouts on connection, reads, and writes
 Final analysis after all reads complete
 No indefinite hangs
 
 Major Improvements Implemented:
-1. All Questions Asked Upfront ✅
+1. All Questions Asked Upfront 
 
 Complete configuration phase before attack starts
 All prompts collected in Phase 1
 Configuration summary displayed for user confirmation
 User must approve before proceeding
 
-2. Instant Append Mode Output ✅
+2. Instant Append Mode Output 
 
 Results saved immediately when found (not at end)
 Uses append_result() function with OpenOptions::append()
@@ -1213,7 +1213,7 @@ Each credential written instantly to prevent data loss
 File header created with timestamp and target info
 Option to append to existing file or overwrite
 
-3. User-Configurable Variables ✅
+3. User-Configurable Variables 
 Added prompts for:
 
 Connection timeout - How long to wait for connection
@@ -1227,7 +1227,7 @@ Success indicators - Custom success detection strings
 Failure indicators - Custom failure detection strings
 Pre-validation - Optional target validation before attack
 
-4. Enhanced Statistics ✅
+4. Enhanced Statistics 
 
 Tracks retry attempts separately
 Success rate percentage
@@ -1235,26 +1235,26 @@ Better formatted progress display
 Worker ID in verbose mode
 Emoji indicators in final report
 
-5. Connection Pooling Concept ✅
+5. Connection Pooling Concept 
 
 Uses Semaphore for controlled concurrency
 Rate limiting with configurable delays
 Prevents overwhelming target
 
-6. Banner Grabbing ✅
+6. Banner Grabbing 
 
 validate_telnet_target() grabs initial banner
 Checks for telnet-specific responses
 Optional pre-validation with user override
 
-7. Better Error Handling ✅
+7. Better Error Handling 
 
 Automatic retry mechanism for failed connections
 Retry counter in statistics
 Exponential backoff on retries (2x delay)
 Graceful degradation
 
-8. Output Features ✅
+8. Output Features 
 
 Timestamped header in output file
 Target info in header
@@ -1262,14 +1262,14 @@ Format documentation
 Append mode support with file existence check
 Immediate write on success (no data loss)
 
-9. Custom Prompts ✅
+9. Custom Prompts 
 
 User can define custom login/password prompts
 User can define custom success/failure indicators
 Supports multiple indicators (comma-separated lists)
 Flexible detection for non-standard telnet services
 
-10. Better UX ✅
+10. Better UX 
 
 Colored section headers
 Configuration summary table
@@ -1279,14 +1279,14 @@ Sorted credential output
 Worker IDs in verbose mode
 
 
-🎯 Major New Features:
-1. Config File Support ✅
+ Major New Features:
+1. Config File Support 
 
 At startup, asks user: "Do you have a configuration file?"
 If yes: displays the JSON format template
 If no: proceeds with interactive prompts
 
-2. JSON Configuration Format ✅
+2. JSON Configuration Format 
 Shows users exactly what the config should look like:
 
 
@@ -1304,10 +1304,10 @@ Execution Phase - Run attack with no interruptions
 
 
 
-### 3. **Comprehensive Validation** ✅
-The `load_and_validate_config()` function validates **everything**:
+### 3. Comprehensive Validation 
+The `load_and_validate_config()` function validates everything:
 
-**Network Settings:**
+Network Settings:
 - ✓ Port must be > 0
 - ✓ Threads: 1-256
 - ✓ Connection timeout: 1-60 seconds
@@ -1315,28 +1315,28 @@ The `load_and_validate_config()` function validates **everything**:
 - ✓ Delay: ≤ 10000ms
 - ✓ Max retries: ≤ 10
 
-**Files:**
+Files:
 - ✓ Username wordlist exists and is a file
 - ✓ Username wordlist is not empty
 - ✓ Password wordlist exists (if specified)
 - ✓ Password wordlist not empty (if not using raw bruteforce)
 - ✓ Output file path is valid
 
-**Raw Bruteforce:**
+Raw Bruteforce:
 - ✓ Charset not empty when enabled
 - ✓ Min length ≥ 1
 - ✓ Max length ≥ 1
 - ✓ Min ≤ Max
 - ✓ Max ≤ 8 (performance limit)
 
-**Prompts & Indicators:**
+Prompts & Indicators:
 - ✓ At least one login prompt
 - ✓ At least one password prompt
 - ✓ At least one success indicator
 - ✓ At least one failure indicator
 
-### 4. **Detailed Error Reporting** ✅
-If validation fails, shows **ALL** errors at once:
+### 4. Detailed Error Reporting 
+If validation fails, shows ALL errors at once:
 
 [!] Configuration validation failed:
     - Port must be greater than 0
@@ -1344,14 +1344,14 @@ If validation fails, shows **ALL** errors at once:
     - Raw bruteforce max length cannot exceed 8
     - At least one success indicator is required
 
-5. Save Configuration ✅
+5. Save Configuration 
 After interactive setup, offers to save config:
 
 User can save current configuration for reuse
 JSON format with pretty-printing
 Reusable for future attacks
 
-6. User Experience Flow ✅
+6. User Experience Flow 
 Config Mode:
 
 "Do you have a configuration file?"
@@ -1368,13 +1368,13 @@ Shows summary
 "Proceed?"
 "Save this configuration?"
 
-7. Serde Integration ✅
+7. Serde Integration 
 
 Uses serde for JSON serialization/deserialization
 Clean struct with #[serde(skip)] for runtime fields
 Pretty-printed JSON output
 
-8. File Validation ✅
+8. File Validation 
 
 Checks file existence asynchronously
 Counts lines to ensure wordlists aren't empty
@@ -1458,7 +1458,7 @@ Fixed: Configurable retry with exponential backoff
 
 
 
-✨ New Production Features Added:
+ New Production Features Added:
 
 JSON Configuration File Support
 
@@ -1536,7 +1536,7 @@ Sorted credential display
 
 
 
-📊 Statistics Tracking:
+Statistics Tracking:
 
 Total attempts
 Successful logins
@@ -1563,7 +1563,7 @@ Pre-lowercased Prompts
 
 All prompts are lowercased once during config preprocessing
 Eliminates repeated .to_lowercase() calls in the hot path
-Stored in new fields: *_prompts_lower and *_indicators_lower
+Stored in new fields: _prompts_lower and _indicators_lower
 
 
 Memory-Based Wordlist Loading
@@ -1590,7 +1590,7 @@ generate_raw_combos() replaces stream-based approach
 Larger Buffers
 
 Increased read buffer from 2048 to 4096 bytes
-Larger channel buffer (threads * 16 instead of threads * 4)
+Larger channel buffer (threads  16 instead of threads  4)
 
 
 Reduced Lock Contention
@@ -1852,20 +1852,20 @@ Stop-on-success option
 
 ## What This Tool Does
 
-This is a **Telnet brute-force and security testing tool** with three main modes:
+This is a Telnet brute-force and security testing tool with three main modes:
 
-### **Mode 1: Single Target Advanced Bruteforce**
+### Mode 1: Single Target Advanced Bruteforce
 - Attempts to log into a single telnet server using wordlists of usernames/passwords
 - Supports custom login/password prompts for different telnet implementations
 - Can generate passwords on-the-fly (raw brute-force)
 - Highly configurable with retry logic, timeouts, threading, etc.
 
-### **Mode 2: Batch Scanner**
+### Mode 2: Batch Scanner
 - Scans multiple IP addresses/networks for open telnet ports
 - Tests default credentials on discovered services
 - Can handle CIDR notation (e.g., `192.168.1.0/24`)
 
-### **Mode 3: Quick Default Credential Check**
+### Mode 3: Quick Default Credential Check
 - Fast check of common default credentials (root/root, admin/admin, etc.)
 - Minimal configuration required
 
@@ -1873,39 +1873,39 @@ This is a **Telnet brute-force and security testing tool** with three main modes
 
 ## Will It now Actually Work?
 
-**Yes, technically it will work**, BUT with important caveats:
+Yes, technically it will work, BUT with important caveats:
 
-### **What Works:**
-1. **Code is syntactically correct** - it will compile without errors after the fix
-2. **Network connectivity** - it establishes TCP connections to telnet services
-3. **Login attempts** - it sends username/password combinations
-4. **Pattern matching** - detects success/failure based on server responses
-5. **Concurrency** - uses tokio for async operations with semaphores for rate limiting
-6. **Wordlist handling** - can load from files or stream for large wordlists
+### What Works:
+1. Code is syntactically correct - it will compile without errors after the fix
+2. Network connectivity - it establishes TCP connections to telnet services
+3. Login attempts - it sends username/password combinations
+4. Pattern matching - detects success/failure based on server responses
+5. Concurrency - uses tokio for async operations with semaphores for rate limiting
+6. Wordlist handling - can load from files or stream for large wordlists
 
-### ⚠️ **Practical Limitations:**
+### ⚠️ Practical Limitations:
 
-1. **Modern Telnet is Rare**
+1. Modern Telnet is Rare
    - Most systems use SSH instead of telnet (telnet is unencrypted and insecure)
    - You'll mostly only find telnet on:
      - Old embedded devices (routers, IoT)
      - Legacy industrial systems
      - Lab/testing environments
 
-2. **Rate Limiting & Detection**
+2. Rate Limiting & Detection
    - Multiple failed login attempts will trigger:
      - Account lockouts
      - IP bans
      - Intrusion detection alerts
    - Even with delays, it's very noisy
 
-3. **Response Parsing Challenges**
+3. Response Parsing Challenges
    - Telnet implementations vary wildly
    - Default prompts may not match all systems
    - Custom prompts require manual configuration
 
 
-### 🔧 **Dependencies Needed:**
+### Dependencies Needed:
 The code requires these Rust crates:
 ```toml
 anyhow
@@ -1923,21 +1923,21 @@ once_cell
 
 ## Example Real-World Effectiveness:
 
-**Scenario 1: Old Router** ✅
+Scenario 1: Old Router 
 ```
 Target: 192.168.1.1:23
 Result: Likely to work if it has default credentials
 Success Rate: High on unpatched devices
 ```
 
-**Scenario 2: Modern Server** ❌
+Scenario 2: Modern Server ❌
 ```
 Target: enterprise-server.com:23
 Result: Port likely closed (SSH on 22 instead)
 Success Rate: Near zero
 ```
 
-**Scenario 3: IoT Device** ✅
+Scenario 3: IoT Device 
 ```
 Target: security-camera.local:2323
 Result: Many IoT devices still use telnet
@@ -1949,11 +1949,11 @@ Success Rate: Moderate to high
 
 ## Bottom Line:
 
-**Does it work?** Yes, the code is functional and will perform as designed.
+Does it work? Yes, the code is functional and will perform as designed.
 
-**Should you use it?** Only in controlled, authorized environments.
+Should you use it? Only in controlled, authorized environments.
 
-**Will it be effective?** Depends heavily on:
+Will it be effective? Depends heavily on:
 - Target still using telnet (increasingly rare)
 - Weak/default credentials present
 - No security controls blocking you
@@ -2345,9 +2345,9 @@ Removed from Cargo.toml
 Added blocking feature to suppaftp for blocking FTP operations
 Updated pachev_ftp_path_traversal_1_0.rs to use suppaftp::FtpStream instead of ftp::FtpStream
 This fixes vulnerabilities in: chrono 0.2.25, regex 0.1.80, thread_local 0.2.7, and time 0.1.45
-Replaced trust-dns-* with hickory-dns-*
+Replaced trust-dns- with hickory-dns-
 Updated Cargo.toml to use hickory-client and hickory-proto (rebranded, maintained versions)
-Updated dns_recursion.rs imports from trust_dns_* to hickory_*
+Updated dns_recursion.rs imports from trust_dns_ to hickory_
 This fixes the idna 0.4.0 vulnerability and the unmaintained trust-dns-proto warning
 All 5 vulnerabilities should now be resolved. The remaining warnings (async-std, atomic-polyfill, atty) are transitive dependencies from other crates (rdp, suppaftp) and are warnings, not vulnerabilities.
 im gunna Run cargo audit again to verify the fixes
@@ -2526,7 +2526,7 @@ Standard Features Added
 All modules now have:
 
 Cyan-bordered ASCII banner with module title
-Colored target information ([*] in cyan)
+Colored target information ([] in cyan)
 Green success messages ([+])
 Yellow warning/failure messages ([-])
 Red error messages ([!])
@@ -2555,13 +2555,13 @@ Standardized Features Added
 
 Added Statistics tracking and real-time progress reporting to:
 Module	Concurrency Model	Progress Reporting Added
-FTP Bruteforce	tokio async + Semaphore	✅
-RDP Bruteforce	tokio async + Semaphore	✅
-SNMP Bruteforce	tokio async + spawn_blocking	✅
-RTSP Bruteforce	tokio async + Semaphore	✅
-L2TP Bruteforce	tokio async + Semaphore	✅
-Fortinet Bruteforce	tokio async + Semaphore	✅
-SMTP Bruteforce	ThreadPool + crossbeam	✅
+FTP Bruteforce	tokio async + Semaphore	
+RDP Bruteforce	tokio async + Semaphore	
+SNMP Bruteforce	tokio async + spawn_blocking	
+RTSP Bruteforce	tokio async + Semaphore	
+L2TP Bruteforce	tokio async + Semaphore	
+Fortinet Bruteforce	tokio async + Semaphore	
+SMTP Bruteforce	ThreadPool + crossbeam	
 Already Correctly Implemented
 
 Module	Notes:
@@ -2593,7 +2593,7 @@ fortinet_bruteforce.rs - Removed unused log function (replaced with inline color
 Standardized Features Added:
 
 Scanner	Banner	Colored Output	Statistics	Progress	Save Results
-sample_scanner.rs	Added	Added	Added	✅	Added
+sample_scanner.rs	Added	Added	Added		Added
 http_title_scanner.rs	Enhanced	Enhanced	Added	Added	Already had
 http_method_scanner.rs	Enhanced	Enhanced	Added	N/A	Already had
 dns_recursion.rs	Added	Enhanced	Added	N/A	N/A (targets output)
@@ -2699,41 +2699,41 @@ Proxy URL validation
 
 #### main.rs
 
-- **NEW:** `validate_bind_address()` - Validates bind address format using `SocketAddr::parse()`:
+- NEW: `validate_bind_address()` - Validates bind address format using `SocketAddr::parse()`:
   - Length limits (max 128 characters)
   - Control character rejection
   - Socket address format validation
-- **NEW:** `validate_api_key()` - Validates API key:
+- NEW: `validate_api_key()` - Validates API key:
   - Length limits (max 256 characters)
   - Only printable ASCII characters allowed
   - Empty/whitespace rejection
-- **NEW:** `validate_ip_limit()` - Validates hardening IP limit:
+- NEW: `validate_ip_limit()` - Validates hardening IP limit:
   - Range validation (1-10,000)
   - Prevents resource exhaustion
 
 #### shell.rs
 
-- **NEW Constants:**
+- NEW Constants:
   - `MAX_URL_LENGTH` (2048) - URL input length limit
   - `MAX_PATH_LENGTH` (4096) - File path length limit
   - `MAX_PROMPT_INPUT_LENGTH` (1024) - General prompt input limit
 
-- **Enhanced `prompt_for_path()`:**
+- Enhanced `prompt_for_path()`:
   - Length validation
   - Control character rejection
   - Path traversal prevention (`..` blocked)
 
-- **Enhanced `prompt_string_default()`:**
+- Enhanced `prompt_string_default()`:
   - Length validation
   - Control character rejection
   - Automatic URL format validation when input looks like URL
 
-- **Enhanced `prompt_yes_no()`:**
+- Enhanced `prompt_yes_no()`:
   - Max attempt limiting (10 attempts before default)
   - Length validation (max 10 chars)
   - Prevents infinite loops on bad input
 
-- **Enhanced `prompt_u64()` and `prompt_usize()`:**
+- Enhanced `prompt_u64()` and `prompt_usize()`:
   - Max attempt limiting (10 attempts)
   - Length validation (max 20 chars)
   - Strict digit-only validation
@@ -2742,17 +2742,17 @@ Proxy URL validation
 
 #### config.rs
 
-- **NEW Constants:**
+- NEW Constants:
   - `MAX_TARGET_LENGTH` (2048) - Target string limit
   - `MAX_HOSTNAME_LENGTH` (253) - DNS hostname limit
 
-- **Enhanced `set_target()`:**
+- Enhanced `set_target()`:
   - Length validation
   - Control character rejection
   - Path traversal prevention (`..`, `//` blocked)
   - Hostname/IP format validation
 
-- **NEW:** `validate_hostname_or_ip()` - Validates hostname/IP:
+- NEW: `validate_hostname_or_ip()` - Validates hostname/IP:
   - Hostname length validation (DNS max 253)
   - Valid character regex check (`[a-zA-Z0-9.\-_:\[\]]+`)
   - Format validation (no leading/trailing special chars)
@@ -2760,19 +2760,19 @@ Proxy URL validation
 
 #### api.rs
 
-- **NEW:** `RequestBodyLimitLayer` (1MB max) - Prevents DoS via large request bodies
-- **NEW Constants:**
+- NEW: `RequestBodyLimitLayer` (1MB max) - Prevents DoS via large request bodies
+- NEW Constants:
   - `MAX_REQUEST_BODY_SIZE` (1MB)
   - `MAX_TRACKED_IPS` (100,000)
   - `MAX_AUTH_FAILURE_ENTRIES` (100,000)
 
-- **Enhanced `track_ip()`:**
+- Enhanced `track_ip()`:
   - IP string length validation (max 128 chars)
   - Automatic cleanup when tracker exceeds limits
   - Prunes oldest entries, keeps most recent half
   - `saturating_add()` for overflow protection
 
-- **Enhanced `record_auth_failure()`:**
+- Enhanced `record_auth_failure()`:
   - IP string length validation (max 128 chars)
   - Automatic cleanup of expired blocks and old entries (>1 hour)
   - `saturating_add()` for overflow protection
@@ -2857,28 +2857,28 @@ Integrated comprehensive SSH attack framework based on OpenSSH 10.0p1 vulnerabil
 
 Based on sftp-server.c vulnerabilities:
 
-- **Symlink Injection** (process_symlink) - Create symlinks to sensitive files, bypass chroot
-- **Setuid Bit Attack** (process_setstat 07777) - Set setuid/setgid bits on uploaded files
-- **Path Traversal** (process_open) - Escape chroot restrictions
-- **Partial Write Race** (process_write) - Exploit write atomicity issues
+- Symlink Injection (process_symlink) - Create symlinks to sensitive files, bypass chroot
+- Setuid Bit Attack (process_setstat 07777) - Set setuid/setgid bits on uploaded files
+- Path Traversal (process_open) - Escape chroot restrictions
+- Partial Write Race (process_write) - Exploit write atomicity issues
 
 #### SCP Attack Module (`exploits/ssh/sshpwn_scp_attacks`)
 
 Based on scp.c vulnerabilities:
 
-- **Path Traversal** (sink function) - Write outside target directory
-- **Username Shell Injection** (okname) - Shell metacharacter injection
-- **Brace Expansion DoS** (brace_expand) - Client-side memory exhaustion
-- **Command Injection** (do_cmd) - Inject commands via arguments
+- Path Traversal (sink function) - Write outside target directory
+- Username Shell Injection (okname) - Shell metacharacter injection
+- Brace Expansion DoS (brace_expand) - Client-side memory exhaustion
+- Command Injection (do_cmd) - Inject commands via arguments
 
 #### Session Attack Module (`exploits/ssh/sshpwn_session`)
 
 Based on session.c vulnerabilities:
 
-- **Environment Variable Injection** (do_setup_env) - Inject LD_PRELOAD, PATH, etc.
-- **Command Execution** - Execute commands on authenticated targets
-- **Reverse Shell** - Multiple payload types (bash, python, nc, perl, php, ruby)
-- **File Upload/Download** - SFTP-based file transfer
+- Environment Variable Injection (do_setup_env) - Inject LD_PRELOAD, PATH, etc.
+- Command Execution - Execute commands on authenticated targets
+- Reverse Shell - Multiple payload types (bash, python, nc, perl, php, ruby)
+- File Upload/Download - SFTP-based file transfer
 
 ###  New SSH Scanner (`scanners/ssh_scanner`)
 
@@ -3163,7 +3163,7 @@ Interprets responses:
 250/251: User exists (valid)
 550/551/553: User doesn't exist (invalid)
 
-252: Cannot verify (treated as invalid) * changed to error
+252: Cannot verify (treated as invalid)  changed to error
 Reports valid usernames with their server responses
 
 Usage:
@@ -3250,7 +3250,7 @@ If the username wordlist file is ≤ 50 MB, behavior is unchanged: it is loaded 
 
 If the wordlist is > 50 MB, the module switches to streaming mode:
 
-Logs: [*] Large username wordlist detected (~X.Y MB) – streaming line by line.
+Logs: [] Large username wordlist detected (~X.Y MB) – streaming line by line.
 A separate producer thread (enqueue_streaming_usernames) reads the username file line by line using BufReader.
 Each non-empty, non-comment username is combined with each target and sent into the work queue as it’s read, without storing the whole list in memory.
 Producer/consumer concurrency (async-style behavior):
@@ -3556,19 +3556,19 @@ Resource Management: Automatic cleanup and finalizatio
 
  Critical Bugs Fixed:
  
-1. Memory Leak in Response Buffer ✅
+1. Memory Leak in Response Buffer 
 
 Problem: response_after_pass accumulated ALL output indefinitely, causing memory exhaustion
 Fix: Added 64KB size limit with truncation and "..." marker
 Impact: Prevents OOM crashes during long telnet sessions
 
-2. Silent Write Timeouts ✅
+2. Silent Write Timeouts 
 
 Problem: Write timeouts ignored with .ok(), causing false success reports
 Fix: Proper error propagation for username/password write timeouts
 Impact: Accurate error reporting and prevents silent authentication failures
 
-3. Panic-Prone unwrap() Calls ✅
+3. Panic-Prone unwrap() Calls 
 
 Problem: Multiple unwrap() calls could crash the application
 Fix: Replaced with proper error handling:
@@ -3578,25 +3578,25 @@ Config validation: proper error messages
 Regex captures: safe unwrapping with error messages
 Impact: Crash-resistant, graceful error handling
 
-4. Division by Zero ✅
+4. Division by Zero 
 
 Problem: Success rate calculation divided by zero when total=0
 Fix: Check total > 0 before calculating percentage
 Impact: No more division by zero panics
 
-5. Buffer Size Limits ✅
+5. Buffer Size Limits 
 
 Problem: Potential for unbounded buffer growth in various places
 Fix: Added size limits to response accumulation (already implemented)
 Impact: Memory safety and resource protection
 
-6. Worker Error Propagation ✅
+6. Worker Error Propagation 
 
 Problem: Worker thread errors were silently ignored
 Fix: Added error logging for failed worker threads
 Impact: Better debugging and error visibility
 
-7. Channel Send Failures ✅
+7. Channel Send Failures 
 
 
 Problem: Channel send failures ignored (acceptable in this context)
@@ -3768,7 +3768,7 @@ Where it runs:
 Before single-target / subnet bruteforce starts, on the primary target:
     let target_primary = targets[0].clone();    // Basic honeypot check on primary target before starting an in-depth bruteforce.    // This is a heuristic only and should not be treated as definitive.    basic_honeypot_check(&target_primary).await;
 Before each target in quick default check (modes 4 and 5):
-    for (target_idx, target_ip) in targets.iter().enumerate() {        // Lightweight honeypot heuristic before hitting this target with default creds.        basic_honeypot_check(target_ip).await;        println!("{}", format!("[*] Testing {}:{} ({}/{})", target_ip, port, target_idx + 1, targets.len()).bold());
+    for (target_idx, target_ip) in targets.iter().enumerate() {        // Lightweight honeypot heuristic before hitting this target with default creds.        basic_honeypot_check(target_ip).await;        println!("{}", format!("[] Testing {}:{} ({}/{})", target_ip, port, target_idx + 1, targets.len()).bold());
 Behavior:
 It’s a heuristic only; it does not stop the scan, just prints a “likely honeypot” warning if all common ports are open, then continues with the chosen scan mode.
 
@@ -3824,7 +3824,7 @@ Shows failed attempts with ✗ Invalid: username/password
 Shows errors with classification (e.g., "Connection timeout", "Connection refused")
 
 Enhanced target information
-Shows target progress: [*] Testing 192.168.1.1:23 (1/5)
+Shows target progress: [] Testing 192.168.1.1:23 (1/5)
 In verbose mode, shows target details and credential count
 Comprehensive statistics summary
 When verbose mode is enabled, displays:
@@ -4015,13 +4015,13 @@ Used for run_combo_mode_streaming()
 Smart Mode Selection
 
 if use_streaming {
-    println!("{}", format!("[*] Password file is {} (>{}), using streaming mode to save memory",
+    println!("{}", format!("[] Password file is {} (>{}), using streaming mode to save memory",
         format_file_size(pass_file_size), format_file_size(MAX_MEMORY_LOAD_SIZE)).yellow());
-    run_combo_mode_streaming(/* ... */).await?;
+    run_combo_mode_streaming(/ ... /).await?;
 } else {
-    println!("{}", format!("[*] Password file is {}, using memory-loaded mode for optimal performance",
+    println!("{}", format!("[] Password file is {}, using memory-loaded mode for optimal performance",
         format_file_size(pass_file_size)).cyan());
-    run_combo_mode_memory(/* ... */).await?;
+    run_combo_mode_memory(/ ... /).await?;
 }
 
 
@@ -4075,16 +4075,16 @@ enablebruteforce.rs: _target → target
 
  Code Analysis Results
  
-Modules with Proper Run Functions: 46+ modules ✅
-All scanner modules: ✅
-All credential modules: ✅
-All exploit modules: ✅
-All payload generators: ✅
-Automatic Dispatch System: ✅
+Modules with Proper Run Functions: 46+ modules 
+All scanner modules: 
+All credential modules: 
+All exploit modules: 
+All payload generators: 
+Automatic Dispatch System: 
 Build-time generation includes all modules
 46+ modules properly registered in dispatch files
 No orphaned module declarations
-Function Usage Verification: ✅
+Function Usage Verification: 
 All public functions are called
 All constants are referenced
 No unused imports detected
@@ -4092,14 +4092,14 @@ All private functions serve their modules
 
 Architecture Validation
 
-Modular Structure: ✅
+Modular Structure: 
 All mod.rs files properly declare submodules
 No circular dependencies
 Clean separation of concerns
-Build System Integration: ✅
-Scanner dispatch generation: ✅
-Credential dispatch generation: ✅
-Exploit dispatch generation: ✅
+Build System Integration: 
+Scanner dispatch generation: 
+Credential dispatch generation: 
+Exploit dispatch generation: 
 All modules included in final binary
 
 Key Improvements Made
@@ -4858,13 +4858,13 @@ NEXT_REDIRECT;push;/login?a=<output>;307;
 digest: <output>``
 Error messages with embedded command output
 Key Features Added:
-✅ Proper chunk reference resolution ($@0)
-✅ Blob deserialization gadget ($B0)
-✅ Function constructor exploitation
-✅ Multiple detection patterns
-✅ Alternative payload techniques
-✅ Enhanced error handling
-✅ Better base64 decoding with fallbacks
+ Proper chunk reference resolution ($@0)
+ Blob deserialization gadget ($B0)
+ Function constructor exploitation
+ Multiple detection patterns
+ Alternative payload techniques
+ Enhanced error handling
+ Better base64 decoding with fallbacks
 The exploit now accurately implements the sophisticated attack chain described in the CVE-2025-55182 vulnerability analysis, making it much more reliable and comprehensive for detecting and exploiting React Server Components RCE vulnerabilities in Next.js applications.
 
 
@@ -4987,7 +4987,7 @@ Fixed command escaping issues in 3 modules (10% of modules) by adding shell meta
 
 Created escaping utilities in src/utils.rs:
 
-escape_shell_command() - Escapes shell metacharacters ($, `` , |, &, ;, >, <, (, ), {, }, [, ], , ?, ~, !, #) to prevent command injection - escape_js_command() - Escapes commands for JavaScript/Node.js execSync() contexts with optional shell metacharacter escaping2. **Fixed 3 modules**: - **flowise/cve_2025_59528_flowise_rce.rs** - Replaced basic escaping (only \, ", \n) with escape_js_command() that handles shell metacharacters. Since execSync() executes in a shell, both JavaScript and shell metacharacters are escaped. - **avtech/cve_2024_7029_avtech_camera.rs** - Added escape_shell_command() to the exec_cmd() function to prevent command injection via the brightness parameter. - **roundcube/roundcube_postauth_rce.rs** - Added escape_shell_command() in build_serialized_payload() to escape commands before base32 encoding, preventing injection in the shell pipeline.All modules now have: - Shell metacharacter escaping to prevent command chaining - Quote and backslash escaping - Control character handling - Protection against command injection attacksNote: The linter warnings about unused functions in utils.rs are false positives; these functions are used in other modules. The code compiles and works correctly.All fixes are complete and ready to use.
+escape_shell_command() - Escapes shell metacharacters ($, `` , |, &, ;, >, <, (, ), {, }, [, ], , ?, ~, !, #) to prevent command injection - escape_js_command() - Escapes commands for JavaScript/Node.js execSync() contexts with optional shell metacharacter escaping2. Fixed 3 modules: - flowise/cve_2025_59528_flowise_rce.rs - Replaced basic escaping (only \, ", \n) with escape_js_command() that handles shell metacharacters. Since execSync() executes in a shell, both JavaScript and shell metacharacters are escaped. - avtech/cve_2024_7029_avtech_camera.rs - Added escape_shell_command() to the exec_cmd() function to prevent command injection via the brightness parameter. - roundcube/roundcube_postauth_rce.rs - Added escape_shell_command() in build_serialized_payload() to escape commands before base32 encoding, preventing injection in the shell pipeline.All modules now have: - Shell metacharacter escaping to prevent command chaining - Quote and backslash escaping - Control character handling - Protection against command injection attacksNote: The linter warnings about unused functions in utils.rs are false positives; these functions are used in other modules. The code compiles and works correctly.All fixes are complete and ready to use.
 
 
 Feature List - Payload Encoder
@@ -5118,10 +5118,10 @@ Summary: The payload encoder is now a comprehensive, bug-free tool with 9 encodi
  
  
  
- #the hallowing night
+ # eclpitic expo
  
  
-  FTP Configuration System Replication
+ FTP Configuration System Replication
 
 I have successfully replicated the Configuration capabilities from telnet into the FTP module and wired everything together. Here's what was accomplished:
 
@@ -6165,77 +6165,6 @@ Incorrect multipart format - Chunk ordering and structure need fixes
 Missing Windows support - No PowerShell payload variant
 No safe-check mode - No way to detect vulnerability without executing RCE
 
- 
- React2Shell Exploit Module Fixes
-I have successfully fixed and enhanced the 
-react2shell.rs
- module to correctly implement the exploit for CVE-2025-55182 / CVE-2025-66478.
-
-Changes Verified
-1. Correct Payload Structure
-I replaced the incorrect payload with the verified 5-chunk structure required for the RSC Flight protocol exploit:
-
-Chunk 0: Entry point "$1"
-Chunk 1: Fake model with gadget references
-Chunk 2: Raw chunk reference "$@3" (Promise trigger)
-Chunk 3: Empty array [] (Constructor access)
-Chunk 4: Malicious Response object with Function() gadget
-2. Output Exfiltration
-Implemented proper output extraction from the X-Action-Redirect header, which is how the vulnerability reflects execution results (e.g., /login?a=<result>).
-
-3. New Features
-Safe Check Mode: Detects vulnerability without RCE by triggering a specific 500 error (undefined.a)
-Windows Support: Added PowerShell payload variant
-WAF Bypass: Added junk data prefixing capability
-Interactive Shell: Robust shell implementation using the new payload structure
-4. Code Quality
-Removed unused fields (
-safe_check
-, error) to fix compiler warnings
-Verified clean compilation with cargo build
-Verification
-The module now compiles successfully without warnings and implements the precise gadget chain documented in Wiz and Assetnote research.
- 
-React2Shell Exploit Module Fixes
-I have successfully fixed and enhanced the 
-react2shell.rs
- module to correctly implement the exploit for CVE-2025-55182 / CVE-2025-66478.
-
-Changes Verified
-1. Correct Payload Structure
-I replaced the incorrect payload with the verified 5-chunk structure required for the RSC Flight protocol exploit:
-
-Chunk 0: Entry point "$1"
-Chunk 1: Fake model with gadget references
-Chunk 2: Raw chunk reference "$@3" (Promise trigger)
-Chunk 3: Empty array [] (Constructor access)
-Chunk 4: Malicious Response object with Function() gadget
-2. Output Exfiltration
-Implemented proper output extraction from the X-Action-Redirect header, which is how the vulnerability reflects execution results (e.g., /login?a=<result>).
-
-3. New Features
-Safe Check Mode: Detects vulnerability without RCE by triggering a specific 500 error (undefined.a)
-Windows Support: Added PowerShell payload variant
-WAF Bypass: Added junk data prefixing capability
-Interactive Shell: Robust shell implementation using the new payload structure
-4. Code Quality
-Removed unused fields (
-safe_check
-, error) to fix compiler warnings
-Verified clean compilation with cargo build
-Verification
-The module now compiles successfully without warnings and implements the precise gadget chain documented in Wiz and Assetnote research.
-
-I've researched the CVE-2025-55182 / CVE-2025-66478 exploit and identified several critical bugs in the current react2shell.rs implementation:
-
-Key Issues Found:
-
-Wrong payload structure - The current payloads don't match the working PoC format (should use 5 chunks: 0-4 with specific gadget chain)
-Missing X-Action-Redirect detection - Output is returned in response headers, not the body
-Incorrect multipart format - Chunk ordering and structure need fixes
-Missing Windows support - No PowerShell payload variant
-No safe-check mode - No way to detect vulnerability without executing RCE
-
 I have successfully refactored and improved the narutto_dropper.rs module.
 
 Summary of Changes:
@@ -6245,9 +6174,11 @@ LOLBAS Support: Added support for Certutil and Bitsadmin as download methods, al
 Anti-VM Improvements: Enhanced the anti-VM logic with checks for uptime, RAM size, and virtualization artifacts (VMware, VirtualBox, QEMU, Xen), all with randomized variable names to evade static signatures.
 Payload Generation: The payload generation is now robust and fully functional, creating a 3-stage chain-linked batch dropper.
 
-Enhanced the anti-VM logic with checks for uptime, RAM size, and virtualization artifacts (VMware, VirtualBox, QEMU, Xen), all with randomized variable names to evade static signatures.
-Payload Generation: The payload generation is now robust and fully functional, creating a 3-stage chain-linked batch dropper.
 
+Fixes & Enhancements
+I have successfully fixed the 
+react2shell.rs
+ module and finalized other components as requested.
 
 1. React Server Components Exploit (
 react2shell.rs
