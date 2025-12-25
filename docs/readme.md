@@ -37,7 +37,7 @@ Rustsploit is a Rust-first re-imagining of RouterSploit:
 
 ## Code Layout
 
-```
+```text
 rustsploit/
 ├── Cargo.toml
 ├── build.rs                 # Generates dispatcher code by scanning src/modules
@@ -130,7 +130,7 @@ Proxies are set globally via environment variables so both module HTTP requests 
 
 Example:
 
-```
+```bash
 cargo run -- --command exploit --module heartbleed --target 203.0.113.12
 ```
 
@@ -164,28 +164,28 @@ Located across core modules, these constants enforce safe limits:
 When writing modules or core code, follow these patterns:
 
 #### 1. Input Length Validation
-```
+```rust
 if input.len() > MAX_INPUT_LENGTH {
     return Err(anyhow!("Input too long (max {} characters)", MAX_INPUT_LENGTH));
 }
 ```
 
 #### 2. Control Character Rejection
-```
+```rust
 if input.chars().any(|c| c.is_control()) {
     return Err(anyhow!("Input cannot contain control characters"));
 }
 ```
 
 #### 3. Path Traversal Prevention
-```
+```rust
 if input.contains("..") || input.contains("//") {
     return Err(anyhow!("Path traversal detected"));
 }
 ```
 
 #### 4. Hostname/Target Validation
-```
+```rust
 // Use the framework's normalize_target function for comprehensive validation
 use crate::utils::normalize_target;
 
@@ -194,7 +194,7 @@ let normalized = normalize_target(raw_target)?;
 ```
 
 For manual validation:
-```
+```rust
 use regex::Regex;
 let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").unwrap();
 if !valid_chars.is_match(target) {
@@ -203,13 +203,13 @@ if !valid_chars.is_match(target) {
 ```
 
 #### 5. Overflow Protection
-```
+```rust
 // Use saturating_add to prevent overflow
 counter = counter.saturating_add(1);
 ```
 
 #### 6. Prompt Attempt Limiting
-```
+```rust
 const MAX_ATTEMPTS: u8 = 10;
 let mut attempts = 0;
 loop {
@@ -256,7 +256,7 @@ This helps operators identify potentially deceptive targets before spending time
 
 Every module must export:
 
-```
+```rust
 use anyhow::Result;
 
 pub async fn run(target: &str) -> Result<()> {
@@ -277,7 +277,7 @@ Guidelines:
 
 ### skeleton
 
-```
+```rust
 use anyhow::{Context, Result};
 
 pub async fn run(target: &str) -> Result<()> {
