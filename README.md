@@ -1,4 +1,4 @@
-# Rustsploit 🛠️
+# Rustsploit 
 
 Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
@@ -6,10 +6,10 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/testing.png)
 
 
-- 📚 **Developer Docs:** [Full guide covering module lifecycle, proxy logic, shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
-- 💬 **Interactive Shell:** Ergonomic command palette with shortcuts (e.g., `f1 ssh`, `u exploits/heartbleed`, `go`)
-- 🌐 **Proxy Smartness:** Supports HTTP(S), SOCKS4/4a/5 (with hostname resolution), validation, and automatic rotation
-- 🧱 **IPv4/IPv6 Ready:** Credential modules and sockets normalize targets so both address families work out-of-the-box
+-  **Developer Docs:** [Full guide covering module lifecycle, proxy logic, shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
+-  **Interactive Shell:** Ergonomic command palette with shortcuts (e.g., `f1 ssh`, `u exploits/heartbleed`, `go`)
+-  **Proxy Smartness:** Supports HTTP(S), SOCKS4/4a/5 (with hostname resolution), validation, and automatic rotation
+-  **IPv4/IPv6 Ready:** Credential modules and sockets normalize targets so both address families work out-of-the-box
 
 ---
 
@@ -31,22 +31,23 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 
 ## Highlights
 
-- **Auto-discovered modules:** `build.rs` indexes `src/modules/**` so new code drops in without manual registration
-- **Interactive shell with color and shortcuts:** Quick command palette, target/module state tracking, alias commands (`help/?`, `modules/m`, `run/go`, etc.)
-- **Ergonomic proxy system:** Load lists, validate availability, choose concurrency/timeouts, and rotate automatically on failure
-- **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, MQTT, Fortinet brute force modules with IPv6 and TLS support where applicable
-- **Enhanced Telnet module:** Full IAC (Interpret As Command) negotiation, advanced error classification, verbose quick-check mode, robust buffer handling
-- **Improved RDP module:** Streaming failover for large password files (>150MB), comprehensive error classification, multiple security level support (NLA/TLS/RDP/Negotiate/Auto)
-- **Framework-level honeypot detection:** Automatic detection before scans using 200 common ports (warns if 11+ ports open)
-- **Advanced target normalization:** Supports IPv4, IPv6, hostnames, URLs, CIDR notation with comprehensive validation
-- **Exploit coverage:** Apache Tomcat, Abus security cameras, Ivanti Connect Secure, TP-Link, Zabbix, Avtech cameras, Spotube, OpenSSH race condition, and more
-- **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, DNS recursion tester, HTTP method scanner, StalkRoute traceroute (root)
-- **Payload generation:** Batch malware dropper (`narutto_dropper`), BAT payload generator, custom credential checkers
-- **Readable output:** Colored prompts, structured status messages, optional verbose logs and result persistence
-- **REST API Server:** Launch a secure API server with authentication, rate limiting, IP tracking, and dynamic key rotation
-- **Security hardened:** Comprehensive input validation, path traversal protection, length limits, and memory-safe operations throughout
-- **Honeypot detection:** Framework-level automatic detection before module execution to warn about potentially deceptive targets
-- **Enhanced target handling:** Advanced normalization supporting IPv4, IPv6 (with brackets), hostnames, URLs, CIDR notation, and port extraction
+-  **Auto-discovered modules:** `build.rs` indexes `src/modules/**` so new code drops in without manual registration
+-  **Interactive shell with color and shortcuts:** Quick command palette, target/module state tracking, alias commands (`help/?`, `modules/m`, `run/go`, etc.)
+-  **Ergonomic proxy system:** Load lists, validate availability, choose concurrency/timeouts, and rotate automatically on failure
+-  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, MQTT, Fortinet brute force modules with IPv6 and TLS support where applicable
+-  **Enhanced Telnet module:** Full IAC (Interpret As Command) negotiation, advanced error classification, verbose quick-check mode, robust buffer handling
+-  **Improved RDP module:** Streaming failover for large password files (>150MB), comprehensive error classification, multiple security level support (NLA/TLS/RDP/Negotiate/Auto)
+-  **L2TP/IPsec Bruteforce:** Multi-platform support (strongswan, xl2tpd, NetworkManager, rasdial, networksetup), proper IPsec Phase 1/2 handling
+-  **Framework-level honeypot detection:** Automatic detection before scans using 200 common ports (warns if 11+ ports open)
+-  **Advanced target normalization:** Supports IPv4, IPv6, hostnames, URLs, CIDR notation with comprehensive validation
+-  **Exploit coverage:** Apache Tomcat, Abus security cameras, Ivanti Connect Secure, TP-Link, Zabbix, Avtech cameras, Spotube, OpenSSH race condition, and more
+-  **Scanners & utilities:** Port scanner, ping sweep, SSDP discovery, HTTP title grabber, DNS recursion tester, HTTP method scanner, StalkRoute traceroute (root), **Directory Bruteforcer**, **Sequential Fuzzer**
+-  **Payload generation:** Batch malware dropper (`narutto_dropper`), BAT payload generator, custom credential checkers
+-  **Readable output:** Colored prompts, structured status messages, optional verbose logs and result persistence
+-  **REST API Server:** Launch a secure API server with authentication, rate limiting, IP tracking, and dynamic key rotation
+-  **Security hardened:** Comprehensive input validation, path traversal protection, length limits, and memory-safe operations throughout
+-  **Honeypot detection:** Framework-level automatic detection before module execution to warn about potentially deceptive targets
+-  **Enhanced target handling:** Advanced normalization supporting IPv4, IPv6 (with brackets), hostnames, URLs, CIDR notation, and port extraction
 
 ---
 
@@ -56,9 +57,9 @@ Rustsploit ships categorized modules under `src/modules/`, automatically exposed
 
 | Category | Highlights |
 |----------|------------|
-| `creds/generic` | FTP anonymous & FTPS brute force, SSH brute force, SSH user enumeration (timing attack), SSH password spray, **Telnet brute force (with IAC negotiation)**, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), **RDP auth-only brute (streaming mode, multiple security levels)**, **MQTT brute force**, SNMP community string brute force, L2TP/IPsec brute force, Fortinet SSL VPN brute force |
-| `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE, Flowise CVE-2025-59528 RCE, HTTP/2 Rapid Reset DoS, Jenkins LFI, PAN-OS Auth Bypass, Heartbleed, **SSHPWN Framework** (SFTP symlink/setuid/traversal, SCP injection/DoS, Session env injection) |
-| `scanners` | Port scanner (TCP/UDP/SYN/ACK), ping sweep (ICMP/TCP/UDP/SYN/ACK), SSDP M-SEARCH enumerator, HTTP title fetcher, HTTP method scanner, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion), **SSH scanner** (banner grabbing, CIDR support) |
+| `creds/generic` | FTP anonymous & FTPS brute force (5 operation modes, JSON config), SSH brute force, SSH user enumeration (timing attack), SSH password spray, **Telnet brute force (with IAC negotiation)**, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), **RDP auth-only brute (streaming mode, multiple security levels)**, **MQTT brute force**, SNMP community string brute force, **L2TP/IPsec brute force (multi-platform)**, Fortinet SSL VPN brute force |
+| `exploits/*` | Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, **TP-Link Tapo C200 CVE-2021-4045**, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE, Flowise CVE-2025-59528 RCE, HTTP/2 Rapid Reset DoS, Jenkins LFI, PAN-OS Auth Bypass, Heartbleed, **React2Shell CVE-2025-55182**, **SSHPWN Framework** (SFTP symlink/setuid/traversal, SCP injection/DoS, Session env injection) |
+| `scanners` | Port scanner (TCP/UDP/SYN/ACK), ping sweep (ICMP/TCP/UDP/SYN/ACK), SSDP M-SEARCH enumerator, HTTP title fetcher, HTTP method scanner, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion), **SSH scanner** (banner grabbing, CIDR support), **Directory Bruteforcer (recursive, extensions)**, **Sequential Fuzzer (multi-encoding, custom charsets)** |
 | `payloadgens` | `narutto_dropper`, BAT payload generator |
 | `lists` | RTSP wordlists, telnet default credentials, and helper files |
 
@@ -164,8 +165,8 @@ Environment variables are written with 0600 permissions so secrets stay private.
 - **Advanced Target Normalization**: The framework now supports:
   - IPv4: `192.168.1.1`, `192.168.1.1:8080`
   - IPv6: `::1`, `[::1]`, `[::1]:8080`, `2001:db8::1`
-  - Hostnames: `.com`, `.com:443`
-  - URLs: `http://.com:8080` (extracts host:port)
+  - Hostnames: `example.com`, `example.com:443`
+  - URLs: `http://example.com:8080` (extracts host:port)
   - CIDR notation: `192.168.1.0/24`, `2001:db8::/32`
   
   All targets are validated for security (DoS prevention, path traversal protection, format validation).
@@ -189,6 +190,23 @@ Environment variables are written with 0600 permissions so secrets stay private.
   - Proper CONNECT packet construction with variable-length encoding
   - CONNACK response parsing and error classification
 
+- **SSH User Enumeration**:
+  - Timing attack-based user enumeration (inspired by CVE-2018-15473)
+  - Statistical analysis with configurable samples and thresholds
+  - Distinguishes valid/invalid users based on authentication time differences
+
+- **Directory Bruteforcer**:
+  - High-performance recursive directory scanning
+  - Custom wordlists with extension appending
+  - Smart status code filtering and size anomaly detection
+  - Interactive wizard for easy configuration
+
+- **Sequential Fuzzer**:
+  - Targeted fuzzing for URLs, headers, and body parameters
+  - Multiple encoding types (URL, Double URL, Hex, Base64, etc.)
+  - Custom charsets (SQL, Traversal, Command Injection)
+  - Iterative generation for exhaustive coverage
+
 ## Interactive Shell Walkthrough
 
 The shell tracks current module, target, and proxy state. All commands are case-insensitive and support aliases:
@@ -210,9 +228,9 @@ show_proxies     show_proxies | proxies   View proxy status
 exit             exit | quit | q          Leave shell
 ```
 
-session:
+Example session:
 
-```
+```text
 rsf> f1 ssh
 rsf> u creds/generic/ssh_bruteforce
 rsf> set target 10.10.10.10
@@ -330,7 +348,7 @@ Authorization: ApiKey your-api-key-here
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/auth-failures
   ```
 
-### telnet config 
+### telnet config example
  ```
 {
   "port": 23,
@@ -399,7 +417,7 @@ Log entries include:
 - Module execution results
 - Resource cleanup operations
 
-###  API Workflow
+### Example API Workflow
 
  ```
 # 1. Start the API server
@@ -433,7 +451,7 @@ Rustsploit treats proxy lists as first-class citizens:
 - Accepts HTTP, HTTPS, SOCKS4, SOCKS4a, SOCKS5, and SOCKS5h entries
 - Loads from user-supplied files, skipping invalid lines with reasons
 - Optional connectivity test prompts allow tuning:
-  - Test URL (default `https://.com`)
+  - Test URL (default `https://example.com`)
   - Timeout (seconds)
   - Max concurrent checks
 - Keeps only working proxies when validation is requested
@@ -447,11 +465,11 @@ Environment variables (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`) are managed tra
 
 Rustsploit scans `src/modules/` recursively during build. Each module should expose:
 
-```
+```rust
 pub async fn run(target: &str) -> anyhow::Result<()>;
 ```
 
-Optional interactive entry points (`run_interactive`) can coexist. Module paths are referenced relative to `src/modules/`, for :
+Optional interactive entry points (`run_interactive`) can coexist. Module paths are referenced relative to `src/modules/`, for example:
 
 - File: `src/modules/exploits/sample_exploit.rs`
 - Shell path: `exploits/sample_exploit`
