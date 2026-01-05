@@ -1,4 +1,4 @@
-# 🛠️ Rustsploit Developer Guide
+#  Rustsploit Developer Guide
 
 > Reference manual for maintainers and contributors. Covers the architecture, build-time module discovery, shell ergonomics, proxy plumbing, and authoring guidelines for exploits, scanners, and credential modules.
 
@@ -37,7 +37,7 @@ Rustsploit is a Rust-first re-imagining of RouterSploit:
 
 ## Code Layout
 
-```
+```text
 rustsploit/
 ├── Cargo.toml
 ├── build.rs                 # Generates dispatcher code by scanning src/modules
@@ -130,7 +130,7 @@ Proxies are set globally via environment variables so both module HTTP requests 
 
 Example:
 
-```
+```bash
 cargo run -- --command exploit --module heartbleed --target 203.0.113.12
 ```
 
@@ -164,28 +164,28 @@ Located across core modules, these constants enforce safe limits:
 When writing modules or core code, follow these patterns:
 
 #### 1. Input Length Validation
-```
+```rust
 if input.len() > MAX_INPUT_LENGTH {
     return Err(anyhow!("Input too long (max {} characters)", MAX_INPUT_LENGTH));
 }
 ```
 
 #### 2. Control Character Rejection
-```
+```rust
 if input.chars().any(|c| c.is_control()) {
     return Err(anyhow!("Input cannot contain control characters"));
 }
 ```
 
 #### 3. Path Traversal Prevention
-```
+```rust
 if input.contains("..") || input.contains("//") {
     return Err(anyhow!("Path traversal detected"));
 }
 ```
 
 #### 4. Hostname/Target Validation
-```
+```rust
 // Use the framework's normalize_target function for comprehensive validation
 use crate::utils::normalize_target;
 
@@ -194,7 +194,7 @@ let normalized = normalize_target(raw_target)?;
 ```
 
 For manual validation:
-```
+```rust
 use regex::Regex;
 let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").unwrap();
 if !valid_chars.is_match(target) {
@@ -203,13 +203,13 @@ if !valid_chars.is_match(target) {
 ```
 
 #### 5. Overflow Protection
-```
+```rust
 // Use saturating_add to prevent overflow
 counter = counter.saturating_add(1);
 ```
 
 #### 6. Prompt Attempt Limiting
-```
+```rust
 const MAX_ATTEMPTS: u8 = 10;
 let mut attempts = 0;
 loop {
@@ -256,7 +256,7 @@ This helps operators identify potentially deceptive targets before spending time
 
 Every module must export:
 
-```
+```rust
 use anyhow::Result;
 
 pub async fn run(target: &str) -> Result<()> {
@@ -277,7 +277,7 @@ Guidelines:
 
 ### skeleton
 
-```
+```rust
 use anyhow::{Context, Result};
 
 pub async fn run(target: &str) -> Result<()> {
@@ -318,7 +318,19 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
 - **IPv6:** Use helpers like `format_addr` to wrap IPv6 addresses in brackets and support port suffixes.
 - **Error classification:** Implement comprehensive error types (ConnectionFailed, AuthenticationFailed, Timeout, etc.) for better debugging and reporting.
 - **Memory management:** For large wordlists (>150MB), implement streaming mode to prevent memory exhaustion (see RDP module for reference).
+- **Timing Attacks:** When implementing user enumeration, use statistical analysis (samples/variance) rather than simple thresholds to account for network jitter (see SSH User Enum module).
 - **Protocol compliance:** Implement full protocol support where applicable (e.g., Telnet IAC negotiation, MQTT 3.1.1).
+
+- **FTP Bruteforce Enhancements**:
+  - 5 Operation Modes: Single Target, Subnet (CIDR), Batch Scanner, Quick Default Check, Subnet Default Check
+  - JSON configuration system with load/save/validation
+  - 32 utility functions (streaming wordlists, JSON/CSV export, network intelligence)
+  - Framework `normalize_target()` integration
+
+- **L2TP/IPsec Module**:
+  - Multi-platform: strongswan, xl2tpd, pppd, NetworkManager (Linux), rasdial (Windows), networksetup (macOS)
+  - Proper IPsec Phase 1/2 and L2TP session management
+  - L2TPv2 packet crafting with AVP encoding
 
 ### Recent Module Enhancements
 
@@ -338,6 +350,23 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
   - Full MQTT 3.1.1 protocol implementation
   - Proper variable-length encoding and UTF-8 string encoding
   - CONNACK response parsing with error classification
+
+- **SSH User Enumeration**:
+  - Implements timing-based enumeration inspired by CVE-2018-15473
+  - Statistical analysis using standard deviation to identify valid users
+  - precise `tokio::time::Instant` measurements for authentication attempts
+
+- **Directory Bruteforcer**:
+  - `DirBruteConfig` struct handles comprehensive settings (extensions, status codes, threads)
+  - Recursive scanning logic with depth control
+  - Custom `Client` configuration for optimized throughput
+  - Interactive setup wizard `setup_wizard` guides users through configuration
+
+- **Sequential Fuzzer**:
+  - Supports versatile payload placement (URL, Header, Body)
+  - `EncodingType` enum supports 10+ encoding schemes including Double URL and Hex
+  - Base-N counting algorithm for exhaustive iteration without memory overhead
+  - Modular `charset` selection (SQL, Traversal, Command Injection)
 
 ---
 
