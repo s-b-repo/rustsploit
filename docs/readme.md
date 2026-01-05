@@ -1,4 +1,4 @@
-# 🛠️ Rustsploit Developer Guide
+#  Rustsploit Developer Guide
 
 > Reference manual for maintainers and contributors. Covers the architecture, build-time module discovery, shell ergonomics, proxy plumbing, and authoring guidelines for exploits, scanners, and credential modules.
 
@@ -318,7 +318,19 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
 - **IPv6:** Use helpers like `format_addr` to wrap IPv6 addresses in brackets and support port suffixes.
 - **Error classification:** Implement comprehensive error types (ConnectionFailed, AuthenticationFailed, Timeout, etc.) for better debugging and reporting.
 - **Memory management:** For large wordlists (>150MB), implement streaming mode to prevent memory exhaustion (see RDP module for reference).
+- **Timing Attacks:** When implementing user enumeration, use statistical analysis (samples/variance) rather than simple thresholds to account for network jitter (see SSH User Enum module).
 - **Protocol compliance:** Implement full protocol support where applicable (e.g., Telnet IAC negotiation, MQTT 3.1.1).
+
+- **FTP Bruteforce Enhancements**:
+  - 5 Operation Modes: Single Target, Subnet (CIDR), Batch Scanner, Quick Default Check, Subnet Default Check
+  - JSON configuration system with load/save/validation
+  - 32 utility functions (streaming wordlists, JSON/CSV export, network intelligence)
+  - Framework `normalize_target()` integration
+
+- **L2TP/IPsec Module**:
+  - Multi-platform: strongswan, xl2tpd, pppd, NetworkManager (Linux), rasdial (Windows), networksetup (macOS)
+  - Proper IPsec Phase 1/2 and L2TP session management
+  - L2TPv2 packet crafting with AVP encoding
 
 ### Recent Module Enhancements
 
@@ -338,6 +350,23 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
   - Full MQTT 3.1.1 protocol implementation
   - Proper variable-length encoding and UTF-8 string encoding
   - CONNACK response parsing with error classification
+
+- **SSH User Enumeration**:
+  - Implements timing-based enumeration inspired by CVE-2018-15473
+  - Statistical analysis using standard deviation to identify valid users
+  - precise `tokio::time::Instant` measurements for authentication attempts
+
+- **Directory Bruteforcer**:
+  - `DirBruteConfig` struct handles comprehensive settings (extensions, status codes, threads)
+  - Recursive scanning logic with depth control
+  - Custom `Client` configuration for optimized throughput
+  - Interactive setup wizard `setup_wizard` guides users through configuration
+
+- **Sequential Fuzzer**:
+  - Supports versatile payload placement (URL, Header, Body)
+  - `EncodingType` enum supports 10+ encoding schemes including Double URL and Hex
+  - Base-N counting algorithm for exhaustive iteration without memory overhead
+  - Modular `charset` selection (SQL, Traversal, Command Injection)
 
 ---
 
