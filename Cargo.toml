@@ -27,6 +27,7 @@ http = "0.2"
 bytes = "1.0"
 tokio-rustls = "0.24"
 url = "2.5"
+urlencoding = "2.1"
 quick-xml = "0.37"
 data-encoding = "2.5"
 semver = "1.0"
@@ -97,6 +98,7 @@ hickory-proto = "0.24"
 # Misc utilities
 once_cell = "1.19"
 home = "0.5"                   # updated for edition 2024 compatibility
+pnet = "0.34"
 
 [build-dependencies]
 regex = "1.11"
