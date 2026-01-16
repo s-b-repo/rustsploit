@@ -102,6 +102,7 @@ pnet = "0.35"
 
 [build-dependencies]
 regex = "1.12"
+walkdir = "2.5"
 
 # Dependency overrides to address security warnings in transitive dependencies
 # Note: These are warnings (not vulnerabilities) in transitive dependencies
