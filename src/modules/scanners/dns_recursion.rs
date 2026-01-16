@@ -1,20 +1,19 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use rand::Rng;
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::Path;
-use std::time::Duration;
-use hickory_client::client::{AsyncClient, ClientHandle};
-use hickory_client::proto::op::ResponseCode;
-use hickory_client::rr::{DNSClass, Name, RecordType};
-use hickory_client::udp::UdpClientStream;
+use tokio::time::{timeout, Duration};
+use crate::utils::{
+    prompt_default, prompt_port,
+};
+
+use hickory_client::client::{Client, ClientHandle};
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::udp::UdpClientStream;
+use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::op::Message;
 use hickory_proto::xfer::DnsResponse;
-use tokio::net::UdpSocket;
 
 #[derive(Clone, Debug)]
 struct TargetSpec {
@@ -35,22 +34,22 @@ fn display_banner() {
 pub async fn run(initial_target: &str) -> Result<()> {
     display_banner();
 
-    let mut targets = collect_targets(initial_target).await?;
-    if targets.is_empty() {
-        return Err(anyhow!(
-            "No valid targets provided. Supply at least one IP/hostname."
-        ));
-    }
+    let mut targets = vec![
+        TargetSpec {
+            input: initial_target.to_string(),
+            host: initial_target.to_string(),
+            port: None,
+        }
+    ];
 
     let needs_default_port = targets.iter().any(|t| t.port.is_none());
     let default_port = if needs_default_port {
-        prompt_port("Default DNS port for targets without port", 53).await?
+        prompt_port("Default DNS port", 53).await?
     } else {
         53
     };
 
-    let default_domain = random_test_domain();
-    let query_name_input = prompt_default("Domain to query", &default_domain).await?;
+    let query_name_input = prompt_default("Domain to query", "google.com").await?;
     let query_name = validate_domain_input(&query_name_input)?;
 
     let record_input =
@@ -148,16 +147,20 @@ async fn query_target(
         record_type, display_target
     );
 
-    let timeout = Duration::from_secs(5);
-    let stream = UdpClientStream::<UdpSocket>::with_timeout(socket_addr, timeout);
+    let stream = UdpClientStream::builder(socket_addr, TokioRuntimeProvider::new())
+        .build();
+    
     let (mut client, bg) =
-        AsyncClient::connect(stream).await.context("Failed to initiate DNS client")?;
+        Client::connect(stream).await.context("Failed to initiate DNS client")?;
     tokio::spawn(bg);
 
-    let response: DnsResponse = client
-        .query(name.clone(), DNSClass::IN, record_type)
-        .await
-        .with_context(|| format!("DNS query to {} failed", display_target))?;
+    let response: DnsResponse = timeout(
+        Duration::from_secs(5),
+        client.query(name.clone(), DNSClass::IN, record_type),
+    )
+    .await
+    .context("DNS query timed out")?
+    .with_context(|| format!("DNS query to {} failed", display_target))?;
 
     let (message, _) = response.into_parts();
     let is_vulnerable = report_result(&message, display_target, record_type);
@@ -265,408 +268,9 @@ async fn resolve_target(host: &str, port: u16) -> Result<(SocketAddr, String)> {
     Ok((addr, addr.to_string()))
 }
 
-fn random_test_domain() -> String {
-    let mut rng = rand::rng();
-    let random_label: String = (0..12)
-        .map(|_| {
-            let n = rng.random_range(0..36);
-            if n < 10 {
-                (b'0' + n) as char
-            } else {
-                (b'a' + (n - 10)) as char
-            }
-        })
-        .collect();
-    format!("{}.rustsploit.test", random_label)
-}
+// random_test_domain removed per request
 
-async fn prompt_default(message: &str, default: &str) -> Result<String> {
-    print!("{} [{}]: ", message, default);
-    tokio::io::stdout()
-        .flush()
-        .await
-        .context("Failed to flush stdout")?;
-    let mut buf = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut buf)
-        .await
-        .context("Failed to read input")?;
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else if trimmed.len() > 255 {
-        Err(anyhow!("Input too long"))
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-async fn prompt_port(message: &str, default: u16) -> Result<u16> {
-    loop {
-        let prompt = format!("{} [{}]: ", message, default);
-        print!("{}", prompt);
-        tokio::io::stdout()
-            .flush()
-            .await
-            .context("Failed to flush stdout")?;
-        let mut buf = String::new();
-        tokio::io::BufReader::new(tokio::io::stdin())
-            .read_line(&mut buf)
-            .await
-            .context("Failed to read input")?;
-        let trimmed = buf.trim();
-        if trimmed.is_empty() {
-            return Ok(default);
-        }
-        if let Ok(value) = trimmed.parse::<u16>() {
-            if value > 0 {
-                return Ok(value);
-            }
-        }
-        println!("Please provide a valid port between 1 and 65535.");
-    }
-}
-
-async fn prompt_line(message: &str) -> Result<String> {
-    print!("{}", message);
-    tokio::io::stdout()
-        .flush()
-        .await
-        .context("Failed to flush stdout")?;
-    let mut buf = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut buf)
-        .await
-        .context("Failed to read input")?;
-    let trimmed = buf.trim();
-    if trimmed.len() > 255 {
-        return Err(anyhow!("Input too long (max 255 characters)."));
-    }
-    Ok(trimmed.to_string())
-}
-
-async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
-    let hint = if default_yes { "Y/n" } else { "y/N" };
-    loop {
-        let prompt = format!("{} [{}]: ", message, hint);
-        print!("{}", prompt);
-        tokio::io::stdout()
-            .flush()
-            .await
-            .context("Failed to flush stdout")?;
-        let mut buf = String::new();
-        tokio::io::BufReader::new(tokio::io::stdin())
-            .read_line(&mut buf)
-            .await
-            .context("Failed to read input")?;
-        let trimmed = buf.trim().to_lowercase();
-        match trimmed.as_str() {
-            "" => return Ok(default_yes),
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            "stop" => return Ok(false),
-            _ => println!("{}", "Please answer with 'y' or 'n'.".yellow()),
-        }
-    }
-}
-
-async fn collect_targets(initial: &str) -> Result<Vec<TargetSpec>> {
-    let mut targets = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let trimmed_initial = initial.trim();
-    if !trimmed_initial.is_empty() {
-        let added = parse_targets_from_str(trimmed_initial, "cli", &mut seen, &mut targets);
-        if added == 0 && Path::new(trimmed_initial).is_file() {
-            println!(
-                "{}",
-                format!("[*] Loading targets from file '{}'", trimmed_initial).cyan()
-            );
-            match parse_targets_from_file(trimmed_initial, &mut seen, &mut targets) {
-                Ok(count) => {
-                    if count == 0 {
-                        println!("{}", "    No valid targets found in file.".yellow());
-                    } else {
-                        println!(
-                            "{}",
-                            format!(
-                                "    Loaded {} target(s) from '{}'",
-                                count, trimmed_initial
-                            )
-                            .green()
-                        );
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "    Failed to read '{}': {}",
-                            trimmed_initial, err
-                        )
-                        .red()
-                    );
-                }
-            }
-        }
-    }
-
-    if prompt_yes_no(
-        "Add additional targets manually? (type 'stop' to finish)",
-        targets.is_empty(),
-    ).await? {
-        loop {
-            let entry = prompt_line("Target (IP/host[:port], 'stop' to finish): ").await?;
-            if entry.is_empty() {
-                continue;
-            }
-            if entry.eq_ignore_ascii_case("stop") {
-                break;
-            }
-            add_target_token(&entry, "interactive", &mut seen, &mut targets);
-        }
-    }
-
-    if prompt_yes_no("Load targets from file?", false).await? {
-        loop {
-            let path_input = prompt_line("Path to file ('stop' to finish): ").await?;
-            if path_input.is_empty() {
-                continue;
-            }
-            if path_input.eq_ignore_ascii_case("stop") {
-                break;
-            }
-            match parse_targets_from_file(&path_input, &mut seen, &mut targets) {
-                Ok(count) => {
-                    if count == 0 {
-                        println!(
-                            "{}",
-                            format!("    No valid targets parsed from '{}'", path_input).yellow()
-                        );
-                    } else {
-                        println!(
-                            "{}",
-                            format!(
-                                "    Loaded {} target(s) from '{}'",
-                                count, path_input
-                            )
-                            .green()
-                        );
-                    }
-                }
-                Err(err) => eprintln!(
-                    "{}",
-                    format!("    Failed to read '{}': {}", path_input, err).red()
-                ),
-            }
-        }
-    }
-
-    Ok(targets)
-}
-
-fn parse_targets_from_str(
-    input: &str,
-    context: &str,
-    seen: &mut HashSet<String>,
-    targets: &mut Vec<TargetSpec>,
-) -> usize {
-    let mut added = 0usize;
-    for token in input
-        .split(|c: char| c == ',' || c.is_ascii_whitespace())
-        .filter_map(|segment| {
-            let trimmed = segment.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
-    {
-        if add_target_token(token, context, seen, targets) {
-            added += 1;
-        }
-    }
-    added
-}
-
-fn parse_targets_from_file(
-    path: &str,
-    seen: &mut HashSet<String>,
-    targets: &mut Vec<TargetSpec>,
-) -> Result<usize> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open target file '{}'", path))?;
-    let reader = BufReader::new(file);
-    let mut added = 0usize;
-
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line?;
-        let content = line.split('#').next().unwrap_or("").trim();
-        if content.is_empty() {
-            continue;
-        }
-        let ctx = format!("file:{}:{}", path, idx + 1);
-        added += parse_targets_from_str(content, &ctx, seen, targets);
-    }
-
-    Ok(added)
-}
-
-fn add_target_token(
-    token: &str,
-    context: &str,
-    seen: &mut HashSet<String>,
-    targets: &mut Vec<TargetSpec>,
-) -> bool {
-    if token.eq_ignore_ascii_case("stop") {
-        return false;
-    }
-
-    match parse_target_spec(token) {
-        Ok(spec) => {
-            let key = format!("{}:{}", spec.host, spec.port.unwrap_or(0));
-            if seen.insert(key) {
-                println!(
-                    "{}",
-                    format!("    [{}] Added target {}", context, spec.input).cyan()
-                );
-                targets.push(spec);
-                true
-            } else {
-                println!(
-                    "{}",
-                    format!("    [{}] Duplicate target '{}' skipped", context, token).dimmed()
-                );
-                false
-            }
-        }
-        Err(err) => {
-            eprintln!(
-                "{}",
-                format!(
-                    "    [{}] Skipping invalid target '{}': {}",
-                    context, token, err
-                )
-                .yellow()
-            );
-            false
-        }
-    }
-}
-
-fn parse_target_spec(token: &str) -> Result<TargetSpec> {
-    let sanitized = sanitize_target_input(token)?;
-    let (host, port) = split_host_port(&sanitized)?;
-    Ok(TargetSpec {
-        input: sanitized.clone(),
-        host: host.to_lowercase(),
-        port,
-    })
-}
-
-fn sanitize_target_input(input: &str) -> Result<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("Target cannot be empty"));
-    }
-    if trimmed.len() > 255 {
-        return Err(anyhow!(
-            "Target '{}' is too long (maximum 255 characters)",
-            trimmed
-        ));
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || ".-_:[]".contains(c))
-    {
-        return Err(anyhow!(
-            "Target '{}' contains invalid characters. Allowed: A-Z, 0-9, '.', '-', '_', ':', '[', ']'",
-            trimmed
-        ));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn split_host_port(value: &str) -> Result<(String, Option<u16>)> {
-    if value.is_empty() {
-        return Err(anyhow!("Target cannot be empty"));
-    }
-
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return Ok((addr.ip().to_string(), Some(addr.port())));
-    }
-
-    if value.starts_with('[') {
-        let end = value
-            .find(']')
-            .ok_or_else(|| anyhow!("Malformed IPv6 target '{}': missing ']'", value))?;
-        let host = value[1..end].to_string();
-        if value.len() == end + 1 {
-            return Ok((host, None));
-        }
-        if !value[end + 1..].starts_with(':') {
-            return Err(anyhow!(
-                "Malformed IPv6 target '{}': expected ':' after ']'",
-                value
-            ));
-        }
-        let port_part = &value[end + 2..];
-        if port_part.is_empty() {
-            return Err(anyhow!("Missing port after IPv6 address in '{}'", value));
-        }
-        let port = port_part
-            .parse::<u16>()
-            .with_context(|| format!("Invalid port '{}' in target '{}'", port_part, value))?;
-        if port == 0 {
-            return Err(anyhow!("Port must be between 1 and 65535"));
-        }
-        return Ok((host, Some(port)));
-    }
-
-    if value.ends_with(':') {
-        return Err(anyhow!(
-            "Invalid target '{}': trailing ':' without port",
-            value
-        ));
-    }
-
-    let colon_count = value.matches(':').count();
-    if colon_count == 1 {
-        let idx = value.rfind(':').unwrap();
-        let host_part = &value[..idx];
-        let port_part = &value[idx + 1..];
-        if host_part.is_empty() {
-            return Err(anyhow!("Host cannot be empty in target '{}'", value));
-        }
-        if !port_part.chars().all(|c| c.is_ascii_digit()) {
-            return Err(anyhow!(
-                "Invalid port '{}' in target '{}'",
-                port_part,
-                value
-            ));
-        }
-        let port = port_part
-            .parse::<u16>()
-            .with_context(|| format!("Invalid port '{}' in target '{}'", port_part, value))?;
-        if port == 0 {
-            return Err(anyhow!("Port must be between 1 and 65535"));
-        }
-        return Ok((host_part.to_string(), Some(port)));
-    }
-
-    if colon_count >= 2 {
-        let ip = value.parse::<IpAddr>().with_context(|| {
-            format!(
-                "Invalid IPv6 address '{}' (use [addr]:port for scoped ports)",
-                value
-            )
-        })?;
-        return Ok((ip.to_string(), None));
-    }
-
-    Ok((value.to_string(), None))
-}
+// Unused local functions removed
 
 fn format_endpoint(host: &str, port: u16) -> String {
     match host.parse::<IpAddr>() {

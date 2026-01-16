@@ -13,23 +13,23 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use rand::Rng;
-use regex::Regex;
+// use regex::Regex; // Unused
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, HashMap};
 use std::net::SocketAddr; // Removed ToSocketAddrs
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+// use std::time::{SystemTime, UNIX_EPOCH}; // Unused
 use std::time::{Duration, Instant};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, lookup_host}; // Added lookup_host
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{sleep, timeout};
-use once_cell::sync::Lazy;
+// use once_cell::sync::Lazy; // Unused
 
 use crate::utils::{
     prompt_required, prompt_default, prompt_yes_no, 
@@ -705,6 +705,16 @@ async fn save_quick_check_results(path: &str, results: &[String]) -> Result<()> 
 // CORE TELNET LOGIN FUNCTIONS
 // ============================================================
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum TelnetState {
+    WaitingForBanner,
+    WaitingForLoginPrompt,
+    SendingUsername,
+    WaitingForPasswordPrompt,
+    SendingPassword,
+    WaitingForResult,
+}
+
 #[inline]
 async fn try_telnet_login(
     socket: &SocketAddr,
@@ -712,7 +722,30 @@ async fn try_telnet_login(
     password: &str,
     config: &TelnetBruteforceConfig,
 ) -> Result<bool> {
+    // Attempt 1: Standard
+    let (success, banner_seen) = do_telnet_login(socket, username, password, config, false).await?;
+    if success {
+        return Ok(true);
+    }
+    
+    // If failed and no banner seen (blind), retry blind pass only
+    if !banner_seen {
+         let (success_retry, _) = do_telnet_login(socket, username, password, config, true).await?;
+         if success_retry {
+             return Ok(true);
+         }
+    }
+    
+    Ok(false)
+}
 
+async fn do_telnet_login(
+    socket: &SocketAddr,
+    username: &str,
+    password: &str,
+    config: &TelnetBruteforceConfig,
+    force_password_only: bool,
+) -> Result<(bool, bool)> {
     let stream = timeout(
         Duration::from_secs(config.connection_timeout),
         TcpStream::connect(socket),
@@ -728,239 +761,227 @@ async fn try_telnet_login(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(BUFFER_SIZE, reader);
     let mut buf = bytes::BytesMut::with_capacity(BUFFER_SIZE);
-
-    let mut login_sent = false;
-    let mut pass_sent = false;
     let mut response_after_pass = String::with_capacity(RESPONSE_BUFFER_CAPACITY);
+    let mut recent_buffer = String::with_capacity(2048); // Track recent output regardless of state
+    let mut banner_detected = false;
 
-    // Phase-specific timeouts for better control
-    let banner_timeout = Duration::from_secs(config.banner_read_timeout);
-    let login_prompt_timeout = Duration::from_secs(config.login_prompt_timeout);
-    let password_prompt_timeout = Duration::from_secs(config.password_prompt_timeout);
-    let auth_response_timeout = Duration::from_secs(config.auth_response_timeout);
-    let write_timeout = Duration::from_millis(config.write_timeout);
+    let mut state = TelnetState::WaitingForBanner;
+    let start_time = Instant::now();
+    let max_duration = Duration::from_secs(config.connection_timeout + 
+                                         config.login_prompt_timeout + 
+                                         config.password_prompt_timeout + 
+                                         config.auth_response_timeout + 5);
 
-    for cycle in 0..15 {
-        // Choose timeout based on current phase
-        let current_timeout = if !login_sent {
-            // Waiting for initial banner/login prompt
-            if cycle == 0 {
-                banner_timeout
-            } else {
-                login_prompt_timeout
-            }
-        } else if login_sent && !pass_sent {
-            // Waiting for password prompt
-            password_prompt_timeout
-        } else if pass_sent {
-            // Waiting for authentication response
-            auth_response_timeout
-        } else {
-            Duration::from_secs(1) // fallback
+    loop {
+        if start_time.elapsed() > max_duration {
+            return Err(anyhow!("Total operation timeout"));
+        }
+
+        // --- READ PHASE ---
+        // Dynamically adjust timeout based on state
+        let current_timeout = match state {
+            TelnetState::WaitingForBanner => Duration::from_secs(config.banner_read_timeout),
+            TelnetState::WaitingForLoginPrompt => Duration::from_secs(config.login_prompt_timeout),
+            TelnetState::WaitingForPasswordPrompt => Duration::from_secs(config.password_prompt_timeout),
+            TelnetState::WaitingForResult => Duration::from_secs(config.auth_response_timeout),
+            _ => Duration::from_millis(100), // Short timeout for sending states
         };
 
-        // Track buffer length before reading to extract only new data
-        let buf_len_before = buf.len();
+        // If we need to read
+        let need_read = match state {
+            TelnetState::SendingUsername | TelnetState::SendingPassword => false,
+            _ => true
+        };
 
-        let read_result = timeout(current_timeout, reader.read_buf(&mut buf)).await;
+        if need_read {
+            let buf_len_before = buf.len();
+            let read_result = timeout(current_timeout, reader.read_buf(&mut buf)).await;
 
-        let _bytes_read = match read_result {
-            Ok(Ok(0)) => {
-                // EOF received - check if this is a half-close (read closed but write still open)
-                // Try to detect half-close by attempting a small write
-                let half_close_detected = match timeout(Duration::from_millis(100), writer.write_all(b"\r\n")).await {
-                    Ok(Ok(_)) => {
-                        // Write succeeded - this is a half-close (read side closed, write side open)
-                        true
+            match read_result {
+                Ok(Ok(0)) => {
+                    // EOF handling
+                    match state {
+                        TelnetState::WaitingForResult => {
+                            // If we already sent password and got EOF, maybe it's a success closed loop (rare but happens)
+                            // or a failure closed loop. Check buffer.
+                            if has_success_indicators(&response_after_pass) {
+                                return Ok((true, banner_detected));
+                            }
+                            // Check for clean close
+                             match classify_eof(&response_after_pass, true, true, 1) {
+                                EofType::CleanClose => return Ok((false, banner_detected)), // Failed auth usually closes cleanly
+                                _ => return Ok((false, banner_detected))
+                             }
+                        },
+                        _ => return Err(anyhow!("Unexpected EOF in state {:?}", state))
                     }
-                    Ok(Err(_)) | Err(_) => {
-                        // Write failed or timed out - full close
-                        false
+                }
+                Ok(Ok(_)) => {
+                     // Extract new data
+                    let new_data = if buf_len_before <= buf.len() {
+                        buf.split_off(buf_len_before)
+                    } else {
+                        buf.split_off(0)
+                    };
+
+                    // Handle IAC
+                    let (clean_bytes, iac_responses) = process_telnet_iac(&new_data);
+                    
+                    if !iac_responses.is_empty() {
+                         let _ = timeout(Duration::from_millis(config.write_timeout), writer.write_all(&iac_responses)).await;
                     }
-                };
-                
-                // Classify the type of disconnect
-                match classify_eof(&response_after_pass, login_sent, pass_sent, cycle) {
-                    EofType::CleanClose => {
-                        if half_close_detected {
-                            // Half-close detected - server closed read side but write still works
-                            // This often happens after successful authentication on some systems
-                            if pass_sent && has_success_indicators(&response_after_pass) {
-                                return Ok(true);
-                            } else if pass_sent && response_after_pass.len() > 0 {
-                                // Got some response before half-close, likely success
-                                return Ok(true);
+                    
+                    let output = String::from_utf8_lossy(&clean_bytes).to_string();
+                    let clean_output = strip_ansi_escape_sequences(&output);
+                    let lower = clean_output.to_lowercase();
+                    
+                    // Append to recent buffer for prompt matching (keep size sane)
+                    recent_buffer.push_str(&lower);
+                    if recent_buffer.len() > 2048 {
+                        let split_idx = recent_buffer.len() - 1024;
+                        recent_buffer = recent_buffer[split_idx..].to_string();
+                    }
+                    
+                    // If waiting for result, accumulate
+                    if state == TelnetState::WaitingForResult {
+                        if response_after_pass.len() + output.len() <= RESPONSE_BUFFER_CAPACITY {
+                             response_after_pass.push_str(&output);
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    if is_connection_error(&e) {
+                         return Err(anyhow!("Connection error during read: {}", e));
+                    }
+                    return Err(anyhow!("Read error: {}", e));
+                },
+                Err(_) => {
+                    // Timeout
+                    // If we are waiting for result and timed out, check if we have enough info
+                    if state == TelnetState::WaitingForResult {
+                        // Check if we have success indicators even if timed out
+                        if has_success_indicators(&response_after_pass) {
+                            return Ok((true, banner_detected));
+                        }
+                         // If we have failure indicators
+                         for indicator in &config.failure_indicators_lower {
+                            if response_after_pass.to_lowercase().contains(indicator) {
+                                return Ok((false, banner_detected));
                             }
                         }
-                        // Server properly closed connection
-                        if pass_sent && has_success_indicators(&response_after_pass) {
-                            // Only consider it success if we have clear success indicators
-                            return Ok(true);
+                        // Fallback logic for timeout
+                        return Ok((false, banner_detected));
+                    }
+                    
+                    // Timeout in Banner/Login wait -> Blind Injection?
+                     if state == TelnetState::WaitingForBanner {
+                        // If we timed out waiting for banner, assume no banner seen.
+                        // Based on force_password_only, we jump state.
+                        if force_password_only {
+                             state = TelnetState::SendingPassword;
                         } else {
-                            // Clean close without success indicators means authentication failed
-                            return Ok(false);
+                             state = TelnetState::SendingUsername;
                         }
+                        continue;
                     }
-                    EofType::AbruptDisconnect => {
-                        if half_close_detected {
-                            return Err(anyhow!("Connection half-closed (read side closed)"));
-                        }
-                        // Connection was reset or network error
-                        return Err(anyhow!("Connection abruptly closed"));
-                    }
-                    EofType::PartialData => {
-                        if half_close_detected {
-                            // Half-close with partial data - likely success
-                            return Ok(true);
-                        }
-                        // Got some data then EOF - check if it contains success indicators
-                        if pass_sent && has_success_indicators(&response_after_pass) {
-                            return Ok(true);
+                    
+                    if state == TelnetState::WaitingForLoginPrompt {
+                        // similar blind injection if we timed out waiting specifically for prompt
+                        if force_password_only {
+                             state = TelnetState::SendingPassword;
                         } else {
-                            return Ok(false);
+                             state = TelnetState::SendingUsername;
                         }
+                        continue;
                     }
                 }
             }
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                // Read error - classify the type with enhanced error classification
-                let error_msg = format!("{}", e);
-                let error_type = classify_telnet_error(&error_msg);
-                
-                if is_connection_error(&e) {
-                    return Err(anyhow!("{}: {}", error_type, e));
-                }
-                if pass_sent && cycle >= 3 {
-                    break;
-                }
-                continue;
-            }
-            Err(_) => {
-                // Timeout
-                if pass_sent && cycle >= 3 {
-                    // If we sent password and timed out, check accumulated response
-                    return Ok(has_success_indicators(&response_after_pass));
-                }
-                continue;
-            }
-        };
-
-        // Extract only the newly read data from buffer
-        // Validate index to prevent panic
-        let new_data = if buf_len_before <= buf.len() {
-            buf.split_off(buf_len_before)
-        } else {
-            // Buffer shrank unexpectedly, use entire buffer
-            eprintln!("[!] Buffer length inconsistency detected");
-            buf.split_off(0)
-        };
-        
-        // Process Telnet IAC commands to get clean application data
-        let (clean_bytes, iac_responses) = process_telnet_iac(&new_data);
-        
-        // Send IAC responses back to server if any
-        if !iac_responses.is_empty() {
-            if let Err(e) = timeout(write_timeout, writer.write_all(&iac_responses)).await {
-                // Log but don't fail - IAC negotiation is best-effort
-                if config.verbose {
-                    eprintln!("[!] Failed to send IAC response: {}", e);
-                }
-            }
-        }
-        
-        // Convert to string for text processing
-        let output = String::from_utf8_lossy(&clean_bytes).to_string();
-        let clean_output = strip_ansi_escape_sequences(&output);
-        let lower = clean_output.to_lowercase();
-
-        // Clear any remaining buffer data to prevent accumulation across cycles
-        buf.clear();
-
-        if pass_sent {
-            // Prevent memory exhaustion by limiting response buffer size
-            const MAX_RESPONSE_BUFFER_SIZE: usize = 65536; // 64KB limit
-            if response_after_pass.len() + output.len() <= MAX_RESPONSE_BUFFER_SIZE {
-                response_after_pass.push_str(&output);
-            } else if response_after_pass.len() < MAX_RESPONSE_BUFFER_SIZE {
-                // Add truncation marker if we're near the limit
-                let remaining_space = MAX_RESPONSE_BUFFER_SIZE - response_after_pass.len();
-                if remaining_space > 3 {
-                    response_after_pass.push_str(&output[..remaining_space - 3]);
-                    response_after_pass.push_str("...");
-                }
-            }
-            // If buffer is already at max size, don't add more data
         }
 
-        if !login_sent {
-            for prompt in &config.login_prompts_lower {
-                if lower.contains(prompt.as_str()) {
-                    let login_data = format!("{}\r\n", username);
-                    if let Err(_) = timeout(write_timeout, writer.write_all(login_data.as_bytes())).await {
-                        return Err(anyhow!("Write timeout when sending username"));
+        // --- STATE TRANSITION PHASE ---
+        match state {
+            TelnetState::WaitingForBanner => {
+                // Check for password prompt first (password-only auth)
+                 let found_pass_prompt = config.password_prompts_lower.iter().any(|p| recent_buffer.contains(p));
+                 if found_pass_prompt {
+                     banner_detected = true;
+                     state = TelnetState::SendingPassword;
+                 } else {
+                    // Check for login prompt
+                    let found_login_prompt = config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p));
+                    if found_login_prompt {
+                         banner_detected = true;
+                         state = TelnetState::SendingUsername;
+                    } else {
+                         // Move to waiting for prompt explicitly
+                         state = TelnetState::WaitingForLoginPrompt;
                     }
-                    login_sent = true;
-                    break;
-                }
+                 }
             }
-            if login_sent {
-                continue;
+            TelnetState::WaitingForLoginPrompt => {
+                 // Also check for password prompt here just in case
+                 let found_pass_prompt = config.password_prompts_lower.iter().any(|p| recent_buffer.contains(p));
+                 if found_pass_prompt {
+                     state = TelnetState::SendingPassword;
+                 } else {
+                     let found_login_prompt = config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p));
+                     if found_login_prompt {
+                         state = TelnetState::SendingUsername;
+                     }
+                 }
+                 // If we read data but didn't match, loop again (implicit continue)
             }
-        }
-
-        if login_sent && !pass_sent {
-            for prompt in &config.password_prompts_lower {
-                if lower.contains(prompt.as_str()) {
-                    let pass_data = format!("{}\r\n", password);
-                    if let Err(_) = timeout(write_timeout, writer.write_all(pass_data.as_bytes())).await {
-                        return Err(anyhow!("Write timeout when sending password"));
-                    }
-                    pass_sent = true;
-                    break;
-                }
+            TelnetState::SendingUsername => {
+                 let login_data = format!("{}\r\n", username);
+                 timeout(Duration::from_millis(config.write_timeout), writer.write_all(login_data.as_bytes())).await??;
+                 // Clear buffers to avoid matching old prompts
+                 recent_buffer.clear(); 
+                 buf.clear();
+                 tokio::time::sleep(Duration::from_secs(2)).await;
+                 state = TelnetState::WaitingForPasswordPrompt;
             }
-            if pass_sent {
-                continue;
+            TelnetState::WaitingForPasswordPrompt => {
+                 let found_pass_prompt = config.password_prompts_lower.iter().any(|p| recent_buffer.contains(p));
+                 if found_pass_prompt {
+                     state = TelnetState::SendingPassword;
+                 }
+                 // If we see a login prompt again, it means username was rejected or something looped
+                 if config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p)) {
+                     return Ok((false, banner_detected)); // Assume failed user
+                 }
             }
-        }
-
-        if pass_sent {
-            for indicator in &config.failure_indicators_lower {
-                if lower.contains(indicator.as_str()) {
-                    return Ok(false);
-                }
+            TelnetState::SendingPassword => {
+                 let pass_data = format!("{}\r\n", password);
+                 timeout(Duration::from_millis(config.write_timeout), writer.write_all(pass_data.as_bytes())).await??;
+                 recent_buffer.clear();
+                 buf.clear();
+                 state = TelnetState::WaitingForResult;
             }
-
-            for indicator in &config.success_indicators_lower {
-                if lower.contains(indicator.as_str()) {
-                    return Ok(true);
-                }
+            TelnetState::WaitingForResult => {
+                 // Check success
+                 if has_success_indicators(&response_after_pass) {
+                     return Ok((true, banner_detected));
+                 }
+                 for indicator in &config.success_indicators_lower {
+                     if recent_buffer.contains(indicator) {
+                         return Ok((true, banner_detected));
+                     }
+                 }
+                 
+                 // Check failure
+                 for indicator in &config.failure_indicators_lower {
+                     if recent_buffer.contains(indicator) {
+                         return Ok((false, banner_detected));
+                     }
+                 }
+                 
+                 // Check if it asks for login again (loopback)
+                 if config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p)) {
+                     return Ok((false, banner_detected));
+                 }
             }
         }
     }
-
-    if pass_sent {
-        let final_lower = response_after_pass.to_lowercase();
-
-        for indicator in &config.failure_indicators_lower {
-            if final_lower.contains(indicator.as_str()) {
-                return Ok(false);
-            }
-        }
-
-        for indicator in &config.success_indicators_lower {
-            if final_lower.contains(indicator.as_str()) {
-                return Ok(true);
-            }
-        }
-
-        if final_lower.len() > 50 {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 async fn try_telnet_login_simple(
@@ -1022,15 +1043,21 @@ async fn try_telnet_login_simple(
 // ============================================================
 
 async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
-    let addr = normalize_target(&config.target, config.port).await?;
-    // Use async lookup_host
-    let socket_addr = lookup_host(&addr).await?.next().context("Unable to resolve target")?;
+    let target_str = crate::utils::normalize_target(&config.target)?;
+    let addr_str = if target_str.contains(':') {
+        target_str
+    } else {
+        format!("{}:{}", target_str, config.port)
+    };
+    
+    // Resolve DNS once here
+    let socket_addr = lookup_host(&addr_str).await?.next().context("Unable to resolve target")?;
 
     println!("[*] Target resolved to: {}", socket_addr);
 
     if config.pre_validate {
         println!("[*] Validating target is Telnet service...");
-        match validate_telnet_target(&addr, &config).await {
+        match validate_telnet_target(&addr_str, &config).await {
             Ok(_) => println!("{}", "[+] Target validation successful".green()),
             Err(e) => {
                 eprintln!("{}", format!("[!] Warning: {}", e).yellow());
@@ -1090,8 +1117,8 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
         stop_flag.clone(),
     );
 
-    // Create a resource-aware semaphore that can dynamically adjust concurrency
-    let semaphore = Arc::new(ResourceAwareSemaphore::new(config.threads));
+    // Use standard Tokio semaphore
+    let semaphore = Arc::new(Semaphore::new(config.threads));
     let rx = Arc::new(Mutex::new(rx));
     let mut worker_handles = Vec::with_capacity(config.threads);
 
@@ -1099,13 +1126,13 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
         let h = spawn_worker(
             worker_id,
             rx.clone(),
-                             addr.clone(),
-                             stop_flag.clone(),
-                             found_creds.clone(),
-                             result_writer.clone(),
-                             config.clone(),
-                             stats.clone(),
-                             semaphore.clone(),
+            socket_addr,
+            stop_flag.clone(),
+            found_creds.clone(),
+            result_writer.clone(),
+            config.clone(),
+            stats.clone(),
+            semaphore.clone(),
         );
         worker_handles.push(h);
     }
@@ -1292,179 +1319,19 @@ async fn check_port(ip: &str, port: u16, timeout_duration: Duration) -> Result<O
 // WORKER AND PRODUCER FUNCTIONS
 // ============================================================
 
-/// Resource-aware semaphore that monitors system resources and adjusts concurrency
-struct ResourceAwareSemaphore {
-    semaphore: Semaphore,
-    original_permits: usize,
-    current_permits: AtomicUsize,
-    last_resource_check: AtomicU64, // Unix timestamp in seconds
-}
-
-impl ResourceAwareSemaphore {
-    fn new(initial_permits: usize) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0); // Fallback to 0 if system time is broken
-
-        Self {
-            semaphore: Semaphore::new(initial_permits),
-            original_permits: initial_permits,
-            current_permits: AtomicUsize::new(initial_permits),
-            last_resource_check: AtomicU64::new(now),
-        }
-    }
-
-    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
-        // Check if we need to run resource monitoring
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0); // Fallback to 0 if system time is broken
-
-        let last_check = self.last_resource_check.load(Ordering::Relaxed);
-        let should_check = now.saturating_sub(last_check) > 10; // Check every 10 seconds
-
-        if should_check {
-            // Perform resource check
-            self.perform_resource_check().await;
-
-            // Update last check time
-            self.last_resource_check.store(now, Ordering::Relaxed);
-        }
-
-        // Adaptive delay based on recent performance
-        self.apply_adaptive_delay().await;
-
-        // Only acquire if we're within the current concurrency limit
-        let current_limit = self.current_permits.load(Ordering::Relaxed);
-        if current_limit > 0 {
-            self.semaphore.acquire().await
-        } else {
-            // Concurrency reduced to 0, wait for it to be increased
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let new_limit = self.current_permits.load(Ordering::Relaxed);
-                if new_limit > 0 {
-                    break self.semaphore.acquire().await;
-                }
-            }
-        }
-    }
-
-    async fn apply_adaptive_delay(&self) {
-        // Adaptive delay logic:
-        // If we are operating with reduced concurrency (current < original), it means
-        // we hit resource limits (FDs or Memory). We should slow down acquisition
-        // to let the system recover.
-        
-        let current = self.current_permits.load(Ordering::Relaxed);
-        if current < self.original_permits {
-            // Calculate usage ratio (0.0 to 1.0)
-            // Lower ratio = higher pressure = longer delay
-            let total_reduction = self.original_permits - current;
-            // Delay: 10ms per reduced permit, capped at 1000ms
-            let delay_ms = (total_reduction as u64 * 10).min(1000);
-            
-            if delay_ms > 0 {
-                // Add jitter (±20%) to prevent thundering herd
-                let jitter = rand::rng().random_range(0..=delay_ms / 5 + 1);
-                let final_delay = delay_ms + jitter;
-                tokio::time::sleep(Duration::from_millis(final_delay)).await;
-            }
-        }
-    }
-
-    async fn perform_resource_check(&self) {
-        // Check available file descriptors (rough estimate)
-        let available_fds = self.estimate_available_file_descriptors();
-
-        // Check memory usage
-        let memory_pressure = self.check_memory_pressure().await;
-
-        let current = self.current_permits.load(Ordering::Relaxed);
-        let mut new_permits = current;
-
-        // Reduce concurrency if resources are low
-        if available_fds < 100 || memory_pressure > 0.8 {
-            new_permits = (current * 3 / 4).max(1); // Reduce to 75%, minimum 1
-            if new_permits < current {
-                println!(
-                    "{} Resource pressure detected (FDs: {}, Memory: {:.1}%), reducing concurrency to {}",
-                    "[!]".yellow(),
-                    available_fds,
-                    memory_pressure * 100.0,
-                    new_permits
-                );
-            }
-        }
-        // Gradually increase concurrency if resources are plentiful
-        else if available_fds > 500 && memory_pressure < 0.3 && current < self.original_permits {
-            new_permits = (current * 5 / 4).min(self.original_permits); // Increase to 125%, max original
-        }
-
-        if new_permits != current {
-            // Adjust semaphore permits by adding/removing the difference
-            let diff = new_permits as isize - current as isize;
-            if diff > 0 {
-                // Add permits
-                for _ in 0..diff {
-                    self.semaphore.add_permits(1);
-                }
-            } else if diff < 0 {
-                // NOTE: Reducing semaphore permits is complex in tokio.
-                // For now, we just update the current_permits counter to reflect
-                // the desired concurrency level. The semaphore will still allow
-                // up to its original capacity, but we'll respect the reduced limit
-                // in our logic by not acquiring more than current_permits.
-                //
-                // A proper fix would require recreating the semaphore or using
-                // a different concurrency control mechanism.
-            }
-
-            self.current_permits.store(new_permits, Ordering::Relaxed);
-        }
-    }
-
-    fn estimate_available_file_descriptors(&self) -> usize {
-        // Rough estimate based on typical limits
-        // In a real implementation, you'd query the actual system limits
-        // For now, use a conservative estimate
-        1024 // Assume 1024 available FDs as a baseline
-    }
-
-    async fn check_memory_pressure(&self) -> f64 {
-        // Use spawn_blocking to avoid blocking the async runtime
-        // Only refresh memory info, not all system info (much faster)
-        let result = tokio::task::spawn_blocking(|| {
-            let mut system = sysinfo::System::new();
-            system.refresh_memory();
-            
-            let total_memory = system.total_memory() as f64;
-            let available_memory = system.available_memory() as f64;
-
-            if total_memory > 0.0 {
-                1.0 - (available_memory / total_memory)
-            } else {
-                0.0
-            }
-        }).await;
-        
-        // Return 0.0 (no pressure) on error to avoid affecting concurrency
-        result.unwrap_or(0.0)
-    }
-}
+// ResourceAwareSemaphore removed in favor of standard Tokio Semaphore
+// for simplicity and reliability.
 
 fn spawn_worker(
     worker_id: usize,
     rx: Arc<Mutex<mpsc::Receiver<(Arc<str>, Arc<str>)>>>,
-                addr: String,
-                stop_flag: Arc<AtomicBool>,
-                found_creds: Arc<Mutex<HashSet<(String, String)>>>,
-                result_writer: Arc<Mutex<BufferedResultWriter>>,
-                config: TelnetBruteforceConfig,
-                stats: Arc<Statistics>,
-                semaphore: Arc<ResourceAwareSemaphore>,
+    socket_addr: SocketAddr,
+    stop_flag: Arc<AtomicBool>,
+    found_creds: Arc<Mutex<HashSet<(String, String)>>>,
+    result_writer: Arc<Mutex<BufferedResultWriter>>,
+    config: TelnetBruteforceConfig,
+    stats: Arc<Statistics>,
+    semaphore: Arc<Semaphore>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1506,32 +1373,8 @@ fn spawn_worker(
                 break;
             };
 
-            // Resolve DNS once per target to avoid repeated lookups
-            // Use async lookup_host
-            let socket = match lookup_host(&addr).await {
-                Ok(mut addrs) => {
-                    match addrs.next() {
-                        Some(socket) => socket,
-                        None => {
-                            eprintln!(
-                                "[!] Worker {} failed to resolve address {}",
-                                worker_id,
-                                sanitize_input(addr.as_str())
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[!] Worker {} DNS resolution failed for {}: {}",
-                        worker_id,
-                        sanitize_input(addr.as_str()),
-                        e
-                    );
-                    continue;
-                }
-            };
+            // DNS resolution is now done once before spawning workers
+            let socket = socket_addr;
 
             // Atomically check stop flag and acquire permit to prevent race condition
             let _permit = match semaphore.acquire().await {
@@ -3142,36 +2985,7 @@ fn save_batch_results(results: &[ScanResult], filename: &str) -> Result<()> {
     Ok(())
 }
 
-async fn normalize_target(host: &str, default_port: u16) -> Result<String> {
-    static TARGET_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^\[*(?P<addr>[^\]]+?)\]*(?::(?P<port>\d{1,5}))?$")
-        .expect("Invalid regex")
-    });
-
-    let caps = TARGET_REGEX
-    .captures(host.trim())
-    .ok_or_else(|| anyhow!("Invalid target format"))?;
-
-    let addr = caps.name("addr")
-        .ok_or_else(|| anyhow!("Missing address in target format"))?
-        .as_str();
-    let port = if let Some(m) = caps.name("port") {
-        m.as_str().parse::<u16>()?
-    } else {
-        default_port
-    };
-
-    let formatted = if addr.contains(':') && !addr.contains('.') {
-        format!("[{}]:{}", addr, port)
-    } else {
-        format!("{}:{}", addr, port)
-    };
-
-    // Use async lookup_host
-    lookup_host(&formatted).await?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
-
-    Ok(formatted)
-}
+// local normalize_target replaced by crate::utils::normalize_target
 
 // ============================================================
 // PROMPT/INPUT FUNCTIONS

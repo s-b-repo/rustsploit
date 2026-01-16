@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use colored::*;
-use suppaftp::{AsyncFtpStream, AsyncNativeTlsFtpStream, AsyncNativeTlsConnector};
+use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsFtpStream, AsyncNativeTlsConnector};
 use suppaftp::async_native_tls::TlsConnector;
 use tokio::time::{timeout, Duration};
 
