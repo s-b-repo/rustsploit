@@ -242,6 +242,17 @@ rsf> go
 
 If proxy mode is enabled, Rustsploit rotates through validated proxies, falls back to direct mode only after exhaustion, and politely reports successes or errors.
 
+### Command Chaining
+
+Execute multiple commands in a single line using the `&` separator:
+
+```text
+rsf> u creds/generic/ssh_bruteforce & set target 10.10.10.10 & go
+rsf> f1 ssh & u creds/generic/ssh_bruteforce & set target 192.168.1.1
+```
+
+This is useful for scripting quick workflows or batching common operations together.
+
 ---
 
 ## CLI Usage
