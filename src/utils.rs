@@ -41,8 +41,62 @@ const MAX_COMMAND_LENGTH: usize = 8192;
 /// Maximum length for file paths to prevent DoS
 const MAX_PATH_LENGTH: usize = 4096;
 
-/// Dangerous command characters that should be sanitized or rejected
-const DANGEROUS_CMD_CHARS: &[char] = &['\x00', '\n', '\r', '\t'];
+/// Reads input from stdin, treating it as a literal string payload.
+/// - Enforces max length (MAX_COMMAND_LENGTH).
+/// - Sanitizes invisible control characters (0x00-0x1F) for safety.
+/// - Warns user if dangerous patterns (shells, traversal) are detected, but DOES NOT block them.
+async fn read_safe_input() -> Result<String> {
+    std::io::stdout().flush().context("Failed to flush stdout")?;
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).context("Failed to read input")?;
+    
+    // 1. Length Check
+    if s.len() > MAX_COMMAND_LENGTH {
+         return Err(anyhow!(
+            "Input too long (max {} characters)",
+            MAX_COMMAND_LENGTH
+        ));
+    }
+    
+    // 2. Control Character Sanitization
+    // We only strip Null bytes (\0) to allow payloads (including ANSI, Bell, etc.)
+    let sanitized: String = s.chars()
+        .filter(|c| *c != '\0')
+        .collect();
+        
+    let trimmed = sanitized.trim().to_string();
+    
+    // 3. Pattern Recognition & Warning (Defense in Depth)
+    // We do NOT block these, we treat them as literal strings, but warn the user.
+    let low = trimmed.to_lowercase();
+    let dangerous_patterns = [
+        "bash", "zsh", "sh", "cmd", "powershell", "pwsh", // Interactive shells
+        "sudo", // Privilege
+        "../", "..\\", // Traversal
+        "\x1b", // ANSI injection attempts that survived sanitization? (Esc is 0x1b control char)
+        // Esc is a control char so it's filtered above, but let's be sure.
+    ];
+    
+    for pat in dangerous_patterns.iter() {
+        if low.contains(pat) {
+            // Found a risky pattern.
+            // Check if it looks like a direct binary execution attempt at start
+            let is_binary_start = ["bash", "zsh", "sh", "cmd", "powershell", "pwsh", "sudo"]
+                .iter()
+                .any(|bin| low.starts_with(bin));
+                
+            if is_binary_start {
+                 println!("{}", "[!] Warning: Input starts with shell binary/sudo. Treated as literal text payload.".yellow().bold());
+                 println!("{}", "    If you intended to execute this locally, this is not a shell.".dimmed());
+            } else {
+                 println!("{}", format!("[!] Warning: Input contains potentially dangerous pattern '{}'. Treated as literal text.", pat).yellow());
+            }
+            break; // Warn once
+        }
+    }
+
+    Ok(trimmed)
+}
 
 /// Comprehensive target normalization function.
 /// 
@@ -1076,10 +1130,10 @@ pub fn validate_command_input(command: &str) -> Result<String> {
         ));
     }
     
-    // Remove dangerous control characters
+    // Remove only Null bytes to allow payloads
     let sanitized: String = trimmed
         .chars()
-        .filter(|c| !DANGEROUS_CMD_CHARS.contains(c))
+        .filter(|c| *c != '\0')
         .collect();
     
     if sanitized.is_empty() {
@@ -1323,16 +1377,19 @@ pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<Strin
 
 // use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // Removed unused imports
 
+/// Generic prompt that allows empty input
+pub async fn prompt_input(msg: &str) -> Result<String> {
+    print!("{}", msg.cyan().bold());
+    read_safe_input().await
+}
+
 /// Prompts the user for input, ensuring it is not empty.
 pub async fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        std::io::stdout().flush().context("Failed to flush stdout")?;
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s).context("Failed to read input")?;
-        let trimmed = s.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        let input = read_safe_input().await?;
+        if !input.is_empty() {
+             return Ok(input);
         }
         println!("{}", "This field is required.".yellow());
     }
@@ -1341,14 +1398,11 @@ pub async fn prompt_required(msg: &str) -> Result<String> {
 /// Prompts the user for input, using a default value if empty.
 pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    std::io::stdout().flush().context("Failed to flush stdout")?;
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s).context("Failed to read input")?;
-    let trimmed = s.trim();
-    Ok(if trimmed.is_empty() {
+    let input = read_safe_input().await?;
+    Ok(if input.is_empty() {
         default.to_string()
     } else {
-        trimmed.to_string()
+        input
     })
 }
 
@@ -1357,10 +1411,8 @@ pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
-        std::io::stdout().flush().context("Failed to flush stdout")?;
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s).context("Failed to read input")?;
-        match s.trim().to_lowercase().as_str() {
+        let input = read_safe_input().await?;
+        match input.to_lowercase().as_str() {
             ""        => return Ok(default_yes),
             "y" | "yes" => return Ok(true),
             "n" | "no"  => return Ok(false),
@@ -1375,6 +1427,16 @@ pub async fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Re
         match input.trim().parse::<i64>() {
             Ok(n) if n >= min && n <= max => return Ok(n),
             _ => println!("{}", format!("Please enter a number between {} and {}.", min, max).yellow()),
+        }
+    }
+}
+
+pub async fn prompt_port(msg: &str, default: u16) -> Result<u16> {
+    loop {
+        let input = prompt_default(msg, &default.to_string()).await?;
+        match input.parse::<u16>() {
+            Ok(n) if n > 0 => return Ok(n),
+            _ => println!("{}", "Please enter a valid port (1-65535).".yellow()),
         }
     }
 }
