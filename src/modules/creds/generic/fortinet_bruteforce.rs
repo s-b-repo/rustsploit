@@ -294,11 +294,19 @@ async fn try_fortinet_login(
     // Send login request
     let login_url = format!("{}/remote/logincheck", base_url);
     
+    // Manual form construction
+    let mut body = String::new();
+    for (key, val) in &form_data {
+        if !body.is_empty() { body.push('&'); }
+        body.push_str(&format!("{}={}", key, urlencoding::encode(val)));
+    }
+
     let login_response = match timeout(
         timeout_duration,
         client
             .post(&login_url)
-            .form(&form_data)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
             .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
             .header("Referer", &login_page_url)
             .send()

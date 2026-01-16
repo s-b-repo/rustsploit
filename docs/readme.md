@@ -104,6 +104,17 @@ The shell lives in `src/shell.rs`. Highlights:
 
 Extensions (tab completion, history) can be added by wrapping the loop with a line-editor crate, but are omitted today to keep dependencies minimal.
 
+### Command Chaining
+
+The shell supports command chaining via the `&` separator, allowing multiple commands to be executed in a single line:
+
+```bash
+rsf> u creds/generic/ssh_bruteforce & set target 10.10.10.10 & go
+rsf> f1 ssh & u creds/generic/ssh_bruteforce & set target 192.168.1.1
+```
+
+Commands are parsed and executed sequentially from left to right. This is useful for scripting workflows or quick module setup.
+
 ---
 
 ## Proxy Subsystem

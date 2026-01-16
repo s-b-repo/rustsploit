@@ -177,9 +177,17 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
             ("btnSubmit", "Login"),
         ];
 
+        // Manual form construction
+        let mut body = String::new();
+        for (key, val) in &data {
+            if !body.is_empty() { body.push('&'); }
+            body.push_str(&format!("{}={}", key, urlencoding::encode(val)));
+        }
+
         let res = client
             .post(&url)
-            .form(&data)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
             .send()
             .await
             .context("[!] Failed to send HTTP form request")?;

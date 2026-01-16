@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use colored::*;
-use suppaftp::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
+use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
 use suppaftp::async_native_tls::TlsConnector;
 use std::{
     fs::File,
