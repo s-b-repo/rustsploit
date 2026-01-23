@@ -3154,3 +3154,67 @@ Prompt Detection: Implemented basic prompt detection (#, $, >) to ensure command
 Thread Safety: Uses Arc<ExploitConfig> and other thread-safe primitives for efficient mass scanning.
 Usage
 When running the exploits/telnet/telnet_auth_bypass_cve_2026_24061 module, you will now be prompted for the operation mode and payload before the scan starts.
+
+
+
+Refactoring Telnet Modules
+This plan outlines the refactoring of telnet-related modules to eliminate duplication, fix logic flaws, and improve maintainability.
+
+User Review Required
+IMPORTANT
+
+This refactoring will centralize Telnet login logic. This means that if a new prompt or indicator is discovered, it only needs to be added in one place to benefit the bruteforcer, the hose scanner, and the exploit modules.
+
+Proposed Changes
+[Core Utilities]
+[NEW] 
+telnet_helper.rs
+Create a shared module for telnet operations:
+process_telnet_iac
+: Unified IAC negotiation.
+strip_ansi_escape_sequences
+: Unified ANSI stripping.
+TelnetSession: A shared state machine for handling telnet logins.
+Framework-wide success/failure indicators.
+[Credential Modules]
+[MODIFY] 
+telnet_bruteforce.rs
+Replace internal 
+process_telnet_iac
+, 
+strip_ansi_escape_sequences
+, and 
+do_telnet_login
+ with calls to requested telnet_helper.
+Delete 
+try_telnet_login_simple
+ and route its logic through the unified TelnetSession.
+Consolidate redundant success indicator checks.
+[MODIFY] 
+telnet_hose.rs
+Replace 
+do_telnet_session
+ with the unified TelnetSession.
+Update prompt detection to use the expanded framework list.
+[Exploit Modules]
+[MODIFY] 
+telnet_auth_bypass_cve_2026_24061.rs
+Use shared telnet_helper for IAC and prompt detection.
+Verification Plan
+Automated Tests
+Run cargo check to ensure all modules correctly integrate with the new helper.
+Verify that the total line count of 
+telnet_bruteforce.rs
+ is significantly reduced.
+Manual Verification
+Test creds/generic/telnet_bruteforce with a mock server or real target to ensure no regression.
+Test creds/generic/telnet_hose to ensure it correctly identifies open telnet services.
+Verify exploits/telnet/telnet_auth_bypass_cve_2026_24061 still triggers the bypass correctly.
+
+
+I have updated both the CVE-2026-24061 exploit module and the generic Telnet bruteforce module with the expanded list of exotic Chinese IoT shell prompts.
+
+Specifically:
+
+Updated SHELL_PROMPTS in src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs.
+Expanded success_indicators in get_default_prompts and has_success_indicators in src/modules/creds/generic/telnet_bruteforce.rs.
