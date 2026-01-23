@@ -21,7 +21,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use colored::*;
 
-use anyhow::{Result, Context, bail};
+use anyhow::{Result, Context, anyhow, bail};
 
 use std::mem::MaybeUninit;
 
@@ -131,19 +131,19 @@ fn craft_probe_packet(
     let (transport_header_len, transport_packet_data) = match protocol_type {
         ProbeProtocolType::Icmp => {
             let mut buf = vec![0u8; 8 + payload.len()];
-            let mut pkt = echo_request::MutableEchoRequestPacket::new(&mut buf).unwrap();
+            let mut pkt = echo_request::MutableEchoRequestPacket::new(&mut buf).ok_or_else(|| anyhow!("Failed to create EchoRequest"))?;
             pkt.set_icmp_type(IcmpTypes::EchoRequest);
             pkt.set_icmp_code(echo_request::IcmpCodes::NoCode);
             pkt.set_identifier(icmp_id_val);
             pkt.set_sequence_number(icmp_seq_val);
             pkt.set_payload(&payload);
-            let view = IcmpPacket::new(pkt.packet()).unwrap();
+            let view = IcmpPacket::new(pkt.packet()).ok_or_else(|| anyhow!("Failed to create ICMP view"))?;
             pkt.set_checksum(icmp::checksum(&view));
             (buf.len(), buf)
         }
         ProbeProtocolType::Udp => {
             let mut buf = vec![0u8; 8 + payload.len()];
-            let mut pkt = MutableUdpPacket::new(&mut buf).unwrap();
+            let mut pkt = MutableUdpPacket::new(&mut buf).ok_or_else(|| anyhow!("Failed to create UDP packet"))?;
             pkt.set_source(rng.random_range(33434..=65535));
             pkt.set_destination(rng.random_range(33434..=65535));
             pkt.set_length((8 + payload.len()) as u16);
@@ -154,7 +154,7 @@ fn craft_probe_packet(
         }
         ProbeProtocolType::Tcp => {
             let mut buf = vec![0u8; 20 + payload.len()];
-            let mut pkt = MutableTcpPacket::new(&mut buf).unwrap();
+            let mut pkt = MutableTcpPacket::new(&mut buf).ok_or_else(|| anyhow!("Failed to create TCP packet"))?;
             pkt.set_source(rng.random_range(33434..=65535));
             pkt.set_destination(rng.random_range(33434..=65535));
             pkt.set_sequence(rng.random());
@@ -174,11 +174,11 @@ fn craft_probe_packet(
     let mut ip_buf = vec![0u8; total_len as usize];
 
     let src_ip = src_ip_override
-        .or_else(|| SPOOF_SRC_IP_CONFIG.map(str::parse).transpose().unwrap())
+        .or_else(|| SPOOF_SRC_IP_CONFIG.map(str::parse).transpose().expect("Invalid SPOOF_SRC_IP_CONFIG"))
         .unwrap_or(Ipv4Addr::new(0,0,0,0));
 
     {
-        let mut ip = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+        let mut ip = MutableIpv4Packet::new(&mut ip_buf).ok_or_else(|| anyhow!("Failed to create IPv4 packet"))?;
         ip.set_version(4);
         ip.set_header_length(5);
         ip.set_total_length(total_len);
@@ -193,7 +193,7 @@ fn craft_probe_packet(
         if sig.df_flag {
             flags |= IPV4_FLAG_DF;
         }
-        ip.set_flags(flags.try_into().unwrap());
+        ip.set_flags(flags.try_into().unwrap_or(0));
         ip.set_payload(&transport_packet_data);
         ip.set_checksum(ipv4::checksum(&ip.to_immutable()));
     }
@@ -242,7 +242,7 @@ async fn send_and_receive_one(
             return Ok(None);
         }
 
-        let sock_clone = receiver_socket.try_clone().expect("Socket clone failed");
+        let sock_clone = receiver_socket.try_clone().context("Socket clone failed")?;
         let recv = task::spawn_blocking(move || -> Result<Option<(Vec<u8>, SocketAddr)>, std::io::Error> {
             let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
             match sock_clone.recv_from(&mut buf) {

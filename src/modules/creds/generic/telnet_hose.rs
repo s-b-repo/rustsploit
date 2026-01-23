@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use colored::*;
 use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -105,7 +105,7 @@ pub async fn run(target: &str) -> Result<()> {
     if target.is_empty() || target == "random" || target == "0.0.0.0/0" {
         // Random Mode
         loop {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
             let exc = exclusions.clone();
             let cr = creds.clone();
             let sc = stats_checked.clone();
@@ -137,7 +137,7 @@ pub async fn run(target: &str) -> Result<()> {
         println!("Loaded {} IPs from list", lines.len());
 
         for ip_str in lines {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
             let cr = creds.clone();
             let sc = stats_checked.clone();
             let sf = stats_found.clone();
@@ -156,7 +156,7 @@ pub async fn run(target: &str) -> Result<()> {
         // Wait for all tasks to finish (simple hack: try to acquire all semaphores)
         // In a real hose, we just run until done.
         for _ in 0..CONCURRENCY {
-            let _ = semaphore.acquire().await.unwrap();
+            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
         }
     }
 

@@ -322,8 +322,8 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         let config_verbose = config.verbose;
         let random_agent = config.random_agent;
         
-        let task = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+        let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+            let _permit = sem.acquire().await.context("Semaphore acquisition failed")?;
             
             // Apply delay
             if delay.as_millis() > 0 {
@@ -391,6 +391,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
                     Err(_) => {}
                 }
             }
+            Ok(())
         });
         tasks.push(task);
     }
@@ -425,7 +426,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         for r in sorted {
              use std::fmt::Write;
              writeln!(file_content, "[{}] {} | Size: {} | Method: {} | {}", 
-                 r.status, get_status_text(r.status), r.len, r.method, r.path).unwrap();
+                 r.status, get_status_text(r.status), r.len, r.method, r.path).context("Failed to write to buffer")?;
         }
         
         fs::write(&filename, file_content)?;

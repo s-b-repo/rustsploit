@@ -494,7 +494,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 
     // Save results to files if requested
     if let Some(ref up_file) = config.save_up_hosts {
-        let up_list = up_hosts_list.lock().unwrap();
+        let up_list = up_hosts_list.lock().unwrap_or_else(|e| e.into_inner());
         if !up_list.is_empty() {
             match save_hosts_to_file(&up_list, up_file) {
                 Ok(_) => {
@@ -510,7 +510,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     }
 
     if let Some(ref down_file) = config.save_down_hosts {
-        let down_list = down_hosts_list.lock().unwrap();
+        let down_list = down_hosts_list.lock().unwrap_or_else(|e| e.into_inner());
         if !down_list.is_empty() {
             match save_hosts_to_file(&down_list, down_file) {
                 Ok(_) => {
@@ -692,7 +692,7 @@ async fn syn_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result
     
     let tcp_header_len = 20;
     let mut tcp_buf = vec![0u8; tcp_header_len];
-    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).ok_or_else(|| anyhow!("Failed to create TCP packet"))?;
     tcp_pkt.set_source(src_port);
     tcp_pkt.set_destination(port);
     tcp_pkt.set_sequence(seq_num);
@@ -709,7 +709,7 @@ async fn syn_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result
     const IPV4_HEADER_LEN: usize = 20;
     let total_len = (IPV4_HEADER_LEN + tcp_header_len) as u16;
     let mut ip_buf = vec![0u8; total_len as usize];
-    let mut ip_pkt = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    let mut ip_pkt = MutableIpv4Packet::new(&mut ip_buf).ok_or_else(|| anyhow!("Failed to create IP packet"))?;
     ip_pkt.set_version(4);
     ip_pkt.set_header_length(5);
     ip_pkt.set_total_length(total_len);
@@ -871,7 +871,7 @@ async fn ack_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result
     
     let tcp_header_len = 20;
     let mut tcp_buf = vec![0u8; tcp_header_len];
-    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_buf).ok_or_else(|| anyhow!("Failed to create TCP packet"))?;
     tcp_pkt.set_source(src_port);
     tcp_pkt.set_destination(port);
     tcp_pkt.set_sequence(seq_num);
@@ -888,7 +888,7 @@ async fn ack_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result
     const IPV4_HEADER_LEN: usize = 20;
     let total_len = (IPV4_HEADER_LEN + tcp_header_len) as u16;
     let mut ip_buf = vec![0u8; total_len as usize];
-    let mut ip_pkt = MutableIpv4Packet::new(&mut ip_buf).unwrap();
+    let mut ip_pkt = MutableIpv4Packet::new(&mut ip_buf).ok_or_else(|| anyhow!("Failed to create IP packet"))?;
     ip_pkt.set_version(4);
     ip_pkt.set_header_length(5);
     ip_pkt.set_total_length(total_len);

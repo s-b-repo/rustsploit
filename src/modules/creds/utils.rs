@@ -1,9 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-// use std::sync::Arc; // Removed unused import
 use std::time::Instant;
 use colored::*;
 use tokio::sync::Mutex;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
+use rand::Rng;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+
 
 /// Standard statistics tracking for bruteforce modules
 pub struct BruteforceStats {
@@ -116,4 +122,81 @@ impl BruteforceStats {
              }
         }
     }
+}
+
+pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
+    let mut rng = rand::rng();
+    loop {
+        let octets: [u8; 4] = rng.random();
+        let ip = Ipv4Addr::from(octets);
+        let ip_addr = IpAddr::V4(ip);
+        
+        // Basic check first to avoid expensive loop
+        if octets[0] == 10 || octets[0] == 127 || octets[0] == 0 {
+             continue;
+        }
+
+        let mut excluded = false;
+        for net in exclusions {
+            if net.contains(ip_addr) {
+                excluded = true;
+                break;
+            }
+        }
+        
+        if !excluded {
+            return ip_addr;
+        }
+    }
+}
+
+pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
+    // Ensure state file exists before checking
+    if !std::path::Path::new(state_file).exists() {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(state_file)
+            .await
+        {
+            let _ = file.flush().await;
+        }
+        return false;
+    }
+
+    let ip_s = ip.to_string();
+    let status = Command::new("grep")
+        .arg("-F")
+        .arg("-q")
+        .arg(format!("checked: {}", ip_s))
+        .arg(state_file)
+        .status()
+        .await;
+    
+    match status {
+        Ok(s) => s.success(), 
+        Err(_) => false, 
+    }
+}
+
+pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
+    let data = format!("checked: {}\n", ip.to_string());
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_file)
+        .await 
+    {
+        let _ = file.write_all(data.as_bytes()).await;
+    }
+}
+
+pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
+    let mut exclusion_subnets = Vec::new();
+    for cidr in min_ranges {
+        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
+            exclusion_subnets.push(net);
+        }
+    }
+    exclusion_subnets
 }
