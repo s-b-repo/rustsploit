@@ -1,6 +1,6 @@
 #  Rustsploit Developer Guide
 
-> Reference manual for maintainers and contributors. Covers the architecture, build-time module discovery, shell ergonomics, proxy plumbing, and authoring guidelines for exploits, scanners, and credential modules.
+> Reference manual for maintainers and contributors. Covers the architecture, build-time module discovery, shell ergonomics, and authoring guidelines for exploits, scanners, and credential modules.
 
 ---
 
@@ -10,7 +10,7 @@
 2. [Code Layout](#code-layout)  
 3. [Build Pipeline & Module Discovery](#build-pipeline--module-discovery)  
 4. [Shell Architecture](#shell-architecture)  
-5. [Proxy Subsystem](#proxy-subsystem)  
+  
 6. [Command-Line Interface](#command-line-interface)  
 7. [Security & Input Validation](#security--input-validation)  
 8. [Authoring Modules](#authoring-modules)  
@@ -29,7 +29,7 @@ Rustsploit is a Rust-first re-imagining of RouterSploit:
 - Async-native (Tokio) for scalable brute forcing and network IO
 - Auto-discovered modules categorized as `exploits`, `scanners`, and `creds`
 - Interactive shell + CLI runner referencing the same dispatch layer
-- Proxy-aware execution with run-time rotation, validation, and fallback logic
+
 - IPv4/IPv6-friendly: target normalization happens uniformly
 - Carefully colored, concise output designed for operators on remote consoles
 
@@ -90,16 +90,15 @@ Because the dispatcher is generated at build time, there is no manual registry d
 
 The shell lives in `src/shell.rs`. Highlights:
 
-- **Context:** `ShellContext` stores `current_module`, `current_target`, the loaded `proxy_list`, and `proxy_enabled` boolean.
+- **Context:** `ShellContext` stores `current_module`, `current_target`.
 - **Prompt helpers:** Inline functions prompt for paths, yes/no decisions, timeouts, etc.
 - **Shortcut parsing:** `split_command` + `resolve_command` normalize input (e.g., `f1 ssh`, `pon`, `ptest`) to canonical keys.
 - **Command palette:** `render_help()` prints a colorized table for quick reference.
-- **Proxy tests:** `proxy_test` command triggers async validation via utils.
+
 - **Run pipeline:** On `run`/`go`, the shell enforces:
   - Module selected
   - Target set
-  - Proxy state respected (rotate until success or fallback direct)
-  - Environment variables (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`) set/cleared per attempt
+
 - **State reset:** On exit, nothing is persisted intentionally for OPSEC.
 
 Extensions (tab completion, history) can be added by wrapping the loop with a line-editor crate, but are omitted today to keep dependencies minimal.
@@ -117,19 +116,7 @@ Commands are parsed and executed sequentially from left to right. This is useful
 
 ---
 
-## Proxy Subsystem
 
-Implemented in `utils.rs` and surfaced in the shell.
-
-- **Loader:** `load_proxies_from_file` reads lists, normalizes schemes (defaulting to `http://`), validates host/port via `Url`, and tolerates comments or blank lines. Returns both valid entries and a list of parse errors (line number, reason).
-- **Supported schemes:** `http`, `https`, `socks4`, `socks4a`, `socks5`, `socks5h`.
-- **Tester:** `test_proxies` concurrently (Tokio) checks a user-chosen URL using `reqwest::Proxy::all`. Configurable timeout and max concurrency.
-- **Result:** Working proxies are retained; failures are reported with the reason (connection refused, invalid cert, etc.).
-- **Integration:** Shell invites the user to validate immediately after loading; `proxy_test` can also be used on demand.
-
-Proxies are set globally via environment variables so both module HTTP requests and low-level sockets (if they honor `ALL_PROXY`) benefit.
-
----
 
 ## Command-Line Interface
 
@@ -345,6 +332,12 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
 
 ### Recent Module Enhancements
 
+- **CVE-2026-24061 Exploit**:
+  - GNU inetutils-telnetd Remote Authentication Bypass via `NEW_ENVIRON`
+  - Automated payload execution and interactive shell session
+  - Mass-scan support with multi-port parallelization and exclusion ranges
+  - Verified logic for IAC (Interpret As Command) telnet negotiation
+
 - **Telnet Module**: 
   - Full IAC (Interpret As Command) negotiation with proper option handling
   - Enhanced error classification with specific error types
@@ -410,7 +403,7 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
 
 - **`module_exists` / `list_all_modules` / `find_modules`**: Used by shell to present module inventory.
 
-- **Proxy helpers**: `load_proxies_from_file`, `test_proxies`, etc. (described earlier).
+
 
 Feel free to expand this file with reusable pieces (e.g., credential loader, HTTP header templates) to avoid duplication inside modules.
 
@@ -423,7 +416,7 @@ Feel free to expand this file with reusable pieces (e.g., credential loader, HTT
 3. **Runtime smoke tests:**
    - Shell: `cargo run` → `modules` → run a harmless module (e.g., `scanners/sample_scanner`).
    - CLI: `cargo run -- --command scanner --module sample_scanner --target 127.0.0.1`.
-4. **Proxy validation:** Load a mixed proxy file and confirm `proxy_test` filters entries correctly.
+
 5. **Wordlists:** Validate that required lists exist (e.g., RTSP paths) and are referenced in docstrings.
 
 When adding new modules, include short usage documentation (stdout prints, README notes) so other operators know how to drive them.
