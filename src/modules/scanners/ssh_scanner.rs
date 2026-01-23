@@ -259,8 +259,8 @@ pub async fn scan_ssh(
         let results = Arc::clone(&results);
         let stats = Arc::clone(&stats);
         
-        let handle = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
+        let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.context("Semaphore acquisition failed")?;
             
             let host_clone = host.clone();
             let result = spawn_blocking(move || {
@@ -286,6 +286,7 @@ pub async fn scan_ssh(
                     stats.record_scan(false, true);
                 }
             }
+            Ok(())
         });
         
         handles.push(handle);

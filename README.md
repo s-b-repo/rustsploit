@@ -1,14 +1,14 @@
 # Rustsploit 
 
-Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, rich proxy support, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
+Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
 ![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/testing.png)
 
 
--  **Developer Docs:** [Full guide covering module lifecycle, proxy logic, shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
+-  **Developer Docs:** [Full guide covering module lifecycle,shell flow, and dispatcher](https://github.com/s-b-repo/rustsploit/blob/main/docs/readme.md)
 -  **Interactive Shell:** Ergonomic command palette with shortcuts (e.g., `f1 ssh`, `u exploits/heartbleed`, `go`)
--  **Proxy Smartness:** Supports HTTP(S), SOCKS4/4a/5 (with hostname resolution), validation, and automatic rotation
+
 -  **IPv4/IPv6 Ready:** Credential modules and sockets normalize targets so both address families work out-of-the-box
 
 ---
@@ -22,10 +22,9 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 5. [Interactive Shell Walkthrough](#interactive-shell-walkthrough)
 6. [CLI Usage](#cli-usage)
 7. [API Server Mode](#api-server-mode)
-8. [Proxy Workflow](#proxy-workflow)
-9. [How Modules Are Discovered](#how-modules-are-discovered)
-10. [Contributing](#contributing)
-11. [Credits](#credits)
+8. [How Modules Are Discovered](#how-modules-are-discovered)
+9. [Contributing](#contributing)
+10. [Credits](#credits)
 
 ---
 
@@ -33,7 +32,7 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 
 -  **Auto-discovered modules:** `build.rs` indexes `src/modules/**` so new code drops in without manual registration
 -  **Interactive shell with color and shortcuts:** Quick command palette, target/module state tracking, alias commands (`help/?`, `modules/m`, `run/go`, etc.)
--  **Ergonomic proxy system:** Load lists, validate availability, choose concurrency/timeouts, and rotate automatically on failure
+
 -  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, MQTT, Fortinet brute force modules with IPv6 and TLS support where applicable
 -  **Enhanced Telnet module:** Full IAC (Interpret As Command) negotiation, advanced error classification, verbose quick-check mode, robust buffer handling
 -  **Improved RDP module:** Streaming failover for large password files (>150MB), comprehensive error classification, multiple security level support (NLA/TLS/RDP/Negotiate/Auto)
@@ -71,12 +70,50 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
 
 ### Requirements
 
- ```
+**Debian/Ubuntu/Kali:**
+ ```bash
 sudo apt update
-sudo apt install freerdp2-x11    # Required for the RDP brute force module
+sudo apt install pkg-config libssl-dev freerdp2-x11    # Required for the RDP brute force module
 ```
 
-Ensure Rust and Cargo are installed (https://www.rust-lang.org/tools/install).
+**Arch Linux:**
+```bash
+sudo pacman -S pkgconf openssl freerdp
+```
+
+**Gentoo:**
+```bash
+sudo emerge dev-libs/openssl dev-util/pkgconf net-misc/freerdp
+```
+
+**Fedora/RHEL:**
+```bash
+sudo dnf install pkgconf-pkg-config openssl-devel freerdp
+```
+
+### Installing Rust & Cargo
+
+**General (Recommended for all Linux/macOS):**
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+**Debian/Ubuntu/Kali:**
+```bash
+sudo apt install rustc cargo
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S rust
+```
+
+**Fedora/RHEL:**
+```bash
+sudo dnf install rust cargo
+```
+
 
 ### Clone + Build
 
@@ -92,10 +129,26 @@ cargo build
 cargo run
 ```
 
-### Install (optional)
+### Global Installation (Run from Terminal)
 
- ```
+To run `rustsploit` from anywhere in your terminal:
+
+**Option 1: Cargo Install (Easiest)**
+```bash
 cargo install --path .
+rustsploit
+```
+
+**Option 2: Manually Build Release Binary**
+```bash
+# 1. Build optimized release version
+cargo build --release
+
+# 2. Move binary to your path (e.g., /usr/local/bin)
+sudo cp target/release/rustsploit /usr/local/bin/
+
+# 3. Run from anywhere
+rustsploit
 ```
 
 ---
@@ -221,10 +274,6 @@ find             find <kw> | f1 <kw>      Search modules by keyword
 use              use <path> | u <path>    Select module (ex: u exploits/heartbleed)
 set target       set target <value>       Set current target (IPv4/IPv6/hostname)
 run              run | go                 Execute current module (honors proxy mode)
-proxy_load       proxy_load [file] | pl   Load proxies from file (HTTP/HTTPS/SOCKS)
-proxy_on/off     proxy_on | pon / ...     Toggle proxy usage
-proxy_test       proxy_test | ptest       Validate proxies (URL, timeout, concurrency)
-show_proxies     show_proxies | proxies   View proxy status
 exit             exit | quit | q          Leave shell
 ```
 
@@ -234,13 +283,8 @@ Example session:
 rsf> f1 ssh
 rsf> u creds/generic/ssh_bruteforce
 rsf> set target 10.10.10.10
-rsf> pl data/proxies.txt    # prompts if omitted
-rsf> pon
-rsf> proxy_test             # optional validation / filtering
 rsf> go
 ```
-
-If proxy mode is enabled, Rustsploit rotates through validated proxies, falls back to direct mode only after exhaustion, and politely reports successes or errors.
 
 ### Command Chaining
 
@@ -455,20 +499,18 @@ curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/ips
 
 ---
 
-## Proxy Workflow
+## Private Internet Recommendations
 
-Rustsploit treats proxy lists as first-class citizens:
+The built-in proxy system has been removed in favor of system-level VPN solutions which offer far superior reliability and security for offensive operations.
 
-- Accepts HTTP, HTTPS, SOCKS4, SOCKS4a, SOCKS5, and SOCKS5h entries
-- Loads from user-supplied files, skipping invalid lines with reasons
-- Optional connectivity test prompts allow tuning:
-  - Test URL (default `https://example.com`)
-  - Timeout (seconds)
-  - Max concurrent checks
-- Keeps only working proxies when validation is requested
-- Rotates at run time; if all proxies fail, reverts to direct host attempts automatically
+We strongly recommend **[Mullvad VPN](https://mullvad.net)** for the following reasons:
+- **No Registration:** Account numbers are generated without email or personal data.
+- **Privacy Focus:** Proven no-logs policy, audited infrastructure, and anonymous payment options (Cash, Crypto).
+- **WireGuard Support:** High-performance, low-latency tunneling essential for scanning and brute-forcing.
+- **Port Forwarding:** (Note: check current availability) historically supported for reverse shells.
+- **Linux CLI:** Excellent command-line client that integrates well with headless setups.
 
-Environment variables (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`) are managed transparently per attempt.
+To use Rustsploit with Mullvad (or any VPN), simply connect the VPN on your host system before running the tool. All traffic will naturally route through the tunnel.
 
 ---
 

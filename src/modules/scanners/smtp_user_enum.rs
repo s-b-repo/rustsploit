@@ -291,7 +291,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                 .green()
                                 .bold()
                             );
-                            let mut users = found.lock().unwrap();
+                            let mut users = found.lock().unwrap_or_else(|e| e.into_inner());
                             users.push((
                                 format!("{}@{}", username, raw_target),
                                 response.trim().to_string(),
@@ -312,7 +312,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                             let msg = e.to_string();
                             if msg.starts_with("Unknown VRFY response for '") {
                                 {
-                                    let mut unk = unknown.lock().unwrap();
+                                    let mut unk = unknown.lock().unwrap_or_else(|e| e.into_inner());
                                     unk.push((
                                         format!("{}@{}", username, raw_target),
                                         msg.clone(),
@@ -434,7 +434,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                             .green()
                             .bold()
                         );
-                        let mut users = found.lock().unwrap();
+                        let mut users = found.lock().unwrap_or_else(|e| e.into_inner());
                         users.push((
                             format!("{}@{}", username, raw_target),
                             response.trim().to_string(),
@@ -455,7 +455,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                         let msg = e.to_string();
                         if msg.starts_with("Unknown VRFY response for '") {
                             {
-                                let mut unk = unknown.lock().unwrap();
+                                let mut unk = unknown.lock().unwrap_or_else(|e| e.into_inner());
                                 unk.push((
                                     format!("{}@{}", username, raw_target),
                                     msg.clone(),
@@ -641,7 +641,7 @@ async fn finalize_and_report(
     // Print final statistics
     stats.print_final();
 
-    let found_guard = found.lock().unwrap();
+    let found_guard = found.lock().unwrap_or_else(|e| e.into_inner());
     if found_guard.is_empty() {
         println!("{}", "[-] No valid usernames found.".yellow());
     } else {
@@ -670,7 +670,7 @@ async fn finalize_and_report(
     }
     drop(found_guard);
 
-    let unknown_guard = unknown.lock().unwrap();
+    let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
     if !unknown_guard.is_empty() {
         println!(
             "{}",
@@ -842,12 +842,12 @@ async fn prompt_wordlist(message: &str) -> Result<String> {
 }
 
 fn normalize_target(host: &str, port: u16) -> Result<String> {
-    let re = Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$").unwrap();
+    let re = Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$").expect("Invalid regex");
     let t = host.trim();
     let cap = re
         .captures(t)
         .ok_or_else(|| anyhow!("Invalid target: {}", host))?;
-    let addr = cap.get(1).unwrap().as_str();
+    let addr = cap.get(1).map(|m| m.as_str()).ok_or_else(|| anyhow!("Target address missing"))?;
     let p = cap
         .get(2)
         .map(|m| m.as_str().parse::<u16>().ok())

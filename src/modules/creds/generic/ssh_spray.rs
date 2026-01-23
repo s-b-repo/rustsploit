@@ -246,8 +246,8 @@ pub async fn password_spray(
             let user = user.clone();
             let password = password.to_string();
             
-            let handle = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
+            let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.context("Semaphore acquisition failed")?;
                 
                 let host_clone = host.clone();
                 let user_clone = user.clone();
@@ -277,6 +277,7 @@ pub async fn password_spray(
                         stats.record_attempt(false, true);
                     }
                 }
+                Ok(())
             });
             
             handles.push(handle);
