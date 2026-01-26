@@ -9,6 +9,13 @@ use url::Url;
 use regex::Regex;
 use once_cell::sync::Lazy; // Added for safe static regex initialization
 
+/// Helper for verbose logging
+pub fn verbose_log(verbose: bool, message: &str) {
+    if verbose {
+        eprintln!("{} {}", "[VERBOSE]".dimmed(), message.dimmed());
+    }
+}
+
 /// Maximum folder depth to traverse
 const MAX_DEPTH: usize = 6;
 
@@ -33,7 +40,7 @@ const MAX_PATH_LENGTH: usize = 4096;
 /// - Enforces max length (MAX_COMMAND_LENGTH).
 /// - Sanitizes invisible control characters (0x00-0x1F) for safety.
 /// - Warns user if dangerous patterns (shells, traversal) are detected, but DOES NOT block them.
-async fn read_safe_input() -> Result<String> {
+fn read_safe_input() -> Result<String> {
     std::io::stdout().flush().context("Failed to flush stdout")?;
     let mut s = String::new();
     std::io::stdin().read_line(&mut s).context("Failed to read input")?;
@@ -1013,16 +1020,16 @@ pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<Strin
 // use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // Removed unused imports
 
 /// Generic prompt that allows empty input
-pub async fn prompt_input(msg: &str) -> Result<String> {
+pub fn prompt_input(msg: &str) -> Result<String> {
     print!("{}", msg.cyan().bold());
-    read_safe_input().await
+    read_safe_input()
 }
 
 /// Prompts the user for input, ensuring it is not empty.
-pub async fn prompt_required(msg: &str) -> Result<String> {
+pub fn prompt_required(msg: &str) -> Result<String> {
     loop {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        let input = read_safe_input().await?;
+        let input = read_safe_input()?;
         if !input.is_empty() {
              return Ok(input);
         }
@@ -1031,9 +1038,9 @@ pub async fn prompt_required(msg: &str) -> Result<String> {
 }
 
 /// Prompts the user for input, using a default value if empty.
-pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
+pub fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    let input = read_safe_input().await?;
+    let input = read_safe_input()?;
     Ok(if input.is_empty() {
         default.to_string()
     } else {
@@ -1042,11 +1049,11 @@ pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
 }
 
 /// Prompts the user for a yes/no answer.
-pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+pub fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
     loop {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
-        let input = read_safe_input().await?;
+        let input = read_safe_input()?;
         match input.to_lowercase().as_str() {
             ""        => return Ok(default_yes),
             "y" | "yes" => return Ok(true),
@@ -1056,9 +1063,9 @@ pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
-pub async fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
+pub fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
     loop {
-        let input = prompt_default(msg, &default.to_string()).await?;
+        let input = prompt_default(msg, &default.to_string())?;
         match input.trim().parse::<i64>() {
             Ok(n) if n >= min && n <= max => return Ok(n),
             _ => println!("{}", format!("Please enter a number between {} and {}.", min, max).yellow()),
@@ -1066,9 +1073,9 @@ pub async fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Re
     }
 }
 
-pub async fn prompt_port(msg: &str, default: u16) -> Result<u16> {
+pub fn prompt_port(msg: &str, default: u16) -> Result<u16> {
     loop {
-        let input = prompt_default(msg, &default.to_string()).await?;
+        let input = prompt_default(msg, &default.to_string())?;
         match input.parse::<u16>() {
             Ok(n) if n > 0 => return Ok(n),
             _ => println!("{}", "Please enter a valid port (1-65535).".yellow()),
@@ -1076,9 +1083,9 @@ pub async fn prompt_port(msg: &str, default: u16) -> Result<u16> {
     }
 }
 
-pub async fn prompt_wordlist(msg: &str) -> Result<String> {
+pub fn prompt_wordlist(msg: &str) -> Result<String> {
     loop {
-        let input = prompt_required(msg).await?;
+        let input = prompt_required(msg)?;
         let path = Path::new(&input);
         if !path.exists() {
             println!("{}", format!("File '{}' does not exist.", input).yellow());
@@ -1093,9 +1100,9 @@ pub async fn prompt_wordlist(msg: &str) -> Result<String> {
 }
 
 /// Prompts for an existing file path.
-pub async fn prompt_existing_file(msg: &str) -> Result<String> {
+pub fn prompt_existing_file(msg: &str) -> Result<String> {
     loop {
-        let candidate = prompt_required(msg).await?;
+        let candidate = prompt_required(msg)?;
         if Path::new(&candidate).is_file() {
             return Ok(candidate);
         } else {
