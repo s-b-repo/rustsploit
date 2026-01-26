@@ -14,7 +14,7 @@ anyhow = "1.0"
 colored = "3.0"                 # newer than 2.0
 rand = "0.9"
 rustyline = "17.0"
-sysinfo = { version = "0.37", features = ["multithread"] }
+sysinfo = { version = "0.38", features = ["multithread"] }
 
 # CLI & Async runtime
 clap = { version = "4.5", features = ["derive"] }
@@ -52,7 +52,7 @@ which = "8.0"
 
 # FTP
 async_ftp = "6.0"
-suppaftp = { version = "7.1", features = ["tokio-async-native-tls"] }
+suppaftp = { version = "8.0", features = ["tokio-async-native-tls"] }
 native-tls = "0.2"
 rustls = "0.23"
 webpki-roots = "1.0"
