@@ -43,4 +43,24 @@ pub struct Cli {
     /// Set global target IP/subnet for all modules
     #[arg(long)]
     pub set_target: Option<String>,
+
+    /// Enable verbose output (shows detailed operation logs)
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// List all available modules and exit
+    #[arg(long)]
+    pub list_modules: bool,
+
+    /// Output format (text, json)
+    #[arg(long, default_value = "text")]
+    pub output_format: Option<String>,
+
+    /// API job queue size (default: 100)
+    #[arg(long, default_value_t = 100)]
+    pub queue_size: usize,
+
+    /// Number of worker threads for API jobs (default: 10)
+    #[arg(long, default_value_t = 10)]
+    pub workers: usize,
 }
