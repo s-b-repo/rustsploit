@@ -75,29 +75,29 @@ pub async fn run(target: &str) -> Result<()> {
 
     // --- Standard Single-Target Logic ---
 
-    let port: u16 = prompt_port("RTSP Port", 554).await?;
+    let port: u16 = prompt_port("RTSP Port", 554)?;
 
-    let usernames_file = prompt_wordlist("Username wordlist").await?;
-    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
 
-    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000).await? as usize;
+    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let _save_results = prompt_yes_no("Save results to file?", true).await?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let _save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if _save_results {
-        Some(prompt_default("Output file", "rtsp_results.txt").await?)
+        Some(prompt_default("Output file", "rtsp_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
 
-    let advanced_mode = prompt_yes_no("Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false).await?;
+    let advanced_mode = prompt_yes_no("Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false)?;
     let mut advanced_headers: Vec<String> = Vec::new();
     let advanced_command = if advanced_mode {
-        let method = prompt_default("RTSP method to use (e.g. DESCRIBE)", "DESCRIBE").await?;
-        if prompt_yes_no("Load extra RTSP headers from a file?", false).await? {
-            let headers_path = prompt_wordlist("Path to RTSP headers file").await?;
+        let method = prompt_default("RTSP method to use (e.g. DESCRIBE)", "DESCRIBE")?;
+        if prompt_yes_no("Load extra RTSP headers from a file?", false)? {
+            let headers_path = prompt_wordlist("Path to RTSP headers file")?;
             advanced_headers = load_lines(&headers_path)?;
         }
         Some(method)
@@ -112,7 +112,7 @@ pub async fn run(target: &str) -> Result<()> {
     // Normalize target and add port if needed
     let target_normalized = if target.starts_with("rtsp://") {
         target.strip_prefix("rtsp://")
-            .unwrap()
+            .expect("Target starts with rtsp://")
             .split('/')
             .next()
             .unwrap_or(target)
@@ -153,9 +153,9 @@ pub async fn run(target: &str) -> Result<()> {
         return Ok(());
     }
 
-    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false).await?;
+    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
     let mut paths = if brute_force_paths {
-        let paths_file = prompt_wordlist("Path to RTSP paths file").await?;
+        let paths_file = prompt_wordlist("Path to RTSP paths file")?;
         load_lines(&paths_file)?
     } else {
         vec!["".to_string()]
@@ -309,11 +309,11 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep wordlists
     println!("{}", "[*] Preparing Mass Scan configuration...".blue());
     
-    let port: u16 = prompt_port("RTSP Port", 554).await?;
+    let port: u16 = prompt_port("RTSP Port", 554)?;
     
-    let usernames_file = prompt_wordlist("Username wordlist").await?;
-    let passwords_file = prompt_wordlist("Password wordlist").await?;
-    let paths_file = prompt_wordlist("RTSP paths file (empty for none/root)").await?;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let paths_file = prompt_wordlist("RTSP paths file (empty for none/root)")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -326,10 +326,10 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         return Err(anyhow!("Wordlists cannot be empty"));
     }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
 
-    let output_file = prompt_default("Output result file", "rtsp_mass_results.txt").await?;
+    let output_file = prompt_default("Output result file", "rtsp_mass_results.txt")?;
 
     // Parse exclusions
     let mut exclusion_subnets = Vec::new();
@@ -366,7 +366,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if run_random {
         println!("{}", "[*] Starting Random Internet Scan...".green());
         loop {
-             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
              let exc = exclusions.clone();
              let cp = creds_pkg.clone();
              let sc = stats_checked.clone();
@@ -393,7 +393,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
 
         for ip_str in lines {
-             let permit = semaphore.clone().acquire_owned().await.unwrap();
+             let permit = semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
              let cp = creds_pkg.clone();
              let sc = stats_checked.clone();
              let sf = stats_found.clone();

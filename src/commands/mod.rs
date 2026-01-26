@@ -10,6 +10,8 @@ use crate::utils::normalize_target;
 /// CLI dispatcher
 pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     // Target resolution logic...
+    crate::utils::verbose_log(cli_args.verbose, "Handling CLI command...");
+
     let raw = if let Some(ref t) = cli_args.target {
         t.clone()
     } else if config::GLOBAL_CONFIG.has_target() {
@@ -25,8 +27,10 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     };
     
     let target = normalize_target(&raw)?;
-    let module = cli_args.module.clone().unwrap_or_default();
+    crate::utils::verbose_log(cli_args.verbose, &format!("Normalized target: {}", target));
 
+    let module = cli_args.module.clone().unwrap_or_default();
+    
     match command {
         "exploit" => {
             let trimmed = module.trim_start_matches("exploits/");
@@ -47,7 +51,9 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
 }
 
 /// Interactive module runner
-pub async fn run_module(module_path: &str, raw_target: &str) -> Result<()> {
+pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> Result<()> {
+    crate::utils::verbose_log(verbose, &format!("Attempting to run module '{}' against '{}'", module_path, raw_target));
+
     // 1. Resolve module using compile-time list
     let available = discover_modules();
     
@@ -57,18 +63,32 @@ pub async fn run_module(module_path: &str, raw_target: &str) -> Result<()> {
         m.rsplit_once('/').map(|(_, short)| short == module_path).unwrap_or(false)
     });
 
+    if let Some(m) = full_match {
+        crate::utils::verbose_log(verbose, &format!("Exact module match found: {}", m));
+    } else if let Some(m) = short_match {
+        crate::utils::verbose_log(verbose, &format!("Short module match found: {}", m));
+    }
+
     let resolved = if let Some(m) = full_match {
         m
     } else if let Some(m) = short_match {
         m
     } else {
-        eprintln!("❌ Unknown module '{}'. Available modules:", module_path);
-        // List modules grouped by category
-        // TODO: Could use `list_all_modules` logic from utils if public, or reimplement simply here
-        for m in available {
-            println!("  {}", m);
+        use colored::*;
+        eprintln!("{}", format!("❌ Unknown module '{}'.", module_path).red());
+        
+        // Fuzzy matching
+        let best_match = available.iter()
+            .map(|m| (m, strsim::levenshtein(module_path, m)))
+            .min_by_key(|&(_, dist)| dist);
+
+        if let Some((suggestion, dist)) = best_match {
+            if dist < 5 { // Threshold for suggestions
+                eprintln!("{}", format!("  Did you mean: {}?", suggestion).yellow());
+            }
         }
-        return Ok(());
+        
+        return Err(anyhow::anyhow!("Module not found"));
     };
 
     // 2. Resolve target
@@ -89,6 +109,7 @@ pub async fn run_module(module_path: &str, raw_target: &str) -> Result<()> {
     };
     
     let target = normalize_target(&target_str)?;
+    crate::utils::verbose_log(verbose, &format!("Target resolved to: {}", target));
 
     let mut parts = resolved.splitn(2, '/');
     let category = parts.next().unwrap_or("");

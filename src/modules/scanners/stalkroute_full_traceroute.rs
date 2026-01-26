@@ -1,5 +1,6 @@
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::{self, MutableIpv4Packet};
+use std::io::Write;
 use pnet_packet::icmp::{self, echo_request, echo_reply, IcmpTypes};
 use pnet_packet::udp::{self, MutableUdpPacket};
 use pnet_packet::tcp::{self, MutableTcpPacket, TcpFlags};
@@ -11,7 +12,7 @@ use rand::Rng;
 use rand::distr::Alphanumeric;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
 
 
 use tokio::time::{Instant, Duration};
@@ -416,13 +417,11 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 pub async fn run(target: &str) -> Result<()> {
     let mut user_input = String::new();
     print!("Are you running this as sudo? (yes/no): ");
-    tokio::io::stdout()
+    std::io::stdout()
         .flush()
-        .await
         .context("Failed to flush stdout")?;
-    tokio::io::BufReader::new(tokio::io::stdin())
+    std::io::stdin()
         .read_line(&mut user_input)
-        .await
         .context("Failed to read input")?;
 
     if user_input.trim().to_lowercase() == "yes" {

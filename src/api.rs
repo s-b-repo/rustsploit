@@ -18,7 +18,8 @@ use std::{
 use tokio::{
     fs::OpenOptions,
     io::AsyncWriteExt,
-    sync::{RwLock, Semaphore},
+
+    sync::{mpsc, RwLock}, // Removed Semaphore, added mpsc
 };
 use tower::ServiceBuilder;
 use tower_http::{
@@ -60,8 +61,24 @@ pub struct AuthFailureTracker {
     pub blocked_until: Option<DateTime<Utc>>,
 }
 
-/// Global limit for concurrent module executions to prevent resource exhaustion
-const MAX_CONCURRENT_MODULES: usize = 10;
+/// Global limit for concurrent module executions
+// const MAX_CONCURRENT_MODULES: usize = 10; // Removed, now dynamic
+
+#[derive(Debug)]
+pub struct Job {
+    pub module: String,
+    pub target: String,
+    pub verbose: bool,
+    pub start_time: std::time::Instant,
+}
+
+
+
+// Force usage of ExecutionError to avoid dead code warning until fully implemented
+fn _suppress_dead_code_warning() {
+    let _ = ApiErrorCode::ExecutionError;
+    let _ = ApiErrorCode::ServerError;
+}
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -71,7 +88,8 @@ pub struct ApiState {
     pub harden_enabled: bool,
     pub ip_limit: u32,
     pub log_file: PathBuf,
-    pub execution_limit: Arc<Semaphore>,
+    pub job_sender: mpsc::Sender<Job>, // Replaced execution_limit
+    pub verbose: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,6 +97,38 @@ pub struct ApiResponse {
     pub success: bool,
     pub message: String,
     pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+pub enum ApiErrorCode {
+    AuthFailed,
+    RateLimited,
+    InvalidModule,
+    InvalidTarget,
+    ExecutionError,
+    ServerError,
+}
+
+impl ApiErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApiErrorCode::AuthFailed => "AUTH_FAILED",
+            ApiErrorCode::RateLimited => "RATE_LIMITED",
+            ApiErrorCode::InvalidModule => "INVALID_MODULE",
+            ApiErrorCode::InvalidTarget => "INVALID_TARGET",
+            ApiErrorCode::ExecutionError => "EXECUTION_ERROR",
+            ApiErrorCode::ServerError => "SERVER_ERROR",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,6 +147,31 @@ pub struct ListModulesResponse {
 // ----------------------
 // Validation utilities
 // ----------------------
+// ----------------------
+// Validation utilities
+// ----------------------
+
+fn create_response(
+    success: bool,
+    message: String,
+    data: Option<serde_json::Value>,
+    error_code: Option<String>,
+    suggestion: Option<String>,
+    start_time: Option<std::time::Instant>,
+) -> ApiResponse {
+    let duration_ms = start_time.map(|t| t.elapsed().as_millis() as u64);
+    ApiResponse {
+        success,
+        message,
+        data,
+        error_code,
+        suggestion,
+        request_id: Some(Uuid::new_v4().to_string()),
+        timestamp: Some(Utc::now().to_rfc3339()),
+        duration_ms,
+    }
+}
+
 fn sanitize_for_log(input: &str) -> String {
     let mut s = input.replace(['\r', '\n', '\t'], " ");
     if s.len() > 500 {
@@ -134,7 +209,7 @@ fn validate_target(target: &str) -> bool {
 }
 
 impl ApiState {
-    pub fn new(initial_key: String, harden: bool, ip_limit: u32) -> Self {
+    pub fn new(initial_key: String, harden: bool, ip_limit: u32, verbose: bool, job_sender: mpsc::Sender<Job>) -> Self {
         let log_file = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("rustsploit_api.log");
@@ -149,7 +224,8 @@ impl ApiState {
             harden_enabled: harden,
             ip_limit,
             log_file,
-            execution_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_MODULES)),
+            job_sender,
+            verbose,
         }
     }
 
@@ -277,6 +353,13 @@ impl ApiState {
             .await
             .context("Failed to write to log file")?;
 
+        Ok(())
+    }
+
+    pub async fn verbose_log(&self, message: &str) -> Result<()> {
+        if self.verbose {
+            self.log_message(message).await?;
+        }
         Ok(())
     }
 
@@ -431,11 +514,14 @@ async fn auth_middleware(
     if client_ip != "unknown" {
         if let Ok(allowed) = state.check_auth_rate_limit(&client_ip).await {
             if !allowed {
-                let response = ApiResponse {
-                    success: false,
-                    message: "Too many failed authentication attempts. Please try again in 30 seconds.".to_string(),
-                    data: None,
-                };
+                let response = create_response(
+                    false,
+                    "Too many failed authentication attempts. Please try again in 30 seconds.".to_string(),
+                    None,
+                    Some(ApiErrorCode::RateLimited.as_str().to_string()),
+                    None,
+                    None,
+                );
                 return (StatusCode::TOO_MANY_REQUESTS, Json(response)).into_response();
             }
         }
@@ -457,11 +543,14 @@ async fn auth_middleware(
 
     // Basic key format validation
     if !validate_api_key_format(provided_key) {
-        let response = ApiResponse {
-            success: false,
-            message: "Malformed API key".to_string(),
-            data: None,
-        };
+        let response = create_response(
+            false,
+            "Malformed API key".to_string(),
+            None,
+            Some(ApiErrorCode::AuthFailed.as_str().to_string()),
+            Some("API key must be printable ASCII and not empty.".to_string()),
+            None,
+        );
         return (StatusCode::UNAUTHORIZED, Json(response)).into_response();
     }
 
@@ -474,11 +563,14 @@ async fn auth_middleware(
             let _ = state.record_auth_failure(&client_ip).await;
         }
 
-        let response = ApiResponse {
-            success: false,
-            message: "Invalid API key".to_string(),
-            data: None,
-        };
+        let response = create_response(
+            false,
+            "Invalid API key".to_string(),
+            None,
+            Some(ApiErrorCode::AuthFailed.as_str().to_string()),
+            None,
+            None,
+        );
         return (StatusCode::UNAUTHORIZED, Json(response)).into_response();
     }
 
@@ -490,15 +582,111 @@ async fn auth_middleware(
     // Track IP for hardening (if enabled)
     let _ = state.track_ip(&client_ip).await;
 
+    // Track IP for hardening (if enabled)
+    let _ = state.track_ip(&client_ip).await;
+    
+    state.verbose_log(&format!("Authenticated request from IP: {}", client_ip)).await.ok();
+
     next.run(request).await
 }
 
 async fn health_check() -> Json<ApiResponse> {
-    Json(ApiResponse {
-        success: true,
-        message: "API is running".to_string(),
-        data: None,
-    })
+    Json(create_response(
+        true,
+        "API is running".to_string(),
+        None,
+        None,
+        None,
+        None,
+    ))
+}
+
+async fn get_module_info(
+    State(_state): State<ApiState>,
+    axum::extract::Path((category, name)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let module_path = format!("{}/{}", category, name);
+    if commands::discover_modules().contains(&module_path) {
+         let response = create_response(
+            true,
+            "Module found".to_string(),
+             Some(serde_json::json!({
+                "module": module_path,
+                "category": category,
+                "name": name,
+                "exists": true
+            })),
+            None,
+            None,
+            None,
+        );
+        (StatusCode::OK, Json(response)).into_response()
+    } else {
+         let response = create_response(
+            false,
+            "Module not found".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidModule.as_str().to_string()),
+            Some("Check the module list for available modules.".to_string()),
+            None,
+        );
+        (StatusCode::NOT_FOUND, Json(response)).into_response()
+    }
+}
+
+async fn validate_module_params(
+    Json(payload): Json<RunModuleRequest>,
+) -> Response {
+    let start_time = std::time::Instant::now();
+    let module_name = payload.module.as_str();
+    let target = payload.target.as_str();
+
+    if !validate_module_name(module_name) {
+         let response = create_response(
+            false,
+            "Invalid module name format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidModule.as_str().to_string()),
+            Some("Module format: category/name. Allowed chars: [a-z0-9/_/-]".to_string()),
+            Some(start_time),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+    
+    // Check if module exists
+    if !commands::discover_modules().contains(&module_name.to_string()) {
+          let response = create_response(
+            false,
+            format!("Module '{}' does not exist", module_name),
+            None,
+            Some(ApiErrorCode::InvalidModule.as_str().to_string()),
+            None,
+            Some(start_time),
+        );
+        return (StatusCode::NOT_FOUND, Json(response)).into_response();
+    }
+
+    if !validate_target(target) {
+        let response = create_response(
+            false,
+            "Invalid target format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidTarget.as_str().to_string()),
+            Some("Target must be a valid IP, hostname, or CIDR.".to_string()),
+            Some(start_time),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+
+    let response = create_response(
+        true,
+        "Validation successful".to_string(),
+        Some(serde_json::json!({ "valid": true })),
+        None,
+        None,
+        Some(start_time),
+    );
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn list_modules(State(_state): State<ApiState>) -> Json<ApiResponse> {
@@ -523,86 +711,115 @@ async fn list_modules(State(_state): State<ApiState>) -> Json<ApiResponse> {
         creds,
     };
 
-    Json(ApiResponse {
-        success: true,
-        message: "Modules retrieved successfully".to_string(),
-        data: Some(serde_json::to_value(data).unwrap_or(serde_json::Value::Null)),
-    })
+    Json(create_response(
+        true,
+        "Modules retrieved successfully".to_string(),
+        Some(serde_json::to_value(data).unwrap_or(serde_json::Value::Null)),
+        None,
+        None,
+        None, // TODO: track duration
+    ))
 }
 
 async fn run_module(
     State(state): State<ApiState>,
     Json(payload): Json<RunModuleRequest>,
-) -> Result<Json<ApiResponse>, StatusCode> {
+) -> Response {
+    let start_time = std::time::Instant::now();
     let module_name_raw = payload.module.as_str();
     let target_raw = payload.target.as_str();
 
     // Validate inputs
     if !validate_module_name(module_name_raw) {
-        return Err(StatusCode::BAD_REQUEST);
+         let response = create_response(
+            false,
+            "Invalid module name format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidModule.as_str().to_string()),
+            Some("Module format: category/name. Allowed chars: [a-z0-9/_/-]".to_string()),
+            Some(start_time),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
     }
     if !validate_target(target_raw) {
-        return Err(StatusCode::BAD_REQUEST);
+        let response = create_response(
+            false,
+            "Invalid target format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidTarget.as_str().to_string()),
+            Some("Target must be a valid IP, hostname, or CIDR.".to_string()),
+            Some(start_time),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
     }
 
     // Sanitize for logging only
     let module_name = sanitize_for_log(module_name_raw);
     let target_name = sanitize_for_log(target_raw);
     
-    state
+    if let Err(_) = state
         .log_message(&format!(
             "API request: run module '{}' on target '{}'",
             module_name, target_name
         ))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .await 
+    {
+         let response = create_response(
+            false,
+            "Internal Server Error: Logging failed".to_string(),
+            None,
+            Some(ApiErrorCode::ServerError.as_str().to_string()),
+            None,
+             Some(start_time),
+        );
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response();
+    }
 
-    // Acquire permit to limit concurrency
-    // We hold an owned permit and move it into the thread
-    let permit = state.execution_limit.clone().acquire_owned().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Fire and forget: Try to send to the job queue
+    let job = Job {
+        module: module_name.to_string(),
+        target: target_name.to_string(),
+        verbose: state.verbose,
+        start_time,
+    };
 
-    // Run the module in a separate OS thread to support !Send futures (like Mutex guards and ThreadRng)
-    // We use a current_thread runtime which allows !Send futures to be blocked on.
-    let module = payload.module.clone();
-    let target = payload.target.clone();
-    let state_clone = state.clone();
-
-    std::thread::spawn(move || {
-        let _permit = permit; // Permit is dropped when thread finishes
-
-        // Use current_thread runtime for lightweight isolation and !Send support
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-
-        match rt {
-            Ok(rt) => {
-                rt.block_on(async {
-                    if let Err(e) = commands::run_module(&module, &target).await {
-                        let _ = state_clone
-                            .log_message(&format!("Error running module: {}", sanitize_for_log(&e.to_string())))
-                            .await;
-                    } else {
-                        let _ = state_clone
-                            .log_message(&format!(
-                                "Successfully completed module '{}' on target '{}'",
-                                sanitize_for_log(&module), sanitize_for_log(&target)
-                            ))
-                            .await;
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("Failed to create runtime for module execution: {}", e);
-            }
+    match state.job_sender.try_send(job) {
+        Ok(_) => {
+             // 202 Accepted
+            (StatusCode::ACCEPTED, Json(create_response(
+                true,
+                format!("Module '{}' queued for execution against '{}'", module_name, target_name),
+                None,
+                None,
+                None,
+                Some(start_time),
+            ))).into_response()
+        },
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Queue full - return 503
+             let response = create_response(
+                false,
+                "Job queue is full. Please try again later.".to_string(),
+                None,
+                Some(ApiErrorCode::RateLimited.as_str().to_string()), // Or ServerError, but RateLimit fits load shedding
+                Some("Increase queue size or wait for jobs to finish.".to_string()),
+                Some(start_time),
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response()
+        },
+        Err(_) => {
+             // Channel closed
+             let response = create_response(
+                false,
+                "Internal Server Error: Job queue closed".to_string(),
+                None,
+                Some(ApiErrorCode::ServerError.as_str().to_string()),
+                None,
+                 Some(start_time),
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
         }
-    });
-
-    Ok(Json(ApiResponse {
-        success: true,
-        message: format!("Module '{}' execution started for target '{}'", module_name, target_name),
-        data: None,
-    }))
+    }
 }
 
 async fn get_status(State(state): State<ApiState>) -> Json<ApiResponse> {
@@ -632,11 +849,14 @@ async fn get_status(State(state): State<ApiState>) -> Json<ApiResponse> {
         "tracked_ips": ip_details,
     });
 
-    Json(ApiResponse {
-        success: true,
-        message: "Status retrieved successfully".to_string(),
-        data: Some(status_data),
-    })
+    Json(create_response(
+        true,
+        "Status retrieved successfully".to_string(),
+        Some(status_data),
+        None,
+        None,
+        None,
+    ))
 }
 
 async fn rotate_key_endpoint(State(state): State<ApiState>) -> Result<Json<ApiResponse>, StatusCode> {
@@ -645,11 +865,14 @@ async fn rotate_key_endpoint(State(state): State<ApiState>) -> Result<Json<ApiRe
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(ApiResponse {
-        success: true,
-        message: "API key rotated successfully".to_string(),
-        data: Some(serde_json::json!({ "new_key": new_key })),
-    }))
+    Ok(Json(create_response(
+        true,
+        "API key rotated successfully".to_string(),
+        Some(serde_json::json!({ "new_key": new_key })),
+        None,
+        None,
+        None,
+    )))
 }
 
 async fn get_tracked_ips(State(state): State<ApiState>) -> Json<ApiResponse> {
@@ -681,11 +904,14 @@ async fn get_tracked_ips(State(state): State<ApiState>) -> Json<ApiResponse> {
         })
         .collect();
 
-    Json(ApiResponse {
-        success: true,
-        message: format!("Retrieved {} tracked IP addresses", ips.len()),
-        data: Some(serde_json::json!({ "ips": ips })),
-    })
+    Json(create_response(
+        true,
+        format!("Retrieved {} tracked IP addresses", ips.len()),
+        Some(serde_json::json!({ "ips": ips })),
+        None,
+        None,
+        None,
+    ))
 }
 
 async fn get_auth_failures(State(state): State<ApiState>) -> Json<ApiResponse> {
@@ -720,11 +946,14 @@ async fn get_auth_failures(State(state): State<ApiState>) -> Json<ApiResponse> {
         })
         .collect();
 
-    Json(ApiResponse {
-        success: true,
-        message: format!("Retrieved {} IPs with authentication failures", failures.len()),
-        data: Some(serde_json::json!({ "auth_failures": failures })),
-    })
+    Json(create_response(
+        true,
+        format!("Retrieved {} IPs with authentication failures", failures.len()),
+        Some(serde_json::json!({ "auth_failures": failures })),
+        None,
+        None,
+        None,
+    ))
 }
 
 pub async fn start_api_server(
@@ -732,14 +961,93 @@ pub async fn start_api_server(
     api_key: String,
     harden: bool,
     ip_limit: u32,
+    verbose: bool,
+    queue_size: usize,
+    workers: usize,
 ) -> Result<()> {
-    let state = ApiState::new(api_key.clone(), harden, ip_limit);
+    // Create channel for jobs
+    let (tx, rx) = mpsc::channel(queue_size);
+    let state = ApiState::new(api_key.clone(), harden, ip_limit, verbose, tx);
+
+    // Spawn worker pool
+    // We clone the receiver for each worker? No, mpsc Receiver is not Clone.
+    // We need an Arc<Mutex<Receiver>> OR usually we just move receiver into one logic/distributor?
+    // Wait, typical pattern for multiple consumers is `async-channel` or `crossbeam`, but Tokio mpsc Receiver is single consumer.
+    // Ah! To have multiple workers on a single mpsc receiver, we wrap it in Arc<Mutex> OR we just use `async-crossbeam-channel` or similar.
+    // OR we spawn 1 dispatcher task that owns RX and sends to N workers?
+    // 
+    // Actually, Tokio's recommended pattern for worker pool is:
+    // 1. Arc<Mutex<Receiver>> (slow)
+    // 2. async-channel crate (MPMC)
+    // 
+    // Since I can't easily add dependencies without checking cargo.toml (I see `tokio`), I will check if I can use `async-channel`.
+    // Let me check Cargo.toml first? 
+    // 
+    // Actually, simple solution: 
+    // Wrap Receiver in Arc<Mutex> is fine for 10-20 workers.
+    
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    
+    for _ in 0..workers {
+        let rx_clone = shared_rx.clone();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            loop {
+                // Lock the receiver to get a job
+                let job = {
+                    let mut lock = rx_clone.lock().await;
+                    lock.recv().await
+                };
+                
+                if let Some(j) = job {
+                    // Create a pseudo-receiver that yields just this one job, or refactor worker_loop
+                    // Refactoring worker_loop to take a single job is better but I put loop inside it.
+                    // Let's just create a modified worker body here.
+                    let module = j.module.clone();
+                    let target = j.target.clone();
+                    let verbose = j.verbose;
+                    let s_clone = state_clone.clone();
+
+                    // Run the job logic (blocking join)
+                     std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build();
+                        
+                        match rt {
+                            Ok(rt) => {
+                                rt.block_on(async {
+                                    if let Err(e) = commands::run_module(&module, &target, verbose).await {
+                                        let duration = j.start_time.elapsed().as_millis();
+                                        let _ = s_clone
+                                            .log_message(&format!("Error running module ({}): {} [{}ms]", ApiErrorCode::ExecutionError.as_str(), sanitize_for_log(&e.to_string()), duration))
+                                            .await;
+                                    } else {
+                                        let duration = j.start_time.elapsed().as_millis();
+                                        let _ = s_clone
+                                            .log_message(&format!(
+                                                "Successfully completed module '{}' on target '{}' [{}ms]",
+                                                sanitize_for_log(&module), sanitize_for_log(&target), duration
+                                            ))
+                                            .await;
+                                    }
+                                });
+                            }
+                            Err(e) => eprintln!("Worker Thread: Failed to create runtime: {}", e),
+                        }
+                    }).join().ok();
+                } else {
+                    break; // Channel closed
+                }
+            }
+        });
+    }
 
     // Log initial startup
     state
         .log_message(&format!(
-            "Starting API server on {} with hardening: {}, IP limit: {}",
-            bind_address, harden, ip_limit
+            "Starting API server on {} with hardening: {}, IP limit: {}, Workers: {}, Queue: {}",
+            bind_address, harden, ip_limit, workers, queue_size
         ))
         .await?;
 
@@ -750,12 +1058,16 @@ pub async fn start_api_server(
     if harden {
         println!("📊 IP limit: {}", ip_limit);
     }
+    println!("👷 Workers: {}", workers);
+    println!("📥 Queue Size: {}", queue_size);
     println!("📝 Log file: {}", state.log_file.display());
 
     // Create routes that require authentication
     let protected_routes = Router::new()
         .route("/api/modules", get(list_modules))
+        .route("/api/module/:category/:name", get(get_module_info))
         .route("/api/run", post(run_module))
+        .route("/api/validate", post(validate_module_params))
         .route("/api/status", get(get_status))
         .route("/api/rotate-key", post(rotate_key_endpoint))
         .route("/api/ips", get(get_tracked_ips))

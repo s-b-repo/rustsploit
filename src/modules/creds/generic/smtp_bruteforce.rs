@@ -67,17 +67,17 @@ pub async fn run(target: &str) -> Result<()> {
 
     // --- Standard Single Target Logic ---
     
-    let port = prompt_int_range("Port", 25, 1, 65535).await? as u16;
-    let username_wordlist = prompt_existing_file("Username wordlist file").await?;
-    let password_wordlist = prompt_existing_file("Password wordlist file").await?;
+    let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
+    let username_wordlist = prompt_existing_file("Username wordlist file")?;
+    let password_wordlist = prompt_existing_file("Password wordlist file")?;
     
-    let threads = prompt_int_range("Threads", 8, 1, 256).await? as usize;
-    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000).await? as u64;
+    let threads = prompt_int_range("Threads", 8, 1, 256)? as usize;
+    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000)? as u64;
     
-    let stop_on_success = prompt_yes_no("Stop on first valid login?", true).await?;
-    let full_combo = prompt_yes_no("Try every username with every password?", false).await?;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let output_file = prompt_default("Output file for results", "smtp_results.txt").await?;
+    let stop_on_success = prompt_yes_no("Stop on first valid login?", true)?;
+    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let output_file = prompt_default("Output file for results", "smtp_results.txt")?;
 
     let config = SmtpBruteforceConfig {
         target: target.to_string(),
@@ -98,9 +98,9 @@ pub async fn run(target: &str) -> Result<()> {
 
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
-    let port = prompt_int_range("Port", 25, 1, 65535).await? as u16;
-    let usernames_file = prompt_wordlist("Username wordlist").await?;
-    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -108,9 +108,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?; 
-    let output_file = prompt_default("Output result file", "smtp_mass_results.txt").await?;
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?; 
+    let output_file = prompt_default("Output result file", "smtp_mass_results.txt")?;
 
     // Parse exclusions
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));

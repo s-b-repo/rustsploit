@@ -46,7 +46,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("[*] Target: {}", target);
 
     let port: u16 = loop {
-        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string()).await?;
+        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string())?;
         match input.parse() {
             Ok(p) if p > 0 => break p,
             _ => println!("{}", "Invalid port. Must be between 1 and 65535.".yellow()),
@@ -54,16 +54,16 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     // Ask about default credentials
-    let use_defaults = prompt_yes_no("Try default credentials first?", true).await?;
+    let use_defaults = prompt_yes_no("Try default credentials first?", true)?;
     
-    let usernames_file = if prompt_yes_no("Use username wordlist?", true).await? {
-        Some(prompt_existing_file("Username wordlist").await?)
+    let usernames_file = if prompt_yes_no("Use username wordlist?", true)? {
+        Some(prompt_existing_file("Username wordlist")?)
     } else {
         None
     };
     
-    let passwords_file = if prompt_yes_no("Use password wordlist?", true).await? {
-        Some(prompt_existing_file("Password wordlist").await?)
+    let passwords_file = if prompt_yes_no("Use password wordlist?", true)? {
+        Some(prompt_existing_file("Password wordlist")?)
     } else {
         None
     };
@@ -73,7 +73,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "10").await?;
+        let input = prompt_default("Max concurrent tasks", "10")?;
         match input.parse() {
             Ok(n) if n > 0 && n <= 256 => break n,
             _ => println!("{}", "Invalid number. Must be between 1 and 256.".yellow()),
@@ -81,17 +81,17 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let connection_timeout: u64 = loop {
-        let input = prompt_default("Connection timeout (seconds)", "5").await?;
+        let input = prompt_default("Connection timeout (seconds)", "5")?;
         match input.parse() {
             Ok(n) if n >= 1 && n <= 60 => break n,
             _ => println!("{}", "Invalid timeout. Must be between 1 and 60 seconds.".yellow()),
         }
     };
 
-    let retry_on_error = prompt_yes_no("Retry on connection errors?", true).await?;
+    let retry_on_error = prompt_yes_no("Retry on connection errors?", true)?;
     let max_retries: usize = if retry_on_error {
         loop {
-            let input = prompt_default("Max retries per attempt", "2").await?;
+            let input = prompt_default("Max retries per attempt", "2")?;
             match input.parse() {
                 Ok(n) if n > 0 && n <= 10 => break n,
                 _ => println!("{}", "Invalid retries. Must be between 1 and 10.".yellow()),
@@ -101,15 +101,15 @@ pub async fn run(target: &str) -> Result<()> {
         0
     };
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let save_results = prompt_yes_no("Save results to file?", true).await?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "ssh_brute_results.txt").await?)
+        Some(prompt_default("Output file", "ssh_brute_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
 
     let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|_| format!("{}:{}", target, port));
 
@@ -365,7 +365,7 @@ pub async fn run(target: &str) -> Result<()> {
             .yellow()
             .bold()
         );
-        if prompt_yes_no("Save unknown responses to file?", true).await? {
+        if prompt_yes_no("Save unknown responses to file?", true)? {
             let default_name = "ssh_unknown_responses.txt";
             let fname = prompt_default(
                 &format!(
@@ -373,7 +373,7 @@ pub async fn run(target: &str) -> Result<()> {
                     default_name
                 ),
                 default_name,
-            ).await?;
+            )?;
             let filename = get_filename_in_current_dir(&fname);
             use std::fs::File;
             match File::create(&filename) {

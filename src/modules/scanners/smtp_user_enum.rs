@@ -10,7 +10,7 @@ use colored::*;
 use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -132,13 +132,13 @@ pub async fn run(target: &str) -> Result<()> {
     println!("  2. Targets from file (ignore current target)");
     println!("  3. Current target + targets from file");
     println!();
-    let mode = prompt("Select mode [1-3] (default 1): ").await?;
+    let mode = prompt("Select mode [1-3] (default 1): ")?;
 
     // Build initial target list based on selected mode
     let mut targets: Vec<String> = Vec::new();
     match mode.trim() {
         "2" => {
-            let file_path = prompt("Targets file (one IP/hostname per line): ").await?;
+            let file_path = prompt("Targets file (one IP/hostname per line): ")?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 2"));
             }
@@ -152,7 +152,7 @@ pub async fn run(target: &str) -> Result<()> {
             if !target.trim().is_empty() {
                 targets.push(target.trim().to_string());
             }
-            let file_path = prompt("Additional targets file (one IP/hostname per line): ").await?;
+            let file_path = prompt("Additional targets file (one IP/hostname per line): ")?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 3"));
             }
@@ -170,11 +170,11 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    let port = prompt_port(DEFAULT_SMTP_PORT).await?;
-    let username_wordlist = prompt_wordlist("Username wordlist file: ").await?;
-    let threads = prompt_threads(DEFAULT_THREADS).await?;
-    let timeout_ms = prompt_timeout(DEFAULT_TIMEOUT_MS).await?;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
+    let port = prompt_port(DEFAULT_SMTP_PORT)?;
+    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
+    let threads = prompt_threads(DEFAULT_THREADS)?;
+    let timeout_ms = prompt_timeout(DEFAULT_TIMEOUT_MS)?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
 
     if targets.is_empty() {
         return Err(anyhow!("No targets specified for SMTP enumeration"));
@@ -655,11 +655,11 @@ async fn finalize_and_report(
             println!("  {}  {} - {}", "✓".green(), username, response);
         }
 
-        if prompt("\nSave valid usernames? (y/n): ").await?
+        if prompt("\nSave valid usernames? (y/n): ")?
             .trim()
             .eq_ignore_ascii_case("y")
         {
-            let filename = prompt("What should the valid results be saved as?: ").await?;
+            let filename = prompt("What should the valid results be saved as?: ")?;
             if filename.is_empty() {
                 println!("{}", "[-] Filename cannot be empty.".red());
             } else {
@@ -682,13 +682,13 @@ async fn finalize_and_report(
             .bold()
         );
 
-        if prompt("Save unknown responses to file? (y/n): ").await?
+        if prompt("Save unknown responses to file? (y/n): ")?
             .trim()
             .eq_ignore_ascii_case("y")
         {
             let default_name = "smtp_unknown_responses.txt";
             let filename =
-                prompt(&format!("What should the unknown results be saved as? [{}]: ", default_name)).await?;
+                prompt(&format!("What should the unknown results be saved as? [{}]: ", default_name))?;
             let chosen = if filename.trim().is_empty() {
                 default_name.to_string()
             } else {
@@ -750,23 +750,21 @@ fn save_unknown_responses(path: &str, entries: &[(String, String)]) -> Result<()
     Ok(())
 }
 
-async fn prompt(msg: &str) -> Result<String> {
+fn prompt(msg: &str) -> Result<String> {
     print!("{}", msg);
-    tokio::io::stdout()
+    std::io::stdout()
         .flush()
-        .await
         .context("Failed to flush stdout")?;
     let mut buffer = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
+    std::io::stdin()
         .read_line(&mut buffer)
-        .await
         .context("Failed to read input")?;
     Ok(buffer.trim().to_string())
 }
 
-async fn prompt_port(default: u16) -> Result<u16> {
+fn prompt_port(default: u16) -> Result<u16> {
     loop {
-        let input = prompt(&format!("SMTP Port (default {}): ", default)).await?;
+        let input = prompt(&format!("SMTP Port (default {}): ", default))?;
         if input.is_empty() {
             return Ok(default);
         }
@@ -778,9 +776,9 @@ async fn prompt_port(default: u16) -> Result<u16> {
     }
 }
 
-async fn prompt_threads(default: usize) -> Result<usize> {
+fn prompt_threads(default: usize) -> Result<usize> {
     loop {
-        let input = prompt(&format!("Threads (default {}): ", default)).await?;
+        let input = prompt(&format!("Threads (default {}): ", default))?;
         if input.is_empty() {
             return Ok(default.max(1));
         }
@@ -793,9 +791,9 @@ async fn prompt_threads(default: usize) -> Result<usize> {
     }
 }
 
-async fn prompt_timeout(default: u64) -> Result<u64> {
+fn prompt_timeout(default: u64) -> Result<u64> {
     loop {
-        let input = prompt(&format!("Timeout in milliseconds (default {}): ", default)).await?;
+        let input = prompt(&format!("Timeout in milliseconds (default {}): ", default))?;
         if input.is_empty() {
             return Ok(default);
         }
@@ -807,10 +805,10 @@ async fn prompt_timeout(default: u64) -> Result<u64> {
     }
 }
 
-async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
+fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     let default_char = if default_yes { "y" } else { "n" };
     loop {
-        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char)).await?;
+        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char))?;
         if input.is_empty() {
             return Ok(default_yes);
         }
@@ -822,9 +820,9 @@ async fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
-async fn prompt_wordlist(message: &str) -> Result<String> {
+fn prompt_wordlist(message: &str) -> Result<String> {
     loop {
-        let response = prompt(message).await?;
+        let response = prompt(message)?;
         if response.is_empty() {
             println!("{}", "[!] Path cannot be empty.".yellow());
             continue;

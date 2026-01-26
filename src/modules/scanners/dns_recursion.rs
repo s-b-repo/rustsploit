@@ -44,16 +44,16 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let needs_default_port = targets.iter().any(|t| t.port.is_none());
     let default_port = if needs_default_port {
-        prompt_port("Default DNS port", 53).await?
+        prompt_port("Default DNS port", 53)?
     } else {
         53
     };
 
-    let query_name_input = prompt_default("Domain to query", "google.com").await?;
+    let query_name_input = prompt_default("Domain to query", "google.com")?;
     let query_name = validate_domain_input(&query_name_input)?;
 
     let record_input =
-        prompt_default("Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY").await?;
+        prompt_default("Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY")?;
     let record_type = parse_record_type(&record_input)?;
 
     println!(

@@ -81,7 +81,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("3. Load Template (Load -> Run)");
     println!("4. Custom Attack (Wizard -> Run)");
     
-    let choice = prompt_default("Selection", "1").await?;
+    let choice = prompt_default("Selection", "1")?;
     
     let config = match choice.as_str() {
         "1" => setup_quick_attack(target).await?,
@@ -119,7 +119,7 @@ async fn setup_quick_attack(initial_target: &str) -> Result<DirBruteConfig> {
     let (proto, host, port, path) = parse_target_interactive(initial_target).await?;
     
     // 2. Wordlist
-    let wordlist = prompt_wordlist("Wordlist path").await?;
+    let wordlist = prompt_wordlist("Wordlist path")?;
     
     Ok(DirBruteConfig {
         target_host: host,
@@ -144,14 +144,14 @@ async fn setup_wizard(initial_target: &str) -> Result<DirBruteConfig> {
     println!("2. Nuke Mode (GET, POST, PUT, HEAD, OPTIONS...) - Noisy!");
     println!("3. TOTAL DESTRUCTION (Level 2 + DELETE) - DANGEROUS");
     
-    let mode_str = prompt_default("Mode", "1").await?;
+    let mode_str = prompt_default("Mode", "1")?;
     let scan_mode = match mode_str.as_str() {
         "3" => {
             println!("\n{}", "!!! CRITICAL WARNING !!!".on_red().white().bold());
             println!("{}", "You have selected TOTAL DESTRUCTION mode.".red().bold());
             println!("This will attempt HTTP DELETE method on discovered resources.");
             println!("This can PERMANENTLY DESTROY data on the target server.");
-            let confirm = prompt_required("Type 'DESTROY' to confirm").await?;
+            let confirm = prompt_required("Type 'DESTROY' to confirm")?;
             if confirm != "DESTROY" {
                 println!("{}", "Confirmation failed. Reverting to Standard Mode.".yellow());
                 1
@@ -161,30 +161,30 @@ async fn setup_wizard(initial_target: &str) -> Result<DirBruteConfig> {
         },
         "2" => {
             println!("\n{}", "[!] Warning: Nuke Mode sends multiple requests per path.".yellow());
-            if prompt_yes_no("Continue?", true).await? { 2 } else { 1 }
+            if prompt_yes_no("Continue?", true)? { 2 } else { 1 }
         },
         _ => 1
     };
     
     // 3. Wordlist
-    let wordlist = prompt_wordlist("Wordlist path").await?;
+    let wordlist = prompt_wordlist("Wordlist path")?;
     
     // 4. Performance
-    let concurrency: usize = prompt_default("Concurrency (Threads)", "10").await?.parse().unwrap_or(10);
-    let delay_ms: u64 = prompt_default("Delay per request (ms)", "200").await?.parse().unwrap_or(200);
+    let concurrency: usize = prompt_default("Concurrency (Threads)", "10")?.parse().unwrap_or(10);
+    let delay_ms: u64 = prompt_default("Delay per request (ms)", "200")?.parse().unwrap_or(200);
     
     // 5. Evasion
-    let random_agent = prompt_yes_no("Use Random User-Agents?", false).await?;
+    let random_agent = prompt_yes_no("Use Random User-Agents?", false)?;
     
-    let custom_cookies = if prompt_yes_no("Configure Custom Cookies (WAF/Cloudflare)?", false).await? {
+    let custom_cookies = if prompt_yes_no("Configure Custom Cookies (WAF/Cloudflare)?", false)? {
         println!("{}", "Enter cookie string (e.g. 'cf_clearance=XXX; _cfduid=YYY')".dimmed());
-        Some(prompt_required("Cookies").await?)
+        Some(prompt_required("Cookies")?)
     } else {
         None
     };
 
     // 6. Reporting
-    let verbose = prompt_yes_no("Verbose Output (show 403s)?", false).await?;
+    let verbose = prompt_yes_no("Verbose Output (show 403s)?", false)?;
     
     Ok(DirBruteConfig {
         target_host: host,
@@ -205,7 +205,7 @@ async fn setup_wizard(initial_target: &str) -> Result<DirBruteConfig> {
 async fn parse_target_interactive(raw: &str) -> Result<(String, String, u16, String)> {
     // Basic normalization from utils
     let resolved_ip = if raw.is_empty() {
-        prompt_required("Target Host/IP").await?
+        prompt_required("Target Host/IP")?
     } else {
         let normalized = normalize_target(raw)?;
         // strip port if present in normalized, we ask for it separately to allow http/https logic
@@ -216,22 +216,22 @@ async fn parse_target_interactive(raw: &str) -> Result<(String, String, u16, Str
         }
     };
 
-    let use_https = prompt_yes_no("Use HTTPS?", true).await?;
+    let use_https = prompt_yes_no("Use HTTPS?", true)?;
     let proto = if use_https { "https".to_string() } else { "http".to_string() };
     
     let def_port = if use_https { "443" } else { "80" };
-    let port: u16 = prompt_default(&format!("Port (default {})", def_port), def_port).await?
+    let port: u16 = prompt_default(&format!("Port (default {})", def_port), def_port)?
         .parse()
         .context("Invalid port")?;
         
-    let path_input = prompt_default("Base Path (must end with /)", "/").await?;
+    let path_input = prompt_default("Base Path (must end with /)", "/")?;
     
     // Slash check logic
     let path = if !path_input.ends_with('/') {
-        if prompt_yes_no("Path does not end with '/'. Append it?", true).await? {
+        if prompt_yes_no("Path does not end with '/'. Append it?", true)? {
             format!("{}/", path_input)
         } else {
-            if !prompt_yes_no("Continue without trailing slash? (May break scanning)", false).await? {
+            if !prompt_yes_no("Continue without trailing slash? (May break scanning)", false)? {
                 return Err(anyhow!("Aborted by user due to path format."));
             }
             path_input
@@ -246,7 +246,7 @@ async fn parse_target_interactive(raw: &str) -> Result<(String, String, u16, Str
 // --- Persistence ---
 
 async fn save_template(config: &DirBruteConfig) -> Result<()> {
-    let name = prompt_default("Template Name (e.g. 'myscan.json')", "scan_template.json").await?;
+    let name = prompt_default("Template Name (e.g. 'myscan.json')", "scan_template.json")?;
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&name, json).context("Failed to write template file")?;
     println!("Saved config to {}", name);
@@ -254,7 +254,7 @@ async fn save_template(config: &DirBruteConfig) -> Result<()> {
 }
 
 async fn load_template() -> Result<DirBruteConfig> {
-    let path = prompt_existing_file("Template File Path").await?;
+    let path = prompt_existing_file("Template File Path")?;
     let content = fs::read_to_string(&path)?;
     let config: DirBruteConfig = serde_json::from_str(&content).context("Invalid template format")?;
     
@@ -263,7 +263,7 @@ async fn load_template() -> Result<DirBruteConfig> {
     println!("Mode: Level {}", config.scan_mode);
     println!("Wordlist: {}", config.wordlist_path);
     
-    if !prompt_yes_no("Run this configuration?", true).await? {
+    if !prompt_yes_no("Run this configuration?", true)? {
         return Err(anyhow!("User cancelled after loading template."));
     }
     
@@ -411,8 +411,8 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
 
     // Report & Save
     let final_results = results_mutex.lock().await;
-    if !final_results.is_empty() && prompt_yes_no("Save results to file?", true).await? {
-        let sort_choice = prompt_default("Sort by (1) Status or (2) Size", "1").await?;
+    if !final_results.is_empty() && prompt_yes_no("Save results to file?", true)? {
+        let sort_choice = prompt_default("Sort by (1) Status or (2) Size", "1")?;
         
         let mut sorted: Vec<&ScanResult> = final_results.iter().collect();
         if sort_choice == "2" {

@@ -70,26 +70,26 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
-    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false).await?;
+    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false)?;
     let default_port = if use_ssl { 995 } else { 110 };
     
-    let port = prompt_int_range("Port", default_port as i64, 1, 65535).await? as u16;
-    let username_wordlist = prompt_existing_file("Username wordlist file").await?;
-    let password_wordlist = prompt_existing_file("Password wordlist file").await?;
+    let port = prompt_int_range("Port", default_port as i64, 1, 65535)? as u16;
+    let username_wordlist = prompt_existing_file("Username wordlist file")?;
+    let password_wordlist = prompt_existing_file("Password wordlist file")?;
     
-    let threads = prompt_int_range("Threads", 16, 1, 256).await? as usize;
-    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000).await? as u64;
-    let connection_timeout = prompt_int_range("Timeout (s)", 5, 1, 60).await? as u64;
+    let threads = prompt_int_range("Threads", 16, 1, 256)? as usize;
+    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000)? as u64;
+    let connection_timeout = prompt_int_range("Timeout (s)", 5, 1, 60)? as u64;
     
-    let full_combo = prompt_yes_no("Try every username with every password?", false).await?;
-    let stop_on_success = prompt_yes_no("Stop on first valid login?", false).await?;
+    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
+    let stop_on_success = prompt_yes_no("Stop on first valid login?", false)?;
     
-    let output_file = prompt_default("Output file for results", "pop3_results.txt").await?;
+    let output_file = prompt_default("Output file for results", "pop3_results.txt")?;
     
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let retry_on_error = prompt_yes_no("Retry failed connections?", true).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let retry_on_error = prompt_yes_no("Retry failed connections?", true)?;
     let max_retries = if retry_on_error { 
-        prompt_int_range("Max retries", 2, 1, 10).await? as usize
+        prompt_int_range("Max retries", 2, 1, 10)? as usize
     } else { 
         0 
     };
@@ -119,12 +119,12 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 async fn run_mass_scan(target: &str) -> Result<()> {
-    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false).await?;
+    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false)?;
     let default_port = if use_ssl { 995 } else { 110 };
-    let port = prompt_int_range("Port", default_port as i64, 1, 65535).await? as u16;
+    let port = prompt_int_range("Port", default_port as i64, 1, 65535)? as u16;
     
-    let usernames_file = prompt_wordlist("Username wordlist").await?;
-    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -132,9 +132,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?; 
-    let output_file = prompt_default("Output result file", "pop3_mass_results.txt").await?;
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?; 
+    let output_file = prompt_default("Output result file", "pop3_mass_results.txt")?;
 
     // Parse exclusions
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));

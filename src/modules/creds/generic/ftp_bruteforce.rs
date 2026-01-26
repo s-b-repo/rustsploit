@@ -140,14 +140,14 @@ pub async fn run(target: &str) -> Result<()> {
     // --- Standard Single Target Logic ---
 
     let port: u16 = loop {
-        let input = prompt_default("FTP Port", "21").await?;
+        let input = prompt_default("FTP Port", "21")?;
         if let Ok(p) = input.parse() { break p }
         println!("Invalid port. Try again.");
     };
-    let usernames_file = prompt_required("Username wordlist").await?;
-    let passwords_file = prompt_required("Password wordlist").await?;
+    let usernames_file = prompt_required("Username wordlist")?;
+    let passwords_file = prompt_required("Password wordlist")?;
     let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "500").await?;
+        let input = prompt_default("Max concurrent tasks", "500")?;
         if let Ok(n) = input.parse::<usize>() {
             if n > 0 { break n }
         }
@@ -157,15 +157,15 @@ pub async fn run(target: &str) -> Result<()> {
     // Create a semaphore to limit concurrent network operations
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let save_results = prompt_yes_no("Save results to file?", true).await?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "ftp_results.txt").await?)
+        Some(prompt_default("Output file", "ftp_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let combo_mode = prompt_yes_no("Combination mode (user × pass)?", false).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode (user × pass)?", false)?;
 
     let display_addr = format_addr_for_display(target, port);
     let connect_addr = format_addr_for_display(target, port);
@@ -393,9 +393,9 @@ pub async fn run(target: &str) -> Result<()> {
 
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
-    let port: u16 = prompt_default("FTP Port", "21").await?.parse().unwrap_or(21);
-    let usernames_file = prompt_wordlist("Username wordlist").await?;
-    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    let port: u16 = prompt_default("FTP Port", "21")?.parse().unwrap_or(21);
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -403,9 +403,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?; 
-    let output_file = prompt_default("Output result file", "ftp_brute_mass_results.txt").await?;
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?; 
+    let output_file = prompt_default("Output result file", "ftp_brute_mass_results.txt")?;
 
     // Parse exclusions
     let mut exclusion_subnets = Vec::new();

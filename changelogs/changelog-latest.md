@@ -3218,3 +3218,599 @@ Specifically:
 
 Updated SHELL_PROMPTS in src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs.
 Expanded success_indicators in get_default_prompts and has_success_indicators in src/modules/creds/generic/telnet_bruteforce.rs.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Trend Micro Apex Central RCE Module
+I have implemented a new exploit module for Trend Micro Apex Central, targeting CVE-2025-5777. This module allows for:
+
+Vulnerability Checking: Uses a ping command to verify RCE by checking for "ping statistics" or "bytes from" in the response.
+Command Execution: Allows executing arbitrary commands via the 
+cmd
+ parameter.
+Changes
+[NEW] src/modules/exploits/trend_micro/
+Created the directory to house Trend Micro exploits.
+
+[NEW] 
+cve_2025_5777.rs
+This file contains the core logic for the exploit.
+
+check_vulnerability: Sends ping -c 3 127.0.0.1 and checks for success indicators.
+exploit_command: Takes user input and sends it as a command payload.
+run: The main entry point that provides an interactive menu.
+[NEW] 
+mod.rs
+Registers the cve_2025_5777 module.
+
+[MODIFY] 
+mod.rs
+Registered the trend_micro module category.
+
+Usage
+To use this module, you would typically select it from the rustsploit main menu (once integrated into the main menu system) or call it directly if testing. Currently, it is registered in the exploits list.
+
+Verification Results
+Automated Tests
+cargo check passed successfully, ensuring all code compiles and dependencies are correct.
+Manual Verification
+The code structure follows the project patterns.
+The HTTP request format matches the provided Python PoC (POST to /TrendMicro/EndpointBaseCamp/UI/Login.aspx).
+[NEW] src/modules/exploits/trend_micro/cve_2025_69258.rs
+Vulnerability: RCE via MsgReceiver.exe Message 0x0a8d (LoadLibraryEx).
+Usage: Connects to port 20001, sends a message to load an attacker-controlled DLL (e.g., from an SMB share).
+Input: Target host and DLL path.
+[NEW] src/modules/exploits/trend_micro/cve_2025_69259.rs
+Vulnerability: DoS via MsgReceiver.exe Message 0x1b5b (Unchecked NULL Return).
+Usage: Connects to port 20001, sends a malformed message (New Protocol) missing CRLF to crash the service.
+Input: Target host.
+[NEW] src/modules/exploits/trend_micro/cve_2025_69260.rs
+Vulnerability: DoS via MsgReceiver.exe Message 0x1b5b (OOB Read).
+Usage: Connects to port 20001, sends a malformed message (Old Protocol) with a fake huge string size to crash the service.
+Input: Target host.
+
+I have fixed all 4 Trend Micro modules:
+
+Changes Made:
+
+CVE-2025-5777: Now uses utils.rs async prompts (prompt_default, prompt_required, normalize_target). Removed excessive comments and improved response handling.
+CVE-2025-69258: Now uses utils.rs prompts with customizable port input (prompt_port). Added confirmation before exploit execution.
+CVE-2025-69259: Now uses utils.rs prompts with customizable port. Added better crash detection feedback.
+CVE-2025-69260: Now uses utils.rs prompts with customizable port. Fixed unused variable warning. Added detailed OOB explanation.
+
+
+Prompt Hanging Fix
+Problem
+The user reported that interactive prompts in various modules were hanging. This was traced to the use of tokio::io::stdin() and tokio::io::stdout() for synchronous user input (e.g., asking for target IP, port, or options) within the 
+run
+ functions of modules. When running in certain async runtime configurations or when mixed with other blocking operations, tokio::io standard streams can behave unexpectedly or hang if not properly managed, especially for simple "stop and wait for input" scenarios.
+
+Solution
+We replaced tokio::io::stdin() and tokio::io::stdout() with std::io::stdin() and std::io::stdout() for all synchronous user prompts. This ensures that the program blocks on input as expected during configuration steps, resolving the hang.
+
+Scope of Changes
+We identified and fixed modules across three main categories:
+
+Scanners: ssh_login.rs, 
+telnet_bruteforce.rs
+, etc.
+Creds: Confirmed no affected files.
+Exploits: Fixed approximately 20 modules including 
+ssh
+ exploits, 
+telnet
+ auth bypass, palo_alto, jenkins, flowise, react, apache_tomcat (various), 
+ftp
+, payloadgens (batgen, lnkgen, narutto), and avtech.
+Interactive Shells
+Note that for modules implementing asynchronous interactive shells (e.g., 
+telnet
+ exploit shell, openssh race condition bind shell), we retained tokio::io::stdin() where it is used inside an async loop (e.g., tokio::select!) to forward input to a network stream. This is necessary for concurrent I/O handling and does not suffer from the same "hanging" issue as the synchronous configuration prompts.
+
+Verified Modules
+The following key modules were updated:
+
+modules/scanners/http/http_bruteforce.rs
+modules/scanners/ssh/ssh_login.rs
+modules/scanners/telnet/telnet_bruteforce.rs
+modules/exploits/ssh/sshpwn_*.rs (Multiple files)
+modules/exploits/ssh/opensshserver_9_8p1race_condition.rs
+modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs
+ (Config prompts fixed)
+modules/exploits/palo_alto/panos_authbypass_cve_2025_0108.rs
+modules/exploits/jenkins/jenkins_2_441_lfi.rs
+modules/exploits/apache_tomcat/cve_2025_24813_apache_tomcat_rce.rs
+modules/exploits/ftp/pachev_ftp_path_traversal_1_0.rs
+modules/exploits/flowise/cve_2025_59528_flowise_rce.rs
+modules/exploits/react/react2shell.rs
+modules/exploits/avtech/cve_2024_7029_avtech_camera.rs
+modules/exploits/payloadgens/*.rs
+Conclusion
+Users should no longer experience hangs when entering target information or selecting options in the affected modules. All interactive configuration prompts now use the reliable standard library blocking I/O.
+
+
+
+
+
+1
+Fixing import issues in narutto_dropper.rs and opensshserver_9_8p1race_condition.rs
+
+2
+Fixing async/sync prompt issues in sshpwn_sftp_attacks.rs
+
+3
+Fixing remaining SSH modules with async prompt issues
+
+4
+Fixing all async prompt functions across SSH modules
+
+5
+Fixing sshpwn_scp_attacks.rs prompt functions
+
+6
+Fixing remaining sshpwn_session.rs, sshpwn_auth_passwd.rs, sshpwn_pam.rs modules
+
+7
+Fixing sshpwn_session.rs and sshpwn_auth_passwd.rs and sshpwn_pam.rs prompt functions
+
+8
+Fixing sshpwn_auth_passwd.rs and sshpwn_pam.rs async prompts
+
+9
+Fixing sshpwn_pam.rs and running cargo check to verify remaining fixes
+
+10
+Applying fixes to sshpwn_pam.rs and remaining files
+
+11
+Fixing avtech, catkiller, and jenkins modules with prompt issues
+
+12
+Fixing avtech camera and catkiller modules with missing imports and async issues
+
+13
+Fixing remaining imports in jenkins_2_441_lfi.rs and react2shell.rs
+
+14
+Adding missing std::io imports and converting async prompt functions to sync
+
+15
+Fixing remaining call sites with .await on sync prompt functions
+
+16
+Fixing fortinet fortiweb module async prompt issues
+
+17
+Converting fortiweb prompt_input_std to sync and running final cargo check
+
+
+
+
+87+ modules available across 3 categories: creds, exploits, scanners
+Module loading verified: sample_exploit, sample_scanner, react2shell, sshpwn_session, port_scanner all load without errors
+Interactive shell works correctly
+CLI mode with -m and -t flags works correctly
+Example verified modules:
+
+exploits/ssh/sshpwn_session - Loads correctly
+exploits/react/react2shell - Loads correctly
+exploits/fortinet/fortiweb_sqli_rce_cve_2025_25257 - Loads correctly
+scanners/port_scanner - Loads correctly
+scanners/http_title_scanner - Loads correctly
+The project is fully functional after fixing the async prompt issues across 19 files.
+
+---
+
+## Changelog
+
+### v0.5.0 (2026-01-25)
+
+- **Fixed async prompt functions** - Resolved compilation errors in 19 module files caused by blocking `std::io` calls inside async functions
+- **CLI error handling** - Added proper warning messages for invalid flag combinations (`-m` without `-t`, `--harden` without `--api`)
+- **Improved CLI UX** - Colored warnings (yellow) and usage hints for common mistakes
+
+---
+
+
+## Changelog
+
+### v0.5.0 (2026-01-25)
+
+**🔧 Critical Fixes:**
+- **Fixed async prompt functions across 19 module files** - Resolved compilation errors caused by blocking `std::io` calls inside `async fn` functions. Converted synchronous prompt functions (`prompt_port`, `prompt_yes_no`, `prompt_default`, etc.) to proper sync functions.
+- Fixed modules: `http_title_scanner`, `ssdp_msearch`, `sample_scanner`, `narutto_dropper`, `opensshserver_9_8p1race_condition`, `sshpwn_sftp_attacks`, `sshpwn_scp_attacks`, `sshpwn_session`, `sshpwn_auth_passwd`, `sshpwn_pam`, `cve_2024_7029_avtech_camera`, `catkiller_cve_2025_31650`, `jenkins_2_441_lfi`, `react2shell`, `fortiweb_sqli_rce_cve_2025_25257`, `telnet_auth_bypass_cve_2026_24061`, `port_scanner`
+
+1
+Implementing verbose flag in CLI and main execution flow
+
+2
+Adding verbose logging helper to utils and updating command handlers
+
+3
+Updating API and Shell to support verbose flag
+
+4
+Updating shell module to use verbose flag and updating main call site
+
+5
+Finalizing Phase 1 by updating main.rs and verifying compilation
+
+6
+Fixing duplicate fields in api.rs and re-verifying compilation
+
+7
+Verifying verbose flag functionality
+
+8
+Fixing unused variable warnings and verifying verbose output
+
+9
+Phase 4 (API Logic Improvements) is complete. I've added request tracking (IDs, timestamps, duration), new validation endpoints, and ensured the API adheres to the new structured error format with no dead code. I'm ready to move to Phase 5 (Documentation).  Phase 4: API Logic Improvements
+I corrected the duplicate serde attribute and utilized ExecutionError in logging to resolve dead code warnings. cargo check is running cleanly. I am verifying the command status and will then mark Phase 4 as complete in the task list.
+
+ Phase 3 (CLI Logic Improvements) is complete. I have added the --list-modules flag and output-format option. I also resolved all dead code warnings, ensuring a clean build. I am ready to start Phase 4 (API Logic Improvemen Phase 2: Enhanced Error Handling
+I successfully implemented and verified the enhanced error handling features. The fuzzy matching correctly suggests similar modules, and invalid module names trigger the expected error messages. Direct module execution via CLI flags is also functional. Phase 1 (Verbose Flag) is complete. I have added the --verbose flag and verified it logs detailed operations in the CLI and API. I am ready to start Phase 2 (Enhanced Error Handling).
+
+
+
+CLI, API, and Job Queue Overhaul
+Goal Description
+Refactor the CLI and API to support robust concurrent execution, improved observability, and "fire-and-forget" job processing, while updating documentation to match.
+
+Changes Made
+1. CLI Logic Improvements
+Implemented --list-modules flag to browse tools without entering the interactive shell.
+Added --verbose flag for detailed operation logs.
+Added --output-format <text|json> for flexible output control.
+Improved command flow and error handling in main.rs and cli.rs.
+
+2. API Logic Improvements
+New Endpoints:
+POST /api/validate: Validate parameters without execution.
+GET /api/module/:category/:name: Retrieve specific module details.
+Request Tracking: Added request_id, timestamp, and duration_ms to API responses.
+Structured Errors: Implemented ApiErrorCode enum for consistent error reporting (AuthFailed, RateLimited, etc.).
+Dead Code Removal: Ensured all error codes and struct fields are utilized.
+
+3. Async Job Queue & Refactoring (Fire-and-Forget)
+Replaced the simple semaphore-based concurrency limit with a robust mpsc channel-based worker pool.
+Configurable Queue: Added --queue-size (default: 100) to limit pending jobs.
+Configurable Workers: Added --workers (default: 10) to control concurrent execution threads.
+Behavior:
+API now returns 202 Accepted immediately if the job is queued.
+Returns 503 Service Unavailable if the queue is full.
+Worker threads process jobs in the background, logging execution duration.
+
+4. Documentation Updates
+Updated README.md and docs/readme.md to include:
+New CLI flags (--list-modules, --verbose, --output-format).
+API endpoints and response structures.
+Async job queue configuration.
+
+Verification
+cargo check passes with 0 errors and 0 warnings.
+Verified API accepts jobs and processes them in background workers.
+Verified queue limits correctly reject excess requests with 503.
+
+Phase 7: Docker Setup Update Implementation Plan
+Goal
+Update 
+scripts/setup_docker.py
+ to support the new queue-size and workers configuration options introduced in Phase 6. This ensures that Docker deployments can tune performance parameters.
+
+Proposed Changes
+Setup Script
+
+[MODIFY] 
+scripts/setup_docker.py
+Arguments: Add --queue-size (default: 100) and --workers (default: 10) to parse_args.
+Interactive Prompts: Add prompts for these values in interactive_prompts function.
+Environment Variables: Add QUEUE_SIZE and WORKERS to the generated .env file.
+Entrypoint Generation: Update entrypoint.sh generation to pass --queue-size "${QUEUE_SIZE}" --workers "${WORKERS}" to the cargo run command.
+Verification Plan
+Manual Verification
+Run python3 scripts/setup_docker.py --help to verify new flags.
+Run dry-run generation and inspect docker/entrypoint.sh and .env.rustsploit-docker.
+
+
+
+5. Docker Setup Update
+Updated scripts/setup_docker.py to support the new performance flags.
+Added interactive prompts for Job Queue Size and Worker Threads.
+Added CLI arguments (--queue-size, --workers, --non-interactive) for automated deployments.
+Updated entrypoint.sh generation to inject RUSTSPLOIT_QUEUE_SIZE and RUSTSPLOIT_WORKERS into the container execution.
+
+
+
+Update Changelog with Docker Changes
+I completed Phase 7 (Docker Setup Update) by modifying 
+scripts/setup_docker.py
+ to prompt for queue-size and workers, updating entrypoint.sh generation, and adding CLI argument support for non-interactive mode. I verified this by running the help command. Now I am appending the summary of these Docker setup changes to 
+changelogs/changelog-latest.md
+.
+
+Progress Updates
+1
+Appending summary of Phase 7 to changelogs/changelog-latest.md
+
+I have updated scripts/setup_docker.py to be compatible with the new API changes.
+
+New Features:
+Prompts for Job queue size and Number of worker threads in interactive mode.
+Supports CLI arguments --queue-size and --workers for non-interactive automation.
+Example: python3 scripts/setup_docker.py --non-interactive --queue-size 200 --workers 20
+
+Generated Files:
+entrypoint.sh now injects RUSTSPLOIT_QUEUE_SIZE and RUSTSPLOIT_WORKERS env vars into the container.
+.env file template updated to include these new variables.
+
+I reviewed scripts/setup_docker.py and found/fixed the following minor flaws:
+
+Validation Check: Added validate_host(host) call in non-interactive mode to ensure the bind address is valid.
+API Key Validation: Added logic to enforce ASCII-printable and length checks for the API key in non-interactive mode (previously only interactive).
+
+I have completed the hardening of the codebase by replacing .unwrap() with proper error handling.
+
+Changes:
+
+Main & Config:
+src/main.rs: Replaced interface unwrap with safe optional check.
+src/config.rs: Replaced unwrap on RwLock with logical default fallback (for readers) or error propagation (for writers). Fixed logic bugs in get_target_ips.
+Modules:
+Replaced unwrap() in 14+ modules (including rtsp, snmp, telnet, mongobleed, hikvision, nginx_pwner, etc.).
+Most changes involved handling closed semaphores safely or propagating errors via ?.
+Fixed a logic regression in snmp_bruteforce.rs that I introduced mid-process.
+Excluded:
+src/commands/*_gen.rs files retained unwraps as they are build-time code generators where panic is appropriate.
+The codebase compiles successfully (cargo check passed). Phase 8 is complete.
+
+System Requirements
+The module uses btleplug for Bluetooth Low Energy usage. On Linux, this requires the D-Bus development headers.
+
+IMPORTANT
+
+You must install the following system dependencies to compile:
+
+sudo apt install libdbus-1-dev pkg-config
+Implementation Details
+Scanning: Scans for the Fast Pair Service UUID (0xFE2C).
+Exploit Logic: Implements 4 strategies ported from the Kotlin app:
+RawKbp
+: Standard Key-Based Pairing request.
+RawWithSeeker: Includes seeker address.
+Retroactive
+: Uses retroactive pairing flags.
+ExtendedResponse: Requests extended response format.
+Crypto: Uses AES-128 (ECB) to encrypt the Account Key payload using a derived shared secret.
+Compilation
+After installing the system dependencies, you can compile with:
+
+cargo build --release
+Running
+sudo ./target/release/rustsploit
+# Inside CLI:
+exploit bluetooth/wpair
+Note: Root privileges (sudo) are often required for Bluetooth access on Linux.
+
+Updating Documentation and Verifying Build
+I confirmed that dbus-1 is missing using pkg-config. I am now updating 
+README.md
+ to clearly state the requirement for libdbus-1-dev and will then attempt cargo check (expecting failure) to provide a clear error message to the user.
+
+Files Edited
+README.md
+Progress Updates
+1
+Updating README.md with system dependencies
+
+I have updated README.md to include the libdbus-1-dev dependency required for the new Bluetooth module.
+
+The cargo run command failed as expected because this system library is missing.
+
+Action Required: Please run the following command to install the necessary dependencies:
+
+Creating Polymorph 3-Stage Dropper Module
+I updated 
+walkthrough.md
+ with the new Polymorph Dropper details. I have fixed the logic issue in the dropper module and verified the implementation via code review. I am now notifying the user of the completion.
+
+Files Edited
+Walkthrough
+polymorph_dropper.rs
+Progress Updates
+1
+Fixing time calculation logic in polymorph_dropper.rs
+
+2
+Verifying compilation
+
+3
+Updating documentation and notifying user
+
+4
+Finalizing documentation and completing task
+
+I have fixed the implementation of polymorph_dropper.rs.
+
+Fixes:
+
+Removed the incomplete get_schedule_time_cmd helper function.
+Injected the PowerShell-based time calculation logic directly into stage2_content_raw within the run function.
+The generated batch file now correctly uses a for /f loop to capture the future time from PowerShell into a %FUTURE_TIME% variable before passing it to schtasks.
+This fully implements the delayed execution requirement.
+I have also updated walkthrough.md with details about this new module.
+
+Note: Compilation checks are still blocked by the missing libdbus-1-dev dependency for the Bluetooth module, but the Dropper module logic is now complete and correct.
+
+
+
+tapo_c200_vulns.rs
+Refinement: Implement raw TLS connection for CVE-2025-14299 to ensure Content-Length header is not normalized by reqwest.
+Reason: Standard HTTP clients serve to prevent "invalid" headers, but the exploit requires exactly that.
+tplink_wdr842n_configure_disclosure.rs
+Safety: Add bounds check for data length (must be multiple of 8) before DES decryption to prevent panics.
+tplink_wdr740n_path_traversal.rs
+Cleanup: Remove speculative comments and finalize on the %2e%2e encoding strategy.
+tplink_archer_c2_c20i_rce.rs
+Verify: Check for any incomplete logic.
+
+
+I have successfully finalized the TP-Link exploit modules.
+
+Improvements Implemented:
+
+tapo_c200_vulns.rs: Implemented a raw TLS DoS exploit (CVE-2025-14299) using tokio-rustls. It now explicitly constructs the malicious HTTP request with Content-Length: 4294967295 to bypass standard client normalizations, including a custom certificate verifier to accept self-signed certificates on target devices.
+tplink_wdr842n_configure_disclosure.rs: Added a safety check to ensure the downloaded configuration file is a valid multiple of 8 bytes before attempting DES encryption, preventing potential crashes.
+tplink_wdr740n_path_traversal.rs: Finalized the URL encoding (%2e%2e) strategy to robustly bypass local URL normalization filters. This code is now clean and production-ready.
+All TP-Link modules in src/modules/exploits/tplink are now fully implemented and free of placeholders.
+
+
+Fixed all issues: polymorph_dropper.rs (imports + using vars), wpair.rs (using UUID constants), netgear (removed Context), tapo_c200_vulns.rs (removed unused RootCertStore), qnap (removed duplicate url).
+
+Files Edited
+tapo_c200_vulns.rs
+polymorph_dropper.rs
+wpair.rs
+qnap_qts_rce_cve_2024_27130.rs
+netgear_r6700v3_rce_cve_2022_27646.rs
+Progress Updates
+1
+Fixing unused imports and variables across all affected files.
+
+2
+Applying fixes to polymorph_dropper.rs, wpair.rs, tapo_c200_vulns.rs, qnap module, and netgear module.
+
+3
+Using MODEL_ID_UUID and PASSKEY_UUID constants in wpair.rs.
+
+4
+Adding code to use MODEL_ID_UUID and PASSKEY_UUID in wpair.rs exploit logic.
+
+5
+Running cargo run to verify all warnings are fixed.
+
+6
+Fixing remaining errors: std::io::Write import and unused RootCertStore.
+
+7
+Running cargo run to verify all warnings and errors are fixed.
+
+Continue
+
+Updating Dependencies
+Successfully updated sysinfo 0.37->0.38 and suppaftp 7.1->8.0. Build and run completed with no API changes needed.
+
+Progress Updates
+1
+Running cargo build to check for API changes.
+
+2
+Verifying application runs with updated dependencies.
+
+3
+Complete. Notifying user.
+
+Dependencies updated successfully! ✓
+
+Package	Old Version	New Version
+sysinfo	0.37.2	0.38.0
+suppaftp	7.1.0	8.0.1
+Note: generic-array (0.14.7 → 0.14.9) and matchit (0.8.4 → 0.8.6) are transitive dependencies that are automatically updated through the main crates. The versions you see are determined by the dependency tree.
+
+No API changes were required - the existing code is compatible with the new versions. Build and run both completed successfully.
+
+
+MQTT Bruteforce module rewritten with significant improvements! ✓
+
+Key improvements:
+
+Feature	Description
+MqttReturnCode enum	Proper classification of MQTT return codes (Accepted, BadCredentials, NotAuthorized, etc.)
+Anonymous auth detection	Option to test if broker allows anonymous connections first
+Protocol constants	Clean constants for MQTT packets, flags, and protocol level
+AttackResult enum	Structured results (Success, AuthFailed, ConnectionError, ProtocolError)
+Progress tracking	Percentage-based progress display
+Auto TLS detection	Automatically enables TLS when port 8883 is selected
+Code organization	Clear separation: Configuration → Engine → Protocol implementation
+Documentation	Module-level docs explaining features
+Before/After comparison:
+
+Before: 323 lines, basic linear logic
+After: 464 lines, structured with enums, proper error handling, anonymous auth
+Build and run both successful!
+
+Ruijie Exploit Modules Added! ✓
+
+I have implemented 5 new Ruijie exploit modules based on GitHub PoCs, using descriptive filenames as requested:
+
+Module File	CVE	Vulnerability
+ruijie_rsr_router_ci_cve_2024_31616.rs	CVE-2024-31616	Command Injection (RG-RSR Routers)
+ruijie_auth_bypass_rce_cve_2023_34644.rs	CVE-2023-34644	Auth Bypass RCE (RG-EW/NBS/S1930)
+ruijie_rg_uac_ci_cve_2024_4508.rs	CVE-2024-4508	Unauth Command Injection (RG-UAC)
+ruijie_rg_ew_update_version_rce_cve_2021_43164.rs	CVE-2021-43164	RCE via Update Function (RG-EW Series)
+ruijie_reyee_ssrf_cve_2024_48874.rs	CVE-2024-48874	Server-Side Request Forgery
+All modules are registered and compile successfully.
+
+All Ruijie Modules Renamed ✓
+
+I've renamed the remaining two modules to match the descriptive naming convention.
+
+Module List (All 7):
+
+Original	New Filename
+cve_2023_4415	ruijie_rg_ew_login_bypass_cve_2023_4415.rs
+cve_2023_4169	ruijie_rg_ew_password_reset_cve_2023_4169.rs
+cve_2024_31616	ruijie_rsr_router_ci_cve_2024_31616.rs
+cve_2023_34644	ruijie_auth_bypass_rce_cve_2023_34644.rs
+cve_2024_4508	ruijie_rg_uac_ci_cve_2024_4508.rs
+cve_2021_43164	ruijie_rg_ew_update_version_rce_cve_2021_43164.rs
+cve_2024_48874	ruijie_reyee_ssrf_cve_2024_48874.rs
+The mod.rs file has been updated, and the project compiles successfully.

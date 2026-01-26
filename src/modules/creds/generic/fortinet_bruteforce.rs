@@ -36,23 +36,23 @@ pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
 
-    let port: u16 = prompt_port("Fortinet VPN Port", 443).await?;
+    let port: u16 = prompt_port("Fortinet VPN Port", 443)?;
 
-    let usernames_file_path = prompt_wordlist("Username wordlist path").await?;
-    let passwords_file_path = prompt_wordlist("Password wordlist path").await?;
+    let usernames_file_path = prompt_wordlist("Username wordlist path")?;
+    let passwords_file_path = prompt_wordlist("Password wordlist path")?;
 
-    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000).await? as usize;
-    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300).await? as u64;
+    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
+    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300)? as u64;
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let _save_results = prompt_yes_no("Save results to file?", true).await?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let _save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if _save_results {
-        Some(prompt_default("Output file name", "fortinet_results.txt").await?)
+        Some(prompt_default("Output file name", "fortinet_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false)?;
     
     // Optional prompts
     // We don't have prompt_optional in shared utils yet? 
@@ -63,10 +63,10 @@ pub async fn run(target: &str) -> Result<()> {
     // The previous code had `prompt_optional`.
     // I will use prompt_default with empty default and check for empty string.
     
-    let trusted_cert_str = prompt_default("Trusted certificate SHA256 (optional, press Enter to skip)", "").await?;
+    let trusted_cert_str = prompt_default("Trusted certificate SHA256 (optional, press Enter to skip)", "")?;
     let trusted_cert = if trusted_cert_str.is_empty() { None } else { Some(trusted_cert_str) };
 
-    let realm_str = prompt_default("Authentication realm (optional)", "").await?;
+    let realm_str = prompt_default("Authentication realm (optional)", "")?;
     let realm = if realm_str.is_empty() { None } else { Some(realm_str) };
 
     let base_url = build_fortinet_url(target, port)?;

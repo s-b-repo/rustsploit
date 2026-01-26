@@ -143,7 +143,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("3. Load Template (Load -> Run)");
     println!("4. Custom Attack (Wizard -> Run)");
     
-    let choice = prompt_default("Selection", "1").await?;
+    let choice = prompt_default("Selection", "1")?;
     
     let config = match choice.as_str() {
         "1" => setup_quick_attack(target).await?,
@@ -178,13 +178,13 @@ async fn setup_quick_attack(initial_target: &str) -> Result<SequentialFuzzerConf
     let url = parse_target_interactive(initial_target).await?;
     
     // Forced Input for Reliability
-    let min_len_str = prompt_required("Min Sequence Length (e.g. 1)").await?;
+    let min_len_str = prompt_required("Min Sequence Length (e.g. 1)")?;
     let min_len: usize = min_len_str.parse().unwrap_or(1);
     
-    let max_len_str = prompt_required("Max Sequence Length (e.g. 3)").await?;
+    let max_len_str = prompt_required("Max Sequence Length (e.g. 3)")?;
     let max_len: usize = max_len_str.parse().unwrap_or(3);
     
-    let verbose = prompt_yes_no("Verbose Mode? (Print all 403s)", false).await?;
+    let verbose = prompt_yes_no("Verbose Mode? (Print all 403s)", false)?;
 
     Ok(SequentialFuzzerConfig {
         target_url: url,
@@ -212,21 +212,21 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     println!("4. All Printable ASCII (Standard Brute)");
     println!("5. Custom");
     
-    let c_mode_str = prompt_required("Charset Selection (1-5)").await?;
+    let c_mode_str = prompt_required("Charset Selection (1-5)")?;
     let c_mode: u8 = c_mode_str.parse().unwrap_or(4);
 
     let custom = if c_mode == 5 {
-        Some(prompt_required("Custom Charset String").await?)
+        Some(prompt_required("Custom Charset String")?)
     } else {
         None
     };
     
     // 3. Lengths
     // Using prompt_required to prevent skipping issues with buffered inputs
-    let min_len_str = prompt_required("Min Sequence Length (e.g. 1)").await?;
+    let min_len_str = prompt_required("Min Sequence Length (e.g. 1)")?;
     let min_len: usize = min_len_str.parse().unwrap_or(1);
     
-    let max_len_str = prompt_required("Max Sequence Length (e.g. 3)").await?;
+    let max_len_str = prompt_required("Max Sequence Length (e.g. 3)")?;
     let max_len: usize = max_len_str.parse().unwrap_or(3);
     
     if max_len > 4 && c_mode == 4 {
@@ -246,7 +246,7 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     println!("8. Base64");
     println!("9. Mixed/Random");
     
-    let enc_choice_str = prompt_required("Encoding Selection (0-9)").await?;
+    let enc_choice_str = prompt_required("Encoding Selection (0-9)")?;
     let enc_choice: u8 = enc_choice_str.parse().unwrap_or(0);
 
     let encoding = match enc_choice {
@@ -263,16 +263,16 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     };
     
     // 5. Config
-    let concurrency_str = prompt_required("Concurrency (Threads)").await?;
+    let concurrency_str = prompt_required("Concurrency (Threads)")?;
     let concurrency: usize = concurrency_str.parse().unwrap_or(50);
     
-    let cookies = if prompt_yes_no("Add Cookies?", false).await? {
-        Some(prompt_required("Cookie Header Value").await?)
+    let cookies = if prompt_yes_no("Add Cookies?", false)? {
+        Some(prompt_required("Cookie Header Value")?)
     } else {
         None
     };
     
-    let verbose = prompt_yes_no("Verbose Mode? (Print all 403s)", false).await?;
+    let verbose = prompt_yes_no("Verbose Mode? (Print all 403s)", false)?;
 
     Ok(SequentialFuzzerConfig {
         target_url: url,
@@ -289,7 +289,7 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
 
 async fn parse_target_interactive(raw: &str) -> Result<String> {
     let base = if raw.is_empty() {
-        normalize_target(&prompt_required("Target URL").await?)?
+        normalize_target(&prompt_required("Target URL")?)?
     } else {
         normalize_target(raw)?
     };
@@ -304,7 +304,7 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
     // Ensure trailing slash
     if !url.ends_with('/') {
         println!("{}", format!("[*] Current Target: {}", url).cyan());
-        if prompt_yes_no("Target does not end with '/'. Append it?", true).await? {
+        if prompt_yes_no("Target does not end with '/'. Append it?", true)? {
             Ok(format!("{}/", url))
         } else {
             Ok(url)
@@ -317,7 +317,7 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
 // --- Persistence ---
 
 async fn save_template(config: &SequentialFuzzerConfig) -> Result<()> {
-    let name = prompt_default("Template Name", "fuzz_template.json").await?;
+    let name = prompt_default("Template Name", "fuzz_template.json")?;
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&name, json).context("Failed to write template")?;
     println!("Saved to {}", name);
@@ -325,7 +325,7 @@ async fn save_template(config: &SequentialFuzzerConfig) -> Result<()> {
 }
 
 async fn load_template() -> Result<SequentialFuzzerConfig> {
-    let path = prompt_existing_file("Template File").await?;
+    let path = prompt_existing_file("Template File")?;
     let content = fs::read_to_string(&path)?;
     let config: SequentialFuzzerConfig = serde_json::from_str(&content).context("Invalid JSON")?;
     println!("{}", "Loaded Config.".green());
