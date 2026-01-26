@@ -153,9 +153,9 @@ pub async fn run(target: &str) -> Result<()> {
 
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
-    let _verbose = prompt_yes_no("Verbose mode?", false).await?; 
-    let output_file = prompt_default("Output result file", "ftp_mass_results.txt").await?;
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let _verbose = prompt_yes_no("Verbose mode?", false)?; 
+    let output_file = prompt_default("Output result file", "ftp_mass_results.txt")?;
 
     // Parse exclusions
     let mut exclusion_subnets = Vec::new();

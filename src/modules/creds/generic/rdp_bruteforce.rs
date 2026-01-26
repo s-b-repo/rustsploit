@@ -146,7 +146,7 @@ impl RdpSecurityLevel {
         }
     }
 
-    async fn prompt_selection() -> Result<Self> {
+    fn prompt_selection() -> Result<Self> {
         println!("\nRDP Security Level Options:");
         println!("  1. Auto (let client negotiate)");
         println!("  2. NLA (Network Level Authentication)");
@@ -155,7 +155,7 @@ impl RdpSecurityLevel {
         println!("  5. Negotiate (try all methods)");
 
         loop {
-            let input = prompt_default("Security level", "1").await?;
+            let input = prompt_default("Security level", "1")?;
             match input.trim() {
                 "1" => return Ok(RdpSecurityLevel::Auto),
                 "2" => return Ok(RdpSecurityLevel::Nla),
@@ -251,27 +251,27 @@ pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
 
-    let port: u16 = prompt_port("RDP Port", 3389).await?;
+    let port: u16 = prompt_port("RDP Port", 3389)?;
 
-    let usernames_file_path = prompt_wordlist("Username wordlist").await?;
+    let usernames_file_path = prompt_wordlist("Username wordlist")?;
 
-    let passwords_file_path = prompt_wordlist("Password wordlist").await?;
+    let passwords_file_path = prompt_wordlist("Password wordlist")?;
 
-    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000).await? as usize;
+    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
 
-    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300).await? as u64;
+    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300)? as u64;
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let save_results = prompt_yes_no("Save results to file?", true).await?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if save_results {
-        Some(prompt_default("Output file name", "rdp_results.txt").await?)
+        Some(prompt_default("Output file name", "rdp_results.txt")?)
     } else {
         None
     };
 
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false).await?;
-    let security_level = RdpSecurityLevel::prompt_selection().await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false)?;
+    let security_level = RdpSecurityLevel::prompt_selection()?;
 
     let addr = format_socket_address(target, port);
 

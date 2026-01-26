@@ -4,7 +4,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::net::UdpSocket;
@@ -41,11 +41,11 @@ pub async fn run(target: &str) -> Result<()> {
     
     println!("{}", format!("[*] Target: {}", target).cyan());
     
-    let port = prompt_port().await.unwrap_or(1900);
-    let timeout_secs = prompt_timeout().await.unwrap_or(3);
-    let retries = prompt_retries().await.unwrap_or(1);
-    let verbose = prompt_verbose().await.unwrap_or(false);
-    let save_results = prompt_save_results().await.unwrap_or(false);
+    let port = prompt_port().unwrap_or(1900);
+    let timeout_secs = prompt_timeout().unwrap_or(3);
+    let retries = prompt_retries().unwrap_or(1);
+    let verbose = prompt_verbose().unwrap_or(false);
+    let save_results = prompt_save_results().unwrap_or(false);
 
     let target = clean_ipv6_brackets(target);
     // Validate target format
@@ -53,7 +53,7 @@ pub async fn run(target: &str) -> Result<()> {
         .with_context(|| format!("Failed to normalize target '{}'", target))?;
 
     // Determine search targets
-    let search_targets = prompt_search_targets().await?;
+    let search_targets = prompt_search_targets()?;
 
     println!();
     println!("{}", format!("[*] Sending SSDP M-SEARCH to {}:{}...", target, port).bold());
@@ -215,15 +215,14 @@ fn clean_ipv6_brackets(ip: &str) -> String {
 }
 
 /// Ask user for port (optional), fallback to 1900 if empty
-async fn prompt_port() -> Option<u16> {
+fn prompt_port() -> Option<u16> {
     print!("{}", "[*] Enter custom port (default 1900): ".cyan().bold());
-    if tokio::io::stdout().flush().await.is_err() {
+    if std::io::stdout().flush().is_err() {
         return None;
     }
     let mut input = String::new();
-    if tokio::io::BufReader::new(tokio::io::stdin())
+    if std::io::stdin()
         .read_line(&mut input)
-        .await
         .is_ok()
     {
         let input = input.trim();
@@ -238,15 +237,14 @@ async fn prompt_port() -> Option<u16> {
 }
 
 /// Ask user for timeout in seconds
-async fn prompt_timeout() -> Option<u64> {
+fn prompt_timeout() -> Option<u64> {
     print!("{}", "[*] Enter timeout in seconds (default 3): ".cyan().bold());
-    if tokio::io::stdout().flush().await.is_err() {
+    if std::io::stdout().flush().is_err() {
         return None;
     }
     let mut input = String::new();
-    if tokio::io::BufReader::new(tokio::io::stdin())
+    if std::io::stdin()
         .read_line(&mut input)
-        .await
         .is_ok()
     {
         let input = input.trim();
@@ -263,15 +261,14 @@ async fn prompt_timeout() -> Option<u64> {
 }
 
 /// Ask user for number of retries
-async fn prompt_retries() -> Option<u32> {
+fn prompt_retries() -> Option<u32> {
     print!("{}", "[*] Enter number of retries (default 1): ".cyan().bold());
-    if tokio::io::stdout().flush().await.is_err() {
+    if std::io::stdout().flush().is_err() {
         return None;
     }
     let mut input = String::new();
-    if tokio::io::BufReader::new(tokio::io::stdin())
+    if std::io::stdin()
         .read_line(&mut input)
-        .await
         .is_ok()
     {
         let input = input.trim();
@@ -288,15 +285,14 @@ async fn prompt_retries() -> Option<u32> {
 }
 
 /// Ask user for verbose mode
-async fn prompt_verbose() -> Option<bool> {
+fn prompt_verbose() -> Option<bool> {
     print!("{}", "[*] Verbose output? [y/N]: ".cyan().bold());
-    if tokio::io::stdout().flush().await.is_err() {
+    if std::io::stdout().flush().is_err() {
         return None;
     }
     let mut input = String::new();
-    if tokio::io::BufReader::new(tokio::io::stdin())
+    if std::io::stdin()
         .read_line(&mut input)
-        .await
         .is_ok()
     {
         let input = input.trim().to_lowercase();
@@ -310,15 +306,14 @@ async fn prompt_verbose() -> Option<bool> {
 }
 
 /// Ask user to save results
-async fn prompt_save_results() -> Option<bool> {
+fn prompt_save_results() -> Option<bool> {
     print!("{}", "[*] Save results to file? [y/N]: ".cyan().bold());
-    if tokio::io::stdout().flush().await.is_err() {
+    if std::io::stdout().flush().is_err() {
         return None;
     }
     let mut input = String::new();
-    if tokio::io::BufReader::new(tokio::io::stdin())
+    if std::io::stdin()
         .read_line(&mut input)
-        .await
         .is_ok()
     {
         let input = input.trim().to_lowercase();
@@ -332,7 +327,7 @@ async fn prompt_save_results() -> Option<bool> {
 }
 
 /// Ask user for search targets
-async fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
+fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
     let mut targets = Vec::new();
 
     println!("{}", "[*] Select SSDP Search Targets:".cyan().bold());
@@ -342,14 +337,12 @@ async fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
     println!("  4. All of the above");
 
     print!("{}", "Enter choice [1-4, default 1]: ".cyan().bold());
-    tokio::io::stdout()
+    std::io::stdout()
         .flush()
-        .await
         .context("Failed to flush stdout")?;
     let mut input = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
+    std::io::stdin()
         .read_line(&mut input)
-        .await
         .context("Failed to read input")?;
 
     match input.trim() {
@@ -361,14 +354,12 @@ async fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
         }
         "3" => {
             print!("{}", "Enter custom ST: ".cyan().bold());
-            tokio::io::stdout()
+            std::io::stdout()
                 .flush()
-                .await
                 .context("Failed to flush stdout")?;
             let mut st_input = String::new();
-            tokio::io::BufReader::new(tokio::io::stdin())
+            std::io::stdin()
                 .read_line(&mut st_input)
-                .await
                 .context("Failed to read input")?;
             let st = st_input.trim().to_string();
             if !st.is_empty() {

@@ -300,23 +300,23 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", target).cyan());
 
     let normalized = normalize_target(target)?;
-    let port: u16 = prompt_port("L2TP Port", 1701).await?;
+    let port: u16 = prompt_port("L2TP Port", 1701)?;
     
-    let usernames_file = prompt_wordlist("Username wordlist").await?;
-    let passwords_file = prompt_wordlist("Password wordlist").await?;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
     
-    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 100).await? as usize;
-    let timeout_ms = prompt_int_range("Connection timeout (ms)", DEFAULT_TIMEOUT_MS as i64, 100, 30000).await? as u64;
+    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 100)? as usize;
+    let timeout_ms = prompt_int_range("Connection timeout (ms)", DEFAULT_TIMEOUT_MS as i64, 100, 30000)? as u64;
     
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
-    let save_results = prompt_yes_no("Save results to file?", true).await?;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if save_results {
-        Some(prompt_default("Output file name", "l2tp_results.txt").await?)
+        Some(prompt_default("Output file name", "l2tp_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false).await?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false)?;
 
     let addr = format!("{}:{}", normalized, port);
     

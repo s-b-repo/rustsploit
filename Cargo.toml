@@ -1,6 +1,6 @@
 [package]
 name = "rustsploit"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2024"
 build = "build.rs"
 
@@ -14,7 +14,7 @@ anyhow = "1.0"
 colored = "3.0"                 # newer than 2.0
 rand = "0.9"
 rustyline = "17.0"
-sysinfo = { version = "0.37", features = ["multithread"] }
+sysinfo = { version = "0.38", features = ["multithread"] }
 
 # CLI & Async runtime
 clap = { version = "4.5", features = ["derive"] }
@@ -52,7 +52,7 @@ which = "8.0"
 
 # FTP
 async_ftp = "6.0"
-suppaftp = { version = "7.1", features = ["tokio-async-native-tls"] }
+suppaftp = { version = "8.0", features = ["tokio-async-native-tls"] }
 native-tls = "0.2"
 rustls = "0.23"
 webpki-roots = "1.0"
@@ -64,8 +64,12 @@ telnet = "0.2"
 async-stream = "0.3.6"
 
 # SSH
-ssh2 = "0.9"
 libc = "0.2"
+
+
+# Bluetooth
+btleplug = "0.11"
+
 
 # RDP - removed unused dependency (module uses external xfreerdp/rdesktop commands)
 # rdp = "0.12"
@@ -89,7 +93,7 @@ chrono = { version = "0.4", features = ["serde"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
-uuid = { version = "1.19", features = ["v4"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 
 # DNS
 hickory-client = { version = "0.25" }
@@ -100,6 +104,9 @@ once_cell = "1.21"
 home = "0.5"                   # updated for edition 2024 compatibility
 pnet = "0.35"
 des = { version = "0.8.1", features = ["zeroize"] }
+strsim = "0.11"
+byteorder = "1.5.0"
+ssh2 = "0.9.5"
 
 [build-dependencies]
 regex = "1.12"

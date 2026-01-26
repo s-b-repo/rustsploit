@@ -60,13 +60,13 @@ pub async fn run(target: &str) -> Result<()> {
     // --- Standard Single-Target Logic ---
 
     let default_port = 161;
-    let port = prompt_int_range("SNMP Port", default_port as i64, 1, 65535).await? as u16;
+    let port = prompt_int_range("SNMP Port", default_port as i64, 1, 65535)? as u16;
     
-    let communities_file = prompt_existing_file("Community string wordlist file path").await?;
+    let communities_file = prompt_existing_file("Community string wordlist file path")?;
     
     // Custom prompt for version since it's specific
     let snmp_version = loop {
-        let input = prompt_default("SNMP Version (1 or 2c)", "2c").await?;
+        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
         match input.trim().to_lowercase().as_str() {
             "1" => break 0,  // SNMPv1
             "2c" | "2" => break 1,  // SNMPv2c
@@ -74,16 +74,16 @@ pub async fn run(target: &str) -> Result<()> {
         }
     };
     
-    let concurrency = prompt_int_range("Max concurrent tasks", 50, 1, 1000).await? as usize;
-    let stop_on_success = prompt_yes_no("Stop on first success?", true).await?;
+    let concurrency = prompt_int_range("Max concurrent tasks", 50, 1, 1000)? as usize;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
     
     // Output file handled by saving results at the end usually, but old code asked upfront.
     // I'll stick to standard flow: prompt for save at end OR automatically if specified.
     // Existing modules prompted for output file upfront. I'll do that for consistency with new standard.
-    let output_file = prompt_default("Output file", "snmp_results.txt").await?;
+    let output_file = prompt_default("Output file", "snmp_results.txt")?;
     
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300).await? as u64;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300)? as u64;
 
     let connect_addr = format!("{}:{}", normalize_target(target)?, port);
 
@@ -564,11 +564,11 @@ fn encode_sub_id(mut value: u32, output: &mut Vec<u8>) {
 async fn run_mass_scan(target: &str) -> Result<()> {
     println!("{}", "[*] Preparing Mass Scan configuration...".blue());
     
-    let port = prompt_int_range("SNMP Port", 161, 1, 65535).await? as u16;
-    let communities_file = prompt_existing_file("Community string wordlist").await?;
+    let port = prompt_int_range("SNMP Port", 161, 1, 65535)? as u16;
+    let communities_file = prompt_existing_file("Community string wordlist")?;
     
     let snmp_version = loop {
-        let input = prompt_default("SNMP Version (1 or 2c)", "2c").await?;
+        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
         match input.trim().to_lowercase().as_str() {
             "1" => break 0,
             "2c" | "2" => break 1,
@@ -581,10 +581,10 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         return Err(anyhow!("Community wordlist cannot be empty"));
     }
     
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).await? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false).await?;
-    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300).await? as u64;
-    let output_file = prompt_default("Output result file", "snmp_mass_results.txt").await?;
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300)? as u64;
+    let output_file = prompt_default("Output result file", "snmp_mass_results.txt")?;
     
     // Parse exclusions
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
@@ -614,7 +614,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if run_random {
         println!("{}", "[*] Starting Random Internet Scan...".green());
         loop {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
             let exc = exclusions.clone();
             let cp = creds_pkg.clone();
             let sc = stats_checked.clone();
@@ -640,7 +640,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
         
         for ip_str in lines {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
             let cp = creds_pkg.clone();
             let sc = stats_checked.clone();
             let sf = stats_found.clone();
