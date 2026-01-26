@@ -638,8 +638,18 @@ fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
 }
 
 async fn is_ip_checked(ip: &impl ToString) -> bool {
+    if !std::path::Path::new(STATE_FILE).exists() {
+        return false;
+    }
     let ip_s = ip.to_string();
-    let status = Command::new("grep").arg("-F").arg("-q").arg(format!("checked: {}", ip_s)).arg(STATE_FILE).status().await;
+    let status = Command::new("grep")
+        .arg("-F")
+        .arg("-q")
+        .arg(format!("checked: {}", ip_s))
+        .arg(STATE_FILE)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
     match status { Ok(s) => s.success(), Err(_) => false }
 }
 
