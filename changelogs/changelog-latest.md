@@ -3434,9 +3434,6 @@ Converting fortiweb prompt_input_std to sync and running final cargo check
 
 
 
-
-
-
 87+ modules available across 3 categories: creds, exploits, scanners
 Module loading verified: sample_exploit, sample_scanner, react2shell, sshpwn_session, port_scanner all load without errors
 Interactive shell works correctly
@@ -3748,3 +3745,72 @@ Running cargo run to verify all warnings and errors are fixed.
 
 Continue
 
+Updating Dependencies
+Successfully updated sysinfo 0.37->0.38 and suppaftp 7.1->8.0. Build and run completed with no API changes needed.
+
+Progress Updates
+1
+Running cargo build to check for API changes.
+
+2
+Verifying application runs with updated dependencies.
+
+3
+Complete. Notifying user.
+
+Dependencies updated successfully! ✓
+
+Package	Old Version	New Version
+sysinfo	0.37.2	0.38.0
+suppaftp	7.1.0	8.0.1
+Note: generic-array (0.14.7 → 0.14.9) and matchit (0.8.4 → 0.8.6) are transitive dependencies that are automatically updated through the main crates. The versions you see are determined by the dependency tree.
+
+No API changes were required - the existing code is compatible with the new versions. Build and run both completed successfully.
+
+
+MQTT Bruteforce module rewritten with significant improvements! ✓
+
+Key improvements:
+
+Feature	Description
+MqttReturnCode enum	Proper classification of MQTT return codes (Accepted, BadCredentials, NotAuthorized, etc.)
+Anonymous auth detection	Option to test if broker allows anonymous connections first
+Protocol constants	Clean constants for MQTT packets, flags, and protocol level
+AttackResult enum	Structured results (Success, AuthFailed, ConnectionError, ProtocolError)
+Progress tracking	Percentage-based progress display
+Auto TLS detection	Automatically enables TLS when port 8883 is selected
+Code organization	Clear separation: Configuration → Engine → Protocol implementation
+Documentation	Module-level docs explaining features
+Before/After comparison:
+
+Before: 323 lines, basic linear logic
+After: 464 lines, structured with enums, proper error handling, anonymous auth
+Build and run both successful!
+
+Ruijie Exploit Modules Added! ✓
+
+I have implemented 5 new Ruijie exploit modules based on GitHub PoCs, using descriptive filenames as requested:
+
+Module File	CVE	Vulnerability
+ruijie_rsr_router_ci_cve_2024_31616.rs	CVE-2024-31616	Command Injection (RG-RSR Routers)
+ruijie_auth_bypass_rce_cve_2023_34644.rs	CVE-2023-34644	Auth Bypass RCE (RG-EW/NBS/S1930)
+ruijie_rg_uac_ci_cve_2024_4508.rs	CVE-2024-4508	Unauth Command Injection (RG-UAC)
+ruijie_rg_ew_update_version_rce_cve_2021_43164.rs	CVE-2021-43164	RCE via Update Function (RG-EW Series)
+ruijie_reyee_ssrf_cve_2024_48874.rs	CVE-2024-48874	Server-Side Request Forgery
+All modules are registered and compile successfully.
+
+All Ruijie Modules Renamed ✓
+
+I've renamed the remaining two modules to match the descriptive naming convention.
+
+Module List (All 7):
+
+Original	New Filename
+cve_2023_4415	ruijie_rg_ew_login_bypass_cve_2023_4415.rs
+cve_2023_4169	ruijie_rg_ew_password_reset_cve_2023_4169.rs
+cve_2024_31616	ruijie_rsr_router_ci_cve_2024_31616.rs
+cve_2023_34644	ruijie_auth_bypass_rce_cve_2023_34644.rs
+cve_2024_4508	ruijie_rg_uac_ci_cve_2024_4508.rs
+cve_2021_43164	ruijie_rg_ew_update_version_rce_cve_2021_43164.rs
+cve_2024_48874	ruijie_reyee_ssrf_cve_2024_48874.rs
+The mod.rs file has been updated, and the project compiles successfully.
