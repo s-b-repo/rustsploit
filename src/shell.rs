@@ -17,18 +17,20 @@ const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
 struct ShellContext {
     current_module: Option<String>,
     current_target: Option<String>,
+    verbose: bool,
 }
 
 impl ShellContext {
-    fn new() -> Self {
+    fn new(verbose: bool) -> Self {
         ShellContext {
             current_module: None,
             current_target: None,
+            verbose,
         }
     }
 }
 
-pub async fn interactive_shell() -> Result<()> {
+pub async fn interactive_shell(verbose: bool) -> Result<()> {
     println!("Welcome to RustSploit Shell (inspired by RouterSploit)");
     println!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
     
@@ -46,7 +48,7 @@ pub async fn interactive_shell() -> Result<()> {
         }
     }
 
-    let mut ctx = ShellContext::new();
+    let mut ctx = ShellContext::new(verbose);
 
     'main_loop: loop {
         print!("{}", "rsf> ".cyan().bold());
@@ -235,7 +237,7 @@ pub async fn interactive_shell() -> Result<()> {
                                     println!("{}", "[!] Warning: No target set.".yellow());
                                     
                                     // Option 1: Manually set target
-                                    match utils::prompt_yes_no("Do you want to provide a target address?", true).await {
+                                    match utils::prompt_yes_no("Do you want to provide a target address?", true) {
                                         Ok(true) => {
                                             match prompt_string_default("Enter target", "").map_err(|e| anyhow::anyhow!("{}", e)) {
                                                 Ok(input) => {
@@ -265,7 +267,7 @@ pub async fn interactive_shell() -> Result<()> {
                                         },
                                         Ok(false) => {
                                             // Option 2: Fallback to localhost
-                                            match utils::prompt_yes_no("Continue with localhost (127.0.0.1)?", false).await {
+                                            match utils::prompt_yes_no("Continue with localhost (127.0.0.1)?", false) {
                                                 Ok(true) => Some("127.0.0.1".to_string()),
                                                 _ => {
                                                     println!("{}", "[!] Execution aborted.".red());
@@ -285,7 +287,7 @@ pub async fn interactive_shell() -> Result<()> {
                                     utils::basic_honeypot_check(t).await;
                                     
                                     println!("Running module '{}' against target '{}'", module_path, t);
-                                    if let Err(e) = commands::run_module(module_path, t).await {
+                                    if let Err(e) = commands::run_module(module_path, t, ctx.verbose).await {
                                         eprintln!("[!] Module failed: {:?}", e);
                                     }
                                 } else {
@@ -328,7 +330,7 @@ pub async fn interactive_shell() -> Result<()> {
                                             // Perform honeypot check before running module
                                             utils::basic_honeypot_check(ip).await;
                                             
-                                            match commands::run_module(module_path, ip).await {
+                                            match commands::run_module(module_path, ip, ctx.verbose).await {
                                                 Ok(_) => success_count += 1,
                                                 Err(e) => {
                                                     eprintln!("[!] Module failed: {:?}", e);
