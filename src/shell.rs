@@ -283,8 +283,12 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
 
                                 if let Some(ref t) = target {
                                     // Perform honeypot check before running module
-                                    // Perform honeypot check before running module
-                                    utils::basic_honeypot_check(t).await;
+                                    // Skip check for mass scan targets (CIDR, random, 0.0.0.0, or file lists)
+                                    let is_mass_scan = t.contains('/') || t == "random" || t == "0.0.0.0" || std::path::Path::new(t).is_file();
+                                    
+                                    if !is_mass_scan {
+                                        utils::basic_honeypot_check(t).await;
+                                    }
                                     
                                     println!("Running module '{}' against target '{}'", module_path, t);
                                     if let Err(e) = commands::run_module(module_path, t, ctx.verbose).await {
