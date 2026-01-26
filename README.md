@@ -50,7 +50,18 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 
 ---
 
-## Module Catalog
+**🚀 New Features:**
+- **CLI Error Handling** - Added proper warning messages for invalid flag combinations:
+  - `⚠ Warning` when `-m` is used without `-t` (suggests proper usage)
+  - `ℹ Note` when `-t` is used without `-m` (target available in shell)
+  - Error when `--harden` is used without `--api`
+  - Helpful usage hints printed for common mistakes
+- **Improved CLI Experience** - Added `--list-modules` to browse tools without entering the shell, and `--verbose` for detailed operation logs. Fuzzy matching now suggests corrections for typos (e.g., `sample_xploit` -> `sample_exploit`).
+- **Colored CLI output** - Warnings in yellow, hints in cyan, success in green
+
+**📚 Documentation:**
+- Updated developer guide with v0.5.0 changes
+- Added CLI error handling examples
 
 Rustsploit ships categorized modules under `src/modules/`, automatically exposed to the shell/CLI. A non-exhaustive snapshot:
 
@@ -73,7 +84,8 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
 **Debian/Ubuntu/Kali:**
  ```bash
 sudo apt update
-sudo apt install pkg-config libssl-dev freerdp2-x11    # Required for the RDP brute force module
+sudo apt install pkg-config libssl-dev freerdp2-x11 libdbus-1-dev    # Required for RDP and Bluetooth modules
+
 ```
 
 **Arch Linux:**
@@ -314,6 +326,20 @@ cargo run -- --command scanner --module port_scanner --target 192.168.1.1
 cargo run -- --command creds --module ssh_bruteforce --target 192.168.1.1
 ```
 
+### Global Flags
+
+- `--list-modules`: Print all available modules and exit.
+- `--verbose (-v)`: Enable detailed logging (useful for debugging).
+- `--output-format <text|json>`: Control output format (default: text).
+
+```bash
+# List all modules
+cargo run -- --list-modules
+
+# Run with verbose logging
+cargo run -- -m exploits/sample_exploit -t 127.0.0.1 -v
+```
+
 Any module exposed to the shell can be called here. Use the `modules` shell command or browse `src/modules/**` for canonical names.
 
 ---
@@ -374,12 +400,24 @@ Authorization: ApiKey your-api-key-here
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/modules
   ```
 
+- **`GET /api/module/:category/:name`** - Get details for a specific module
+  ```
+  curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/module/exploits/sample_exploit
+  ```
+
 - **`POST /api/run`** - Execute a module on a target
   ```
   curl -X POST -H "Authorization: Bearer your-api-key" \
        -H "Content-Type: application/json" \
-       -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
        http://localhost:8080/api/run
+  ```
+
+- **`POST /api/validate`** - Validate parameters without execution
+  ```
+  curl -X POST -H "Authorization: Bearer your-api-key" \
+       -H "Content-Type: application/json" \
+       -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
+       http://localhost:8080/api/validate
   ```
 
 - **`GET /api/status`** - Get API server status and statistics
@@ -471,6 +509,8 @@ Log entries include:
 - Key rotation events
 - Module execution results
 - Resource cleanup operations
+
+**Note:** API responses now include `request_id`, `timestamp`, and `duration_ms` for better observability.
 
 ### Example API Workflow
 
