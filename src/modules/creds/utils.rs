@@ -170,6 +170,7 @@ pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
         .arg("-q")
         .arg(format!("checked: {}", ip_s))
         .arg(state_file)
+        .stderr(std::process::Stdio::null())
         .status()
         .await;
     
