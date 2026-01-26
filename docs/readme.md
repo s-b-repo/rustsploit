@@ -125,6 +125,9 @@ Commands are parsed and executed sequentially from left to right. This is useful
 - `--command exploit|scanner|creds`
 - `--module <name>` (short or qualified, same mapping as the shell)
 - `--target <host|IP>`
+- `--list-modules` (list all available modules)
+- `--verbose` (enable detailed logging)
+- `--output-format <text|json>` (control output format)
 
 Example:
 
