@@ -61,7 +61,7 @@ impl GlobalConfig {
 
         // Try to parse as CIDR subnet first
         if let Ok(network) = trimmed.parse::<IpNetwork>() {
-            let mut target_guard = self.target.write().unwrap();
+            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
             *target_guard = Some(TargetConfig::Subnet(network));
             return Ok(());
         }
@@ -70,7 +70,7 @@ impl GlobalConfig {
         Self::validate_hostname_or_ip(trimmed)?;
 
         // Otherwise, treat as single IP or hostname
-        let mut target_guard = self.target.write().unwrap();
+        let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
         *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
         Ok(())
     }
@@ -87,7 +87,7 @@ impl GlobalConfig {
         
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
-        let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").unwrap();
+        let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("Regex compilation failed");
         if !valid_chars.is_match(target) {
             return Err(anyhow!(
                 "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"
@@ -118,8 +118,8 @@ impl GlobalConfig {
 
     /// Get the global target as a single string (for display)
     pub fn get_target(&self) -> Option<String> {
-        let target_guard = self.target.read().unwrap();
-        target_guard.as_ref().map(|t| match t {
+        let guard = self.target.read().ok()?;
+        guard.as_ref().map(|t| match t {
             TargetConfig::Single(ip) => ip.clone(),
             TargetConfig::Subnet(net) => net.to_string(),
         })
@@ -128,9 +128,9 @@ impl GlobalConfig {
     /// Get a single IP address from the global target
     /// For subnets, returns the network address (first IP)
     pub fn get_single_target_ip(&self) -> Result<String> {
-        let target_guard = self.target.read().unwrap();
+        let guard = self.target.read().map_err(|_| anyhow!("Config lock poisoned"))?;
         
-        match target_guard.as_ref() {
+        match guard.as_ref() {
             Some(TargetConfig::Single(ip)) => {
                 Ok(ip.clone())
             }
@@ -146,9 +146,9 @@ impl GlobalConfig {
     /// Returns a vector of IP addresses (expands subnets)
     /// For very large subnets (> 65536 IPs), returns an error
     pub fn get_target_ips(&self) -> Result<Vec<String>> {
-        let target_guard = self.target.read().unwrap();
+        let guard = self.target.read().map_err(|_| anyhow!("Config lock poisoned"))?;
         
-        match target_guard.as_ref() {
+        match guard.as_ref() {
             Some(TargetConfig::Single(ip)) => {
                 // For single IP/hostname, return as-is
                 Ok(vec![ip.clone()])
@@ -202,21 +202,19 @@ impl GlobalConfig {
 
     /// Check if global target is set
     pub fn has_target(&self) -> bool {
-        let target_guard = self.target.read().unwrap();
-        target_guard.is_some()
+        self.target.read().map(|g| g.is_some()).unwrap_or(false)
     }
 
     /// Check if global target is a subnet
     pub fn is_subnet(&self) -> bool {
-        let target_guard = self.target.read().unwrap();
-        matches!(target_guard.as_ref(), Some(TargetConfig::Subnet(_)))
+        self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)))).unwrap_or(false)
     }
 
     /// Get the size of the target (number of IPs)
     /// For single IPs, returns 1
     /// For subnets, returns the subnet size without expanding
     pub fn get_target_size(&self) -> Option<u64> {
-        let target_guard = self.target.read().unwrap();
+        let target_guard = self.target.read().ok()?;
         match target_guard.as_ref() {
             Some(TargetConfig::Single(_)) => Some(1),
             Some(TargetConfig::Subnet(net)) => {
@@ -252,8 +250,9 @@ impl GlobalConfig {
 
     /// Clear the global target
     pub fn clear_target(&self) {
-        let mut target_guard = self.target.write().unwrap();
-        *target_guard = None;
+        if let Ok(mut target_guard) = self.target.write() {
+             *target_guard = None;
+        }
     }
 }
 
