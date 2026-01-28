@@ -145,6 +145,11 @@ pub fn prompt_existing_file(msg: &str) -> Result<String> {
     }
 }
 
+/// Prompts for a wordlist file path.
+pub fn prompt_wordlist(msg: &str) -> Result<String> {
+    prompt_existing_file(msg)
+}
+
 // ============================================================
 // VALIDATION & SANITIZATION
 // ============================================================
