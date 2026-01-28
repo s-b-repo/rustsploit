@@ -19,6 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use crate::utils::prompt_port;
 
 use anyhow::Context;
 use tokio::{
@@ -383,7 +384,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Get port
-    let port: u16 = prompt_default("SSH Port", "22")?.parse().unwrap_or(DEFAULT_SSH_PORT);
+    let port: u16 = prompt_port("SSH Port", DEFAULT_SSH_PORT)?;
     
     // Get targets
     let mut targets = Vec::new();

@@ -187,6 +187,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
 
     if run_random {
+        // Initialize state file
+        OpenOptions::new().create(true).write(true).open(STATE_FILE).await?;
+
         println!("{}", "[*] Starting Random Internet Scan...".green());
         loop {
              let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;

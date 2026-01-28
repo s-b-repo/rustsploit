@@ -33,7 +33,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::utils::{
     prompt_required, prompt_default, prompt_yes_no,
-    prompt_existing_file, prompt_int_range
+    prompt_existing_file, prompt_int_range, prompt_port
 };
 
 // ============================================================
@@ -368,7 +368,7 @@ async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<(
         print_config_format();
         println!();
 
-        let config_path = prompt_wordlist("Path to configuration file: ")?;
+        let config_path = prompt_existing_file("Path to configuration file: ")?;
 
         println!("[*] Loading configuration from '{}'...", config_path);
         match load_and_validate_config(&config_path, &target_primary).await {
@@ -503,7 +503,7 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
         .map(|(u, p)| (u.to_string(), p.to_string()))
         .collect();
     } else {
-        let cred_file = prompt_wordlist("Path to credentials file (user:pass format): ")?;
+        let cred_file = prompt_existing_file("Path to credentials file (user:pass format): ")?;
         config.credentials = load_credentials_file(&cred_file).await?;
     }
 
@@ -549,9 +549,7 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
         vec![target.to_string()]
     };
 
-    let port: u16 = prompt_required("Port (default 23): ")?
-    .parse()
-    .unwrap_or(23);
+    let port: u16 = prompt_port("Port", 23)?;
 
     let verbose = prompt_yes_no("Verbose mode? (show all attempts and details) (y/n): ", false)?;
 
@@ -1999,7 +1997,7 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     println!("{}", "[Interactive Configuration]".bold().green());
     println!();
 
-    let port = prompt_port(23)?;
+    let port = prompt_port("Port", 23)?;
     let threads = prompt_threads(8)?;
     let delay_ms = prompt_delay(100)?;
     let connection_timeout = prompt_timeout("Connection timeout (seconds, default 3): ", 3)?;
@@ -2010,13 +2008,13 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     let command_timeout = prompt_timeout("Command timeout (seconds, default 3): ", 3)?;
     let write_timeout = 500; // Fixed write timeout in milliseconds
 
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
+    let username_wordlist = prompt_existing_file("Username wordlist file: ")?;
     let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false)?;
 
     let password_wordlist = if raw_bruteforce {
         prompt_optional_wordlist("Password wordlist (leave blank to skip): ")?
     } else {
-        Some(prompt_wordlist("Password wordlist file: ")?)
+        Some(prompt_existing_file("Password wordlist file: ")?)
     };
 
     let (raw_charset, raw_min_length, raw_max_length) = if raw_bruteforce {
@@ -3050,9 +3048,7 @@ fn display_banner() {
 // prompt and prompt_required are replaced by crate::utils imports/usage
 // prompt_yes_no is replaced by crate::utils imports/usage
 
-fn prompt_port(default: u16) -> Result<u16> {
-    Ok(prompt_int_range("Port", default as i64, 1, 65535)? as u16)
-}
+
 
 fn prompt_delay(default: u64) -> Result<u64> {
     Ok(prompt_int_range("Delay in ms", default as i64, 0, 10000)? as u64)
@@ -3070,16 +3066,16 @@ fn prompt_retries(default: usize) -> Result<usize> {
     Ok(prompt_int_range("Max retries", default as i64, 0, 10)? as usize)
 }
 
-fn prompt_wordlist(prompt_text: &str) -> Result<String> {
+fn prompt_file_path(prompt_text: &str) -> Result<String> {
     // Strip ": " if present to match prompt_existing_file style
     let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
-    prompt_existing_file(msg)
+    crate::utils::prompt_existing_file(msg)
 }
 
 fn prompt_optional_wordlist(prompt_text: &str) -> Result<Option<String>> {
     let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
     if prompt_yes_no(&format!("Use {}?", msg), true)? {
-        Ok(Some(prompt_existing_file(msg)?))
+        Ok(Some(prompt_file_path(msg)?))
     } else {
         Ok(None)
     }

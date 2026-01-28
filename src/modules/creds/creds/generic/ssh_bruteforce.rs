@@ -17,7 +17,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
     normalize_target, prompt_default, prompt_yes_no, 
-    prompt_existing_file, load_lines, get_filename_in_current_dir
+    prompt_existing_file, load_lines, get_filename_in_current_dir, prompt_port
 };
 use crate::modules::creds::utils::BruteforceStats;
 
@@ -45,13 +45,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", "=== SSH Brute Force Module ===".bold());
     println!("[*] Target: {}", target);
 
-    let port: u16 = loop {
-        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string())?;
-        match input.parse() {
-            Ok(p) if p > 0 => break p,
-            _ => println!("{}", "Invalid port. Must be between 1 and 65535.".yellow()),
-        }
-    };
+    let port: u16 = prompt_port("SSH Port", DEFAULT_SSH_PORT)?;
 
     // Ask about default credentials
     let use_defaults = prompt_yes_no("Try default credentials first?", true)?;

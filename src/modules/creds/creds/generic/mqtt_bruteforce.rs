@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, Semaphore};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
-    prompt_yes_no, prompt_wordlist, prompt_int_range, prompt_default,
+    prompt_yes_no, prompt_existing_file, prompt_int_range, prompt_default,
     load_lines, normalize_target,
 };
 use crate::modules::creds::utils::BruteforceStats;
@@ -135,8 +135,8 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let test_anonymous = prompt_yes_no("Test anonymous authentication first?", true)?;
-    let username_wordlist = prompt_wordlist("Username wordlist file")?;
-    let password_wordlist = prompt_wordlist("Password wordlist file")?;
+    let username_wordlist = prompt_existing_file("Username wordlist file")?;
+    let password_wordlist = prompt_existing_file("Password wordlist file")?;
     let threads = prompt_int_range("Concurrent connections", 10, 1, 500)? as usize;
     let stop_on_success = prompt_yes_no("Stop on first valid login?", true)?;
     let full_combo = prompt_yes_no("Full combination mode (user × pass)?", false)?;

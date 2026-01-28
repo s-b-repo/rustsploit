@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
 use crate::utils::{
-    prompt_yes_no, prompt_wordlist, prompt_default, prompt_int_range,
+    prompt_yes_no, prompt_existing_file, prompt_default, prompt_int_range,
     load_lines, normalize_target, get_filename_in_current_dir, prompt_port,
 };
 use crate::modules::creds::utils::BruteforceStats;
@@ -302,8 +302,8 @@ pub async fn run(target: &str) -> Result<()> {
     let normalized = normalize_target(target)?;
     let port: u16 = prompt_port("L2TP Port", 1701)?;
     
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let usernames_file = prompt_existing_file("Username wordlist")?;
+    let passwords_file = prompt_existing_file("Password wordlist")?;
     
     let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 100)? as usize;
     let timeout_ms = prompt_int_range("Connection timeout (ms)", DEFAULT_TIMEOUT_MS as i64, 100, 30000)? as u64;
