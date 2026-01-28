@@ -5,6 +5,7 @@ use anyhow::Result;
 use colored::*;
 use std::io::{self, Write};
 use url::Url;
+use ipnetwork::IpNetwork;
 
 const MAX_INPUT_LENGTH: usize = 4096;
 const MAX_TARGET_LENGTH: usize = 512;
@@ -55,7 +56,9 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
         io::stdout().flush()?;
 
         let mut raw_input = String::new();
-        io::stdin().read_line(&mut raw_input)?;
+        if io::stdin().read_line(&mut raw_input)? == 0 {
+            break 'main_loop;
+        }
 
         if raw_input.len() > MAX_INPUT_LENGTH {
             println!(
@@ -317,24 +320,36 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                                     continue;
                                 }
 
-                                // Get all IPs from the subnet
-                                match config::GLOBAL_CONFIG.get_target_ips() {
-                                    Ok(ips) => {
-                                        let total = ips.len();
-                                        println!("{}", format!("[*] Running module '{}' against all {} IPs in subnet", module_path, total).cyan().bold());
-                                        println!("{}", format!("[*] Subnet: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default()).cyan());
+                                // Get subnet and iterate lazily
+                                match config::GLOBAL_CONFIG.get_target_subnet() {
+                                    Some(subnet) => {
+                                        // Calculate total size for display
+                                        // Caution: size can be huge (u64)
+                                        let total_size = match subnet {
+                                            IpNetwork::V4(net) => 2u64.pow(32 - net.prefix() as u32),
+                                            IpNetwork::V6(net) => {
+                                                 let prefix = net.prefix();
+                                                 if prefix > 64 { 2u64.pow(128 - prefix as u32) } else { u64::MAX }
+                                            } // Simplified size display
+                                        };
                                         
+                                        println!("{}", format!("[*] Running module '{}' against subnet {}", module_path, subnet).cyan().bold());
+                                        if total_size > 1000000 {
+                                             println!("{}", format!("[!] Warning: Subnet is very large (~{} IPs). This will take a long time.", total_size).yellow());
+                                        }
+
                                         let mut success_count = 0;
                                         let mut fail_count = 0;
+                                        let mut idx = 0u64;
 
-                                        for (idx, ip) in ips.iter().enumerate() {
-                                            println!("\n{}", format!("[{}/{}] Running against: {}", idx + 1, total, ip).yellow());
+                                        for ip in subnet.iter() {
+                                            idx += 1;
+                                            let ip_str = ip.to_string();
+                                            println!("\n{}", format!("[{}/{}] Running against: {}", idx, total_size, ip_str).yellow());
                                             
-                                            // Perform honeypot check before running module
-                                            // Perform honeypot check before running module
-                                            utils::basic_honeypot_check(ip).await;
+                                            utils::basic_honeypot_check(&ip_str).await;
                                             
-                                            match commands::run_module(module_path, ip, ctx.verbose).await {
+                                            match commands::run_module(module_path, &ip_str, ctx.verbose).await {
                                                 Ok(_) => success_count += 1,
                                                 Err(e) => {
                                                     eprintln!("[!] Module failed: {:?}", e);
@@ -344,13 +359,13 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                                         }
 
                                         println!("\n{}", "=== Run All Summary ===".cyan().bold());
-                                        println!("{}", format!("Total IPs: {}", total).green());
+                                        println!("{}", format!("Total IPs: {}", total_size).green());
                                         println!("{}", format!("Successful: {}", success_count).green());
                                         println!("{}", format!("Failed: {}", fail_count).red());
                                     }
-                                    Err(e) => {
-                                        println!("{}", format!("[!] Error getting target IPs: {}", e).red());
-                                        println!("{}", "Note: Subnets larger than 65536 IPs are not supported for run_all. Use a smaller subnet.".yellow());
+                                    None => {
+                                         // Fallback if somehow is_subnet returned true but get_target_subnet failed (race condition?)
+                                         println!("{}", "[!] Error retrieving subnet configuration.".red());
                                     }
                                 }
                             } else {
