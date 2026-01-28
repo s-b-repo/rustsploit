@@ -59,8 +59,8 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 - **Improved CLI Experience** - Added `--list-modules` to browse tools without entering the shell, and `--verbose` for detailed operation logs. Fuzzy matching now suggests corrections for typos (e.g., `sample_xploit` -> `sample_exploit`).
 - **Colored CLI output** - Warnings in yellow, hints in cyan, success in green
 
-**📚 Documentation:**
-- Updated developer guide with v0.5.0 changes
+** Documentation:**
+- Updated developer guide with v0.4.6 changes
 - Added CLI error handling examples
 
 Rustsploit ships categorized modules under `src/modules/`, automatically exposed to the shell/CLI. A non-exhaustive snapshot:
@@ -291,7 +291,7 @@ exit             exit | quit | q          Leave shell
 
 Example session:
 
-```text
+```
 rsf> f1 ssh
 rsf> u creds/generic/ssh_bruteforce
 rsf> set target 10.10.10.10
@@ -302,7 +302,7 @@ rsf> go
 
 Execute multiple commands in a single line using the `&` separator:
 
-```text
+```
 rsf> u creds/generic/ssh_bruteforce & set target 10.10.10.10 & go
 rsf> f1 ssh & u creds/generic/ssh_bruteforce & set target 192.168.1.1
 ```
@@ -332,7 +332,7 @@ cargo run -- --command creds --module ssh_bruteforce --target 192.168.1.1
 - `--verbose (-v)`: Enable detailed logging (useful for debugging).
 - `--output-format <text|json>`: Control output format (default: text).
 
-```bash
+```
 # List all modules
 cargo run -- --list-modules
 
@@ -441,7 +441,7 @@ Authorization: ApiKey your-api-key-here
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/auth-failures
   ```
 
-### telnet config example
+### telnet config 
  ```
 {
   "port": 23,
