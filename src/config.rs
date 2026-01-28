@@ -61,6 +61,8 @@ impl GlobalConfig {
 
         // Try to parse as CIDR subnet first
         if let Ok(network) = trimmed.parse::<IpNetwork>() {
+            // No size limit enforced here - user can set 0.0.0.0/0 if they want.
+            // Consumers (looping logic) must handle large subnets responsibly (e.g. via iterators).
             let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
             *target_guard = Some(TargetConfig::Subnet(network));
             return Ok(());
@@ -142,63 +144,6 @@ impl GlobalConfig {
         }
     }
 
-    /// Get all IP addresses from the global target
-    /// Returns a vector of IP addresses (expands subnets)
-    /// For very large subnets (> 65536 IPs), returns an error
-    pub fn get_target_ips(&self) -> Result<Vec<String>> {
-        let guard = self.target.read().map_err(|_| anyhow!("Config lock poisoned"))?;
-        
-        match guard.as_ref() {
-            Some(TargetConfig::Single(ip)) => {
-                // For single IP/hostname, return as-is
-                Ok(vec![ip.clone()])
-            }
-            Some(TargetConfig::Subnet(net)) => {
-                // Check subnet size to prevent memory issues
-                // Calculate size from prefix length: 2^(32-prefix) for IPv4, 2^(128-prefix) for IPv6
-                let size = match net {
-                    IpNetwork::V4(net4) => {
-                        let prefix = net4.prefix() as u32;
-                        if prefix >= 32 {
-                            1u64
-                        } else {
-                            2u64.pow(32 - prefix)
-                        }
-                    }
-                    IpNetwork::V6(net6) => {
-                        let prefix = net6.prefix() as u32;
-                        if prefix >= 128 {
-                            1u64
-                        } else {
-                            // For very large IPv6 subnets, cap at u64::MAX
-                            let exp = 128u32.saturating_sub(prefix);
-                            if exp > 63 {
-                                u64::MAX
-                            } else {
-                                2u64.pow(exp)
-                            }
-                        }
-                    }
-                };
-                const MAX_SUBNET_SIZE: u64 = 65536; // Limit to /16 or smaller
-                
-                if size > MAX_SUBNET_SIZE {
-                    return Err(anyhow!(
-                        "Subnet too large ({} IPs). Maximum allowed: {} IPs. Use a smaller subnet or use 'get_single_target_ip' for a single IP.",
-                        size, MAX_SUBNET_SIZE
-                    ));
-                }
-                
-                // Expand subnet to individual IPs
-                let mut ips = Vec::new();
-                for ip in net.iter() {
-                    ips.push(ip.to_string());
-                }
-                Ok(ips)
-            }
-            None => Err(anyhow!("No global target set")),
-        }
-    }
 
     /// Check if global target is set
     pub fn has_target(&self) -> bool {
@@ -208,6 +153,15 @@ impl GlobalConfig {
     /// Check if global target is a subnet
     pub fn is_subnet(&self) -> bool {
         self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)))).unwrap_or(false)
+    }
+
+    /// Get the target subnet if set
+    pub fn get_target_subnet(&self) -> Option<IpNetwork> {
+        let guard = self.target.read().ok()?;
+        match guard.as_ref() {
+            Some(TargetConfig::Subnet(net)) => Some(*net),
+            _ => None,
+        }
     }
 
     /// Get the size of the target (number of IPs)
