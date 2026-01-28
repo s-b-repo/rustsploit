@@ -1065,7 +1065,7 @@ pub async fn start_api_server(
     // Create routes that require authentication
     let protected_routes = Router::new()
         .route("/api/modules", get(list_modules))
-        .route("/api/module/:category/:name", get(get_module_info))
+        .route("/api/module/{category}/{name}", get(get_module_info))
         .route("/api/run", post(run_module))
         .route("/api/validate", post(validate_module_params))
         .route("/api/status", get(get_status))
