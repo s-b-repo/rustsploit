@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::utils::{
     prompt_yes_no, prompt_default, prompt_port, 
-    prompt_wordlist, prompt_int_range,
+    prompt_existing_file, prompt_int_range,
     load_lines, get_filename_in_current_dir,
 };
 
@@ -253,9 +253,9 @@ pub async fn run(target: &str) -> Result<()> {
 
     let port: u16 = prompt_port("RDP Port", 3389)?;
 
-    let usernames_file_path = prompt_wordlist("Username wordlist")?;
+    let usernames_file_path = prompt_existing_file("Username wordlist")?;
 
-    let passwords_file_path = prompt_wordlist("Password wordlist")?;
+    let passwords_file_path = prompt_existing_file("Password wordlist")?;
 
     let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
 

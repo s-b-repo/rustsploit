@@ -16,7 +16,7 @@ use tokio::fs::OpenOptions;
 
 use crate::utils::{
     prompt_yes_no, prompt_existing_file, prompt_int_range,
-    load_lines, prompt_default, prompt_wordlist,
+    load_lines, prompt_default,
 };
 use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 
@@ -99,8 +99,8 @@ pub async fn run(target: &str) -> Result<()> {
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
     let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let usernames_file = prompt_existing_file("Username wordlist")?;
+    let passwords_file = prompt_existing_file("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;

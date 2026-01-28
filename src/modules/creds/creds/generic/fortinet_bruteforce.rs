@@ -15,7 +15,7 @@ use tokio::{
 };
 use crate::utils::{
     prompt_yes_no, prompt_default, prompt_int_range,
-    load_lines, prompt_wordlist, normalize_target,
+    load_lines, prompt_existing_file, normalize_target,
     get_filename_in_current_dir, prompt_port,
 };
 use regex::Regex;
@@ -38,8 +38,8 @@ pub async fn run(target: &str) -> Result<()> {
 
     let port: u16 = prompt_port("Fortinet VPN Port", 443)?;
 
-    let usernames_file_path = prompt_wordlist("Username wordlist path")?;
-    let passwords_file_path = prompt_wordlist("Password wordlist path")?;
+    let usernames_file_path = prompt_existing_file("Username wordlist path")?;
+    let passwords_file_path = prompt_existing_file("Password wordlist path")?;
 
     let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
     let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300)? as u64;

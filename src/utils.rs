@@ -9,12 +9,9 @@ use url::Url;
 use regex::Regex;
 use once_cell::sync::Lazy; // Added for safe static regex initialization
 
-/// Helper for verbose logging
-pub fn verbose_log(verbose: bool, message: &str) {
-    if verbose {
-        eprintln!("{} {}", "[VERBOSE]".dimmed(), message.dimmed());
-    }
-}
+// ============================================================
+// CONSTANTS
+// ============================================================
 
 /// Maximum folder depth to traverse
 const MAX_DEPTH: usize = 6;
@@ -25,21 +22,30 @@ const MAX_TARGET_LENGTH: usize = 2048;
 /// Maximum length for module paths
 const MAX_MODULE_PATH_LENGTH: usize = 512;
 
-/// Maximum file size to read (10MB) - prevents reading huge files
-
-
-
-
 /// Maximum length for command inputs to prevent DoS
 const MAX_COMMAND_LENGTH: usize = 8192;
 
 /// Maximum length for file paths to prevent DoS
 const MAX_PATH_LENGTH: usize = 4096;
 
+// ============================================================
+// LOGGING
+// ============================================================
+
+/// Helper for verbose logging
+pub fn verbose_log(verbose: bool, message: &str) {
+    if verbose {
+        eprintln!("{} {}", "[VERBOSE]".dimmed(), message.dimmed());
+    }
+}
+
+// ============================================================
+// INPUT HANDLING
+// ============================================================
+
 /// Reads input from stdin, treating it as a literal string payload.
 /// - Enforces max length (MAX_COMMAND_LENGTH).
-/// - Sanitizes invisible control characters (0x00-0x1F) for safety.
-/// - Warns user if dangerous patterns (shells, traversal) are detected, but DOES NOT block them.
+/// - Returns raw text (trimmed) without analysis.
 fn read_safe_input() -> Result<String> {
     std::io::stdout().flush().context("Failed to flush stdout")?;
     let mut s = String::new();
@@ -53,45 +59,375 @@ fn read_safe_input() -> Result<String> {
         ));
     }
     
-    // 2. Control Character Sanitization
-    // We only strip Null bytes (\0) to allow payloads (including ANSI, Bell, etc.)
-    let sanitized: String = s.chars()
-        .filter(|c| *c != '\0')
-        .collect();
-        
-    let trimmed = sanitized.trim().to_string();
-    
-    // 3. Pattern Recognition & Warning (Defense in Depth)
-    // We do NOT block these, we treat them as literal strings, but warn the user.
-    let low = trimmed.to_lowercase();
-    let dangerous_patterns = [
-        "bash", "zsh", "sh", "cmd", "powershell", "pwsh", // Interactive shells
-        "sudo", // Privilege
-        "../", "..\\", // Traversal
-        "\x1b", // ANSI injection attempts that survived sanitization? (Esc is 0x1b control char)
-        // Esc is a control char so it's filtered above, but let's be sure.
-    ];
-    
-    for pat in dangerous_patterns.iter() {
-        if low.contains(pat) {
-            // Found a risky pattern.
-            // Check if it looks like a direct binary execution attempt at start
-            let is_binary_start = ["bash", "zsh", "sh", "cmd", "powershell", "pwsh", "sudo"]
-                .iter()
-                .any(|bin| low.starts_with(bin));
-                
-            if is_binary_start {
-                 println!("{}", "[!] Warning: Input starts with shell binary/sudo. Treated as literal text payload.".yellow().bold());
-                 println!("{}", "    If you intended to execute this locally, this is not a shell.".dimmed());
-            } else {
-                 println!("{}", format!("[!] Warning: Input contains potentially dangerous pattern '{}'. Treated as literal text.", pat).yellow());
-            }
-            break; // Warn once
+    // Treat as literal plain text
+    Ok(s.trim().to_string())
+}
+
+// ============================================================
+// INTERACTIVE PROMPTS
+// ============================================================
+
+/// Generic prompt that allows empty input
+pub fn prompt_input(msg: &str) -> Result<String> {
+    print!("{}", msg.cyan().bold());
+    read_safe_input()
+}
+
+/// Prompts the user for input, ensuring it is not empty.
+pub fn prompt_required(msg: &str) -> Result<String> {
+    loop {
+        print!("{}", format!("{}: ", msg).cyan().bold());
+        let input = read_safe_input()?;
+        if !input.is_empty() {
+             return Ok(input);
+        }
+        println!("{}", "This field is required.".yellow());
+    }
+}
+
+/// Prompts the user for input, using a default value if empty.
+pub fn prompt_default(msg: &str, default: &str) -> Result<String> {
+    print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
+    let input = read_safe_input()?;
+    Ok(if input.is_empty() {
+        default.to_string()
+    } else {
+        input
+    })
+}
+
+/// Prompts the user for a yes/no answer.
+pub fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
+    let default = if default_yes { "y" } else { "n" };
+    loop {
+        print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
+        let input = read_safe_input()?;
+        match input.to_lowercase().as_str() {
+            ""        => return Ok(default_yes),
+            "y" | "yes" => return Ok(true),
+            "n" | "no"  => return Ok(false),
+            _ => println!("{}", "Invalid input. Please enter 'y' or 'n'.".yellow()),
         }
     }
-
-    Ok(trimmed)
 }
+
+pub fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
+    loop {
+        let input = prompt_default(msg, &default.to_string())?;
+        match input.trim().parse::<i64>() {
+            Ok(n) if n >= min && n <= max => return Ok(n),
+            _ => println!("{}", format!("Please enter a number between {} and {}.", min, max).yellow()),
+        }
+    }
+}
+
+pub fn prompt_port(msg: &str, default: u16) -> Result<u16> {
+    loop {
+        let input = prompt_default(msg, &default.to_string())?;
+        match input.parse::<u16>() {
+            Ok(n) if n > 0 => return Ok(n),
+            _ => println!("{}", "Please enter a valid port (1-65535).".yellow()),
+        }
+    }
+}
+
+
+
+/// Prompts for an existing file path.
+pub fn prompt_existing_file(msg: &str) -> Result<String> {
+    loop {
+        let candidate = prompt_required(msg)?;
+        if Path::new(&candidate).is_file() {
+            return Ok(candidate);
+        } else {
+            println!("{}", format!("File '{}' does not exist or is not a regular file.", candidate).yellow());
+        }
+    }
+}
+
+/// Prompts for a wordlist file path.
+pub fn prompt_wordlist(msg: &str) -> Result<String> {
+    prompt_existing_file(msg)
+}
+
+// ============================================================
+// VALIDATION & SANITIZATION
+// ============================================================
+
+/// Validates and sanitizes command input to prevent injection attacks and DoS
+/// 
+/// # Security Features
+/// - Length limits to prevent DoS
+/// - Dangerous character filtering
+/// - Control character removal
+/// 
+/// # Arguments
+/// - `command`: The command string to validate
+/// 
+/// # Returns
+/// - `Ok(String)`: Sanitized command if valid
+/// - `Err`: Error if validation fails
+pub fn validate_command_input(command: &str) -> Result<String> {
+    let trimmed = command.trim();
+    
+    // Check if empty
+    if trimmed.is_empty() {
+        return Err(anyhow!("Command cannot be empty"));
+    }
+    
+    // Check length to prevent DoS
+    if trimmed.len() > MAX_COMMAND_LENGTH {
+        return Err(anyhow!(
+            "Command too long (max {} characters, got {})",
+            MAX_COMMAND_LENGTH,
+            trimmed.len()
+        ));
+    }
+    
+    // Remove only Null bytes to allow payloads
+    let sanitized: String = trimmed
+        .chars()
+        .filter(|c| *c != '\0')
+        .collect();
+    
+    if sanitized.is_empty() {
+        return Err(anyhow!("Command contains only invalid characters"));
+    }
+    
+    Ok(sanitized)
+}
+
+/// Validates file path to prevent path traversal attacks
+/// 
+/// # Security Features
+/// - Path traversal detection (.., //, etc.)
+/// - Length limits to prevent DoS
+/// - Control character filtering
+/// - Absolute path validation (optional)
+/// 
+/// # Arguments
+/// - `path`: The file path to validate
+/// - `allow_absolute`: Whether to allow absolute paths
+/// 
+/// # Returns
+/// - `Ok(String)`: Sanitized path if valid
+/// - `Err`: Error if validation fails
+pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
+    let trimmed = path.trim();
+    
+    // Check if empty
+    if trimmed.is_empty() {
+        return Err(anyhow!("File path cannot be empty"));
+    }
+    
+    // Check length to prevent DoS
+    if trimmed.len() > MAX_PATH_LENGTH {
+        return Err(anyhow!(
+            "File path too long (max {} characters, got {})",
+            MAX_PATH_LENGTH,
+            trimmed.len()
+        ));
+    }
+    
+    // Check for path traversal attempts
+    if trimmed.contains("..") {
+        return Err(anyhow!("Path traversal detected: '..' not allowed"));
+    }
+    
+    // Check for double slashes (potential traversal)
+    if trimmed.contains("//") {
+        return Err(anyhow!("Invalid path format: double slashes not allowed"));
+    }
+    
+    // Check for control characters
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("File path cannot contain control characters"));
+    }
+    
+    // Check for absolute paths if not allowed
+    if !allow_absolute {
+        if trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':')) {
+            return Err(anyhow!("Absolute paths not allowed"));
+        }
+    }
+    
+    // Basic path validation - ensure it's a reasonable path
+    let _path_obj = Path::new(trimmed);
+    
+    // Check for null bytes (shouldn't happen after trim, but double-check)
+    if trimmed.contains('\x00') {
+        return Err(anyhow!("File path cannot contain null bytes"));
+    }
+    
+    // On Windows, check for invalid characters
+    #[cfg(windows)]
+    {
+        const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+        if trimmed.chars().any(|c| INVALID_CHARS.contains(&c)) {
+            return Err(anyhow!("File path contains invalid characters for Windows"));
+        }
+    }
+    
+    Ok(trimmed.to_string())
+}
+
+/// Validates URL input to prevent injection and ensure proper format
+/// 
+/// # Security Features
+/// - Length limits
+/// - URL format validation
+/// - Dangerous protocol filtering (optional)
+/// 
+/// # Arguments
+/// - `url`: The URL string to validate
+/// - `allowed_schemes`: Optional list of allowed URL schemes (e.g., ["http", "https"])
+/// 
+/// # Returns
+/// - `Ok(String)`: Validated URL if valid
+/// - `Err`: Error if validation fails
+pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<String> {
+    let trimmed = url.trim();
+    
+    // Check if empty
+    if trimmed.is_empty() {
+        return Err(anyhow!("URL cannot be empty"));
+    }
+    
+    // Check length
+    if trimmed.len() > MAX_COMMAND_LENGTH {
+        return Err(anyhow!(
+            "URL too long (max {} characters, got {})",
+            MAX_COMMAND_LENGTH,
+            trimmed.len()
+        ));
+    }
+    
+    // Parse URL
+    let parsed_url = Url::parse(trimmed)
+        .map_err(|e| anyhow!("Invalid URL format: {}", e))?;
+    
+    // Check scheme if restrictions provided
+    if let Some(schemes) = allowed_schemes {
+        let scheme = parsed_url.scheme();
+        if !schemes.iter().any(|&s| s == scheme) {
+            return Err(anyhow!(
+                "URL scheme '{}' not allowed. Allowed schemes: {:?}",
+                scheme,
+                schemes
+            ));
+        }
+    }
+    
+    // Validate host exists
+    if parsed_url.host_str().is_none() {
+        return Err(anyhow!("URL must contain a host"));
+    }
+    
+    Ok(trimmed.to_string())
+}
+
+/// Escapes shell metacharacters in a command string to prevent command injection
+/// 
+/// # Security Features
+/// - Escapes all shell metacharacters: $, `, |, &, ;, >, <, (, ), {, }, [, ], *, ?, ~, !, #
+/// - Handles quotes and backslashes
+/// - Prevents command chaining and injection
+/// 
+/// # Arguments
+/// - `cmd`: The command string to escape
+/// 
+/// # Returns
+/// - Escaped command string safe for shell execution
+pub fn escape_shell_command(cmd: &str) -> String {
+    let mut escaped = String::with_capacity(cmd.len() * 2);
+    
+    for ch in cmd.chars() {
+        match ch {
+            // Shell metacharacters that need escaping
+            '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Quotes and backslashes
+            '"' | '\'' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Newlines and other control characters
+            '\n' => {
+                escaped.push_str("\\n");
+            }
+            '\r' => {
+                escaped.push_str("\\r");
+            }
+            '\t' => {
+                escaped.push_str("\\t");
+            }
+            // Regular characters
+            _ => {
+                escaped.push(ch);
+            }
+        }
+    }
+    
+    escaped
+}
+
+/// Escapes command for JavaScript/Node.js execSync context
+/// 
+/// # Security Features
+/// - Escapes backslashes, quotes, and newlines for JavaScript strings
+/// - Escapes shell metacharacters if the command will be executed in a shell
+/// - Handles both single and double quotes
+/// 
+/// # Arguments
+/// - `cmd`: The command string to escape
+/// - `escape_shell_meta`: Whether to also escape shell metacharacters (default: true)
+/// 
+/// # Returns
+/// - Escaped command string safe for JavaScript execSync
+pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
+    let mut escaped = String::with_capacity(cmd.len() * 2);
+    
+    for ch in cmd.chars() {
+        match ch {
+            // JavaScript string escaping
+            '\\' => {
+                escaped.push_str("\\\\");
+            }
+            '"' => {
+                escaped.push_str("\\\"");
+            }
+            '\'' => {
+                escaped.push_str("\\'");
+            }
+            '\n' => {
+                escaped.push_str("\\n");
+            }
+            '\r' => {
+                escaped.push_str("\\r");
+            }
+            '\t' => {
+                escaped.push_str("\\t");
+            }
+            // Shell metacharacters (if execSync uses shell)
+            ch if escape_shell_meta && matches!(ch, '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#') => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            // Regular characters
+            _ => {
+                escaped.push(ch);
+            }
+        }
+    }
+    
+    escaped
+}
+
+// ============================================================
+// TARGET & NETWORKING
+// ============================================================
 
 /// Comprehensive target normalization function.
 /// 
@@ -435,6 +771,175 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
     true
 }
 
+/// Extract IP address or hostname from target string.
+/// Handles formats: IP:port, [IPv6]:port, hostname:port, CIDR notation
+/// Returns the host/IP part without port or brackets.
+fn extract_ip_from_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    
+    // Handle CIDR notation: extract network part before /
+    if let Some(slash_pos) = trimmed.find('/') {
+        let network_part = &trimmed[..slash_pos];
+        return extract_ip_from_target(network_part);
+    }
+    
+    // Handle IPv6 with brackets: [::1]:8080 or [::1]
+    if trimmed.starts_with('[') {
+        if let Some(bracket_end) = trimmed.find(']') {
+            let ipv6_part = &trimmed[1..bracket_end];
+            return Some(ipv6_part.to_string());
+        }
+        // Malformed - missing closing bracket, but try to extract anyway
+        return Some(trimmed.trim_start_matches('[').to_string());
+    }
+    
+    // Handle IPv4 or hostname with port: 192.168.1.1:8080 or hostname:8080
+    if let Some(colon_pos) = trimmed.rfind(':') {
+        let before_colon = &trimmed[..colon_pos];
+        let after_colon = &trimmed[colon_pos + 1..];
+        
+        // Check if after colon is a port (all digits)
+        if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
+            // It's a port - extract host part
+            // But check if before_colon is IPv6 (multiple colons)
+            let colon_count = before_colon.matches(':').count();
+            if colon_count >= 2 {
+                // IPv6 address - return as is (without brackets)
+                return Some(before_colon.to_string());
+            }
+            // IPv4 or hostname - return host part
+            return Some(before_colon.to_string());
+        }
+    }
+    
+    // No port or malformed - check if it's IPv6 (multiple colons)
+    let colon_count = trimmed.matches(':').count();
+    if colon_count >= 2 {
+        // IPv6 without brackets - return as is
+        return Some(trimmed.to_string());
+    }
+    
+    // No port - return as is (IPv4 or hostname)
+    Some(trimmed.to_string())
+}
+
+/// Perform a lightweight honeypot check by probing common ports.
+/// If 11 or more ports are open, warns that the target is likely a honeypot.
+pub async fn basic_honeypot_check(target: &str) {
+    // Extract IP address from target (handles IP:port format)
+    let ip = match extract_ip_from_target(target) {
+        Some(ip) => ip,
+        None => {
+            // If we can't extract IP, skip check
+            return;
+        }
+    };
+    
+    // Skip check for hostnames (contains non-IP characters)
+    if ip.contains(|c: char| c.is_alphabetic() && c != ':') && !ip.contains(':') {
+        // Likely a hostname, skip honeypot check
+        return;
+    }
+    
+    println!();
+    println!("{}", "╔══════════════════════════════════════════════╗".bright_yellow());
+    println!("{}", "║   HONEYPOT DETECTION CHECK                  ║".bright_yellow());
+    println!("{}", "╚══════════════════════════════════════════════╝".bright_yellow());
+    println!();
+    println!("[*] Scanning {} common ports on {}...", 200, ip);
+    
+    // Common ports typically exposed by network services.
+    const COMMON_PORTS: &[u16] = &[
+        11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 26, 37, 38, 43, 49, 53, 70, 79, 80, 81, 82, 83, 84, 86, 88, 89, 91, 92, 94, 95, 97, 99,
+        101, 102, 104, 110, 111, 113, 119, 143, 154, 161, 175, 177, 179, 180, 189, 195, 221, 234, 243, 263, 264, 285, 311, 314, 385, 389,
+        400, 427, 440, 441, 442, 443, 444, 446, 447, 449, 450, 451, 452, 462, 465, 480, 485, 488, 502, 503, 513, 515, 541, 548, 554, 556,
+        587, 591, 593, 602, 631, 636, 646, 666, 685, 700, 743, 771, 777, 785, 789, 805, 806, 811, 832, 833, 843, 873, 880, 886, 887, 902,
+        953, 990, 992, 993, 995, 998, 999, 1013, 1022, 1023, 1024, 1027, 1080, 1099, 1110, 1111, 1153, 1181, 1188, 1195, 1198, 1200, 1207,
+        1234, 1291, 1292, 1311, 1337, 1366, 1370, 1377, 1388, 1400, 1414, 1433, 1444, 1447, 1451, 1453, 1454, 1457, 1460, 1471, 1521, 1554,
+        1599, 1604, 1605, 1650, 1723, 1741, 1820, 1830, 1883
+    ];
+
+    let mut open_count = 0usize;
+    let mut open_ports = Vec::new();
+    let scan_timeout = std::time::Duration::from_millis(300); // 300ms fast scan
+
+    // Use a Semaphore to limit concurrency (200 = scan all common ports at once)
+    // Modern OS can handle 200 ephemeral ports easily.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(200));
+    
+    // Create a vector of async tasks
+    let mut tasks = Vec::new();
+
+    for &port in COMMON_PORTS {
+        let ip = ip.clone();
+        let sem = semaphore.clone();
+        
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok(); // Acquire permit
+            let addr = format!("{}:{}", ip, port);
+            
+            let conn = tokio::time::timeout(
+                scan_timeout,
+                tokio::net::TcpStream::connect(&addr),
+            ).await;
+
+            if let Ok(Ok(_)) = conn {
+                // Connection successful
+                Some(port)
+            } else {
+                None
+            }
+            // Permit dropped here
+        }));
+    }
+
+    // Await all tasks and collect results
+    // We use join_all which is available via futures usually, but since we rely on tokio::spawn,
+    // we can just collect the JoinHandles.
+    for task in tasks {
+        if let Ok(Some(port)) = task.await {
+            open_count += 1;
+            if open_ports.len() < 20 {
+                open_ports.push(port);
+            }
+        }
+    }
+
+    println!("[*] Found {} open port(s) out of {} scanned", open_count, COMMON_PORTS.len());
+    
+    // Threshold: if 11 or more common ports are open, likely a honeypot
+    if open_count >= 11 {
+        println!();
+        println!("{}", "╔══════════════════════════════════════════════╗".red().bold());
+        println!("{}", "║   ⚠️  HONEYPOT DETECTED                     ║".red().bold());
+        println!("{}", "╚══════════════════════════════════════════════╝".red().bold());
+        println!();
+        println!(
+            "{}",
+            format!(
+                "[!] Target {} has {} / {} common ports open - likely honeypot",
+                ip,
+                open_count,
+                COMMON_PORTS.len()
+            )
+            .yellow()
+            .bold()
+        );
+        println!("{}", "    This is likely a honeypot system".yellow().bold());
+        if open_count <= 20 && !open_ports.is_empty() {
+            println!("{}", format!("    Open ports: {:?}", &open_ports[..open_count.min(20)]).yellow());
+        }
+        println!();
+    } else {
+        println!("{}", "[+] No honeypot indicators detected".green());
+        println!();
+    }
+}
+
+// ============================================================
+// FILE SYSTEM & MODULES
+// ============================================================
+
 /// Recursively list .rs files up to a certain depth with security checks
 fn collect_module_paths(dir: &Path, depth: usize) -> Vec<String> {
     let mut modules = Vec::new();
@@ -595,518 +1100,6 @@ pub fn find_modules(keyword: &str) {
         println!("\n{}:", category.blue().bold());
         for path in paths {
             println!("  - {}", path.green());
-        }
-    }
-}
-
-
-
-
-/// Extract IP address or hostname from target string.
-/// Handles formats: IP:port, [IPv6]:port, hostname:port, CIDR notation
-/// Returns the host/IP part without port or brackets.
-fn extract_ip_from_target(target: &str) -> Option<String> {
-    let trimmed = target.trim();
-    
-    // Handle CIDR notation: extract network part before /
-    if let Some(slash_pos) = trimmed.find('/') {
-        let network_part = &trimmed[..slash_pos];
-        return extract_ip_from_target(network_part);
-    }
-    
-    // Handle IPv6 with brackets: [::1]:8080 or [::1]
-    if trimmed.starts_with('[') {
-        if let Some(bracket_end) = trimmed.find(']') {
-            let ipv6_part = &trimmed[1..bracket_end];
-            return Some(ipv6_part.to_string());
-        }
-        // Malformed - missing closing bracket, but try to extract anyway
-        return Some(trimmed.trim_start_matches('[').to_string());
-    }
-    
-    // Handle IPv4 or hostname with port: 192.168.1.1:8080 or hostname:8080
-    if let Some(colon_pos) = trimmed.rfind(':') {
-        let before_colon = &trimmed[..colon_pos];
-        let after_colon = &trimmed[colon_pos + 1..];
-        
-        // Check if after colon is a port (all digits)
-        if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
-            // It's a port - extract host part
-            // But check if before_colon is IPv6 (multiple colons)
-            let colon_count = before_colon.matches(':').count();
-            if colon_count >= 2 {
-                // IPv6 address - return as is (without brackets)
-                return Some(before_colon.to_string());
-            }
-            // IPv4 or hostname - return host part
-            return Some(before_colon.to_string());
-        }
-    }
-    
-    // No port or malformed - check if it's IPv6 (multiple colons)
-    let colon_count = trimmed.matches(':').count();
-    if colon_count >= 2 {
-        // IPv6 without brackets - return as is
-        return Some(trimmed.to_string());
-    }
-    
-    // No port - return as is (IPv4 or hostname)
-    Some(trimmed.to_string())
-}
-
-/// Perform a lightweight honeypot check by probing common ports.
-/// If 11 or more ports are open, warns that the target is likely a honeypot.
-pub async fn basic_honeypot_check(target: &str) {
-    // Extract IP address from target (handles IP:port format)
-    let ip = match extract_ip_from_target(target) {
-        Some(ip) => ip,
-        None => {
-            // If we can't extract IP, skip check
-            return;
-        }
-    };
-    
-    // Skip check for hostnames (contains non-IP characters)
-    if ip.contains(|c: char| c.is_alphabetic() && c != ':') && !ip.contains(':') {
-        // Likely a hostname, skip honeypot check
-        return;
-    }
-    
-    println!();
-    println!("{}", "╔══════════════════════════════════════════════╗".bright_yellow());
-    println!("{}", "║   HONEYPOT DETECTION CHECK                  ║".bright_yellow());
-    println!("{}", "╚══════════════════════════════════════════════╝".bright_yellow());
-    println!();
-    println!("[*] Scanning {} common ports on {}...", 200, ip);
-    
-    // Common ports typically exposed by network services.
-    const COMMON_PORTS: &[u16] = &[
-        11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 26, 37, 38, 43, 49, 53, 70, 79, 80, 81, 82, 83, 84, 86, 88, 89, 91, 92, 94, 95, 97, 99,
-        101, 102, 104, 110, 111, 113, 119, 143, 154, 161, 175, 177, 179, 180, 189, 195, 221, 234, 243, 263, 264, 285, 311, 314, 385, 389,
-        400, 427, 440, 441, 442, 443, 444, 446, 447, 449, 450, 451, 452, 462, 465, 480, 485, 488, 502, 503, 513, 515, 541, 548, 554, 556,
-        587, 591, 593, 602, 631, 636, 646, 666, 685, 700, 743, 771, 777, 785, 789, 805, 806, 811, 832, 833, 843, 873, 880, 886, 887, 902,
-        953, 990, 992, 993, 995, 998, 999, 1013, 1022, 1023, 1024, 1027, 1080, 1099, 1110, 1111, 1153, 1181, 1188, 1195, 1198, 1200, 1207,
-        1234, 1291, 1292, 1311, 1337, 1366, 1370, 1377, 1388, 1400, 1414, 1433, 1444, 1447, 1451, 1453, 1454, 1457, 1460, 1471, 1521, 1554,
-        1599, 1604, 1605, 1650, 1723, 1741, 1820, 1830, 1883
-    ];
-
-    let mut open_count = 0usize;
-    let mut open_ports = Vec::new();
-
-    for &port in COMMON_PORTS {
-        let addr = format!("{}:{}", ip, port);
-        let conn = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await;
-
-        if let Ok(Ok(stream)) = conn {
-            // We only care that the TCP handshake completed; drop immediately.
-            drop(stream);
-            open_count += 1;
-            if open_ports.len() < 20 {
-                open_ports.push(port);
-            }
-        }
-    }
-
-    println!("[*] Found {} open port(s) out of {} scanned", open_count, COMMON_PORTS.len());
-    
-    // Threshold: if 11 or more common ports are open, likely a honeypot
-    if open_count >= 11 {
-        println!();
-        println!("{}", "╔══════════════════════════════════════════════╗".red().bold());
-        println!("{}", "║   ⚠️  HONEYPOT DETECTED                     ║".red().bold());
-        println!("{}", "╚══════════════════════════════════════════════╝".red().bold());
-        println!();
-        println!(
-            "{}",
-            format!(
-                "[!] Target {} has {} / {} common ports open - likely honeypot",
-                ip,
-                open_count,
-                COMMON_PORTS.len()
-            )
-            .yellow()
-            .bold()
-        );
-        println!("{}", "    This is likely a honeypot system".yellow().bold());
-        if open_count <= 20 && !open_ports.is_empty() {
-            println!("{}", format!("    Open ports: {:?}", &open_ports[..open_count.min(20)]).yellow());
-        }
-        println!();
-    } else {
-        println!("{}", "[+] No honeypot indicators detected".green());
-        println!();
-    }
-}
-
-/// Validates and sanitizes command input to prevent injection attacks and DoS
-/// 
-/// # Security Features
-/// - Length limits to prevent DoS
-/// - Dangerous character filtering
-/// - Control character removal
-/// 
-/// # Arguments
-/// - `command`: The command string to validate
-/// 
-/// # Returns
-/// - `Ok(String)`: Sanitized command if valid
-/// - `Err`: Error if validation fails
-pub fn validate_command_input(command: &str) -> Result<String> {
-    let trimmed = command.trim();
-    
-    // Check if empty
-    if trimmed.is_empty() {
-        return Err(anyhow!("Command cannot be empty"));
-    }
-    
-    // Check length to prevent DoS
-    if trimmed.len() > MAX_COMMAND_LENGTH {
-        return Err(anyhow!(
-            "Command too long (max {} characters, got {})",
-            MAX_COMMAND_LENGTH,
-            trimmed.len()
-        ));
-    }
-    
-    // Remove only Null bytes to allow payloads
-    let sanitized: String = trimmed
-        .chars()
-        .filter(|c| *c != '\0')
-        .collect();
-    
-    if sanitized.is_empty() {
-        return Err(anyhow!("Command contains only invalid characters"));
-    }
-    
-    Ok(sanitized)
-}
-
-/// Validates file path to prevent path traversal attacks
-/// 
-/// # Security Features
-/// - Path traversal detection (.., //, etc.)
-/// - Length limits to prevent DoS
-/// - Control character filtering
-/// - Absolute path validation (optional)
-/// 
-/// # Arguments
-/// - `path`: The file path to validate
-/// - `allow_absolute`: Whether to allow absolute paths
-/// 
-/// # Returns
-/// - `Ok(String)`: Sanitized path if valid
-/// - `Err`: Error if validation fails
-pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
-    let trimmed = path.trim();
-    
-    // Check if empty
-    if trimmed.is_empty() {
-        return Err(anyhow!("File path cannot be empty"));
-    }
-    
-    // Check length to prevent DoS
-    if trimmed.len() > MAX_PATH_LENGTH {
-        return Err(anyhow!(
-            "File path too long (max {} characters, got {})",
-            MAX_PATH_LENGTH,
-            trimmed.len()
-        ));
-    }
-    
-    // Check for path traversal attempts
-    if trimmed.contains("..") {
-        return Err(anyhow!("Path traversal detected: '..' not allowed"));
-    }
-    
-    // Check for double slashes (potential traversal)
-    if trimmed.contains("//") {
-        return Err(anyhow!("Invalid path format: double slashes not allowed"));
-    }
-    
-    // Check for control characters
-    if trimmed.chars().any(|c| c.is_control()) {
-        return Err(anyhow!("File path cannot contain control characters"));
-    }
-    
-    // Check for absolute paths if not allowed
-    if !allow_absolute {
-        if trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':')) {
-            return Err(anyhow!("Absolute paths not allowed"));
-        }
-    }
-    
-    // Basic path validation - ensure it's a reasonable path
-    let _path_obj = Path::new(trimmed);
-    
-    // Check for null bytes (shouldn't happen after trim, but double-check)
-    if trimmed.contains('\x00') {
-        return Err(anyhow!("File path cannot contain null bytes"));
-    }
-    
-    // On Windows, check for invalid characters
-    #[cfg(windows)]
-    {
-        const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
-        if trimmed.chars().any(|c| INVALID_CHARS.contains(&c)) {
-            return Err(anyhow!("File path contains invalid characters for Windows"));
-        }
-    }
-    
-    Ok(trimmed.to_string())
-}
-
-/// Escapes shell metacharacters in a command string to prevent command injection
-/// 
-/// # Security Features
-/// - Escapes all shell metacharacters: $, `, |, &, ;, >, <, (, ), {, }, [, ], *, ?, ~, !, #
-/// - Handles quotes and backslashes
-/// - Prevents command chaining and injection
-/// 
-/// # Arguments
-/// - `cmd`: The command string to escape
-/// 
-/// # Returns
-/// - Escaped command string safe for shell execution
-pub fn escape_shell_command(cmd: &str) -> String {
-    let mut escaped = String::with_capacity(cmd.len() * 2);
-    
-    for ch in cmd.chars() {
-        match ch {
-            // Shell metacharacters that need escaping
-            '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            // Quotes and backslashes
-            '"' | '\'' | '\\' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            // Newlines and other control characters
-            '\n' => {
-                escaped.push_str("\\n");
-            }
-            '\r' => {
-                escaped.push_str("\\r");
-            }
-            '\t' => {
-                escaped.push_str("\\t");
-            }
-            // Regular characters
-            _ => {
-                escaped.push(ch);
-            }
-        }
-    }
-    
-    escaped
-}
-
-/// Escapes command for JavaScript/Node.js execSync context
-/// 
-/// # Security Features
-/// - Escapes backslashes, quotes, and newlines for JavaScript strings
-/// - Escapes shell metacharacters if the command will be executed in a shell
-/// - Handles both single and double quotes
-/// 
-/// # Arguments
-/// - `cmd`: The command string to escape
-/// - `escape_shell_meta`: Whether to also escape shell metacharacters (default: true)
-/// 
-/// # Returns
-/// - Escaped command string safe for JavaScript execSync
-pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
-    let mut escaped = String::with_capacity(cmd.len() * 2);
-    
-    for ch in cmd.chars() {
-        match ch {
-            // JavaScript string escaping
-            '\\' => {
-                escaped.push_str("\\\\");
-            }
-            '"' => {
-                escaped.push_str("\\\"");
-            }
-            '\'' => {
-                escaped.push_str("\\'");
-            }
-            '\n' => {
-                escaped.push_str("\\n");
-            }
-            '\r' => {
-                escaped.push_str("\\r");
-            }
-            '\t' => {
-                escaped.push_str("\\t");
-            }
-            // Shell metacharacters (if execSync uses shell)
-            ch if escape_shell_meta && matches!(ch, '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#') => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            // Regular characters
-            _ => {
-                escaped.push(ch);
-            }
-        }
-    }
-    
-    escaped
-}
-
-/// Validates URL input to prevent injection and ensure proper format
-/// 
-/// # Security Features
-/// - Length limits
-/// - URL format validation
-/// - Dangerous protocol filtering (optional)
-/// 
-/// # Arguments
-/// - `url`: The URL string to validate
-/// - `allowed_schemes`: Optional list of allowed URL schemes (e.g., ["http", "https"])
-/// 
-/// # Returns
-/// - `Ok(String)`: Validated URL if valid
-/// - `Err`: Error if validation fails
-pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<String> {
-    let trimmed = url.trim();
-    
-    // Check if empty
-    if trimmed.is_empty() {
-        return Err(anyhow!("URL cannot be empty"));
-    }
-    
-    // Check length
-    if trimmed.len() > MAX_COMMAND_LENGTH {
-        return Err(anyhow!(
-            "URL too long (max {} characters, got {})",
-            MAX_COMMAND_LENGTH,
-            trimmed.len()
-        ));
-    }
-    
-    // Parse URL
-    let parsed_url = Url::parse(trimmed)
-        .map_err(|e| anyhow!("Invalid URL format: {}", e))?;
-    
-    // Check scheme if restrictions provided
-    if let Some(schemes) = allowed_schemes {
-        let scheme = parsed_url.scheme();
-        if !schemes.iter().any(|&s| s == scheme) {
-            return Err(anyhow!(
-                "URL scheme '{}' not allowed. Allowed schemes: {:?}",
-                scheme,
-                schemes
-            ));
-        }
-    }
-    
-    // Validate host exists
-    if parsed_url.host_str().is_none() {
-        return Err(anyhow!("URL must contain a host"));
-    }
-    
-    Ok(trimmed.to_string())
-}
-
-// ============================================================
-// INTERACTIVE PROMPT HELPERS
-// ============================================================
-
-// use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // Removed unused imports
-
-/// Generic prompt that allows empty input
-pub fn prompt_input(msg: &str) -> Result<String> {
-    print!("{}", msg.cyan().bold());
-    read_safe_input()
-}
-
-/// Prompts the user for input, ensuring it is not empty.
-pub fn prompt_required(msg: &str) -> Result<String> {
-    loop {
-        print!("{}", format!("{}: ", msg).cyan().bold());
-        let input = read_safe_input()?;
-        if !input.is_empty() {
-             return Ok(input);
-        }
-        println!("{}", "This field is required.".yellow());
-    }
-}
-
-/// Prompts the user for input, using a default value if empty.
-pub fn prompt_default(msg: &str, default: &str) -> Result<String> {
-    print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    let input = read_safe_input()?;
-    Ok(if input.is_empty() {
-        default.to_string()
-    } else {
-        input
-    })
-}
-
-/// Prompts the user for a yes/no answer.
-pub fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
-    let default = if default_yes { "y" } else { "n" };
-    loop {
-        print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
-        let input = read_safe_input()?;
-        match input.to_lowercase().as_str() {
-            ""        => return Ok(default_yes),
-            "y" | "yes" => return Ok(true),
-            "n" | "no"  => return Ok(false),
-            _ => println!("{}", "Invalid input. Please enter 'y' or 'n'.".yellow()),
-        }
-    }
-}
-
-pub fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
-    loop {
-        let input = prompt_default(msg, &default.to_string())?;
-        match input.trim().parse::<i64>() {
-            Ok(n) if n >= min && n <= max => return Ok(n),
-            _ => println!("{}", format!("Please enter a number between {} and {}.", min, max).yellow()),
-        }
-    }
-}
-
-pub fn prompt_port(msg: &str, default: u16) -> Result<u16> {
-    loop {
-        let input = prompt_default(msg, &default.to_string())?;
-        match input.parse::<u16>() {
-            Ok(n) if n > 0 => return Ok(n),
-            _ => println!("{}", "Please enter a valid port (1-65535).".yellow()),
-        }
-    }
-}
-
-pub fn prompt_wordlist(msg: &str) -> Result<String> {
-    loop {
-        let input = prompt_required(msg)?;
-        let path = Path::new(&input);
-        if !path.exists() {
-            println!("{}", format!("File '{}' does not exist.", input).yellow());
-            continue;
-        }
-        if !path.is_file() {
-            println!("{}", format!("'{}' is not a regular file.", input).yellow());
-            continue;
-        }
-        return Ok(input);
-    }
-}
-
-/// Prompts for an existing file path.
-pub fn prompt_existing_file(msg: &str) -> Result<String> {
-    loop {
-        let candidate = prompt_required(msg)?;
-        if Path::new(&candidate).is_file() {
-            return Ok(candidate);
-        } else {
-            println!("{}", format!("File '{}' does not exist or is not a regular file.", candidate).yellow());
         }
     }
 }

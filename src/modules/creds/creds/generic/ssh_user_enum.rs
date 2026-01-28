@@ -14,6 +14,7 @@ use std::{
     net::TcpStream,
     time::{Duration, Instant},
 };
+use crate::utils::prompt_port;
 
 use anyhow::Context;
 
@@ -247,7 +248,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Target: {}", host).cyan());
     
     // Get parameters
-    let port: u16 = prompt_default("SSH Port", "22")?.parse().unwrap_or(DEFAULT_SSH_PORT);
+    let port: u16 = prompt_port("SSH Port", DEFAULT_SSH_PORT)?;
     let samples: usize = prompt_default("Samples per username", "3")?.parse().unwrap_or(DEFAULT_SAMPLES);
     let timeout: u64 = prompt_default("Connection timeout (seconds)", "10")?.parse().unwrap_or(DEFAULT_TIMEOUT_SECS);
     let threshold: f64 = prompt_default("Timing threshold (seconds)", "0.3")?.parse().unwrap_or(TIMING_THRESHOLD);

@@ -298,6 +298,16 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Validate target if provided (fail fast on invalid input)
+    if let Some(ref target) = cli_args.target {
+        if let Err(e) = utils::normalize_target(target) {
+             return Err(anyhow!(CliError::TargetInvalid { 
+                target: target.clone(), 
+                reason: e.to_string() 
+            }));
+        }
+    }
+
     // Set global target if provided
     if let Some(ref target) = cli_args.set_target {
         verbose_log(cli_args.verbose, &format!("Setting global target to: {}", target));

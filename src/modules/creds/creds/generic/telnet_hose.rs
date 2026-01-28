@@ -103,6 +103,9 @@ pub async fn run(target: &str) -> Result<()> {
     });
 
     if target.is_empty() || target == "random" || target == "0.0.0.0/0" {
+        // Initialize state file
+        OpenOptions::new().create(true).write(true).open(STATE_FILE).await?;
+
         // Random Mode
         loop {
             let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
@@ -185,6 +188,11 @@ fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
 }
 
 async fn is_ip_checked(ip: &impl ToString) -> bool {
+    // Ensure state file exists before running grep
+    if !std::path::Path::new(STATE_FILE).exists() {
+        return false;
+    }
+
     // Grep for "checked: <ip>" in state file
     let ip_s = ip.to_string();
     let status = Command::new("grep")
@@ -192,6 +200,7 @@ async fn is_ip_checked(ip: &impl ToString) -> bool {
         .arg("-q")
         .arg(format!("checked: {}", ip_s))
         .arg(STATE_FILE)
+        .stderr(std::process::Stdio::null())
         .status()
         .await;
     

@@ -7,7 +7,7 @@
     pub mod ssh_bruteforce;
     pub mod ssh_user_enum;
     pub mod ssh_spray;
-    pub mod rtsp_bruteforce_advanced;
+    pub mod rtsp_bruteforce;
     pub mod rdp_bruteforce;
     pub mod enablebruteforce;
     pub mod smtp_bruteforce;

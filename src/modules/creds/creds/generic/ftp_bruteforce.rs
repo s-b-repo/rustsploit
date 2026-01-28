@@ -23,7 +23,7 @@ use rand::Rng;
 
 use crate::utils::{
     prompt_required, prompt_default, prompt_yes_no, 
-    prompt_int_range, prompt_wordlist,
+    prompt_int_range, prompt_existing_file, prompt_port,
     load_lines, get_filename_in_current_dir
 };
 use crate::modules::creds::utils::BruteforceStats;
@@ -139,11 +139,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // --- Standard Single Target Logic ---
 
-    let port: u16 = loop {
-        let input = prompt_default("FTP Port", "21")?;
-        if let Ok(p) = input.parse() { break p }
-        println!("Invalid port. Try again.");
-    };
+    let port: u16 = prompt_port("FTP Port", 21)?;
     let usernames_file = prompt_required("Username wordlist")?;
     let passwords_file = prompt_required("Password wordlist")?;
     let concurrency: usize = loop {
@@ -393,9 +389,9 @@ pub async fn run(target: &str) -> Result<()> {
 
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
-    let port: u16 = prompt_default("FTP Port", "21")?.parse().unwrap_or(21);
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let port: u16 = prompt_port("FTP Port", 21)?;
+    let usernames_file = prompt_existing_file("Username wordlist")?;
+    let passwords_file = prompt_existing_file("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -439,6 +435,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
 
     if run_random {
+        // Initialize state file
+        OpenOptions::new().create(true).write(true).open(STATE_FILE).await?;
+        
         println!("{}", "[*] Starting Random Internet Scan...".green());
         loop {
              let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
