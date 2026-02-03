@@ -21,7 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.49", features = ["full", "process", "fs", "io-std", "rt-multi-thread", "macros", "rt"] }
 
 # HTTP & Web
-reqwest = { version = "0.13", features = ["json", "cookies", "socks"] }
+reqwest = { version = "0.13", features = ["json", "cookies", "socks", "multipart", "form"] }
 h2 = "0.4"
 http = "1.4"
 bytes = "1.11"
@@ -107,6 +107,13 @@ des = { version = "0.8.1", features = ["zeroize"] }
 strsim = "0.11"
 byteorder = "1.5.0"
 ssh2 = "0.9.5"
+num_cpus = "1.17.0"
+
+# TOTP Authentication
+totp-rs = { version = "5.6", features = ["gen_secret", "otpauth", "qr"] }
+
+# Archive format for job output storage
+tar = "0.4"
 
 [build-dependencies]
 regex = "1.12"
