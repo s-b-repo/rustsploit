@@ -6202,3 +6202,228 @@ cargo run -- --api --api-key token1 --harden-totp - Start API
 Test: token1 + TOTP1 = works
 Test: token1 + TOTP2 = fails (wrong TOTP)
 Test: token2 + TOTP1 = fails (wrong token)
+
+
+
+Security Fixes Walkthrough
+Changes Made
+1. Removed TOTP Secret Endpoint (Critical Fix)
+File: 
+api.rs
+
+Removed get_totp_secret function (53 lines)
+Removed /api/totp/secret route registration
+CAUTION
+
+This endpoint defeated 2FA by exposing Factor 2 (TOTP secret) to anyone with Factor 1 (API token). TOTP secrets should only be shown once during CLI setup wizard.
+
+2. Sanitized Status Response
+File: 
+api.rs
+
+Removed 
+accounts
+ count from /api/status response
+Reduces information leakage about TOTP configuration
+3. Fixed Job Archive Syntax Error
+File: 
+job_archive.rs
+
+Added missing closing brace for 
+cleanup_old_archives
+ function
+Already Implemented (No Changes Needed)
+Security Control	Status
+Constant-time API key comparison	✅ Uses subtle::ConstantTimeEq
+Memory DoS protection	✅ MAX_OUTPUT_SIZE=1MB, MAX_MEMORY_JOBS=20
+Disk DoS protection	✅ MAX_ARCHIVE_SIZE_BYTES=1GB with automatic cleanup
+Verification Results
+✅ cargo check - Passed
+✅ cargo build - Passed (1 warning: unused get_text_secret_for_token method)
+Build output:
+
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 40s
+
+✅ Fixed! Changed the default API bind address from 0.0.0.0 (all interfaces) to 127.0.0.1 (localhost only).
+
+Changes made:
+
+cli.rs
+: Updated default value for --interface argument
+main.rs
+: Updated fallback default to match
+
+
+
+exploit_gen.rs
+, 
+creds_gen.rs
+, 
+scanner_gen.rs
+ - These are build-time code generators (called from build.rs). Using .unwrap() here is acceptable since build failures should be fatal and clear.
+acm_5611_rce.rs:186 - sem.acquire().await.unwrap() inside a spawned task - NEEDS FIX
+null_syn_exhaustion.rs:209, 219 - These are inside 
+build_packet
+ which is called in a hot loop. The buffer is pre-sized correctly, so these should never fail. However, using expect() with a message is more robust than unwrap().
+polymorph_dropper.rs:208, 215, 223 - charset.choose().unwrap() - The charset is non-empty, so this is safe but should use expect() for clarity.
+
+Verifying Unwrap Fixes
+Fixed .unwrap() calls in 3 runtime modules: 
+acm_5611_rce.rs
+ (proper error handling), 
+null_syn_exhaustion.rs
+ (expect with context), 
+polymorph_dropper.rs
+ (expect with context). Build-time gen files left as-is (acceptable for build scripts).
+
+Progress Updates
+1
+Running cargo check to verify compilation
+
+Replacing Unwrap and Expect Patterns
+Identified 6 files with expect() calls in logic or regex construction: 
+fortisiem_rce_cve_2025_64155.rs
+, 
+tapo_c200_vulns.rs
+, 
+smtp_user_enum.rs
+, 
+api_endpoint_scanner.rs
+, 
+ftp_bruteforce.rs
+, 
+rtsp_bruteforce.rs
+. replacing them with proper error propagation or safe handling.
+
+Files Edited
+rtsp_bruteforce.rs
+api_endpoint_scanner.rs
+ftp_bruteforce.rs
+fortisiem_rce_cve_2025_64155.rs
+tapo_c200_vulns.rs
+smtp_user_enum.rs
+Progress Updates
+1
+Reading modules with file opening .expect() calls
+
+2
+Replacing .expect() in file opened for React, TP-Link, and FortiWeb modules
+
+3
+Reading modules with remaining .expect() calls (Regex/Logic)
+
+4
+Refactoring logic errors and regex constructions to be safe
+
+Verifying Security Fixes
+Verified all changes: cargo check passed successfully. Fixed temporary compilation issues in 
+JobArchive
+ and exploit modules.
+
+Files Edited
+job_archive.rs
+fortiweb_sqli_rce_cve_2025_25257.rs
+react2shell.rs
+abussecurity_camera_cve202326609variant1.rs
+tplink_tapo_c200.rs
+fortisiem_rce_cve_2025_64155.rs
+Progress Updates
+
+I have fixed the ServerName creation logic in tapo_c200_vulns.rs to remove the unsafe unwrap() calls and properly propagate errors.
+
+The code now uses a clean or_else chain:
+
+1. Mass Scan File Output Safety
+Replaced panic-prone .expect("Failed to open output file") with graceful error logging and task termination. Affected Modules:
+
+hikvision/hikvision_rce_cve_2021_36260.rs
+telnet/telnet_auth_bypass_cve_2026_24061.rs
+acti/acm_5611_rce.rs
+react/react2shell.rs
+tplink/tplink_tapo_c200.rs
+abus/abussecurity_camera_cve202326609variant1.rs
+fortinet/fortiweb_sqli_rce_cve_2025_25257.rs
+2. Logic and Regex Safety
+Replaced expects with 
+Result
+ propagation or safe fallbacks.
+
+Examples:
+
+Tapo C200 (
+tapo_c200_vulns.rs
+): Replaced unsafe fallback chain with clean error propagation.
+SMTP Scanner (
+smtp_user_enum.rs
+): Regex::new(...).context(...)
+FortiSIEM (fortisiem_rce...): Proper error context.
+FTP Bruteforce (
+ftp_bruteforce.rs
+): Safe vector indexing.
+API Scanner (
+api_endpoint_scanner.rs
+): Safe HTTP method conversion.
+RTSP Bruteforce (
+rtsp_bruteforce.rs
+): Safe string slicing.
+3. Verification & Cleanup
+Dead Code Removal: Removed unused get_text_secret_for_token method in 
+totp_config.rs
+.
+Struct Fix: Corrected JobArchive::default() implementation.
+Wiring Verification: Audited modules/exploits, modules/creds, and modules/scanners for unregistered modules. None found.
+Build Verification:
+cargo check: Passed with 0 warnings.
+cargo run: Application starts successfully.
+
+
+I have completed the task of replacing .expect() calls with robust error handling across the codebase.
+
+Summary of changes:
+
+File I/O: Fixed unsafe file opening in 7 mass scan modules (Hikvision, Telnet, Acti, React, TP-Link, Abus, Fortinet). They now log errors safely instead of crashing.
+Logic/Regex: Replaced .expect() with proper error propagation or safe fallbacks in smtp_user_enum, tapo_c200, api_endpoint_scanner, fortisiem, ftp_bruteforce, and rtsp_bruteforce.
+Compilation: Fixed a compilation error I introduced in JobArchive::default() and verified the entire project compiles with cargo check.
+
+
+3. Static Constant Safety (No .expect allowed)
+Refactored static initializations to handle errors safely or silently drop invalid values (fail-safe for developer errors), preventing startup panics.
+
+utils.rs
+: Changed Lazy<Regex> to Lazy<Result<Regex>>. Usages now check Ok and fail safe (return false) on error.
+fortinet_bruteforce.rs
+: Changed Lazy<Vec<Regex>> initialization to use filter_map(Regex::new().ok()), automatically dropping any invalid patterns.
+stalkroute_full_traceroute.rs
+: Replaced parsing .expect() with safe 
+ok().flatten()
+ chains.
+polymorph_dropper.rs
+: Replaced choose().expect() with unwrap_or().
+4. Verification & Cleanup
+Wiring: Verified no orphaned modules.
+Build: cargo check (0 warnings), cargo run (starts successfully).
+
+Scan Method Selection: Added options for TCP Connect, UDP, or Both.
+Source Port: Added an option to bind to a specific source port.
+Custom TTL: Added an option to set the Time-To-Live for packets.
+Garbage Data: Added an option to append random payload data (post-handshake for TCP, payload replacement for UDP) to evade signatures.
+Technical Details:
+
+Refactored scan_tcp to use socket2 for low-level socket configuration (TTL/Bind) before connection, overcoming standard library limitations.
+Verified compilation with cargo check.
+You can now use these features by selecting the Port Scanner module and following the interactive prompts.
+
+I have successfully tested 3 random modules using the API.
+
+During the process, I identified and fixed a bug in src/api.rs where the route parameter syntax was incorrect (:job_id instead of {job_id}).
+
+The tested modules were:
+
+scanners/port_scanner
+exploits/sample_exploit
+creds/generic/sample_cred_check
+They were executed via a test script (test_api_modules.sh) which started the API server and sent POST requests. All modules executed successfully and returned job IDs.
+
+
+
+
