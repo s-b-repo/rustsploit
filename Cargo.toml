@@ -115,6 +115,9 @@ totp-rs = { version = "5.6", features = ["gen_secret", "otpauth", "qr"] }
 # Archive format for job output storage
 tar = "0.4"
 
+# Constant-time comparison for security (timing attack prevention)
+subtle = "2.6"
+
 [build-dependencies]
 regex = "1.12"
 walkdir = "2.5"
