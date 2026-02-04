@@ -231,6 +231,8 @@ The API server (`api.rs`) implements:
 - **Rate Limiting:** 3 failed auth attempts = 30 second block
 - **Auto-cleanup:** Old entries purged when limits exceeded
 - **IP Tracking:** With automatic rotation when suspicious activity detected
+- **Secure Defaults:** API binds to `127.0.0.1` by default to prevent accidental exposure
+- **2FA/TOTP:** Optional Time-based One-Time Password enforcement (`--harden-totp`) with interactive setup wizard (`--setup-totp`)
 
 ### File Operations
 
@@ -374,6 +376,33 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
   - `EncodingType` enum supports 10+ encoding schemes including Double URL and Hex
   - Base-N counting algorithm for exhaustive iteration without memory overhead
   - Modular `charset` selection (SQL, Traversal, Command Injection)
+
+- **API Endpoint Scanner**:
+  - Full-featured vulnerability scanner supporting SQLi, NoSQLi, Command Injection, and Path Traversal
+  - Extended HTTP method support (CONNECT, TRACE, DEBUG, PUT, DELETE, etc.)
+  - ID Enumeration module for finding resource leaks
+  - Endpoint discovery via wordlist enumeration
+  - Concurrent scanning with results filed by endpoint
+
+- **DoS / Stress Testing Optimizations**:
+  - **Null SYN Exhaustion**: Rewritten for high-performance using native OS threads, zero-allocation loops, and custom thread-local XorShift128+ RNG. Capable of >1M PPS.
+  - **TCP Connection Flood**: Optimized with DNS pre-resolution and efficient address sharing to maximize connection rate.
+
+- **New Exploit Modules**:
+  - **SharePoint**: CVE-2024-38094 (Deserialization RCE)
+  - **MongoBleed**: CVE-2025-14847 (Memory Disclosure) with mass-scan and deep-scan modes
+  - **TP-Link VIGI**: CVE-2026-1457 (Authenticated RCE)
+  - **Telnet**: CVE-2026-24061 (Auth Bypass)
+  - **Windows DWM**: CVE-2026-20805 (Info Disclosure)
+  - **Geth (Go-Ethereum)**: CVE-2026-22862 (DoS via Ecies Panic)
+  - **Termix**: CVE-2026-22804 (Stored XSS)
+  - **FortiCloud SSO**: CVE-2026-24858 (Auth Bypass)
+  - **Ruijie Series**: 7 new modules covering RCE, Auth Bypass, and SSRF
+
+- **Framework Core Enhancements**:
+  - **Mass Scan Standardization**: All mass-scan capable modules now accept `0.0.0.0`, `0.0.0.0/0`, or `random` targets and offer consistent private range exclusion prompts.
+  - **Stability**: Removed all `unwrap()` and `unwrap_or_default()` calls from critical paths for crash-free operation.
+  - **Architecture**: Fixed design flaws in API worker threading (moved to `spawn_blocking`) and consolidated validation logic.
 
 ---
 
