@@ -11,3 +11,4 @@ pub mod smtp_user_enum;
 pub mod dir_brute;
 pub mod sequential_fuzzer;
 pub mod api_endpoint_scanner;
+pub mod ipmi_enum_exploit;
