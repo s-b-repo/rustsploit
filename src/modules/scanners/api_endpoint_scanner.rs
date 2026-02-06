@@ -129,7 +129,8 @@ pub async fn run(target: &str) -> Result<()> {
     if prompt_yes_no("Enable Extended HTTP methods (PUT, PATCH, HEAD, OPTIONS, CONNECT, TRACE, DEBUG)?", false)? {
         methods.extend(vec![
             Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
-            Method::from_bytes(b"DEBUG").unwrap_or(Method::GET),
+            Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
+            match Method::from_bytes(b"DEBUG") { Ok(m) => m, Err(_) => Method::GET }, // Method parsing is generally safe for ASCII
         ]);
     }
 
@@ -164,6 +165,9 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     let concurrency = prompt_int_range("Concurrency limit", 10, 1, 100)? as usize;
+    
+    // Bug 10: Configurable timeout
+    let timeout_secs = prompt_int_range("Timeout (seconds)", 10, 1, 60)? as u64;
 
     // Injection Attacks Configuration
     let sqli_payloads = if modules.contains(&ScanModule::SQLi) {
@@ -194,6 +198,9 @@ pub async fn run(target: &str) -> Result<()> {
         } else {
              let start = prompt_int_range("Start ID", 1, 0, 1000000)? as usize;
              let end = prompt_int_range("End ID", 100, start as i64, 1000000)? as usize;
+             if start > end {
+                 return Err(anyhow!("Start ID must be less than or equal to End ID"));
+             }
              (Some(start), Some(end), None)
         }
     } else {
@@ -234,7 +241,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
     
     // Deduplicate endpoints based on key and path to avoid redundant work and file collisions
-    endpoints.sort_by(|a, b| a.key.cmp(&b.key));
+    endpoints.sort_by(|a, b| a.key.cmp(&b.key).then(a.path.cmp(&b.path)));
     endpoints.dedup_by(|a, b| a.key == b.key && a.path == b.path);
 
     if endpoints.is_empty() {
@@ -245,7 +252,7 @@ pub async fn run(target: &str) -> Result<()> {
     // 3. Setup Client
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -287,7 +294,9 @@ pub async fn run(target: &str) -> Result<()> {
                 // Print progress occasionally
                 if current % 10 == 0 || current == total {
                     print!("\r[*] Progress: {}/{}", current, total);
-                    std::io::stdout().flush().unwrap_or(());
+                    if let Err(e) = std::io::stdout().flush() {
+                        eprintln!("\n[!] Failed to flush stdout: {}", e);
+                    }
                 }
                 
                 scan_endpoint(&client, &config, endpoint).await
@@ -370,14 +379,23 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
     println!("{}", "\n[*] Starting Endpoint Enumeration...".cyan());
     
     let lines = load_lines(wordlist_path)?;
+    if lines.is_empty() {
+        return Err(anyhow!("Wordlist is empty"));
+    }
     let total = lines.len();
     println!("[*] Enumerating {} potential endpoints with concurrency {}", total, concurrency);
     
-    let base_url = format!("{}{}", target_base.trim_end_matches('/'), if base_path.starts_with('/') { base_path.to_string() } else { format!("/{}", base_path) });
+    let base_url = format!("{}{}", 
+        target_base.trim_end_matches('/'), 
+        if base_path.starts_with('/') { base_path.to_string() } else { format!("/{}", base_path) }
+    );
     // Ensure base_url ends with / for appending words
     let base_url = if base_url.ends_with('/') { base_url } else { format!("{}/", base_url) };
 
     let counter = Arc::new(AtomicUsize::new(0));
+
+    // Bug 6: Calculate base path prefix once outside loop
+    let clean_base_path = if base_path.starts_with('/') { base_path.to_string() } else { format!("/{}", base_path) };
 
     // Use a stream that returns Option<Endpoint> instead of locking a shared Vec
     let stream = stream::iter(lines)
@@ -385,11 +403,14 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
             let client = client.clone();
             let counter = Arc::clone(&counter);
             let base_url = base_url.clone();
+            let clean_base_path = clean_base_path.clone();
             async move {
                 let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
                  if current % 50 == 0 || current == total {
                     print!("\r[*] Brute-force Progress: {}/{}", current, total);
-                    std::io::stdout().flush().unwrap_or(());
+                if let Err(_e) = std::io::stdout().flush() {
+                    // Ignore flush errors in tough loops
+                }
                 }
 
                 let url = format!("{}{}", base_url, word);
@@ -398,9 +419,9 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
                          let status = resp.status();
                          // Consider valid if not 404
                         if status != reqwest::StatusCode::NOT_FOUND {
-                             // Recalculate clean path
-                             let clean_path = format!("{}{}", if base_path.starts_with('/') { base_path.to_string() } else { format!("/{}", base_path) }, word);
-                             // Ensure no double slashes if base_path ended with /
+                             // Recalculate clean path efficiently
+                             let clean_path = format!("{}{}", clean_base_path, word);
+                             // Ensure no double slashes (Bug 5 fix: check logic)
                              let clean_path = clean_path.replace("//", "/");
 
                             Some(Endpoint {
@@ -443,7 +464,17 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
 
 async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint: Endpoint) {
     // Create directory for this endpoint
-    let sanitized_key = endpoint.key.replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+    // Bug 9: Fix collision by appending a short hash of path
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    endpoint.path.hash(&mut hasher);
+    let path_hash = hasher.finish();
+    
+    let sanitized_key = format!("{}_{:x}", 
+        endpoint.key.replace(|c: char| !c.is_alphanumeric() && c != '_', "_"),
+        path_hash
+    );
     let endpoint_dir = Path::new(&config.output_dir).join(&sanitized_key);
     
     if let Err(e) = fs::create_dir_all(&endpoint_dir) {
@@ -505,12 +536,26 @@ async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint: Endpoint)
 
 async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir: &Path, config: &ScanConfig) {
     let enum_dir = dir.join("enumeration");
-    if let Err(_) = fs::create_dir_all(&enum_dir) { return; }
+    if let Err(e) = fs::create_dir_all(&enum_dir) {
+        eprintln!("[!] Failed to create enumeration directory: {}", e);
+        return;
+    }
     
     let bodies_dir = enum_dir.join("bodies");
-    if let Err(_) = fs::create_dir_all(&bodies_dir) { return; }
+    if let Err(e) = fs::create_dir_all(&bodies_dir) {
+        eprintln!("[!] Failed to create bodies directory: {}", e);
+        return;
+    }
 
     let results_file = enum_dir.join("results.txt");
+    // Open file once to prevent resource exhaustion in loop
+    let mut results_file_handle = match OpenOptions::new().create(true).append(true).open(&results_file) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[!] Failed to open results file: {}", e);
+            return;
+        }
+    };
 
     // Determine injection point
     // Strategy: Look for the last numeric segment. If found, replace it.
@@ -564,7 +609,11 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
                  let status = resp.status();
                  if status != reqwest::StatusCode::NOT_FOUND {
                       // Log hit
-                      let _ = run_enum_logging(&results_file, &payload, &label, status, &target_url);
+                      // Log hit with shared handle
+                      // Log hit with shared handle
+                      if let Err(e) = run_enum_logging_handle(&mut results_file_handle, &payload, &label, status, &target_url) {
+                          eprintln!("[!] Logging failed: {}", e);
+                      }
                       
                       // If 200, save body
                        if status.is_success() {
@@ -574,7 +623,9 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
                                 Err(_) => bytes::Bytes::new(),
                             };
                             if let Ok(mut f) = File::create(body_file) {
-                                let _ = f.write_all(&body);
+                                if let Err(e) = f.write_all(&body) {
+                                    eprintln!("[!] Failed to write body: {}", e);
+                                }
                             }
                        }
                  }
@@ -584,8 +635,7 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
     }
 }
 
-fn run_enum_logging(path: &Path, payload: &str, label: &str, status: reqwest::StatusCode, url: &str) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+fn run_enum_logging_handle(file: &mut File, payload: &str, label: &str, status: reqwest::StatusCode, url: &str) -> std::io::Result<()> {
     writeln!(file, "[{}] [{}] ID: {} - Status: {} - URL: {}", chrono::Local::now().format("%H:%M:%S"), label, payload, status, url)?;
     Ok(())
 }
@@ -609,10 +659,11 @@ async fn perform_injection(client: &Client, url: &str, method: Method, type_name
      
      // 1. URL Injection (Applies to ALL methods)
      // Construct URL with payload
+     // Bug 16: Fix parameter injection logic
      let injected_url = if url.contains('?') {
-         format!("{}{}", url, payload)
+         format!("{}&test={}", url, payload)
      } else {
-         format!("{}?id={}", url, payload)
+         format!("{}?test={}", url, payload)
      };
      
      perform_request(client, &injected_url, method.clone(), &result_file, type_name, &format!("{}-URL-{}", method.as_str(), payload), None, None, config).await;
@@ -641,7 +692,10 @@ async fn perform_injection(client: &Client, url: &str, method: Method, type_name
 // =========================================================================
 
 async fn perform_request(client: &Client, url: &str, method: Method, result_file: &Path, method_name: &str, valid_label: &str, header: Option<(&str, &str)>, custom_json: Option<serde_json::Value>, config: &ScanConfig) {
-    let user_agent = *CHROME_USER_AGENTS.choose(&mut rand::rng()).unwrap_or(&"Mozilla/5.0");
+    let user_agent = match CHROME_USER_AGENTS.choose(&mut rand::rng()) {
+        Some(ua) => *ua,
+        None => "Mozilla/5.0",
+    };
 
     let mut req_builder = client.request(method.clone(), url)
         .header("User-Agent", user_agent);
@@ -673,7 +727,9 @@ async fn perform_request(client: &Client, url: &str, method: Method, result_file
         Err(e) => {
              // Log error to file
              if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(result_file) {
-                 let _ = writeln!(file, "=== {} {} ===\nError: {}\n", full_label, url, e);
+                 if let Err(write_err) = writeln!(file, "=== {} {} ===\nError: {}\n", full_label, url, e) {
+                     eprintln!("[!] Failed to write error log: {}", write_err);
+                 }
              }
         }
     }
@@ -683,25 +739,42 @@ async fn log_response(resp: Response, path: &Path, method: &str, url: &str, user
     let status = resp.status();
     let headers = resp.headers().clone();
     
-    // Safety: Limit body read to 1MB to prevent OOM
-    let body_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(anyhow!("Failed to read response body: {}", e));
-        }
-    };
-    let body_len = body_bytes.len();
-    let truncated = body_len > 1_000_000;
-    let body = if truncated {
-        &body_bytes[..1_000_000]
-    } else {
-        &body_bytes[..]
-    };
-    
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+
+    // Safety: Limit body read to 1MB to prevent OOM
+    // Bug 11: Check Content-Length first
+    if let Some(cl) = headers.get("content-length") {
+        if let Ok(s) = cl.to_str() {
+            if let Ok(len) = s.parse::<usize>() {
+                if len > 5_000_000 {
+                     writeln!(file, "Body skipped (Content-Length: {} > 5MB)", len)?;
+                     return Ok(());
+                }
+            }
+        }
+    }
+
+    // Streaming check or limited read
+    let body_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+             // Don't fail the whole log just for body read error
+             writeln!(file, "Failed to read body: {}", e)?;
+             return Ok(());
+        }
+    };
+    let body_len = body_bytes.len();
+    let max_len = 1_000_000;
+    let truncated = body_len > max_len;
+    let body = if truncated {
+        &body_bytes[..max_len]
+    } else {
+        &body_bytes[..]
+    };
+    
 
     writeln!(file, "=======================================================")?;
     writeln!(file, "Timestamp: {}", chrono::Local::now().to_rfc3339())?;
@@ -710,6 +783,7 @@ async fn log_response(resp: Response, path: &Path, method: &str, url: &str, user
     writeln!(file, "-------------------------------------------------------")?;
     writeln!(file, "Status: {}", status)?;
     writeln!(file, "Headers:")?;
+
     for (k, v) in headers.iter() {
         writeln!(file, "  {}: {:?}", k, v)?;
     }
