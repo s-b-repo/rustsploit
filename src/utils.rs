@@ -8,6 +8,7 @@ use anyhow::{Result, anyhow, Context};
 use url::Url;
 use regex::Regex;
 use once_cell::sync::Lazy; // Added for safe static regex initialization
+use rand::prelude::IndexedRandom; // Fixed for rand 0.9 compatibility
 
 // ============================================================
 // CONSTANTS
@@ -1079,6 +1080,26 @@ pub fn module_exists(module_path: &str) -> bool {
     modules.iter().any(|m| m == module_path)
 }
 
+/// Helper to get a random color for module display
+fn get_random_color() -> Color {
+    let colors = [
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::BrightRed,
+        Color::BrightGreen,
+        Color::BrightYellow,
+        Color::BrightBlue,
+        Color::BrightMagenta,
+        Color::BrightCyan,
+    ];
+    let mut rng = rand::rng();
+    *colors.choose(&mut rng).unwrap_or(&Color::Green)
+}
+
 /// Lists all available modules recursively under src/modules/
 pub fn list_all_modules() {
     println!("{}", "Available modules:".bold().underline());
@@ -1102,7 +1123,7 @@ pub fn list_all_modules() {
     for (category, paths) in grouped {
         println!("\n{}:", category.blue().bold());
         for path in paths {
-            println!("  - {}", path.green());
+            println!("  - {}", path.color(get_random_color()));
         }
     }
 }
@@ -1155,7 +1176,7 @@ pub fn find_modules(keyword: &str) {
     for (category, paths) in grouped {
         println!("\n{}:", category.blue().bold());
         for path in paths {
-            println!("  - {}", path.green());
+            println!("  - {}", path.color(get_random_color()));
         }
     }
 }
