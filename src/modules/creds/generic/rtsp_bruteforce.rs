@@ -102,13 +102,19 @@ async fn run_single_target(target: &str) -> Result<()> {
     
     // Normalize target and add port if needed
     let target_normalized = if target.starts_with("rtsp://") {
-        target.strip_prefix("rtsp://")
-            .unwrap_or(target)
-            .split('/')
-            .next()
-            .unwrap_or(target)
+        let stripped = match target.strip_prefix("rtsp://") {
+            Some(s) => s,
+            None => target,
+        };
+        match stripped.split('/').next() {
+            Some(host_part) => host_part,
+            None => target,
+        }
     } else {
-        target.split('/').next().unwrap_or(target)
+        match target.split('/').next() {
+            Some(host_part) => host_part,
+            None => target,
+        }
     };
     
     let normalized = normalize_target(target_normalized)?;
@@ -222,7 +228,11 @@ async fn run_single_target(target: &str) -> Result<()> {
         let userlist: Vec<String> = if combo_mode {
             users.clone()
         } else {
-            vec![users.get(idx % users.len()).unwrap_or(&users[0]).to_string()]
+            // Safe access since users.is_empty() is checked earlier
+            match users.get(idx % users.len()) {
+                Some(u) => vec![u.to_string()],
+                None => vec![],
+            }
         };
 
         for user in userlist {
@@ -538,42 +548,88 @@ async fn mass_scan_host(
         Err(_) => return, // Failed to probe, host likely gone
     };
 
+    // Parallel credential attempts per host
+    // Limit concurrent connections per host to avoid FD exhaustion
+    const MAX_CONCURRENT_PER_HOST: usize = 10;
+    let host_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PER_HOST));
+    let found_flag = Arc::new(AtomicBool::new(false));
+    
+    let mut tasks = FuturesUnordered::new();
+    
     for path in paths {
         for user in users {
             for pass in passes {
-                let res = try_rtsp_login_smart(
-                    &addrs, 
-                    &sa.to_string(), 
-                    user, 
-                    pass, 
-                    path, 
-                    &auth_method
-                ).await;
-
-                match res {
-                   Ok(true) => {
-                       let result_str = format!("{} -> {}:{} [path={}]", sa, user, pass, path);
-                       println!("\r{}", format!("[+] FOUND: {}", result_str).green().bold());
-                       if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&output_file).await {
-                           let _ = file.write_all(format!("{}\n", result_str).as_bytes()).await;
-                       }
-                       stats_found.fetch_add(1, Ordering::Relaxed);
-                       return; 
-                   }
-                   Ok(false) => {}
-                   Err(e) => {
-                       let err_str = e.to_string().to_lowercase();
-                       if err_str.contains("refused") || err_str.contains("timeout") || err_str.contains("reset") {
-                           return; 
-                       }
-                       if verbose {
-                           println!("\r{}", format!("[!] {} -> error: {}", sa, e).red());
-                       }
-                   }
+                // Stop if we already found a valid credential for this host
+                if found_flag.load(Ordering::Relaxed) {
+                    break;
                 }
+                
+                let addrs_clone = addrs;
+                let sa_str = sa.to_string();
+                let user_clone = user.clone();
+                let pass_clone = pass.clone();
+                let path_clone = path.clone();
+                let auth_clone = auth_method.clone();
+                let sem = host_semaphore.clone();
+                let found = found_flag.clone();
+                let sf = stats_found.clone();
+                let of = output_file.clone();
+                let v = verbose;
+                
+                tasks.push(tokio::spawn(async move {
+                    if found.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    
+                    // Acquire per-host permit
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    
+                    if found.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    
+                    let res = try_rtsp_login_smart(
+                        &addrs_clone, 
+                        &sa_str, 
+                        &user_clone, 
+                        &pass_clone, 
+                        &path_clone, 
+                        &auth_clone
+                    ).await;
+
+                    match res {
+                       Ok(true) => {
+                           let result_str = format!("{} -> {}:{} [path={}]", sa_str, user_clone, pass_clone, path_clone);
+                           println!("\r{}", format!("[+] FOUND: {}", result_str).green().bold());
+                           if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&of).await {
+                               let _ = file.write_all(format!("{}\n", result_str).as_bytes()).await;
+                           }
+                           sf.fetch_add(1, Ordering::Relaxed);
+                           found.store(true, Ordering::Relaxed);
+                       }
+                       Ok(false) => {}
+                       Err(e) => {
+                           let err_str = e.to_string().to_lowercase();
+                           if err_str.contains("refused") || err_str.contains("timeout") || err_str.contains("reset") || err_str.contains("too many open files") {
+                               found.store(true, Ordering::Relaxed); // Stop this host
+                           }
+                           if v {
+                               println!("\r{}", format!("[!] {} -> error: {}", sa_str, e).red());
+                           }
+                       }
+                    }
+                }));
             }
+            if found_flag.load(Ordering::Relaxed) { break; }
         }
+        if found_flag.load(Ordering::Relaxed) { break; }
     }
+    
+    // Wait for all tasks on this host to complete
+    while let Some(_) = tasks.next().await {}
 }
 
 
@@ -616,7 +672,11 @@ async fn resolve_targets(addr: &str, default_port: u16) -> Result<Vec<SocketAddr
         return Ok(vec![sa]);
     }
     let (host, port) = if let Some((h, p)) = addr.rsplit_once(':') {
-        (h.to_string(), p.parse().unwrap_or(default_port))
+        let parsed_port = match p.parse::<u16>() {
+            Ok(port_num) => port_num,
+            Err(_) => default_port,
+        };
+        (h.to_string(), parsed_port)
     } else {
         (addr.to_string(), default_port)
     };
@@ -650,7 +710,10 @@ async fn connect_to_any(addrs: &[SocketAddr]) -> Result<(TcpStream, SocketAddr)>
             Err(_) => { last_err = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connect timeout")); continue; }
         }
     }
-    Err(last_err.map(|e| e.into()).unwrap_or_else(|| anyhow!("All connection attempts failed")))
+    match last_err {
+        Some(e) => Err(e.into()),
+        None => Err(anyhow!("All connection attempts failed")),
+    }
 }
 
 async fn send_request(stream: &mut TcpStream, request: &str) -> Result<String> {
@@ -728,7 +791,10 @@ async fn try_rtsp_login_smart(
 ) -> Result<bool> {
     
     let method_to_use = if let AuthMethod::Unknown = auth_method {
-        probe_auth_method(addrs, addr_display, path).await.unwrap_or(AuthMethod::Basic)
+        match probe_auth_method(addrs, addr_display, path).await {
+            Ok(m) => m,
+            Err(_) => AuthMethod::Basic,
+        }
     } else {
         auth_method.clone()
     };
@@ -778,7 +844,10 @@ async fn try_rtsp_login_smart(
 
 fn extract_rtsp_path(target: &str) -> Option<String> {
     let trimmed = target.trim();
-    let without_scheme = trimmed.strip_prefix("rtsp://").unwrap_or(trimmed);
+    let without_scheme = match trimmed.strip_prefix("rtsp://") {
+        Some(s) => s,
+        None => trimmed,
+    };
     
     if let Some((_, path)) = without_scheme.split_once('/') {
         let clean_path = match path.split(|c| c == '?' || c == '#').next() {
