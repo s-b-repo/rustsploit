@@ -356,23 +356,28 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
     println!("{}", format!("[*] Resolved {} to {}", target_name, dst_ip).green());
 
     let src_ip_override_opt: Option<Ipv4Addr> = SPOOF_SRC_IP_CONFIG.and_then(|s| s.parse().ok());
-    let mut rng = rand::rng();
+
 
     for ttl_val in 1..=MAX_TTL {
         let line_prefix = format!("[TTL={:2}] ", ttl_val).yellow().to_string();
         let mut ttl_responded = false;
 
         for _probe_idx in 0..PROBE_COUNT {
-            let icmp_probe_id = rng.random_range(33434..=65535);
-            let icmp_probe_seq = ttl_val as u16;
+            // Scope RNG to avoid holding it across await
+            let (icmp_probe_id, packet_bytes, protocol_used, os_sig_params) = {
+                let mut rng = rand::rng();
+                let icmp_probe_id = rng.random_range(33434..=65535);
+                let icmp_probe_seq = ttl_val as u16;
 
-            let (packet_bytes, protocol_used, os_sig_params) = craft_probe_packet(
-                dst_ip,
-                ttl_val,
-                src_ip_override_opt,
-                icmp_probe_id,
-                icmp_probe_seq,
-            )?;
+                let (packet_bytes, protocol_used, os_sig_params) = craft_probe_packet(
+                    dst_ip,
+                    ttl_val,
+                    src_ip_override_opt,
+                    icmp_probe_id,
+                    icmp_probe_seq,
+                )?;
+                (icmp_probe_id, packet_bytes, protocol_used, os_sig_params)
+            };
 
             let _t0 = Instant::now();
             let response = send_and_receive_one(
@@ -381,7 +386,7 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 protocol_used,
                 os_sig_params.id,
                 icmp_probe_id,
-                icmp_probe_seq,
+                ttl_val as u16,
                 Duration::from_secs(2),
             ).await?;
 
@@ -402,7 +407,10 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 }
             }
 
-            let jitter_duration = rng.random_range(JITTER_RANGE.0..JITTER_RANGE.1);
+            let jitter_duration = {
+                let mut rng = rand::rng(); // New RNG for jitter
+                rng.random_range(JITTER_RANGE.0..JITTER_RANGE.1)
+            };
             tokio::time::sleep(Duration::from_secs_f32(jitter_duration)).await;
         }
 
