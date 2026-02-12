@@ -225,11 +225,6 @@ impl TotpConfig {
         self.entries.contains_key(&token_hash)
     }
     
-    /// Check if any TOTP is configured
-    pub fn is_configured(&self) -> bool {
-        self.totp_enabled && !self.entries.is_empty()
-    }
-    
     /// Remove TOTP entry for a token
     pub fn remove_entry_by_token(&mut self, token: &str) -> Result<bool> {
         let token_hash = Self::hash_token(token);
