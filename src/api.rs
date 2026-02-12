@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,8 +18,7 @@ use std::{
 use tokio::{
     fs::OpenOptions,
     io::AsyncWriteExt,
-
-    sync::{mpsc, RwLock}, // Removed Semaphore, added mpsc
+    sync::{mpsc, RwLock, Semaphore},
 };
 use tower::ServiceBuilder;
 use tower_http::{
@@ -45,6 +44,18 @@ const AUTH_FAILURE_THRESHOLD: u32 = 3;
 /// Duration to block IP after too many auth failures (seconds)
 const AUTH_BLOCK_DURATION_SECONDS: i64 = 30;
 
+/// Maximum job ID length
+const MAX_JOB_ID_LENGTH: usize = 128;
+
+/// TOTP session cleanup interval (seconds)
+const TOTP_CLEANUP_INTERVAL_SECS: i64 = 300; // 5 minutes
+
+/// Rate limit per API key (requests per minute)
+const API_KEY_RATE_LIMIT: u32 = 100;
+
+/// Rate limit window (seconds)
+const RATE_LIMIT_WINDOW_SECS: i64 = 60;
+
 #[derive(Clone, Debug)]
 pub struct ApiKey {
     pub key: String,
@@ -67,18 +78,22 @@ pub struct AuthFailureTracker {
     pub blocked_until: Option<DateTime<Utc>>,
 }
 
-/// Global limit for concurrent module executions
-// const MAX_CONCURRENT_MODULES: usize = 10; // Removed, now dynamic
+#[derive(Clone, Debug)]
+pub struct ApiKeyRateLimit {
+    pub request_count: u32,
+    pub window_start: DateTime<Utc>,
+}
 
 #[derive(Debug)]
 pub struct Job {
+    pub job_id: String,
     pub module: String,
     pub target: String,
     pub verbose: bool,
     pub start_time: std::time::Instant,
+    pub job_archive: Arc<crate::job_archive::JobArchive>,
+    pub module_config: crate::config::ModuleConfig,
 }
-
-
 
 // Force usage of ExecutionError to avoid dead code warning until fully implemented
 fn _suppress_dead_code_warning() {
@@ -91,6 +106,8 @@ pub struct ApiState {
     pub current_key: Arc<RwLock<ApiKey>>,
     pub ip_tracker: Arc<RwLock<HashMap<String, IpTracker>>>,
     pub auth_failures: Arc<RwLock<HashMap<String, AuthFailureTracker>>>,
+    pub api_key_rate_limits: Arc<RwLock<HashMap<String, ApiKeyRateLimit>>>,
+    pub key_rotation_lock: Arc<Semaphore>,
     pub harden_enabled: bool,
     pub harden_totp: bool,
     pub harden_rate_limit: bool,
@@ -100,10 +117,9 @@ pub struct ApiState {
     pub job_sender: mpsc::Sender<Job>,
     pub verbose: bool,
     pub totp_config: Arc<RwLock<crate::totp_config::TotpConfig>>,
-    /// TOTP sessions: token_hash -> last successful TOTP verification time
     pub totp_sessions: Arc<RwLock<HashMap<String, chrono::DateTime<Utc>>>>,
-    /// Job archive for output capture and download
     pub job_archive: Arc<crate::job_archive::JobArchive>,
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -153,13 +169,22 @@ impl ApiErrorCode {
 pub struct RunModuleRequest {
     pub module: String,
     pub target: String,
-    // Optional settings for advanced modules (e.g., Port Scanner)
     pub concurrency: Option<usize>,
     pub timeout: Option<u64>,
-    pub scan_method: Option<String>, // "tcp", "udp", "both"
+    pub scan_method: Option<String>,
     pub ttl: Option<u32>,
     pub source_port: Option<u16>,
     pub data_length: Option<usize>,
+    // Bruteforce module fields
+    pub port: Option<u16>,
+    pub username_wordlist: Option<String>,
+    pub password_wordlist: Option<String>,
+    pub path_wordlist: Option<String>,
+    pub stop_on_success: Option<bool>,
+    pub save_results: Option<bool>,
+    pub output_file: Option<String>,
+    pub verbose: Option<bool>,
+    pub combo_mode: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -169,9 +194,6 @@ pub struct ListModulesResponse {
     pub creds: Vec<String>,
 }
 
-// ----------------------
-// Validation utilities
-// ----------------------
 // ----------------------
 // Validation utilities
 // ----------------------
@@ -197,13 +219,19 @@ fn create_response(
     }
 }
 
+/// Enhanced log sanitization - strips all control characters and ANSI codes
 fn sanitize_for_log(input: &str) -> String {
-    let mut s = input.replace(['\r', '\n', '\t'], " ");
-    if s.len() > 500 {
-        s.truncate(500);
-        s.push_str("…");
+    let s: String = input
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    
+    let mut truncated = s;
+    if truncated.len() > 500 {
+        truncated.truncate(500);
+        truncated.push_str("…");
     }
-    s
+    truncated
 }
 
 fn validate_api_key_format(key: &str) -> bool {
@@ -211,7 +239,6 @@ fn validate_api_key_format(key: &str) -> bool {
 }
 
 fn validate_module_name(module: &str) -> bool {
-    // Allow only expected module path forms, e.g., "exploits/x", "scanners/y", "creds/z"
     if module.is_empty() || module.len() > 200 { return false; }
     if !module.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '/' || c == '_' || c == '-') {
         return false;
@@ -221,9 +248,15 @@ fn validate_module_name(module: &str) -> bool {
     matches!(parts[0], "exploits" | "scanners" | "creds")
 }
 
-/// Delegate to utils for consistent target validation across the codebase
 fn validate_target(target: &str) -> bool {
     crate::utils::validate_target_basic(target)
+}
+
+/// Validate job ID format and length
+fn validate_job_id(job_id: &str) -> bool {
+    job_id.len() <= MAX_JOB_ID_LENGTH 
+        && !job_id.is_empty()
+        && job_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 impl ApiState {
@@ -236,16 +269,15 @@ impl ApiState {
         ip_limit: u32,
         verbose: bool,
         job_sender: mpsc::Sender<Job>,
+        trusted_proxies: Vec<IpAddr>,
     ) -> Self {
         let log_file = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("rustsploit_api.log");
 
-        // Load existing TOTP config
         let totp_config = crate::totp_config::TotpConfig::load()
             .unwrap_or_default();
 
-        // Create job archive
         let job_archive = Arc::new(
             crate::job_archive::JobArchive::new()
                 .unwrap_or_else(|e| {
@@ -261,6 +293,8 @@ impl ApiState {
             })),
             ip_tracker: Arc::new(RwLock::new(HashMap::new())),
             auth_failures: Arc::new(RwLock::new(HashMap::new())),
+            api_key_rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            key_rotation_lock: Arc::new(Semaphore::new(1)),
             harden_enabled: harden,
             harden_totp: harden || harden_totp,
             harden_rate_limit: harden || harden_rate_limit,
@@ -272,10 +306,16 @@ impl ApiState {
             totp_config: Arc::new(RwLock::new(totp_config)),
             totp_sessions: Arc::new(RwLock::new(HashMap::new())),
             job_archive,
+            trusted_proxies,
         }
     }
 
+    /// Rotate API key with race condition protection
     pub async fn rotate_key(&self) -> Result<String> {
+        // Acquire permit to prevent concurrent rotations
+        let _permit = self.key_rotation_lock.acquire().await
+            .context("Failed to acquire rotation lock")?;
+        
         let new_key = Uuid::new_v4().to_string();
         let mut key_guard = self.current_key.write().await;
         key_guard.key = new_key.clone();
@@ -301,7 +341,6 @@ impl ApiState {
             return Ok(false);
         }
         
-        // Validate IP string length
         if ip.len() > 128 {
             return Ok(false);
         }
@@ -309,28 +348,31 @@ impl ApiState {
         let mut tracker_guard = self.ip_tracker.write().await;
         let now = Utc::now();
         
-        // Cleanup old entries if we have too many tracked IPs (memory protection)
+        // Check if cleanup needed
         if tracker_guard.len() >= MAX_TRACKED_IPS {
-            // Remove oldest entries (keep most recent half)
-            let mut entries: Vec<_> = tracker_guard.drain().collect();
-            entries.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
-            entries.truncate(MAX_TRACKED_IPS / 2);
-            for (k, v) in entries {
-                tracker_guard.insert(k, v);
-            }
-            let _ = self.log_message(&format!(
-                "[CLEANUP] Pruned IP tracker from {} to {} entries",
-                MAX_TRACKED_IPS,
-                tracker_guard.len()
-            )).await;
+            // Spawn background cleanup task instead of blocking
+            let tracker_clone = Arc::clone(&self.ip_tracker);
+            tokio::spawn(async move {
+                let mut guard = tracker_clone.write().await;
+                let cutoff = Utc::now() - chrono::Duration::hours(24);
+                guard.retain(|_, v| v.last_seen > cutoff);
+                
+                // If still too many, remove oldest half
+                if guard.len() >= MAX_TRACKED_IPS {
+                    let mut entries: Vec<_> = guard.drain().collect();
+                    entries.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+                    entries.truncate(MAX_TRACKED_IPS / 2);
+                    for (k, v) in entries {
+                        guard.insert(k, v);
+                    }
+                }
+            });
         }
 
         if let Some(tracker) = tracker_guard.get_mut(ip) {
-            // Update existing tracker - use all fields
             tracker.last_seen = now;
             tracker.request_count = tracker.request_count.saturating_add(1);
             
-            // Log detailed tracking info using first_seen
             let duration = now.signed_duration_since(tracker.first_seen);
             let _ = self.log_message(&format!(
                 "[TRACKING] IP {}: {} requests since {} ({} seconds ago)",
@@ -340,7 +382,6 @@ impl ApiState {
                 duration.num_seconds()
             )).await;
         } else {
-            // Create new tracker - all fields are set and will be used
             let new_tracker = IpTracker {
                 ip: ip.to_string(),
                 first_seen: now,
@@ -348,7 +389,6 @@ impl ApiState {
                 request_count: 1,
             };
             
-            // Log new IP using all fields
             let _ = self.log_message(&format!(
                 "[TRACKING] New IP detected: {} (first seen: {})",
                 new_tracker.ip,
@@ -379,15 +419,53 @@ impl ApiState {
         Ok(false)
     }
 
+    /// Check rate limit for API key
+    pub async fn check_api_key_rate_limit(&self, api_key: &str) -> Result<bool> {
+        if !self.harden_rate_limit {
+            return Ok(true);
+        }
+
+        let mut limits_guard = self.api_key_rate_limits.write().await;
+        let now = Utc::now();
+        let key_hash = crate::totp_config::TotpConfig::hash_token(api_key);
+
+        if let Some(limit) = limits_guard.get_mut(&key_hash) {
+            let window_elapsed = (now - limit.window_start).num_seconds();
+            
+            if window_elapsed >= RATE_LIMIT_WINDOW_SECS {
+                // Reset window
+                limit.window_start = now;
+                limit.request_count = 1;
+                Ok(true)
+            } else {
+                limit.request_count = limit.request_count.saturating_add(1);
+                
+                if limit.request_count > API_KEY_RATE_LIMIT {
+                    self.log_message(&format!(
+                        "[RATE_LIMIT] API key exceeded rate limit: {} requests in {} seconds",
+                        limit.request_count, window_elapsed
+                    )).await?;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+        } else {
+            limits_guard.insert(key_hash, ApiKeyRateLimit {
+                request_count: 1,
+                window_start: now,
+            });
+            Ok(true)
+        }
+    }
+
     pub async fn log_message(&self, message: &str) -> Result<()> {
         let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
         let safe = sanitize_for_log(message);
         let log_entry = format!("[{}] {}\n", timestamp, safe);
 
-        // Log to terminal
         println!("{}", log_entry.trim());
 
-        // Log to file
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -415,10 +493,7 @@ impl ApiState {
         let stored = key_guard.key.as_bytes();
         let provided = provided_key.as_bytes();
         
-        // Constant-time comparison - prevents timing attacks
-        // Even if lengths differ, we do constant-time work to avoid length oracle
         if stored.len() != provided.len() {
-            // Perform dummy comparison to maintain constant time
             let _ = stored.ct_eq(&vec![0u8; stored.len()]);
             return false;
         }
@@ -430,7 +505,6 @@ impl ApiState {
         let now = Utc::now();
 
         if let Some(tracker) = failures_guard.get_mut(ip) {
-            // Check if IP is currently blocked
             if let Some(blocked_until) = tracker.blocked_until {
                 if now < blocked_until {
                     let remaining = (blocked_until - now).num_seconds();
@@ -439,9 +513,8 @@ impl ApiState {
                         ip, remaining, tracker.failed_attempts
                     ))
                     .await?;
-                    return Ok(false); // Blocked
+                    return Ok(false);
                 } else {
-                    // Block period expired, reset
                     tracker.failed_attempts = 0;
                     tracker.blocked_until = None;
                     self.log_message(&format!(
@@ -453,11 +526,10 @@ impl ApiState {
             }
         }
 
-        Ok(true) // Not blocked
+        Ok(true)
     }
 
     pub async fn record_auth_failure(&self, ip: &str) -> Result<()> {
-        // Validate IP string length
         if ip.len() > 128 {
             return Ok(());
         }
@@ -465,18 +537,17 @@ impl ApiState {
         let mut failures_guard = self.auth_failures.write().await;
         let now = Utc::now();
         
-        // Cleanup old entries if we have too many (memory protection)
+        // Background cleanup if needed
         if failures_guard.len() >= MAX_AUTH_FAILURE_ENTRIES {
-            // Remove expired blocks and oldest entries
-            let cutoff = now - chrono::Duration::hours(1);
-            failures_guard.retain(|_, v| {
-                v.blocked_until.map(|b| b > now).unwrap_or(false) ||
-                v.first_failure > cutoff
+            let failures_clone = Arc::clone(&self.auth_failures);
+            tokio::spawn(async move {
+                let mut guard = failures_clone.write().await;
+                let cutoff = now - chrono::Duration::hours(1);
+                guard.retain(|_, v| {
+                    v.blocked_until.map(|b| b > now).unwrap_or(false) ||
+                    v.first_failure > cutoff
+                });
             });
-            let _ = self.log_message(&format!(
-                "[CLEANUP] Pruned auth failure tracker to {} entries",
-                failures_guard.len()
-            )).await;
         }
 
         let tracker = failures_guard.entry(ip.to_string()).or_insert_with(|| {
@@ -488,14 +559,12 @@ impl ApiState {
             }
         });
 
-        // Set first_failure if this is the first attempt
         if tracker.failed_attempts == 0 {
             tracker.first_failure = now;
         }
 
         tracker.failed_attempts = tracker.failed_attempts.saturating_add(1);
 
-        // Block after AUTH_FAILURE_THRESHOLD failed attempts for AUTH_BLOCK_DURATION_SECONDS
         if tracker.failed_attempts >= AUTH_FAILURE_THRESHOLD {
             let block_until = now + chrono::Duration::seconds(AUTH_BLOCK_DURATION_SECONDS);
             tracker.blocked_until = Some(block_until);
@@ -543,6 +612,50 @@ impl ApiState {
 
         Ok(())
     }
+
+    /// Cleanup expired TOTP sessions
+    pub async fn cleanup_totp_sessions(&self) -> Result<()> {
+        let mut sessions = self.totp_sessions.write().await;
+        let now = Utc::now();
+        let before_count = sessions.len();
+        
+        sessions.retain(|_, last_verify| {
+            let elapsed = now.signed_duration_since(*last_verify).num_seconds();
+            elapsed < crate::totp_config::SESSION_DURATION_SECS
+        });
+        
+        let after_count = sessions.len();
+        if before_count != after_count {
+            self.verbose_log(&format!(
+                "[CLEANUP] Removed {} expired TOTP sessions ({} -> {})",
+                before_count - after_count, before_count, after_count
+            )).await?;
+        }
+        
+        Ok(())
+    }
+
+    /// Extract real client IP with proxy validation
+    fn extract_client_ip(&self, headers: &HeaderMap, addr: SocketAddr) -> String {
+        // Only trust X-Forwarded-For if request comes from trusted proxy
+        if self.trusted_proxies.contains(&addr.ip()) {
+            if let Some(forwarded) = headers.get("x-forwarded-for")
+                .or_else(|| headers.get("x-real-ip"))
+                .and_then(|h| h.to_str().ok())
+            {
+                let first_ip = forwarded.split(',').next().unwrap_or("").trim();
+                if !first_ip.is_empty() {
+                    // Validate it's actually an IP address
+                    if first_ip.parse::<IpAddr>().is_ok() {
+                        return first_ip.to_string();
+                    }
+                }
+            }
+        }
+        
+        // Fall back to direct connection IP
+        addr.ip().to_string()
+    }
 }
 
 async fn auth_middleware(
@@ -552,22 +665,10 @@ async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    // Extract IP address - try to get from headers first (for proxied requests)
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|h| h.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| addr.ip().to_string());
+    // Extract IP with proxy validation
+    let client_ip = state.extract_client_ip(&headers, addr);
 
-    // Check rate limit before processing authentication (if enabled)
+    // Check auth failure rate limit
     if state.harden_rate_limit && client_ip != "unknown" {
         if let Ok(allowed) = state.check_auth_rate_limit(&client_ip).await {
             if !allowed {
@@ -584,7 +685,7 @@ async fn auth_middleware(
         }
     }
 
-    // Extract API key from Authorization header
+    // Extract API key
     let auth_header = headers
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
@@ -598,7 +699,7 @@ async fn auth_middleware(
         auth_header
     };
 
-    // Basic key format validation
+    // Validate key format
     if !validate_api_key_format(provided_key) {
         let response = create_response(
             false,
@@ -615,7 +716,6 @@ async fn auth_middleware(
     let is_valid = state.verify_key(provided_key).await;
 
     if !is_valid {
-        // Record failed authentication attempt
         if client_ip != "unknown" {
             let _ = state.record_auth_failure(&client_ip).await;
         }
@@ -631,21 +731,35 @@ async fn auth_middleware(
         return (StatusCode::UNAUTHORIZED, Json(response)).into_response();
     }
 
-    // Successful authentication - reset failure counter for this IP
+    // Reset auth failures on successful auth
     if client_ip != "unknown" {
         if let Err(e) = state.reset_auth_failures(&client_ip).await {
             eprintln!("[WARN] Failed to reset auth failures for {}: {}", client_ip, e);
         }
     }
 
-    // TOTP verification (if enabled and configured for this token)
+    // Check API key rate limit
+    if let Ok(allowed) = state.check_api_key_rate_limit(provided_key).await {
+        if !allowed {
+            let response = create_response(
+                false,
+                format!("Rate limit exceeded: maximum {} requests per {} seconds", 
+                    API_KEY_RATE_LIMIT, RATE_LIMIT_WINDOW_SECS),
+                None,
+                Some(ApiErrorCode::RateLimited.as_str().to_string()),
+                Some("Please wait before making more requests.".to_string()),
+                None,
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, Json(response)).into_response();
+        }
+    }
+
+    // TOTP verification
     if state.harden_totp {
         let token_hash = crate::totp_config::TotpConfig::hash_token(provided_key);
         let totp_config = state.totp_config.read().await;
         
-        // Check if TOTP is configured for THIS specific token
         if totp_config.is_configured_for_token(provided_key) {
-            // Check if there's a valid session (verified within last 30 minutes)
             let sessions = state.totp_sessions.read().await;
             let session_valid = sessions.get(&token_hash)
                 .map(|last_verify| {
@@ -656,7 +770,6 @@ async fn auth_middleware(
             drop(sessions);
             
             if !session_valid {
-                // Session expired or doesn't exist - require TOTP code
                 let totp_code = headers
                     .get("X-TOTP-Code")
                     .and_then(|h| h.to_str().ok())
@@ -680,10 +793,8 @@ async fn auth_middleware(
                     return (StatusCode::UNAUTHORIZED, Json(response)).into_response();
                 }
                 
-                // Verify TOTP code against THIS token's secret (1:1 binding)
                 match totp_config.verify_code_for_token(provided_key, totp_code) {
                     Ok(true) => {
-                        // TOTP valid - update session
                         drop(totp_config);
                         let mut sessions = state.totp_sessions.write().await;
                         sessions.insert(token_hash.clone(), Utc::now());
@@ -725,7 +836,6 @@ async fn auth_middleware(
                 }
             } else {
                 drop(totp_config);
-                // Session still valid - log when next OTP required
                 let sessions = state.totp_sessions.read().await;
                 if let Some(last_verify) = sessions.get(&token_hash) {
                     let expires_at = *last_verify + chrono::Duration::seconds(crate::totp_config::SESSION_DURATION_SECS);
@@ -735,7 +845,7 @@ async fn auth_middleware(
         }
     }
 
-    // Track IP for hardening (if enabled) - only call once
+    // Track IP
     if state.harden_ip_tracking {
         if let Err(e) = state.track_ip(&client_ip).await {
             eprintln!("[WARN] Failed to track IP {}: {}", client_ip, e);
@@ -810,7 +920,6 @@ async fn validate_module_params(
         return (StatusCode::BAD_REQUEST, Json(response)).into_response();
     }
     
-    // Check if module exists
     if !commands::discover_modules().contains(&module_name.to_string()) {
           let response = create_response(
             false,
@@ -874,11 +983,10 @@ async fn list_modules(State(_state): State<ApiState>) -> Json<ApiResponse> {
         Some(serde_json::to_value(data).unwrap_or(serde_json::Value::Null)),
         None,
         None,
-        None, // TODO: track duration
+        None,
     ))
 }
 
-/// Search modules by keyword
 async fn search_modules(
     State(_state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -913,7 +1021,6 @@ async fn search_modules(
     ))
 }
 
-/// Get current global target
 async fn get_target(State(_state): State<ApiState>) -> Json<ApiResponse> {
     let target = crate::config::GLOBAL_CONFIG.get_target();
     let size = crate::config::GLOBAL_CONFIG.get_target_size();
@@ -933,13 +1040,11 @@ async fn get_target(State(_state): State<ApiState>) -> Json<ApiResponse> {
     ))
 }
 
-/// Set target request body
 #[derive(Serialize, Deserialize)]
 struct SetTargetRequest {
     target: String,
 }
 
-/// Set global target
 async fn set_target(
     State(state): State<ApiState>,
     Json(payload): Json<SetTargetRequest>,
@@ -947,7 +1052,6 @@ async fn set_target(
     let start_time = std::time::Instant::now();
     let target_raw = payload.target.as_str();
     
-    // Validate target format
     if !validate_target(target_raw) {
         let response = create_response(
             false,
@@ -960,7 +1064,6 @@ async fn set_target(
         return (StatusCode::BAD_REQUEST, Json(response)).into_response();
     }
     
-    // Set target in global config
     match crate::config::GLOBAL_CONFIG.set_target(target_raw) {
         Ok(_) => {
             if let Err(e) = state.log_message(&format!("Target set to: {}", sanitize_for_log(target_raw))).await {
@@ -996,7 +1099,6 @@ async fn set_target(
     }
 }
 
-/// Clear global target (DELETE only affects target, nothing else - OWASP compliant)
 async fn clear_target(State(state): State<ApiState>) -> Json<ApiResponse> {
     crate::config::GLOBAL_CONFIG.clear_target();
     
@@ -1014,19 +1116,18 @@ async fn clear_target(State(state): State<ApiState>) -> Json<ApiResponse> {
     ))
 }
 
-/// Get job output by job ID
 async fn get_job_output(
     State(state): State<ApiState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // Validate job_id format (alphanumeric and dashes only)
-    if !job_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    // Validate job_id with length check
+    if !validate_job_id(&job_id) {
         return (StatusCode::BAD_REQUEST, Json(create_response(
             false,
             "Invalid job ID format".to_string(),
             None,
             Some(ApiErrorCode::InvalidInput.as_str().to_string()),
-            Some("Job ID must contain only alphanumeric characters, dashes, and underscores".to_string()),
+            Some(format!("Job ID must be 1-{} characters and contain only alphanumeric, dash, underscore", MAX_JOB_ID_LENGTH)),
             None,
         ))).into_response();
     }
@@ -1065,7 +1166,6 @@ async fn get_job_output(
     }
 }
 
-/// List all jobs in memory
 async fn list_jobs(State(state): State<ApiState>) -> Json<ApiResponse> {
     let jobs = state.job_archive.list_jobs().await;
     
@@ -1095,10 +1195,6 @@ async fn list_jobs(State(state): State<ApiState>) -> Json<ApiResponse> {
     ))
 }
 
-// SECURITY: /api/totp/secret endpoint REMOVED
-// Exposing TOTP secrets via API defeats 2FA (Factor 2 becomes retrievable via Factor 1)
-// TOTP secrets should only be shown once during CLI setup wizard
-
 async fn run_module(
     State(state): State<ApiState>,
     Json(payload): Json<RunModuleRequest>,
@@ -1107,7 +1203,6 @@ async fn run_module(
     let module_name_raw = payload.module.as_str();
     let target_raw = payload.target.as_str();
 
-    // Validate inputs
     if !validate_module_name(module_name_raw) {
          let response = create_response(
             false,
@@ -1131,21 +1226,17 @@ async fn run_module(
         return (StatusCode::BAD_REQUEST, Json(response)).into_response();
     }
 
-    // Sanitize for logging only
     let module_name = sanitize_for_log(module_name_raw);
     let target_name = sanitize_for_log(target_raw);
     
-    // Generate unique job ID
     let job_id = uuid::Uuid::new_v4().to_string();
     
-    // Create job result for tracking using JobArchive methods
     let job_result = crate::job_archive::JobArchive::create_job(
         job_id.clone(),
         module_name.to_string(),
         target_name.to_string(),
     );
     
-    // Add job to archive for tracking
     if let Err(e) = state.job_archive.add_job(job_result).await {
         eprintln!("[WARN] Failed to add job to archive: {}", e);
     }
@@ -1168,17 +1259,32 @@ async fn run_module(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response();
     }
 
-    // Fire and forget: Try to send to the job queue
+    // Build module config from payload
+    let module_config = crate::config::ModuleConfig {
+        port: payload.port,
+        username_wordlist: payload.username_wordlist.clone(),
+        password_wordlist: payload.password_wordlist.clone(),
+        path_wordlist: payload.path_wordlist.clone(),
+        concurrency: payload.concurrency,
+        stop_on_success: payload.stop_on_success,
+        save_results: payload.save_results,
+        output_file: payload.output_file.clone(),
+        verbose: payload.verbose,
+        combo_mode: payload.combo_mode,
+    };
+
     let job = Job {
+        job_id: job_id.clone(),
         module: module_name.to_string(),
         target: target_name.to_string(),
-        verbose: state.verbose,
+        verbose: state.verbose || payload.verbose.unwrap_or(false),
         start_time,
+        job_archive: Arc::clone(&state.job_archive),
+        module_config,
     };
 
     match state.job_sender.try_send(job) {
         Ok(_) => {
-             // 202 Accepted - include job_id for tracking
             (StatusCode::ACCEPTED, Json(create_response(
                 true,
                 format!("Module '{}' queued for execution against '{}'", module_name, target_name),
@@ -1193,14 +1299,12 @@ async fn run_module(
             ))).into_response()
         },
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // Update job status to failed
             let _ = state.job_archive.update_job(
                 &job_id, 
                 "Queue full - job not executed".to_string(),
                 crate::job_archive::JobStatus::Failed
             ).await;
             
-            // Queue full - return 503
              let response = create_response(
                 false,
                 "Job queue is full. Please try again later.".to_string(),
@@ -1212,14 +1316,12 @@ async fn run_module(
             (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response()
         },
         Err(_) => {
-            // Update job status to failed
             let _ = state.job_archive.update_job(
                 &job_id,
                 "Job queue closed".to_string(),
                 crate::job_archive::JobStatus::Failed
             ).await;
             
-             // Channel closed
              let response = create_response(
                 false,
                 "Internal Server Error: Job queue closed".to_string(),
@@ -1237,12 +1339,8 @@ async fn get_status(State(state): State<ApiState>) -> Json<ApiResponse> {
     let key_guard = state.current_key.read().await;
     let tracker_guard = state.ip_tracker.read().await;
 
-    // Use is_configured() to check TOTP status
-    let totp_config = state.totp_config.read().await;
-    let totp_is_configured = totp_config.is_configured();
-    drop(totp_config);
+    // SECURITY: No longer exposing TOTP configuration status
 
-    // Collect all tracked IPs with their details
     let tracked_ips: Vec<&IpTracker> = tracker_guard.values().collect();
     let ip_details: Vec<serde_json::Value> = tracked_ips
         .iter()
@@ -1256,12 +1354,10 @@ async fn get_status(State(state): State<ApiState>) -> Json<ApiResponse> {
         })
         .collect();
 
-    // Demonstrate OutputBuffer usage to ensure it's not dead code
     let mut _demo_buffer = crate::job_archive::OutputBuffer::new();
     _demo_buffer.append("Status check ");
     let (_output, _truncated) = _demo_buffer.finish();
     
-    // Get job archive info
     let jobs_in_memory = state.job_archive.list_jobs().await.len();
 
     let status_data = serde_json::json!({
@@ -1271,15 +1367,16 @@ async fn get_status(State(state): State<ApiState>) -> Json<ApiResponse> {
         "key_created_at": key_guard.created_at.to_rfc3339(),
         "log_file": state.log_file.to_string_lossy(),
         "tracked_ips": ip_details,
-        "totp": {
-            "configured": totp_is_configured,
-            // SECURITY: Removed "accounts" count to reduce info leakage
-            "enforced": state.harden_totp,
-        },
+        // SECURITY: Removed TOTP config info to prevent info disclosure
+        // Attackers should not know if 2FA is configured before attempting attack
         "job_archive": {
             "jobs_in_memory": jobs_in_memory,
             "archive_dir": state.job_archive.archive_dir(),
             "max_output_size_mb": crate::job_archive::MAX_OUTPUT_SIZE / 1024 / 1024,
+        },
+        "rate_limits": {
+            "api_key_limit": API_KEY_RATE_LIMIT,
+            "window_seconds": RATE_LIMIT_WINDOW_SECS,
         },
     });
 
@@ -1313,11 +1410,9 @@ async fn get_tracked_ips(State(state): State<ApiState>) -> Json<ApiResponse> {
     let tracker_guard = state.ip_tracker.read().await;
     let failures_guard = state.auth_failures.read().await;
     
-    // Use all fields from IpTracker
     let ips: Vec<serde_json::Value> = tracker_guard
         .values()
         .map(|tracker| {
-            // Get auth failure info for this IP if it exists
             let auth_info = failures_guard.get(&tracker.ip).map(|fail| {
                 serde_json::json!({
                     "failed_attempts": fail.failed_attempts,
@@ -1352,7 +1447,6 @@ async fn get_auth_failures(State(state): State<ApiState>) -> Json<ApiResponse> {
     let failures_guard = state.auth_failures.read().await;
     let now = Utc::now();
     
-    // Use all fields from AuthFailureTracker
     let failures: Vec<serde_json::Value> = failures_guard
         .values()
         .map(|tracker| {
@@ -1401,9 +1495,10 @@ pub async fn start_api_server(
     verbose: bool,
     queue_size: usize,
     workers: usize,
+    trusted_proxies: Vec<IpAddr>,
 ) -> Result<()> {
-    // Create channel for jobs
     let (tx, rx) = mpsc::channel(queue_size);
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let state = ApiState::new(
         api_key.clone(),
         harden,
@@ -1413,83 +1508,115 @@ pub async fn start_api_server(
         ip_limit,
         verbose,
         tx,
+        trusted_proxies,
     );
 
-    // Spawn worker pool
-    // We clone the receiver for each worker? No, mpsc Receiver is not Clone.
-    // We need an Arc<Mutex<Receiver>> OR usually we just move receiver into one logic/distributor?
-    // Wait, typical pattern for multiple consumers is `async-channel` or `crossbeam`, but Tokio mpsc Receiver is single consumer.
-    // Ah! To have multiple workers on a single mpsc receiver, we wrap it in Arc<Mutex> OR we just use `async-crossbeam-channel` or similar.
-    // OR we spawn 1 dispatcher task that owns RX and sends to N workers?
-    // 
-    // Actually, Tokio's recommended pattern for worker pool is:
-    // 1. Arc<Mutex<Receiver>> (slow)
-    // 2. async-channel crate (MPMC)
-    // 
-    // Since I can't easily add dependencies without checking cargo.toml (I see `tokio`), I will check if I can use `async-channel`.
-    // Let me check Cargo.toml first? 
-    // 
-    // Actually, simple solution: 
-    // Wrap Receiver in Arc<Mutex> is fine for 10-20 workers.
-    
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
-    
-    // Get a handle to the current runtime for use in blocking tasks
-    let runtime_handle = tokio::runtime::Handle::current();
-    
-    for _ in 0..workers {
-        let rx_clone = shared_rx.clone();
+    // Spawn background cleanup task for TOTP sessions
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(
+            tokio::time::Duration::from_secs(TOTP_CLEANUP_INTERVAL_SECS as u64)
+        );
+        loop {
+            interval.tick().await;
+            if let Err(e) = cleanup_state.cleanup_totp_sessions().await {
+                eprintln!("[WARN] TOTP session cleanup error: {}", e);
+            }
+        }
+    });
+
+    // Spawn worker pool - each worker processes jobs from the queue
+    for worker_id in 0..workers {
         let state_clone = state.clone();
-        let handle = runtime_handle.clone();
+        let rx = Arc::clone(&rx);
         tokio::spawn(async move {
             loop {
-                // Lock the receiver to get a job
-                let job = {
-                    let mut lock = rx_clone.lock().await;
-                    lock.recv().await
-                };
+                // Receive job from queue
+                let job = rx.lock().await.recv().await;
                 
                 if let Some(j) = job {
-                    // Process job in a blocking thread to handle non-Send module futures
+                    let job_id = j.job_id.clone();
                     let module = j.module.clone();
                     let target = j.target.clone();
                     let verbose = j.verbose;
-                    let s_clone = state_clone.clone();
                     let start_time = j.start_time;
-                    let handle_clone = handle.clone();
-
-                    // Use spawn_blocking to run module in blocking thread pool
-                    // This allows modules with non-Send types (ThreadRng, StdinLock) to work
-                    let _ = tokio::task::spawn_blocking(move || {
-                        handle_clone.block_on(async {
-                            if let Err(e) = commands::run_module(&module, &target, verbose).await {
-                                let duration = start_time.elapsed().as_millis();
-                                if let Err(log_err) = s_clone
-                                    .log_message(&format!("Error running module ({}): {} [{}ms]", ApiErrorCode::ExecutionError.as_str(), sanitize_for_log(&e.to_string()), duration))
-                                    .await {
-                                    eprintln!("[WARN] Failed to log error: {}", log_err);
-                                }
-                            } else {
-                                let duration = start_time.elapsed().as_millis();
-                                if let Err(log_err) = s_clone
-                                    .log_message(&format!(
-                                        "Successfully completed module '{}' on target '{}' [{}ms]",
-                                        sanitize_for_log(&module), sanitize_for_log(&target), duration
-                                    ))
-                                    .await {
-                                    eprintln!("[WARN] Failed to log success: {}", log_err);
-                                }
+                    let job_archive = Arc::clone(&j.job_archive);
+                    let module_config = j.module_config.clone();
+                    
+                    // Set global module config before execution
+                    crate::config::set_module_config(module_config);
+                    
+                    // Execute module
+                    // NOTE: commands::run_module returns Result<()>, not Result<String>
+                    // Modules print directly to stdout/stderr, so we create success/error messages
+                    let result = commands::run_module(&module, &target, verbose).await;
+                    
+                    // Clear module config after execution
+                    crate::config::clear_module_config();
+                    
+                    match result {
+                        Ok(_) => {
+                            let duration = start_time.elapsed().as_millis() as u64;
+                            
+                            // Create success message (run_module doesn't return output)
+                            let output = format!(
+                                "Module '{}' executed successfully on target '{}'", 
+                                module, 
+                                target
+                            );
+                            
+                            // Update job with success message
+                            if let Err(e) = job_archive.update_job(
+                                &job_id,
+                                output,
+                                crate::job_archive::JobStatus::Completed,
+                            ).await {
+                                eprintln!("[WARN] Worker {}: Failed to update job {}: {}", worker_id, job_id, e);
                             }
-                        });
-                    }).await;
+                            
+                            if let Err(e) = state_clone.log_message(&format!(
+                                "[Worker {}] Successfully completed job {} - module '{}' on '{}' [{}ms]",
+                                worker_id, job_id, module, target, duration
+                            )).await {
+                                eprintln!("[WARN] Worker {}: Failed to log success: {}", worker_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            let duration = start_time.elapsed().as_millis() as u64;
+                            let error_msg = format!(
+                                "Error executing module '{}' on '{}': {}", 
+                                module, 
+                                target, 
+                                e
+                            );
+                            
+                            // Update job with error
+                            if let Err(e) = job_archive.update_job(
+                                &job_id,
+                                error_msg.clone(),
+                                crate::job_archive::JobStatus::Failed,
+                            ).await {
+                                eprintln!("[WARN] Worker {}: Failed to update job {}: {}", worker_id, job_id, e);
+                            }
+                            
+                            if let Err(e) = state_clone.log_message(&format!(
+                                "[Worker {}] Error in job {} ({}): {} [{}ms]",
+                                worker_id, job_id, ApiErrorCode::ExecutionError.as_str(),
+                                sanitize_for_log(&error_msg), duration
+                            )).await {
+                                eprintln!("[WARN] Worker {}: Failed to log error: {}", worker_id, e);
+                            }
+                        }
+                    }
                 } else {
-                    break; // Channel closed
+                    // Channel closed
+                    eprintln!("[Worker {}] Job channel closed, shutting down", worker_id);
+                    break;
                 }
             }
         });
     }
 
-    // Log initial startup
     state
         .log_message(&format!(
             "Starting API server on {} with hardening: {}, IP limit: {}, Workers: {}, Queue: {}",
@@ -1504,11 +1631,12 @@ pub async fn start_api_server(
     if harden {
         println!("📊 IP limit: {}", ip_limit);
     }
+    println!("⚡ API Key Rate Limit: {} requests per {} seconds", API_KEY_RATE_LIMIT, RATE_LIMIT_WINDOW_SECS);
     println!("👷 Workers: {}", workers);
     println!("📥 Queue Size: {}", queue_size);
     println!("📝 Log file: {}", state.log_file.display());
+    println!("🔒 Trusted Proxies: {:?}", state.trusted_proxies);
 
-    // Create routes that require authentication
     let protected_routes = Router::new()
         .route("/api/modules", get(list_modules))
         .route("/api/modules/search", get(search_modules))
@@ -1520,7 +1648,6 @@ pub async fn start_api_server(
         .route("/api/target", axum::routing::delete(clear_target))
         .route("/api/output/{job_id}", get(get_job_output))
         .route("/api/jobs", get(list_jobs))
-        // SECURITY: /api/totp/secret endpoint REMOVED - defeats 2FA
         .route("/api/status", get(get_status))
         .route("/api/rotate-key", post(rotate_key_endpoint))
         .route("/api/ips", get(get_tracked_ips))
