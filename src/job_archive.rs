@@ -59,7 +59,7 @@ pub enum JobStatus {
 }
 
 /// Thread-safe job storage with automatic archival
-#[derive(Clone)]
+#[derive(Clone, Debug)]  // Added Debug here
 pub struct JobArchive {
     /// In-memory job storage
     jobs: Arc<RwLock<VecDeque<JobResult>>>,
