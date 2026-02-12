@@ -112,6 +112,16 @@ pub fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
+pub fn prompt_int(msg: &str, default: i64) -> Result<i64> {
+    loop {
+        let input = prompt_default(msg, &default.to_string())?;
+        match input.trim().parse::<i64>() {
+            Ok(n) => return Ok(n),
+            Err(_) => println!("{}", "Please enter a valid number.".yellow()),
+        }
+    }
+}
+
 pub fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
     loop {
         let input = prompt_default(msg, &default.to_string())?;
