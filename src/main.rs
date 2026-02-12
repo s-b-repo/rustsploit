@@ -517,6 +517,7 @@ async fn run() -> Result<()> {
             cli_args.verbose,
             cli_args.queue_size,
             cli_args.workers,
+            Vec::new(), // trusted_proxies
         ).await?;
         return Ok(());
     }
