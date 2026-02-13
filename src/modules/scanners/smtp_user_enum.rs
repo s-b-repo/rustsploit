@@ -840,7 +840,7 @@ fn prompt_wordlist(message: &str) -> Result<String> {
 }
 
 fn normalize_target(host: &str, port: u16) -> Result<String> {
-    let re = Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$").expect("Invalid regex");
+    let re = Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$").context("Failed to compile regex")?;
     let t = host.trim();
     let cap = re
         .captures(t)

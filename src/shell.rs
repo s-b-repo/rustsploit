@@ -8,16 +8,17 @@ use url::Url;
 use ipnetwork::IpNetwork;
 
 const MAX_INPUT_LENGTH: usize = 4096;
-const MAX_TARGET_LENGTH: usize = 512;
 const MAX_COMMAND_CHAIN_LENGTH: usize = 10;
 const MAX_URL_LENGTH: usize = 2048;
 
 const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
 
+/// IPv6 prefix threshold for size calculations (prefixes > this use u64 formula, otherwise u64::MAX)
+const IPV6_PREFIX_THRESHOLD: u8 = 64;
+
 /// Simple interactive shell context
 struct ShellContext {
     current_module: Option<String>,
-    current_target: Option<String>,
     verbose: bool,
 }
 
@@ -25,7 +26,6 @@ impl ShellContext {
     fn new(verbose: bool) -> Self {
         ShellContext {
             current_module: None,
-            current_target: None,
             verbose,
         }
     }
@@ -37,7 +37,10 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
     
     // Show global target if set
     if config::GLOBAL_CONFIG.has_target() {
-        let target_str = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
+        let target_str = match config::GLOBAL_CONFIG.get_target() {
+            Some(t) => t,
+            None => String::new(),
+        };
         if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
             if size > 1 {
                 println!("{}", format!("[*] Global target set: {} ({} IPs)", target_str, size).cyan());
@@ -104,39 +107,35 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                     match command_key.as_str() {
                         "exit" => {
                             println!("Exiting...");
-                            println!("Exiting...");
                             break 'main_loop;
                         }
                         "back" => {
                             ctx.current_module = None;
-                            ctx.current_target = None;
+                            config::GLOBAL_CONFIG.clear_target();
                             println!("{}", "Cleared current module and target.".green());
                         }
                         "show_target" | "target" => {
-                            if let Some(ref t) = ctx.current_target {
-                                println!("{}", format!("Local target: {}", t).cyan());
-                            } else {
-                                println!("{}", "No local target set.".dimmed());
-                            }
                             if config::GLOBAL_CONFIG.has_target() {
-                                let target_str = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
+                                let target_str = match config::GLOBAL_CONFIG.get_target() {
+                                    Some(t) => t,
+                                    None => String::new(),
+                                };
                                 if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
                                     if size > 1 {
-                                        println!("{}", format!("Global target (subnet): {} ({} IPs)", target_str, size).green());
+                                        println!("{}", format!("Target (subnet): {} ({} IPs)", target_str, size).green());
                                     } else {
-                                        println!("{}", format!("Global target: {}", target_str).green());
+                                        println!("{}", format!("Target: {}", target_str).green());
                                     }
                                 } else {
-                                    println!("{}", format!("Global target: {}", target_str).green());
+                                    println!("{}", format!("Target: {}", target_str).green());
                                 }
                             } else {
-                                println!("{}", "No global target set.".dimmed());
+                                println!("{}", "No target set.".dimmed());
                             }
                         }
                         "clear_target" => {
-                            ctx.current_target = None;
                             config::GLOBAL_CONFIG.clear_target();
-                            println!("{}", "Cleared local and global targets.".green());
+                            println!("{}", "Cleared target.".green());
                         }
                         "help" => render_help(),
                         "modules" => utils::list_all_modules(),
@@ -183,29 +182,26 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                             if raw_value.is_empty() {
                                 println!("{}", "Usage: set target <value>".yellow());
                                 println!("{}", "  Shortcuts: t <value>, target <value>".dimmed());
+                                println!("{}", "  Note: Value must be on the same line as the command.".dimmed());
                                 println!("{}", "  Examples:".dimmed());
                                 println!("{}", "    t 192.168.1.1".dimmed());
+                                println!("{}", "    t 10.16.0.22/24".dimmed());
                                 println!("{}", "    set target example.com".dimmed());
                                 continue;
                             }
 
                             match sanitize_target(raw_value) {
                                 Ok(valid_target) => {
-                                    // Set both local context and global config
-                                    ctx.current_target = Some(valid_target.clone());
                                     match config::GLOBAL_CONFIG.set_target(&valid_target) {
                                         Ok(_) => {
                                             if config::GLOBAL_CONFIG.is_subnet() {
-                                                println!("{}", format!("Global target set to subnet: {}", valid_target).green());
+                                                println!("{}", format!("Target set to subnet: {}", valid_target).green());
                                             } else {
-                                                println!("{}", format!("Global target set to: {}", valid_target).green());
+                                                println!("{}", format!("Target set to: {}", valid_target).green());
                                             }
-                                            println!("{}", format!("Local target set to: {}", valid_target).green());
                                         }
                                         Err(e) => {
-                                            println!("{}", format!("[!] Failed to set global target: {}", e).red());
-                                            // Still set local target
-                                            println!("{}", format!("Local target set to: {}", valid_target).green());
+                                            println!("{}", format!("[!] Failed to set target: {}", e).red());
                                         }
                                     }
                                 }
@@ -216,18 +212,20 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                         }
                         "run" => {
                             if let Some(ref module_path) = ctx.current_module {
-                                // Try to get target from local context, then global config
-                                let target = if let Some(ref t) = ctx.current_target {
-                                    Some(t.clone())
-                                } else if config::GLOBAL_CONFIG.has_target() {
+                                // Get target from global config
+                                let target = if config::GLOBAL_CONFIG.has_target() {
                                     // Use single IP from global target (handles subnets intelligently)
                                     match config::GLOBAL_CONFIG.get_single_target_ip() {
                                         Ok(ip) => {
-                                            println!("{}", format!("[*] Using global target: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default()).cyan());
+                                            let target_display = match config::GLOBAL_CONFIG.get_target() {
+                                                Some(t) => t,
+                                                None => String::new(),
+                                            };
+                                            println!("{}", format!("[*] Using target: {}", target_display).cyan());
                                             Some(ip)
                                         }
                                         Err(e) => {
-                                            println!("{}", format!("[!] Error getting global target: {}", e).red());
+                                            println!("{}", format!("[!] Error getting target: {}", e).red());
                                             None
                                         }
                                     }
@@ -247,14 +245,13 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                                                     match sanitize_target(&input) {
                                                         Ok(valid_target) => {
                                                             // Set it for future use too
-                                                            ctx.current_target = Some(valid_target.clone());
-                                                            // Try to set global but don't fail if it errors (e.g. strict subnet rules), just warn
                                                             if let Err(e) = config::GLOBAL_CONFIG.set_target(&valid_target) {
-                                                                 println!("{}", format!("[*] Local target set to '{}', but failed to set global: {}", valid_target, e).dimmed());
+                                                                 println!("{}", format!("[!] Failed to set target: {}", e).red());
+                                                                 None
                                                             } else {
                                                                  println!("{}", format!("[*] Target set to '{}'", valid_target).green());
+                                                                 Some(valid_target)
                                                             }
-                                                            Some(valid_target)
                                                         },
                                                         Err(e) => {
                                                             println!("{}", format!("[!] Invalid target: {}", e).red());
@@ -329,7 +326,7 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                                             IpNetwork::V4(net) => 2u64.pow(32 - net.prefix() as u32),
                                             IpNetwork::V6(net) => {
                                                  let prefix = net.prefix();
-                                                 if prefix > 64 { 2u64.pow(128 - prefix as u32) } else { u64::MAX }
+                                                 if prefix > IPV6_PREFIX_THRESHOLD { 2u64.pow(128 - prefix as u32) } else { u64::MAX }
                                             } // Simplified size display
                                         };
                                         
@@ -441,18 +438,9 @@ fn sanitize_module_path(input: &str) -> Option<String> {
     }
 }
 
+/// Delegate to utils for consistent target validation across the codebase
 fn sanitize_target(input: &str) -> std::result::Result<String, &'static str> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("Target cannot be empty.");
-    }
-    if trimmed.len() > MAX_TARGET_LENGTH {
-        return Err("Target value is too long.");
-    }
-    if trimmed.chars().any(|c| c.is_control()) {
-        return Err("Target cannot contain control characters.");
-    }
-    Ok(trimmed.to_string())
+    utils::sanitize_target_simple(input)
 }
 
 fn render_help() {

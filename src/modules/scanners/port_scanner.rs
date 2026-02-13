@@ -13,6 +13,15 @@ use tokio::{
     sync::Semaphore,
     time::{timeout, Duration},
 };
+use rand::{Rng, rng};
+use socket2::{Socket, Domain, Type, Protocol};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScanMethod {
+    TcpConnect,
+    Udp,
+    Both,
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanSettings {
@@ -20,9 +29,12 @@ pub struct ScanSettings {
     pub timeout_secs: u64,
     pub show_only_open: bool,
     pub verbose: bool,
-    pub scan_udp_enabled: bool,
+    pub scan_method: ScanMethod,
     pub output_file: String,
     pub port_range: PortRange,
+    pub ttl: Option<u32>,
+    pub data_length: Option<usize>,
+    pub source_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,14 +129,48 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     let ports = port_range.get_ports();
     println!("{}", format!("[*] Selected {} ports to scan", ports.len()).green());
     
+    // Scan Method Selection
+    println!("\n{}", "Scan Method:".yellow());
+    println!("  1. TCP Connect Scan (Default)");
+    println!("  2. UDP Scan");
+    println!("  3. Both TCP & UDP");
+    let method_choice = prompt_usize("Select method (1-3) [1]: ").unwrap_or(1);
+    let scan_method = match method_choice {
+        2 => ScanMethod::Udp,
+        3 => ScanMethod::Both,
+        _ => ScanMethod::TcpConnect,
+    };
+
+    // Advanced Options
+    let ttl = if prompt_bool("Enable custom TTL? (y/n) [n]: ").unwrap_or(false) {
+        Some(prompt_usize("TTL value (1-255): ").unwrap_or(64) as u32)
+    } else {
+        None
+    };
+
+    let source_port = if prompt_bool("Enable custom Source Port? (y/n) [n]: ").unwrap_or(false) {
+        Some(prompt_usize("Source Port (1-65535): ").unwrap_or(0) as u16)
+    } else {
+        None
+    };
+
+    let data_length = if prompt_bool("Enable garbage data / payload padding? (y/n) [n]: ").unwrap_or(false) {
+        Some(prompt_usize("Data length (bytes): ").unwrap_or(0))
+    } else {
+        None
+    };
+
     Ok(ScanSettings {
         concurrency: prompt_usize("Concurrency [100]: ").unwrap_or(100),
         timeout_secs: prompt_usize("Timeout (in seconds) [3]: ").unwrap_or(3) as u64,
         show_only_open: prompt_bool("Show only open ports? (y/n) [y]: ").unwrap_or(true),
         verbose: prompt_bool("Verbose output? (y/n) [n]: ").unwrap_or(false),
-        scan_udp_enabled: prompt_bool("Include UDP scan? (y/n) [n]: ").unwrap_or(false),
+        scan_method,
         output_file: prompt("Output filename [scan_results.txt]: ").unwrap_or_else(|_| "scan_results.txt".to_string()),
         port_range,
+        ttl,
+        source_port,
+        data_length,
     })
 }
 
@@ -137,9 +183,12 @@ pub async fn run_interactive(target: &str) -> Result<()> {
         settings.timeout_secs,
         settings.show_only_open,
         settings.verbose,
-        settings.scan_udp_enabled,
+        settings.scan_method,
         &settings.output_file,
         settings.port_range,
+        settings.ttl,
+        settings.source_port,
+        settings.data_length,
     )
     .await
 }
@@ -155,9 +204,12 @@ pub async fn run_with_settings(
     timeout_secs: u64,
     show_only_open: bool,
     _verbose: bool,
-    scan_udp_enabled: bool,
+    scan_method: ScanMethod,
     output_file: &str,
     port_range: PortRange,
+    ttl: Option<u32>,
+    source_port: Option<u16>,
+    data_length: Option<usize>,
 ) -> Result<()> {
     let start_time = Instant::now();
     let (resolved_ip_str, resolved_ip) = resolve_target(target)?;
@@ -165,7 +217,7 @@ pub async fn run_with_settings(
     let file = Arc::new(Mutex::new(BufWriter::new(File::create(output_file)?)));
     
     let ports = port_range.get_ports();
-    let total_ports = ports.len() * (1 + scan_udp_enabled as usize);
+    let total_ports = ports.len() * (if scan_method == ScanMethod::Both { 2 } else { 1 });
     
     let stats = Arc::new(Mutex::new(ScanStats::new()));
     let progress = Arc::new(Mutex::new(ProgressTracker::new(total_ports)));
@@ -180,62 +232,64 @@ pub async fn run_with_settings(
     writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "Scan started at: {}\n", timestamp)?;
 
     // TCP Scan
-    println!("{}", "\n[*] Starting TCP scan...".yellow());
     let mut tcp_tasks = vec![];
     
-    for port in &ports {
-        let permit = semaphore.clone().acquire_owned().await?;
-        let file = file.clone();
-        let stats = stats.clone();
-        let progress = progress.clone();
-        let ip = resolved_ip;
-        let ip_str = resolved_ip_str.clone();
-        let port = *port;
+    if scan_method == ScanMethod::TcpConnect || scan_method == ScanMethod::Both {
+        println!("{}", "\n[*] Starting TCP scan...".yellow());
+        for port in &ports {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let file = file.clone();
+            let stats = stats.clone();
+            let progress = progress.clone();
+            let ip = resolved_ip;
+            let ip_str = resolved_ip_str.clone();
+            let port = *port;
 
-        let handle = tokio::spawn(async move {
-            let _permit = permit;
-            let result = scan_tcp(&ip, port, timeout_secs).await;
-            
-            let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
-            let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
-            
-            if let Some((status, banner, service)) = result {
-                match status.as_str() {
-                    "OPEN" => {
-                        stats_guard.tcp_open += 1;
-                        let service_name = if service.is_empty() { get_service_name(port) } else { &service };
-                        let line = format!("[TCP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
-                        
-                        if !show_only_open {
-                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
+            let handle = tokio::spawn(async move {
+                let _permit = permit;
+                let result = scan_tcp(&ip, port, timeout_secs, ttl, source_port, data_length).await;
+                
+                let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
+                let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
+                
+                if let Some((status, banner, service)) = result {
+                    match status.as_str() {
+                        "OPEN" => {
+                            stats_guard.tcp_open += 1;
+                            let service_name = if service.is_empty() { get_service_name(port) } else { &service };
+                            let line = format!("[TCP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
+                            
+                            if !show_only_open {
+                                let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
+                            }
+                            
+                            let output_line = if !banner.is_empty() {
+                                format!("{} | Banner: {}", line, banner.trim().bright_black())
+                            } else {
+                                line
+                            };
+                            
+                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
+                            println!("{}", output_line);
                         }
-                        
-                        let output_line = if !banner.is_empty() {
-                            format!("{} | Banner: {}", line, banner.trim().bright_black())
-                        } else {
-                            line
-                        };
-                        
-                        let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
-                        println!("{}", output_line);
+                        "CLOSED" => stats_guard.tcp_closed += 1,
+                        "TIMEOUT" | "FILTERED" => stats_guard.tcp_filtered += 1,
+                        _ => {}
                     }
-                    "CLOSED" => stats_guard.tcp_closed += 1,
-                    "TIMEOUT" | "FILTERED" => stats_guard.tcp_filtered += 1,
-                    _ => {}
                 }
-            }
-            
-            progress_guard.increment(&start_time);
-            if progress_guard.should_print() {
-                progress_guard.print_progress();
-            }
-        });
-        tcp_tasks.push(handle);
+                
+                progress_guard.increment(&start_time);
+                if progress_guard.should_print() {
+                    progress_guard.print_progress();
+                }
+            });
+            tcp_tasks.push(handle);
+        }
     }
 
     // UDP Scan
     let mut udp_tasks = vec![];
-    if scan_udp_enabled {
+    if scan_method == ScanMethod::Udp || scan_method == ScanMethod::Both {
         println!("{}", "\n[*] Starting UDP scan...".yellow());
         for port in &ports {
             let permit = semaphore.clone().acquire_owned().await?;
@@ -248,7 +302,7 @@ pub async fn run_with_settings(
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
-                let result = scan_udp(&ip, port, timeout_secs).await;
+                let result = scan_udp(&ip, port, timeout_secs, ttl, source_port, data_length).await;
                 
                 let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
                 let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
@@ -301,7 +355,7 @@ pub async fn run_with_settings(
     println!("  {} Closed: {}", "✗".red(), stats.tcp_closed);
     println!("  {} Filtered/Timeout: {}", "~".yellow(), stats.tcp_filtered);
     
-    if scan_udp_enabled {
+    if scan_method == ScanMethod::Udp || scan_method == ScanMethod::Both {
         println!("\n{}", "UDP Ports:".yellow());
         println!("  {} Open: {}", "✓".green(), stats.udp_open.to_string().green().bold());
         println!("  {} Closed: {}", "✗".red(), stats.udp_closed);
@@ -317,7 +371,7 @@ pub async fn run_with_settings(
     writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Open: {}", stats.tcp_open)?;
     writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Closed: {}", stats.tcp_closed)?;
     writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Filtered/Timeout: {}", stats.tcp_filtered)?;
-    if scan_udp_enabled {
+    if scan_method == ScanMethod::Udp || scan_method == ScanMethod::Both {
         writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "\nUDP Ports:")?;
         writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Open: {}", stats.udp_open)?;
         writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Closed: {}", stats.udp_closed)?;
@@ -328,16 +382,85 @@ pub async fn run_with_settings(
 }
 
 /// === TCP Port Scanner with Enhanced Banner Grabbing ===
-async fn scan_tcp(ip: &std::net::IpAddr, port: u16, timeout_secs: u64) -> Option<(String, String, String)> {
+async fn scan_tcp(
+    ip: &std::net::IpAddr, 
+    port: u16, 
+    timeout_secs: u64,
+    ttl: Option<u32>,
+    source_port: Option<u16>,
+    data_length: Option<usize>
+) -> Option<(String, String, String)> {
     let addr = SocketAddr::new(*ip, port);
-    match timeout(Duration::from_secs(timeout_secs), TcpStream::connect(addr)).await {
-        Ok(Ok(mut stream)) => {
-            // Try service-specific probes for better banner grabbing
-            let (banner, service) = grab_banner(&mut stream, port).await;
-            Some(("OPEN".into(), banner, service))
+    
+    // Create socket using socket2
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
+        Ok(s) => s,
+        Err(_) => return Some(("ERROR".into(), "".into(), "".into())),
+    };
+    
+    // Set options
+    if let Some(ttl_val) = ttl {
+        if domain == Domain::IPV4 {
+            let _ = socket.set_ttl_v4(ttl_val);
+        } else {
+            let _ = socket.set_unicast_hops_v6(ttl_val);
         }
-        Ok(Err(_)) => Some(("CLOSED".into(), "".into(), "".into())),
-        Err(_) => Some(("TIMEOUT".into(), "".into(), "".into())),
+    }
+    
+    let _ = socket.set_nonblocking(true);
+    let _ = socket.set_tcp_nodelay(true);
+
+    // Bind to custom source port if configured
+    if let Some(src_port) = source_port {
+        let bind_addr = if addr.is_ipv4() {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), src_port)
+        } else {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), src_port)
+        };
+        let _ = socket.bind(&bind_addr.into());
+    }
+
+    // Connect (non-blocking)
+    let connect_res = socket.connect(&addr.into());
+    match connect_res {
+        Ok(_) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+        Err(_) => return Some(("CLOSED".into(), "".into(), "".into())),
+    }
+
+    // Convert to Tokio TcpStream
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream_res = TcpStream::from_std(std_stream);
+    
+    match stream_res {
+        Ok(mut stream) => {
+            // Wait for connection to complete
+            if let Ok(_) = timeout(Duration::from_secs(timeout_secs), stream.writable()).await {
+                // Check for socket error
+                if let Ok(None) = stream.take_error() {
+                    // Send garbage data if configured
+                    if let Some(len) = data_length {
+                        if len > 0 {
+                            let payload: Vec<u8> = {
+                                let mut rng = rng();
+                                (0..len).map(|_| rng.random()).collect()
+                            };
+                            let _ = stream.write_all(&payload).await;
+                        }
+                    }
+                    
+                    // Try service-specific probes
+                    let (banner, service) = grab_banner(&mut stream, port).await;
+                    Some(("OPEN".into(), banner, service))
+                } else {
+                    Some(("CLOSED".into(), "".into(), "".into()))
+                }
+            } else {
+                Some(("TIMEOUT".into(), "".into(), "".into()))
+            }
+        }
+        Err(_) => Some(("CLOSED".into(), "".into(), "".into())),
     }
 }
 
@@ -431,16 +554,47 @@ fn extract_http_server(response: &str) -> Option<String> {
 }
 
 /// === UDP Port Scanner ===
-async fn scan_udp(ip: &std::net::IpAddr, port: u16, timeout_secs: u64) -> Option<String> {
-    let bind_addr = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+async fn scan_udp(
+    ip: &std::net::IpAddr, 
+    port: u16, 
+    timeout_secs: u64,
+    ttl: Option<u32>,
+    source_port: Option<u16>,
+    data_length: Option<usize>
+) -> Option<String> {
+    // Bind address (source port logic)
+    let bind_port = source_port.unwrap_or(0);
+    let bind_addr = if ip.is_ipv4() { 
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), bind_port)
+    } else { 
+        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), bind_port)
+    };
+
     let sock = match UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(_) => return Some("ERROR".into()),
     };
+    
+    // Set TTL if configured
+    if let Some(ttl_val) = ttl {
+        let _ = sock.set_ttl(ttl_val);
+    }
 
     let target = SocketAddr::new(*ip, port);
-    let payload = b"\x00\x00\x10\x10";
-    let _ = sock.send_to(payload, target).await;
+    
+    // Payload generation
+    let payload = if let Some(len) = data_length {
+        if len > 0 {
+            let mut rng = rng();
+            (0..len).map(|_| rng.random()).collect()
+        } else {
+            b"\x00\x00\x10\x10".to_vec()
+        }
+    } else {
+        b"\x00\x00\x10\x10".to_vec()
+    };
+    
+    let _ = sock.send_to(&payload, target).await;
     
     let mut buf = [0u8; 512];
     match timeout(Duration::from_secs(timeout_secs), sock.recv_from(&mut buf)).await {
@@ -562,7 +716,10 @@ impl ProgressTracker {
         }
         
         let percentage = (self.current as f64 / self.total as f64) * 100.0;
-        let elapsed = self.start_time.map(|s| s.elapsed()).unwrap_or_default();
+        let elapsed = match self.start_time {
+            Some(s) => s.elapsed(),
+            None => std::time::Duration::ZERO,
+        };
         
         let rate = if elapsed.as_secs() > 0 {
             self.current as f64 / elapsed.as_secs() as f64

@@ -17,7 +17,10 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     } else if config::GLOBAL_CONFIG.has_target() {
         match config::GLOBAL_CONFIG.get_single_target_ip() {
             Ok(ip) => {
-                println!("[*] Using global target: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default());
+                println!("[*] Using global target: {}", match config::GLOBAL_CONFIG.get_target() {
+                    Some(t) => t,
+                    None => String::new(),
+                });
                 ip
             }
             Err(e) => return Err(anyhow::anyhow!("No target specified and global target error: {}", e)),
@@ -29,7 +32,10 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
     let target = normalize_target(&raw)?;
     crate::utils::verbose_log(cli_args.verbose, &format!("Normalized target: {}", target));
 
-    let module = cli_args.module.clone().unwrap_or_default();
+    let module = match cli_args.module.clone() {
+        Some(m) => m,
+        None => String::new(),
+    };
     
     match command {
         "exploit" => {
@@ -96,7 +102,10 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
         if config::GLOBAL_CONFIG.has_target() {
             match config::GLOBAL_CONFIG.get_single_target_ip() {
                 Ok(ip) => {
-                    println!("[*] Using global target: {}", config::GLOBAL_CONFIG.get_target().unwrap_or_default());
+                    println!("[*] Using global target: {}", match config::GLOBAL_CONFIG.get_target() {
+                        Some(t) => t,
+                        None => String::new(),
+                    });
                     ip
                 }
                 Err(e) => return Err(anyhow::anyhow!("Global target error: {}", e)),

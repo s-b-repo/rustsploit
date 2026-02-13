@@ -215,3 +215,71 @@ use once_cell::sync::Lazy;
 
 pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new());
 
+/// Module-level configuration for API-driven execution
+/// This is set by the API before running a module and read by modules
+/// to get pre-configured values instead of prompting the user
+#[derive(Clone, Debug, Default)]
+pub struct ModuleConfig {
+    pub port: Option<u16>,
+    pub username_wordlist: Option<String>,
+    pub password_wordlist: Option<String>,
+    pub path_wordlist: Option<String>,
+    pub concurrency: Option<usize>,
+    pub stop_on_success: Option<bool>,
+    pub save_results: Option<bool>,
+    pub output_file: Option<String>,
+    pub verbose: Option<bool>,
+    pub combo_mode: Option<bool>,
+}
+
+impl ModuleConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if running in API mode (any config option is set)
+    pub fn is_api_mode(&self) -> bool {
+        self.port.is_some() ||
+        self.username_wordlist.is_some() ||
+        self.password_wordlist.is_some() ||
+        self.path_wordlist.is_some() ||
+        self.concurrency.is_some() ||
+        self.stop_on_success.is_some() ||
+        self.save_results.is_some() ||
+        self.output_file.is_some() ||
+        self.verbose.is_some() ||
+        self.combo_mode.is_some()
+    }
+
+    /// Clear all settings
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Global module config instance (API-provided configuration)
+pub static MODULE_CONFIG: Lazy<Arc<RwLock<ModuleConfig>>> = Lazy::new(|| {
+    Arc::new(RwLock::new(ModuleConfig::new()))
+});
+
+/// Set module config from API request
+pub fn set_module_config(config: ModuleConfig) {
+    if let Ok(mut guard) = MODULE_CONFIG.write() {
+        *guard = config;
+    }
+}
+
+/// Get a clone of the current module config
+pub fn get_module_config() -> ModuleConfig {
+    MODULE_CONFIG.read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// Clear module config (should be called after module execution)
+pub fn clear_module_config() {
+    if let Ok(mut guard) = MODULE_CONFIG.write() {
+        guard.clear();
+    }
+}
+
