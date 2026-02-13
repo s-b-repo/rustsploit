@@ -1,6 +1,6 @@
 [package]
 name = "rustsploit"
-version = "0.5.0"
+version = "v0.4.7"
 edition = "2024"
 build = "build.rs"
 
