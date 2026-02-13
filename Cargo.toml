@@ -70,6 +70,9 @@ libc = "0.2"
 # Bluetooth
 btleplug = "0.11"
 
+# TUI (WPair module)
+ratatui = "0.29"
+crossterm = "0.28"
 
 # RDP - removed unused dependency (module uses external xfreerdp/rdesktop commands)
 # rdp = "0.12"
