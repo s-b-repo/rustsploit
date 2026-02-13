@@ -175,7 +175,12 @@ async fn fetch_title(client: &Client, url: &str, title_re: &Regex) -> Result<Tit
     let start = std::time::Instant::now();
     let response = client.get(url).send().await.context("Request failed")?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = match response.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(anyhow!("Failed to read response body: {}", e));
+        }
+    };
     let title = title_re
         .captures(&text)
         .and_then(|cap| cap.get(1))

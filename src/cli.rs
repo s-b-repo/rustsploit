@@ -6,7 +6,7 @@ use clap::{ArgGroup, Parser};
 #[clap(group(
     ArgGroup::new("mode")
         .required(false)
-        .args(&["command", "api"])
+        .args(&["command", "api", "setup_totp"])
 ))]
 pub struct Cli {
     /// Subcommand to run (e.g. "exploit", "scanner", "creds")
@@ -28,16 +28,28 @@ pub struct Cli {
     #[arg(long, requires = "api")]
     pub api_key: Option<String>,
 
-    /// Enable hardening mode (auto-rotate API key on suspicious activity)
+    /// Enable all hardening features (TOTP + rate limit + IP tracking)
     #[arg(long, requires = "api")]
     pub harden: bool,
 
-    /// Network interface to bind API server to (default: 0.0.0.0)
-    #[arg(long, requires = "api", default_value = "0.0.0.0")]
+    /// Enable TOTP authentication for API (requires --api)
+    #[arg(long, requires = "api")]
+    pub harden_totp: bool,
+
+    /// Enable rate limiting for API (requires --api)
+    #[arg(long, requires = "api")]
+    pub harden_rate_limit: bool,
+
+    /// Enable IP tracking for API (requires --api)
+    #[arg(long, requires = "api")]
+    pub harden_ip_tracking: bool,
+
+    /// Network interface to bind API server to (default: 127.0.0.1 for security)
+    #[arg(long, requires = "api", default_value = "127.0.0.1")]
     pub interface: Option<String>,
 
     /// IP limit for hardening mode (default: 10 unique IPs)
-    #[arg(long, requires = "harden", default_value = "10")]
+    #[arg(long, default_value = "10")]
     pub ip_limit: Option<u32>,
 
     /// Set global target IP/subnet for all modules
@@ -63,4 +75,9 @@ pub struct Cli {
     /// Number of worker threads for API jobs (default: 10)
     #[arg(long, default_value_t = 10)]
     pub workers: usize,
+
+    /// Set up TOTP authentication (interactive wizard)
+    #[arg(long)]
+    pub setup_totp: bool,
 }
+

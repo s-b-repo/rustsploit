@@ -8,6 +8,7 @@ use anyhow::{Result, anyhow, Context};
 use url::Url;
 use regex::Regex;
 use once_cell::sync::Lazy; // Added for safe static regex initialization
+use rand::prelude::IndexedRandom; // Fixed for rand 0.9 compatibility
 
 // ============================================================
 // CONSTANTS
@@ -111,6 +112,16 @@ pub fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
+pub fn prompt_int(msg: &str, default: i64) -> Result<i64> {
+    loop {
+        let input = prompt_default(msg, &default.to_string())?;
+        match input.trim().parse::<i64>() {
+            Ok(n) => return Ok(n),
+            Err(_) => println!("{}", "Please enter a valid number.".yellow()),
+        }
+    }
+}
+
 pub fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
     loop {
         let input = prompt_default(msg, &default.to_string())?;
@@ -153,6 +164,51 @@ pub fn prompt_wordlist(msg: &str) -> Result<String> {
 // ============================================================
 // VALIDATION & SANITIZATION
 // ============================================================
+
+/// Basic target validation for API use - returns bool for simple checks
+/// 
+/// This is a lightweight check suitable for API request validation.
+/// For full normalization and format handling, use `normalize_target`.
+/// 
+/// # Checks
+/// - Non-empty and reasonable length
+/// - Printable ASCII only
+/// - No CRLF injection
+/// - No control characters
+pub fn validate_target_basic(target: &str) -> bool {
+    if target.is_empty() || target.len() > MAX_TARGET_LENGTH {
+        return false;
+    }
+    // Printable ASCII check (32-126)
+    if !target.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return false;
+    }
+    // CRLF injection check
+    if target.contains("\r\n\r\n") {
+        return false;
+    }
+    // Whitespace trimming check
+    let trimmed = target.trim();
+    trimmed == target
+}
+
+/// Simple target sanitization - trims and validates basic format
+/// 
+/// Returns the sanitized target string or an error message.
+/// For full normalization, use `normalize_target` instead.
+pub fn sanitize_target_simple(input: &str) -> std::result::Result<String, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Target cannot be empty.");
+    }
+    if trimmed.len() > MAX_TARGET_LENGTH {
+        return Err("Target value is too long.");
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("Target cannot contain control characters.");
+    }
+    Ok(trimmed.to_string())
+}
 
 /// Validates and sanitizes command input to prevent injection attacks and DoS
 /// 
@@ -643,6 +699,7 @@ pub fn normalize_target(raw: &str) -> Result<String> {
 }
 
 /// Validate IPv6 address format (basic validation)
+/// Validate IPv6 address format (basic validation)
 /// Supports compressed notation (::), mixed IPv4/IPv6 (::ffff:192.168.1.1), etc.
 fn is_valid_ipv6(addr: &str) -> bool {
     if addr.is_empty() {
@@ -650,8 +707,13 @@ fn is_valid_ipv6(addr: &str) -> bool {
     }
     
     // Check for valid IPv6 characters: hex digits, colons, and dots (for IPv4-mapped)
-    static IPV6_CHAR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[0-9a-fA-F:.]+$").expect("Invalid Regex"));
-    if !IPV6_CHAR_RE.is_match(addr) {
+    static IPV6_CHAR_RE: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| Regex::new(r"^[0-9a-fA-F:.]+$"));
+    let re = match &*IPV6_CHAR_RE {
+        Ok(re) => re,
+        Err(_) => return false, // Fail safe if regex compilation fails
+    };
+
+    if !re.is_match(addr) {
         return false;
     }
     
@@ -728,8 +790,13 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
     }
     
     // Check for valid characters (alphanumeric, dots, hyphens, underscores)
-    static HOST_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9.\-_]+$").expect("Invalid Regex"));
-    if !HOST_RE.is_match(host) {
+    static HOST_RE: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9.\-_]+$"));
+    let re = match &*HOST_RE {
+        Ok(re) => re,
+        Err(_) => return false, // Fail safe
+    };
+
+    if !re.is_match(host) {
         return false;
     }
     
@@ -1023,6 +1090,26 @@ pub fn module_exists(module_path: &str) -> bool {
     modules.iter().any(|m| m == module_path)
 }
 
+/// Helper to get a random color for module display
+fn get_random_color() -> Color {
+    let colors = [
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::BrightRed,
+        Color::BrightGreen,
+        Color::BrightYellow,
+        Color::BrightBlue,
+        Color::BrightMagenta,
+        Color::BrightCyan,
+    ];
+    let mut rng = rand::rng();
+    *colors.choose(&mut rng).unwrap_or(&Color::Green)
+}
+
 /// Lists all available modules recursively under src/modules/
 pub fn list_all_modules() {
     println!("{}", "Available modules:".bold().underline());
@@ -1046,7 +1133,7 @@ pub fn list_all_modules() {
     for (category, paths) in grouped {
         println!("\n{}:", category.blue().bold());
         for path in paths {
-            println!("  - {}", path.green());
+            println!("  - {}", path.color(get_random_color()));
         }
     }
 }
@@ -1099,7 +1186,7 @@ pub fn find_modules(keyword: &str) {
     for (category, paths) in grouped {
         println!("\n{}:", category.blue().bold());
         for path in paths {
-            println!("  - {}", path.green());
+            println!("  - {}", path.color(get_random_color()));
         }
     }
 }

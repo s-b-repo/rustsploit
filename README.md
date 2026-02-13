@@ -47,6 +47,8 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 -  **Security hardened:** Comprehensive input validation, path traversal protection, length limits, and memory-safe operations throughout
 -  **Honeypot detection:** Framework-level automatic detection before module execution to warn about potentially deceptive targets
 -  **Enhanced target handling:** Advanced normalization supporting IPv4, IPv6 (with brackets), hostnames, URLs, CIDR notation, and port extraction
+-  **IP exclusion ranges (EXCLUDED_RANGES):** Camxploit, Telnet bruteforce, and exploit modules now skip bogon, private, reserved, documentation, and public DNS IPs during mass scans
+-  **DoS / Stress testing suite:** Connection Exhaustion Flood (semaphore-bounded FDs), Null SYN Exhaustion (>1M PPS, IP spoofing), TCP Connection Flood (connect & drop, infinite mode)
 
 ---
 
@@ -68,6 +70,8 @@ Rustsploit ships categorized modules under `src/modules/`, automatically exposed
 | Category | Highlights |
 |----------|------------|
 | `creds/generic` | FTP anonymous & FTPS brute force (5 operation modes, JSON config), SSH brute force, SSH user enumeration (timing attack), SSH password spray, **Telnet brute force (with IAC negotiation)**, POP3(S) brute force, SMTP brute force, RTSP brute force (path + header bruting), **RDP auth-only brute (streaming mode, multiple security levels)**, **MQTT brute force**, SNMP community string brute force, **L2TP/IPsec brute force (multi-platform)**, Fortinet SSL VPN brute force |
+| `creds/camxploit` | **Camxploit camera scanner** with masscan-style parallel scanning, EXCLUDED_RANGES (bogons/private/reserved/DNS), port-based service filtering (ignores SSH/Telnet/RDP-only hosts), output file support |
+| `exploits/dos` | **Connection Exhaustion Flood** (FD-bounded semaphore, connect & drop), **Null SYN Exhaustion** (raw packet, IP spoofing, XorShift128+ RNG, >1M PPS), **TCP Connection Flood** (pre-resolved DNS, high-concurrency handshake stress) |
 | `exploits/*` | GNU inetutils-telnetd Auth Bypass (CVE-2026-24061), Apache Tomcat (CVE-2025-24813 RCE, CatKiller CVE-2025-31650), TP-Link VN020 / WR740N DoS, **TP-Link Tapo C200 CVE-2021-4045**, Abus camera CVE-2023-26609 variants, Ivanti Connect Secure stack buffer overflow, Zabbix 7.0.0 SQLi, Avtech CVE-2024-7029, Spotube zero-day, OpenSSH 9.8p1 race condition, Uniview password disclosure, ACTi camera RCE, Flowise CVE-2025-59528 RCE, HTTP/2 Rapid Reset DoS, Jenkins LFI, PAN-OS Auth Bypass, Heartbleed, **React2Shell CVE-2025-55182**, **SSHPWN Framework** (SFTP symlink/setuid/traversal, SCP injection/DoS, Session env injection) |
 | `scanners` | Port scanner (TCP/UDP/SYN/ACK), ping sweep (ICMP/TCP/UDP/SYN/ACK), SSDP M-SEARCH enumerator, HTTP title fetcher, HTTP method scanner, DNS recursion/amplification tester, StalkRoute traceroute (firewall evasion), **SSH scanner** (banner grabbing, CIDR support), **Directory Bruteforcer (recursive, extensions)**, **Sequential Fuzzer (multi-encoding, custom charsets)** |
 | `payloadgens` | `narutto_dropper`, BAT payload generator |
