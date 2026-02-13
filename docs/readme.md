@@ -385,8 +385,20 @@ Modules like FTP/SSH/Telnet/POP3/SMTP/RTSP/RDP/MQTT follow shared patterns:
   - Concurrent scanning with results filed by endpoint
 
 - **DoS / Stress Testing Optimizations**:
-  - **Null SYN Exhaustion**: Rewritten for high-performance using native OS threads, zero-allocation loops, and custom thread-local XorShift128+ RNG. Capable of >1M PPS.
-  - **TCP Connection Flood**: Optimized with DNS pre-resolution and efficient address sharing to maximize connection rate.
+  - **Null SYN Exhaustion**: Rewritten for high-performance using native OS threads, zero-allocation loops, and custom thread-local XorShift128+ RNG. Capable of >1M PPS. IP spoofing with per-packet random source IPs.
+  - **TCP Connection Flood**: Optimized with DNS pre-resolution, counter-based error sampling, infinite mode support (`duration=0`), and efficient address sharing to maximize connection rate.
+  - **Connection Exhaustion Flood**: FD-bounded semaphore design caps local file descriptors while exhausting the target's connection table/TIME_WAIT slots. Supports infinite mode with graceful Ctrl+C shutdown.
+
+- **Camxploit Mass Scan Enhancements**:
+  - Masscan-style parallel port scanning with semaphore-based concurrency (default 200 threads)
+  - EXCLUDED_RANGES: 16 CIDR ranges excluded (bogons, private, reserved, documentation, public DNS)
+  - Service filtering: Hosts with only SSH/Telnet/RDP ports are skipped automatically
+  - Time-based progress reporting and output file for discovered cameras
+
+- **IP Exclusion Ranges (EXCLUDED_RANGES pattern)**:
+  - Standardized across `camxploit`, `telnet_bruteforce`, and exploit modules
+  - Uses `ipnetwork` crate for proper CIDR matching
+  - Covers: 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 0.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 255.255.255.255/32, plus public DNS (1.1.1.1, 8.8.8.8, etc.)
 
 - **New Exploit Modules**:
   - **SharePoint**: CVE-2024-38094 (Deserialization RCE)
