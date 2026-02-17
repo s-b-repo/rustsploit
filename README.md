@@ -127,7 +127,8 @@ cargo build
 ### instant quick run command debian 13
 
 ```
-sudo apt update -y && sudo apt upgrade -y && sudo apt install git wget curl -y && git clone https://github.com/s-b-repo/rustsploit.git && sudo apt install pkg-config libssl-dev rustc libdbus-1-dev -y && source $HOME/.cargo/env && cd rustsploit && cargo run 
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh && chmod +x rustup-init.sh && ./rustup-init.sh -y && source "$HOME/.cargo/env" && sudo apt update -y && sudo apt upgrade -y && sudo apt install -y git wget curl pkg-config libssl-dev libdbus-1-dev  && 
+git clone https://github.com/s-b-repo/rustsploit.git && sudo apt install -y rustc cargo && cd rustsploit && cargo run
 ```
 
 ### Run (Interactive Shell)
