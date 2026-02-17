@@ -278,7 +278,32 @@ impl JobArchive {
         let jobs = self.jobs.read().await;
         jobs.iter().cloned().collect()
     }
-    
+
+    /// Cancel a running job (set status to Failed with cancellation message)
+    pub async fn cancel_job(&self, id: &str) -> Result<bool> {
+        let mut jobs = self.jobs.write().await;
+        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+            if job.status == JobStatus::Running {
+                job.status = JobStatus::Failed;
+                job.output = format!("{}\n\n[JOB CANCELLED BY USER]", job.output);
+                job.completed_at = Some(Utc::now());
+                let now = Utc::now().timestamp_millis();
+                job.duration_ms = Some((now - job.started_at.timestamp_millis()) as u64);
+                return Ok(true);
+            }
+            return Ok(false); // Not running
+        }
+        Ok(false) // Not found
+    }
+
+    /// Delete a job from memory
+    pub async fn delete_job(&self, id: &str) -> bool {
+        let mut jobs = self.jobs.write().await;
+        let before = jobs.len();
+        jobs.retain(|j| j.id != id);
+        jobs.len() < before
+    }
+
     /// Get archive directory path
     pub fn archive_dir(&self) -> &PathBuf {
         &self.archive_dir

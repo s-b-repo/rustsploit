@@ -59,7 +59,7 @@ rustsploit/
 │   │   ├── exploits/
 │   │   ├── scanners/
 │   │   └── creds/
-│   └── utils.rs             # Shared helpers (module lookup, validation)
+│   └── utils.rs             # Shared helpers (proxy parsing, module lookup, validation)
 ├── docs/
 │   └── readme.md            # This document
 ├── lists/

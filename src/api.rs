@@ -1484,6 +1484,307 @@ async fn get_auth_failures(State(state): State<ApiState>) -> Json<ApiResponse> {
     ))
 }
 
+// ─── Honeypot Check ─────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct HoneypotCheckRequest {
+    target: String,
+}
+
+async fn honeypot_check(
+    State(state): State<ApiState>,
+    Json(payload): Json<HoneypotCheckRequest>,
+) -> Response {
+    let start_time = std::time::Instant::now();
+    let target_raw = payload.target.as_str();
+
+    if !validate_target(target_raw) {
+        let response = create_response(
+            false,
+            "Invalid target format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidTarget.as_str().to_string()),
+            Some("Target must be a valid IP address.".to_string()),
+            Some(start_time),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+
+    let ip = match crate::utils::extract_ip_from_target(target_raw) {
+        Some(ip) => ip,
+        None => {
+            let response = create_response(
+                false,
+                "Could not extract IP from target".to_string(),
+                None,
+                Some(ApiErrorCode::InvalidTarget.as_str().to_string()),
+                None,
+                Some(start_time),
+            );
+            return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+        }
+    };
+
+    // Scan common ports (same logic as basic_honeypot_check but returns data)
+    const COMMON_PORTS: &[u16] = &[
+        21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995,
+        1723, 3306, 3389, 5900, 8080, 8443, 8888, 9090, 1433, 1521, 5432,
+        6379, 11211, 27017, 161, 389, 636, 902, 1080, 1194, 1883, 5672,
+        8883, 9200, 15672, 25565, 27018, 28017, 50000, 50070, 61616,
+    ];
+
+    let scan_timeout = std::time::Duration::from_millis(500);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(50));
+    let mut tasks = Vec::new();
+
+    for &port in COMMON_PORTS {
+        let ip = ip.clone();
+        let sem = semaphore.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            let addr = format!("{}:{}", ip, port);
+            let conn = tokio::time::timeout(
+                scan_timeout,
+                tokio::net::TcpStream::connect(&addr),
+            ).await;
+            if let Ok(Ok(_)) = conn { Some(port) } else { None }
+        }));
+    }
+
+    let mut open_ports: Vec<u16> = Vec::new();
+    for task in tasks {
+        if let Ok(Some(port)) = task.await {
+            open_ports.push(port);
+        }
+    }
+    open_ports.sort();
+
+    let is_honeypot = open_ports.len() >= 11;
+    let total_scanned = COMMON_PORTS.len();
+
+    let _ = state.log_message(&format!(
+        "Honeypot check on {}: {}/{} ports open (honeypot={})",
+        sanitize_for_log(&ip), open_ports.len(), total_scanned, is_honeypot
+    )).await;
+
+    let response = create_response(
+        true,
+        format!("Honeypot check completed for {}", ip),
+        Some(serde_json::json!({
+            "target": ip,
+            "open_ports": open_ports,
+            "open_count": open_ports.len(),
+            "total_scanned": total_scanned,
+            "is_honeypot": is_honeypot,
+            "threshold": 11,
+        })),
+        None,
+        None,
+        Some(start_time),
+    );
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+// ─── Job Cancel ─────────────────────────────────────────────────────
+
+async fn cancel_job(
+    State(state): State<ApiState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    if !validate_job_id(&job_id) {
+        let response = create_response(
+            false,
+            "Invalid job ID format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidInput.as_str().to_string()),
+            None,
+            None,
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+
+    match state.job_archive.cancel_job(&job_id).await {
+        Ok(true) => {
+            let _ = state.log_message(&format!("Job {} cancelled by user", job_id)).await;
+            let response = create_response(
+                true,
+                format!("Job '{}' cancelled", job_id),
+                Some(serde_json::json!({ "job_id": job_id, "status": "cancelled" })),
+                None,
+                None,
+                None,
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Ok(false) => {
+            let response = create_response(
+                false,
+                format!("Job '{}' not found or not running", job_id),
+                None,
+                Some(ApiErrorCode::NotFound.as_str().to_string()),
+                Some("Only running jobs can be cancelled.".to_string()),
+                None,
+            );
+            (StatusCode::NOT_FOUND, Json(response)).into_response()
+        }
+        Err(e) => {
+            let response = create_response(
+                false,
+                format!("Failed to cancel job: {}", e),
+                None,
+                Some(ApiErrorCode::ServerError.as_str().to_string()),
+                None,
+                None,
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+        }
+    }
+}
+
+// ─── Job Delete ─────────────────────────────────────────────────────
+
+async fn delete_job(
+    State(state): State<ApiState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    if !validate_job_id(&job_id) {
+        let response = create_response(
+            false,
+            "Invalid job ID format".to_string(),
+            None,
+            Some(ApiErrorCode::InvalidInput.as_str().to_string()),
+            None,
+            None,
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+
+    if state.job_archive.delete_job(&job_id).await {
+        let _ = state.log_message(&format!("Job {} deleted by user", job_id)).await;
+        let response = create_response(
+            true,
+            format!("Job '{}' deleted", job_id),
+            Some(serde_json::json!({ "job_id": job_id })),
+            None,
+            None,
+            None,
+        );
+        (StatusCode::OK, Json(response)).into_response()
+    } else {
+        let response = create_response(
+            false,
+            format!("Job '{}' not found", job_id),
+            None,
+            Some(ApiErrorCode::NotFound.as_str().to_string()),
+            None,
+            None,
+        );
+        (StatusCode::NOT_FOUND, Json(response)).into_response()
+    }
+}
+
+// ─── Audit Logs ─────────────────────────────────────────────────────
+
+async fn get_logs(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let lines_count: usize = params
+        .get("lines")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(1000); // Cap at 1000 lines
+
+    let log_path = &state.log_file;
+    match std::fs::read_to_string(log_path) {
+        Ok(contents) => {
+            let all_lines: Vec<&str> = contents.lines().collect();
+            let total = all_lines.len();
+            let start = total.saturating_sub(lines_count);
+            let recent: Vec<&str> = all_lines[start..].to_vec();
+
+            let response = create_response(
+                true,
+                format!("Retrieved {} log entries (of {} total)", recent.len(), total),
+                Some(serde_json::json!({
+                    "lines": recent,
+                    "total_lines": total,
+                    "returned": recent.len(),
+                    "log_file": log_path.to_string_lossy(),
+                })),
+                None,
+                None,
+                None,
+            );
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            let response = create_response(
+                false,
+                format!("Failed to read log file: {}", e),
+                None,
+                Some(ApiErrorCode::ServerError.as_str().to_string()),
+                None,
+                None,
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+        }
+    }
+}
+
+// ─── Runtime Config ─────────────────────────────────────────────────
+
+async fn get_config(State(state): State<ApiState>) -> Json<ApiResponse> {
+    Json(create_response(
+        true,
+        "Runtime configuration retrieved".to_string(),
+        Some(serde_json::json!({
+            "harden_enabled": state.harden_enabled,
+            "harden_totp": state.harden_totp,
+            "harden_rate_limit": state.harden_rate_limit,
+            "harden_ip_tracking": state.harden_ip_tracking,
+            "ip_limit": state.ip_limit,
+            "verbose": state.verbose,
+            "rate_limits": {
+                "api_key_limit": API_KEY_RATE_LIMIT,
+                "window_seconds": RATE_LIMIT_WINDOW_SECS,
+            },
+            "job_archive": {
+                "max_output_size_bytes": crate::job_archive::MAX_OUTPUT_SIZE,
+                "archive_dir": state.job_archive.archive_dir(),
+            },
+            "log_file": state.log_file.to_string_lossy(),
+            "trusted_proxies": state.trusted_proxies.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+        })),
+        None,
+        None,
+        None,
+    ))
+}
+
+// ─── Module Counts ─────────────────────────────────────────────────
+
+async fn get_module_counts() -> Json<ApiResponse> {
+    let modules = commands::discover_modules();
+    let exploit_count = modules.iter().filter(|m| m.starts_with("exploits/")).count();
+    let scanner_count = modules.iter().filter(|m| m.starts_with("scanners/")).count();
+    let creds_count = modules.iter().filter(|m| m.starts_with("creds/")).count();
+
+    Json(create_response(
+        true,
+        format!("Total {} modules", modules.len()),
+        Some(serde_json::json!({
+            "total": modules.len(),
+            "exploits": exploit_count,
+            "scanners": scanner_count,
+            "creds": creds_count,
+        })),
+        None,
+        None,
+        None,
+    ))
+}
+
 pub async fn start_api_server(
     bind_address: &str,
     api_key: String,
@@ -1652,6 +1953,12 @@ pub async fn start_api_server(
         .route("/api/rotate-key", post(rotate_key_endpoint))
         .route("/api/ips", get(get_tracked_ips))
         .route("/api/auth-failures", get(get_auth_failures))
+        .route("/api/honeypot-check", post(honeypot_check))
+        .route("/api/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/api/jobs/{job_id}", axum::routing::delete(delete_job))
+        .route("/api/logs", get(get_logs))
+        .route("/api/config", get(get_config))
+        .route("/api/modules/count", get(get_module_counts))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
