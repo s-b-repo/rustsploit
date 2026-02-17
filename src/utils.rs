@@ -841,7 +841,7 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
 /// Extract IP address or hostname from target string.
 /// Handles formats: IP:port, [IPv6]:port, hostname:port, CIDR notation
 /// Returns the host/IP part without port or brackets.
-fn extract_ip_from_target(target: &str) -> Option<String> {
+pub fn extract_ip_from_target(target: &str) -> Option<String> {
     let trimmed = target.trim();
     
     // Handle CIDR notation: extract network part before /

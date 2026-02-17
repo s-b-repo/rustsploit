@@ -61,8 +61,8 @@ Modular offensive tooling for embedded targets, written in Rust and inspired by 
 - **Improved CLI Experience** - Added `--list-modules` to browse tools without entering the shell, and `--verbose` for detailed operation logs. Fuzzy matching now suggests corrections for typos (e.g., `sample_xploit` -> `sample_exploit`).
 - **Colored CLI output** - Warnings in yellow, hints in cyan, success in green
 
-** Documentation:**
-- Updated developer guide with v0.4.6 changes
+**📚 Documentation:**
+- Updated developer guide with v0.5.0 changes
 - Added CLI error handling examples
 
 Rustsploit ships categorized modules under `src/modules/`, automatically exposed to the shell/CLI. A non-exhaustive snapshot:
@@ -88,23 +88,24 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
 **Debian/Ubuntu/Kali:**
  ```bash
 sudo apt update
-sudo apt install pkg-config libssl-dev freerdp2-x11 libdbus-1-dev    # Required for RDP and Bluetooth modules
+
+sudo apt install pkg-config libssl-dev rustc libdbus-1-dev    freerdp2-x11 # Required for RDP and Bluetooth modules
 
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S pkgconf openssl freerdp
+sudo pacman -S pkgconf openssl freerdp rustc
 ```
 
 **Gentoo:**
 ```bash
-sudo emerge dev-libs/openssl dev-util/pkgconf net-misc/freerdp
+sudo emerge dev-libs/openssl dev-util/pkgconf net-misc/freerdp  
 ```
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install pkgconf-pkg-config openssl-devel freerdp
+sudo dnf install pkgconf-pkg-config openssl-devel freerdp rustc
 ```
 
 ### Installing Rust & Cargo
@@ -113,21 +114,6 @@ sudo dnf install pkgconf-pkg-config openssl-devel freerdp
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
-```
-
-**Debian/Ubuntu/Kali:**
-```bash
-sudo apt install rustc cargo
-```
-
-**Arch Linux:**
-```bash
-sudo pacman -S rust
-```
-
-**Fedora/RHEL:**
-```bash
-sudo dnf install rust cargo
 ```
 
 
@@ -145,27 +131,6 @@ cargo build
 cargo run
 ```
 
-### Global Installation (Run from Terminal)
-
-To run `rustsploit` from anywhere in your terminal:
-
-**Option 1: Cargo Install (Easiest)**
-```bash
-cargo install --path .
-rustsploit
-```
-
-**Option 2: Manually Build Release Binary**
-```bash
-# 1. Build optimized release version
-cargo build --release
-
-# 2. Move binary to your path (e.g., /usr/local/bin)
-sudo cp target/release/rustsploit /usr/local/bin/
-
-# 3. Run from anywhere
-rustsploit
-```
 
 ---
 
@@ -295,7 +260,7 @@ exit             exit | quit | q          Leave shell
 
 Example session:
 
-```
+```text
 rsf> f1 ssh
 rsf> u creds/generic/ssh_bruteforce
 rsf> set target 10.10.10.10
@@ -306,7 +271,7 @@ rsf> go
 
 Execute multiple commands in a single line using the `&` separator:
 
-```
+```text
 rsf> u creds/generic/ssh_bruteforce & set target 10.10.10.10 & go
 rsf> f1 ssh & u creds/generic/ssh_bruteforce & set target 192.168.1.1
 ```
@@ -336,7 +301,7 @@ cargo run -- --command creds --module ssh_bruteforce --target 192.168.1.1
 - `--verbose (-v)`: Enable detailed logging (useful for debugging).
 - `--output-format <text|json>`: Control output format (default: text).
 
-```
+```bash
 # List all modules
 cargo run -- --list-modules
 
@@ -445,7 +410,7 @@ Authorization: ApiKey your-api-key-here
   curl -H "Authorization: Bearer your-api-key" http://localhost:8080/api/auth-failures
   ```
 
-### telnet config 
+### telnet config example
  ```
 {
   "port": 23,

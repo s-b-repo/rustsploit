@@ -10207,5 +10207,18 @@ ipmi/ — ipmi_enum_exploit
 cargo check ✅ | cargo run → shell + all modules disc
 
 
+Honeypot, Job Delete , Module Counts  Audit Logs Check added to api
+
+        .route("/api/honeypot-check", post(honeypot_check))
+        .route("/api/jobs/{job_id}/cancel", post(cancel_job))
+        .route("/api/jobs/{job_id}", axum::routing::delete(delete_job))
+        .route("/api/logs", get(get_logs))
+        .route("/api/config", get(get_config))
+        .route("/api/modules/count", get(get_module_counts))
+
+
+
+
+
 
 
