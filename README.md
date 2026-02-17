@@ -89,7 +89,7 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
  ```bash
 sudo apt update
 
-sudo apt install pkg-config libssl-dev rustc libdbus-1-dev    freerdp2-x11 # Required for RDP and Bluetooth modules
+sudo apt install pkg-config libssl-dev rustc libdbus-1-dev    sudo apt install freerdp3-x11 # Required for RDP and Bluetooth modules
 
 ```
 
