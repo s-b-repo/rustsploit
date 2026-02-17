@@ -124,6 +124,11 @@ git clone https://github.com/s-b-repo/rustsploit.git
 cd rustsploit
 cargo build
 ```
+### instant quick run command debian 13
+
+```
+sudo apt update -y && sudo apt upgrade -y && sudo apt install git wget curl -y && git clone https://github.com/s-b-repo/rustsploit.git && sudo apt install pkg-config libssl-dev rustc libdbus-1-dev -y && source $HOME/.cargo/env && cd rustsploit && cargo run 
+```
 
 ### Run (Interactive Shell)
 
