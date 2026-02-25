@@ -223,7 +223,6 @@ pub struct ModuleConfig {
     pub port: Option<u16>,
     pub username_wordlist: Option<String>,
     pub password_wordlist: Option<String>,
-    pub path_wordlist: Option<String>,
     pub concurrency: Option<usize>,
     pub stop_on_success: Option<bool>,
     pub save_results: Option<bool>,
@@ -235,20 +234,6 @@ pub struct ModuleConfig {
 impl ModuleConfig {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Check if running in API mode (any config option is set)
-    pub fn is_api_mode(&self) -> bool {
-        self.port.is_some() ||
-        self.username_wordlist.is_some() ||
-        self.password_wordlist.is_some() ||
-        self.path_wordlist.is_some() ||
-        self.concurrency.is_some() ||
-        self.stop_on_success.is_some() ||
-        self.save_results.is_some() ||
-        self.output_file.is_some() ||
-        self.verbose.is_some() ||
-        self.combo_mode.is_some()
     }
 
     /// Clear all settings

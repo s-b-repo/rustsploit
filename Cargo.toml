@@ -112,11 +112,6 @@ byteorder = "1.5.0"
 ssh2 = "0.9.5"
 num_cpus = "1.17.0"
 
-# TOTP Authentication
-totp-rs = { version = "5.6", features = ["gen_secret", "otpauth", "qr"] }
-
-# Archive format for job output storage
-tar = "0.4"
 
 # Constant-time comparison for security (timing attack prevention)
 subtle = "2.6"

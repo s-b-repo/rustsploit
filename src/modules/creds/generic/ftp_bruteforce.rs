@@ -141,7 +141,6 @@ pub async fn run(target: &str) -> Result<()> {
     
     // Check for API-provided config
     let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
 
     // Get port - from API config or prompt
     let port: u16 = if let Some(p) = config.port {
@@ -170,14 +169,12 @@ pub async fn run(target: &str) -> Result<()> {
     };
     
     let concurrency: usize = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 500 } else {
-            loop {
-                let input = prompt_default("Max concurrent tasks", "500").unwrap_or_else(|_| "500".to_string());
-                if let Ok(n) = input.parse::<usize>() {
-                    if n > 0 { return n }
-                }
-                println!("Invalid number. Try again.");
+        loop {
+            let input = prompt_default("Max concurrent tasks", "500").unwrap_or_else(|_| "500".to_string());
+            if let Ok(n) = input.parse::<usize>() {
+                if n > 0 { return n }
             }
+            println!("Invalid number. Try again.");
         }
     });
 
@@ -185,27 +182,27 @@ pub async fn run(target: &str) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     let stop_on_success = config.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first success?", true).unwrap_or(true) }
+        prompt_yes_no("Stop on first success?", true).unwrap_or(true)
     });
     
     let save_results = config.save_results.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Save results to file?", true).unwrap_or(true) }
+        prompt_yes_no("Save results to file?", true).unwrap_or(true)
     });
     
     let save_path = if save_results {
         Some(config.output_file.clone().unwrap_or_else(|| {
-            if api_mode { "ftp_results.txt".to_string() } else { prompt_default("Output file", "ftp_results.txt").unwrap_or_else(|_| "ftp_results.txt".to_string()) }
+            prompt_default("Output file", "ftp_results.txt").unwrap_or_else(|_| "ftp_results.txt".to_string())
         }))
     } else {
         None
     };
     
     let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
+        prompt_yes_no("Verbose mode?", false).unwrap_or(false)
     });
     
     let combo_mode = config.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Combination mode (user × pass)?", false).unwrap_or(false) }
+        prompt_yes_no("Combination mode (user × pass)?", false).unwrap_or(false)
     });
 
     let display_addr = format_addr_for_display(target, port);
@@ -435,54 +432,40 @@ pub async fn run(target: &str) -> Result<()> {
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Get API config
     let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
 
     // Prep - use API config or prompt
-    let port: u16 = config.port.unwrap_or_else(|| {
-        if api_mode { 21 } else { prompt_port("FTP Port", 21).unwrap_or(21) }
-    });
+    let port: u16 = config.port.unwrap_or_else(|| prompt_port("FTP Port", 21).unwrap_or(21));
     
-    let usernames_file = config.username_wordlist.clone().ok_or_else(|| {
-        if api_mode {
-            anyhow!("username_wordlist required for API mode mass scan")
-        } else {
-            anyhow!("Username wordlist required")
-        }
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("username_wordlist required for API mode")) } 
-        else { prompt_existing_file("Username wordlist") }
-    })?;
+    let usernames_file = if let Some(ref f) = config.username_wordlist {
+        f.clone()
+    } else {
+        prompt_existing_file("Username wordlist")?
+    };
     
-    let passwords_file = config.password_wordlist.clone().ok_or_else(|| {
-        if api_mode {
-            anyhow!("password_wordlist required for API mode mass scan")
-        } else {
-            anyhow!("Password wordlist required")
-        }
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("password_wordlist required for API mode")) } 
-        else { prompt_existing_file("Password wordlist") }
-    })?;
+    let passwords_file = if let Some(ref f) = config.password_wordlist {
+        f.clone()
+    } else {
+        prompt_existing_file("Password wordlist")?
+    };
     
     let users = load_lines(&usernames_file)?;
-    let pass_lines = load_lines(&passwords_file)?;
+    let pass_lines = load_lines(&passwords_file)?
+;
 
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
     let concurrency = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 500 } else { prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).unwrap_or(500) as usize }
+        prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).unwrap_or(500) as usize
     });
     let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
+        prompt_yes_no("Verbose mode?", false).unwrap_or(false)
     });
     let output_file = config.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "ftp_brute_mass_results.txt".to_string() } 
-        else { prompt_default("Output result file", "ftp_brute_mass_results.txt").unwrap_or_else(|_| "ftp_brute_mass_results.txt".to_string()) }
+        prompt_default("Output result file", "ftp_brute_mass_results.txt").unwrap_or_else(|_| "ftp_brute_mass_results.txt".to_string())
     });
 
-    // In API mode, always exclude private ranges; otherwise ask
-    let use_exclusions = if api_mode { true } else { prompt_yes_no("Exclude reserved/private ranges?", true).unwrap_or(true) };
+    let use_exclusions = prompt_yes_no("Exclude reserved/private ranges?", true).unwrap_or(true);
     
     // Parse exclusions
     let mut exclusion_subnets = Vec::new();
