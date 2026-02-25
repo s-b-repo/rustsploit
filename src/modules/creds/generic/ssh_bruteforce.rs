@@ -17,7 +17,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
     normalize_target, prompt_default, prompt_yes_no, 
-    prompt_existing_file, load_lines, get_filename_in_current_dir, prompt_port
+    prompt_existing_file, load_lines, get_filename_in_current_dir
 };
 use crate::modules::creds::utils::BruteforceStats;
 
@@ -45,40 +45,24 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", "=== SSH Brute Force Module ===".bold());
     println!("[*] Target: {}", target);
 
-    // Check for API-provided config
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
-
-    let port: u16 = if let Some(p) = config.port {
-        p
-    } else {
-        prompt_port("SSH Port", DEFAULT_SSH_PORT)?
+    let port: u16 = loop {
+        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string())?;
+        match input.parse() {
+            Ok(p) if p > 0 => break p,
+            _ => println!("{}", "Invalid port. Must be between 1 and 65535.".yellow()),
+        }
     };
 
-    // In API mode, skip default credentials question and use wordlists directly
-    let use_defaults = if api_mode { false } else { prompt_yes_no("Try default credentials first?", true)? };
+    // Ask about default credentials
+    let use_defaults = prompt_yes_no("Try default credentials first?", true)?;
     
-    let usernames_file = if let Some(ref f) = config.username_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Username wordlist not found: {}", f));
-        }
-        Some(f.clone())
-    } else if api_mode {
-        None
-    } else if prompt_yes_no("Use username wordlist?", true)? {
+    let usernames_file = if prompt_yes_no("Use username wordlist?", true)? {
         Some(prompt_existing_file("Username wordlist")?)
     } else {
         None
     };
     
-    let passwords_file = if let Some(ref f) = config.password_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Password wordlist not found: {}", f));
-        }
-        Some(f.clone())
-    } else if api_mode {
-        None
-    } else if prompt_yes_no("Use password wordlist?", true)? {
+    let passwords_file = if prompt_yes_no("Use password wordlist?", true)? {
         Some(prompt_existing_file("Password wordlist")?)
     } else {
         None
@@ -88,64 +72,44 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("At least one wordlist or default credentials must be enabled"));
     }
 
-    let concurrency: usize = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 10 } else {
-            loop {
-                let input = prompt_default("Max concurrent tasks", "10").unwrap_or_else(|_| "10".to_string());
-                match input.parse() {
-                    Ok(n) if n > 0 && n <= 256 => return n,
-                    _ => println!("{}", "Invalid number. Must be between 1 and 256.".yellow()),
-                }
-            }
-        }
-    });
-
-    let connection_timeout: u64 = if api_mode { 
-        10 
-    } else {
-        loop {
-            let input = prompt_default("Connection timeout (seconds)", "5").unwrap_or_else(|_| "5".to_string());
-            match input.parse::<u64>() {
-                Ok(n) if n >= 1 && n <= 60 => break n,
-                _ => println!("{}", "Invalid timeout. Must be between 1 and 60 seconds.".yellow()),
-            }
+    let concurrency: usize = loop {
+        let input = prompt_default("Max concurrent tasks", "10")?;
+        match input.parse() {
+            Ok(n) if n > 0 && n <= 256 => break n,
+            _ => println!("{}", "Invalid number. Must be between 1 and 256.".yellow()),
         }
     };
 
-    let retry_on_error = if api_mode { true } else { prompt_yes_no("Retry on connection errors?", true)? };
+    let connection_timeout: u64 = loop {
+        let input = prompt_default("Connection timeout (seconds)", "5")?;
+        match input.parse() {
+            Ok(n) if n >= 1 && n <= 60 => break n,
+            _ => println!("{}", "Invalid timeout. Must be between 1 and 60 seconds.".yellow()),
+        }
+    };
+
+    let retry_on_error = prompt_yes_no("Retry on connection errors?", true)?;
     let max_retries: usize = if retry_on_error {
-        if api_mode { 2 } else {
-            loop {
-                let input = prompt_default("Max retries per attempt", "2").unwrap_or_else(|_| "2".to_string());
-                match input.parse::<usize>() {
-                    Ok(n) if n > 0 && n <= 10 => break n,
-                    _ => println!("{}", "Invalid retries. Must be between 1 and 10.".yellow()),
-                }
+        loop {
+            let input = prompt_default("Max retries per attempt", "2")?;
+            match input.parse() {
+                Ok(n) if n > 0 && n <= 10 => break n,
+                _ => println!("{}", "Invalid retries. Must be between 1 and 10.".yellow()),
             }
         }
     } else {
         0
     };
 
-    let stop_on_success = config.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first success?", true).unwrap_or(true) }
-    });
-    let save_results = config.save_results.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Save results to file?", true).unwrap_or(true) }
-    });
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if save_results {
-        Some(config.output_file.clone().unwrap_or_else(|| {
-            if api_mode { "ssh_brute_results.txt".to_string() } else { prompt_default("Output file", "ssh_brute_results.txt").unwrap_or_else(|_| "ssh_brute_results.txt".to_string()) }
-        }))
+        Some(prompt_default("Output file", "ssh_brute_results.txt")?)
     } else {
         None
     };
-    let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let combo_mode = config.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Combination mode? (try every pass with every user)", false).unwrap_or(false) }
-    });
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
 
     let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|_| format!("{}:{}", target, port));
 

@@ -33,7 +33,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::utils::{
     prompt_required, prompt_default, prompt_yes_no,
-    prompt_existing_file, prompt_int_range, prompt_port
+    prompt_existing_file, prompt_int_range
 };
 
 // ============================================================
@@ -47,14 +47,6 @@ const BUFFER_SIZE: usize = 4096;
 const RESPONSE_BUFFER_CAPACITY: usize = 2048;
 const DEFAULT_TELNET_PORTS: &[u16] = &[23, 2323, 23231];
 const TASK_WATCHDOG_TIMEOUT_SECS: u64 = 20;
-
-// Bogon/Private/Reserved exclusion ranges for batch/subnet scanning
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
-    "1.1.1.1/32", "1.0.0.1/32", "8.8.8.8/32", "8.8.4.4/32",
-];
 
 const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
     ("root", "root"),
@@ -319,15 +311,6 @@ impl Statistics {
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
 
-    // Check for API-provided config - skip mode selection in API mode
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
-    
-    if api_mode {
-        // In API mode, directly run single target bruteforce (most common use case)
-        return run_single_target_bruteforce_api(target, &config).await;
-    }
-
     println!("Select operation mode:");
     println!("  1. Single Target Bruteforce (advanced)");
     println!("  2. Subnet Bruteforce (CIDR notation)");
@@ -349,64 +332,6 @@ pub async fn run(target: &str) -> Result<()> {
             Ok(())
         }
     }
-}
-
-/// API mode entry for single target bruteforce - uses module config directly
-async fn run_single_target_bruteforce_api(target: &str, api_config: &crate::config::ModuleConfig) -> Result<()> {
-    let targets = parse_single_target(target)?;
-    let target_primary = targets[0].clone();
-    
-    // Build config from API params
-    let username_file = api_config.username_wordlist.clone()
-        .ok_or_else(|| anyhow::anyhow!("Username wordlist required for API mode"))?;
-    let password_file = api_config.password_wordlist.clone()
-        .ok_or_else(|| anyhow::anyhow!("Password wordlist required for API mode"))?;
-    
-    if !std::path::Path::new(&username_file).exists() {
-        return Err(anyhow::anyhow!("Username wordlist not found: {}", username_file));
-    }
-    if !std::path::Path::new(&password_file).exists() {
-        return Err(anyhow::anyhow!("Password wordlist not found: {}", password_file));
-    }
-    
-    let mut config = TelnetBruteforceConfig {
-        target: target_primary,
-        port: api_config.port.unwrap_or(23),
-        username_wordlist: username_file,
-        password_wordlist: Some(password_file),
-        output_file: api_config.output_file.clone().unwrap_or_else(|| "telnet_results.txt".to_string()),
-        threads: api_config.concurrency.unwrap_or(500),
-        delay_ms: 0,
-        connection_timeout: 10,
-        banner_read_timeout: 5,
-        login_prompt_timeout: 5,
-        password_prompt_timeout: 5,
-        auth_response_timeout: 5,
-        command_timeout: 5,
-        write_timeout: 5,
-        stop_on_success: api_config.stop_on_success.unwrap_or(true),
-        verbose: api_config.verbose.unwrap_or(false),
-        full_combo: api_config.combo_mode.unwrap_or(false),
-        raw_bruteforce: false,
-        raw_charset: String::new(),
-        raw_min_length: 1,
-        raw_max_length: 8,
-        append_mode: false,
-        pre_validate: false,
-        retry_on_error: true,
-        max_retries: 3,
-        login_prompts: vec!["login:".to_string(), "username:".to_string()],
-        password_prompts: vec!["password:".to_string(), "pass:".to_string()],
-        success_indicators: vec!["$".to_string(), "#".to_string(), ">".to_string()],
-        failure_indicators: vec!["incorrect".to_string(), "invalid".to_string(), "failed".to_string()],
-        login_prompts_lower: Vec::new(),
-        password_prompts_lower: Vec::new(),
-        success_indicators_lower: Vec::new(),
-        failure_indicators_lower: Vec::new(),
-    };
-    
-    config.preprocess_prompts();
-    run_telnet_bruteforce(config).await
 }
 
 // ============================================================
@@ -443,7 +368,7 @@ async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<(
         print_config_format();
         println!();
 
-        let config_path = prompt_existing_file("Path to configuration file: ")?;
+        let config_path = prompt_wordlist("Path to configuration file: ")?;
 
         println!("[*] Loading configuration from '{}'...", config_path);
         match load_and_validate_config(&config_path, &target_primary).await {
@@ -521,10 +446,10 @@ async fn run_parallel_bruteforce(targets: Vec<String>, base_config: TelnetBrutef
         let config = base_config.clone();
 
         let task = tokio::spawn(async move {
-            let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
+            let _permit = sem.acquire().await.unwrap();
             let mut target_config = config;
             target_config.target = target.clone();
-            run_telnet_bruteforce(target_config).await
+            run_telnet_bruteforce(target_config)
         });
 
         tasks.push(task);
@@ -562,29 +487,6 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
 
     println!("Loaded {} target(s)", config.targets.len());
 
-    // IP exclusion prompt
-    if prompt_yes_no("Exclude reserved/private IP ranges? (y/n): ", true)? {
-        let exclusions: Vec<ipnetwork::IpNetwork> = EXCLUDED_RANGES.iter()
-            .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-            .collect();
-        let before = config.targets.len();
-        config.targets.retain(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                !exclusions.iter().any(|net| net.contains(addr))
-            } else {
-                true // keep hostnames
-            }
-        });
-        let excluded = before - config.targets.len();
-        if excluded > 0 {
-            println!("{}", format!("[*] Excluded {} IPs from reserved/private ranges", excluded).yellow());
-        }
-        println!("{}", format!("[+] {} targets remaining after exclusion", config.targets.len()).green());
-        if config.targets.is_empty() {
-            return Err(anyhow!("No targets remaining after exclusion"));
-        }
-    }
-
     if prompt_yes_no("Use default ports (23, 2323, 23231)? (y/n): ", true)? {
         config.ports = DEFAULT_TELNET_PORTS.to_vec();
     } else {
@@ -601,7 +503,7 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
         .map(|(u, p)| (u.to_string(), p.to_string()))
         .collect();
     } else {
-        let cred_file = prompt_existing_file("Path to credentials file (user:pass format): ")?;
+        let cred_file = prompt_wordlist("Path to credentials file (user:pass format): ")?;
         config.credentials = load_credentials_file(&cred_file).await?;
     }
 
@@ -638,7 +540,7 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
     }.bold().cyan());
     println!();
 
-    let mut targets = if is_subnet {
+    let targets = if is_subnet {
         parse_single_target(target)?
     } else if Path::new(target).exists() {
         let content = tokio::fs::read_to_string(target).await?;
@@ -647,26 +549,9 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
         vec![target.to_string()]
     };
 
-    // Apply IP exclusion for subnet/batch modes
-    if targets.len() > 1 && prompt_yes_no("Exclude reserved/private IP ranges? (y/n): ", true)? {
-        let exclusions: Vec<ipnetwork::IpNetwork> = EXCLUDED_RANGES.iter()
-            .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-            .collect();
-        let before = targets.len();
-        targets.retain(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                !exclusions.iter().any(|net| net.contains(addr))
-            } else {
-                true
-            }
-        });
-        let excluded = before - targets.len();
-        if excluded > 0 {
-            println!("{}", format!("[*] Excluded {} IPs from reserved/private ranges", excluded).yellow());
-        }
-    }
-
-    let port: u16 = prompt_port("Port", 23)?;
+    let port: u16 = prompt_required("Port (default 23): ")?
+    .parse()
+    .unwrap_or(23);
 
     let verbose = prompt_yes_no("Verbose mode? (show all attempts and details) (y/n): ", false)?;
 
@@ -1191,7 +1076,7 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
     };
 
     let total_size = username_size + password_size;
-    let use_streaming = should_use_streaming(total_size).await?;
+    let use_streaming = should_use_streaming(total_size)?;
 
     let (usernames, passwords, username_count, password_count) = if use_streaming {
         load_wordlists_streaming(&config).await?
@@ -1290,13 +1175,7 @@ async fn execute_batch_scan(config: BatchScanConfig) -> Result<()> {
         let cfg = config.clone();
 
         let task = tokio::spawn(async move {
-            let _permit = match sem.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    eprintln!("[!] Semaphore closed, skipping target");
-                    return Vec::new();
-                }
-            };
+            let _permit = sem.acquire().await.unwrap();
             scan_target(target, &cfg).await
         });
 
@@ -2120,7 +1999,7 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     println!("{}", "[Interactive Configuration]".bold().green());
     println!();
 
-    let port = prompt_port("Port", 23)?;
+    let port = prompt_port(23)?;
     let threads = prompt_threads(8)?;
     let delay_ms = prompt_delay(100)?;
     let connection_timeout = prompt_timeout("Connection timeout (seconds, default 3): ", 3)?;
@@ -2131,13 +2010,13 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     let command_timeout = prompt_timeout("Command timeout (seconds, default 3): ", 3)?;
     let write_timeout = 500; // Fixed write timeout in milliseconds
 
-    let username_wordlist = prompt_existing_file("Username wordlist file: ")?;
+    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
     let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false)?;
 
     let password_wordlist = if raw_bruteforce {
         prompt_optional_wordlist("Password wordlist (leave blank to skip): ")?
     } else {
-        Some(prompt_existing_file("Password wordlist file: ")?)
+        Some(prompt_wordlist("Password wordlist file: ")?)
     };
 
     let (raw_charset, raw_min_length, raw_max_length) = if raw_bruteforce {
@@ -2835,7 +2714,7 @@ fn print_config_format() {
 // UTILITY FUNCTIONS
 // ============================================================
 
-async fn should_use_streaming(total_size: u64) -> Result<bool> {
+fn should_use_streaming(total_size: u64) -> Result<bool> {
     if total_size > MAX_MEMORY_SIZE {
         let size_mb = total_size as f64 / (1024.0 * 1024.0);
         println!("\n{}", format!("[!] Large wordlists: {:.1} MB", size_mb).yellow());
@@ -3171,7 +3050,9 @@ fn display_banner() {
 // prompt and prompt_required are replaced by crate::utils imports/usage
 // prompt_yes_no is replaced by crate::utils imports/usage
 
-
+fn prompt_port(default: u16) -> Result<u16> {
+    Ok(prompt_int_range("Port", default as i64, 1, 65535)? as u16)
+}
 
 fn prompt_delay(default: u64) -> Result<u64> {
     Ok(prompt_int_range("Delay in ms", default as i64, 0, 10000)? as u64)
@@ -3189,16 +3070,16 @@ fn prompt_retries(default: usize) -> Result<usize> {
     Ok(prompt_int_range("Max retries", default as i64, 0, 10)? as usize)
 }
 
-fn prompt_file_path(prompt_text: &str) -> Result<String> {
+fn prompt_wordlist(prompt_text: &str) -> Result<String> {
     // Strip ": " if present to match prompt_existing_file style
     let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
-    crate::utils::prompt_existing_file(msg)
+    prompt_existing_file(msg)
 }
 
 fn prompt_optional_wordlist(prompt_text: &str) -> Result<Option<String>> {
     let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
     if prompt_yes_no(&format!("Use {}?", msg), true)? {
-        Ok(Some(prompt_file_path(msg)?))
+        Ok(Some(prompt_existing_file(msg)?))
     } else {
         Ok(None)
     }
@@ -3225,4 +3106,3 @@ fn prompt_list(prompt_text: &str) -> Result<Vec<String>> {
 }
 
 // prompt function removed as it is superseded by specific prompts or prompt_default
-

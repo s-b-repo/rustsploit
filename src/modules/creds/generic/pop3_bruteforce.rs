@@ -13,7 +13,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
     prompt_yes_no, prompt_existing_file, prompt_int_range,
-    load_lines, prompt_default,
+    load_lines, prompt_default, prompt_wordlist,
 };
 use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 use std::sync::atomic::AtomicUsize;
@@ -70,68 +70,26 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
-    // Check for API-provided config
-    let config_api = crate::config::get_module_config();
-    let api_mode = config_api.is_api_mode();
-
-    let use_ssl = if api_mode { false } else { prompt_yes_no("Use SSL/TLS (POP3S)?", false)? };
+    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false)?;
     let default_port = if use_ssl { 995 } else { 110 };
     
-    let port = if let Some(p) = config_api.port {
-        p
-    } else if api_mode {
-        default_port
-    } else {
-        prompt_int_range("Port", default_port as i64, 1, 65535)? as u16
-    };
+    let port = prompt_int_range("Port", default_port as i64, 1, 65535)? as u16;
+    let username_wordlist = prompt_existing_file("Username wordlist file")?;
+    let password_wordlist = prompt_existing_file("Password wordlist file")?;
     
-    let username_wordlist = if let Some(ref f) = config_api.username_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Username wordlist not found: {}", f));
-        }
-        f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Username wordlist required for API mode"));
-    } else {
-        prompt_existing_file("Username wordlist file")?
-    };
+    let threads = prompt_int_range("Threads", 16, 1, 256)? as usize;
+    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000)? as u64;
+    let connection_timeout = prompt_int_range("Timeout (s)", 5, 1, 60)? as u64;
     
-    let password_wordlist = if let Some(ref f) = config_api.password_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Password wordlist not found: {}", f));
-        }
-        f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Password wordlist required for API mode"));
-    } else {
-        prompt_existing_file("Password wordlist file")?
-    };
+    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
+    let stop_on_success = prompt_yes_no("Stop on first valid login?", false)?;
     
-    let threads = config_api.concurrency.unwrap_or_else(|| {
-        if api_mode { 16 } else { prompt_int_range("Threads", 16, 1, 256).unwrap_or(16) as usize }
-    });
-    let delay_ms = if api_mode { 50 } else { prompt_int_range("Delay (ms)", 50, 0, 10000).unwrap_or(50) as u64 };
-    let connection_timeout = if api_mode { 5 } else { 
-        prompt_int_range("Timeout (s)", 5, 1, 60).unwrap_or(5) as u64 
-    };
+    let output_file = prompt_default("Output file for results", "pop3_results.txt")?;
     
-    let full_combo = config_api.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Try every username with every password?", false).unwrap_or(false) }
-    });
-    let stop_on_success = config_api.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first valid login?", false).unwrap_or(true) }
-    });
-    
-    let output_file = config_api.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "pop3_results.txt".to_string() } else { prompt_default("Output file for results", "pop3_results.txt").unwrap_or_else(|_| "pop3_results.txt".to_string()) }
-    });
-    
-    let verbose = config_api.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let retry_on_error = if api_mode { true } else { prompt_yes_no("Retry failed connections?", true)? };
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let retry_on_error = prompt_yes_no("Retry failed connections?", true)?;
     let max_retries = if retry_on_error { 
-        if api_mode { 2 } else { prompt_int_range("Max retries", 2, 1, 10).unwrap_or(2) as usize }
+        prompt_int_range("Max retries", 2, 1, 10)? as usize
     } else { 
         0 
     };
@@ -153,41 +111,20 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms,
     };
 
-    if !api_mode {
-        println!();
-        println!("{}", "[Starting Attack]".bold().yellow());
-        println!();
-    }
+    println!();
+    println!("{}", "[Starting Attack]".bold().yellow());
+    println!();
 
     run_pop3_bruteforce(config).await
 }
 
 async fn run_mass_scan(target: &str) -> Result<()> {
-    // Get API config
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
-
-    // In API mode, default to no SSL; otherwise ask
-    let use_ssl = if api_mode { false } else { prompt_yes_no("Use SSL/TLS (POP3S)?", false).unwrap_or(false) };
+    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false)?;
     let default_port = if use_ssl { 995 } else { 110 };
+    let port = prompt_int_range("Port", default_port as i64, 1, 65535)? as u16;
     
-    let port = config.port.unwrap_or_else(|| {
-        if api_mode { default_port } else { prompt_int_range("Port", default_port as i64, 1, 65535).unwrap_or(default_port as i64) as u16 }
-    });
-    
-    let usernames_file = config.username_wordlist.clone().ok_or_else(|| {
-        anyhow!("username_wordlist required")
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("username_wordlist required for API mode")) } 
-        else { prompt_existing_file("Username wordlist") }
-    })?;
-    
-    let passwords_file = config.password_wordlist.clone().ok_or_else(|| {
-        anyhow!("password_wordlist required")
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("password_wordlist required for API mode")) } 
-        else { prompt_existing_file("Password wordlist") }
-    })?;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -195,27 +132,12 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 500 } else { prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).unwrap_or(500) as usize }
-    });
-    let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let output_file = config.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "pop3_mass_results.txt".to_string() } 
-        else { prompt_default("Output result file", "pop3_mass_results.txt").unwrap_or_else(|_| "pop3_mass_results.txt".to_string()) }
-    });
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?; 
+    let output_file = prompt_default("Output result file", "pop3_mass_results.txt")?;
 
-    // In API mode, always exclude private ranges
-    let use_exclusions = if api_mode { true } else { prompt_yes_no("Exclude reserved/private ranges?", true).unwrap_or(true) };
-    
     // Parse exclusions
-    let exclusions = if use_exclusions {
-        println!("{}", format!("[+] Loaded {} exclusion ranges", EXCLUDED_RANGES.len()).cyan());
-        Arc::new(parse_exclusions(EXCLUDED_RANGES))
-    } else {
-        Arc::new(Vec::new())
-    };
+    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let stats_checked = Arc::new(AtomicUsize::new(0));
@@ -240,9 +162,6 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
 
     if run_random {
-        // Initialize state file
-        OpenOptions::new().create(true).write(true).open(STATE_FILE).await?;
-        
         println!("{}", "[*] Starting Random Internet Scan...".green());
         loop {
              let permit = match semaphore.clone().acquire_owned().await {

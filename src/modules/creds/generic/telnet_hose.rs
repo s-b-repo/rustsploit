@@ -103,9 +103,6 @@ pub async fn run(target: &str) -> Result<()> {
     });
 
     if target.is_empty() || target == "random" || target == "0.0.0.0/0" {
-        // Initialize state file
-        OpenOptions::new().create(true).write(true).open(STATE_FILE).await?;
-
         // Random Mode
         loop {
             let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
@@ -129,13 +126,7 @@ pub async fn run(target: &str) -> Result<()> {
     } else {
         // File/List Mode
         // We assume 'target' is a file path since it's a "hose" module
-        let content = match tokio::fs::read_to_string(target).await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("{}", format!("[!] Failed to read target file: {}", e).red());
-                return Ok(());
-            }
-        };
+        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
         let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         
         if lines.is_empty() {
@@ -194,11 +185,6 @@ fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
 }
 
 async fn is_ip_checked(ip: &impl ToString) -> bool {
-    // Ensure state file exists before running grep
-    if !std::path::Path::new(STATE_FILE).exists() {
-        return false;
-    }
-
     // Grep for "checked: <ip>" in state file
     let ip_s = ip.to_string();
     let status = Command::new("grep")
@@ -206,7 +192,6 @@ async fn is_ip_checked(ip: &impl ToString) -> bool {
         .arg("-q")
         .arg(format!("checked: {}", ip_s))
         .arg(STATE_FILE)
-        .stderr(std::process::Stdio::null())
         .status()
         .await;
     

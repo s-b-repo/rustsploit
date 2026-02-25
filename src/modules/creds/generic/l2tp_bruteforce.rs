@@ -301,13 +301,10 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Check for API-provided config
     let config_api = crate::config::get_module_config();
-    let api_mode = config_api.is_api_mode();
 
     let normalized = normalize_target(target)?;
     let port: u16 = if let Some(p) = config_api.port {
         p
-    } else if api_mode {
-        1701
     } else {
         prompt_port("L2TP Port", 1701)?
     };
@@ -317,8 +314,6 @@ pub async fn run(target: &str) -> Result<()> {
             return Err(anyhow!("Username wordlist not found: {}", f));
         }
         f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Username wordlist required for API mode"));
     } else {
         prompt_existing_file("Username wordlist")?
     };
@@ -328,35 +323,31 @@ pub async fn run(target: &str) -> Result<()> {
             return Err(anyhow!("Password wordlist not found: {}", f));
         }
         f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Password wordlist required for API mode"));
     } else {
         prompt_existing_file("Password wordlist")?
     };
     
     let concurrency = config_api.concurrency.unwrap_or_else(|| {
-        if api_mode { 10 } else { prompt_int_range("Max concurrent tasks", 10, 1, 100).unwrap_or(10) as usize }
+        prompt_int_range("Max concurrent tasks", 10, 1, 100).unwrap_or(10) as usize
     });
-    let timeout_ms = if api_mode { DEFAULT_TIMEOUT_MS } else { 
-        prompt_int_range("Connection timeout (ms)", DEFAULT_TIMEOUT_MS as i64, 100, 30000).unwrap_or(DEFAULT_TIMEOUT_MS as i64) as u64 
-    };
+    let timeout_ms = prompt_int_range("Connection timeout (ms)", DEFAULT_TIMEOUT_MS as i64, 100, 30000).unwrap_or(DEFAULT_TIMEOUT_MS as i64) as u64;
     
     let stop_on_success = config_api.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first success?", true).unwrap_or(true) }
+        prompt_yes_no("Stop on first success?", true).unwrap_or(true)
     });
-    let save_results = if api_mode { true } else { prompt_yes_no("Save results to file?", true)? };
+    let save_results = prompt_yes_no("Save results to file?", true)?;
     let save_path = if save_results {
         Some(config_api.output_file.clone().unwrap_or_else(|| {
-            if api_mode { "l2tp_results.txt".to_string() } else { prompt_default("Output file name", "l2tp_results.txt").unwrap_or_else(|_| "l2tp_results.txt".to_string()) }
+            prompt_default("Output file name", "l2tp_results.txt").unwrap_or_else(|_| "l2tp_results.txt".to_string())
         }))
     } else {
         None
     };
     let verbose = config_api.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
+        prompt_yes_no("Verbose mode?", false).unwrap_or(false)
     });
     let combo_mode = config_api.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Combination mode? (try every password with every user)", false).unwrap_or(false) }
+        prompt_yes_no("Combination mode? (try every password with every user)", false).unwrap_or(false)
     });
 
     let addr = format!("{}:{}", normalized, port);

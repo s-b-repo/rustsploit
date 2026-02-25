@@ -16,7 +16,7 @@ use tokio::fs::OpenOptions;
 
 use crate::utils::{
     prompt_yes_no, prompt_existing_file, prompt_int_range,
-    load_lines, prompt_default,
+    load_lines, prompt_default, prompt_wordlist,
 };
 use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 
@@ -67,57 +67,17 @@ pub async fn run(target: &str) -> Result<()> {
 
     // --- Standard Single Target Logic ---
     
-    // Check for API-provided config
-    let config_api = crate::config::get_module_config();
-    let api_mode = config_api.is_api_mode();
+    let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
+    let username_wordlist = prompt_existing_file("Username wordlist file")?;
+    let password_wordlist = prompt_existing_file("Password wordlist file")?;
     
-    let port = if let Some(p) = config_api.port {
-        p
-    } else if api_mode {
-        25
-    } else {
-        prompt_int_range("Port", 25, 1, 65535)? as u16
-    };
+    let threads = prompt_int_range("Threads", 8, 1, 256)? as usize;
+    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000)? as u64;
     
-    let username_wordlist = if let Some(ref f) = config_api.username_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Username wordlist not found: {}", f));
-        }
-        f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Username wordlist required for API mode"));
-    } else {
-        prompt_existing_file("Username wordlist file")?
-    };
-    
-    let password_wordlist = if let Some(ref f) = config_api.password_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Password wordlist not found: {}", f));
-        }
-        f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Password wordlist required for API mode"));
-    } else {
-        prompt_existing_file("Password wordlist file")?
-    };
-    
-    let threads = config_api.concurrency.unwrap_or_else(|| {
-        if api_mode { 8 } else { prompt_int_range("Threads", 8, 1, 256).unwrap_or(8) as usize }
-    });
-    let delay_ms = if api_mode { 50 } else { prompt_int_range("Delay (ms)", 50, 0, 10000).unwrap_or(50) as u64 };
-    
-    let stop_on_success = config_api.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first valid login?", true).unwrap_or(true) }
-    });
-    let full_combo = config_api.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Try every username with every password?", false).unwrap_or(false) }
-    });
-    let verbose = config_api.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let output_file = config_api.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "smtp_results.txt".to_string() } else { prompt_default("Output file for results", "smtp_results.txt").unwrap_or_else(|_| "smtp_results.txt".to_string()) }
-    });
+    let stop_on_success = prompt_yes_no("Stop on first valid login?", true)?;
+    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let output_file = prompt_default("Output file for results", "smtp_results.txt")?;
 
     let config = SmtpBruteforceConfig {
         target: target.to_string(),
@@ -132,35 +92,15 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms,
     };
 
-    if !api_mode {
-        println!();
-    }
+    println!();
     run_smtp_bruteforce(config).await
 }
 
 async fn run_mass_scan(target: &str) -> Result<()> {
-    // Get API config
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
-
-    // Prep - use API config or prompt
-    let port = config.port.unwrap_or_else(|| {
-        if api_mode { 25 } else { prompt_int_range("Port", 25, 1, 65535).unwrap_or(25) as u16 }
-    });
-    
-    let usernames_file = config.username_wordlist.clone().ok_or_else(|| {
-        anyhow!("username_wordlist required")
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("username_wordlist required for API mode")) } 
-        else { prompt_existing_file("Username wordlist") }
-    })?;
-    
-    let passwords_file = config.password_wordlist.clone().ok_or_else(|| {
-        anyhow!("password_wordlist required")
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("password_wordlist required for API mode")) } 
-        else { prompt_existing_file("Password wordlist") }
-    })?;
+    // Prep
+    let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
+    let usernames_file = prompt_wordlist("Username wordlist")?;
+    let passwords_file = prompt_wordlist("Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -168,27 +108,12 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 500 } else { prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).unwrap_or(500) as usize }
-    });
-    let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let output_file = config.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "smtp_mass_results.txt".to_string() } 
-        else { prompt_default("Output result file", "smtp_mass_results.txt").unwrap_or_else(|_| "smtp_mass_results.txt".to_string()) }
-    });
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?; 
+    let output_file = prompt_default("Output result file", "smtp_mass_results.txt")?;
 
-    // In API mode, always exclude private ranges
-    let use_exclusions = if api_mode { true } else { prompt_yes_no("Exclude reserved/private ranges?", true).unwrap_or(true) };
-    
     // Parse exclusions
-    let exclusions = if use_exclusions {
-        println!("{}", format!("[+] Loaded {} exclusion ranges", EXCLUDED_RANGES.len()).cyan());
-        Arc::new(parse_exclusions(EXCLUDED_RANGES))
-    } else {
-        Arc::new(Vec::new())
-    };
+    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let stats_checked = Arc::new(AtomicUsize::new(0));
@@ -234,13 +159,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         }
     } else {
         // File Mode
-        let content = match tokio::fs::read_to_string(target).await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("{}", format!("[!] Failed to read target file: {}", e).red());
-                return Ok(());
-            }
-        };
+        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
         let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
 
@@ -572,5 +491,4 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Re
     
     Ok(false)
 }
-
 

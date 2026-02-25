@@ -19,8 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use crate::utils::prompt_port;
-
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use anyhow::Context;
 use tokio::{
     sync::Semaphore,
@@ -321,24 +320,28 @@ fn save_results(results: &[SprayResult], path: &str) -> Result<()> {
 /// Prompt helper
 async fn prompt(message: &str) -> Result<String> {
     print!("{}: ", message);
-    std::io::stdout()
+    tokio::io::stdout()
         .flush()
+        .await
         .context("Failed to flush stdout")?;
     let mut input = String::new();
-    std::io::stdin()
+    tokio::io::BufReader::new(tokio::io::stdin())
         .read_line(&mut input)
+        .await
         .context("Failed to read input")?;
     Ok(input.trim().to_string())
 }
 
-fn prompt_default(message: &str, default: &str) -> Result<String> {
+async fn prompt_default(message: &str, default: &str) -> Result<String> {
     print!("{} [{}]: ", message, default);
-    std::io::stdout()
+    tokio::io::stdout()
         .flush()
+        .await
         .context("Failed to flush stdout")?;
     let mut input = String::new();
-    std::io::stdin()
+    tokio::io::BufReader::new(tokio::io::stdin())
         .read_line(&mut input)
+        .await
         .context("Failed to read input")?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -348,15 +351,17 @@ fn prompt_default(message: &str, default: &str) -> Result<String> {
     }
 }
 
-fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
+async fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
     let hint = if default { "Y/n" } else { "y/N" };
     print!("{} [{}]: ", message, hint);
-    std::io::stdout()
+    tokio::io::stdout()
         .flush()
+        .await
         .context("Failed to flush stdout")?;
     let mut input = String::new();
-    std::io::stdin()
+    tokio::io::BufReader::new(tokio::io::stdin())
         .read_line(&mut input)
+        .await
         .context("Failed to read input")?;
     let trimmed = input.trim().to_lowercase();
     match trimmed.as_str() {
@@ -384,7 +389,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Get port
-    let port: u16 = prompt_port("SSH Port", DEFAULT_SSH_PORT)?;
+    let port: u16 = prompt_default("SSH Port", "22").await?.parse().unwrap_or(DEFAULT_SSH_PORT);
     
     // Get targets
     let mut targets = Vec::new();
@@ -403,7 +408,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Load from file?
-    if prompt_yes_no("Load targets from file?", false)? {
+    if prompt_yes_no("Load targets from file?", false).await? {
         let file_path = prompt("File path").await?;
         if !file_path.is_empty() {
             match load_list_from_file(&file_path) {
@@ -433,7 +438,7 @@ pub async fn run(target: &str) -> Result<()> {
     // Get usernames
     let mut usernames: Vec<String> = Vec::new();
     
-    if prompt_yes_no("Load usernames from file?", false)? {
+    if prompt_yes_no("Load usernames from file?", false).await? {
         let file_path = prompt("Username file path").await?;
         if !file_path.is_empty() {
             match load_list_from_file(&file_path) {
@@ -449,7 +454,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Add default usernames?
-    if usernames.is_empty() || prompt_yes_no("Also test default usernames?", true)? {
+    if usernames.is_empty() || prompt_yes_no("Also test default usernames?", true).await? {
         for user in DEFAULT_USERNAMES {
             if !usernames.contains(&user.to_string()) {
                 usernames.push(user.to_string());
@@ -462,10 +467,10 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Get scan options
-    let threads: usize = prompt_default("Concurrent threads", &DEFAULT_THREADS.to_string())?
+    let threads: usize = prompt_default("Concurrent threads", &DEFAULT_THREADS.to_string()).await?
         .parse()
         .unwrap_or(DEFAULT_THREADS);
-    let timeout: u64 = prompt_default("Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string())?
+    let timeout: u64 = prompt_default("Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string()).await?
         .parse()
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     
@@ -475,8 +480,8 @@ pub async fn run(target: &str) -> Result<()> {
     let results = password_spray(targets, &usernames, &password, threads, timeout).await;
     
     // Save results?
-    if !results.is_empty() && prompt_yes_no("Save results to file?", true)? {
-        let output_path = prompt_default("Output file", "ssh_spray_results.txt")?;
+    if !results.is_empty() && prompt_yes_no("Save results to file?", true).await? {
+        let output_path = prompt_default("Output file", "ssh_spray_results.txt").await?;
         if let Err(e) = save_results(&results, &output_path) {
             println!("{}", format!("[-] Failed to save: {}", e).red());
         }
@@ -487,4 +492,3 @@ pub async fn run(target: &str) -> Result<()> {
     
     Ok(())
 }
-

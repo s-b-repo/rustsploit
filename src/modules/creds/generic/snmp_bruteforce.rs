@@ -60,63 +60,30 @@ pub async fn run(target: &str) -> Result<()> {
     // --- Standard Single-Target Logic ---
 
     let default_port = 161;
+    let port = prompt_int_range("SNMP Port", default_port as i64, 1, 65535)? as u16;
     
-    // Check for API-provided config
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
-
-    let port = if let Some(p) = config.port {
-        p
-    } else if api_mode {
-        default_port
-    } else {
-        prompt_int_range("SNMP Port", default_port as i64, 1, 65535)? as u16
-    };
-    
-    // For SNMP, username_wordlist contains community strings
-    let communities_file = if let Some(ref f) = config.username_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Community wordlist not found: {}", f));
-        }
-        f.clone()
-    } else if api_mode {
-        return Err(anyhow!("Community wordlist required for API mode"));
-    } else {
-        prompt_existing_file("Community string wordlist file path")?
-    };
+    let communities_file = prompt_existing_file("Community string wordlist file path")?;
     
     // Custom prompt for version since it's specific
-    let snmp_version = if api_mode { 1 } else { // Default to v2c in API mode
-        loop {
-            let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
-            match input.trim().to_lowercase().as_str() {
-                "1" => break 0,  // SNMPv1
-                "2c" | "2" => break 1,  // SNMPv2c
-                _ => println!("Invalid version. Enter '1' or '2c'."),
-            }
+    let snmp_version = loop {
+        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
+        match input.trim().to_lowercase().as_str() {
+            "1" => break 0,  // SNMPv1
+            "2c" | "2" => break 1,  // SNMPv2c
+            _ => println!("Invalid version. Enter '1' or '2c'."),
         }
     };
     
-    let concurrency = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 50 } else { prompt_int_range("Max concurrent tasks", 50, 1, 1000).unwrap_or(50) as usize }
-    });
-    let stop_on_success = config.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first success?", true).unwrap_or(true) }
-    });
+    let concurrency = prompt_int_range("Max concurrent tasks", 50, 1, 1000)? as usize;
+    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
     
     // Output file handled by saving results at the end usually, but old code asked upfront.
     // I'll stick to standard flow: prompt for save at end OR automatically if specified.
     // Existing modules prompted for output file upfront. I'll do that for consistency with new standard.
-    let output_file = config.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "snmp_results.txt".to_string() } else { prompt_default("Output file", "snmp_results.txt").unwrap_or_else(|_| "snmp_results.txt".to_string()) }
-    });
+    let output_file = prompt_default("Output file", "snmp_results.txt")?;
     
-    let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let timeout_secs = if api_mode { 3 } else { 
-        prompt_int_range("Timeout (seconds)", 3, 1, 300).unwrap_or(3) as u64 
-    };
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300)? as u64;
 
     let connect_addr = format!("{}:{}", normalize_target(target)?, port);
 
@@ -597,30 +564,15 @@ fn encode_sub_id(mut value: u32, output: &mut Vec<u8>) {
 async fn run_mass_scan(target: &str) -> Result<()> {
     println!("{}", "[*] Preparing Mass Scan configuration...".blue());
     
-    // Get API config
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
+    let port = prompt_int_range("SNMP Port", 161, 1, 65535)? as u16;
+    let communities_file = prompt_existing_file("Community string wordlist")?;
     
-    let port = config.port.unwrap_or_else(|| {
-        if api_mode { 161 } else { prompt_int_range("SNMP Port", 161, 1, 65535).unwrap_or(161) as u16 }
-    });
-    
-    let communities_file = config.username_wordlist.clone().ok_or_else(|| {
-        anyhow!("username_wordlist (community strings) required")
-    }).or_else(|_| {
-        if api_mode { Err(anyhow!("username_wordlist required for API mode")) } 
-        else { prompt_existing_file("Community string wordlist") }
-    })?;
-    
-    // In API mode, default to SNMPv2c
-    let snmp_version = if api_mode { 1 } else {
-        loop {
-            let input = prompt_default("SNMP Version (1 or 2c)", "2c").unwrap_or_else(|_| "2c".to_string());
-            match input.trim().to_lowercase().as_str() {
-                "1" => break 0,
-                "2c" | "2" => break 1,
-                _ => println!("Invalid version. Enter '1' or '2c'."),
-            }
+    let snmp_version = loop {
+        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
+        match input.trim().to_lowercase().as_str() {
+            "1" => break 0,
+            "2c" | "2" => break 1,
+            _ => println!("Invalid version. Enter '1' or '2c'."),
         }
     };
     
@@ -629,28 +581,13 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         return Err(anyhow!("Community wordlist cannot be empty"));
     }
     
-    let concurrency = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 500 } else { prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).unwrap_or(500) as usize }
-    });
-    let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let timeout_secs = if api_mode { 3 } else { prompt_int_range("Timeout (seconds)", 3, 1, 300).unwrap_or(3) as u64 };
-    let output_file = config.output_file.clone().unwrap_or_else(|| {
-        if api_mode { "snmp_mass_results.txt".to_string() } 
-        else { prompt_default("Output result file", "snmp_mass_results.txt").unwrap_or_else(|_| "snmp_mass_results.txt".to_string()) }
-    });
-    
-    // In API mode, always exclude private ranges
-    let use_exclusions = if api_mode { true } else { prompt_yes_no("Exclude reserved/private ranges?", true).unwrap_or(true) };
+    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300)? as u64;
+    let output_file = prompt_default("Output result file", "snmp_mass_results.txt")?;
     
     // Parse exclusions
-    let exclusions = if use_exclusions {
-        println!("{}", format!("[+] Loaded {} exclusion ranges", EXCLUDED_RANGES.len()).cyan());
-        Arc::new(parse_exclusions(EXCLUDED_RANGES))
-    } else {
-        Arc::new(Vec::new())
-    };
+    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
     
     // Shared State
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -677,7 +614,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if run_random {
         println!("{}", "[*] Starting Random Internet Scan...".green());
         loop {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let exc = exclusions.clone();
             let cp = creds_pkg.clone();
             let sc = stats_checked.clone();
@@ -698,18 +635,12 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         }
     } else {
         // File mode
-        let content = match tokio::fs::read_to_string(target).await {
-            Ok(c) => c,
-            Err(e) => {
-                println!("{}", format!("[!] Failed to read target file: {}", e).red());
-                return Ok(());
-            }
-        };
+        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
         let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
         
         for ip_str in lines {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let cp = creds_pkg.clone();
             let sc = stats_checked.clone();
             let sf = stats_found.clone();
@@ -781,5 +712,4 @@ async fn mass_scan_host(
         }
     }
 }
-
 
