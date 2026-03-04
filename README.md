@@ -89,8 +89,7 @@ Run `modules` or `find <keyword>` in the shell for the authoritative list.
  ```bash
 sudo apt update
 
-sudo apt install pkg-config libssl-dev rustc libdbus-1-dev freerdp3-x11 # Required for RDP and Bluetooth modules
-
+sudo apt install pkg-config libssl-dev rustc libdbus-1-dev    freerdp2-x11 # Required for RDP and Bluetooth modules
 
 ```
 
@@ -131,15 +130,6 @@ cargo build
  ```
 cargo run
 ```
-### quick install
-
-### instant quick run command debian 13
-
-```
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh && chmod +x rustup-init.sh && ./rustup-init.sh -y && source "$HOME/.cargo/env" && sudo apt update -y && sudo apt upgrade -y && sudo apt install -y git wget curl pkg-config libssl-dev libdbus-1-dev  && 
-git clone https://github.com/s-b-repo/rustsploit.git && sudo apt install -y rustc cargo && cd rustsploit && cargo run
-```
-
 
 
 ---

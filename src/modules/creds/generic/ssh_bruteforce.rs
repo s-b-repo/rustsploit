@@ -16,10 +16,12 @@ use tokio::{
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
-    normalize_target, prompt_default, prompt_yes_no, 
-    prompt_existing_file, load_lines, get_filename_in_current_dir
+    normalize_target,
+    load_lines, get_filename_in_current_dir,
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_port,
+    cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::BruteforceStats;
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
 
 // Constants
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -45,25 +47,34 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", "=== SSH Brute Force Module ===".bold());
     println!("[*] Target: {}", target);
 
-    let port: u16 = loop {
-        let input = prompt_default("SSH Port", &DEFAULT_SSH_PORT.to_string())?;
-        match input.parse() {
-            Ok(p) if p > 0 => break p,
-            _ => println!("{}", "Invalid port. Must be between 1 and 65535.".yellow()),
+    if is_subnet_target(target) {
+        let network = parse_subnet(target)?;
+        let count = subnet_host_count(&network);
+        println!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
         }
-    };
+        println!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
+
+    let port: u16 = cfg_prompt_port("port", "SSH Port", DEFAULT_SSH_PORT)?;
 
     // Ask about default credentials
-    let use_defaults = prompt_yes_no("Try default credentials first?", true)?;
+    let use_defaults = cfg_prompt_yes_no("use_defaults", "Try default credentials first?", true)?;
     
-    let usernames_file = if prompt_yes_no("Use username wordlist?", true)? {
-        Some(prompt_existing_file("Username wordlist")?)
+    let usernames_file = if cfg_prompt_yes_no("use_username_wordlist", "Use username wordlist?", true)? {
+        Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist")?)
     } else {
         None
     };
     
-    let passwords_file = if prompt_yes_no("Use password wordlist?", true)? {
-        Some(prompt_existing_file("Password wordlist")?)
+    let passwords_file = if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true)? {
+        Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist")?)
     } else {
         None
     };
@@ -72,44 +83,33 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("At least one wordlist or default credentials must be enabled"));
     }
 
-    let concurrency: usize = loop {
-        let input = prompt_default("Max concurrent tasks", "10")?;
-        match input.parse() {
-            Ok(n) if n > 0 && n <= 256 => break n,
-            _ => println!("{}", "Invalid number. Must be between 1 and 256.".yellow()),
-        }
+    let concurrency: usize = {
+        let input = cfg_prompt_default("concurrency", "Max concurrent tasks", "10")?;
+        input.parse::<usize>().unwrap_or(10).max(1).min(256)
     };
 
-    let connection_timeout: u64 = loop {
-        let input = prompt_default("Connection timeout (seconds)", "5")?;
-        match input.parse() {
-            Ok(n) if n >= 1 && n <= 60 => break n,
-            _ => println!("{}", "Invalid timeout. Must be between 1 and 60 seconds.".yellow()),
-        }
+    let connection_timeout: u64 = {
+        let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "5")?;
+        input.parse::<u64>().unwrap_or(5).max(1).min(60)
     };
 
-    let retry_on_error = prompt_yes_no("Retry on connection errors?", true)?;
+    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true)?;
     let max_retries: usize = if retry_on_error {
-        loop {
-            let input = prompt_default("Max retries per attempt", "2")?;
-            match input.parse() {
-                Ok(n) if n > 0 && n <= 10 => break n,
-                _ => println!("{}", "Invalid retries. Must be between 1 and 10.".yellow()),
-            }
-        }
+        let input = cfg_prompt_default("max_retries", "Max retries per attempt", "2")?;
+        input.parse::<usize>().unwrap_or(2).max(1).min(10)
     } else {
         0
     };
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
     let save_path = if save_results {
-        Some(prompt_default("Output file", "ssh_brute_results.txt")?)
+        Some(cfg_prompt_output_file("output_file", "Output file", "ssh_brute_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false)?;
 
     let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|_| format!("{}:{}", target, port));
 
@@ -365,13 +365,11 @@ pub async fn run(target: &str) -> Result<()> {
             .yellow()
             .bold()
         );
-        if prompt_yes_no("Save unknown responses to file?", true)? {
+        if cfg_prompt_yes_no("save_unknown_responses", "Save unknown responses to file?", true)? {
             let default_name = "ssh_unknown_responses.txt";
-            let fname = prompt_default(
-                &format!(
-                    "What should the unknown results be saved as? (default: {})",
-                    default_name
-                ),
+            let fname = cfg_prompt_output_file(
+                "unknown_responses_file",
+                "What should the unknown results be saved as?",
                 default_name,
             )?;
             let filename = get_filename_in_current_dir(&fname);

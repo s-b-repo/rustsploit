@@ -14,13 +14,14 @@ use tokio::{
     time::{sleep, timeout},
 };
 use crate::utils::{
-    prompt_yes_no, prompt_default, prompt_int_range,
-    load_lines, prompt_existing_file, normalize_target,
-    get_filename_in_current_dir, prompt_port,
+    load_lines, normalize_target,
+    get_filename_in_current_dir,
+    cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_int_range,
+    cfg_prompt_port, cfg_prompt_existing_file, cfg_prompt_output_file,
 };
 use regex::Regex;
 use once_cell::sync::Lazy;
-use crate::modules::creds::utils::BruteforceStats;
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
@@ -36,13 +37,28 @@ pub async fn run(target: &str) -> Result<()> {
     display_banner();
     println!("{}", format!("[*] Target: {}", target).cyan());
 
+    if is_subnet_target(target) {
+        let network = parse_subnet(target)?;
+        let count = subnet_host_count(&network);
+        println!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
+        }
+        println!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
+
     // Check for API-provided config
     let config_api = crate::config::get_module_config();
 
     let port: u16 = if let Some(p) = config_api.port {
         p
     } else {
-        prompt_port("Fortinet VPN Port", 443)?
+        cfg_prompt_port("port", "Fortinet VPN Port", 443)?
     };
 
     let usernames_file_path = if let Some(ref f) = config_api.username_wordlist {
@@ -51,7 +67,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
         f.clone()
     } else {
-        prompt_existing_file("Username wordlist path")?
+        cfg_prompt_existing_file("username_wordlist", "Username wordlist path")?
     };
 
     let passwords_file_path = if let Some(ref f) = config_api.password_wordlist {
@@ -60,36 +76,36 @@ pub async fn run(target: &str) -> Result<()> {
         }
         f.clone()
     } else {
-        prompt_existing_file("Password wordlist path")?
+        cfg_prompt_existing_file("password_wordlist", "Password wordlist path")?
     };
 
     let concurrency = config_api.concurrency.unwrap_or_else(|| {
-        prompt_int_range("Max concurrent tasks", 10, 1, 10000).unwrap_or(10) as usize
+        cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 10000).unwrap_or(10) as usize
     });
-    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300).unwrap_or(10) as u64;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 10, 1, 300).unwrap_or(10) as u64;
 
     let stop_on_success = config_api.stop_on_success.unwrap_or_else(|| {
-        prompt_yes_no("Stop on first success?", true).unwrap_or(true)
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).unwrap_or(true)
     });
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
     let save_path = if save_results {
         Some(config_api.output_file.clone().unwrap_or_else(|| {
-            prompt_default("Output file name", "fortinet_results.txt").unwrap_or_else(|_| "fortinet_results.txt".to_string())
+            cfg_prompt_output_file("output_file", "Output file name", "fortinet_results.txt").unwrap_or_else(|_| "fortinet_results.txt".to_string())
         }))
     } else {
         None
     };
     let verbose = config_api.verbose.unwrap_or_else(|| {
-        prompt_yes_no("Verbose mode?", false).unwrap_or(false)
+        cfg_prompt_yes_no("verbose", "Verbose mode?", false).unwrap_or(false)
     });
     let combo_mode = config_api.combo_mode.unwrap_or_else(|| {
-        prompt_yes_no("Combination mode? (try every password with every user)", false).unwrap_or(false)
+        cfg_prompt_yes_no("combo_mode", "Combination mode? (try every password with every user)", false).unwrap_or(false)
     });
     
-    let trusted_cert_str = prompt_default("Trusted certificate SHA256 (optional, press Enter to skip)", "")?;
+    let trusted_cert_str = cfg_prompt_default("trusted_cert", "Trusted certificate SHA256 (optional, press Enter to skip)", "")?;
     let trusted_cert = if trusted_cert_str.is_empty() { None } else { Some(trusted_cert_str) };
 
-    let realm_str = prompt_default("Authentication realm (optional)", "")?;
+    let realm_str = cfg_prompt_default("realm", "Authentication realm (optional)", "")?;
     let realm = if realm_str.is_empty() { None } else { Some(realm_str) };
 
     let base_url = build_fortinet_url(target, port)?;

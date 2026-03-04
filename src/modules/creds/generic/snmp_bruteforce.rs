@@ -19,10 +19,11 @@ use tokio::{
 };
 
 use crate::utils::{
-    prompt_yes_no, prompt_existing_file, prompt_int_range,
     load_lines, prompt_default, normalize_target,
+    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_port,
 };
-use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
+use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const STATE_FILE: &str = "snmp_hose_state.log";
@@ -57,33 +58,47 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
+    if is_subnet_target(target) {
+        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+        return run_subnet_scan(target).await;
+    }
+
     // --- Standard Single-Target Logic ---
 
     let default_port = 161;
-    let port = prompt_int_range("SNMP Port", default_port as i64, 1, 65535)? as u16;
+    let port = cfg_prompt_port("port", "SNMP Port", default_port)?
+    ;
     
-    let communities_file = prompt_existing_file("Community string wordlist file path")?;
+    let communities_file = cfg_prompt_existing_file("community_wordlist", "Community string wordlist file path")?;
     
     // Custom prompt for version since it's specific
-    let snmp_version = loop {
-        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
-        match input.trim().to_lowercase().as_str() {
-            "1" => break 0,  // SNMPv1
-            "2c" | "2" => break 1,  // SNMPv2c
-            _ => println!("Invalid version. Enter '1' or '2c'."),
+    let snmp_version = {
+        let config = crate::config::get_module_config();
+        if let Some(val) = config.custom_prompts.get("snmp_version") {
+            match val.trim().to_lowercase().as_str() {
+                "1" => 0,
+                "2c" | "2" => 1,
+                _ => 1, // default to v2c
+            }
+        } else {
+            loop {
+                let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
+                match input.trim().to_lowercase().as_str() {
+                    "1" => break 0,
+                    "2c" | "2" => break 1,
+                    _ => println!("Invalid version. Enter '1' or '2c'."),
+                }
+            }
         }
     };
     
-    let concurrency = prompt_int_range("Max concurrent tasks", 50, 1, 1000)? as usize;
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 50, 1, 1000)? as usize;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
     
-    // Output file handled by saving results at the end usually, but old code asked upfront.
-    // I'll stick to standard flow: prompt for save at end OR automatically if specified.
-    // Existing modules prompted for output file upfront. I'll do that for consistency with new standard.
-    let output_file = prompt_default("Output file", "snmp_results.txt")?;
+    let output_file = cfg_prompt_output_file("output_file", "Output file", "snmp_results.txt")?;
     
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300)? as u64;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300)? as u64;
 
     let connect_addr = format!("{}:{}", normalize_target(target)?, port);
 
@@ -105,7 +120,7 @@ pub async fn run(target: &str) -> Result<()> {
     // Start progress reporter
     let stats_clone = stats.clone();
     let stop_clone = stop.clone();
-    let _start_time = Instant::now();
+    let start_time = Instant::now();
     let progress_handle = tokio::spawn(async move {
         loop {
             if stop_clone.load(Ordering::Relaxed) {
@@ -183,6 +198,8 @@ pub async fn run(target: &str) -> Result<()> {
     let _ = progress_handle.await;
 
     // Print final statistics
+    let elapsed = start_time.elapsed();
+    println!("[*] Elapsed: {:.1}s", elapsed.as_secs_f64());
     stats.print_final().await;
 
     let creds = found.lock().await;
@@ -564,15 +581,26 @@ fn encode_sub_id(mut value: u32, output: &mut Vec<u8>) {
 async fn run_mass_scan(target: &str) -> Result<()> {
     println!("{}", "[*] Preparing Mass Scan configuration...".blue());
     
-    let port = prompt_int_range("SNMP Port", 161, 1, 65535)? as u16;
-    let communities_file = prompt_existing_file("Community string wordlist")?;
+    let port = cfg_prompt_port("port", "SNMP Port", 161)?;
+    let communities_file = cfg_prompt_existing_file("community_wordlist", "Community string wordlist")?;
     
-    let snmp_version = loop {
-        let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
-        match input.trim().to_lowercase().as_str() {
-            "1" => break 0,
-            "2c" | "2" => break 1,
-            _ => println!("Invalid version. Enter '1' or '2c'."),
+    let snmp_version = {
+        let config = crate::config::get_module_config();
+        if let Some(val) = config.custom_prompts.get("snmp_version") {
+            match val.trim().to_lowercase().as_str() {
+                "1" => 0,
+                "2c" | "2" => 1,
+                _ => 1,
+            }
+        } else {
+            loop {
+                let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
+                match input.trim().to_lowercase().as_str() {
+                    "1" => break 0,
+                    "2c" | "2" => break 1,
+                    _ => println!("Invalid version. Enter '1' or '2c'."),
+                }
+            }
         }
     };
     
@@ -581,10 +609,10 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         return Err(anyhow!("Community wordlist cannot be empty"));
     }
     
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let timeout_secs = prompt_int_range("Timeout (seconds)", 3, 1, 300)? as u64;
-    let output_file = prompt_default("Output result file", "snmp_mass_results.txt")?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300)? as u64;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "snmp_mass_results.txt")?;
     
     // Parse exclusions
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
@@ -672,13 +700,80 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     Ok(())
 }
 
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
+
+    let port = cfg_prompt_port("port", "SNMP Port", 161)?;
+    let communities_file = cfg_prompt_existing_file("community_wordlist", "Community string wordlist")?;
+    let snmp_version = {
+        let config = crate::config::get_module_config();
+        if let Some(val) = config.custom_prompts.get("snmp_version") {
+            match val.trim().to_lowercase().as_str() { "1" => 0, _ => 1 }
+        } else {
+            loop {
+                let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
+                match input.trim().to_lowercase().as_str() { "1" => break 0, "2c" | "2" => break 1, _ => println!("Invalid version.") }
+            }
+        }
+    };
+    let communities = load_lines(&communities_file)?;
+    if communities.is_empty() { return Err(anyhow!("Community wordlist empty")); }
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300)? as u64;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "snmp_subnet_results.txt")?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((communities, snmp_version, timeout_secs));
+    let total = count;
+
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!("[*] Status: {}/{} IPs scanned, {} SNMP devices found",
+                s_checked.load(Ordering::Relaxed), total,
+                s_found.load(Ordering::Relaxed).to_string().green().bold());
+        }
+    });
+
+    for ip in network.iter() {
+        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
+        let cp = creds_pkg.clone();
+        let sc = stats_checked.clone();
+        let sf = stats_found.clone();
+        let of = output_file.clone();
+
+        tokio::spawn(async move {
+            mass_scan_host(ip, port, cp, sf, of, verbose).await;
+            sc.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+        });
+    }
+
+    for _ in 0..concurrency {
+        let _ = semaphore.acquire().await.context("Semaphore")?;
+    }
+
+    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} SNMP services found.",
+        stats_checked.load(Ordering::Relaxed),
+        stats_found.load(Ordering::Relaxed)).cyan().bold());
+    Ok(())
+}
+
 async fn mass_scan_host(
     ip: IpAddr,
     port: u16,
     creds: Arc<(Vec<String>, u8, u64)>,
     stats_found: Arc<AtomicUsize>,
     output_file: String,
-    _verbose: bool,
+    verbose: bool,
 ) {
     let addr = format!("{}:{}", ip, port);
     let (communities, version, timeout_secs) = &*creds;
@@ -703,7 +798,9 @@ async fn mass_scan_host(
                 return; // Stop on first valid community for this host
             }
             Ok(false) => {
-                // Auth failure
+                if verbose {
+                    println!("\\r{}", format!("[-] {} community '{}' failed", addr, community).dimmed());
+                }
             }
             Err(_) => {
                 // Connection error

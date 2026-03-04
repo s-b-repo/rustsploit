@@ -10424,3 +10424,1052 @@ State management fast & reliable.
 
 Completed all fixes: RDP brute force now has mass scan support and handles xfreerdp3 exit codes 71/132/133. MQTT brute force now has mass scan support and recovers from connection refused during anonymous auth test instead of fatally erroring.
 
+
+redoing api design
+
+WPair Upgrade + API Shell Parity — Walkthrough
+Summary
+Upgraded the 
+wpair.rs
+ BLE exploit module with features from CloudWaddie/whisper and added a new /api/exec endpoint that mirrors the interactive shell for remote control.
+
+Part 1: WPair Module Upgrade
+Files Changed
+wpair.rs
+Changes Made
+Feature	Description
+LEGACY strategy	New 5th exploit strategy using dummy provider address (0xAA:BB:CC:11:22:33) to bypass address checks on older firmware
+Subscribe-before-write	Bug fix: KBP notification subscription now happens before the write, preventing missed responses
+WriteType::WithResponse	KBP writes now use WithResponse for GATT delivery confirmation
+GATT device name	Active name resolution via UUID 0x2A00 characteristic read after connecting
+prefers_br_edr quirk	Nothing Ear (a) devices (D0A72C) now bond via BLE address instead of BR/EDR
+Extended response parsing	Added count field check (data[2] > 0) before extracting MAC from type 0x02 responses
+Decrypted fallback	If decrypted response type ≠ 0x01, still attempt MAC extraction from bytes [1..7]
+Write-accepted fallback	If all strategies had writes accepted but no notifications, attempt direct bonding via BLE address
+Account key flooding	New 
+flood_account_keys()
+ function — write N keys with optional KBP handshake
+[W] TUI keybind	w = write 1 key with handshake, W = flood 10 keys
+Randomized seeker	Seeker address is now randomized per-exploit to evade caching
+Error categorization	BLE errors now categorized: "Write Not Permitted", "Auth Required", or raw error
+
+Part 2: API Shell Parity
+Files Changed
+api.rs
+ — New /api/exec endpoint
+shell.rs
+ — Made 
+resolve_command
+ and 
+sanitize_module_path
+ public
+New Endpoint: POST /api/exec
+Accepts a shell command string and dispatches it through the same command resolution logic as the interactive shell.
+
+Supported commands: 
+help
+, 
+modules
+, find <query>, use <module>, set/target <ip>, show_target, 
+clear_target
+, 
+run
+, run_all, back, exit
+
+Features:
+
+Command chaining via & separator
+Alias resolution (same aliases as shell: t, ls, m, go, 
+ra
+, etc.)
+Persistent current_module state across API calls
+Fuzzy module name suggestions via strsim
+Structured JSON responses with per-command output and duration
+Example:
+
+bash
+curl -X POST http://127.0.0.1:8080/api/exec \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "use creds/generic/telnet_bruteforce & t 10.0.0.1 & show_target"}'
+Response:
+
+json
+{
+  "success": true,
+  "message": "3 command(s) executed",
+  "data": {
+    "results": [
+      {"command": "use creds/generic/telnet_bruteforce", "success": true, "output": "Module selected: creds/generic/telnet_bruteforce"},
+      {"command": "t 10.0.0.1", "success": true, "output": "Target set to: 10.0.0.1"},
+      {"command": "show_target", "success": true, "output": "{\"target\":\"10.0.0.1\",\"current_module\":\"creds/generic/telnet_bruteforce\"}"}
+    ]
+  }
+}
+Verification
+Check	Result
+cargo run -- --help	✅ Exit code 0, no errors
+cargo audit	✅ Clean — no vulnerabilities
+
+
+Walkthrough: Bruteforce Module → cfg_prompt_* Conversion
+Summary
+Converted all 10 bruteforce modules to use cfg_prompt_* wrappers, enabling the API to pre-configure prompt answers via ModuleConfig.custom_prompts. When a matching key exists in the config, the prompt auto-resolves without user interaction; otherwise it falls back to the interactive prompt.
+
+Modules Converted
+Module	File	Prompts Converted
+SSH	
+ssh_bruteforce.rs
+~10
+MQTT	
+mqtt_bruteforce.rs
+~15 (run + mass_scan)
+RDP	
+rdp_bruteforce.rs
+~18 (run + mass_scan + security_level)
+POP3	
+pop3_bruteforce.rs
+~16 (run + mass_scan)
+SMTP	
+smtp_bruteforce.rs
+~12 (run + mass_scan)
+SNMP	
+snmp_bruteforce.rs
+~12 (run + mass_scan + version)
+L2TP	
+l2tp_bruteforce.rs
+~12
+Fortinet	
+fortinet_bruteforce.rs
+~14
+RTSP	
+rtsp_bruteforce.rs
+~18 (run + mass_scan + advanced)
+Telnet	
+telnet_bruteforce.rs
+~50+ (5 modes + local helpers)
+enablebruteforce	enablebruteforce.rs	0 (skipped, no prompts)
+What Changed
+Imports: Replaced prompt_* with cfg_prompt_* imports in each module
+Prompt calls: Every 
+prompt_yes_no(msg, default)
+ → 
+cfg_prompt_yes_no(key, msg, default)
+, etc.
+Mass scan sections: Also converted (MQTT, POP3, SMTP, SNMP, RDP, RTSP)
+RDP security level: Added config lookup before interactive menu
+SNMP version: Added config lookup via custom_prompts.get("snmp_version")
+Telnet local helpers: Updated 
+prompt_port
+, 
+prompt_threads
+, 
+prompt_delay
+, 
+prompt_timeout
+, 
+prompt_retries
+, 
+prompt_charset
+, 
+prompt_min_length
+, 
+prompt_max_length
+, 
+prompt_list
+ to call cfg_prompt_* internally
+Cleanup: Removed all unused old imports, trailing semicolons, dead code
+Verification
+$ cargo build
+   Compiling rustsploit v0.5.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.77s
+
+
+Module Prompt → API Integration
+Make every brute force module's custom prompts work with the API so modules run non-interactively when prompt values are pre-supplied.
+
+Design
+Core idea: Add a generic custom_prompts: HashMap<String, String> to the existing 
+ModuleConfig
+. Create config-aware wrappers for prompt functions that check the map first, falling back to stdin. Modules call these wrappers instead of raw prompts — zero new modules, minimal per-file changes.
+
+key found
+key missing
+API /api/run
+set_module_config
+ModuleConfig.custom_prompts
+Module calls cfg_prompt_*
+Return pre-set value
+Fall back to stdin prompt
+Proposed Changes
+Config Layer
+[MODIFY] 
+config.rs
+Add custom_prompts: HashMap<String, String> to 
+ModuleConfig
+:
+
+Holds arbitrary key→value pairs like "mode" → "1", "port" → "22", "stop_on_success" → "y"
+Populated by the API via RunModuleRequest.prompts
+Prompt Wrappers
+[MODIFY] 
+utils.rs
+Add 5 config-aware functions that check ModuleConfig.custom_prompts first:
+
+Function	Behavior
+cfg_prompt_required(key, msg)	Returns custom_prompts[key] if set, else 
+prompt_required(msg)
+cfg_prompt_default(key, msg, default)	Returns custom_prompts[key] if set, else 
+prompt_default(msg, default)
+cfg_prompt_yes_no(key, msg, default)	Returns bool from custom_prompts[key] (y/n/true/false), else 
+prompt_yes_no(msg, default)
+cfg_prompt_port(key, msg, default)	Parses custom_prompts[key] as u16, else 
+prompt_port(msg, default)
+cfg_prompt_existing_file(key, msg)	Returns custom_prompts[key] with file existence check, else 
+prompt_existing_file(msg)
+API Layer
+[MODIFY] 
+api.rs
+Add prompts: Option<HashMap<String, String>> field to 
+RunModuleRequest
+Before calling commands::run_module(), populate ModuleConfig.custom_prompts from request.prompts
+After execution, call 
+clear_module_config()
+Module Updates (12 files)
+Each module's 
+run()
+ function replaces raw prompt_* calls with cfg_prompt_* calls. Example for SSH:
+
+diff
+-let port: u16 = prompt_default("SSH Port", "22")?.parse()?;
++let port: u16 = cfg_prompt_port("port", "SSH Port", 22)?;
+Module	Prompts to convert	Key names
+ssh_bruteforce	port, wordlists, concurrency, timeout, retries, stop/save/verbose/combo	port, username_wordlist, password_wordlist, concurrency, timeout, retries, stop_on_success, save_results, output_file, verbose, combo_mode
+telnet_bruteforce
+mode, port, wordlists, config file, threads, verbose, etc.	mode, port, username_wordlist, password_wordlist, threads, verbose, stop_on_success
+rtsp_bruteforce	port, wordlists, concurrency, stop/save/verbose/combo, paths	port, username_wordlist, password_wordlist, concurrency, stop_on_success, output_file, verbose, combo_mode, paths_file
+ftp_bruteforce	Already done ✓ (uses 
+ModuleConfig
+ fixed fields)	—
+mqtt_bruteforce	port, wordlists, concurrency, verbose	port, username_wordlist, password_wordlist, concurrency, verbose
+rdp_bruteforce	port, wordlists, concurrency, verbose	port, username_wordlist, password_wordlist, concurrency, verbose
+pop3_bruteforce	port, wordlists, concurrency, verbose	port, username_wordlist, password_wordlist, concurrency, verbose
+smtp_bruteforce	port, wordlists, concurrency, verbose	port, username_wordlist, password_wordlist, concurrency, verbose
+snmp_bruteforce	port, community list, concurrency, verbose	port, community_wordlist, concurrency, verbose
+l2tp_bruteforce	port, wordlists, concurrency, verbose	port, username_wordlist, password_wordlist, concurrency, verbose
+fortinet_bruteforce	port, wordlists, concurrency, verbose	port, username_wordlist, password_wordlist, concurrency, verbose
+enablebruteforce	port, wordlists, concurrency, verbose	port, password_wordlist, concurrency, verbose
+API Usage Example
+bash
+curl -X POST http://127.0.0.1:8080/api/run \
+  -H "Authorization: Bearer KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "10.0.0.1",
+    "prompts": {
+      "port": "22",
+      "username_wordlist": "/opt/wordlists/users.txt",
+      "password_wordlist": "/opt/wordlists/rockyou.txt",
+      "concurrency": "50",
+      "verbose": "y",
+      "combo_mode": "y",
+      "stop_on_success": "y"
+    }
+  }'
+Verification Plan
+Automated Tests
+cargo run -- --help — compilation check
+cargo audit — dependency security check
+Manual Verification
+Run SSH module via API with prompts populated → should run without stdin
+Run telnet module via API with "mode": "4" → should auto-select quick check
+
+Comment
+Ctrl+Alt+M
+
+
+
+
+All 5 API Bug Fixes
+Summary
+Fixed all 5 bugs from 
+report.txt
+ and 
+bugs.txt
+. All verified via API testing.
+
+Bug Fixes & Test Results
+Bug 1: cfg_prompt_* Falls Back to stdin in API Mode
+File	Change
+config.rs
+Added api_mode: bool to 
+ModuleConfig
+utils.rs
+All 6 cfg_prompt_* functions return error/default in API mode
+api.rs
+Set api_mode: true in 
+run_module
+ handler
+Test: Missing username_wordlist key → Returns helpful error:
+
+json
+{"message": "Missing required prompt key 'username_wordlist' (prompt: 'Username wordlist'). Supply a valid file path in the 'prompts' field."}
+Bug 2: Command Injection in /api/exec
+Added 
+contains_shell_metacharacters()
+ function blocking & | ;  $ > <characters. Removed&` command chaining.
+
+Test: "command": "help & echo injection_test" → HTTP 400:
+
+json
+{"message": "Command contains forbidden characters (& | ; ` $ > <). Only single commands are allowed."}
+Bug 3: Server Crash on Extra JSON Fields
+Added #[serde(deny_unknown_fields)] to 
+RunModuleRequest
+.
+
+Test: Extra field "is_admin": true → HTTP 422:
+
+unknown field `is_admin`, expected one of `module`, `target`, `port`, ...
+Bug 4: Rate Limiting
+Integrated per-IP rate limiter into 
+auth_middleware
+ using token bucket (10 req/s window).
+
+Test: 15 rapid requests → Requests 1-9: HTTP 200, Requests 10-15: HTTP 429:
+
+json
+{"message": "Rate limit exceeded: max 10 requests per second"}
+Bug 5: SSRF via Cloud Metadata IPs
+Added 
+is_blocked_target()
+ blocking 169.254.0.0/16 and 0.0.0.0. Applied to both 
+run_module
+ and 
+honeypot_check
+.
+
+Test: "target": "169.254.169.254" → HTTP 403:
+
+json
+{"message": "Target is a blocked internal/metadata address (link-local 169.254.0.0/16 or 0.0.0.0)"}
+
+Walkthrough: Results Retrieval API
+Summary
+Added attack output capture + safe results file retrieval. All 10 modules tested.
+
+Features Added
+1. Stdout Capture in /api/run
+Module output is captured via gag::BufferRedirect and returned in data.output. Output is truncated at 64KB. Module result files are written to ~/.rustsploit/results/.
+
+2. GET /api/results — List Result Files
+Lists all files in ~/.rustsploit/results/ with name, size, and modified timestamp.
+
+3. GET /api/results/{filename} — Retrieve File
+ASCII-only filename validation:
+
+Max 255 chars, no path separators (/, \, ..)
+Only [a-zA-Z0-9_-.] allowed
+No dotfiles (.hidden)
+Canonicalized path check (blocks symlink escapes)
+File content capped at 1MB
+Security Tests
+Test	Result
+Path traversal ../../etc/passwd	✅ INVALID_FILENAME
+Non-ASCII файл.txt	✅ INVALID_FILENAME
+Valid file manual_test.txt	✅ Content returned
+Symlink escape	✅ PATH_TRAVERSAL
+All 10 Modules — Output Capture
+Module	Status	Output
+SSH	✅	578 chars
+MQTT	✅	~600 chars
+SMTP	✅	~500 chars
+POP3	✅	~500 chars
+SNMP	✅	~500 chars
+RDP	✅	792 chars
+RTSP	✅	912 chars
+L2TP	✅	875 chars
+Fortinet	✅	848 chars
+Telnet	✅	675 chars
+Files Modified
+api.rs
+ — stdout capture, CWD redirection, results endpoints, router
+config.rs
+ — 
+results_dir()
+ function
+Cargo.toml
+ — added gag v1.0.0
+
+
+   // Capture stdout during module execution
+    // Use file-backed redirect instead of pipe-backed BufferRedirect to avoid
+    // deadlock: pipes have a 64KB kernel buffer; long-running modules fill it,
+    // blocking println!() since we only drain after the module finishes.
+    // Files have no size limit so writes never block.
+
+
+
+    Fixing SMTP, Telnet, and L2TP Module Issues
+Implemented continuous-drain pipe capture in 
+
+api.rs
+: uses gag::BufferRedirect (pipe, no dup2) with background drain threads that read every 50ms, preventing 64KB buffer overflow. This avoids both the pipe deadlock AND the dup2/telnet crate conflict.
+
+
+
+
+Fix Brute Force Modules & Check Template API Commands
+Fix bugs in SMTP and FTP brute force modules that prevent them from working correctly via the API, and ensure 
+template-api-commands.txt
+ has working commands for all modules.
+
+Proposed Changes
+SMTP Brute Force Module
+[MODIFY] 
+smtp_bruteforce.rs
+The SMTP module uses the 
+telnet
+ crate for TCP communication, which conflicts with gag's dup2()-based stdout redirection in 
+api.rs
+. This means the API returns [output not captured] for SMTP instead of actual results.
+
+Fix: Replace the telnet::Telnet usage in 
+try_smtp_login()
+ with direct std::net::TcpStream I/O (
+read
+/
+write
+). The telnet crate's only real contribution here is wrapping a TCP stream — SMTP doesn't actually use telnet protocol features. Remove the 
+telnet
+ import and use std::io::{Read, Write} directly on the TcpStream.
+
+Also remove the special skip_capture bypass in 
+api.rs
+ for SMTP modules.
+
+FTP Brute Force Module
+[MODIFY] 
+ftp_bruteforce.rs
+The FTP module uses old-style prompt_* functions that don't check ModuleConfig.custom_prompts. When called via API, these block on stdin. Specifically:
+
+run()
+ line 143-209: Uses 
+prompt_port
+, 
+prompt_required
+, 
+prompt_default
+, 
+prompt_yes_no
+ directly
+run_mass_scan()
+ line 437-468: Uses 
+prompt_port
+, 
+prompt_existing_file
+, 
+prompt_int_range
+, 
+prompt_yes_no
+, 
+prompt_default
+Mass scan calls 
+is_ip_checked(&ip)
+ / 
+mark_ip_checked(&ip)
+ without the state_file parameter (the shared utils version requires 2 args, but FTP has its own local functions)
+Fix:
+
+Convert all prompt calls in 
+run()
+ from old-style to cfg_prompt_* variants
+Convert all prompt calls in 
+run_mass_scan()
+ to cfg_prompt_* variants
+Remove the local 
+is_ip_checked
+ / 
+mark_ip_checked
+ / 
+generate_random_public_ip
+ functions and use the shared versions from crate::modules::creds::utils
+API Handler
+[MODIFY] 
+api.rs
+Remove the SMTP skip_capture workaround (lines 526-531) now that the SMTP module won't use the 
+telnet
+ crate.
+
+Template API Commands
+[MODIFY] 
+template-api-commands.txt
+Add FTP brute force template command. All existing commands are preserved.
+
+Verification Plan
+Automated Tests
+Compile check: cargo check — should complete with no errors
+Build: cargo build — should complete successfully
+Manual Verification
+Since the project has no unit tests (#[cfg(test)] not used), testing requires manual API calls:
+
+Start the emulated test servers: python3 test_servers.py
+Build and start the API: cargo run -- --api --api-key test123 --interface 127.0.0.1
+Run the SMTP brute force via API against the emulated SMTP server (port 2525) and confirm output is captured (not [output not captured])
+Run the FTP brute force via API (even though there's no emulated FTP server, verify it doesn't hang on prompts and returns an appropriate error)
+NOTE
+
+The user may want to test manually against the emulated servers. I'll do cargo check to verify compilation and review the template commands for correctness.
+
+
+Brute Force Module Fixes — Walkthrough
+Changes Made
+1. SMTP Module — Telnet Crate Removed
+File: 
+smtp_bruteforce.rs
+
+Replaced telnet::{Telnet, Event} with std::io::{BufRead, BufReader, Write}
+Added 
+read_smtp_line()
+ helper that reads SMTP responses line-by-line via BufReader<&TcpStream>
+Rewrote 
+try_smtp_login()
+ to use writer.write_all() / writer.flush() + 
+read_smtp_line()
+ instead of telnet.write() / telnet.read()
+Why: The 
+telnet
+ crate's dup2()-based I/O conflicted with gag::BufferRedirect, causing the API to return [output not captured] for SMTP modules
+2. API Handler — Removed SMTP Skip
+File: 
+api.rs
+
+Removed skip_capture = module_name.contains("smtp") workaround
+All modules now use the same gag::BufferRedirect stdout capture path
+3. FTP Module — API Compatibility
+File: 
+ftp_bruteforce.rs
+
+Replaced all old-style prompt_* calls with cfg_prompt_* wrappers in both 
+run()
+ and 
+run_mass_scan()
+Switched local duplicate helpers (
+generate_random_public_ip
+, 
+is_ip_checked
+, 
+mark_ip_checked
+) to shared versions from crate::modules::creds::utils
+Added state_file parameter to 
+is_ip_checked()
+/
+mark_ip_checked()
+ calls
+Used 
+parse_exclusions()
+ from shared utils instead of inline loop
+Cleaned up unused imports (rand::Rng, process::Command, Ipv4Addr)
+4. Template Commands
+File: 
+template-api-commands.txt
+
+Added FTP brute force command as module #2
+Updated SMTP comment to reflect output capture now works
+Renumbered all modules: 1. SSH → 2. FTP → 3. MQTT → 4. SMTP → 5. POP3 → 6. SNMP → 7. RDP → 8. RTSP → 9. L2TP → 10. Fortinet → 11. Telnet
+Verification
+cargo check — 0 errors, 1 pre-existing warning (save_results field in 
+ModuleConfig
+ is unused directly)
+All existing commands preserved
+
+
+Save Results + Universal Subnet/IP Scanning
+Wire the save_results field to actually work via API/CLI, and make all brute force modules scan any subnet, not just 0.0.0.0/0.
+
+Proposed Changes
+1. Wire save_results into custom_prompts
+[MODIFY] 
+api.rs
+In 
+run_module()
+, after building 
+ModuleConfig
+, inject save_results, 
+verbose
+, 
+combo_mode
+, stop_on_success, 
+output_file
+ from the dedicated fields into custom_prompts if they're set. This way 
+cfg_prompt_yes_no("save_results", ...)
+ picks them up without any module changes.
+
+diff
+// After building module_config, inject dedicated fields into custom_prompts
++if let Some(v) = module_config.save_results {
++    module_config.custom_prompts.entry("save_results".to_string())
++        .or_insert(if v { "y".to_string() } else { "n".to_string() });
++}
++// Same for verbose, stop_on_success, combo_mode, output_file
+2. Shell passes raw target to modules
+[MODIFY] 
+shell.rs
+In the 
+run
+ command handler (~line 216-225), when the global target is a subnet, pass the full CIDR string (e.g. 192.168.8.0/21) instead of calling 
+get_single_target_ip()
+ which strips it to the network address.
+
+diff
+-match config::GLOBAL_CONFIG.get_single_target_ip() {
+-    Ok(ip) => Some(ip)
++// Pass full raw target (preserves CIDR notation for modules)
++match config::GLOBAL_CONFIG.get_target() {
++    Some(t) => Some(t),
++    None => None,
+[MODIFY] 
+commands/mod.rs
+In 
+run_module()
+ (~line 101-118), same change — pass raw target including CIDR to modules.
+
+3. Shared CIDR expansion helper
+[MODIFY] 
+modules/creds/utils.rs
+Add:
+
+is_subnet_target(target: &str) -> bool — returns true if target contains / and parses as IpNetwork
+expand_subnet(target: &str) -> Vec<IpAddr> — parses CIDR and returns all IPs
+4. Update all brute force modules
+[MODIFY] All 11 modules in src/modules/creds/generic/
+For each module, update the is_mass_scan detection to include subnet targets, and add a run_subnet_scan() path that:
+
+Parses the CIDR into individual IPs
+Iterates with concurrency (reusing existing mass_scan_host())
+No exclusion ranges (user explicitly chose this subnet)
+The pattern for each module:
+
+rust
+// Before:
+let is_mass_scan = target == "random" || target == "0.0.0.0"
+    || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+// After:
+let is_subnet = crate::modules::creds::utils::is_subnet_target(target);
+let is_mass_scan = target == "random" || target == "0.0.0.0"
+    || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+if is_mass_scan {
+    return run_mass_scan(target).await;
+}
+if is_subnet {
+    return run_subnet_scan(target).await;
+}
+The run_subnet_scan() function reuses the module's existing mass_scan_host() logic but:
+
+Expands the CIDR to get all IPs
+Does NOT apply exclusion ranges (user chose this private/public subnet)
+Uses the same concurrency/output_file prompts
+IMPORTANT
+
+Modules that already have mass_scan_host() just need a thin run_subnet_scan() wrapper. No duplication of the core brute logic.
+
+Verification Plan
+Automated Tests
+cargo check — 0 errors
+Manual Verification
+Set target to 192.168.8.0/29 in shell, use creds/generic/ssh_bruteforce, run — should iterate 8 IPs
+API call with "target": "192.168.1.0/30" — should scan 4 IPs
+
+Walkthrough: Save Results + Universal Subnet Scanning
+What Changed
+1. save_results Wiring — 
+api.rs
+Injected save_results, 
+verbose
+, stop_on_success, 
+combo_mode
+, and 
+output_file
+ from 
+ModuleConfig
+ dedicated fields into custom_prompts so 
+cfg_prompt_yes_no("save_results", ...)
+ picks them up automatically via API.
+
+2. Shell/Commands CIDR Passthrough
+shell.rs
+: 
+run
+ command now passes raw CIDR target (e.g. 192.168.8.0/21) directly to modules instead of stripping via 
+get_single_target_ip()
+commands/mod.rs
+: Same fix for CLI mode
+3. Shared CIDR Helpers — 
+creds/utils.rs
+is_subnet_target(target)
+ — detects CIDR notation (contains / with valid prefix length, not 0.0.0.0/0)
+expand_subnet(target)
+ — parses CIDR and returns Vec<IpAddr> of all IPs in the subnet
+4. All 11 Brute Force Modules Updated
+Module	Strategy
+FTP, SMTP, POP3, SNMP, MQTT, RTSP, RDP	Concurrent 
+run_subnet_scan()
+ reusing existing 
+mass_scan_host()
+SSH, L2TP, Fortinet, Telnet	Sequential Box::pin(run(&ip)) iteration per host
+What Was Tested
+Full cargo build — compiles with zero errors
+All 11 module files modified successfully
+How It Works
+User sets target: t 192.168.8.0/24
+Shell passes 192.168.8.0/24 directly to the module
+Module detects CIDR via 
+is_subnet_target()
+Expands to 256 IPs via 
+expand_subnet()
+Scans all IPs (concurrently for modules with 
+mass_scan_host
+, sequentially for others)
+
+Comment
+Ctrl+Alt+M
+
+
+Walkthrough: Save Results + CIDR Testing
+Test Setup
+test_servers.py: SSH:2222, SMTP:2525, POP3:1110, MQTT:1884, Telnet:2323, SNMP:1161, RTSP:5554, Fortinet:4443, L2TP:1701
+Creds: admin/password123, root/toor | SNMP community: public
+Wordlists: test_users.txt (5 users), test_passwords.txt (7 passwords), test_communities.txt (4 strings)
+Single-Target Results (save_results = "y")
+Module	Status	Found	Saved To
+SSH	✅	root:toor	ssh_results.txt
+SMTP	✅	root:toor	smtp_results.txt
+POP3	✅	root:toor	pop3_results.txt
+MQTT	✅	root:toor, admin:password123	mqtt_results.txt
+SNMP	✅	community: public	snmp_results.txt
+RTSP	✅	admin:password123, root:toor	rtsp_results.txt
+Telnet	✅	Runs (mode 4 default check)	—
+FTP	⚠️	No emulator	—
+RDP	⚠️	No emulator (needs xfreerdp)	—
+Fortinet	⏳	Slow HTTPS protocol	—
+L2TP	⏳	Slow UDP L2TP/CHAP	—
+CIDR Subnet Scanning Results
+Module	Target	Status	Found
+SSH	127.0.0.1/32	✅ "Subnet scan complete"	root:toor
+MQTT	127.0.0.1/32	✅ "Subnet detected, mass_scan_host"	root:toor
+POP3	127.0.0.1/32	✅ "Subnet detected"	root:toor
+Files Updated
+template-api-commands.txt
+ — All 11 modules with save_results: "y" + CIDR examples
+
+any subnet range works without OOM:
+
+Before: expand_subnet("/8") tried to allocate 16M IPs into a Vec → OOM crash
+After: 
+
+parse_subnet("/8")
+ returns an IpNetwork and network.iter() lazily yields one IP at a time — zero memory allocation regardless of subnet size
+Even a /0 (4 billion IPs) won't crash — it'll just iterate for a very long time. The semaphore-based concurrency control in each module ensures only N hosts are scanned concurrently (e.g., 50 at a time), so memory stays bounded.
+
+Secure Saved Results API Endpoints
+The project already has GET /api/results (list files) and GET /api/results/{filename} (retrieve a file) in 
+api.rs
+. Both are behind the auth middleware (API key + IP whitelist + rate limiting). However, they currently serve any file type and leak the 
+results_dir
+ path. This plan hardens them to meet the user's requirements.
+
+Proposed Changes
+API Module
+[MODIFY] 
+api.rs
+1. 
+validate_result_filename
+ (line 622–631) — enforce 
+.txt
+ extension:
+
+diff
+fn validate_result_filename(name: &str) -> bool {
+     !name.is_empty()
+         && name.len() <= 255
+         && name.is_ascii()
+         && !name.contains('/')
+         && !name.contains('\\')
+         && !name.contains("..")
+         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+         && !name.starts_with('.')
++        && name.ends_with(".txt")
+ }
+2. 
+list_results
+ (line 634–670) — only list 
+.txt
+ files, remove 
+results_dir
+ from response:
+
+diff
+async fn list_results() -> Json<ApiResponse> {
+     let results_dir = crate::config::results_dir();
+     let mut files: Vec<serde_json::Value> = Vec::new();
+     if let Ok(entries) = std::fs::read_dir(&results_dir) {
+         for entry in entries.flatten() {
+             if let Ok(meta) = entry.metadata() {
+-                if meta.is_file() {
++                if meta.is_file() && !meta.file_type().is_symlink() {
+                     let name = entry.file_name().to_string_lossy().to_string();
+-                    if name.is_ascii() {
++                    if name.is_ascii() && name.ends_with(".txt") && !name.starts_with('.') {
+Remove 
+results_dir
+ from JSON response — only return files array.
+
+3. 
+get_result_file
+ (line 674–748) — enforce 
+.txt
+, verify it's a regular file (not symlink), set Content-Type: text/plain:
+
+After 
+validate_result_filename
+ check (which now enforces 
+.txt
+), add explicit symlink check using symlink_metadata().
+Keep existing canonicalize-based path traversal protection.
+Set Content-Type: text/plain; charset=utf-8 header.
+Security measures already in place (no changes needed):
+
+Layer	Protection
+Auth middleware	API key via Authorization: Bearer header with constant-time comparison
+IP whitelist	~/.rustsploit/ip_whitelist.conf
+Rate limiting	10 req/s per IP
+Body size limit	1 MB max request body
+HTTP method	Both routes are GET-only — no mutation possible
+Path traversal	.. blocked + canonicalize check
+Filename validation	ASCII-only, safe characters
+Verification Plan
+Automated Tests
+Build and verify compilation:
+
+bash
+cd /home/kali/Pictures/Jenkins/rustsploit-thekiaboys && cargo build 2>&1 | tail -20
+Manual Verification
+Create test files and curl the endpoints to verify:
+
+bash
+# Create test files
+mkdir -p ~/.rustsploit/results
+echo "test result" > ~/.rustsploit/results/test_result.txt
+echo "secret data" > ~/.rustsploit/results/secret.json
+echo "hidden" > ~/.rustsploit/results/.hidden.txt
+# Start server (if not running)
+# Test list — should only show .txt files, no .json, no hidden files
+curl -s -H 'Authorization: Bearer <KEY>' http://127.0.0.1:8080/api/results | python3 -m json.tool
+# Test fetch valid .txt
+curl -s -H 'Authorization: Bearer <KEY>' http://127.0.0.1:8080/api/results/test_result.txt | python3 -m json.tool
+# Test fetch .json — should be rejected
+curl -s -H 'Authorization: Bearer <KEY>' http://127.0.0.1:8080/api/results/secret.json | python3 -m json.tool
+# Test path traversal — should be rejected
+curl -s -H 'Authorization: Bearer <KEY>' http://127.0.0.1:8080/api/results/..%2F..%2Fetc%2Fpasswd | python3 -m json.tool
+
+Done! The existing /api/results and /api/results/{filename} endpoints have been hardened with the following security improvements:
+
+.txt only — both listing and retrieval now reject any file that doesn't end with .txt
+Symlink protection — symlinks are explicitly detected and rejected (prevents escaping the results directory)
+No path disclosure — results_dir path is no longer leaked in the list response
+Regular file check — directories, devices, etc. are rejected in the retrieval endpoint
+Hidden file exclusion — files starting with . are filtered out
+All existing protections remain (API key auth, IP whitelist, rate limiting, path traversal prevention, 1MB cap, GET-only). Build compiles cleanly.
+
+
+
+
+Input Sanitization for Brute Force Modules
+All 13 brute force modules receive user input through centralized cfg_prompt_* wrapper functions in 
+utils.rs
+. By hardening these wrappers, every module — across API, CLI, and shell — gets sanitized inputs automatically without touching the 13 individual module files.
+
+Security Gaps Found
+Input Vector	Current State	Risk
+cfg_prompt_required
+ / 
+cfg_prompt_default
+Returns raw string, no sanitization	Control chars, null bytes, excessive length
+cfg_prompt_existing_file
+Checks file exists, no path traversal check	../../etc/shadow accepted if file exists
+Output file names (via 
+cfg_prompt_default
+)	No validation at all	Path traversal, symlink attacks, writing to /etc/
+SSH concurrency/timeout (ad-hoc parse)	Parsed in-module with .unwrap_or()	Not a bug, but inconsistent — some modules use cfg_prompt_int_range
+Proposed Changes
+Utils Module
+[MODIFY] 
+utils.rs
+1. Add sanitize_string_input() helper — strips null bytes, control chars, enforces max length:
+
+rust
+fn sanitize_string_input(input: &str) -> Result<String> {
+    if input.len() > MAX_COMMAND_LENGTH {
+        return Err(anyhow!("Input too long (max {} chars)", MAX_COMMAND_LENGTH));
+    }
+    if input.contains('\0') {
+        return Err(anyhow!("Input contains null bytes"));
+    }
+    let sanitized: String = input.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
+    Ok(sanitized)
+}
+2. Harden cfg_prompt_required — sanitize the value from custom_prompts map:
+
+diff
+pub fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
+     let config = crate::config::get_module_config();
+     if let Some(val) = config.custom_prompts.get(key) {
+-        if !val.is_empty() {
+-            return Ok(val.clone());
+-        }
++        let sanitized = sanitize_string_input(val)?;
++        if !sanitized.is_empty() {
++            return Ok(sanitized);
++        }
+     }
+3. Harden cfg_prompt_default — same sanitization:
+
+diff
+if let Some(val) = config.custom_prompts.get(key) {
+-        return Ok(if val.is_empty() { default.to_string() } else { val.clone() });
++        let sanitized = sanitize_string_input(val)?;
++        return Ok(if sanitized.is_empty() { default.to_string() } else { sanitized });
+     }
+4. Harden cfg_prompt_existing_file — add path traversal and symlink checks:
+
+diff
+if let Some(val) = config.custom_prompts.get(key) {
+         if !val.is_empty() {
+-            if Path::new(val).is_file() {
+-                return Ok(val.clone());
+-            }
+-            return Err(anyhow!("File not found: {}", val));
++            let sanitized = sanitize_string_input(val)?;
++            validate_file_path(&sanitized, true)?;
++            let p = Path::new(&sanitized);
++            // Reject symlinks
++            if let Ok(m) = p.symlink_metadata() {
++                if m.file_type().is_symlink() {
++                    return Err(anyhow!("Symlinks are not allowed: {}", sanitized));
++                }
++            }
++            if p.is_file() {
++                return Ok(sanitized);
++            }
++            return Err(anyhow!("File not found: {}", sanitized));
+         }
+     }
+Also harden the interactive prompt_existing_file with the same checks.
+
+5. Add cfg_prompt_output_file() — dedicated sanitized output filename prompt:
+
+rust
+pub fn cfg_prompt_output_file(key: &str, msg: &str, default: &str) -> Result<String> {
+    let raw = cfg_prompt_default(key, msg, default)?;
+    // Strip to basename only — no directory traversal allowed
+    let filename = Path::new(&raw)
+        .file_name()
+        .ok_or_else(|| anyhow!("Invalid output filename"))?
+        .to_string_lossy()
+        .to_string();
+    // Must be non-empty, ASCII safe, no control chars
+    if filename.is_empty() || filename.starts_with('.') {
+        return Err(anyhow!("Invalid output filename: '{}'", filename));
+    }
+    if filename.contains('\0') || filename.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("Output filename contains invalid characters"));
+    }
+    if filename.len() > 255 {
+        return Err(anyhow!("Output filename too long (max 255 chars)"));
+    }
+    Ok(filename)
+}
+Brute Force Modules (13 files)
+[MODIFY] All modules that use cfg_prompt_default("output_file", ...)
+Replace cfg_prompt_default("output_file", ...) → cfg_prompt_output_file("output_file", ...) in all modules. This is a simple find-and-replace. Affected modules:
+
+ssh_bruteforce.rs, ftp_bruteforce.rs, smtp_bruteforce.rs
+rtsp_bruteforce.rs, fortinet_bruteforce.rs, l2tp_bruteforce.rs
+rdp_bruteforce.rs, mqtt_bruteforce.rs, pop3_bruteforce.rs
+snmp_bruteforce.rs, enablebruteforce.rs, ssh_spray.rs
+telnet_bruteforce.rs (uses cfg_prompt_required("output_file", ...))
+Verification Plan
+Automated Tests
+bash
+cd /home/kali/Pictures/Jenkins/rustsploit-thekiaboys && cargo build 2>&1 | tail -20
+
+Comment
+Ctrl+Alt+M
+
+Input Sanitization — All Brute Force Modules
+What Changed
+Every single user input across all 13 brute force modules is now sanitized, regardless of input source (CLI, shell, API).
+
+Core: 
+utils.rs
+New Function	Purpose
+sanitize_string_input()
+Strips null bytes, control chars, enforces max length — applied to all inputs
+validate_safe_file_path()
+Rejects .. traversal, //, symlinks, null bytes, control chars, long paths
+cfg_prompt_output_file()	Forces basename-only filenames — no directory traversal possible
+prompt_output_file()	Interactive equivalent of above
+Every cfg_prompt_* function was hardened:
+
+Function	Sanitization Added
+read_safe_input	Null bytes, control chars, length limit
+cfg_prompt_required	sanitize_string_input() on API values
+cfg_prompt_default	sanitize_string_input() on API values
+cfg_prompt_yes_no	Sanitization + strict reject of invalid values in API mode
+cfg_prompt_port	Sanitization + error on invalid port in API mode
+cfg_prompt_int_range	Sanitization + error on out-of-range in API mode
+cfg_prompt_existing_file	validate_safe_file_path() — path traversal + symlink protection
+prompt_existing_file	Same as above for interactive mode
+Modules Updated (13 files)
+All output file prompts switched from cfg_prompt_default / cfg_prompt_required → cfg_prompt_output_file:
+
+ssh_bruteforce.rs
+ — output file + unknown responses file
+ftp_bruteforce.rs
+ — 3 output points
+ftp_anonymous.rs
+ — mass scan output
+smtp_bruteforce.rs
+ — 3 output points
+telnet_bruteforce.rs
+ — 4 output points + config save path
+rtsp_bruteforce.rs
+ — 3 output points
+rdp_bruteforce.rs
+ — 3 output points
+snmp_bruteforce.rs
+ — 3 output points
+pop3_bruteforce.rs
+ — 3 output points
+mqtt_bruteforce.rs
+ — 2 output points
+fortinet_bruteforce.rs
+ — 1 output point
+l2tp_bruteforce.rs
+ — 1 output point
+ssh_spray.rs
+ — local prompts hardened + basename output
+Attacks Mitigated
+Attack	Before	After
+Path traversal (../../etc/shadow)	File accepted if it exists	Rejected — .. blocked in paths
+Symlink attacks	Followed silently	Rejected — symlink check on all file paths
+Directory traversal in output (/etc/passwd)	Wrote anywhere	Forced to basename only
+Null byte injection (file%00.txt)	Passed through	Rejected with error
+Control char injection (escape sequences)	Passed through	Stripped from all inputs
+Oversized inputs (DoS)	Only CLI checked	All sources checked (CLI + API)
+Invalid API values (bad port, bad boolean)	Silently fell back to defaults	Error returned with clear message
+Verification
+cargo build → 0 errors, 0 warnings ✓

@@ -22,10 +22,12 @@ use tokio::{
 use rand::Rng;
 
 use crate::utils::{
-    prompt_yes_no, prompt_wordlist, prompt_default, prompt_int_range, prompt_port,
     load_lines, get_filename_in_current_dir, normalize_target,
+    cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port,
+    cfg_prompt_existing_file,
+    cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::BruteforceStats;
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
@@ -73,31 +75,36 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
+    if is_subnet_target(target) {
+        println!("{}", "[*] Mode: Subnet Scan".cyan());
+        return run_subnet_scan(target).await;
+    }
+
     // --- Standard Single-Target Logic ---
 
-    let port: u16 = prompt_port("RTSP Port", 554)?;
+    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554)?;
 
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
 
-    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 10000)? as usize;
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let _save_results = prompt_yes_no("Save results to file?", true)?;
-    let save_path = if _save_results {
-        Some(prompt_default("Output file", "rtsp_results.txt")?)
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
+    let save_path = if save_results {
+        Some(cfg_prompt_output_file("output_file", "Output file", "rtsp_results.txt")?)
     } else {
         None
     };
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every pass with every user)", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false)?;
 
-    let advanced_mode = prompt_yes_no("Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false)?;
+    let advanced_mode = cfg_prompt_yes_no("advanced_mode", "Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false)?;
     let mut advanced_headers: Vec<String> = Vec::new();
     let advanced_command = if advanced_mode {
-        let method = prompt_default("RTSP method to use (e.g. DESCRIBE)", "DESCRIBE")?;
-        if prompt_yes_no("Load extra RTSP headers from a file?", false)? {
-            let headers_path = prompt_wordlist("Path to RTSP headers file")?;
+        let method = cfg_prompt_default("rtsp_method", "RTSP method to use (e.g. DESCRIBE)", "DESCRIBE")?;
+        if cfg_prompt_yes_no("load_headers_file", "Load extra RTSP headers from a file?", false)? {
+            let headers_path = cfg_prompt_existing_file("headers_file", "Path to RTSP headers file")?;
             advanced_headers = load_lines(&headers_path)?;
         }
         Some(method)
@@ -153,9 +160,9 @@ pub async fn run(target: &str) -> Result<()> {
         return Ok(());
     }
 
-    let brute_force_paths = prompt_yes_no("Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
+    let brute_force_paths = cfg_prompt_yes_no("brute_force_paths", "Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
     let mut paths = if brute_force_paths {
-        let paths_file = prompt_wordlist("Path to RTSP paths file")?;
+        let paths_file = cfg_prompt_existing_file("paths_file", "Path to RTSP paths file")?;
         load_lines(&paths_file)?
     } else {
         vec!["".to_string()]
@@ -304,16 +311,77 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run subnet scan - iterate over all IPs in a CIDR range
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
+
+    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554)?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let paths_file = cfg_prompt_existing_file("paths_file", "RTSP paths file (empty for none/root)")?;
+    let users = load_lines(&usernames_file)?;
+    let pass_lines = load_lines(&passwords_file)?;
+    let mut paths = load_lines(&paths_file)?;
+    if paths.is_empty() { paths.push("".to_string()); }
+    if users.is_empty() || pass_lines.is_empty() { return Err(anyhow!("Wordlists cannot be empty")); }
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rtsp_subnet_results.txt")?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((users, pass_lines, paths));
+    let total = count;
+
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!("[*] Status: {}/{} IPs scanned, {} RTSP streams found",
+                s_checked.load(Ordering::Relaxed), total,
+                s_found.load(Ordering::Relaxed).to_string().green().bold());
+        }
+    });
+
+    for ip in network.iter() {
+        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
+        let cp = creds_pkg.clone();
+        let sc = stats_checked.clone();
+        let sf = stats_found.clone();
+        let of = output_file.clone();
+
+        tokio::spawn(async move {
+            mass_scan_host(ip, port, cp, sf, of, verbose).await;
+            sc.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+        });
+    }
+
+    for _ in 0..concurrency {
+        let _ = semaphore.acquire().await.context("Semaphore")?;
+    }
+
+    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} RTSP streams found.",
+        stats_checked.load(Ordering::Relaxed),
+        stats_found.load(Ordering::Relaxed)).cyan().bold());
+    Ok(())
+}
+
 /// Run mass scan logic (Hose style)
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep wordlists
     println!("{}", "[*] Preparing Mass Scan configuration...".blue());
     
-    let port: u16 = prompt_port("RTSP Port", 554)?;
+    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554)?;
     
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
-    let paths_file = prompt_wordlist("RTSP paths file (empty for none/root)")?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let paths_file = cfg_prompt_existing_file("paths_file", "RTSP paths file (empty for none/root)")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -326,10 +394,10 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         return Err(anyhow!("Wordlists cannot be empty"));
     }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
 
-    let output_file = prompt_default("Output result file", "rtsp_mass_results.txt")?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rtsp_mass_results.txt")?;
 
     // Parse exclusions
     let mut exclusion_subnets = Vec::new();

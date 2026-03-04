@@ -44,24 +44,61 @@ pub fn verbose_log(verbose: bool, message: &str) {
 // INPUT HANDLING
 // ============================================================
 
+/// Sanitize an arbitrary string value: strip null bytes, control characters,
+/// and enforce maximum length. Used to sanitize ALL user-supplied values
+/// regardless of input source (CLI, shell, or API).
+fn sanitize_string_input(input: &str) -> Result<String> {
+    if input.len() > MAX_COMMAND_LENGTH {
+        return Err(anyhow!("Input too long (max {} chars)", MAX_COMMAND_LENGTH));
+    }
+    if input.contains('\0') {
+        return Err(anyhow!("Input contains null bytes"));
+    }
+    // Strip control characters except tab (allow tab in payloads)
+    let sanitized: String = input.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
+    Ok(sanitized)
+}
+
+/// Validate a file path for safety: rejects path traversal, null bytes,
+/// control characters, symlinks, and excessively long paths.
+fn validate_safe_file_path(path: &str) -> Result<String> {
+    let sanitized = sanitize_string_input(path)?;
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("File path cannot be empty"));
+    }
+    if trimmed.len() > MAX_PATH_LENGTH {
+        return Err(anyhow!("File path too long (max {} chars)", MAX_PATH_LENGTH));
+    }
+    // Reject path traversal
+    if trimmed.contains("..") {
+        return Err(anyhow!("Path traversal detected: '..' is not allowed in file paths"));
+    }
+    if trimmed.contains("//") {
+        return Err(anyhow!("Invalid path: double slashes are not allowed"));
+    }
+    // Reject symlinks
+    let p = Path::new(trimmed);
+    if let Ok(m) = p.symlink_metadata() {
+        if m.file_type().is_symlink() {
+            return Err(anyhow!("Symlinks are not allowed: {}", trimmed));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Reads input from stdin, treating it as a literal string payload.
 /// - Enforces max length (MAX_COMMAND_LENGTH).
-/// - Returns raw text (trimmed) without analysis.
+/// - Strips null bytes and control characters.
+/// - Returns sanitized text (trimmed).
 fn read_safe_input() -> Result<String> {
     std::io::stdout().flush().context("Failed to flush stdout")?;
     let mut s = String::new();
     std::io::stdin().read_line(&mut s).context("Failed to read input")?;
-    
-    // 1. Length Check
-    if s.len() > MAX_COMMAND_LENGTH {
-         return Err(anyhow!(
-            "Input too long (max {} characters)",
-            MAX_COMMAND_LENGTH
-        ));
-    }
-    
-    // Treat as literal plain text
-    Ok(s.trim().to_string())
+    let trimmed = s.trim().to_string();
+    sanitize_string_input(&trimmed)
 }
 
 // ============================================================
@@ -145,13 +182,21 @@ pub fn prompt_port(msg: &str, default: u16) -> Result<u16> {
 
 
 /// Prompts for an existing file path.
+/// Validates against path traversal, symlinks, and control characters.
 pub fn prompt_existing_file(msg: &str) -> Result<String> {
     loop {
         let candidate = prompt_required(msg)?;
-        if Path::new(&candidate).is_file() {
-            return Ok(candidate);
-        } else {
-            println!("{}", format!("File '{}' does not exist or is not a regular file.", candidate).yellow());
+        match validate_safe_file_path(&candidate) {
+            Ok(safe_path) => {
+                if Path::new(&safe_path).is_file() {
+                    return Ok(safe_path);
+                } else {
+                    println!("{}", format!("File '{}' does not exist or is not a regular file.", safe_path).yellow());
+                }
+            }
+            Err(e) => {
+                println!("{}", format!("Invalid path: {}", e).yellow());
+            }
         }
     }
 }
@@ -159,6 +204,189 @@ pub fn prompt_existing_file(msg: &str) -> Result<String> {
 /// Prompts for a wordlist file path.
 pub fn prompt_wordlist(msg: &str) -> Result<String> {
     prompt_existing_file(msg)
+}
+
+/// Prompts for a safe output filename (basename only, no directory traversal).
+pub fn prompt_output_file(msg: &str, default: &str) -> Result<String> {
+    loop {
+        let raw = prompt_default(msg, default)?;
+        let filename = Path::new(&raw)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if filename.is_empty() || filename.starts_with('.') {
+            println!("{}", "Invalid output filename. Cannot be empty or start with '.'".yellow());
+            continue;
+        }
+        if filename.len() > 255 {
+            println!("{}", "Filename too long (max 255 chars).".yellow());
+            continue;
+        }
+        return Ok(filename);
+    }
+}
+
+// ============================================================
+// CONFIG-AWARE PROMPT WRAPPERS
+// These check ModuleConfig.custom_prompts first, falling back
+// to interactive stdin if no value is pre-set.
+// ============================================================
+
+/// Config-aware required prompt.
+/// If `key` exists in `ModuleConfig.custom_prompts`, returns that value (sanitized).
+/// Otherwise falls back to interactive `prompt_required(msg)`.
+pub fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        let sanitized = sanitize_string_input(val)
+            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+        if !sanitized.is_empty() {
+            return Ok(sanitized);
+        }
+    }
+    if config.api_mode {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    }
+    prompt_required(msg)
+}
+
+/// Config-aware prompt with default value. All values are sanitized.
+pub fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<String> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        let sanitized = sanitize_string_input(val)
+            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+        return Ok(if sanitized.is_empty() { default.to_string() } else { sanitized });
+    }
+    if config.api_mode {
+        return Ok(default.to_string());
+    }
+    prompt_default(msg, default)
+}
+
+/// Config-aware yes/no prompt.
+/// Sanitizes input, then accepts "y", "yes", "true", "1" as true;
+/// "n", "no", "false", "0" as false. Rejects unexpected values in API mode.
+pub fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Result<bool> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        let sanitized = sanitize_string_input(val)
+            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+        match sanitized.to_lowercase().trim() {
+            "y" | "yes" | "true" | "1" => return Ok(true),
+            "n" | "no" | "false" | "0" => return Ok(false),
+            other if !other.is_empty() && config.api_mode => {
+                return Err(anyhow!(
+                    "Invalid boolean value for '{}': '{}'. Use y/n/yes/no/true/false/1/0.",
+                    key, other
+                ));
+            }
+            _ => {} // fall through to interactive
+        }
+    }
+    if config.api_mode {
+        return Ok(default_yes);
+    }
+    prompt_yes_no(msg, default_yes)
+}
+
+/// Config-aware port prompt. Sanitizes input, validates port range 1-65535.
+pub fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        let sanitized = sanitize_string_input(val)
+            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+        let trimmed = sanitized.trim();
+        if !trimmed.is_empty() {
+            match trimmed.parse::<u16>() {
+                Ok(p) if p > 0 => return Ok(p),
+                Ok(_) => return Err(anyhow!("Invalid port for '{}': port cannot be 0", key)),
+                Err(_) => {
+                    if config.api_mode {
+                        return Err(anyhow!("Invalid port value for '{}': '{}'", key, trimmed));
+                    }
+                    // fall through to interactive
+                }
+            }
+        }
+    }
+    if config.api_mode {
+        return Ok(default);
+    }
+    prompt_port(msg, default)
+}
+
+/// Config-aware file path prompt (validates file exists).
+/// Sanitizes input, rejects path traversal, symlinks, and control characters.
+pub fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        if !val.is_empty() {
+            let safe_path = validate_safe_file_path(val)
+                .map_err(|e| anyhow!("Invalid file path for '{}': {}", key, e))?;
+            if Path::new(&safe_path).is_file() {
+                return Ok(safe_path);
+            }
+            return Err(anyhow!("File not found: {}", safe_path));
+        }
+    }
+    if config.api_mode {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply a valid file path in the 'prompts' field.", key, msg));
+    }
+    prompt_existing_file(msg)
+}
+
+/// Config-aware integer range prompt. Sanitizes input, validates range bounds.
+pub fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        let sanitized = sanitize_string_input(val)
+            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+        let trimmed = sanitized.trim();
+        if !trimmed.is_empty() {
+            match trimmed.parse::<i64>() {
+                Ok(n) if n >= min && n <= max => return Ok(n),
+                Ok(n) => {
+                    if config.api_mode {
+                        return Err(anyhow!(
+                            "Value for '{}' out of range: {} (must be {}-{})",
+                            key, n, min, max
+                        ));
+                    }
+                    // fall through to interactive
+                }
+                Err(_) => {
+                    if config.api_mode {
+                        return Err(anyhow!("Invalid numeric value for '{}': '{}'", key, trimmed));
+                    }
+                    // fall through to interactive
+                }
+            }
+        }
+    }
+    if config.api_mode {
+        return Ok(default);
+    }
+    prompt_int_range(msg, default, min, max)
+}
+
+/// Config-aware output file prompt.
+/// Forces basename only (no directory traversal), rejects hidden files,
+/// null bytes, control characters, and excessively long names.
+pub fn cfg_prompt_output_file(key: &str, msg: &str, default: &str) -> Result<String> {
+    let raw = cfg_prompt_default(key, msg, default)?;
+    // Extract basename only — prevents any directory traversal
+    let filename = Path::new(&raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if filename.is_empty() || filename.starts_with('.') {
+        return Err(anyhow!("Invalid output filename: '{}'. Cannot be empty or start with '.'", raw));
+    }
+    if filename.len() > 255 {
+        return Err(anyhow!("Output filename too long (max 255 chars)"));
+    }
+    Ok(filename)
 }
 
 // ============================================================
@@ -282,8 +510,7 @@ pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
         }
     }
     
-    // Basic path validation - ensure it's a reasonable path
-    let _path_obj = Path::new(trimmed);
+    // Basic path validation
     
     // Check for null bytes (shouldn't happen after trim, but double-check)
     if trimmed.contains('\x00') {

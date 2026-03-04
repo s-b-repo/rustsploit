@@ -379,7 +379,6 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 (icmp_probe_id, packet_bytes, protocol_used, os_sig_params)
             };
 
-            let _t0 = Instant::now();
             let response = send_and_receive_one(
                 dst_ip,
                 &packet_bytes,

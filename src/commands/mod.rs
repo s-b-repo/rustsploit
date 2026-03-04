@@ -100,15 +100,13 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
     // 2. Resolve target
     let target_str = if raw_target.is_empty() {
         if config::GLOBAL_CONFIG.has_target() {
-            match config::GLOBAL_CONFIG.get_single_target_ip() {
-                Ok(ip) => {
-                    println!("[*] Using global target: {}", match config::GLOBAL_CONFIG.get_target() {
-                        Some(t) => t,
-                        None => String::new(),
-                    });
-                    ip
+            // Pass full raw target (preserves CIDR notation for modules)
+            match config::GLOBAL_CONFIG.get_target() {
+                Some(t) => {
+                    println!("[*] Using global target: {}", t);
+                    t
                 }
-                Err(e) => return Err(anyhow::anyhow!("Global target error: {}", e)),
+                None => return Err(anyhow::anyhow!("No global target set")),
             }
         } else {
             return Err(anyhow::anyhow!("No target specified."));

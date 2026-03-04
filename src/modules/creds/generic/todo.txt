@@ -1,0 +1,3 @@
+i want to move all prompt stuff from utils.rs to config.rs same with sanitization can you migrate dupes to config.rs  
+
+do not let anycode be dead or unintentional everything should be used do this for  l2tp module  and audit the code for bugs like oom etc all code should handlle logic and edge cases like 200 gb wordlists etc and no used or dead or unintentional code 

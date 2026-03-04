@@ -8,8 +8,10 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
 use tower_http::{
@@ -61,7 +63,16 @@ pub struct ApiState {
     verbose: bool,
     /// Optional IP whitelist — if non-empty, only these IPs can access the API
     ip_whitelist: Arc<Vec<String>>,
+    /// Persistent module selection (mirrors ShellContext.current_module)
+    current_module: Arc<Mutex<Option<String>>>,
+    /// Per-IP rate limiter: IP -> (request_count, window_start)
+    rate_limiter: Arc<Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>>,
 }
+
+/// Max requests per IP per window
+const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
+/// Rate limit window duration (1 second)
+const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 
 // ─── Request / Response Types ───────────────────────────────────────
 
@@ -94,6 +105,7 @@ fn err_response(message: impl Into<String>, code: &str) -> ApiResponse {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunModuleRequest {
     pub module: String,
     pub target: String,
@@ -107,6 +119,9 @@ pub struct RunModuleRequest {
     pub output_file: Option<String>,
     pub verbose: Option<bool>,
     pub combo_mode: Option<bool>,
+    /// Generic prompt overrides — any key/value pair that modules read via
+    /// `cfg_prompt_*()`. Examples: {"mode": "1", "timeout": "5", "retries": "3"}
+    pub prompts: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,6 +132,23 @@ pub struct SetTargetRequest {
 #[derive(Serialize, Deserialize)]
 pub struct HoneypotCheckRequest {
     pub target: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExecRequest {
+    /// Single command (backward compatible)
+    pub command: Option<String>,
+    /// Array of commands for chaining (preferred, more secure than string splitting)
+    pub commands: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExecResult {
+    command: String,
+    success: bool,
+    output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
 }
 
 // ─── Validation Helpers ─────────────────────────────────────────────
@@ -131,6 +163,40 @@ fn validate_target(target: &str) -> bool {
     !target.is_empty() && target.len() <= 2048 && !target.chars().any(|c| c.is_control())
 }
 
+/// Check if a target IP is a blocked internal/metadata address.
+/// Blocks cloud metadata IPs (169.254.0.0/16), null addresses (0.0.0.0), etc.
+fn is_blocked_target(target: &str) -> bool {
+    let ip_str = target.split(':').next().unwrap_or(target);
+    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                // Block link-local / cloud metadata (169.254.0.0/16)
+                if v4.octets()[0] == 169 && v4.octets()[1] == 254 {
+                    return true;
+                }
+                // Block 0.0.0.0
+                if v4.is_unspecified() {
+                    return true;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_unspecified() {
+                    return true;
+                }
+            }
+        }
+    }
+    // Also check raw string for targets like "169.254.169.254:80"
+    ip_str.starts_with("169.254.")
+}
+
+/// Check if exec input contains shell metacharacters that could enable injection.
+fn contains_shell_metacharacters(input: &str) -> bool {
+    input.chars().any(|c| matches!(c, '&' | '|' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r'))
+        || input.contains("$(")
+        || input.contains("${")
+}
+
 // ─── Auth Middleware ────────────────────────────────────────────────
 
 async fn auth_middleware(
@@ -140,6 +206,33 @@ async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Rate limiting (runs first, before auth, to prevent unauthenticated floods)
+    {
+        let ip = addr.ip();
+        let now = Instant::now();
+        if let Ok(mut limiter) = state.rate_limiter.lock() {
+            let entry = limiter.entry(ip).or_insert((0, now));
+            if now.duration_since(entry.1).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+                *entry = (1, now);
+            } else {
+                entry.0 += 1;
+                if entry.0 > RATE_LIMIT_MAX_REQUESTS {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(err_response(
+                            format!(
+                                "Rate limit exceeded: max {} requests per second",
+                                RATE_LIMIT_MAX_REQUESTS
+                            ),
+                            "RATE_LIMITED",
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     // IP whitelist check (if configured)
     if !state.ip_whitelist.is_empty() {
         let client_ip = addr.ip().to_string();
@@ -373,6 +466,16 @@ async fn run_module(
         )
             .into_response();
     }
+    if is_blocked_target(target_raw) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(err_response(
+                "Target is a blocked internal/metadata address (link-local 169.254.0.0/16 or 0.0.0.0)",
+                "BLOCKED_TARGET",
+            )),
+        )
+            .into_response();
+    }
 
     // Check module exists
     if !commands::discover_modules().contains(&module_name.to_string()) {
@@ -387,7 +490,7 @@ async fn run_module(
     }
 
     // Set module config (like CLI does via prompts, the API passes them in the request)
-    let module_config = crate::config::ModuleConfig {
+    let mut module_config = crate::config::ModuleConfig {
         port: payload.port,
         username_wordlist: payload.username_wordlist.clone(),
         password_wordlist: payload.password_wordlist.clone(),
@@ -397,7 +500,33 @@ async fn run_module(
         output_file: payload.output_file.clone(),
         verbose: payload.verbose,
         combo_mode: payload.combo_mode,
+        custom_prompts: payload.prompts.clone().unwrap_or_default(),
+        api_mode: true,
     };
+
+    // Inject dedicated fields into custom_prompts so cfg_prompt_* picks them up.
+    // Only insert if not already set by the explicit prompts map.
+    if let Some(v) = module_config.save_results {
+        module_config.custom_prompts.entry("save_results".into())
+            .or_insert(if v { "y".into() } else { "n".into() });
+    }
+    if let Some(v) = module_config.verbose {
+        module_config.custom_prompts.entry("verbose".into())
+            .or_insert(if v { "y".into() } else { "n".into() });
+    }
+    if let Some(v) = module_config.stop_on_success {
+        module_config.custom_prompts.entry("stop_on_success".into())
+            .or_insert(if v { "y".into() } else { "n".into() });
+    }
+    if let Some(v) = module_config.combo_mode {
+        module_config.custom_prompts.entry("combo_mode".into())
+            .or_insert(if v { "y".into() } else { "n".into() });
+    }
+    if let Some(ref v) = module_config.output_file {
+        module_config.custom_prompts.entry("output_file".into())
+            .or_insert(v.clone());
+    }
+
     crate::config::set_module_config(module_config);
 
     let verbose = state.verbose || payload.verbose.unwrap_or(false);
@@ -409,13 +538,50 @@ async fn run_module(
         );
     }
 
-    // Run synchronously (same as CLI `run` command)
-    let result = commands::run_module(module_name, target_raw, verbose).await;
+    // Run synchronously with stdout/stderr capture
+    // CWD to results directory so module File::create calls write there
+    let results_dir = crate::config::results_dir();
+    let original_dir = std::env::current_dir().ok();
+    let _ = std::env::set_current_dir(&results_dir);
+
+    // Capture stdout during module execution.
+    let captured_output = {
+        use std::io::Read;
+        let mut stdout_buf = gag::BufferRedirect::stdout()
+            .unwrap_or_else(|_| gag::BufferRedirect::stdout().unwrap());
+        let mut stderr_buf = gag::BufferRedirect::stderr()
+            .unwrap_or_else(|_| gag::BufferRedirect::stderr().unwrap());
+
+        let result = commands::run_module(module_name, target_raw, verbose).await;
+
+        let mut stdout_output = String::new();
+        let mut stderr_output = String::new();
+        let _ = stdout_buf.read_to_string(&mut stdout_output);
+        let _ = stderr_buf.read_to_string(&mut stderr_output);
+        drop(stdout_buf);
+        drop(stderr_buf);
+
+        (result, stdout_output, stderr_output)
+    };
+
+    // Restore CWD
+    if let Some(dir) = original_dir {
+        let _ = std::env::set_current_dir(dir);
+    }
 
     // Clear module config after execution
     crate::config::clear_module_config();
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    let (result, stdout_output, stderr_output) = captured_output;
+
+    // Truncate output to prevent huge responses (max 64KB)
+    let max_output = 64 * 1024;
+    let stdout_truncated = if stdout_output.len() > max_output {
+        format!("{}\n... (output truncated at {} bytes)", &stdout_output[..max_output], stdout_output.len())
+    } else {
+        stdout_output
+    };
 
     match result {
         Ok(_) => (
@@ -430,6 +596,8 @@ async fn run_module(
                     "target": target_raw,
                     "status": "completed",
                     "duration_ms": duration_ms,
+                    "output": stdout_truncated,
+                    "stderr": stderr_output,
                 })),
             )),
         )
@@ -448,6 +616,198 @@ async fn run_module(
     }
 }
 
+// ─── Results File Retrieval ─────────────────────────────────────────
+
+/// Validate a result filename: ASCII-only, no path components, safe characters, .txt only.
+fn validate_result_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.is_ascii()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && !name.starts_with('.')
+        && name.ends_with(".txt")
+}
+
+/// GET /api/results — list saved .txt result files in the results directory
+/// Only regular .txt files are listed; symlinks, hidden files, and non-.txt files are excluded.
+async fn list_results() -> Json<ApiResponse> {
+    let results_dir = crate::config::results_dir();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&results_dir) {
+        for entry in entries.flatten() {
+            // Use symlink_metadata to detect symlinks (metadata() follows symlinks)
+            let symlink_meta = match entry.path().symlink_metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            // Skip symlinks entirely — prevent symlink-based path escapes
+            if symlink_meta.file_type().is_symlink() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Only list .txt files, ASCII names, no hidden files
+                    if name.is_ascii()
+                        && name.ends_with(".txt")
+                        && !name.starts_with('.')
+                    {
+                        files.push(serde_json::json!({
+                            "name": name,
+                            "size_bytes": meta.len(),
+                            "modified": meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs()),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    files.sort_by(|a, b| {
+        let a_name = a["name"].as_str().unwrap_or("");
+        let b_name = b["name"].as_str().unwrap_or("");
+        a_name.cmp(b_name)
+    });
+
+    Json(ok_response(
+        format!("{} result file(s) found", files.len()),
+        Some(serde_json::json!({
+            "files": files,
+        })),
+    ))
+}
+
+/// GET /api/results/{filename} — retrieve a specific saved .txt result file
+/// Filename must be ASCII-only, end with .txt, no path separators, safe characters only.
+/// Returns the file content as plain text within a JSON envelope.
+async fn get_result_file(
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> Response {
+    // validate_result_filename enforces .txt extension, ASCII-only, no path separators, etc.
+    if !validate_result_filename(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(err_response(
+                "Invalid filename. Must be ASCII-only, end with .txt, no path separators, only alphanumeric/underscore/dash/dot.",
+                "INVALID_FILENAME",
+            )),
+        )
+            .into_response();
+    }
+
+    let results_dir = crate::config::results_dir();
+    let file_path = results_dir.join(&filename);
+
+    // Reject symlinks before canonicalizing — prevents following malicious symlinks
+    match file_path.symlink_metadata() {
+        Ok(sym_meta) => {
+            if sym_meta.file_type().is_symlink() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(err_response("Access denied: symlinks are not allowed", "SYMLINK_DENIED")),
+                )
+                    .into_response();
+            }
+        }
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(err_response(
+                    format!("Result file '{}' not found", filename),
+                    "NOT_FOUND",
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    // Double-check the resolved path is still inside results_dir (canonicalize to prevent path escapes)
+    match file_path.canonicalize() {
+        Ok(canonical) => {
+            let results_canonical = results_dir.canonicalize().unwrap_or(results_dir.clone());
+            if !canonical.starts_with(&results_canonical) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(err_response("Access denied: path escapes results directory", "PATH_TRAVERSAL")),
+                )
+                    .into_response();
+            }
+        }
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(err_response(
+                    format!("Result file '{}' not found", filename),
+                    "NOT_FOUND",
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    // Verify it's a regular file (not a directory, device, etc.)
+    match file_path.metadata() {
+        Ok(meta) if !meta.is_file() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(err_response("Requested path is not a regular file", "NOT_A_FILE")),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(err_response(
+                    format!("Result file '{}' not found", filename),
+                    "NOT_FOUND",
+                )),
+            )
+                .into_response();
+        }
+        _ => {}
+    }
+
+    match std::fs::read_to_string(&file_path) {
+        Ok(content) => {
+            // Cap at 1MB to prevent memory exhaustion
+            let max_size = 1024 * 1024;
+            let content = if content.len() > max_size {
+                format!("{}\n... (truncated at {} bytes, total: {} bytes)",
+                    &content[..max_size], max_size, content.len())
+            } else {
+                content
+            };
+
+            (
+                StatusCode::OK,
+                Json(ok_response(
+                    format!("File '{}' retrieved", filename),
+                    Some(serde_json::json!({
+                        "filename": filename,
+                        "content": content,
+                        "size_bytes": file_path.metadata().map(|m| m.len()).unwrap_or(0),
+                    })),
+                )),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(err_response(
+                format!("Could not read file '{}': {}", filename, e),
+                "READ_ERROR",
+            )),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/honeypot-check — honeypot port scan (like CLI pre-run check)
 async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
     let target_raw = payload.target.as_str();
@@ -456,6 +816,16 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
         return (
             StatusCode::BAD_REQUEST,
             Json(err_response("Invalid target format", "INVALID_TARGET")),
+        )
+            .into_response();
+    }
+    if is_blocked_target(target_raw) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(err_response(
+                "Target is a blocked internal/metadata address (link-local 169.254.0.0/16 or 0.0.0.0)",
+                "BLOCKED_TARGET",
+            )),
         )
             .into_response();
     }
@@ -527,6 +897,378 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
         .into_response()
 }
 
+// ─── Shell-Parity Exec Endpoint ─────────────────────────────────────
+
+/// POST /api/exec — execute internal commands remotely (mirrors interactive shell)
+/// Supports secure command chaining via JSON array `commands` field.
+/// Each command is individually validated — no shell metacharacters allowed.
+async fn exec_command(
+    State(state): State<ApiState>,
+    Json(payload): Json<ExecRequest>,
+) -> Response {
+    // Build command list from either `commands` (array) or `command` (single string)
+    let command_list: Vec<String> = if let Some(cmds) = &payload.commands {
+        if cmds.is_empty() || cmds.len() > 20 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(err_response("Commands array must have 1-20 entries", "INVALID_INPUT")),
+            ).into_response();
+        }
+        cmds.clone()
+    } else if let Some(cmd) = &payload.command {
+        vec![cmd.clone()]
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(err_response("Provide 'command' (string) or 'commands' (array)", "INVALID_INPUT")),
+        ).into_response();
+    };
+
+    let mut results: Vec<ExecResult> = Vec::new();
+
+    for raw_cmd in &command_list {
+        let trimmed = raw_cmd.trim().to_string();
+        if trimmed.is_empty() || trimmed.len() > 4096 {
+            results.push(ExecResult {
+                command: trimmed,
+                success: false,
+                output: "Command is empty or too long (max 4096 chars)".to_string(),
+                duration_ms: None,
+            });
+            continue;
+        }
+
+        // Validate each individual command against shell metacharacters
+        if contains_shell_metacharacters(&trimmed) {
+            results.push(ExecResult {
+                command: trimmed,
+                success: false,
+                output: "Command contains forbidden characters (& | ; ` $ > <). Use the 'commands' JSON array for chaining.".to_string(),
+                duration_ms: None,
+            });
+            continue;
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let cmd = match parts.next() {
+            Some(c) => c.to_lowercase(),
+            None => continue,
+        };
+        let rest = parts.next().unwrap_or("").trim().to_string();
+        let command_key = crate::shell::resolve_command(&cmd);
+
+        let start = std::time::Instant::now();
+
+        match command_key.as_str() {
+            "help" => {
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: "Available commands: help, modules, find <query>, use <module>, \
+                             set/target <ip>, show_target, clear_target, run, run_all, back, exit"
+                        .to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            "modules" => {
+                let modules = commands::discover_modules();
+                let mut exploits = Vec::new();
+                let mut scanners = Vec::new();
+                let mut creds = Vec::new();
+                for m in &modules {
+                    if m.starts_with("exploits/") { exploits.push(m.as_str()); }
+                    else if m.starts_with("scanners/") { scanners.push(m.as_str()); }
+                    else if m.starts_with("creds/") { creds.push(m.as_str()); }
+                }
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: serde_json::json!({
+                        "total": modules.len(),
+                        "exploits": exploits,
+                        "scanners": scanners,
+                        "creds": creds,
+                    }).to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            "find" => {
+                if rest.is_empty() {
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: find <query>".to_string(),
+                        duration_ms: None,
+                    });
+                } else {
+                    let query = rest.to_lowercase();
+                    let modules = commands::discover_modules();
+                    let matches: Vec<&String> = modules.iter()
+                        .filter(|m| m.to_lowercase().contains(&query))
+                        .collect();
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({
+                            "query": query,
+                            "matches": matches,
+                            "count": matches.len(),
+                        }).to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            "use" => {
+                if rest.is_empty() {
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: use <module_path>".to_string(),
+                        duration_ms: None,
+                    });
+                } else {
+                    let sanitized = crate::shell::sanitize_module_path(&rest);
+                    match sanitized {
+                        Some(path) => {
+                            let modules = commands::discover_modules();
+                            let found = modules.iter().any(|m| m == &path)
+                                || modules.iter().any(|m| {
+                                    m.rsplit_once('/').map(|(_, s)| s == path).unwrap_or(false)
+                                });
+                            if found {
+                                if let Ok(mut cm) = state.current_module.lock() {
+                                    *cm = Some(path.clone());
+                                }
+                                results.push(ExecResult {
+                                    command: trimmed.to_string(),
+                                    success: true,
+                                    output: format!("Module selected: {}", path),
+                                    duration_ms: None,
+                                });
+                            } else {
+                                // Fuzzy suggestion
+                                let best = modules.iter()
+                                    .map(|m| (m, strsim::levenshtein(&path, m)))
+                                    .min_by_key(|(_, d)| *d);
+                                let suggestion = if let Some((s, d)) = best {
+                                    if d < 5 { format!(" Did you mean: {}?", s) } else { String::new() }
+                                } else {
+                                    String::new()
+                                };
+                                results.push(ExecResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: format!("Unknown module '{}'.{}", path, suggestion),
+                                    duration_ms: None,
+                                });
+                            }
+                        }
+                        None => {
+                            results.push(ExecResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: "Invalid module path".to_string(),
+                                duration_ms: None,
+                            });
+                        }
+                    }
+                }
+            }
+
+            "set" => {
+                if rest.is_empty() {
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: set <target>".to_string(),
+                        duration_ms: None,
+                    });
+                } else if !validate_target(&rest) {
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Invalid target".to_string(),
+                        duration_ms: None,
+                    });
+                } else {
+                    match crate::config::GLOBAL_CONFIG.set_target(&rest) {
+                        Ok(_) => {
+                            results.push(ExecResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: format!("Target set to: {}", rest),
+                                duration_ms: None,
+                            });
+                        }
+                        Err(e) => {
+                            results.push(ExecResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: format!("Failed to set target: {}", e),
+                                duration_ms: None,
+                            });
+                        }
+                    }
+                }
+            }
+
+            "show_target" => {
+                let target = crate::config::GLOBAL_CONFIG.get_target().unwrap_or_else(|| "Not set".to_string());
+                let module = state.current_module.lock().ok().and_then(|cm| cm.clone()).unwrap_or_else(|| "None".to_string());
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: serde_json::json!({
+                        "target": target,
+                        "current_module": module,
+                    }).to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            "clear_target" => {
+                crate::config::GLOBAL_CONFIG.clear_target();
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: "Target cleared".to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            "back" => {
+                if let Ok(mut cm) = state.current_module.lock() {
+                    *cm = None;
+                }
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: "Module deselected".to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            "run" => {
+                let module_path = state.current_module.lock().ok().and_then(|cm| cm.clone());
+                if module_path.is_none() {
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "No module selected. Use 'use <module>' first.".to_string(),
+                        duration_ms: None,
+                    });
+                } else {
+                    let module_path = module_path.unwrap();
+                    // Resolve target: from rest arg, or global config
+                    let target = if !rest.is_empty() {
+                        rest.clone()
+                    } else if crate::config::GLOBAL_CONFIG.has_target() {
+                        crate::config::GLOBAL_CONFIG.get_target().unwrap_or_default()
+                    } else {
+                        results.push(ExecResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "No target set. Use 'set <target>' first.".to_string(),
+                            duration_ms: None,
+                        });
+                        continue;
+                    };
+
+                    let verbose = state.verbose;
+                    let run_start = std::time::Instant::now();
+                    match commands::run_module(&module_path, &target, verbose).await {
+                        Ok(_) => {
+                            results.push(ExecResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: format!("Module '{}' executed against '{}'", module_path, target),
+                                duration_ms: Some(run_start.elapsed().as_millis() as u64),
+                            });
+                        }
+                        Err(e) => {
+                            results.push(ExecResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: format!("Module failed: {}", e),
+                                duration_ms: Some(run_start.elapsed().as_millis() as u64),
+                            });
+                        }
+                    }
+                }
+            }
+
+            "run_all" => {
+                let target = if !rest.is_empty() {
+                    rest.clone()
+                } else if crate::config::GLOBAL_CONFIG.has_target() {
+                    crate::config::GLOBAL_CONFIG.get_target().unwrap_or_default()
+                } else {
+                    results.push(ExecResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "No target set for run_all".to_string(),
+                        duration_ms: None,
+                    });
+                    continue;
+                };
+
+                let modules = commands::discover_modules();
+                let verbose = state.verbose;
+                let run_start = std::time::Instant::now();
+                let mut ok_count = 0usize;
+                let mut fail_count = 0usize;
+                for m in &modules {
+                    match commands::run_module(m, &target, verbose).await {
+                        Ok(_) => ok_count += 1,
+                        Err(_) => fail_count += 1,
+                    }
+                }
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: format!("run_all complete: {} ok, {} failed out of {} modules",
+                        ok_count, fail_count, modules.len()),
+                    duration_ms: Some(run_start.elapsed().as_millis() as u64),
+                });
+            }
+
+            "exit" => {
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: "Exit not applicable in API mode".to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            other => {
+                results.push(ExecResult {
+                    command: trimmed.to_string(),
+                    success: false,
+                    output: format!("Unknown command: '{}'", other),
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                });
+            }
+        }
+    }
+
+    let all_ok = results.iter().all(|r| r.success);
+    let total = results.len();
+
+    (
+        if all_ok { StatusCode::OK } else { StatusCode::OK },
+        Json(ok_response(
+            format!("{} command(s) executed", total),
+            Some(serde_json::json!({
+                "results": results,
+            })),
+        )),
+    ).into_response()
+}
+
 // ─── Server Entry Point ─────────────────────────────────────────────
 
 pub async fn start_api_server(
@@ -550,6 +1292,8 @@ pub async fn start_api_server(
         api_key: api_key.clone(),
         verbose,
         ip_whitelist: Arc::new(whitelist),
+        current_module: Arc::new(Mutex::new(None)),
+        rate_limiter: Arc::new(Mutex::new(HashMap::new())),
     };
 
     println!("🚀 Starting RustSploit API server...");
@@ -567,6 +1311,9 @@ pub async fn start_api_server(
         .route("/api/target", post(set_target))
         .route("/api/target", axum::routing::delete(clear_target))
         .route("/api/honeypot-check", post(honeypot_check))
+        .route("/api/exec", post(exec_command))
+        .route("/api/results", get(list_results))
+        .route("/api/results/{filename}", get(get_result_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

