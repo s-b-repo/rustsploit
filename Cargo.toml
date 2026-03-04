@@ -24,7 +24,7 @@ tokio = { version = "1.49", features = ["full", "process", "fs", "io-std", "rt-m
 reqwest = { version = "0.13", features = ["json", "cookies", "socks", "multipart", "form"] }
 h2 = "0.4"
 http = "1.4"
-bytes = "1.11"
+bytes = "1.11.1"
 tokio-rustls = "0.26"
 url = "2.5"
 urlencoding = "2.1"
@@ -71,8 +71,8 @@ libc = "0.2"
 btleplug = "0.11"
 
 # TUI (WPair module)
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # RDP - removed unused dependency (module uses external xfreerdp/rdesktop commands)
 # rdp = "0.12"
@@ -115,15 +115,18 @@ num_cpus = "1.17.0"
 
 # Constant-time comparison for security (timing attack prevention)
 subtle = "2.6"
+gag = "1.0.0"
+tempfile = "3.26.0"
 
 [build-dependencies]
 regex = "1.12"
 walkdir = "2.5"
 
-# Dependency overrides to address security warnings in transitive dependencies
-# Note: These are warnings (not vulnerabilities) in transitive dependencies
-# async-std warning: suppaftp uses async-std internally - waiting for upstream fix
-# The other warnings (atomic-polyfill, atty) are resolved by removing unused rdp dependency
+# Dependency overrides to address security advisories in transitive dependencies
+# RUSTSEC-2026-0009: time >=0.3.47 fixes DoS via stack exhaustion (used by reqwest via cookie/cookie_store)
+time = "0.3.47"
+# Note: paste (RUSTSEC-2024-0436, unmaintained) and lru (RUSTSEC-2026-0002, unsound) are
+# transitive warnings from ratatui 0.29 internals — no upstream fix available yet.
 
 # ============================================
 # Development profile: Fast incremental builds

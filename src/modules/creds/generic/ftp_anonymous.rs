@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use rand::Rng;
 use tokio::net::TcpStream; // For fast connect check
 
-use crate::utils::{prompt_default, prompt_int_range, prompt_yes_no}; 
+use crate::utils::{prompt_int_range, prompt_yes_no, prompt_output_file}; 
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
@@ -154,8 +154,11 @@ pub async fn run(target: &str) -> Result<()> {
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
     let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let _verbose = prompt_yes_no("Verbose mode?", false)?; 
-    let output_file = prompt_default("Output result file", "ftp_mass_results.txt")?;
+    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    if verbose {
+        println!("{}", "[*] Verbose mode enabled".dimmed());
+    }
+    let output_file = prompt_output_file("Output result file", "ftp_mass_results.txt")?;
 
     // Ask about exclusions
     let use_exclusions = prompt_yes_no("Exclude reserved/private ranges?", true)?;

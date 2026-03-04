@@ -214,18 +214,14 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                             if let Some(ref module_path) = ctx.current_module {
                                 // Get target from global config
                                 let target = if config::GLOBAL_CONFIG.has_target() {
-                                    // Use single IP from global target (handles subnets intelligently)
-                                    match config::GLOBAL_CONFIG.get_single_target_ip() {
-                                        Ok(ip) => {
-                                            let target_display = match config::GLOBAL_CONFIG.get_target() {
-                                                Some(t) => t,
-                                                None => String::new(),
-                                            };
-                                            println!("{}", format!("[*] Using target: {}", target_display).cyan());
-                                            Some(ip)
+                                    // Pass full raw target (preserves CIDR notation for modules)
+                                    match config::GLOBAL_CONFIG.get_target() {
+                                        Some(t) => {
+                                            println!("{}", format!("[*] Using target: {}", t).cyan());
+                                            Some(t)
                                         }
-                                        Err(e) => {
-                                            println!("{}", format!("[!] Error getting target: {}", e).red());
+                                        None => {
+                                            println!("{}", "[!] Error getting target".red());
                                             None
                                         }
                                     }
@@ -393,7 +389,7 @@ fn split_command(input: &str) -> Option<(String, String)> {
     Some((cmd, rest))
 }
 
-fn resolve_command(cmd: &str) -> String {
+pub fn resolve_command(cmd: &str) -> String {
     match cmd {
         "?" | "help" | "h" => "help",
         "modules" | "list" | "ls" | "m" => "modules",
@@ -412,7 +408,7 @@ fn resolve_command(cmd: &str) -> String {
     .to_string()
 }
 
-fn sanitize_module_path(input: &str) -> Option<String> {
+pub fn sanitize_module_path(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;

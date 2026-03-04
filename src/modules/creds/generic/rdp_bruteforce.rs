@@ -21,10 +21,13 @@ use tokio::{
 };
 
 use crate::utils::{
-    prompt_yes_no, prompt_default, prompt_port, 
-    prompt_wordlist, prompt_int_range,
+    prompt_default,
     load_lines, get_filename_in_current_dir,
+    cfg_prompt_yes_no, cfg_prompt_port, cfg_prompt_int_range,
+    cfg_prompt_existing_file,
+    cfg_prompt_output_file,
 };
+use crate::modules::creds::utils::{is_subnet_target, parse_subnet, subnet_host_count};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const MAX_MEMORY_LOAD_SIZE: u64 = 150 * 1024 * 1024; // 150 MB
@@ -178,6 +181,19 @@ impl RdpSecurityLevel {
     }
 
     fn prompt_selection() -> Result<Self> {
+        // Check config for pre-set security level
+        let config = crate::config::get_module_config();
+        if let Some(val) = config.custom_prompts.get("security_level") {
+            match val.trim() {
+                "1" | "auto" => return Ok(RdpSecurityLevel::Auto),
+                "2" | "nla" => return Ok(RdpSecurityLevel::Nla),
+                "3" | "tls" => return Ok(RdpSecurityLevel::Tls),
+                "4" | "rdp" => return Ok(RdpSecurityLevel::Rdp),
+                "5" | "negotiate" => return Ok(RdpSecurityLevel::Negotiate),
+                _ => {} // fall through to interactive
+            }
+        }
+
         println!("\nRDP Security Level Options:");
         println!("  1. Auto (let client negotiate)");
         println!("  2. NLA (Network Level Authentication)");
@@ -290,28 +306,33 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
+    if is_subnet_target(target) {
+        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+        return run_subnet_scan(target).await;
+    }
+
     println!("{}", format!("[*] Target: {}", target).cyan());
 
-    let port: u16 = prompt_port("RDP Port", 3389)?;
+    let port: u16 = cfg_prompt_port("port", "RDP Port", 3389)?;
 
-    let usernames_file_path = prompt_wordlist("Username wordlist")?;
+    let usernames_file_path = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
 
-    let passwords_file_path = prompt_wordlist("Password wordlist")?;
+    let passwords_file_path = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
 
-    let concurrency = prompt_int_range("Max concurrent tasks", 10, 1, 10000)? as usize;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 10000)? as usize;
 
-    let timeout_secs = prompt_int_range("Connection timeout (seconds)", 10, 1, 300)? as u64;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 10, 1, 300)? as u64;
 
-    let stop_on_success = prompt_yes_no("Stop on first success?", true)?;
-    let save_results = prompt_yes_no("Save results to file?", true)?;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
     let save_path = if save_results {
-        Some(prompt_default("Output file name", "rdp_results.txt")?)
+        Some(cfg_prompt_output_file("output_file", "Output file name", "rdp_results.txt")?)
     } else {
         None
     };
 
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let combo_mode = prompt_yes_no("Combination mode? (try every password with every user)", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every password with every user)", false)?;
     let security_level = RdpSecurityLevel::prompt_selection()?;
 
     let addr = format_socket_address(target, port);
@@ -1073,9 +1094,9 @@ fn format_socket_address(ip: &str, port: u16) -> String {
 // ============================================================================
 
 async fn run_mass_scan(target: &str) -> Result<()> {
-    let port: u16 = prompt_port("RDP Port", 3389)?;
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let port: u16 = cfg_prompt_port("port", "RDP Port", 3389)?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
 
     let users = load_lines(&usernames_file)?;
     let passes = load_lines(&passwords_file)?;
@@ -1083,13 +1104,13 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let output_file = prompt_default("Output result file", "rdp_brute_mass_results.txt")?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rdp_brute_mass_results.txt")?;
     let security_level = RdpSecurityLevel::prompt_selection()?;
-    let timeout_secs: u64 = prompt_int_range("Connection timeout (seconds)", 10, 1, 300)? as u64;
+    let timeout_secs: u64 = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 10, 1, 300)? as u64;
 
-    let use_exclusions = prompt_yes_no("Exclude reserved/private ranges?", true)?;
+    let use_exclusions = cfg_prompt_yes_no("use_exclusions", "Exclude reserved/private ranges?", true)?;
 
     let mut exclusion_subnets = Vec::new();
     if use_exclusions {
@@ -1185,6 +1206,65 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
+
+    let port: u16 = cfg_prompt_port("port", "RDP Port", 3389)?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let users = load_lines(&usernames_file)?;
+    let passes = load_lines(&passwords_file)?;
+    if users.is_empty() || passes.is_empty() { return Err(anyhow!("Wordlists cannot be empty")); }
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 10, 1, 300)? as u64;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rdp_subnet_results.txt")?;
+    let security_level = RdpSecurityLevel::prompt_selection()?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((users, passes));
+    let total = count;
+
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            println!("[*] Status: {}/{} IPs scanned, {} valid credentials found",
+                s_checked.load(Ordering::Relaxed), total,
+                s_found.load(Ordering::Relaxed).to_string().green().bold());
+        }
+    });
+
+    for ip in network.iter() {
+        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
+        let cp = creds_pkg.clone();
+        let sc = stats_checked.clone();
+        let sf = stats_found.clone();
+        let of = output_file.clone();
+
+        tokio::spawn(async move {
+            mass_scan_host(ip, port, timeout_secs, security_level, cp, sf, of, verbose).await;
+            sc.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+        });
+    }
+
+    for _ in 0..concurrency {
+        let _ = semaphore.acquire().await.context("Semaphore")?;
+    }
+
+    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} credentials found.",
+        stats_checked.load(Ordering::Relaxed),
+        stats_found.load(Ordering::Relaxed)).cyan().bold());
     Ok(())
 }
 

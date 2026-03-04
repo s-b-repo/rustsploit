@@ -203,7 +203,7 @@ pub async fn run_with_settings(
     concurrency: usize,
     timeout_secs: u64,
     show_only_open: bool,
-    _verbose: bool,
+    verbose: bool,
     scan_method: ScanMethod,
     output_file: &str,
     port_range: PortRange,
@@ -222,6 +222,7 @@ pub async fn run_with_settings(
     let stats = Arc::new(Mutex::new(ScanStats::new()));
     let progress = Arc::new(Mutex::new(ProgressTracker::new(total_ports)));
     
+    let verbose = verbose; // capture for move into async tasks
     println!("\n{}", format!("[*] Starting scan for target: {} (resolved: {})", target, resolved_ip_str).cyan().bold());
     println!("{}", format!("[*] Scanning {} ports with concurrency: {}", total_ports, concurrency).cyan());
     writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "Port Scan Results for {} ({})\n", target, resolved_ip_str)?;
@@ -244,6 +245,7 @@ pub async fn run_with_settings(
             let ip = resolved_ip;
             let ip_str = resolved_ip_str.clone();
             let port = *port;
+            let verbose = verbose;
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -272,8 +274,18 @@ pub async fn run_with_settings(
                             let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
                             println!("{}", output_line);
                         }
-                        "CLOSED" => stats_guard.tcp_closed += 1,
-                        "TIMEOUT" | "FILTERED" => stats_guard.tcp_filtered += 1,
+                        "CLOSED" => {
+                            stats_guard.tcp_closed += 1;
+                            if verbose {
+                                println!("  {} TCP {}:{} CLOSED", "✗".red(), ip_str, port);
+                            }
+                        }
+                        "TIMEOUT" | "FILTERED" => {
+                            stats_guard.tcp_filtered += 1;
+                            if verbose {
+                                println!("  {} TCP {}:{} FILTERED", "~".yellow(), ip_str, port);
+                            }
+                        }
                         _ => {}
                     }
                 }

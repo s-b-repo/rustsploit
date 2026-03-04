@@ -32,9 +32,11 @@ use tokio::time::{sleep, timeout};
 // use once_cell::sync::Lazy; // Unused
 
 use crate::utils::{
-    prompt_required, prompt_default, prompt_yes_no,
-    prompt_existing_file, prompt_int_range
+    prompt_required,
+    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default,
+    cfg_prompt_port, cfg_prompt_required, cfg_prompt_output_file,
 };
+use crate::modules::creds::utils::{is_subnet_target, parse_subnet, subnet_host_count};
 
 // ============================================================
 // CONSTANTS
@@ -311,6 +313,21 @@ impl Statistics {
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
 
+    if is_subnet_target(target) {
+        let network = parse_subnet(target)?;
+        let count = subnet_host_count(&network);
+        println!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
+        }
+        println!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
+
     println!("Select operation mode:");
     println!("  1. Single Target Bruteforce (advanced)");
     println!("  2. Subnet Bruteforce (CIDR notation)");
@@ -319,7 +336,14 @@ pub async fn run(target: &str) -> Result<()> {
     println!("  5. Subnet Default Check (CIDR)");
     println!();
 
-    let mode = prompt_required("Select mode [1-5]: ")?;
+    let mode = {
+        let config = crate::config::get_module_config();
+        if let Some(val) = config.custom_prompts.get("mode") {
+            val.clone()
+        } else {
+            prompt_required("Select mode [1-5]: ")?
+        }
+    };
 
     match mode.as_str() {
         "1" => run_single_target_bruteforce(target, false).await,
@@ -354,21 +378,21 @@ async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<(
 
     if targets.len() > 1 {
         println!("[*] Expanded to {} hosts", targets.len());
-        if !prompt_yes_no("Continue with all hosts? (y/n): ", true)? {
+        if !cfg_prompt_yes_no("continue_all_hosts", "Continue with all hosts? (y/n): ", true)? {
             return Ok(());
         }
     }
 
     let target_primary = targets[0].clone();
 
-    let use_config = prompt_yes_no("Do you have a configuration file? (y/n): ", false)?;
+    let use_config = cfg_prompt_yes_no("use_config_file", "Do you have a configuration file? (y/n): ", false)?;
 
     let mut config = if use_config {
         println!();
         print_config_format();
         println!();
 
-        let config_path = prompt_wordlist("Path to configuration file: ")?;
+        let config_path = cfg_prompt_existing_file("config_file", "Path to configuration file")?;
 
         println!("[*] Loading configuration from '{}'...", config_path);
         match load_and_validate_config(&config_path, &target_primary).await {
@@ -389,13 +413,13 @@ async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<(
     config.preprocess_prompts();
     print_config_summary(&config);
 
-    if !prompt_yes_no("\nProceed with this configuration? (y/n): ", true)? {
+    if !cfg_prompt_yes_no("proceed", "\nProceed with this configuration? (y/n): ", true)? {
         println!("[*] Aborted by user.");
         return Ok(());
     }
 
-    if !use_config && prompt_yes_no("\nSave this configuration? (y/n): ", false)? {
-        let save_path = prompt_required("Configuration file path: ")?;
+    if !use_config && cfg_prompt_yes_no("save_config", "\nSave this configuration? (y/n): ", false)? {
+        let save_path = cfg_prompt_output_file("save_path", "Configuration file path", "telnet_config.json")?;
         if let Err(e) = save_config(&config, &save_path).await {
             eprintln!("[!] Failed to save config: {}", e);
         } else {
@@ -408,7 +432,7 @@ async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<(
     println!();
 
     if targets.len() > 1 {
-        let parallel = prompt_yes_no("Run targets in parallel? (y/n): ", false)?;
+        let parallel = cfg_prompt_yes_no("parallel", "Run targets in parallel? (y/n): ", false)?;
         if parallel {
             run_parallel_bruteforce(targets, config).await
         } else {
@@ -487,29 +511,29 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
 
     println!("Loaded {} target(s)", config.targets.len());
 
-    if prompt_yes_no("Use default ports (23, 2323, 23231)? (y/n): ", true)? {
+    if cfg_prompt_yes_no("use_default_ports", "Use default ports (23, 2323, 23231)? (y/n): ", true)? {
         config.ports = DEFAULT_TELNET_PORTS.to_vec();
     } else {
-        let ports_str = prompt_required("Enter ports (comma-separated): ")?;
+        let ports_str = cfg_prompt_required("ports", "Enter ports (comma-separated): ")?;
         config.ports = ports_str
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     }
 
-    if prompt_yes_no("Use default credential list? (y/n): ", true)? {
+    if cfg_prompt_yes_no("use_default_creds", "Use default credential list? (y/n): ", true)? {
         config.credentials = DEFAULT_CREDENTIALS
         .iter()
         .map(|(u, p)| (u.to_string(), p.to_string()))
         .collect();
     } else {
-        let cred_file = prompt_wordlist("Path to credentials file (user:pass format): ")?;
+        let cred_file = cfg_prompt_existing_file("credentials_file", "Path to credentials file (user:pass format)")?;
         config.credentials = load_credentials_file(&cred_file).await?;
     }
 
     config.max_concurrent = prompt_threads(50)?;
-    config.verbose = prompt_yes_no("Verbose output? (y/n): ", false)?;
-    config.output_file = prompt_required("Output file: ")?;
+    config.verbose = cfg_prompt_yes_no("verbose", "Verbose output? (y/n): ", false)?;
+    config.output_file = cfg_prompt_output_file("output_file", "Output file", "telnet_scan_results.txt")?;
 
     println!();
     println!("Configuration:");
@@ -519,7 +543,7 @@ async fn run_batch_scanner(target: &str) -> Result<()> {
     println!("  Concurrency:  {}", config.max_concurrent);
     println!();
 
-    if !prompt_yes_no("Start scan? (y/n): ", true)? {
+    if !cfg_prompt_yes_no("start_scan", "Start scan? (y/n): ", true)? {
         println!("Scan cancelled");
         return Ok(());
     }
@@ -549,11 +573,9 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
         vec![target.to_string()]
     };
 
-    let port: u16 = prompt_required("Port (default 23): ")?
-    .parse()
-    .unwrap_or(23);
+    let port: u16 = cfg_prompt_port("port", "Port (default 23)", 23)?;
 
-    let verbose = prompt_yes_no("Verbose mode? (show all attempts and details) (y/n): ", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode? (show all attempts and details) (y/n): ", false)?;
 
     println!();
     println!("Testing {} target(s) on port {} with {} default credentials...",
@@ -677,8 +699,8 @@ async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
             println!();
         }
 
-        if prompt_yes_no("Save results to file? (y/n): ", true)? {
-            let output_path = prompt_required("Output file path: ")?;
+        if cfg_prompt_yes_no("save_results", "Save results to file? (y/n): ", true)? {
+            let output_path = cfg_prompt_output_file("output_path", "Output file path", "telnet_quick_results.txt")?;
             save_quick_check_results(&output_path, &results).await?;
             println!("[+] Results saved to '{}'", output_path);
         }
@@ -1061,7 +1083,7 @@ async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
             Ok(_) => println!("{}", "[+] Target validation successful".green()),
             Err(e) => {
                 eprintln!("{}", format!("[!] Warning: {}", e).yellow());
-                if !prompt_yes_no("Continue anyway? (y/n): ", false)? {
+                if !cfg_prompt_yes_no("continue_anyway", "Continue anyway? (y/n): ", false)? {
                     return Err(anyhow!("Target validation failed"));
                 }
             }
@@ -1811,8 +1833,10 @@ async fn enqueue_wordlist_combos_streaming(
                                            full_combo: bool,
                                            stop_flag: Arc<AtomicBool>,
                                            username_count: usize,
-                                           _password_count: usize,
+                                           password_count: usize,
 ) -> Result<()> {
+    let total_combos = if full_combo { username_count * password_count } else { std::cmp::max(username_count, password_count) };
+    println!("[*] Streaming {} credential combinations...", total_combos);
     if full_combo {
         // Open password file once and cache passwords to avoid reopening file for each username
         let pass_file = File::open(password_path).await?;
@@ -2010,13 +2034,13 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
     let command_timeout = prompt_timeout("Command timeout (seconds, default 3): ", 3)?;
     let write_timeout = 500; // Fixed write timeout in milliseconds
 
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
-    let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false)?;
+    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file")?;
+    let raw_bruteforce = cfg_prompt_yes_no("raw_bruteforce", "Enable raw brute-force password generation? (y/n): ", false)?;
 
     let password_wordlist = if raw_bruteforce {
         prompt_optional_wordlist("Password wordlist (leave blank to skip): ")?
     } else {
-        Some(prompt_wordlist("Password wordlist file: ")?)
+        Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist file")?)
     };
 
     let (raw_charset, raw_min_length, raw_max_length) = if raw_bruteforce {
@@ -2028,22 +2052,22 @@ async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig
         (String::new(), 0, 0)
     };
 
-    let full_combo = prompt_yes_no("Try every username with every password? (y/n): ", false)?;
-    let stop_on_success = prompt_yes_no("Stop on first valid login? (y/n): ", false)?;
+    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password? (y/n): ", false)?;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login? (y/n): ", false)?;
 
-    let output_file = prompt_required("Output file: ")?;
+    let output_file = cfg_prompt_output_file("output_file", "Output file", "telnet_brute_results.txt")?;
     let append_mode = if tokio::fs::metadata(&output_file).await.is_ok() {
-        prompt_yes_no(&format!("File exists. Append? (y/n): "), true)?
+        cfg_prompt_yes_no("append_mode", &format!("File exists. Append? (y/n): "), true)?
     } else {
         false
     };
 
-    let verbose = prompt_yes_no("Verbose mode? (y/n): ", false)?;
-    let pre_validate = prompt_yes_no("Pre-validate target? (y/n): ", true)?;
-    let retry_on_error = prompt_yes_no("Retry failed connections? (y/n): ", true)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode? (y/n): ", false)?;
+    let pre_validate = cfg_prompt_yes_no("pre_validate", "Pre-validate target? (y/n): ", true)?;
+    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry failed connections? (y/n): ", true)?;
     let max_retries = if retry_on_error { prompt_retries(2)? } else { 0 };
 
-    let use_custom_prompts = prompt_yes_no("Use custom prompts? (y/n): ", false)?;
+    let use_custom_prompts = cfg_prompt_yes_no("use_custom_prompts", "Use custom prompts? (y/n): ", false)?;
 
     let (login_prompts, password_prompts, success_indicators, failure_indicators) =
     if use_custom_prompts {
@@ -2722,7 +2746,7 @@ fn should_use_streaming(total_size: u64) -> Result<bool> {
         println!("  1. Load into memory (faster, ~{:.0} MB RAM)", size_mb);
         println!("  2. Streaming mode (slower, minimal memory)");
         println!();
-        Ok(!prompt_yes_no("Load into memory? (y/n): ", true)?)
+        Ok(!cfg_prompt_yes_no("load_into_memory", "Load into memory? (y/n): ", true)?)
     } else {
         Ok(false)
     }
@@ -3051,53 +3075,54 @@ fn display_banner() {
 // prompt_yes_no is replaced by crate::utils imports/usage
 
 fn prompt_port(default: u16) -> Result<u16> {
-    Ok(prompt_int_range("Port", default as i64, 1, 65535)? as u16)
+    Ok(cfg_prompt_int_range("port", "Port", default as i64, 1, 65535)? as u16)
 }
 
 fn prompt_delay(default: u64) -> Result<u64> {
-    Ok(prompt_int_range("Delay in ms", default as i64, 0, 10000)? as u64)
+    Ok(cfg_prompt_int_range("delay_ms", "Delay in ms", default as i64, 0, 10000)? as u64)
 }
 
 fn prompt_timeout(msg: &str, default: u64) -> Result<u64> {
-    Ok(prompt_int_range(msg, default as i64, 1, 60)? as u64)
+    // Derive a config key from the message
+    let key = msg.to_lowercase().replace(' ', "_").replace('(', "").replace(')', "").replace(',', "").replace(':', "").trim().to_string();
+    let key = if key.len() > 40 { key[..40].to_string() } else { key };
+    Ok(cfg_prompt_int_range(&key, msg, default as i64, 1, 60)? as u64)
 }
 
 fn prompt_threads(default: usize) -> Result<usize> {
-    Ok(prompt_int_range("Threads", default as i64, 1, 256)? as usize)
+    Ok(cfg_prompt_int_range("threads", "Threads", default as i64, 1, 256)? as usize)
 }
 
 fn prompt_retries(default: usize) -> Result<usize> {
-    Ok(prompt_int_range("Max retries", default as i64, 0, 10)? as usize)
+    Ok(cfg_prompt_int_range("max_retries", "Max retries", default as i64, 0, 10)? as usize)
 }
 
-fn prompt_wordlist(prompt_text: &str) -> Result<String> {
-    // Strip ": " if present to match prompt_existing_file style
-    let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
-    prompt_existing_file(msg)
-}
+
+
 
 fn prompt_optional_wordlist(prompt_text: &str) -> Result<Option<String>> {
     let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
-    if prompt_yes_no(&format!("Use {}?", msg), true)? {
-        Ok(Some(prompt_existing_file(msg)?))
+    if cfg_prompt_yes_no("use_optional_wordlist", &format!("Use {}?", msg), true)? {
+        Ok(Some(cfg_prompt_existing_file("optional_wordlist", msg)?))
     } else {
         Ok(None)
     }
 }
 fn prompt_charset(prompt_text: &str, default: &str) -> Result<String> {
-    prompt_default(prompt_text, default)
+    cfg_prompt_default("raw_charset", prompt_text, default)
 }
 
 fn prompt_min_length(default: usize, min: usize, max: usize) -> Result<usize> {
-    Ok(prompt_int_range("Min length", default as i64, min as i64, max as i64)? as usize)
+    Ok(cfg_prompt_int_range("raw_min_length", "Min length", default as i64, min as i64, max as i64)? as usize)
 }
 
 fn prompt_max_length(default: usize, min: usize, max: usize) -> Result<usize> {
-    Ok(prompt_int_range("Max length", default as i64, min as i64, max as i64)? as usize)
+    Ok(cfg_prompt_int_range("raw_max_length", "Max length", default as i64, min as i64, max as i64)? as usize)
 }
 
 fn prompt_list(prompt_text: &str) -> Result<Vec<String>> {
-    let input = prompt_default(prompt_text, "")?;
+    let key = prompt_text.to_lowercase().replace(' ', "_").replace('(', "").replace(')', "").replace(',', "").replace(':', "").trim().to_string();
+    let input = cfg_prompt_default(&key, prompt_text, "")?;
     Ok(input
     .split(',')
     .map(|s| s.trim().to_string())

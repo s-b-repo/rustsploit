@@ -201,3 +201,36 @@ pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
     }
     exclusion_subnets
 }
+
+/// Check if a target string is a CIDR subnet (e.g. "192.168.8.0/21").
+/// Returns false for special mass-scan triggers like "0.0.0.0/0".
+pub fn is_subnet_target(target: &str) -> bool {
+    if !target.contains('/') {
+        return false;
+    }
+    // Exclude the special mass-scan triggers
+    if target == "0.0.0.0/0" {
+        return false;
+    }
+    target.parse::<ipnetwork::IpNetwork>().is_ok()
+}
+
+/// Parse a CIDR string into an IpNetwork for lazy iteration.
+/// Does NOT allocate a Vec — callers iterate with `network.iter()`.
+/// This handles ANY subnet size (/0 through /32) without OOM risk.
+pub fn parse_subnet(target: &str) -> Result<ipnetwork::IpNetwork, anyhow::Error> {
+    let network: ipnetwork::IpNetwork = target.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid CIDR '{}': {}", target, e))?;
+    Ok(network)
+}
+
+/// Get the number of host IPs in a network (for display purposes).
+pub fn subnet_host_count(net: &ipnetwork::IpNetwork) -> u128 {
+    match net.size() {
+        ipnetwork::NetworkSize::V4(n) => n as u128,
+        ipnetwork::NetworkSize::V6(n) => n,
+    }
+}
+
+
+

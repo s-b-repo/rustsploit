@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use ipnetwork::IpNetwork;
 use regex::Regex;
@@ -218,7 +219,7 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 /// Module-level configuration for API-driven execution
 /// This is set by the API before running a module and read by modules
 /// to get pre-configured values instead of prompting the user
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ModuleConfig {
     pub port: Option<u16>,
     pub username_wordlist: Option<String>,
@@ -229,6 +230,13 @@ pub struct ModuleConfig {
     pub output_file: Option<String>,
     pub verbose: Option<bool>,
     pub combo_mode: Option<bool>,
+    /// Generic key→value prompt overrides.
+    /// When set, `cfg_prompt_*` functions in utils.rs return these values
+    /// instead of prompting stdin. Keys match prompt names like "port", "mode", etc.
+    pub custom_prompts: HashMap<String, String>,
+    /// When true, cfg_prompt_* will return an error instead of falling back
+    /// to stdin. This prevents the API server from blocking on interactive prompts.
+    pub api_mode: bool,
 }
 
 impl ModuleConfig {
@@ -239,6 +247,24 @@ impl ModuleConfig {
     /// Clear all settings
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+}
+
+impl Default for ModuleConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            username_wordlist: None,
+            password_wordlist: None,
+            concurrency: None,
+            stop_on_success: None,
+            save_results: None,
+            output_file: None,
+            verbose: None,
+            combo_mode: None,
+            custom_prompts: HashMap::new(),
+            api_mode: false,
+        }
     }
 }
 
@@ -268,3 +294,15 @@ pub fn clear_module_config() {
     }
 }
 
+/// Get the results directory (~/.rustsploit/results/) — creates it if needed.
+/// Module output files are stored here when running via API.
+pub fn results_dir() -> std::path::PathBuf {
+    let dir = home::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".rustsploit")
+        .join("results");
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    dir
+}

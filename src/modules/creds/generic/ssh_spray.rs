@@ -317,7 +317,7 @@ fn save_results(results: &[SprayResult], path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt helper
+/// Prompt helper (sanitized)
 async fn prompt(message: &str) -> Result<String> {
     print!("{}: ", message);
     tokio::io::stdout()
@@ -329,7 +329,15 @@ async fn prompt(message: &str) -> Result<String> {
         .read_line(&mut input)
         .await
         .context("Failed to read input")?;
-    Ok(input.trim().to_string())
+    let trimmed = input.trim().to_string();
+    if trimmed.len() > 4096 {
+        return Err(anyhow!("Input too long (max 4096 chars)"));
+    }
+    if trimmed.contains('\0') {
+        return Err(anyhow!("Input contains null bytes"));
+    }
+    // Strip control characters except tab
+    Ok(trimmed.chars().filter(|c| !c.is_control() || *c == '\t').collect())
 }
 
 async fn prompt_default(message: &str, default: &str) -> Result<String> {
@@ -344,10 +352,17 @@ async fn prompt_default(message: &str, default: &str) -> Result<String> {
         .await
         .context("Failed to read input")?;
     let trimmed = input.trim();
+    if trimmed.len() > 4096 {
+        return Err(anyhow!("Input too long (max 4096 chars)"));
+    }
+    if trimmed.contains('\0') {
+        return Err(anyhow!("Input contains null bytes"));
+    }
     if trimmed.is_empty() {
         Ok(default.to_string())
     } else {
-        Ok(trimmed.to_string())
+        // Strip control characters
+        Ok(trimmed.chars().filter(|c| !c.is_control() || *c == '\t').collect())
     }
 }
 
@@ -481,8 +496,15 @@ pub async fn run(target: &str) -> Result<()> {
     
     // Save results?
     if !results.is_empty() && prompt_yes_no("Save results to file?", true).await? {
-        let output_path = prompt_default("Output file", "ssh_spray_results.txt").await?;
-        if let Err(e) = save_results(&results, &output_path) {
+        let raw = prompt_default("Output file", "ssh_spray_results.txt").await?;
+        // Force basename only — no directory traversal
+        let output_path = std::path::Path::new(&raw)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ssh_spray_results.txt".to_string());
+        if output_path.is_empty() || output_path.starts_with('.') {
+            println!("{}", "[-] Invalid output filename".red());
+        } else if let Err(e) = save_results(&results, &output_path) {
             println!("{}", format!("[-] Failed to save: {}", e).red());
         }
     }

