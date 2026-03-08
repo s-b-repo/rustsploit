@@ -234,8 +234,8 @@ impl L2tpSession {
         
         Ok(L2tpPacket {
             is_control,
-            tunnel_id,
-            session_id,
+            _tunnel_id: tunnel_id,
+            _session_id: session_id,
             payload,
         })
     }
@@ -289,10 +289,8 @@ impl L2tpSession {
 
 struct L2tpPacket {
     is_control: bool,
-    #[allow(dead_code)]
-    tunnel_id: u16,
-    #[allow(dead_code)]
-    session_id: u16,
+    _tunnel_id: u16,
+    _session_id: u16,
     payload: Vec<u8>,
 }
 

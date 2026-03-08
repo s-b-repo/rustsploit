@@ -6,7 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     fs::File,
     io::Write,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
@@ -16,10 +16,8 @@ use tokio::{
     net::TcpStream,
     sync::{Mutex, Semaphore},
     time::{sleep, timeout},
-    process::Command,
     fs::OpenOptions,
 };
-use rand::Rng;
 
 use crate::utils::{
     load_lines, get_filename_in_current_dir, normalize_target,
@@ -27,7 +25,7 @@ use crate::utils::{
     cfg_prompt_existing_file,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
@@ -400,12 +398,7 @@ async fn run_mass_scan(target: &str) -> Result<()> {
     let output_file = cfg_prompt_output_file("output_file", "Output result file", "rtsp_mass_results.txt")?;
 
     // Parse exclusions
-    let mut exclusion_subnets = Vec::new();
-    for cidr in EXCLUDED_RANGES {
-        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
-            exclusion_subnets.push(net);
-        }
-    }
+    let exclusion_subnets = parse_exclusions(EXCLUDED_RANGES);
     let exclusions = Arc::new(exclusion_subnets);
 
     // Shared State
@@ -445,8 +438,8 @@ async fn run_mass_scan(target: &str) -> Result<()> {
                  let ip = generate_random_public_ip(&exc);
                  
                  // Deduplication check
-                 if !is_ip_checked(&ip).await {
-                     mark_ip_checked(&ip).await;
+                 if !is_ip_checked(&ip, STATE_FILE).await {
+                     mark_ip_checked(&ip, STATE_FILE).await;
                      mass_scan_host(ip, port, cp, sf, of, verbose).await;
                  }
                  
@@ -482,8 +475,8 @@ async fn run_mass_scan(target: &str) -> Result<()> {
 
              tokio::spawn(async move {
                  if let Some(ip) = ip_addr {
-                    if !is_ip_checked(&ip).await {
-                        mark_ip_checked(&ip).await;
+                    if !is_ip_checked(&ip, STATE_FILE).await {
+                        mark_ip_checked(&ip, STATE_FILE).await;
                         mass_scan_host(ip, port, cp, sf, of, verbose).await;
                     }
                  }
@@ -584,69 +577,6 @@ async fn mass_scan_host(
     }
 }
 
-
-fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
-    let mut rng = rand::rng();
-    loop {
-        let octets: [u8; 4] = rng.random();
-        let ip = Ipv4Addr::from(octets);
-        let ip_addr = IpAddr::V4(ip);
-        
-        let mut excluded = false;
-        for net in exclusions {
-            if net.contains(ip_addr) {
-                excluded = true;
-                break;
-            }
-        }
-        
-        if !excluded {
-            return ip_addr;
-        }
-    }
-}
-
-async fn is_ip_checked(ip: &impl ToString) -> bool {
-    // Ensure state file exists before running grep
-    if !std::path::Path::new(STATE_FILE).exists() {
-        // Create empty state file to avoid grep errors
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(STATE_FILE)
-            .await
-        {
-            let _ = file.flush().await;
-        }
-        return false; // File was just created, IP definitely not checked
-    }
-
-    let ip_s = ip.to_string();
-    let status = Command::new("grep")
-        .arg("-F")
-        .arg("-q")
-        .arg(format!("checked: {}", ip_s))
-        .arg(STATE_FILE)
-        .status()
-        .await;
-    
-    match status {
-        Ok(s) => s.success(), 
-        Err(_) => false, 
-    }
-}
-
-async fn mark_ip_checked(ip: &impl ToString) {
-    let data = format!("checked: {}\n", ip.to_string());
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(STATE_FILE)
-        .await 
-    {
-        let _ = file.write_all(data.as_bytes()).await;
-    }
-}
 
 /// Resolve a host:port (literal v4/v6 or DNS) into all possible SocketAddrs.
 async fn resolve_targets(addr: &str) -> Result<Vec<SocketAddr>> {

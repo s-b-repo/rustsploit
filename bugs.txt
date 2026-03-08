@@ -1,0 +1,8 @@
+--- API Initial Fuzzing Bugs ---
+BUG: /api/exec executes raw shell commands instead of mapping them
+
+--- PortSwigger API Security Findings ---
+BUG (Mass Assignment/Error Handling): Server crashed on extra unexpected JSON fields (Status: 500)
+BUG (Lack of Resources/Rate Limiting): Server allowed 50 requests in 0.13 seconds with no rate limiting applied
+BUG (SSRF): API allows scanning internal/cloud metadata IP (169.254.169.254)
+INFO (SSRF): API legitimately allows scanning localhost/127.0.0.1 by its design.

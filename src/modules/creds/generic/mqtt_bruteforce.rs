@@ -9,10 +9,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use rand::Rng;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -25,7 +24,7 @@ use crate::utils::{
     cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default,
     cfg_prompt_port, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 
 // ============================================================================
 // Constants
@@ -660,15 +659,13 @@ async fn run_mass_scan(target: &str) -> Result<()> {
 
     let use_exclusions = cfg_prompt_yes_no("use_exclusions", "Exclude reserved/private ranges?", true)?;
 
-    let mut exclusion_subnets = Vec::new();
-    if use_exclusions {
-        for cidr in EXCLUDED_RANGES {
-            if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
-                exclusion_subnets.push(net);
-            }
-        }
-        println!("{}", format!("[+] Loaded {} exclusion ranges", exclusion_subnets.len()).cyan());
-    }
+    let exclusion_subnets = if use_exclusions {
+        let subs = parse_exclusions(EXCLUDED_RANGES);
+        println!("{}", format!("[+] Loaded {} exclusion ranges", subs.len()).cyan());
+        subs
+    } else {
+        Vec::new()
+    };
     let exclusions = Arc::new(exclusion_subnets);
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -709,8 +706,8 @@ async fn run_mass_scan(target: &str) -> Result<()> {
 
             tokio::spawn(async move {
                 let ip = generate_random_public_ip(&exc);
-                if !is_ip_checked(&ip).await {
-                    mark_ip_checked(&ip).await;
+                if !is_ip_checked(&ip, STATE_FILE).await {
+                    mark_ip_checked(&ip, STATE_FILE).await;
                     mass_scan_host(ip, port, use_tls, &cid, cp, sf, of, verbose).await;
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -739,8 +736,8 @@ async fn run_mass_scan(target: &str) -> Result<()> {
 
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 tokio::spawn(async move {
-                    if !is_ip_checked(&ip).await {
-                        mark_ip_checked(&ip).await;
+                    if !is_ip_checked(&ip, STATE_FILE).await {
+                        mark_ip_checked(&ip, STATE_FILE).await;
                         mass_scan_host(ip, port, use_tls, &cid, cp, sf, of, verbose).await;
                     }
                     sc.fetch_add(1, Ordering::Relaxed);
@@ -875,42 +872,3 @@ async fn mass_scan_host(
     }
 }
 
-fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
-    let mut rng = rand::rng();
-    loop {
-        let octets: [u8; 4] = rng.random();
-        let ip = Ipv4Addr::from(octets);
-        let ip_addr = IpAddr::V4(ip);
-        let mut excluded = false;
-        for net in exclusions {
-            if net.contains(ip_addr) {
-                excluded = true;
-                break;
-            }
-        }
-        if !excluded { return ip_addr; }
-    }
-}
-
-async fn is_ip_checked(ip: &impl ToString) -> bool {
-    if !std::path::Path::new(STATE_FILE).exists() {
-        return false;
-    }
-    let ip_s = ip.to_string();
-    let status = tokio::process::Command::new("grep")
-        .arg("-F")
-        .arg("-q")
-        .arg(format!("checked: {}", ip_s))
-        .arg(STATE_FILE)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
-    match status { Ok(s) => s.success(), Err(_) => false }
-}
-
-async fn mark_ip_checked(ip: &impl ToString) {
-    let data = format!("checked: {}\n", ip.to_string());
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(STATE_FILE).await {
-        let _ = file.write_all(data.as_bytes()).await;
-    }
-}
