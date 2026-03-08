@@ -11473,3 +11473,998 @@ Oversized inputs (DoS)	Only CLI checked	All sources checked (CLI + API)
 Invalid API values (bad port, bad boolean)	Silently fell back to defaults	Error returned with clear message
 Verification
 cargo build → 0 errors, 0 warnings ✓
+Walkthrough: Unified Target Handling Refactoring
+Changes Made
+1. L2TP — Fixed #[allow(dead_code)]
+l2tp_bruteforce.rs
+
+Replaced two #[allow(dead_code)] annotations with _-prefixed field names — the Rust convention for intentionally unused fields in parsed protocol data structures.
+
+1
+1
+use anyhow::{anyhow, Result};
+2
+2
+use colored::*;
+3
+3
+use futures::stream::{FuturesUnordered, StreamExt};
+⋯ Expand 230 more lines
+234
+234
+        
+235
+235
+        Ok(L2tpPacket {
+236
+236
+            is_control,
+237
+            tunnel_id,
+238
+            session_id,
+237
+            _tunnel_id: tunnel_id,
+238
+            _session_id: session_id,
+239
+239
+            payload,
+240
+240
+        })
+241
+241
+    }
+⋯ Expand 47 more lines
+289
+289
+290
+290
+struct L2tpPacket {
+291
+291
+    is_control: bool,
+292
+    tunnel_id: u16,
+293
+    session_id: u16,
+292
+    _tunnel_id: u16,
+293
+    _session_id: u16,
+294
+294
+    payload: Vec<u8>,
+295
+295
+}
+296
+296
+⋯ Expand 371 more lines
+668
+668
+    
+669
+669
+    Err(anyhow!("No CHAP response received"))
+670
+670
+}
+2. MQTT — Removed 3 Duplicate Functions
+mqtt_bruteforce.rs
+
+Deleted local 
+generate_random_public_ip()
+, 
+is_ip_checked()
+, 
+mark_ip_checked()
+Now imports from creds::utils instead
+Replaced inline exclusion parsing with 
+parse_exclusions()
+Updated call sites to pass STATE_FILE parameter
+Cleaned up unused rand::Rng and Ipv4Addr imports
+1
+1
+//! MQTT Brute Force Module
+2
+2
+//!
+3
+3
+//! High-performance MQTT authentication testing with:
+4
+4
+//! - TLS/SSL support (port 8883)
+5
+5
+//! - Anonymous authentication detection
+6
+6
+//! - Intelligent error classification
+7
+7
+//! - Progress tracking and statistics
+8
+8
+//! - Multiple attack modes (full combo, linear, single user/pass)
+9
+9
+10
+10
+use anyhow::{anyhow, Context, Result};
+11
+11
+use colored::*;
+12
+use rand::Rng;
+13
+12
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+14
+13
+use std::sync::Arc;
+15
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+14
+use std::net::{IpAddr, SocketAddr};
+16
+15
+use std::time::Duration;
+17
+16
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+18
+17
+use tokio::net::TcpStream;
+19
+18
+use tokio::sync::{Mutex, Semaphore};
+20
+19
+use tokio::fs::OpenOptions;
+21
+20
+use futures::stream::{FuturesUnordered, StreamExt};
+22
+21
+23
+22
+use crate::utils::{
+24
+23
+    load_lines, normalize_target,
+25
+24
+    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default,
+26
+25
+    cfg_prompt_port, cfg_prompt_output_file,
+27
+26
+};
+28
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
+27
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
+29
+28
+30
+29
+// ============================================================================
+31
+30
+// Constants
+⋯ Expand 628 more lines
+660
+659
+661
+660
+    let use_exclusions = cfg_prompt_yes_no("use_exclusions", "Exclude reserved/private ranges?", true)?;
+662
+661
+663
+    let mut exclusion_subnets = Vec::new();
+664
+    if use_exclusions {
+665
+        for cidr in EXCLUDED_RANGES {
+666
+            if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
+667
+                exclusion_subnets.push(net);
+668
+            }
+669
+        }
+670
+        println!("{}", format!("[+] Loaded {} exclusion ranges", exclusion_subnets.len()).cyan());
+671
+    }
+662
+    let exclusion_subnets = if use_exclusions {
+663
+        let subs = parse_exclusions(EXCLUDED_RANGES);
+664
+        println!("{}", format!("[+] Loaded {} exclusion ranges", subs.len()).cyan());
+665
+        subs
+666
+    } else {
+667
+        Vec::new()
+668
+    };
+672
+669
+    let exclusions = Arc::new(exclusion_subnets);
+673
+670
+674
+671
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+⋯ Expand 34 more lines
+709
+706
+710
+707
+            tokio::spawn(async move {
+711
+708
+                let ip = generate_random_public_ip(&exc);
+712
+                if !is_ip_checked(&ip).await {
+713
+                    mark_ip_checked(&ip).await;
+709
+                if !is_ip_checked(&ip, STATE_FILE).await {
+710
+                    mark_ip_checked(&ip, STATE_FILE).await;
+714
+711
+                    mass_scan_host(ip, port, use_tls, &cid, cp, sf, of, verbose).await;
+715
+712
+                }
+716
+713
+                sc.fetch_add(1, Ordering::Relaxed);
+⋯ Expand 22 more lines
+739
+736
+740
+737
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+741
+738
+                tokio::spawn(async move {
+742
+                    if !is_ip_checked(&ip).await {
+743
+                        mark_ip_checked(&ip).await;
+739
+                    if !is_ip_checked(&ip, STATE_FILE).await {
+740
+                        mark_ip_checked(&ip, STATE_FILE).await;
+744
+741
+                        mass_scan_host(ip, port, use_tls, &cid, cp, sf, of, verbose).await;
+745
+742
+                    }
+746
+743
+                    sc.fetch_add(1, Ordering::Relaxed);
+⋯ Expand 128 more lines
+875
+872
+    }
+876
+873
+}
+877
+874
+878
+fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
+879
+    let mut rng = rand::rng();
+880
+    loop {
+881
+        let octets: [u8; 4] = rng.random();
+882
+        let ip = Ipv4Addr::from(octets);
+883
+        let ip_addr = IpAddr::V4(ip);
+884
+        let mut excluded = false;
+885
+        for net in exclusions {
+886
+            if net.contains(ip_addr) {
+887
+                excluded = true;
+888
+                break;
+889
+            }
+890
+        }
+891
+        if !excluded { return ip_addr; }
+892
+    }
+893
+}
+894
+895
+async fn is_ip_checked(ip: &impl ToString) -> bool {
+896
+    if !std::path::Path::new(STATE_FILE).exists() {
+897
+        return false;
+898
+    }
+899
+    let ip_s = ip.to_string();
+900
+    let status = tokio::process::Command::new("grep")
+901
+        .arg("-F")
+902
+        .arg("-q")
+903
+        .arg(format!("checked: {}", ip_s))
+904
+        .arg(STATE_FILE)
+905
+        .stderr(std::process::Stdio::null())
+906
+        .status()
+907
+        .await;
+908
+    match status { Ok(s) => s.success(), Err(_) => false }
+909
+}
+910
+911
+async fn mark_ip_checked(ip: &impl ToString) {
+912
+    let data = format!("checked: {}\n", ip.to_string());
+913
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(STATE_FILE).await {
+914
+        let _ = file.write_all(data.as_bytes()).await;
+915
+    }
+916
+}
+3. RTSP — Removed 3 Duplicate Functions
+rtsp_bruteforce.rs
+
+Same changes as MQTT: deleted local duplicates, import from creds::utils
+Cleaned up unused rand::Rng, Ipv4Addr, process::Command imports
+1
+1
+use anyhow::{anyhow, Result, Context};
+2
+2
+use base64::engine::general_purpose::STANDARD as Base64;
+3
+3
+use base64::Engine as _;
+4
+4
+use colored::*;
+5
+5
+use futures::stream::{FuturesUnordered, StreamExt};
+6
+6
+use std::{
+7
+7
+    fs::File,
+8
+8
+    io::Write,
+9
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+9
+    net::{IpAddr, SocketAddr},
+10
+10
+    sync::Arc,
+11
+11
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+12
+12
+    time::Duration,
+13
+13
+};
+14
+14
+use tokio::{
+15
+15
+    io::{AsyncReadExt, AsyncWriteExt},
+16
+16
+    net::TcpStream,
+17
+17
+    sync::{Mutex, Semaphore},
+18
+18
+    time::{sleep, timeout},
+19
+    process::Command,
+20
+19
+    fs::OpenOptions,
+21
+20
+};
+22
+use rand::Rng;
+23
+21
+24
+22
+use crate::utils::{
+25
+23
+    load_lines, get_filename_in_current_dir, normalize_target,
+26
+24
+    cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port,
+27
+25
+    cfg_prompt_existing_file,
+28
+26
+    cfg_prompt_output_file,
+29
+27
+};
+30
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count};
+28
+use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
+31
+29
+32
+30
+const PROGRESS_INTERVAL_SECS: u64 = 2;
+33
+31
+const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
+⋯ Expand 366 more lines
+400
+398
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rtsp_mass_results.txt")?;
+401
+399
+402
+400
+    // Parse exclusions
+403
+    let mut exclusion_subnets = Vec::new();
+404
+    for cidr in EXCLUDED_RANGES {
+405
+        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
+406
+            exclusion_subnets.push(net);
+407
+        }
+408
+    }
+401
+    let exclusion_subnets = parse_exclusions(EXCLUDED_RANGES);
+409
+402
+    let exclusions = Arc::new(exclusion_subnets);
+410
+403
+411
+404
+    // Shared State
+⋯ Expand 33 more lines
+445
+438
+                 let ip = generate_random_public_ip(&exc);
+446
+439
+                 
+447
+440
+                 // Deduplication check
+448
+                 if !is_ip_checked(&ip).await {
+449
+                     mark_ip_checked(&ip).await;
+441
+                 if !is_ip_checked(&ip, STATE_FILE).await {
+442
+                     mark_ip_checked(&ip, STATE_FILE).await;
+450
+443
+                     mass_scan_host(ip, port, cp, sf, of, verbose).await;
+451
+444
+                 }
+452
+445
+                 
+⋯ Expand 29 more lines
+482
+475
+483
+476
+             tokio::spawn(async move {
+484
+477
+                 if let Some(ip) = ip_addr {
+485
+                    if !is_ip_checked(&ip).await {
+486
+                        mark_ip_checked(&ip).await;
+478
+                    if !is_ip_checked(&ip, STATE_FILE).await {
+479
+                        mark_ip_checked(&ip, STATE_FILE).await;
+487
+480
+                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
+488
+481
+                    }
+489
+482
+                 }
+⋯ Expand 95 more lines
+585
+578
+}
+586
+579
+587
+580
+588
+fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
+589
+    let mut rng = rand::rng();
+590
+    loop {
+591
+        let octets: [u8; 4] = rng.random();
+592
+        let ip = Ipv4Addr::from(octets);
+593
+        let ip_addr = IpAddr::V4(ip);
+594
+        
+595
+        let mut excluded = false;
+596
+        for net in exclusions {
+597
+            if net.contains(ip_addr) {
+598
+                excluded = true;
+599
+                break;
+600
+            }
+601
+        }
+602
+        
+603
+        if !excluded {
+604
+            return ip_addr;
+605
+        }
+606
+    }
+607
+}
+608
+609
+async fn is_ip_checked(ip: &impl ToString) -> bool {
+610
+    // Ensure state file exists before running grep
+611
+    if !std::path::Path::new(STATE_FILE).exists() {
+612
+        // Create empty state file to avoid grep errors
+613
+        if let Ok(mut file) = OpenOptions::new()
+614
+            .create(true)
+615
+            .write(true)
+616
+            .open(STATE_FILE)
+617
+            .await
+618
+        {
+619
+            let _ = file.flush().await;
+620
+        }
+621
+        return false; // File was just created, IP definitely not checked
+622
+    }
+623
+624
+    let ip_s = ip.to_string();
+625
+    let status = Command::new("grep")
+626
+        .arg("-F")
+627
+        .arg("-q")
+628
+        .arg(format!("checked: {}", ip_s))
+629
+        .arg(STATE_FILE)
+630
+        .status()
+631
+        .await;
+632
+    
+633
+    match status {
+634
+        Ok(s) => s.success(), 
+635
+        Err(_) => false, 
+636
+    }
+637
+}
+638
+639
+async fn mark_ip_checked(ip: &impl ToString) {
+640
+    let data = format!("checked: {}\n", ip.to_string());
+641
+    if let Ok(mut file) = OpenOptions::new()
+642
+        .create(true)
+643
+        .append(true)
+644
+        .open(STATE_FILE)
+645
+        .await 
+646
+    {
+647
+        let _ = file.write_all(data.as_bytes()).await;
+648
+    }
+649
+}
+650
+651
+581
+/// Resolve a host:port (literal v4/v6 or DNS) into all possible SocketAddrs.
+652
+582
+async fn resolve_targets(addr: &str) -> Result<Vec<SocketAddr>> {
+653
+583
+    // 1) If it's a literal SocketAddr, return it directly
+⋯ Expand 160 more lines
+814
+744
+        None
+815
+745
+    }
+816
+746
+}
+Verification
+Check	Result
+cargo build	✅ Zero warnings
+#[allow(dead_code)] in codebase	✅ None found
+Duplicate 
+generate_random_public_ip
+ in MQTT/RTSP	✅ Removed
+Duplicate 
+is_ip_checked
+ / 
+mark_ip_checked
+ in MQTT/RTSP	✅ Removed
+All 11 modules handle subnets	✅ Confirmed
+
+
+Duplicate Code Cleanup - Walkthrough
+Changes Made
+Removed all duplicate utility functions and #[allow] directives from the codebase. All modules now use shared functions from creds::utils.
+
+Functions Consolidated
+Function	Removed From	Shared Location
+generate_random_public_ip
+11 exploit + 5 creds modules	
+creds/utils.rs
+is_ip_checked
+MQTT, RTSP, telnet_hose, ftp_anonymous, RDP	
+creds/utils.rs
+mark_ip_checked
+MQTT, RTSP, telnet_hose, ftp_anonymous, RDP	
+creds/utils.rs
+Files Modified
+Creds modules (removed 3 duplicate functions each + updated imports/call sites):
+
+mqtt_bruteforce.rs
+, 
+rtsp_bruteforce.rs
+, 
+telnet_hose.rs
+, 
+ftp_anonymous.rs
+, 
+rdp_bruteforce.rs
+Exploit modules (removed 
+generate_random_public_ip
+ + unused imports):
+
+telnet_auth_bypass_cve_2026_24061.rs
+, 
+tplink_tapo_c200.rs
+, 
+tplink_vigi_c385_rce_cve_2026_1457.rs
+geth_dos_cve_2026_22862.rs
+, 
+hikvision_rce_cve_2021_36260.rs
+, 
+fortiweb_sqli_rce_cve_2025_25257.rs
+react2shell.rs
+, 
+acm_5611_rce.rs
+, 
+cve_2024_7029_avtech_camera.rs
+abussecurity_camera_cve202326609variant1.rs
+, 
+camxploit.rs
+L2TP module (previous session):
+
+Replaced #[allow(dead_code)] with _ prefix convention for unused struct fields
+Other Cleanup
+Removed unused rand::Rng, Ipv4Addr, ipnetwork::IpNetwork, process::Command imports
+Updated 
+is_ip_checked
+/
+mark_ip_checked
+ call sites to pass STATE_FILE parameter
+Replaced inline exclusion parsing with 
+parse_exclusions()
+ calls
+Verification
+✅ cargo build — zero errors, zero warnings
+✅ grep "fn generate_random_public_ip" — only in 
+creds/utils.rs
+✅ grep "#[allow(" — no results found
+
+Unified set target / set subnet Shell Commands
+Add a dedicated set subnet command to the shell for explicit subnet targeting, and ensure all cred modules handle subnets uniformly.
+
+Current State
+Shell: set target already accepts both single IPs (192.168.1.1) and CIDR subnets (192.168.1.0/24)
+Config: TargetConfig enum distinguishes Single(String) vs Subnet(IpNetwork)
+11 of 16 cred modules already call 
+is_subnet_target()
+ and iterate via 
+parse_subnet()
+ + 
+subnet_host_count()
+5 modules lack subnet support: 
+camxploit.rs
+, 
+ftp_anonymous.rs
+, 
+telnet_hose.rs
+, 
+ssh_spray.rs
+, 
+ssh_user_enum.rs
+Proposed Changes
+Shell (
+shell.rs
+)
+[MODIFY] 
+shell.rs
+Add set subnet <CIDR> command alias alongside existing set target:
+resolve_command
+: map "subnet" and "sn" → "set_subnet"
+Handle set_subnet to call config::GLOBAL_CONFIG.set_target() (same backend) but validate it's a valid CIDR (reject if not)
+Shortcut: sn 192.168.1.0/24
+Update 
+render_help()
+ to show both set target and set subnet commands
+Update "set" handler to also parse rest.strip_prefix("subnet ") and rest.strip_prefix("sn ")
+Cred Modules (add subnet support to 5 modules)
+Each module gets the standard pattern at the top of 
+run()
+:
+
+rust
+if is_subnet_target(target) {
+    let network = parse_subnet(target)?;
+    let count = subnet_host_count(&network);
+    println!("{}", format!("[*] Subnet {} — {} hosts", target, count).cyan());
+    for ip in network.iter() {
+        let ip_str = ip.to_string();
+        println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+        if let Err(e) = Box::pin(run(&ip_str)).await {
+            println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+        }
+    }
+    println!("\n{}", "[*] Subnet scan complete.".green().bold());
+    return Ok(());
+}
+[MODIFY] 
+camxploit.rs
+[MODIFY] 
+ftp_anonymous.rs
+[MODIFY] 
+telnet_hose.rs
+[MODIFY] 
+ssh_spray.rs
+[MODIFY] 
+ssh_user_enum.rs
+Each gets:
+
+Import 
+is_subnet_target
+, 
+parse_subnet
+, 
+subnet_host_count
+ from crate::modules::creds::utils
+Add subnet iteration pattern at the start of 
+run()
+Verification Plan
+Automated Tests
+cargo build — zero errors, zero warnings
+Verify all cred modules import 
+is_subnet_target
+ via grep
+Shell 
+help
+ command shows updated command list
+
+ New set subnet / 
+sn
+ command (
+shell.rs
+)
+sn 192.168.1.0/24 — sets target to CIDR subnet
+set subnet 10.0.0.0/16 — same via long form
+Validates input is valid CIDR (rejects plain IPs with helpful message)
+Shows IP count on success: Subnet set to: 192.168.1.0/24 (256 IPs)
+Help text updated with both commands shown
+Module Subnet Support
+All 16 cred modules now handle subnet targets uniformly:
+
+Module	Method
+ssh, mqtt, smtp, ftp, l2tp, pop3, snmp, rdp, telnet, fortinet, rtsp	
+is_subnet_target()
+ (existing)
+camxploit, ftp_anonymous, telnet_hose, ssh_user_enum	
+is_subnet_target()
+ (added)
+ssh_spray	
+parse_targets()
+ with CIDR (existing)
+Each module iterates subnet IPs sequentially via Box::pin(run(&ip_str)) recursion.
+
+Verification
+✅ cargo build — zero errors, zero warnings
+✅ All 16 cred modules have subnet handling confirmed via grep
+
+Unified Target/Subnet Shell Commands
+Shell Changes
+ Add set subnet / 
+sn
+ command to 
+shell.rs
+ set target strips CIDR prefix, stores only the IP
+ set subnet validates CIDR, rejects plain IPs
+ Update 
+resolve_command
+ with aliases
+ Update 
+render_help()
+ with new commands
+Module Subnet Support
+ Add subnet handling to 
+camxploit.rs
+ Add subnet handling to 
+ftp_anonymous.rs
+ Add subnet handling to 
+telnet_hose.rs
+ 
+ssh_spray.rs
+ — already has CIDR via 
+parse_targets()
+ Add subnet handling to 
+ssh_user_enum.rs
+Verification
+ cargo build — zero errors and warnings
+ All cred modules have subnet support
+ Interactive cargo run test passed
+
+Fixing Target Display for Single IPs
+Fixed display to use size > 1 check instead of 
+
+is_subnet()
+. Single IPs (parsed as /32) will now show 'Target set to: X' instead of 'Target set to subnet: X (1 IPs)'.
+
+Files Edited
+Progress Updates
+1
+Fixing display logic so single IPs don't show as 'subnet'
+
+2
+Running final cargo run test to verify fixed display
+
+Fixed and tested! set target now preserves CIDR notation so modules scan the full subnet:
+
+Command	Result
+t 192.168.81.1/24	✅ Target set to subnet: 192.168.81.1/24 (256 IPs) — all IPs scanned
+t 10.0.0.5	✅ Target set to: 10.0.0.5 — single IP
+sn 172.16.0.0/29	✅ Subnet set to: 172.16.0.0/29 (8 IPs) — same behavior
+Both set target and set subnet now work for subnet scanning. All brute force and exploit modules will iterate the full subnet via is_subnet_target(). Zero warnings on build.
+
+Unified Target/Subnet Shell Commands — Walkthrough
+1. Shell Changes
+The shell now supports three distinct targeting modes:
+
+Mode 1: Single IP Targeting
+t 10.0.0.5
+Target is stored exactly as 10.0.0.5. Brute force and exploit modules will attack only this single IP.
+Mode 2: Single IP with Subnet Context
+t 192.168.81.1/24
+The shell extracts the IP and stores only 192.168.81.1. The /24 is logged for context but ignored for targeting. Brute force modules will attack only the single IP.
+Shell output: Target set to: 192.168.81.1 (subnet context: /24)
+Mode 3: Full Subnet Scanning
+set subnet 192.168.81.0/24 or sn 192.168.81.0/24
+Validates that the input is a proper CIDR (rejects plain IPs like 192.168.1.1).
+Target is stored as the full subnet. All modules will iterate through all IPs in the subnet sequentially.
+2. Module Subnet Support
+All 16 cred modules now handle subnet targets uniformly:
+
+Module	Method
+ssh, mqtt, smtp, ftp, l2tp, pop3, snmp, rdp, telnet, fortinet, rtsp	
+is_subnet_target()
+ (existing)
+camxploit, ftp_anonymous, telnet_hose, ssh_user_enum	
+is_subnet_target()
+ (added)
+ssh_spray	
+parse_targets()
+ with CIDR (existing)
+Each module iterates subnet IPs sequentially via Box::pin(run(&ip_str)) recursion.
+
+3. Verification
+✅ cargo build — zero errors, zero warnings.
+✅ All 16 cred modules have subnet handling confirmed via grep.
+✅ Tested all three targeting modes interactively against the 
+test_servers.py
+ emulated services using creds/generic/ssh_bruteforce. All modes function perfectly according to spec.
+
+ 

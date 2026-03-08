@@ -1,16 +1,16 @@
 use anyhow::{Result, Context};
 use colored::*;
-use rand::Rng;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::timeout;
+
+use crate::modules::creds::utils::{generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 
 // Hardcoded exclusions (Private + Cloudflare + Google + Link Local etc)
 const EXCLUDED_RANGES: &[&str] = &[
@@ -58,6 +58,22 @@ enum TelnetState {
 }
 
 pub async fn run(target: &str) -> Result<()> {
+    // Subnet handling — iterate over each IP in the CIDR
+    if is_subnet_target(target) {
+        let network = parse_subnet(target)?;
+        let count = subnet_host_count(&network);
+        println!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
+        }
+        println!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
+
     println!("{}", "=== Telnet Hose Mass Scanner ===".bold().cyan());
     println!("Target Mode: {}", if target.is_empty() || target == "random" { "Internet Random" } else { target });
     println!("Concurrency: {}", CONCURRENCY);
@@ -65,13 +81,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("Output:      {}", OUTPUT_FILE);
     
     // Parse exclusions
-    let mut exclusion_subnets = Vec::new();
-    for cidr in EXCLUDED_RANGES {
-        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
-            exclusion_subnets.push(net);
-        }
-    }
-    let exclusions = Arc::new(exclusion_subnets);
+    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
 
     // Prepare Credential Combos
     let mut creds = Vec::new();
@@ -115,8 +125,8 @@ pub async fn run(target: &str) -> Result<()> {
                 let ip = generate_random_public_ip(&exc);
                 
                 // Check if already tested
-                if !is_ip_checked(&ip).await {
-                    mark_ip_checked(&ip).await;
+                if !is_ip_checked(&ip, STATE_FILE).await {
+                    mark_ip_checked(&ip, STATE_FILE).await;
                     scan_ip(Some(ip), cr, sf).await;
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -144,8 +154,8 @@ pub async fn run(target: &str) -> Result<()> {
             let ip = ip_str.clone();
 
             tokio::spawn(async move {
-                 if !is_ip_checked(&ip).await {
-                    mark_ip_checked(&ip).await;
+                 if !is_ip_checked(&ip, STATE_FILE).await {
+                    mark_ip_checked(&ip, STATE_FILE).await;
                     scan_ip(ip.parse().ok(), cr, sf).await;
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -163,55 +173,7 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
-    let mut rng = rand::rng();
-    loop {
-        let octets: [u8; 4] = rng.random();
-        let ip = Ipv4Addr::from(octets);
-        let ip_addr = IpAddr::V4(ip);
-        
-        let mut excluded = false;
-        for net in exclusions {
-            if net.contains(ip_addr) {
-                excluded = true;
-                break;
-            }
-        }
-        
-        if !excluded {
-            return ip_addr;
-        }
-    }
-}
 
-async fn is_ip_checked(ip: &impl ToString) -> bool {
-    // Grep for "checked: <ip>" in state file
-    let ip_s = ip.to_string();
-    let status = Command::new("grep")
-        .arg("-F")
-        .arg("-q")
-        .arg(format!("checked: {}", ip_s))
-        .arg(STATE_FILE)
-        .status()
-        .await;
-    
-    match status {
-        Ok(s) => s.success(), // Grep returns 0 (true) if found
-        Err(_) => false, // File might not exist yet
-    }
-}
-
-async fn mark_ip_checked(ip: &impl ToString) {
-    let data = format!("checked: {}\n", ip.to_string());
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(STATE_FILE)
-        .await 
-    {
-        let _ = file.write_all(data.as_bytes()).await;
-    }
-}
 
 async fn save_result(ip: &str, port: u16, user: &str, pass: &str) {
     let data = format!("{}:{} {}:{}\n", ip, port, user, pass);

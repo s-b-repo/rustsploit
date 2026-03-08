@@ -16,6 +16,7 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use anyhow::Context;
+use crate::modules::creds::utils::{is_subnet_target, parse_subnet, subnet_host_count};
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -248,7 +249,23 @@ const DEFAULT_USERNAMES: &[&str] = &[
 /// Main entry point
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
-    
+
+    // Subnet handling — iterate over each IP in the CIDR
+    if is_subnet_target(target) {
+        let network = parse_subnet(target)?;
+        let count = subnet_host_count(&network);
+        println!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
+        }
+        println!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
+
     let host = normalize_target(target);
     println!("{}", format!("[*] Target: {}", host).cyan());
     

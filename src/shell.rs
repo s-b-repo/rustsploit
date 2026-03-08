@@ -182,26 +182,92 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
                             if raw_value.is_empty() {
                                 println!("{}", "Usage: set target <value>".yellow());
                                 println!("{}", "  Shortcuts: t <value>, target <value>".dimmed());
-                                println!("{}", "  Note: Value must be on the same line as the command.".dimmed());
+                                println!("{}", "  For subnets: set subnet <CIDR> or sn <CIDR>".dimmed());
                                 println!("{}", "  Examples:".dimmed());
                                 println!("{}", "    t 192.168.1.1".dimmed());
-                                println!("{}", "    t 10.16.0.22/24".dimmed());
+                                println!("{}", "    sn 10.16.0.0/24".dimmed());
                                 println!("{}", "    set target example.com".dimmed());
                                 continue;
                             }
 
                             match sanitize_target(raw_value) {
                                 Ok(valid_target) => {
-                                    match config::GLOBAL_CONFIG.set_target(&valid_target) {
+                                    // If user provides CIDR (e.g. 192.168.81.1/24), extract just the IP.
+                                    // "set target" always targets a SINGLE IP.
+                                    // Use "set subnet" / "sn" to scan an entire subnet.
+                                    let (ip_only, subnet_note) = if valid_target.contains('/') {
+                                        let ip_part = valid_target.split('/').next().unwrap_or(&valid_target).to_string();
+                                        let prefix = valid_target.split('/').nth(1).unwrap_or("");
+                                        (ip_part, Some(format!("/{}", prefix)))
+                                    } else {
+                                        (valid_target.clone(), None)
+                                    };
+
+                                    match config::GLOBAL_CONFIG.set_target(&ip_only) {
                                         Ok(_) => {
-                                            if config::GLOBAL_CONFIG.is_subnet() {
-                                                println!("{}", format!("Target set to subnet: {}", valid_target).green());
+                                            if let Some(ref sn) = subnet_note {
+                                                println!("{}", format!("Target set to: {} (subnet context: {})", ip_only, sn).green());
                                             } else {
-                                                println!("{}", format!("Target set to: {}", valid_target).green());
+                                                println!("{}", format!("Target set to: {}", ip_only).green());
                                             }
                                         }
                                         Err(e) => {
                                             println!("{}", format!("[!] Failed to set target: {}", e).red());
+                                        }
+                                    }
+                                }
+                                Err(reason) => {
+                                    println!("{}", format!("[!] {}", reason).yellow());
+                                }
+                            }
+                        }
+                        "set_subnet" => {
+                            // Handle shortcuts: "subnet <val>", "sn <val>", "set subnet <val>", "set sn <val>"
+                            let raw_value = if cmd == "subnet" || cmd == "sn" {
+                                &rest
+                            } else if let Some(val) = rest.strip_prefix("subnet ") {
+                                val
+                            } else if let Some(val) = rest.strip_prefix("sn ") {
+                                val
+                            } else {
+                                ""
+                            };
+
+                            let raw_value = raw_value.trim();
+
+                            if raw_value.is_empty() {
+                                println!("{}", "Usage: set subnet <CIDR>".yellow());
+                                println!("{}", "  Shortcuts: sn <CIDR>, subnet <CIDR>".dimmed());
+                                println!("{}", "  Examples:".dimmed());
+                                println!("{}", "    sn 192.168.1.0/24".dimmed());
+                                println!("{}", "    set subnet 10.0.0.0/16".dimmed());
+                                continue;
+                            }
+
+                            // Validate it's a CIDR subnet, not a plain IP
+                            if !raw_value.contains('/') {
+                                println!("{}", "[!] Not a subnet. Use CIDR notation (e.g. 192.168.1.0/24).".yellow());
+                                println!("{}", "    For single IPs, use: set target <IP>".dimmed());
+                                continue;
+                            }
+
+                            match sanitize_target(raw_value) {
+                                Ok(valid_target) => {
+                                    // Verify it actually parses as CIDR
+                                    if valid_target.parse::<IpNetwork>().is_err() {
+                                        println!("{}", format!("[!] Invalid CIDR notation: {}", valid_target).red());
+                                        continue;
+                                    }
+                                    match config::GLOBAL_CONFIG.set_target(&valid_target) {
+                                        Ok(_) => {
+                                            if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+                                                println!("{}", format!("Subnet set to: {} ({} IPs)", valid_target, size).green());
+                                            } else {
+                                                println!("{}", format!("Subnet set to: {}", valid_target).green());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("{}", format!("[!] Failed to set subnet: {}", e).red());
                                         }
                                     }
                                 }
@@ -397,6 +463,7 @@ pub fn resolve_command(cmd: &str) -> String {
 
         "use" | "u" => "use",
         "set" | "target" | "t" => "set",
+        "subnet" | "sn" => "set_subnet",
         "show_target" | "showtarget" | "st" => "show_target",
         "clear_target" | "cleartarget" | "ct" => "clear_target",
                         "run" | "go" | "exec" => "run",
@@ -454,11 +521,12 @@ fn render_help() {
         ("modules", "modules | ls | m", "List available modules"),
         ("find", "find <kw> | f1 <kw>", "Search modules by keyword"),
         ("use", "use <path> | u <path>", "Select a module to run"),
-        ("set target", "set target <val> | t <val>", "Set global target (IP/subnet)"),
+        ("set target", "set target <val> | t <val>", "Set global target (IP or subnet)"),
+        ("set subnet", "set subnet <CIDR> | sn <CIDR>", "Set target to a CIDR subnet"),
         ("show_target", "show_target | st", "Show current local and global targets"),
         ("clear_target", "clear_target", "Clear local and global targets"),
-        ("run", "run | go", "Execute selected module (with proxy rotation)"),
-        ("run_all", "run_all | runall | ra", "Run module against all IPs in subnet (max 65536)"),
+        ("run", "run | go", "Execute selected module"),
+        ("run_all", "run_all | runall | ra", "Run module against all IPs in subnet"),
         ("back", "back | b | clear | reset", "Clear current module and target"),
         ("exit", "exit | quit | q", "Leave the shell"),
     ];

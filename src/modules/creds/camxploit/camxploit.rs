@@ -3,8 +3,7 @@ use colored::*;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use base64::prelude::*;
-use rand::Rng;
-use std::net::{IpAddr, Ipv4Addr};
+use crate::modules::creds::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
@@ -177,6 +176,22 @@ const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
 pub async fn run(target: &str) -> Result<()> {
     let target = target.trim().to_string();
     print_banner();
+
+    // Subnet handling — iterate over each IP in the CIDR
+    if is_subnet_target(&target) {
+        let network = parse_subnet(&target)?;
+        let count = subnet_host_count(&network);
+        println!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            println!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                println!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
+        }
+        println!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
 
     if target == "0.0.0.0" || target == "0.0.0.0/0" {
         return run_mass_scan().await;
@@ -686,17 +701,7 @@ fn build_exclusion_list() -> Vec<ipnetwork::IpNetwork> {
         .collect()
 }
 
-/// Generate a random public IP, excluding reserved/bogon ranges
-fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> Ipv4Addr {
-    let mut rng = rand::rng();
-    loop {
-        let ip = Ipv4Addr::from(rng.random::<u32>());
-        let ip_addr = IpAddr::V4(ip);
-        if !exclusions.iter().any(|net| net.contains(ip_addr)) {
-            return ip;
-        }
-    }
-}
+
 
 /// Check if all open ports are in the ignored services list (SSH/Telnet/RDP)
 /// Returns true if the host should be skipped (only non-camera services found)
