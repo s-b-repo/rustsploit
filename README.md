@@ -127,11 +127,9 @@ cargo build
 ### instant quick run command debian 13
 
 ```
-sudo apt update -y && sudo apt upgrade -y && sudo apt install git wget curl -y && \
-sudo apt install pkg-config libssl-dev freerdp2-x11 libdbus-1-dev -y && \
+sudo apt update -y && sudo apt upgrade -y && sudo apt install git wget curl pkg-config libssl-dev rustc libdbus-1-dev -y && \
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-source $HOME/.cargo/env && \
-rm -rf rustsploit && git clone https://github.com/s-b-repo/rustsploit.git && \
+source $HOME/.cargo/env  && git clone https://github.com/s-b-repo/rustsploit.git && \
 cd rustsploit && CARGO_BUILD_JOBS=1 cargo run
 ```
 
