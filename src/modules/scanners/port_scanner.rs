@@ -286,7 +286,6 @@ pub async fn run_with_settings(
                                 println!("  {} TCP {}:{} FILTERED", "~".yellow(), ip_str, port);
                             }
                         }
-                        _ => {}
                     }
                 }
                 
