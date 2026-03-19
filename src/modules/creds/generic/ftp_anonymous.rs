@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream; // For fast connect check
 
-use crate::utils::{prompt_int_range, prompt_yes_no, prompt_output_file};
+use crate::utils::{cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file};
 use crate::modules::creds::utils::{generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -168,15 +168,15 @@ pub async fn run(target: &str) -> Result<()> {
 
 async fn run_mass_scan(target: &str) -> Result<()> {
     // Prep
-    let concurrency = prompt_int_range("Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
     if verbose {
         println!("{}", "[*] Verbose mode enabled".dimmed());
     }
-    let output_file = prompt_output_file("Output result file", "ftp_mass_results.txt")?;
+    let output_file = cfg_prompt_output_file("output_file", "Output result file", "ftp_mass_results.txt")?;
 
     // Ask about exclusions
-    let use_exclusions = prompt_yes_no("Exclude reserved/private ranges?", true)?;
+    let use_exclusions = cfg_prompt_yes_no("use_exclusions", "Exclude reserved/private ranges?", true)?;
     
     // Parse exclusions
     let exclusion_subnets = if use_exclusions {

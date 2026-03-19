@@ -219,6 +219,75 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 /// Module-level configuration for API-driven execution
 /// This is set by the API before running a module and read by modules
 /// to get pre-configured values instead of prompting the user
+///
+/// # Unified Prompt Keys
+///
+/// These are the standardized `custom_prompts` keys used across all
+/// scanner modules (via `cfg_prompt_*` in utils.rs). Supply them in the
+/// JSON `"prompts"` object of an API `/api/run` request.
+///
+/// ## Common Keys (used by many modules)
+/// | Key               | Type   | Description                                    |
+/// |-------------------|--------|------------------------------------------------|
+/// | `port`            | u16    | Target service port                            |
+/// | `timeout`         | int    | Connection/request timeout (seconds or ms)     |
+/// | `verbose`         | y/n    | Verbose output                                 |
+/// | `save_results`    | y/n    | Save results to file                           |
+/// | `output_file`     | string | Output filename for results                    |
+/// | `concurrency`     | int    | Number of concurrent threads/tasks             |
+/// | `threads`         | int    | Alias for concurrency (some modules)           |
+/// | `wordlist`        | path   | Path to wordlist file                          |
+/// | `target_file`     | path   | Path to file containing targets                |
+/// | `additional_targets` | string | Comma-separated additional targets           |
+/// | `mode`            | string | Operation mode selector (1, 2, 3, etc.)        |
+///
+/// ## Scanner-Specific Keys
+///
+/// ### Port Scanner (`scanners/port_scanner`)
+/// `port_range`, `scan_method`, `show_only_open`, `ttl`, `source_port`, `data_length`
+///
+/// ### SSH Scanner (`scanners/ssh_scanner`)
+/// `load_from_file`, `target_file`
+///
+/// ### DNS Recursion (`scanners/dns_recursion`)
+/// `domain`, `record_type`
+///
+/// ### SMTP User Enum (`scanners/smtp_user_enum`)
+/// `timeout_ms`, `save_valid`, `valid_output`, `save_unknown`, `unknown_output`
+///
+/// ### Ping Sweep (`scanners/ping_sweep`)
+/// `add_manual_targets`, `manual_target`, `load_from_file`, `save_up_hosts`,
+/// `up_hosts_file`, `save_down_hosts`, `down_hosts_file`, `use_icmp`, `use_tcp`,
+/// `tcp_ports`, `use_syn`, `syn_ports`, `use_ack`, `ack_ports`
+///
+/// ### HTTP Title Scanner (`scanners/http_title_scanner`)
+/// `check_http`, `check_https`, `use_ports`, `ports`
+///
+/// ### HTTP Method Scanner (`scanners/http_method_scanner`)
+/// `scheme`, `use_ports`, `ports`
+///
+/// ### Dir Brute (`scanners/dir_brute`)
+/// `scan_mode`, `delay_ms`, `random_agent`, `custom_cookies`, `cookies`,
+/// `use_https`, `base_path`, `template_name`, `template_file`, `sort_by`
+///
+/// ### Sequential Fuzzer (`scanners/sequential_fuzzer`)
+/// `min_length`, `max_length`, `charset`, `custom_charset`, `encoding`,
+/// `add_cookies`, `cookies`, `append_slash`, `template_name`, `template_file`, `target_url`
+///
+/// ### API Endpoint Scanner (`scanners/api_endpoint_scanner`)
+/// `output_dir`, `use_spoofing`, `use_generic_payload`, `enable_delete`,
+/// `enable_extended_methods`, `modules`, `enum_mode`, `id_start`, `id_end`,
+/// `id_file`, `endpoint_source`, `base_path`, `endpoint_file`
+///
+/// ### IPMI Enum/Exploit (`scanners/ipmi_enum_exploit`)
+/// `cidr`, `target`, `test_cipher_zero`, `test_anonymous`, `test_default_creds`,
+/// `test_rakp_hash`, `continue_large_scan`, `destroy_confirm`
+///
+/// ### SSDP MSearch (`scanners/ssdp_msearch`)
+/// `retries`, `search_target`
+///
+/// ### Sample Scanner (`scanners/sample_scanner`)
+/// `check_http`, `check_https`
 #[derive(Clone, Debug)]
 pub struct ModuleConfig {
     pub port: Option<u16>,

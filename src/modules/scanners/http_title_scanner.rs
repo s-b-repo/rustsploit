@@ -5,47 +5,47 @@ use regex::Regex;
 use reqwest::{Client, StatusCode, Url};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 
 use std::time::{Duration, Instant};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
+};
 
 pub async fn run(initial_target: &str) -> Result<()> {
     banner();
 
     let mut targets = collect_initial_targets(initial_target);
 
-    let additional = prompt("Enter additional comma-separated targets (optional): ")?;
+    let additional = cfg_prompt_default("additional_targets", "Enter additional comma-separated targets (optional)", "")?;
     if !additional.is_empty() {
         targets.extend(split_targets(&additional));
     }
 
-    let file_path = prompt("Path to file with targets (optional): ")?;
+    let file_path = cfg_prompt_default("target_file", "Path to file with targets (optional)", "")?;
     if !file_path.is_empty() {
         let file_targets = load_targets_from_file(&file_path)?;
         targets.extend(file_targets);
     }
 
-    let check_http = prompt_bool("Check HTTP (http://)? (yes/no, default yes): ", true)?;
-    let check_https = prompt_bool("Check HTTPS (https://)? (yes/no, default yes): ", true)?;
+    let check_http = cfg_prompt_yes_no("check_http", "Check HTTP (http://)?", true)?;
+    let check_https = cfg_prompt_yes_no("check_https", "Check HTTPS (https://)?", true)?;
 
     if !check_http && !check_https {
         println!("[!] Neither HTTP nor HTTPS selected; nothing to scan.");
         return Ok(());
     }
 
-    let use_ports = prompt_bool(
-        "Test via specific ports (port tunneling)? (yes/no, default no): ",
-        false,
-    )?;
+    let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false)?;
     let ports = if use_ports {
-        prompt_ports()?
+        let ports_str = cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "")?;
+        parse_ports_from_string(&ports_str)
     } else {
         Vec::new()
     };
 
-    let timeout_secs = prompt_timeout()?;
-    let save_output = prompt_bool("Save results to file? (yes/no, default yes): ", true)?;
-    let verbose = prompt_bool("Enable verbose output? (yes/no, default no): ", false)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120)? as u64;
+    let save_output = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Enable verbose output?", false)?;
 
     let mut normalized = normalize_targets(targets, check_http, check_https);
     if !ports.is_empty() {
@@ -141,10 +141,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
             "http_title_scan_{}.txt",
             Utc::now().format("%Y%m%d_%H%M%S")
         );
-        let output_path = prompt_with_default(
-            "Enter output file path (press Enter for default): ",
-            &default_name,
-        )?;
+        let output_path = cfg_prompt_output_file("output_file", "Enter output file path", &default_name)?;
         write_report(&output_path, &all_results)?;
         println!("[*] Results saved to {}", output_path);
     }
@@ -266,6 +263,13 @@ fn normalize_targets(targets: Vec<String>, check_http: bool, check_https: bool) 
     normalized
 }
 
+fn parse_ports_from_string(s: &str) -> Vec<u16> {
+    s.split(',')
+        .filter_map(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .collect()
+}
+
 fn expand_targets_with_ports(targets: &[String], ports: &[u16]) -> Vec<String> {
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
@@ -292,90 +296,6 @@ fn expand_targets_with_ports(targets: &[String], ports: &[u16]) -> Vec<String> {
     }
 
     expanded
-}
-
-fn prompt(message: &str) -> Result<String> {
-    print!("{}", message);
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read user input")?;
-    Ok(input.trim().to_string())
-}
-
-fn prompt_bool(message: &str, default: bool) -> Result<bool> {
-    let default_text = if default { "yes" } else { "no" };
-    let input = prompt(message)?;
-    if input.is_empty() {
-        return Ok(default);
-    }
-    match input.to_lowercase().as_str() {
-        "y" | "yes" | "true" => Ok(true),
-        "n" | "no" | "false" => Ok(false),
-        _ => {
-            println!("[!] Invalid input, using default ({})", default_text);
-            Ok(default)
-        }
-    }
-}
-
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
-    let input = prompt(message)?;
-    if input.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(input)
-    }
-}
-
-fn prompt_timeout() -> Result<u64> {
-    let input = prompt("Request timeout in seconds (default 10): ")?;
-    if input.is_empty() {
-        return Ok(10);
-    }
-    match input.parse::<u64>() {
-        Ok(val) if val > 0 => Ok(val),
-        _ => {
-            println!("[!] Invalid timeout, using default (10s)");
-            Ok(10)
-        }
-    }
-}
-
-fn prompt_ports() -> Result<Vec<u16>> {
-    let input = prompt(
-        "Enter port(s) to tunnel through (comma-separated, e.g., 80,8080; leave blank to skip): ",
-    )?;
-    if input.is_empty() {
-        println!("[!] No ports provided; skipping port tunneling.");
-        return Ok(Vec::new());
-    }
-
-    let mut ports = Vec::new();
-    let mut seen = HashSet::new();
-    for part in input.split(|c| c == ',' || c == ';' || c == ' ') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match trimmed.parse::<u16>() {
-            Ok(port) => {
-                if seen.insert(port) {
-                    ports.push(port);
-                }
-            }
-            Err(_) => println!("[!] Skipping invalid port '{}'.", trimmed),
-        }
-    }
-
-    if ports.is_empty() {
-        println!("[!] No valid ports parsed; skipping port tunneling.");
-    }
-
-    Ok(ports)
 }
 
 fn write_report(path: &str, results: &[TitleResult]) -> Result<()> {

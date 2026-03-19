@@ -9,6 +9,9 @@ use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::time::{timeout as tokio_timeout, Duration};
+use crate::utils::{
+    cfg_prompt_port, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_default,
+};
 
 /// SSDP Search Target types
 #[derive(Clone, Debug)]
@@ -41,11 +44,11 @@ pub async fn run(target: &str) -> Result<()> {
     
     println!("{}", format!("[*] Target: {}", target).cyan());
     
-    let port = prompt_port().unwrap_or(1900);
-    let timeout_secs = prompt_timeout().unwrap_or(3);
-    let retries = prompt_retries().unwrap_or(1);
-    let verbose = prompt_verbose().unwrap_or(false);
-    let save_results = prompt_save_results().unwrap_or(false);
+    let port = cfg_prompt_port("port", "Enter custom port", 1900)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout in seconds", 3, 1, 60)? as u64;
+    let retries = cfg_prompt_int_range("retries", "Number of retries", 1, 1, 10)? as u32;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false)?;
 
     let target = clean_ipv6_brackets(target);
     // Validate target format
@@ -53,7 +56,16 @@ pub async fn run(target: &str) -> Result<()> {
         .with_context(|| format!("Failed to normalize target '{}'", target))?;
 
     // Determine search targets
-    let search_targets = prompt_search_targets()?;
+    let search_target_choice = cfg_prompt_default("search_target", "SSDP Search Target (1=rootdevice, 2=all, 3=custom, 4=both)", "1")?;
+    let search_targets = match search_target_choice.as_str() {
+        "2" => vec![SearchTarget::All],
+        "3" => {
+            let custom_st = cfg_prompt_default("custom_st", "Enter custom ST", "upnp:rootdevice")?;
+            vec![SearchTarget::Custom(custom_st)]
+        },
+        "4" => vec![SearchTarget::RootDevice, SearchTarget::All],
+        _ => vec![SearchTarget::RootDevice],
+    };
 
     println!();
     println!("{}", format!("[*] Sending SSDP M-SEARCH to {}:{}...", target, port).bold());
@@ -212,176 +224,6 @@ fn clean_ipv6_brackets(ip: &str) -> String {
     ip.trim_start_matches('[')
       .trim_end_matches(']')
       .to_string()
-}
-
-/// Ask user for port (optional), fallback to 1900 if empty
-fn prompt_port() -> Option<u16> {
-    print!("{}", "[*] Enter custom port (default 1900): ".cyan().bold());
-    if std::io::stdout().flush().is_err() {
-        return None;
-    }
-    let mut input = String::new();
-    if std::io::stdin()
-        .read_line(&mut input)
-        .is_ok()
-    {
-        let input = input.trim();
-        if input.is_empty() {
-            return None;
-        }
-        if let Ok(p) = input.parse::<u16>() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Ask user for timeout in seconds
-fn prompt_timeout() -> Option<u64> {
-    print!("{}", "[*] Enter timeout in seconds (default 3): ".cyan().bold());
-    if std::io::stdout().flush().is_err() {
-        return None;
-    }
-    let mut input = String::new();
-    if std::io::stdin()
-        .read_line(&mut input)
-        .is_ok()
-    {
-        let input = input.trim();
-        if input.is_empty() {
-            return None;
-        }
-        if let Ok(t) = input.parse::<u64>() {
-            if t > 0 && t <= 60 {
-                return Some(t);
-            }
-        }
-    }
-    None
-}
-
-/// Ask user for number of retries
-fn prompt_retries() -> Option<u32> {
-    print!("{}", "[*] Enter number of retries (default 1): ".cyan().bold());
-    if std::io::stdout().flush().is_err() {
-        return None;
-    }
-    let mut input = String::new();
-    if std::io::stdin()
-        .read_line(&mut input)
-        .is_ok()
-    {
-        let input = input.trim();
-        if input.is_empty() {
-            return None;
-        }
-        if let Ok(r) = input.parse::<u32>() {
-            if r > 0 && r <= 10 {
-                return Some(r);
-            }
-        }
-    }
-    None
-}
-
-/// Ask user for verbose mode
-fn prompt_verbose() -> Option<bool> {
-    print!("{}", "[*] Verbose output? [y/N]: ".cyan().bold());
-    if std::io::stdout().flush().is_err() {
-        return None;
-    }
-    let mut input = String::new();
-    if std::io::stdin()
-        .read_line(&mut input)
-        .is_ok()
-    {
-        let input = input.trim().to_lowercase();
-        match input.as_str() {
-            "y" | "yes" => return Some(true),
-            "n" | "no" | "" => return Some(false),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Ask user to save results
-fn prompt_save_results() -> Option<bool> {
-    print!("{}", "[*] Save results to file? [y/N]: ".cyan().bold());
-    if std::io::stdout().flush().is_err() {
-        return None;
-    }
-    let mut input = String::new();
-    if std::io::stdin()
-        .read_line(&mut input)
-        .is_ok()
-    {
-        let input = input.trim().to_lowercase();
-        match input.as_str() {
-            "y" | "yes" => return Some(true),
-            "n" | "no" | "" => return Some(false),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Ask user for search targets
-fn prompt_search_targets() -> Result<Vec<SearchTarget>> {
-    let mut targets = Vec::new();
-
-    println!("{}", "[*] Select SSDP Search Targets:".cyan().bold());
-    println!("  1. upnp:rootdevice (default)");
-    println!("  2. ssdp:all");
-    println!("  3. Custom ST");
-    println!("  4. All of the above");
-
-    print!("{}", "Enter choice [1-4, default 1]: ".cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-
-    match input.trim() {
-        "1" | "" => {
-            targets.push(SearchTarget::RootDevice);
-        }
-        "2" => {
-            targets.push(SearchTarget::All);
-        }
-        "3" => {
-            print!("{}", "Enter custom ST: ".cyan().bold());
-            std::io::stdout()
-                .flush()
-                .context("Failed to flush stdout")?;
-            let mut st_input = String::new();
-            std::io::stdin()
-                .read_line(&mut st_input)
-                .context("Failed to read input")?;
-            let st = st_input.trim().to_string();
-            if !st.is_empty() {
-                targets.push(SearchTarget::Custom(st));
-            } else {
-                targets.push(SearchTarget::RootDevice);
-            }
-        }
-        "4" => {
-            targets.push(SearchTarget::RootDevice);
-            targets.push(SearchTarget::All);
-        }
-        _ => {
-            targets.push(SearchTarget::RootDevice);
-        }
-    }
-
-    if targets.is_empty() {
-        targets.push(SearchTarget::RootDevice);
-    }
-
-    Ok(targets)
 }
 
 fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> Option<String> {

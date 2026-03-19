@@ -14,10 +14,10 @@ use tokio::{
     fs::OpenOptions,
     io::AsyncWriteExt,
     net::TcpStream,
-    process::Command,
     sync::{Mutex, Semaphore},
     time::{sleep, Duration, timeout},
 };
+use crate::native::rdp as rdp_native;
 
 use crate::utils::{
     prompt_default,
@@ -50,100 +50,14 @@ const EXCLUDED_RANGES: &[&str] = &[
 #[derive(Debug, Clone)]
 enum RdpError {
     ConnectionFailed,
-    AuthenticationFailed,
-    CertificateError,
-    Timeout,
-    NetworkError,
     ProtocolError,
-    ToolNotFound,
-    Unknown,
 }
 
 impl std::fmt::Display for RdpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RdpError::ConnectionFailed => write!(f, "Connection failed"),
-            RdpError::AuthenticationFailed => write!(f, "Authentication failed"),
-            RdpError::CertificateError => write!(f, "Certificate validation error"),
-            RdpError::Timeout => write!(f, "Connection timeout"),
-            RdpError::NetworkError => write!(f, "Network error"),
             RdpError::ProtocolError => write!(f, "Protocol error"),
-            RdpError::ToolNotFound => write!(f, "RDP tool not found"),
-            RdpError::Unknown => write!(f, "Unknown error"),
-        }
-    }
-}
-
-/// Classify RDP errors based on exit codes and error messages
-/// This function ensures all RdpError variants can be constructed
-fn classify_rdp_error(exit_code: Option<i32>, error_msg: &str) -> RdpError {
-    match exit_code {
-        Some(0) => {
-            // Success case shouldn't reach here, but classify as Unknown if it does
-            RdpError::Unknown
-        }
-        Some(1) => {
-            // Authentication failed
-            RdpError::AuthenticationFailed
-        }
-        Some(2) => {
-            // Connection failed
-            RdpError::ConnectionFailed
-        }
-        Some(3) => {
-            // Certificate error
-            RdpError::CertificateError
-        }
-        Some(71) => {
-            // xfreerdp3: ERRCONNECT_CONNECT_TRANSPORT_FAILED
-            RdpError::ConnectionFailed
-        }
-        Some(132) => {
-            // xfreerdp3: Disconnect by user
-            RdpError::Unknown
-        }
-        Some(133) => {
-            // xfreerdp3: SSL/TLS error
-            RdpError::CertificateError
-        }
-        Some(131) => {
-            // Connection timeout
-            RdpError::Timeout
-        }
-        Some(code) => {
-            // Unknown exit code - analyze error message for classification
-            let _ = code;
-            let msg_lower = error_msg.to_lowercase();
-            if msg_lower.contains("timeout") || msg_lower.contains("timed out") || msg_lower.contains("deadline") {
-                RdpError::Timeout
-            } else if msg_lower.contains("connection") || msg_lower.contains("connect") || msg_lower.contains("refused") {
-                RdpError::ConnectionFailed
-            } else if msg_lower.contains("network") || msg_lower.contains("dns") || msg_lower.contains("resolve") || msg_lower.contains("host") {
-                RdpError::NetworkError
-            } else if msg_lower.contains("certificate") || msg_lower.contains("cert") || msg_lower.contains("tls") || msg_lower.contains("ssl") {
-                RdpError::CertificateError
-            } else if msg_lower.contains("auth") || msg_lower.contains("password") || msg_lower.contains("login") || msg_lower.contains("credential") {
-                RdpError::AuthenticationFailed
-            } else if msg_lower.contains("protocol") || msg_lower.contains("invalid") || msg_lower.contains("malformed") {
-                RdpError::ProtocolError
-            } else {
-                // Default to ProtocolError for unknown exit codes
-                RdpError::ProtocolError
-            }
-        }
-        None => {
-            // Process terminated by signal - analyze message for classification
-            let msg_lower = error_msg.to_lowercase();
-            if msg_lower.contains("timeout") || msg_lower.contains("timed out") || msg_lower.contains("deadline") {
-                RdpError::Timeout
-            } else if msg_lower.contains("connection") || msg_lower.contains("connect") {
-                RdpError::ConnectionFailed
-            } else if msg_lower.contains("network") || msg_lower.contains("dns") {
-                RdpError::NetworkError
-            } else {
-                // Unknown termination reason
-                RdpError::Unknown
-            }
         }
     }
 }
@@ -159,23 +73,13 @@ enum RdpSecurityLevel {
 }
 
 impl RdpSecurityLevel {
-    fn as_xfreerdp_arg(&self) -> &'static str {
+    fn as_protocol_flags(&self) -> u32 {
         match self {
-            RdpSecurityLevel::Auto => "/sec:auto",
-            RdpSecurityLevel::Nla => "/sec:nla",
-            RdpSecurityLevel::Tls => "/sec:tls",
-            RdpSecurityLevel::Rdp => "/sec:rdp",
-            RdpSecurityLevel::Negotiate => "/sec:negotiate",
-        }
-    }
-
-    fn as_rdesktop_arg(&self) -> Option<&'static str> {
-        match self {
-            RdpSecurityLevel::Auto => None,
-            RdpSecurityLevel::Nla => Some("-E"),
-            RdpSecurityLevel::Tls => Some("-E"),
-            RdpSecurityLevel::Rdp => Some("-E"),
-            RdpSecurityLevel::Negotiate => None,
+            RdpSecurityLevel::Auto => rdp_native::PROTO_HYBRID | rdp_native::PROTO_SSL,
+            RdpSecurityLevel::Nla => rdp_native::PROTO_HYBRID,
+            RdpSecurityLevel::Tls => rdp_native::PROTO_SSL,
+            RdpSecurityLevel::Rdp => rdp_native::PROTO_RDP,
+            RdpSecurityLevel::Negotiate => rdp_native::PROTO_HYBRID | rdp_native::PROTO_SSL | rdp_native::PROTO_RDP,
         }
     }
 
@@ -288,7 +192,7 @@ fn display_banner() {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     println!("{}", "║   RDP Brute Force Module                                  ║".cyan());
     println!("{}", "║   Remote Desktop Protocol Credential Testing              ║".cyan());
-    println!("{}", "║   Requires xfreerdp or rdesktop                           ║".cyan());
+    println!("{}", "║   Native TCP + TLS + CredSSP/NTLM Authentication         ║".cyan());
     println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
     println!();
 }
@@ -811,253 +715,20 @@ async fn run_combo_mode_streaming(
     Ok(())
 }
 
+/// Native RDP login via TCP + TLS + CredSSP/NTLM (no external tools needed)
 async fn try_rdp_login(addr: &str, user: &str, pass: &str, timeout_duration: Duration, security_level: RdpSecurityLevel) -> Result<bool> {
-    // Check if RDP tools are available
-    let xfreerdp_available = Command::new("which")
-        .arg("xfreerdp")
-        .output()
-        .await
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-
-    let rdesktop_available = Command::new("which")
-            .arg("rdesktop")
-            .output()
-        .await
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-
-    if !xfreerdp_available && !rdesktop_available {
-        return Err(anyhow!("{}", RdpError::ToolNotFound));
+    let protocols = security_level.as_protocol_flags();
+    match rdp_native::try_login(addr, user, pass, timeout_duration, protocols).await {
+        Ok(rdp_native::RdpLoginResult::Success) => Ok(true),
+        Ok(rdp_native::RdpLoginResult::AuthFailed) => Ok(false),
+        Ok(rdp_native::RdpLoginResult::ConnectionFailed(e)) => {
+            Err(anyhow!("{}: {}", RdpError::ConnectionFailed, e))
+        }
+        Ok(rdp_native::RdpLoginResult::ProtocolError(e)) => {
+            Err(anyhow!("{}: {}", RdpError::ProtocolError, e))
+        }
+        Err(e) => Err(e),
     }
-
-    // Prefer xfreerdp over rdesktop
-    if xfreerdp_available {
-        try_rdp_login_xfreerdp(addr, user, pass, timeout_duration, security_level).await
-    } else {
-        try_rdp_login_rdesktop(addr, user, pass, timeout_duration, security_level).await
-    }
-}
-
-async fn try_rdp_login_xfreerdp(addr: &str, user: &str, pass: &str, timeout_duration: Duration, security_level: RdpSecurityLevel) -> Result<bool> {
-    let sanitized_addr = sanitize_rdp_argument(addr);
-    let sanitized_user = sanitize_rdp_argument(user);
-    let sanitized_pass = sanitize_rdp_argument(pass);
-
-    let mut child = match Command::new("xfreerdp")
-        .arg(format!("/v:{}", sanitized_addr))
-        .arg(format!("/u:{}", sanitized_user))
-        .arg(format!("/p:{}", sanitized_pass))
-        .arg("/cert:ignore")
-        .arg(format!("/timeout:{}", timeout_duration.as_secs() * 1000))
-        .arg("+auth-only")
-        .arg("/log-level:OFF")
-        .arg(security_level.as_xfreerdp_arg())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            // Classify spawn errors - could be ConnectionFailed, NetworkError, or ProtocolError
-            // This ensures all error types can be constructed from spawn failures
-            let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            return Err(anyhow!("{}", error_msg));
-        }
-    };
-
-    match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => {
-            match status.code() {
-                Some(0) => Ok(true), // Success
-                Some(code) => {
-                    // Classify error based on exit code
-                    let error_type = classify_rdp_error(Some(code), "");
-                    // Ensure all error types can be constructed and handled
-                    match error_type {
-                        RdpError::AuthenticationFailed => Ok(false),
-                        RdpError::ConnectionFailed => Ok(false),
-                        RdpError::CertificateError => Ok(false),
-                        RdpError::Timeout => Ok(false),
-                        RdpError::NetworkError => Ok(false),
-                        RdpError::ProtocolError => Ok(false),
-                        RdpError::ToolNotFound => Ok(false),
-                        RdpError::Unknown => Ok(false),
-                    }
-                }
-                None => {
-                    // Process terminated by signal - classify for completeness
-                    // This ensures Unknown error type is constructed
-                    let error_type = classify_rdp_error(None, "Process terminated");
-                    match error_type {
-                        RdpError::Timeout | RdpError::ConnectionFailed | RdpError::NetworkError | RdpError::Unknown => Ok(false),
-                        _ => Ok(false), // All other types also return false
-                    }
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            let _ = child.kill().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            Err(anyhow!("{}", error_msg))
-        }
-        Err(_) => {
-            // Timeout occurred - ensure Timeout error type is constructed
-            let _ = child.kill().await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let error_type = classify_rdp_error(Some(131), "Connection timeout");
-            // Ensure Timeout variant is constructed
-            match error_type {
-                RdpError::Timeout => Ok(false),
-                _ => Ok(false), // Should not happen, but handle all cases
-            }
-        }
-    }
-}
-
-async fn try_rdp_login_rdesktop(addr: &str, user: &str, pass: &str, timeout_duration: Duration, security_level: RdpSecurityLevel) -> Result<bool> {
-    let mut cmd = Command::new("rdesktop");
-    cmd.arg("-u").arg(user)
-        .arg("-p").arg(pass)
-        .arg("-n").arg("auth-only")
-        .arg(addr)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    if let Some(sec_arg) = security_level.as_rdesktop_arg() {
-        cmd.arg(sec_arg);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            // Classify spawn errors - ensures all error types can be constructed
-            let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            return Err(anyhow!("{}", error_msg));
-        }
-    };
-
-    match timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => {
-            match status.code() {
-                Some(0) => Ok(true), // Success
-                Some(code) => {
-                    // Classify error based on exit code
-                    let error_type = classify_rdp_error(Some(code), "");
-                    // Ensure all error types can be constructed and handled
-                    match error_type {
-                        RdpError::AuthenticationFailed => Ok(false),
-                        RdpError::ConnectionFailed => Ok(false),
-                        RdpError::CertificateError => Ok(false),
-                        RdpError::Timeout => Ok(false),
-                        RdpError::NetworkError => Ok(false),
-                        RdpError::ProtocolError => Ok(false),
-                        RdpError::ToolNotFound => Ok(false),
-                        RdpError::Unknown => Ok(false),
-                    }
-                }
-                None => {
-                    // Process terminated by signal - classify for completeness
-                    // This ensures Unknown error type is constructed
-                    let error_type = classify_rdp_error(None, "Process terminated");
-                    match error_type {
-                        RdpError::Timeout | RdpError::ConnectionFailed | RdpError::NetworkError | RdpError::Unknown => Ok(false),
-                        _ => Ok(false), // All other types also return false
-                    }
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            let _ = child.kill().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let error_type = classify_rdp_error(None, &e.to_string());
-            // Explicitly match all variants to ensure they're all constructed
-            let error_msg = match error_type {
-                RdpError::ConnectionFailed => format!("{}: {}", RdpError::ConnectionFailed, e),
-                RdpError::NetworkError => format!("{}: {}", RdpError::NetworkError, e),
-                RdpError::ProtocolError => format!("{}: {}", RdpError::ProtocolError, e),
-                RdpError::Timeout => format!("{}: {}", RdpError::Timeout, e),
-                RdpError::AuthenticationFailed => format!("{}: {}", RdpError::AuthenticationFailed, e),
-                RdpError::CertificateError => format!("{}: {}", RdpError::CertificateError, e),
-                RdpError::ToolNotFound => format!("{}: {}", RdpError::ToolNotFound, e),
-                RdpError::Unknown => format!("{}: {}", RdpError::Unknown, e),
-            };
-            Err(anyhow!("{}", error_msg))
-        }
-        Err(_) => {
-            // Timeout occurred - ensure Timeout error type is constructed
-            let _ = child.kill().await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let error_type = classify_rdp_error(Some(131), "Connection timeout");
-            // Ensure Timeout variant is constructed
-            match error_type {
-                RdpError::Timeout => Ok(false),
-                _ => Ok(false), // Should not happen, but handle all cases
-            }
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-fn sanitize_rdp_argument(input: &str) -> String {
-    input.chars()
-        .map(|c| match c {
-            // Handle whitespace characters first (before control character range)
-            '\n' | '\r' | '\t' => ' ',
-            // Dangerous shell metacharacters
-            '|' | '&' | ';' | '(' | ')' | '<' | '>' | '`' | '$' | '!' | '\\' => '?',
-            // Quotes that could break argument parsing
-            '"' | '\'' => '?',
-            // Control characters (excluding \n, \r, \t which are handled above)
-            // \x00-\x08, \x0b-\x0c, \x0e-\x1f, \x7f
-            '\x00'..='\x08' | '\x0b'..='\x0c' | '\x0e'..='\x1f' | '\x7f' => '?',
-            // Extended ASCII control characters
-            '\u{0080}'..='\u{009f}' => '?',
-            // Safe characters
-            c => c,
-        })
-        .collect()
 }
 
 fn should_use_streaming<P: AsRef<Path>>(path: P) -> Result<bool> {

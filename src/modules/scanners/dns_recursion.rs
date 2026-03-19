@@ -4,7 +4,7 @@ use colored::*;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use tokio::time::{timeout, Duration};
 use crate::utils::{
-    prompt_default, prompt_port,
+    cfg_prompt_default, cfg_prompt_port,
 };
 
 use hickory_client::client::{Client, ClientHandle};
@@ -44,16 +44,16 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let needs_default_port = targets.iter().any(|t| t.port.is_none());
     let default_port = if needs_default_port {
-        prompt_port("Default DNS port", 53)?
+        cfg_prompt_port("port", "Default DNS port", 53)?
     } else {
         53
     };
 
-    let query_name_input = prompt_default("Domain to query", "google.com")?;
+    let query_name_input = cfg_prompt_default("domain", "Domain to query", "google.com")?;
     let query_name = validate_domain_input(&query_name_input)?;
 
     let record_input =
-        prompt_default("Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY")?;
+        cfg_prompt_default("record_type", "Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY")?;
     let record_type = parse_record_type(&record_input)?;
 
     println!(

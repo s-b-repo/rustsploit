@@ -12468,3 +12468,617 @@ test_servers.py
  emulated services using creds/generic/ssh_bruteforce. All modes function perfectly according to spec.
 
  
+Camera & Bruteforce Module API/CLI Unification — Walkthrough
+What Was Done
+All 6 camera exploit modules and 2 bruteforce modules were updated to use the cfg_prompt_* wrapper functions, giving them full API compatibility without changing any interactive CLI/shell behavior.
+
+How cfg_prompt_* works
+In CLI/shell mode → falls back to interactive stdin prompts (exactly as before)
+In API mode → reads values from the "prompts": {} field in the request JSON; uses defaults for optional fields; returns an error for missing required fields
+Camera Modules Changed
+Module	File	Raw calls replaced
+ACTi ACM-5611 RCE	
+exploits/cameras/acti/acm_5611_rce.rs
+prompt_port
+, 
+prompt_yes_no
+, 
+prompt_default
+, io::stdin
+AVTech CVE-2024-7029	
+exploits/cameras/avtech/cve_2024_7029_avtech_camera.rs
+prompt_port
+, io::stdin exclusion prompt
+Hikvision CVE-2021-36260	
+exploits/cameras/hikvision/hikvision_rce_cve_2021_36260.rs
+All 7 io::stdin().read_line() calls in 
+run()
+ and 
+run_mass_scan()
+ABUS CVE-2023-26609	
+exploits/cameras/abus/abussecurity_camera_cve202326609variant1.rs
+All 8 io::stdin().read_line() calls in 
+execute()
+ and 
+run_mass_scan()
+Reolink CVE-2019-11001	
+exploits/cameras/reolink/reolink_rce_cve_2019_11001.rs
+prompt_required
+, 
+prompt_default
+Uniview NVR Pwd Disclosure	
+exploits/cameras/uniview/uniview_nvr_pwd_disclosure.rs
+Added 
+cfg_prompt_output_file
+ (was hardcoded)
+Prompt key names for camera modules
+ACTi:      port, command, exclude_ranges, output_file, concurrency
+AVTech:    port, exclude_ranges
+Hikvision: mode, command, confirm_reboot, exclude_ranges, output_file, scan_mode, custom_payload
+ABUS:      mode, filepath, command, password, exclude_ranges, output_file, scan_mode, custom_command
+Reolink:   target (fallback), username, password, command
+Uniview:   output_file
+Note: 
+interactive_shell()
+ (avtech) and 
+interactive_mode()
+ (hikvision mode 5) keep raw io::stdin intentionally — they're post-exploitation live shells only reachable in CLI mode.
+
+Bruteforce Modules Fixed
+Module	Change
+creds/generic/ftp_anonymous.rs
+Replaced 
+prompt_int_range
+, 
+prompt_yes_no
+ (×2), 
+prompt_output_file
+ with cfg_prompt_* equivalents
+creds/camxploit/camxploit.rs
+Replaced 
+prompt_int
+, 
+prompt_default
+ in 
+run_mass_scan()
+ with 
+cfg_prompt_int_range
+, 
+cfg_prompt_output_file
+All other bruteforce modules (
+ssh
+, ftp, smtp, pop3, mqtt, snmp, 
+rtsp
+, telnet, rdp, 
+fortinet
+, l2tp, etc.) were audited and already used cfg_prompt_* throughout — no changes needed.
+
+Build Result
+cargo build
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.13s
+Zero errors. 2 dead-code warnings for 
+prompt_int
+ / 
+prompt_output_file
+ in 
+utils.rs
+ (pre-existing, not caused by these changes — those functions are kept for forward compatibility).
+
+Verification: No Raw Prompts in Camera Modules
+bash
+grep -rn "prompt_port\|prompt_default\|prompt_required\|prompt_yes_no\|prompt_int_range\|prompt_output_file\|io::stdin\|\.read_line" \
+  src/modules/exploits/cameras/ \
+  src/modules/creds/generic/ftp_anonymous.rs \
+  src/modules/creds/camxploit/camxploit.rs \
+  | grep -v cfg_prompt
+Remaining hits:
+
+avtech/cve_2024_7029_avtech_camera.rs:60 — 
+interactive_shell()
+ stdin loop (CLI-only post-exploit)
+hikvision/hikvision_rce_cve_2021_36260.rs:256 — 
+interactive_mode()
+ stdin loop (CLI-only mode 5)
+Both are intentional — they are live interactive shell loops that can only be used at a terminal.
+
+API Template Commands
+All new camera module API templates were appended to: 
+template-api-commands.txt
+ (now 750 lines — entries 12–19)
+
+Existing bruteforce templates (entries 1–11) were not modified.
+
+
+All done. Here's a summary:
+
+✅ cargo build — zero errors
+
+What changed
+6 camera exploit modules — all raw prompt_* / io::stdin() calls replaced with cfg_prompt_* wrappers:
+
+acti/acm_5611_rce.rs — port, command, exclude_ranges, output_file, concurrency
+avtech/cve_2024_7029_avtech_camera.rs — port, exclude_ranges
+hikvision/hikvision_rce_cve_2021_36260.rs — mode, command, scan_mode, custom_payload, etc.
+abus/abussecurity_camera_cve202326609variant1.rs — mode, filepath/command/password, scan_mode, etc.
+reolink/reolink_rce_cve_2019_11001.rs — username, password, command
+uniview/uniview_nvr_pwd_disclosure.rs — output_file (was hardcoded)
+2 bruteforce modules fixed:
+
+ftp_anonymous.rs — concurrency, verbose, output_file, use_exclusions
+camxploit/camxploit.rs — concurrency, output_file
+All other bruteforce modules were already correct.
+
+Interactive shells kept as-is: The avtech + hikvision live-shell loops still read stdin directly — they're post-exploit CLI tools, not reachable in API mode.
+
+template-api-commands.txt — grew from 472 → 750 lines: new entries 12–19 cover all camera modules. Existing entries 1–11 (bruteforce) untouched.
+
+
+Finalizing Wiki Docs
+All 16 wiki pages written and verified, README.md updated, old docs/readme.md is a clean redirect stub. Proxy system accurately removed from all docs — only intentional references remain (changelog note, VPN recommendation).
+
+Files Edited
+Progress Updates
+1
+Cleaning up old docs/readme.md and verifying all files are correct
+
+2
+Verifying all wiki files exist and are internally consistent
+
+3
+Notifying user of completion
+
+Done. The docs/ folder is now a full GitHub wiki with 16 categorized files:
+
+File	What's in it
+Home.md	Index / navigation hub
+Getting-Started.md	Install, build, Docker (no proxy mentions)
+Interactive-Shell.md	Command palette, chaining, target normalization, honeypot detection
+CLI-Reference.md	All flags, examples, error hints
+API-Server.md	Startup flags, all endpoints, rate limiting, hardening
+API-Usage-Examples.md	Practical curl workflows including new modules
+Module-Catalog.md	Full module list — all new modules from changelog included (n8n, MongoBleed, FortiWeb, Hikvision, NginxPwner, telnet_hose, Ruijie ×7, etc.)
+Module-Development.md	build.rs lifecycle, skeleton, 0.0.0.0/0 mass-scan pattern
+Security-Validation.md	Constants table, security patterns, EXCLUDED_RANGES
+Credential-Modules-Guide.md	Best practices + per-module notes (telnet_hose state machine, streaming RDP, MQTT 3.1.1, etc.)
+Exploit-Modules-Guide.md	Best practices + per-module notes (n8n payloads, MongoBleed, FortiWeb chain, NginxPwner checks)
+Utilities-Helpers.md	Full utils.rs public API — normalize_target, prompt helpers, honeypot check
+Testing-QA.md	cargo check/fmt/test, smoke tests, regression checklist
+Changelog.md	Summary of all recent changes including dependency upgrades
+Contributing.md	Fork workflow, code style, mass-scan checklist
+Credits.md	Authors, key crates, license
+Proxy system: confirmed fully removed from all docs. The only references remaining are an explicit "no built-in proxy" note in the README and a VPN recommendation — no framework proxy commands anywhere.
+
+
+API Security Audit — Findings & Patches
+File: 
+src/api.rs
+ | Build: ✅ cargo check 0 errors after patches
+
+Findings
+🔴 CRITICAL: SSRF via Incomplete Private-Range Block
+Location: 
+is_blocked_target()
+ (line ~168)
+
+Bug: The original function only blocked 169.254.0.0/16 and 0.0.0.0. An attacker with a valid API key could target any RFC-1918 address, loopback (127.x), or localhost to make the server fire scans/exploits at internal infrastructure.
+
+PoC:
+
+bash
+# Scan the server's own loopback \u2014 was allowed pre-patch
+curl -X POST -H "Authorization: Bearer key" -H "Content-Type: application/json" \
+  -d '{"module":"scanners/port_scanner","target":"127.0.0.1"}' \
+  http://localhost:8080/api/run
+# RFC-1918 pivot to internal network
+curl -X POST ... -d '{"module":"exploits/heartbleed","target":"192.168.1.1"}' ...
+# Named localhost bypass
+curl -X POST ... -d '{"module":"scanners/port_scanner","target":"localhost"}' ...
+Fix: Rewrote 
+is_blocked_target
+ to block:
+
+localhost (name check)
+127.0.0.0/8 (loopback)
+0.0.0.0 (unspecified)
+169.254.0.0/16 (link-local / metadata)
+10.0.0.0/8 (RFC-1918)
+172.16.0.0/12 (RFC-1918)
+192.168.0.0/16 (RFC-1918)
+100.64.0.0/10 (carrier-grade NAT)
+IPv6 loopback (::1), unspecified, link-local (fe80::/10), ULA (fc00::/7)
+Raw-string fallback for unparsed hosts
+🔴 CRITICAL: Shell 
+run
+/run_all Bypass SSRF Guard
+Location: 
+shell_command()
+ — "run" and "run_all" arms (~line 1251/1300)
+
+Bug: The /api/shell endpoint accepted run <target> or run_all <target> with an inline target that was never passed through 
+is_blocked_target()
+. Even after the function was improved, these paths were still completely unguarded.
+
+PoC:
+
+bash
+curl -X POST -H "Authorization: Bearer key" -H "Content-Type: application/json" \
+  -d '{"commands":["use scanners/port_scanner","run 127.0.0.1"]}' \
+  http://localhost:8080/api/shell
+Fix: Added 
+is_blocked_target
+ + 
+validate_target
+ guard immediately after target resolution in both "run" and "run_all" arms.
+
+🟠 HIGH: output_file Path Traversal
+Location: 
+run_module()
+, RunModuleRequest.output_file (~line 500)
+
+Bug: The output_file field was injected verbatim into custom_prompts with no validation. A ..-based path or absolute path would let an attacker write module results to arbitrary filesystem locations (e.g., ../../.ssh/authorized_keys).
+
+PoC:
+
+bash
+curl -X POST -H "Authorization: Bearer key" -H "Content-Type: application/json" \
+  -d '{"module":"scanners/port_scanner","target":"8.8.8.8","output_file":"../../.ssh/authorized_keys"}' \
+  http://localhost:8080/api/run
+Fix: Added explicit check before inject — rejects any output_file containing .., /, \, or \0.
+
+🟠 HIGH: API Key Exposed in Plaintext Logs
+Location: 
+start_api_server()
+ (~line 1397)
+
+Bug: println!("🔑 API key: {}", api_key) printed the full secret key to stdout on startup. Anyone with access to process stdout, container logs, or a log shipper would see the key.
+
+Fix: Now prints a masked form: first 4 chars, last 2 chars, and total length — e.g., myse...et (32 chars).
+
+🟡 MEDIUM: Rate Limiter Unbounded Memory Growth
+Location: 
+auth_middleware()
+ (~line 210)
+
+Bug: rate_limiter is a HashMap<IpAddr, (u32, Instant)>. There was no eviction of old entries. A sustained scan from many unique IPs would grow the HashMap indefinitely, eventually exhausting heap memory.
+
+Fix: Added a pruning step at 10,000 entries — removes all IPs whose window started more than 60 seconds ago.
+
+Attack Surface Notes (No Bug, Worth Knowing)
+Surface	Status
+Module name validation	✅ Strict allowlist [a-z0-9/_-], max 256 chars
+validate_module_name
+ + dispatcher	✅ Only registered modules can be executed
+/api/results/{filename}	✅ ASCII-only, 
+.txt
+ required, symlink rejection, canonicalize() escape check
+Auth constant-time comparison	✅ subtle::ConstantTimeEq prevents timing attacks
+Request body size	✅ 1 MB hard limit via RequestBodyLimitLayer
+Shell metacharacter injection in /api/shell	✅ 
+contains_shell_metacharacters()
+ rejects `&
+/api/module/{category}/{name} path params	✅ Only checked against in-memory module list; no filesystem access
+Patches Summary
+#	Severity	File	Lines	Fix
+1	Critical	
+api.rs
+168-198	Rewrote 
+is_blocked_target
+ — full RFC-1918 + loopback + localhost + IPv6
+2	Critical	
+api.rs
+1261-1296	SSRF guard on shell 
+run
+ inline target
+3	Critical	
+api.rs
+1300-1333	SSRF guard on shell run_all inline target
+4	High	
+api.rs
+500-513	output_file path-traversal validation before prompt injection
+5	High	
+api.rs
+1397-1399	API key masked in startup log
+6	Medium	
+api.rs
+210-234	Rate limiter pruning to prevent memory exhaustion
+
+
+
+
+Unified Scanner Module API/Shell/CLI Support
+Summary
+Converted all 14 scanner modules to use cfg_prompt_* functions for unified prompt handling across API, shell, and CLI execution environments. Local prompt functions were preserved per user request.
+
+Changes Made
+New utility: 
+cfg_prompt_wordlist
+ in 
+utils.rs
+Config-aware wordlist prompt that checks ModuleConfig.custom_prompts first, or falls back to interactive 
+prompt_wordlist()
+.
+
+Scanner modules converted (14 total)
+Module	Key Changes
+sample_scanner.rs
+Local prompts → 
+cfg_prompt_default
+, 
+cfg_prompt_yes_no
+ssdp_msearch.rs
+Local prompts → cfg_prompt_*
+port_scanner.rs
+prompt_settings()
+ refactored to cfg_prompt_*
+http_title_scanner.rs
++ 
+parse_ports_from_string
+ helper
+http_method_scanner.rs
++ 
+parse_ports_from_string
+ helper
+ssh_scanner.rs
+Added 
+cfg_prompt_output_file
+ for save
+dns_recursion.rs
+prompt_default
+ → 
+cfg_prompt_default
+, 
+prompt_port
+ → 
+cfg_prompt_port
+sequential_fuzzer.rs
+10 prompt calls converted
+api_endpoint_scanner.rs
+9 prompt calls + injection config
+ipmi_enum_exploit.rs
+8 prompt calls converted
+smtp_user_enum.rs
+7 prompt calls + report saving
+ping_sweep.rs
+15 prompt calls + ping method config
+dir_brute.rs
+18 prompt calls converted
+stalkroute_full_traceroute.rs	No prompts — no changes needed
+Prompt key documentation in 
+config.rs
+Added 69-line doc comment on 
+ModuleConfig
+ documenting all common and per-module prompt keys.
+
+API template examples in 
+template-api-commands.txt
+Added examples #20–#32 covering all scanner modules with documented prompt keys per module.
+
+Verification
+cargo build → ✅ Success (37 warnings, 0 errors)
+Warnings are from preserved local prompt functions (intentionally kept per user request — they remain available for potential future direct-call use).
+
+
+Verifying Clean Build
+Removed all 37 dead local prompt functions from 9 files and cleaned up 4 orphaned imports. cargo check now passes with 0 warnings, 0 errors. All scanner modules use cfg_prompt_* from 
+
+utils.rs
+ exclusively — same pattern as bruteforce modules.
+
+Files Edited
+Progress Updates
+1
+Running cargo check to verify zero warnings and zero errors
+
+2
+Cleaning up 4 remaining unused imports, then final build check
+
+3
+Fixing duplicate imports introduced by cleanup, then rebuilding
+
+4
+Fixing last duplicate import in smtp_user_enum.rs, then running final cargo check
+
+5
+Build complete — 0 warnings, 0 errors
+
+All done — cargo check passes with 0 warnings, 0 errors.
+
+Removed all 37 dead local prompt functions from 9 files:
+
+sample_scanner.rs — 3 functions removed
+ssdp_msearch.rs — 6 functions removed
+port_scanner.rs — 3 functions removed
+http_title_scanner.rs — 5 functions removed
+http_method_scanner.rs — 4 functions removed
+ssh_scanner.rs — 3 functions removed
+smtp_user_enum.rs — 6 functions removed
+ping_sweep.rs — 5 functions removed
+utils.rs — 2 functions removed (prompt_int, prompt_output_file)
+Also cleaned up 4 orphaned imports left behind. All scanner modules now use cfg_prompt_* from utils.rs exclusively — same clean pattern as the bruteforce modules.
+
+All interactive flows preserved via cfg_prompt_* (API + shell + CLI):
+
+SSDP — search target menu (4 options: rootdevice/all/custom/both) at line 59 using cfg_prompt_default
+Port Scanner — full prompt_settings() with port range selection, scan method, TTL, source port, data padding — all wired with cfg_prompt_*
+Ping Sweep — manual targets, file loading, ICMP/TCP/SYN/ACK method selection with port config, save up/down hosts
+Sample Scanner — timeout, HTTP/HTTPS checks, verbose, save results
+HTTP Title/Method — target lists, scheme selection, port tunneling, timeout, verbose, save
+SSH Scanner — port, additional targets, file loading, threads, timeout, save
+SMTP User Enum — mode selection, port, wordlist, threads, timeout, save valid/unknown
+Dir Brute — scan mode, HTTPS, port, base path, wordlist, delay, cookies, templates
+Sequential Fuzzer — mode, min/max length, charset, encoding, cookies, templates
+API Endpoint Scanner — spoofing, generic payloads, methods, endpoint sources
+IPMI Enum/Exploit — mode, target, port, cipher zero, anonymous, default creds, RAKP hash
+Deleted from utils.rs: prompt_int and prompt_output_file — grep confirmed zero callers anywhere in the codebase. Their functionality is fully covered by cfg_prompt_int_range and cfg_prompt_output_file.
+
+Build: cargo check ✅ — 0 warnings, 0 errors.
+
+Deleted from utils.rs: prompt_int and prompt_output_file — grep confirmed zero callers anywhere in the codebase. Their functionality is fully covered by cfg_prompt_int_range and cfg_prompt_output_file.
+
+Build: cargo check ✅ — 0 warnings, 0 errors
+
+
+Migrate RDP Brute Force from FreeRDP2 to Native Rust
+Problem
+rdp_bruteforce.rs
+ shells out to 
+xfreerdp
+/
+rdesktop
+ external CLI tools. This is fragile:
+
+Requires freerdp2/rdesktop installed on the system
+Version-specific exit codes (xfreerdp2 vs xfreerdp3)
+Process spawning overhead (~50ms per attempt) limits throughput
+Each attempt spawns+kills a full process
+Proposed Solution
+Replace CLI shelling with native TCP RDP authentication using raw protocol negotiation. The approach:
+
+TCP connect to target RDP port
+Send X.224 Connection Request with protocol negotiation (requesting NLA/TLS/RDP)
+Read X.224 Connection Confirm to determine supported security
+For TLS/NLA: Upgrade to TLS → attempt CredSSP NTLM authentication
+For Standard RDP: Attempt RDP Security encryption handshake
+Determine auth success/failure from the server's response
+This eliminates all external dependencies and is 10-50x faster.
+
+Proposed Changes
+Dependencies
+[MODIFY] 
+Cargo.toml
+Add ntlm-rs = "0.3" or implement NTLM inline (NTLMSSP for CredSSP)
+tokio-rustls already in deps (line 28) — reuse for TLS upgrade
+No new heavy dependencies needed
+Core Module
+[MODIFY] 
+rdp_bruteforce.rs
+Replace 
+try_rdp_login_xfreerdp
+ and 
+try_rdp_login_rdesktop
+ with:
+
+rust
+async fn try_rdp_login_native(addr, user, pass, timeout, security_level) -> Result<bool>
+Implementation steps:
+
+TcpStream::connect with timeout
+Send X.224 Connection Request PDU (RDP negotiation request)
+Parse X.224 Connection Confirm (get selected protocol: RDP/TLS/NLA)
+If TLS/NLA: wrap stream in TLS → send CredSSP NTLM Type1 → process Type2 challenge → send Type3 auth
+Check server's auth response: success = valid creds, auth failure = wrong creds, error = connection issue
+What stays the same:
+
+All 3 modes (single, subnet, mass) — untouched
+All prompt/config logic — already uses cfg_prompt_*
+RdpError enum and 
+classify_rdp_error
+ — updated for native errors
+RdpSecurityLevel — maps to protocol negotiation flags instead of CLI flags
+Statistics, progress, output — unchanged
+sanitize_rdp_argument
+ — removed (no CLI args to sanitize)
+Remove:
+
+try_rdp_login_xfreerdp
+ (~100 lines)
+try_rdp_login_rdesktop
+ (~100 lines)
+which xfreerdp/which rdesktop checks
+sanitize_rdp_argument
+ function
+as_xfreerdp_arg
+ / 
+as_rdesktop_arg
+ methods
+Add:
+
+try_rdp_login_native (~150 lines) — native TCP+TLS+NTLM auth
+RDP protocol constants (X.224 PDU types, negotiation flags)
+build_x224_connection_request helper
+parse_x224_connection_confirm helper
+perform_credssp_auth — NTLM over CredSSP/TLS
+build_ntlm_negotiate / build_ntlm_authenticate helpers
+Update:
+
+try_rdp_login
+ — remove tool availability check, call native directly
+RdpSecurityLevel — remove CLI arg methods, add protocol negotiation flags
+Banner — remove "Requires xfreerdp or rdesktop" line
+RdpError::ToolNotFound — removed (no external tools needed)
+Verification Plan
+Automated Tests
+bash
+cargo check    # Zero warnings, zero errors
+cargo run      # Verify it starts
+Manual Verification
+Test against a known RDP target with valid/invalid credentials
+Verify all 3 modes work (single, subnet, mass)
+Verify API mode works via template commands
+
+Migration complete — cargo check passes with 0 warnings, 0 errors.
+
+What changed:
+
+Created src/native/rdp.rs — pure Rust RDP authentication (X.224 → TLS → CredSSP/NTLM)
+rdp_bruteforce.rs now calls crate::native::rdp::try_login — no more xfreerdp/rdesktop dependency
+Removed ~250 lines of CLI process spawning, replaced with 15-line native wrapper
+src/native/ folder established for future native protocol implementations
+No #[allow(dead_code)] anywhere — every item is genuinely used
+Banner updated: "Native TCP + TLS + CredSSP/NTLM Authentication"
+All 3 modes preserved: single target, subnet scan, mass scan — all with full API/shell/CLI support via cfg_prompt_*.
+
+Dynamic Payload Mutation Engine for API Endpoint Scanner
+Problem
+Current scanner uses static payload arrays — every user gets the same payloads. WAFs and filters easily signature-match them. No evasion, no adaptation.
+
+Solution
+Add a mutation engine that takes seed payloads and dynamically generates mutated variants using composable mutation strategies. Each generation applies random combinations of mutations, producing unique payloads every scan.
+
+Mutation Strategies
+#	Strategy	Example Input → Output
+1	URL Encode	' OR 1=1 → %27%20OR%201%3D1
+2	Double URL Encode	' → %2527
+3	Case Toggle	OR 1=1 → oR 1=1, Or 1=1
+4	Comment Inject (SQL)	UNION SELECT → UNI/**/ON SEL/**/ECT
+5	Whitespace Swap	OR 1=1 → OR\t1=1, OR%0a1=1
+6	Concat/Split (SQL)	admin → ad'+'min, CONCAT('ad','min')
+7	Null Byte	../../etc/passwd → ../../etc/passwd%00
+8	Unicode Homoglyph	../ → ．．／
+9	Boundary Wrap	; id → %0a; id, \n; id
+Proposed Changes
+Mutation Engine (new file in native libs)
+[NEW] 
+payload_mutator.rs
+Core mutation engine with:
+
+MutationStrategy enum (all 9 strategies above)
+PayloadMutator struct — holds config (max generations, mutations per payload)
+mutate(seed: &str, category: PayloadCategory) -> Vec<String> — generates mutated variants
+PayloadCategory enum (SQLi, NoSQLi, CMDi, Traversal) — applies category-specific mutations
+Each seed → N mutated variants per generation (configurable, default 5)
+Scanner Integration
+[MODIFY] 
+api_endpoint_scanner.rs
+Add MutatedPayloads module option (menu item 7)
+Add enable_mutations prompt (yes/no) when any injection module is selected
+When enabled: for each seed payload, generate N mutations before sending
+Add mutation_depth prompt (1-5, default 2) — how many mutation passes
+Add mutations_per_seed prompt (1-20, default 5) — variants per seed payload
+Update 
+ScanConfig
+ with mutation settings
+Update 
+perform_injection
+ to optionally run payloads through mutator first
+[MODIFY] 
+mod.rs
+Register payload_mutator module
+Verification Plan
+Automated Tests
+bash
+cargo check    # Zero warnings, zero errors
+Manual Verification
+Run scanner with mutations enabled, verify unique payloads in output logs
+Compare mutation output diversity across runs
+

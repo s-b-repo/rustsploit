@@ -21,6 +21,9 @@ use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Durat
 
 use rand::Rng;
 use std::mem::MaybeUninit;
+use crate::utils::{
+    cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_int_range,
+};
 
 #[derive(Clone, Debug)]
 struct PingConfig {
@@ -160,12 +163,9 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
         }
     }
 
-    if prompt_yes_no("Add additional targets manually?", false)? {
+    if cfg_prompt_yes_no("add_manual_targets", "Add additional targets manually?", false)? {
         loop {
-            let entry = prompt_line(
-                "Enter target (IP or CIDR, leave blank to stop): ",
-                true,
-            )?;
+            let entry = cfg_prompt_default("manual_target", "Enter target (IP or CIDR, leave blank to stop)", "")?;
             if entry.is_empty() {
                 break;
             }
@@ -181,22 +181,24 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
         }
     }
 
-    if prompt_yes_no("Load targets from file?", false)? {
-        let path = prompt_line("Path to file: ", false)?;
-        let file_targets = load_targets_from_file(&path)?;
-        if file_targets.is_empty() {
-            println!("{}", "    No targets parsed from file.".yellow());
-        } else {
-            println!(
-                "{}",
-                format!(
-                    "    Loaded {} targets from '{}'",
-                    file_targets.len(),
-                    path
-                )
-                .green()
-            );
-            nets.extend(file_targets);
+    if cfg_prompt_yes_no("load_from_file", "Load targets from file?", false)? {
+        let path = cfg_prompt_default("target_file", "Path to file", "")?;
+        if !path.is_empty() {
+            let file_targets = load_targets_from_file(&path)?;
+            if file_targets.is_empty() {
+                println!("{}", "    No targets parsed from file.".yellow());
+            } else {
+                println!(
+                    "{}",
+                    format!(
+                        "    Loaded {} targets from '{}'",
+                        file_targets.len(),
+                        path
+                    )
+                    .green()
+                );
+                nets.extend(file_targets);
+            }
         }
     }
 
@@ -214,23 +216,23 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
     let targets: Vec<IpNet> = unique.into_iter().collect();
 
     let timeout_secs =
-        prompt_u64("Probe timeout (seconds)", 3, Some(1), Some(60))?;
+        cfg_prompt_int_range("timeout", "Probe timeout (seconds)", 3, 1, 60)? as u64;
     let concurrency =
-        prompt_usize("Max concurrent hosts", 100, Some(1), Some(10_000))?;
-    let verbose = prompt_yes_no("Verbose output (show down hosts/errors)?", false)?;
+        cfg_prompt_int_range("concurrency", "Max concurrent hosts", 100, 1, 10000)? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose output (show down hosts/errors)?", false)?;
 
     // Ask about saving results
-    let save_up_hosts = if prompt_yes_no("Save up hosts to file?", false)? {
+    let save_up_hosts = if cfg_prompt_yes_no("save_up_hosts", "Save up hosts to file?", false)? {
         let default_file = "ping_sweep_up_hosts.txt";
-        let file_path = prompt_with_default("Output file for up hosts", default_file)?;
+        let file_path = cfg_prompt_default("up_hosts_file", "Output file for up hosts", default_file)?;
         Some(file_path)
     } else {
         None
     };
 
-    let save_down_hosts = if prompt_yes_no("Save down hosts to file?", false)? {
+    let save_down_hosts = if cfg_prompt_yes_no("save_down_hosts", "Save down hosts to file?", false)? {
         let default_file = "ping_sweep_down_hosts.txt";
-        let file_path = prompt_with_default("Output file for down hosts", default_file)?;
+        let file_path = cfg_prompt_default("down_hosts_file", "Output file for down hosts", default_file)?;
         Some(file_path)
     } else {
         None
@@ -239,14 +241,14 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
     let methods = loop {
         let mut methods = Vec::new();
 
-        if prompt_yes_no("Use ICMP ping (system ping/ping6)?", true)? {
+        if cfg_prompt_yes_no("use_icmp", "Use ICMP ping (system ping/ping6)?", true)? {
             methods.push(PingMethod::Icmp);
         }
 
-        if prompt_yes_no("Use TCP connect probes?", false)? {
+        if cfg_prompt_yes_no("use_tcp", "Use TCP connect probes?", false)? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports (comma separated)", default_ports)?;
+                cfg_prompt_default("tcp_ports", "TCP ports (comma separated)", default_ports)?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
                 println!("{}", "    No valid ports provided.".yellow());
@@ -255,10 +257,10 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
             }
         }
 
-        if prompt_yes_no("Use SYN scan (stealth scan, requires root)?", false)? {
+        if cfg_prompt_yes_no("use_syn", "Use SYN scan (stealth scan, requires root)?", false)? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports for SYN scan (comma separated)", default_ports)?;
+                cfg_prompt_default("syn_ports", "TCP ports for SYN scan (comma separated)", default_ports)?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
                 println!("{}", "    No valid ports provided.".yellow());
@@ -267,10 +269,10 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
             }
         }
 
-        if prompt_yes_no("Use ACK scan (filter detection, requires root)?", false)? {
+        if cfg_prompt_yes_no("use_ack", "Use ACK scan (filter detection, requires root)?", false)? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports for ACK scan (comma separated)", default_ports)?;
+                cfg_prompt_default("ack_ports", "TCP ports for ACK scan (comma separated)", default_ports)?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
                 println!("{}", "    No valid ports provided.".yellow());
@@ -1008,136 +1010,6 @@ fn get_local_ipv4() -> Option<Ipv4Addr> {
     }
     
     None
-}
-
-fn prompt_line(message: &str, allow_empty: bool) -> Result<String> {
-    print!("{}", message.cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim().to_string();
-    if !allow_empty && trimmed.is_empty() {
-        return Err(anyhow!("Input cannot be empty."));
-    }
-    Ok(trimmed)
-}
-
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
-    print!(
-        "{}",
-        format!("{} [{}]: ", message, default).cyan().bold()
-    );
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
-    let default_hint = if default_yes { "Y/n" } else { "y/N" };
-    loop {
-        print!(
-            "{}",
-            format!("{} [{}]: ", message, default_hint).cyan().bold()
-        );
-        std::io::stdout()
-            .flush()
-            .context("Failed to flush stdout")?;
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .context("Failed to read input")?;
-        let trimmed = input.trim().to_lowercase();
-        match trimmed.as_str() {
-            "" => return Ok(default_yes),
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => println!("{}", "Please answer with 'y' or 'n'.".yellow()),
-        }
-    }
-}
-
-fn prompt_usize(
-    message: &str,
-    default: usize,
-    min: Option<usize>,
-    max: Option<usize>,
-) -> Result<usize> {
-    loop {
-        let response = prompt_with_default(message, &default.to_string())?;
-        match response.parse::<usize>() {
-            Ok(value) => {
-                if let Some(minimum) = min {
-                    if value < minimum {
-                        println!(
-                            "{}",
-                            format!("Value must be >= {}", minimum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                if let Some(maximum) = max {
-                    if value > maximum {
-                        println!(
-                            "{}",
-                            format!("Value must be <= {}", maximum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                return Ok(value);
-            }
-            Err(_) => println!("{}", "Enter a valid positive integer.".yellow()),
-        }
-    }
-}
-
-fn prompt_u64(
-    message: &str,
-    default: u64,
-    min: Option<u64>,
-    max: Option<u64>,
-) -> Result<u64> {
-    loop {
-        let response = prompt_with_default(message, &default.to_string())?;
-        match response.parse::<u64>() {
-            Ok(value) => {
-                if let Some(minimum) = min {
-                    if value < minimum {
-                        println!(
-                            "{}",
-                            format!("Value must be >= {}", minimum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                if let Some(maximum) = max {
-                    if value > maximum {
-                        println!(
-                            "{}",
-                            format!("Value must be <= {}", maximum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                return Ok(value);
-            }
-            Err(_) => println!("{}", "Enter a valid positive integer.".yellow()),
-        }
-    }
 }
 
 fn parse_ports(input: &str) -> Result<Vec<u16>> {

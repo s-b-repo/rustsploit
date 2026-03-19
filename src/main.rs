@@ -11,6 +11,7 @@ mod modules;
 mod utils;
 mod api;
 mod config;
+mod native;
 
 /// Maximum length for API key to prevent memory exhaustion
 const MAX_API_KEY_LENGTH: usize = 256;

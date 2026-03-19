@@ -12,13 +12,16 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use telnet::{Telnet, Event};
 use threadpool::ThreadPool;
 use crossbeam_channel::unbounded;
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
+    cfg_prompt_int_range, cfg_prompt_existing_file, cfg_prompt_output_file,
+};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SMTP_PORT: u16 = 25;
@@ -132,13 +135,13 @@ pub async fn run(target: &str) -> Result<()> {
     println!("  2. Targets from file (ignore current target)");
     println!("  3. Current target + targets from file");
     println!();
-    let mode = prompt("Select mode [1-3] (default 1): ")?;
+    let mode = cfg_prompt_default("mode", "Select mode [1-3] (default 1)", "1")?;
 
     // Build initial target list based on selected mode
     let mut targets: Vec<String> = Vec::new();
     match mode.trim() {
         "2" => {
-            let file_path = prompt("Targets file (one IP/hostname per line): ")?;
+            let file_path = cfg_prompt_existing_file("target_file", "Targets file (one IP/hostname per line)")?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 2"));
             }
@@ -152,7 +155,7 @@ pub async fn run(target: &str) -> Result<()> {
             if !target.trim().is_empty() {
                 targets.push(target.trim().to_string());
             }
-            let file_path = prompt("Additional targets file (one IP/hostname per line): ")?;
+            let file_path = cfg_prompt_existing_file("additional_target_file", "Additional targets file (one IP/hostname per line)")?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 3"));
             }
@@ -170,11 +173,11 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    let port = prompt_port(DEFAULT_SMTP_PORT)?;
-    let username_wordlist = prompt_wordlist("Username wordlist file: ")?;
-    let threads = prompt_threads(DEFAULT_THREADS)?;
-    let timeout_ms = prompt_timeout(DEFAULT_TIMEOUT_MS)?;
-    let verbose = prompt_yes_no("Verbose mode?", false)?;
+    let port = cfg_prompt_port("port", "SMTP Port", DEFAULT_SMTP_PORT)?;
+    let username_wordlist = cfg_prompt_existing_file("wordlist", "Username wordlist file")?;
+    let threads = cfg_prompt_int_range("threads", "Threads", DEFAULT_THREADS as i64, 1, 1024)? as usize;
+    let timeout_ms = cfg_prompt_int_range("timeout_ms", "Timeout in milliseconds", DEFAULT_TIMEOUT_MS as i64, 100, 60000)? as u64;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
 
     if targets.is_empty() {
         return Err(anyhow!("No targets specified for SMTP enumeration"));
@@ -655,11 +658,9 @@ async fn finalize_and_report(
             println!("  {}  {} - {}", "✓".green(), username, response);
         }
 
-        if prompt("\nSave valid usernames? (y/n): ")?
-            .trim()
-            .eq_ignore_ascii_case("y")
+        if cfg_prompt_yes_no("save_valid", "Save valid usernames?", false)?
         {
-            let filename = prompt("What should the valid results be saved as?: ")?;
+            let filename = cfg_prompt_output_file("valid_output", "What should the valid results be saved as?", "smtp_valid_users.txt")?;
             if filename.is_empty() {
                 println!("{}", "[-] Filename cannot be empty.".red());
             } else {
@@ -682,18 +683,10 @@ async fn finalize_and_report(
             .bold()
         );
 
-        if prompt("Save unknown responses to file? (y/n): ")?
-            .trim()
-            .eq_ignore_ascii_case("y")
+        if cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false)?
         {
             let default_name = "smtp_unknown_responses.txt";
-            let filename =
-                prompt(&format!("What should the unknown results be saved as? [{}]: ", default_name))?;
-            let chosen = if filename.trim().is_empty() {
-                default_name.to_string()
-            } else {
-                filename.trim().to_string()
-            };
+            let chosen = cfg_prompt_output_file("unknown_output", "What should the unknown results be saved as?", default_name)?;
 
             if let Err(e) = save_unknown_responses(&chosen, &unknown_guard) {
                 println!(
@@ -748,95 +741,6 @@ fn save_unknown_responses(path: &str, entries: &[(String, String)]) -> Result<()
     }
 
     Ok(())
-}
-
-fn prompt(msg: &str) -> Result<String> {
-    print!("{}", msg);
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut buffer = String::new();
-    std::io::stdin()
-        .read_line(&mut buffer)
-        .context("Failed to read input")?;
-    Ok(buffer.trim().to_string())
-}
-
-fn prompt_port(default: u16) -> Result<u16> {
-    loop {
-        let input = prompt(&format!("SMTP Port (default {}): ", default))?;
-        if input.is_empty() {
-            return Ok(default);
-        }
-        match input.parse::<u16>() {
-            Ok(0) => println!("{}", "[!] Port cannot be zero. Please enter a value between 1 and 65535.".yellow()),
-            Ok(port) => return Ok(port),
-            Err(_) => println!("{}", "[!] Invalid port. Please enter a number between 1 and 65535.".yellow()),
-        }
-    }
-}
-
-fn prompt_threads(default: usize) -> Result<usize> {
-    loop {
-        let input = prompt(&format!("Threads (default {}): ", default))?;
-        if input.is_empty() {
-            return Ok(default.max(1));
-        }
-        if let Ok(value) = input.parse::<usize>() {
-            if value >= 1 && value <= 1024 {
-                return Ok(value);
-            }
-        }
-        println!("{}", "[!] Invalid thread count. Please enter a value between 1 and 1024.".yellow());
-    }
-}
-
-fn prompt_timeout(default: u64) -> Result<u64> {
-    loop {
-        let input = prompt(&format!("Timeout in milliseconds (default {}): ", default))?;
-        if input.is_empty() {
-            return Ok(default);
-        }
-        match input.parse::<u64>() {
-            Ok(value) if value >= 100 && value <= 60000 => return Ok(value),
-            Ok(_) => println!("{}", "[!] Timeout must be between 100 and 60000 milliseconds.".yellow()),
-            Err(_) => println!("{}", "[!] Invalid timeout. Please enter a number.".yellow()),
-        }
-    }
-}
-
-fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
-    let default_char = if default_yes { "y" } else { "n" };
-    loop {
-        let input = prompt(&format!("{} (y/n) [{}]: ", message, default_char))?;
-        if input.is_empty() {
-            return Ok(default_yes);
-        }
-        match input.to_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => println!("{}", "[!] Please respond with y or n.".yellow()),
-        }
-    }
-}
-
-fn prompt_wordlist(message: &str) -> Result<String> {
-    loop {
-        let response = prompt(message)?;
-        if response.is_empty() {
-            println!("{}", "[!] Path cannot be empty.".yellow());
-            continue;
-        }
-        let trimmed = response.trim();
-        if Path::new(trimmed).is_file() {
-            return Ok(trimmed.to_string());
-        } else {
-            println!(
-                "{}",
-                format!("[!] File '{}' does not exist or is not a regular file.", trimmed).yellow()
-            );
-        }
-    }
 }
 
 fn normalize_target(host: &str, port: u16) -> Result<String> {
