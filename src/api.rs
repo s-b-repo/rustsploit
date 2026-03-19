@@ -135,7 +135,7 @@ pub struct HoneypotCheckRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ExecRequest {
+pub struct ShellRequest {
     /// Single command (backward compatible)
     pub command: Option<String>,
     /// Array of commands for chaining (preferred, more secure than string splitting)
@@ -143,7 +143,7 @@ pub struct ExecRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ExecResult {
+struct ShellResult {
     command: String,
     success: bool,
     output: String,
@@ -164,30 +164,65 @@ fn validate_target(target: &str) -> bool {
 }
 
 /// Check if a target IP is a blocked internal/metadata address.
-/// Blocks cloud metadata IPs (169.254.0.0/16), null addresses (0.0.0.0), etc.
+/// Blocks loopback, RFC-1918 private ranges, link-local, cloud metadata,
+/// and any hostname that resolves to "localhost".
 fn is_blocked_target(target: &str) -> bool {
-    let ip_str = target.split(':').next().unwrap_or(target);
-    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+    // Strip port suffix and brackets (IPv6) to isolate the host part
+    let host = {
+        let s = target.split(':').next().unwrap_or(target);
+        s.trim_matches('[').trim_matches(']')
+    };
+
+    // Block localhost by name
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         match ip {
             std::net::IpAddr::V4(v4) => {
-                // Block link-local / cloud metadata (169.254.0.0/16)
-                if v4.octets()[0] == 169 && v4.octets()[1] == 254 {
-                    return true;
-                }
-                // Block 0.0.0.0
-                if v4.is_unspecified() {
-                    return true;
-                }
+                let o = v4.octets();
+                // Loopback 127.0.0.0/8
+                if o[0] == 127 { return true; }
+                // Unspecified 0.0.0.0
+                if v4.is_unspecified() { return true; }
+                // Link-local / metadata 169.254.0.0/16
+                if o[0] == 169 && o[1] == 254 { return true; }
+                // RFC-1918: 10.0.0.0/8
+                if o[0] == 10 { return true; }
+                // RFC-1918: 172.16.0.0/12
+                if o[0] == 172 && o[1] >= 16 && o[1] <= 31 { return true; }
+                // RFC-1918: 192.168.0.0/16
+                if o[0] == 192 && o[1] == 168 { return true; }
+                // Carrier-grade NAT 100.64.0.0/10
+                if o[0] == 100 && (o[1] & 0xC0) == 64 { return true; }
             }
             std::net::IpAddr::V6(v6) => {
-                if v6.is_unspecified() {
-                    return true;
-                }
+                // Unspecified (::)
+                if v6.is_unspecified() { return true; }
+                // Loopback (::1)
+                if v6.is_loopback() { return true; }
+                // Link-local (fe80::/10)
+                let seg = v6.segments();
+                if (seg[0] & 0xFFC0) == 0xFE80 { return true; }
+                // Unique local (fc00::/7)
+                if (seg[0] & 0xFE00) == 0xFC00 { return true; }
             }
         }
     }
-    // Also check raw string for targets like "169.254.169.254:80"
-    ip_str.starts_with("169.254.")
+
+    // Raw-string fallback for targets not yet parsed (e.g. "169.254.169.254:80")
+    host.starts_with("127.")
+        || host.starts_with("169.254.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || (host.starts_with("172.") && {
+            // 172.16.0.0/12
+            host[4..].split('.').next()
+                .and_then(|n| n.parse::<u8>().ok())
+                .map(|n| n >= 16 && n <= 31)
+                .unwrap_or(false)
+        })
 }
 
 /// Check if exec input contains shell metacharacters that could enable injection.
@@ -211,6 +246,10 @@ async fn auth_middleware(
         let ip = addr.ip();
         let now = Instant::now();
         if let Ok(mut limiter) = state.rate_limiter.lock() {
+            // Prune stale entries to prevent unbounded HashMap growth
+            if limiter.len() > 10_000 {
+                limiter.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < 60);
+            }
             let entry = limiter.entry(ip).or_insert((0, now));
             if now.duration_since(entry.1).as_secs() >= RATE_LIMIT_WINDOW_SECS {
                 *entry = (1, now);
@@ -487,6 +526,20 @@ async fn run_module(
             )),
         )
             .into_response();
+    }
+
+    // Validate output_file for path traversal before injecting into prompts
+    if let Some(ref f) = payload.output_file {
+        let bad = f.contains("..") || f.contains('/') || f.contains('\\') || f.contains('\0');
+        if bad {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(err_response(
+                    "Invalid output_file: must not contain path separators or traversal sequences",
+                    "INVALID_OUTPUT_FILE",
+                )),
+            ).into_response();
+        }
     }
 
     // Set module config (like CLI does via prompts, the API passes them in the request)
@@ -899,12 +952,17 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
 
 // ─── Shell-Parity Exec Endpoint ─────────────────────────────────────
 
-/// POST /api/exec — execute internal commands remotely (mirrors interactive shell)
+/// POST /api/shell — run interactive-shell commands remotely (mirrors the interactive `rsf>` shell)
+///
+/// Use this endpoint to execute the same commands as the interactive shell:
+/// `use`, `set target`, `set subnet`, `show_target`, `clear_target`, `run`, `run_all`, `find`, `modules`, `back`.
+///
+/// For direct module execution with prompts, prefer POST /api/run instead.
 /// Supports secure command chaining via JSON array `commands` field.
 /// Each command is individually validated — no shell metacharacters allowed.
-async fn exec_command(
+async fn shell_command(
     State(state): State<ApiState>,
-    Json(payload): Json<ExecRequest>,
+    Json(payload): Json<ShellRequest>,
 ) -> Response {
     // Build command list from either `commands` (array) or `command` (single string)
     let command_list: Vec<String> = if let Some(cmds) = &payload.commands {
@@ -924,12 +982,12 @@ async fn exec_command(
         ).into_response();
     };
 
-    let mut results: Vec<ExecResult> = Vec::new();
+    let mut results: Vec<ShellResult> = Vec::new();
 
     for raw_cmd in &command_list {
         let trimmed = raw_cmd.trim().to_string();
         if trimmed.is_empty() || trimmed.len() > 4096 {
-            results.push(ExecResult {
+            results.push(ShellResult {
                 command: trimmed,
                 success: false,
                 output: "Command is empty or too long (max 4096 chars)".to_string(),
@@ -940,7 +998,7 @@ async fn exec_command(
 
         // Validate each individual command against shell metacharacters
         if contains_shell_metacharacters(&trimmed) {
-            results.push(ExecResult {
+            results.push(ShellResult {
                 command: trimmed,
                 success: false,
                 output: "Command contains forbidden characters (& | ; ` $ > <). Use the 'commands' JSON array for chaining.".to_string(),
@@ -961,11 +1019,22 @@ async fn exec_command(
 
         match command_key.as_str() {
             "help" => {
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
-                    output: "Available commands: help, modules, find <query>, use <module>, \
-                             set/target <ip>, show_target, clear_target, run, run_all, back, exit"
+                    output: "Available commands (same as interactive shell):\n\
+                             help | h | ?                  — This help\n\
+                             modules | ls | m              — List all modules\n\
+                             find <kw> | f1 <kw>          — Search modules by keyword\n\
+                             use <path> | u <path>        — Select a module\n\
+                             set target <ip> | t <ip>     — Set target (single IP/hostname)\n\
+                             set subnet <CIDR> | sn <CIDR>— Set target to CIDR subnet\n\
+                             show_target | st             — Show current target & module\n\
+                             clear_target | ct            — Clear target\n\
+                             run [target]                 — Run selected module\n\
+                             run_all [target]             — Run all modules against target\n\
+                             back | b                     — Deselect current module\n\
+                             exit                         — (no-op in API mode)"
                         .to_string(),
                     duration_ms: None,
                 });
@@ -981,7 +1050,7 @@ async fn exec_command(
                     else if m.starts_with("scanners/") { scanners.push(m.as_str()); }
                     else if m.starts_with("creds/") { creds.push(m.as_str()); }
                 }
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: serde_json::json!({
@@ -996,7 +1065,7 @@ async fn exec_command(
 
             "find" => {
                 if rest.is_empty() {
-                    results.push(ExecResult {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
                         output: "Usage: find <query>".to_string(),
@@ -1008,7 +1077,7 @@ async fn exec_command(
                     let matches: Vec<&String> = modules.iter()
                         .filter(|m| m.to_lowercase().contains(&query))
                         .collect();
-                    results.push(ExecResult {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: true,
                         output: serde_json::json!({
@@ -1023,7 +1092,7 @@ async fn exec_command(
 
             "use" => {
                 if rest.is_empty() {
-                    results.push(ExecResult {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
                         output: "Usage: use <module_path>".to_string(),
@@ -1042,7 +1111,7 @@ async fn exec_command(
                                 if let Ok(mut cm) = state.current_module.lock() {
                                     *cm = Some(path.clone());
                                 }
-                                results.push(ExecResult {
+                                results.push(ShellResult {
                                     command: trimmed.to_string(),
                                     success: true,
                                     output: format!("Module selected: {}", path),
@@ -1058,7 +1127,7 @@ async fn exec_command(
                                 } else {
                                     String::new()
                                 };
-                                results.push(ExecResult {
+                                results.push(ShellResult {
                                     command: trimmed.to_string(),
                                     success: false,
                                     output: format!("Unknown module '{}'.{}", path, suggestion),
@@ -1067,7 +1136,7 @@ async fn exec_command(
                             }
                         }
                         None => {
-                            results.push(ExecResult {
+                            results.push(ShellResult {
                                 command: trimmed.to_string(),
                                 success: false,
                                 output: "Invalid module path".to_string(),
@@ -1079,32 +1148,48 @@ async fn exec_command(
             }
 
             "set" => {
-                if rest.is_empty() {
-                    results.push(ExecResult {
+                // Mirror shell.rs: `set target <ip>`, `t <ip>`, `set subnet <cidr>`, `sn <cidr>`
+                // Peel off leading "target ", "t ", "subnet ", "sn " keywords to extract the value
+                let raw_value = if rest.starts_with("target ") {
+                    rest.strip_prefix("target ").unwrap_or(&rest).trim()
+                } else if rest.starts_with("t ") {
+                    rest.strip_prefix("t ").unwrap_or(&rest).trim()
+                } else {
+                    rest.trim()
+                };
+
+                if raw_value.is_empty() {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
-                        output: "Usage: set <target>".to_string(),
+                        output: "Usage: set target <ip>  or  set subnet <CIDR>  or  t <ip>  or  sn <CIDR>".to_string(),
                         duration_ms: None,
                     });
-                } else if !validate_target(&rest) {
-                    results.push(ExecResult {
+                } else if !validate_target(raw_value) {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
                         output: "Invalid target".to_string(),
                         duration_ms: None,
                     });
                 } else {
-                    match crate::config::GLOBAL_CONFIG.set_target(&rest) {
+                    // Strip CIDR prefix if user did `set target 1.2.3.4/24` (single-IP intent)
+                    let ip_only = if raw_value.contains('/') {
+                        raw_value.split('/').next().unwrap_or(raw_value)
+                    } else {
+                        raw_value
+                    };
+                    match crate::config::GLOBAL_CONFIG.set_target(ip_only) {
                         Ok(_) => {
-                            results.push(ExecResult {
+                            results.push(ShellResult {
                                 command: trimmed.to_string(),
                                 success: true,
-                                output: format!("Target set to: {}", rest),
+                                output: format!("Target set to: {}", ip_only),
                                 duration_ms: None,
                             });
                         }
                         Err(e) => {
-                            results.push(ExecResult {
+                            results.push(ShellResult {
                                 command: trimmed.to_string(),
                                 success: false,
                                 output: format!("Failed to set target: {}", e),
@@ -1115,10 +1200,75 @@ async fn exec_command(
                 }
             }
 
+            "set_subnet" => {
+                // Mirror shell.rs set_subnet: accepts `sn <CIDR>`, `subnet <CIDR>`, `set subnet <CIDR>`
+                let raw_value = if rest.starts_with("subnet ") {
+                    rest.strip_prefix("subnet ").unwrap_or(&rest).trim()
+                } else if rest.starts_with("sn ") {
+                    rest.strip_prefix("sn ").unwrap_or(&rest).trim()
+                } else {
+                    rest.trim()
+                };
+
+                if raw_value.is_empty() {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: sn <CIDR>  or  set subnet <CIDR>  (e.g. 192.168.1.0/24)".to_string(),
+                        duration_ms: None,
+                    });
+                } else if !raw_value.contains('/') {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Not a subnet — use CIDR notation (e.g. 192.168.1.0/24). For single IPs use: set target <IP>".to_string(),
+                        duration_ms: None,
+                    });
+                } else if !validate_target(raw_value) {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Invalid CIDR target".to_string(),
+                        duration_ms: None,
+                    });
+                } else if raw_value.parse::<ipnetwork::IpNetwork>().is_err() {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: format!("Invalid CIDR notation: {}", raw_value),
+                        duration_ms: None,
+                    });
+                } else {
+                    match crate::config::GLOBAL_CONFIG.set_target(raw_value) {
+                        Ok(_) => {
+                            let size = crate::config::GLOBAL_CONFIG.get_target_size();
+                            let msg = match size {
+                                Some(s) => format!("Subnet set to: {} ({} IPs)", raw_value, s),
+                                None    => format!("Subnet set to: {}", raw_value),
+                            };
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: msg,
+                                duration_ms: None,
+                            });
+                        }
+                        Err(e) => {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: format!("Failed to set subnet: {}", e),
+                                duration_ms: None,
+                            });
+                        }
+                    }
+                }
+            }
+
             "show_target" => {
                 let target = crate::config::GLOBAL_CONFIG.get_target().unwrap_or_else(|| "Not set".to_string());
                 let module = state.current_module.lock().ok().and_then(|cm| cm.clone()).unwrap_or_else(|| "None".to_string());
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: serde_json::json!({
@@ -1131,7 +1281,7 @@ async fn exec_command(
 
             "clear_target" => {
                 crate::config::GLOBAL_CONFIG.clear_target();
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: "Target cleared".to_string(),
@@ -1143,7 +1293,7 @@ async fn exec_command(
                 if let Ok(mut cm) = state.current_module.lock() {
                     *cm = None;
                 }
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: "Module deselected".to_string(),
@@ -1154,7 +1304,7 @@ async fn exec_command(
             "run" => {
                 let module_path = state.current_module.lock().ok().and_then(|cm| cm.clone());
                 if module_path.is_none() {
-                    results.push(ExecResult {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
                         output: "No module selected. Use 'use <module>' first.".to_string(),
@@ -1168,7 +1318,7 @@ async fn exec_command(
                     } else if crate::config::GLOBAL_CONFIG.has_target() {
                         crate::config::GLOBAL_CONFIG.get_target().unwrap_or_default()
                     } else {
-                        results.push(ExecResult {
+                        results.push(ShellResult {
                             command: trimmed.to_string(),
                             success: false,
                             output: "No target set. Use 'set <target>' first.".to_string(),
@@ -1177,11 +1327,22 @@ async fn exec_command(
                         continue;
                     };
 
+                    // SSRF guard — shell 'run' must also validate the resolved target
+                    if !validate_target(&target) || is_blocked_target(&target) {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Target is invalid or blocked (internal/private address)".to_string(),
+                            duration_ms: None,
+                        });
+                        continue;
+                    }
+
                     let verbose = state.verbose;
                     let run_start = std::time::Instant::now();
                     match commands::run_module(&module_path, &target, verbose).await {
                         Ok(_) => {
-                            results.push(ExecResult {
+                            results.push(ShellResult {
                                 command: trimmed.to_string(),
                                 success: true,
                                 output: format!("Module '{}' executed against '{}'", module_path, target),
@@ -1189,7 +1350,7 @@ async fn exec_command(
                             });
                         }
                         Err(e) => {
-                            results.push(ExecResult {
+                            results.push(ShellResult {
                                 command: trimmed.to_string(),
                                 success: false,
                                 output: format!("Module failed: {}", e),
@@ -1206,7 +1367,7 @@ async fn exec_command(
                 } else if crate::config::GLOBAL_CONFIG.has_target() {
                     crate::config::GLOBAL_CONFIG.get_target().unwrap_or_default()
                 } else {
-                    results.push(ExecResult {
+                    results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
                         output: "No target set for run_all".to_string(),
@@ -1214,6 +1375,17 @@ async fn exec_command(
                     });
                     continue;
                 };
+
+                // SSRF guard — run_all must check the resolved target too
+                if !validate_target(&target) || is_blocked_target(&target) {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Target is invalid or blocked (internal/private address)".to_string(),
+                        duration_ms: None,
+                    });
+                    continue;
+                }
 
                 let modules = commands::discover_modules();
                 let verbose = state.verbose;
@@ -1226,7 +1398,7 @@ async fn exec_command(
                         Err(_) => fail_count += 1,
                     }
                 }
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: format!("run_all complete: {} ok, {} failed out of {} modules",
@@ -1236,7 +1408,7 @@ async fn exec_command(
             }
 
             "exit" => {
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: "Exit not applicable in API mode".to_string(),
@@ -1245,7 +1417,7 @@ async fn exec_command(
             }
 
             other => {
-                results.push(ExecResult {
+                results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: false,
                     output: format!("Unknown command: '{}'", other),
@@ -1261,7 +1433,7 @@ async fn exec_command(
     (
         if all_ok { StatusCode::OK } else { StatusCode::OK },
         Json(ok_response(
-            format!("{} command(s) executed", total),
+            format!("{} shell command(s) executed", total),
             Some(serde_json::json!({
                 "results": results,
             })),
@@ -1298,7 +1470,11 @@ pub async fn start_api_server(
 
     println!("🚀 Starting RustSploit API server...");
     println!("📍 Binding to: {}", bind_address);
-    println!("🔑 API key: {}", api_key);
+    // Do NOT print the API key in plaintext — log only a masked hint
+    println!("🔑 API key: {}...{} ({}  chars)",
+        &api_key[..api_key.len().min(4)],
+        &api_key[api_key.len().saturating_sub(2)..],
+        api_key.len());
     println!("📢 Verbose: {}", verbose);
 
     // Protected routes (require API key)
@@ -1311,7 +1487,7 @@ pub async fn start_api_server(
         .route("/api/target", post(set_target))
         .route("/api/target", axum::routing::delete(clear_target))
         .route("/api/honeypot-check", post(honeypot_check))
-        .route("/api/exec", post(exec_command))
+        .route("/api/shell", post(shell_command))
         .route("/api/results", get(list_results))
         .route("/api/results/{filename}", get(get_result_file))
         .layer(axum::middleware::from_fn_with_state(

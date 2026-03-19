@@ -5,6 +5,9 @@ use std::fs::File;
 use std::io::Write;
 
 use std::time::{Duration, Instant};
+use crate::utils::{
+    cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
+};
 
 fn display_banner() {
     println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
@@ -19,11 +22,11 @@ pub async fn run(target: &str) -> Result<()> {
     
     println!("{}", format!("[*] Target: {}", target).cyan());
     
-    let timeout_secs = prompt_timeout()?;
-    let check_http = prompt_bool("Check HTTP (port 80)?", true)?;
-    let check_https = prompt_bool("Check HTTPS (port 443)?", true)?;
-    let verbose = prompt_bool("Verbose output?", false)?;
-    let save_results = prompt_bool("Save results to file?", false)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout in seconds", 10, 1, 120)? as u64;
+    let check_http = cfg_prompt_yes_no("check_http", "Check HTTP (port 80)?", true)?;
+    let check_https = cfg_prompt_yes_no("check_https", "Check HTTPS (port 443)?", true)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false)?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false)?;
     
     if !check_http && !check_https {
         return Err(anyhow!("At least one protocol must be selected"));
@@ -146,7 +149,7 @@ pub async fn run(target: &str) -> Result<()> {
     
     // Save results
     if save_results && !results.is_empty() {
-        let filename = prompt_with_default("Output filename", "http_scan_results.txt")?;
+        let filename = cfg_prompt_output_file("output_file", "Output filename", "http_scan_results.txt")?;
         let mut file = File::create(&filename).context("Failed to create output file")?;
         writeln!(file, "HTTP Connectivity Scan Results")?;
         writeln!(file, "Target: {}", target)?;
@@ -159,57 +162,4 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     Ok(())
-}
-
-fn prompt_bool(message: &str, default: bool) -> Result<bool> {
-    let hint = if default { "Y/n" } else { "y/N" };
-    print!("{}", format!("{} [{}]: ", message, hint).cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim().to_lowercase();
-    match trimmed.as_str() {
-        "" => Ok(default),
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => Ok(default),
-    }
-}
-
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
-    print!("{}", format!("{} [{}]: ", message, default).cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn prompt_timeout() -> Result<u64> {
-    print!("{}", "Timeout in seconds [10]: ".cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(10)
-    } else {
-        trimmed.parse().map_err(|_| anyhow!("Invalid timeout"))
-    }
 }

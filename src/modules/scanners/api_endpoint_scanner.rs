@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::utils::{prompt_existing_file, prompt_int_range, prompt_default, prompt_yes_no, prompt_wordlist, load_lines};
+use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines};
+use crate::native::payload_mutator::{self, PayloadCategory, MutatorConfig};
 use serde_json::json;
 
 // =========================================================================
@@ -90,6 +91,9 @@ struct ScanConfig {
     id_start: Option<usize>,
     id_end: Option<usize>,
     id_file_path: Option<String>,
+    // Mutation Engine Config
+    mutation_enabled: bool,
+    mutator_config: MutatorConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,16 +121,16 @@ pub async fn run(target: &str) -> Result<()> {
     println!();
 
     // 1. Input parsing & Configuration
-    let output_dir_name = prompt_default("Output directory name", "api_scan_results")?;
-    let use_spoofing = prompt_yes_no("Enable IP Spoofing/Bypass headers logic? (Applies to all selected modules)", false)?;
-    let use_generic_payload = prompt_yes_no("Send generic JSON payload with POST/PUT/PATCH? (Better for API compatibility)", true)?;
+    let output_dir_name = cfg_prompt_default("output_dir", "Output directory name", "api_scan_results")?;
+    let use_spoofing = cfg_prompt_yes_no("use_spoofing", "Enable IP Spoofing/Bypass headers logic? (Applies to all selected modules)", false)?;
+    let use_generic_payload = cfg_prompt_yes_no("use_generic_payload", "Send generic JSON payload with POST/PUT/PATCH? (Better for API compatibility)", true)?;
     
     // Method Selection
     let mut methods = vec![Method::GET, Method::POST];
-    if prompt_yes_no("Enable DELETE method? (WARNING: Destructive)", false)? {
+    if cfg_prompt_yes_no("enable_delete", "Enable DELETE method? (WARNING: Destructive)", false)? {
         methods.push(Method::DELETE);
     }
-    if prompt_yes_no("Enable Extended HTTP methods (PUT, PATCH, HEAD, OPTIONS, CONNECT, TRACE, DEBUG)?", false)? {
+    if cfg_prompt_yes_no("enable_extended_methods", "Enable Extended HTTP methods (PUT, PATCH, HEAD, OPTIONS, CONNECT, TRACE, DEBUG)?", false)? {
         methods.extend(vec![
             Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
             Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
@@ -141,7 +145,7 @@ pub async fn run(target: &str) -> Result<()> {
     println!("5. Path Traversal");
     println!("6. ID/Payload Enumeration");
     
-    let module_selection = prompt_default("Selection", "1")?;
+    let module_selection = cfg_prompt_default("modules", "Selection", "1")?;
     let mut modules = Vec::new();
     
     for s in module_selection.split(',') {
@@ -164,10 +168,10 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No modules selected!"));
     }
 
-    let concurrency = prompt_int_range("Concurrency limit", 10, 1, 100)? as usize;
+    let concurrency = cfg_prompt_int_range("concurrency", "Concurrency limit", 10, 1, 100)? as usize;
     
     // Bug 10: Configurable timeout
-    let timeout_secs = prompt_int_range("Timeout (seconds)", 10, 1, 60)? as u64;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 10, 1, 60)? as u64;
 
     // Injection Attacks Configuration
     let sqli_payloads = if modules.contains(&ScanModule::SQLi) {
@@ -191,13 +195,13 @@ pub async fn run(target: &str) -> Result<()> {
         println!("\n{}", "Configure ID/Payload Enumeration:".cyan().bold());
         println!("1. Numeric Range (e.g. 1-100)");
         println!("2. File List (e.g. valid_ids.txt)");
-        let enum_choice = prompt_default("Selection", "1")?;
+        let enum_choice = cfg_prompt_default("enum_mode", "Selection", "1")?;
         
         if enum_choice == "2" {
-            (None, None, Some(prompt_existing_file("Path to ID/Payload file")?))
+            (None, None, Some(cfg_prompt_existing_file("id_file", "Path to ID/Payload file")?))
         } else {
-             let start = prompt_int_range("Start ID", 1, 0, 1000000)? as usize;
-             let end = prompt_int_range("End ID", 100, start as i64, 1000000)? as usize;
+             let start = cfg_prompt_int_range("id_start", "Start ID", 1, 0, 1000000)? as usize;
+             let end = cfg_prompt_int_range("id_end", "End ID", 100, start as i64, 1000000)? as usize;
              if start > end {
                  return Err(anyhow!("Start ID must be less than or equal to End ID"));
              }
@@ -205,6 +209,36 @@ pub async fn run(target: &str) -> Result<()> {
         }
     } else {
         (None, None, None)
+    };
+
+    // Mutation Engine Configuration
+    let has_injection = modules.iter().any(|m| matches!(m, ScanModule::SQLi | ScanModule::NoSQLi | ScanModule::CMDi | ScanModule::PathTraversal));
+    let mutation_enabled = if has_injection {
+        println!("\n{}", "Dynamic Payload Mutation Engine:".cyan().bold());
+        cfg_prompt_yes_no("enable_mutations", "Enable dynamic payload mutations? (WAF bypass, exhaustive encoding)", true)?
+    } else {
+        false
+    };
+
+    let mutator_config = if mutation_enabled {
+        let depth = cfg_prompt_int_range("mutation_depth", "Mutation depth (generations of mutations)", 3, 1, 10)? as usize;
+        let max_variants = cfg_prompt_int_range("max_variants", "Max variants per seed payload", 15, 1, 50)? as usize;
+        let max_total = cfg_prompt_int_range("max_total_payloads", "Max total payloads per category", 500, 10, 5000)? as usize;
+        let traversal_depth = if modules.contains(&ScanModule::PathTraversal) {
+            cfg_prompt_int_range("traversal_max_depth", "Max traversal directory depth", 15, 1, 30)? as usize
+        } else { 15 };
+        let exhaustive = cfg_prompt_yes_no("exhaustive_encoding", "Exhaustive encoding chains? (tries every combination)", true)?;
+        println!("[+] Mutation engine: depth={}, max_variants={}, max_total={}, exhaustive={}",
+            depth, max_variants, max_total, exhaustive);
+        MutatorConfig {
+            depth,
+            max_variants_per_seed: max_variants,
+            max_total,
+            traversal_max_depth: traversal_depth,
+            exhaustive_encoding: exhaustive,
+        }
+    } else {
+        MutatorConfig::default()
     };
 
     // Validate and format target base URL
@@ -220,12 +254,12 @@ pub async fn run(target: &str) -> Result<()> {
     println!("\n{}", "Select Endpoint Source:".cyan().bold());
     println!("1. Load from file (Known endpoints)");
     println!("2. Brute-force/Enumerate (Discover using wordlist)");
-    let source_choice = prompt_default("Selection", "1")?;
+    let source_choice = cfg_prompt_default("endpoint_source", "Selection", "1")?;
 
     let mut endpoints = if source_choice == "2" {
         // Enumerate
-        let base_path = prompt_default("Base Path (e.g. /api/)", "/")?;
-        let wordlist_path = prompt_wordlist("Wordlist path")?;
+        let base_path = cfg_prompt_default("base_path", "Base Path (e.g. /api/)", "/")?;
+        let wordlist_path = cfg_prompt_wordlist("wordlist", "Wordlist path")?;
         
         // Setup simple client for enumeration
         let enum_client = Client::builder()
@@ -236,7 +270,7 @@ pub async fn run(target: &str) -> Result<()> {
         enumerate_endpoints(&enum_client, &target_base, &base_path, &wordlist_path, concurrency).await?
     } else {
         // Load from file
-        let endpoint_file = prompt_existing_file("Path to endpoint list file")?;
+        let endpoint_file = cfg_prompt_existing_file("endpoint_file", "Path to endpoint list file")?;
         parse_endpoint_file(&endpoint_file)?
     };
     
@@ -275,6 +309,8 @@ pub async fn run(target: &str) -> Result<()> {
         id_start,
         id_end,
         id_file_path,
+        mutation_enabled,
+        mutator_config,
     });
     let client = Arc::new(client);
 
@@ -319,15 +355,15 @@ pub async fn run(target: &str) -> Result<()> {
 
 fn configure_injection_payloads(name: &str, default_payloads: &[&str]) -> Result<Option<Vec<String>>> {
     println!(); // Add spacing
-    if !prompt_yes_no(&format!("Test for {} Injection?", name), false)? {
+    if !cfg_prompt_yes_no(&format!("test_{}", name.to_lowercase()), &format!("Test for {} Injection?", name), false)? {
         return Ok(None);
     }
 
-    if prompt_yes_no(&format!("Use default {} payloads?", name), true)? {
+    if cfg_prompt_yes_no(&format!("default_{}_payloads", name.to_lowercase()), &format!("Use default {} payloads?", name), true)? {
         return Ok(Some(default_payloads.iter().map(|&s| s.to_string()).collect()));
     }
 
-    let file_path = prompt_existing_file(&format!("Path to custom {} payload file", name))?;
+    let file_path = cfg_prompt_existing_file(&format!("{}_payload_file", name.to_lowercase()), &format!("Path to custom {} payload file", name))?;
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let payloads: Vec<String> = reader.lines()
@@ -459,6 +495,21 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
 }
 
 // =========================================================================
+//                     MUTATION ENGINE INTEGRATION
+// =========================================================================
+
+/// Expand seed payloads with dynamic mutations if enabled
+fn expand_with_mutations(seeds: &[String], category: PayloadCategory, config: &ScanConfig) -> Vec<String> {
+    if !config.mutation_enabled {
+        return seeds.to_vec();
+    }
+    let mutated = payload_mutator::mutate_payloads(seeds, category, &config.mutator_config);
+    println!("  [~] {} seeds → {} payloads ({:?}, depth={})",
+        seeds.len(), mutated.len(), category, config.mutator_config.depth);
+    mutated
+}
+
+// =========================================================================
 //                            SCAN LOGIC
 // =========================================================================
 
@@ -500,28 +551,32 @@ async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint: Endpoint)
                 },
                 ScanModule::SQLi => {
                     if let Some(payloads) = &config.sqli_payloads {
-                        for payload in payloads {
+                        let effective = expand_with_mutations(payloads, PayloadCategory::SQLi, config);
+                        for payload in &effective {
                              perform_injection(client, &url, method.clone(), "SQLi", payload, &endpoint_dir, config).await;
                         }
                     }
                 },
                 ScanModule::NoSQLi => {
                     if let Some(payloads) = &config.nosqli_payloads {
-                        for payload in payloads {
+                        let effective = expand_with_mutations(payloads, PayloadCategory::NoSQLi, config);
+                        for payload in &effective {
                              perform_injection(client, &url, method.clone(), "NoSQLi", payload, &endpoint_dir, config).await;
                         }
                     }
                 },
                 ScanModule::CMDi => {
                     if let Some(payloads) = &config.cmdi_payloads {
-                        for payload in payloads {
+                        let effective = expand_with_mutations(payloads, PayloadCategory::CMDi, config);
+                        for payload in &effective {
                              perform_injection(client, &url, method.clone(), "CMDi", payload, &endpoint_dir, config).await;
                         }
                     }
                 },
                 ScanModule::PathTraversal => {
                     if let Some(payloads) = &config.traversal_payloads {
-                        for payload in payloads {
+                        let effective = expand_with_mutations(payloads, PayloadCategory::Traversal, config);
+                        for payload in &effective {
                              perform_injection(client, &url, method.clone(), "Traversal", payload, &endpoint_dir, config).await;
                         }
                     }

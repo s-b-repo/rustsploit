@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, Context};
+use anyhow::{Result, anyhow};
 use colored::*;
 use std::{
     fs::File,
@@ -15,6 +15,9 @@ use tokio::{
 };
 use rand::{Rng, rng};
 use socket2::{Socket, Domain, Type, Protocol};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScanMethod {
@@ -93,27 +96,15 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     println!("{}", "\n=== Port Scanner Configuration ===".cyan().bold());
     
     // Port range selection
-    println!("\n{}", "Port Range Options:".yellow());
-    println!("  1. All ports (1-65535)");
-    println!("  2. Common ports (21, 22, 23, 25, 53, 80, 443, etc.)");
-    println!("  3. Top 1000 ports");
-    println!("  4. Custom range");
-    
-    let range_choice = prompt_usize("Select option (1-4) [1]: ")?;
+    let range_choice_str = cfg_prompt_default("port_range", "Port Range (1=All, 2=Common, 3=Top1000, 4=Custom)", "1")?;
+    let range_choice: usize = range_choice_str.parse().unwrap_or(1);
     let port_range = match range_choice {
         1 | 0 => PortRange::All,
         2 => PortRange::Common,
         3 => PortRange::Top1000,
         4 => {
-            let start_val: usize = prompt_usize("Start port: ")?;
-            let end_val: usize = prompt_usize("End port: ")?;
-            
-            if start_val > 65535 || start_val == 0 {
-                return Err(anyhow!("Start port must be between 1 and 65535"));
-            }
-            if end_val > 65535 || end_val == 0 {
-                return Err(anyhow!("End port must be between 1 and 65535"));
-            }
+            let start_val = cfg_prompt_int_range("port_start", "Start port", 1, 1, 65535)? as usize;
+            let end_val = cfg_prompt_int_range("port_end", "End port", 65535, 1, 65535)? as usize;
             
             let start: u16 = start_val.try_into().map_err(|_| anyhow!("Invalid start port"))?;
             let end: u16 = end_val.try_into().map_err(|_| anyhow!("Invalid end port"))?;
@@ -130,11 +121,8 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     println!("{}", format!("[*] Selected {} ports to scan", ports.len()).green());
     
     // Scan Method Selection
-    println!("\n{}", "Scan Method:".yellow());
-    println!("  1. TCP Connect Scan (Default)");
-    println!("  2. UDP Scan");
-    println!("  3. Both TCP & UDP");
-    let method_choice = prompt_usize("Select method (1-3) [1]: ").unwrap_or(1);
+    let method_choice_str = cfg_prompt_default("scan_method", "Scan Method (1=TCP, 2=UDP, 3=Both)", "1")?;
+    let method_choice: usize = method_choice_str.parse().unwrap_or(1);
     let scan_method = match method_choice {
         2 => ScanMethod::Udp,
         3 => ScanMethod::Both,
@@ -142,31 +130,31 @@ pub fn prompt_settings() -> Result<ScanSettings> {
     };
 
     // Advanced Options
-    let ttl = if prompt_bool("Enable custom TTL? (y/n) [n]: ").unwrap_or(false) {
-        Some(prompt_usize("TTL value (1-255): ").unwrap_or(64) as u32)
+    let ttl = if cfg_prompt_yes_no("enable_ttl", "Enable custom TTL?", false)? {
+        Some(cfg_prompt_int_range("ttl", "TTL value", 64, 1, 255)? as u32)
     } else {
         None
     };
 
-    let source_port = if prompt_bool("Enable custom Source Port? (y/n) [n]: ").unwrap_or(false) {
-        Some(prompt_usize("Source Port (1-65535): ").unwrap_or(0) as u16)
+    let source_port = if cfg_prompt_yes_no("enable_source_port", "Enable custom Source Port?", false)? {
+        Some(cfg_prompt_int_range("source_port", "Source Port", 0, 0, 65535)? as u16)
     } else {
         None
     };
 
-    let data_length = if prompt_bool("Enable garbage data / payload padding? (y/n) [n]: ").unwrap_or(false) {
-        Some(prompt_usize("Data length (bytes): ").unwrap_or(0))
+    let data_length = if cfg_prompt_yes_no("enable_data_padding", "Enable garbage data / payload padding?", false)? {
+        Some(cfg_prompt_int_range("data_length", "Data length (bytes)", 0, 0, 65535)? as usize)
     } else {
         None
     };
 
     Ok(ScanSettings {
-        concurrency: prompt_usize("Concurrency [100]: ").unwrap_or(100),
-        timeout_secs: prompt_usize("Timeout (in seconds) [3]: ").unwrap_or(3) as u64,
-        show_only_open: prompt_bool("Show only open ports? (y/n) [y]: ").unwrap_or(true),
-        verbose: prompt_bool("Verbose output? (y/n) [n]: ").unwrap_or(false),
+        concurrency: cfg_prompt_int_range("concurrency", "Concurrency", 100, 1, 10000)? as usize,
+        timeout_secs: cfg_prompt_int_range("timeout", "Timeout (in seconds)", 3, 1, 120)? as u64,
+        show_only_open: cfg_prompt_yes_no("show_only_open", "Show only open ports?", true)?,
+        verbose: cfg_prompt_yes_no("verbose", "Verbose output?", false)?,
         scan_method,
-        output_file: prompt("Output filename [scan_results.txt]: ").unwrap_or_else(|_| "scan_results.txt".to_string()),
+        output_file: cfg_prompt_output_file("output_file", "Output filename", "scan_results.txt")?,
         port_range,
         ttl,
         source_port,
@@ -286,6 +274,7 @@ pub async fn run_with_settings(
                                 println!("  {} TCP {}:{} FILTERED", "~".yellow(), ip_str, port);
                             }
                         }
+                        _ => {} // ignore any other status variants
                     }
                 }
                 
@@ -625,46 +614,6 @@ fn resolve_target(input: &str) -> Result<(String, std::net::IpAddr)> {
         Ok((addr.ip().to_string(), addr.ip()))
     } else {
         Err(anyhow!("Could not resolve target '{}'", input))
-    }
-}
-
-/// === Prompt Utilities ===
-fn prompt(message: &str) -> Result<String> {
-    print!("{}", message.cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_line(&mut buf)
-        .context("Failed to read input")?;
-    Ok(buf.trim().to_string())
-}
-
-fn prompt_bool(message: &str) -> Result<bool> {
-    loop {
-        let input = prompt(message)?;
-        if input.is_empty() {
-            return Ok(false);
-        }
-        match input.to_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => println!("{}", "Please enter 'y' or 'n'.".yellow()),
-        }
-    }
-}
-
-fn prompt_usize(message: &str) -> Result<usize> {
-    loop {
-        let input = prompt(message)?;
-        if input.is_empty() {
-            return Err(anyhow!("Input required"));
-        }
-        if let Ok(n) = input.parse::<usize>() {
-            return Ok(n);
-        }
-        println!("{}", "Please enter a valid number.".yellow());
     }
 }
 

@@ -149,16 +149,6 @@ pub fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
-pub fn prompt_int(msg: &str, default: i64) -> Result<i64> {
-    loop {
-        let input = prompt_default(msg, &default.to_string())?;
-        match input.trim().parse::<i64>() {
-            Ok(n) => return Ok(n),
-            Err(_) => println!("{}", "Please enter a valid number.".yellow()),
-        }
-    }
-}
-
 pub fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
     loop {
         let input = prompt_default(msg, &default.to_string())?;
@@ -204,26 +194,6 @@ pub fn prompt_existing_file(msg: &str) -> Result<String> {
 /// Prompts for a wordlist file path.
 pub fn prompt_wordlist(msg: &str) -> Result<String> {
     prompt_existing_file(msg)
-}
-
-/// Prompts for a safe output filename (basename only, no directory traversal).
-pub fn prompt_output_file(msg: &str, default: &str) -> Result<String> {
-    loop {
-        let raw = prompt_default(msg, default)?;
-        let filename = Path::new(&raw)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if filename.is_empty() || filename.starts_with('.') {
-            println!("{}", "Invalid output filename. Cannot be empty or start with '.'".yellow());
-            continue;
-        }
-        if filename.len() > 255 {
-            println!("{}", "Filename too long (max 255 chars).".yellow());
-            continue;
-        }
-        return Ok(filename);
-    }
 }
 
 // ============================================================
@@ -387,6 +357,24 @@ pub fn cfg_prompt_output_file(key: &str, msg: &str, default: &str) -> Result<Str
         return Err(anyhow!("Output filename too long (max 255 chars)"));
     }
     Ok(filename)
+}
+
+/// Config-aware wordlist prompt.
+/// Checks ModuleConfig.custom_prompts first, then falls back to prompt_wordlist().
+pub fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
+    let config = crate::config::get_module_config();
+    if let Some(val) = config.custom_prompts.get(key) {
+        if !val.is_empty() && Path::new(val).is_file() {
+            return Ok(val.clone());
+        }
+        if !val.is_empty() {
+            return Err(anyhow!("Wordlist file not found: '{}'", val));
+        }
+    }
+    if config.api_mode {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    }
+    prompt_wordlist(msg)
 }
 
 // ============================================================

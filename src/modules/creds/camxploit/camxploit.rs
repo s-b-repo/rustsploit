@@ -724,10 +724,11 @@ async fn run_mass_scan() -> Result<()> {
     println!("{}", format!("[+] Loaded {} IP exclusion ranges", exclusions.len()).green());
 
     // Prompt for thread count
-    let thread_count = crate::utils::prompt_int("Threads", 200)? as usize;
+    let thread_count = crate::utils::cfg_prompt_int_range("concurrency", "Threads", 200, 1, 5000)? as usize;
 
     // Prompt for output file
-    let output_file = crate::utils::prompt_default(
+    let output_file = crate::utils::cfg_prompt_output_file(
+        "output_file",
         "Output file for discovered cameras",
         "camxploit_results.txt",
     )?;

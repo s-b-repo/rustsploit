@@ -26,6 +26,9 @@ use tokio::{
     time::sleep,
 };
 use ipnetwork::IpNetwork;
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file,
+};
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -325,55 +328,6 @@ fn save_results(results: &[SshScanResult], path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt helper
-fn prompt(message: &str) -> Result<String> {
-    print!("{}: ", message);
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    Ok(input.trim().to_string())
-}
-
-fn prompt_default(message: &str, default: &str) -> Result<String> {
-    print!("{} [{}]: ", message, default);
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
-    let hint = if default { "Y/n" } else { "y/N" };
-    print!("{} [{}]: ", message, hint);
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim().to_lowercase();
-    match trimmed.as_str() {
-        "" => Ok(default),
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => Ok(default),
-    }
-}
-
 /// Main entry point
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
@@ -386,10 +340,11 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Get port
-    let port: u16 = prompt_default("SSH Port", "22")?.parse().unwrap_or(DEFAULT_SSH_PORT);
+    let port_str = cfg_prompt_default("port", "SSH Port", "22")?;
+    let port: u16 = port_str.parse().unwrap_or(DEFAULT_SSH_PORT);
     
     // Get additional targets
-    let more_targets = prompt("Additional targets (comma-separated, CIDR, or leave empty)")?;
+    let more_targets = cfg_prompt_default("additional_targets", "Additional targets (comma-separated, CIDR, or leave empty)", "")?;
     
     // Add initial target
     if !target.trim().is_empty() {
@@ -402,8 +357,8 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Load from file?
-    if prompt_yes_no("Load targets from file?", false)? {
-        let file_path = prompt("File path")?;
+    if cfg_prompt_yes_no("load_from_file", "Load targets from file?", false)? {
+        let file_path = cfg_prompt_default("target_file", "File path", "")?;
         if !file_path.is_empty() {
             match load_targets_from_file(&file_path, port) {
                 Ok(file_targets) => {
@@ -428,12 +383,10 @@ pub async fn run(target: &str) -> Result<()> {
     println!("{}", format!("[*] Total unique targets: {}", targets.len()).cyan());
     
     // Get scan options
-    let threads: usize = prompt_default("Concurrent threads", &DEFAULT_THREADS.to_string())?
-        .parse()
-        .unwrap_or(DEFAULT_THREADS);
-    let timeout: u64 = prompt_default("Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string())?
-        .parse()
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let threads_str = cfg_prompt_default("threads", "Concurrent threads", &DEFAULT_THREADS.to_string())?;
+    let threads: usize = threads_str.parse().unwrap_or(DEFAULT_THREADS);
+    let timeout_str = cfg_prompt_default("timeout", "Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string())?;
+    let timeout: u64 = timeout_str.parse().unwrap_or(DEFAULT_TIMEOUT_SECS);
     
     println!();
     
@@ -441,8 +394,8 @@ pub async fn run(target: &str) -> Result<()> {
     let results = scan_ssh(targets, threads, timeout).await;
     
     // Save results?
-    if !results.is_empty() && prompt_yes_no("Save results to file?", true)? {
-        let output_path = prompt_default("Output file", "ssh_scan_results.txt")?;
+    if !results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true)? {
+        let output_path = cfg_prompt_output_file("output_file", "Output file", "ssh_scan_results.txt")?;
         if let Err(e) = save_results(&results, &output_path) {
             println!("{}", format!("[-] Failed to save: {}", e).red());
         }
