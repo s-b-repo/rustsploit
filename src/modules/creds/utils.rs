@@ -203,13 +203,9 @@ pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
 }
 
 /// Check if a target string is a CIDR subnet (e.g. "192.168.8.0/21").
-/// Returns false for special mass-scan triggers like "0.0.0.0/0".
+/// Any valid CIDR notation (including 0.0.0.0/0) is treated as a subnet target.
 pub fn is_subnet_target(target: &str) -> bool {
     if !target.contains('/') {
-        return false;
-    }
-    // Exclude the special mass-scan triggers
-    if target == "0.0.0.0/0" {
         return false;
     }
     target.parse::<ipnetwork::IpNetwork>().is_ok()

@@ -13082,3 +13082,632 @@ Manual Verification
 Run scanner with mutations enabled, verify unique payloads in output logs
 Compare mutation output diversity across runs
 
+
+dd API/Shell/CLI Support to FTP & DOS Modules
+Fix all cargo build warnings, verify camera modules have full support, and migrate FTP/DOS exploit modules to use cfg_prompt_* for API compatibility.
+
+Background
+The project uses two sets of prompt utilities:
+
+cfg_prompt_* (API-compatible): Checks ModuleConfig for pre-set values (API mode) before falling back to interactive stdin (CLI/shell mode). Used by camera modules and brute force modules.
+prompt_* (legacy, CLI-only): Always reads from stdin, blocking when called via the API.
+Camera exploit modules already use cfg_prompt_*. FTP and DOS exploit modules still use legacy prompt_* and need migration.
+
+Proposed Changes
+Payload Mutator (Warnings Fix)
+[MODIFY] 
+payload_mutator.rs
+Fix 3 warnings:
+
+Line 97: Remove unused let mut rng = rand::rng() — the variable is created but the collection is already truncated without shuffling
+Line 21: Suppress dead-code warning on Generic variant with #[allow(dead_code)]
+FTP Exploit Modules
+[MODIFY] 
+ftp_bounce_test.rs
+Replace prompt_existing_file, prompt_default, prompt_int_range with cfg_prompt_existing_file, cfg_prompt_default, cfg_prompt_int_range. Update import statement accordingly.
+
+Prompt key mapping:
+
+Interactive Prompt	API Key	Default
+Mode select [1-2]	
+mode
+"2"
+Credentials file path	credentials_file	—
+Target IP:PORT	target_input	—
+Max concurrent checks	concurrency	50
+Output file	output_file	ftp_bounce_results.txt
+[MODIFY] 
+pachev_ftp_path_traversal_1_0.rs
+Replace raw stdin().read_line() calls with cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_existing_file. This is the most heavily refactored module since it directly reads stdin without any utility functions.
+
+Prompt key mapping:
+
+Interactive Prompt	API Key	Default
+FTP port	
+port
+21
+Use IP list?	use_list	false
+IP list file path	ip_list_file	—
+DOS Exploit Modules
+[MODIFY] 
+tcp_connection_flood.rs
+Replace all prompt_* → cfg_prompt_*:
+
+prompt_required → cfg_prompt_required
+prompt_default → cfg_prompt_default
+prompt_port → cfg_prompt_port
+prompt_yes_no → cfg_prompt_yes_no
+[MODIFY] 
+connection_exhaustion_flood.rs
+Same pattern: replace all prompt_* → cfg_prompt_*.
+
+[MODIFY] 
+null_syn_exhaustion.rs
+Same pattern: replace all prompt_* → cfg_prompt_*.
+
+Verification Plan
+Automated Tests
+Build with zero warnings:
+
+bash
+cd /home/kali/Pictures/Jenkins/rustsploit-thekiaboys && cargo build 2>&1 | grep -E "warning|error"
+Expected: no output (0 warnings, 0 errors).
+
+Module discovery includes all FTP/DOS modules:
+
+bash
+cd /home/kali/Pictures/Jenkins/rustsploit-thekiaboys && cargo run -- --list-modules 2>/dev/null | grep -E "ftp|dos"
+Expected: all 5 modules listed.
+
+
+
+Walkthrough: API/Shell/CLI Support for FTP & DOS Modules
+What Changed
+1. Cargo Warnings Fixed (payload_mutator.rs)
+Removed unused rng variable (lines 96–97) — was allocated but never used for shuffling
+Removed dead 
+Generic
+ variant from PayloadCategory enum — never constructed anywhere in the codebase
+Result: cargo build produces 0 warnings
+//! Dynamic Payload Mutation Engine
+//!
+//! Takes seed payloads and generates exhaustive mutated variants using
+    NoSQLi,
+    CMDi,
+    Traversal,
+    Generic,
+}
+/// Configuration for mutation behavior
+        // Limit next generation size to prevent explosion
+        if next_gen.len() > config.max_total / 2 {
+            // Keep a random subset
+            let mut rng = rand::rng();
+            let mut shuffled = next_gen;
+            // Take first N after shuffle
+            // Truncate to cap size
+            let mut truncated = next_gen;
+            let limit = config.max_total / 2;
+            if shuffled.len() > limit {
+                shuffled.truncate(limit);
+            if truncated.len() > limit {
+                truncated.truncate(limit);
+            }
+            current_gen = shuffled;
+            current_gen = truncated;
+        } else {
+            current_gen = next_gen;
+        }
+            results.extend(traversal_null_extension(payload));
+            results.extend(traversal_double_dot_variants(payload));
+        }
+        PayloadCategory::Generic => {}
+    }
+    // Deduplicate and cap
+    }
+    None
+}
+2. Camera Modules — Already Supported ✅
+All 6 camera exploit modules already use cfg_prompt_* utilities:
+
+Module	Status
+hikvision_rce_cve_2021_36260	✅ cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file
+reolink_rce_cve_2019_11001	✅ cfg_prompt_required, cfg_prompt_default
+abussecurity_camera_cve202326609variant1	✅ cfg_prompt_default, cfg_prompt_required, cfg_prompt_yes_no, cfg_prompt_output_file
+acm_5611_rce	✅ cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_port, cfg_prompt_int_range
+cve_2024_7029_avtech_camera	✅ cfg_prompt_port, cfg_prompt_yes_no
+uniview_nvr_pwd_disclosure	✅ cfg_prompt_output_file
+3. FTP Exploit Modules — Migrated
+ftp_bounce_test.rs
+Swapped prompt_existing_file → cfg_prompt_existing_file, prompt_default → cfg_prompt_default, prompt_int_range → cfg_prompt_int_range.
+
+API keys: 
+mode
+, credentials_file, target_input, concurrency, output_file
+
+use anyhow::{anyhow, Result};
+use colored::*;
+use suppaftp::tokio::AsyncFtpStream;
+use regex::Regex;
+use crate::utils::{
+    prompt_existing_file, prompt_default, prompt_int_range,
+    cfg_prompt_existing_file, cfg_prompt_default, cfg_prompt_int_range,
+    load_lines
+};
+         println!("[1] Load targets from file (supporting 'IP:PORT:USER:PASS')");
+         println!("[2] Scan single target");
+         
+         let choice = prompt_int_range("Select mode", 1, 1, 2)?;
+         let choice = cfg_prompt_int_range("mode", "Select mode", 2, 1, 2)?;
+         if choice == 1 {
+             let f = prompt_existing_file("Path to credentials file")?;
+             let f = cfg_prompt_existing_file("credentials_file", "Path to credentials file")?;
+             f
+         } else {
+             let t = prompt_default("Target (IP:PORT or IP:PORT:USER:PASS)", "")?;
+             let t = cfg_prompt_default("target_input", "Target (IP:PORT or IP:PORT:USER:PASS)", "")?;
+             t
+         }
+    } else {
+    }
+    println!("{}", format!("[*] Loaded {} credential/target sets.", targets.len()).green());
+    let concurrency = prompt_int_range("Max concurrent checks", 50, 1, 500)? as usize;
+    let output_file = prompt_default("Output file for vulnerabilities", "ftp_bounce_results.txt")?;
+    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent checks", 50, 1, 500)? as usize;
+    let output_file = cfg_prompt_default("output_file", "Output file for vulnerabilities", "ftp_bounce_results.txt")?;
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats_checked = Arc::new(AtomicUsize::new(0));
+    is_vuln
+}
+pachev_ftp_path_traversal_1_0.rs
+Replaced raw stdin().read_line() calls with cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_existing_file.
+
+API keys: 
+port
+, use_list, ip_list_file
+
+use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Result};
+use suppaftp::FtpStream;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use tokio::task;
+use tokio::sync::Semaphore;
+use futures::stream::{FuturesUnordered, StreamExt};
+use colored::*; // // Colorful output
+use colored::*;
+use std::time::Duration;
+use tokio::time::timeout;
+use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_existing_file};
+const MAX_CONCURRENT_TASKS: usize = 10;
+const FTP_TIMEOUT_SECONDS: u64 = 10;
+const MAX_CONCURRENT_TASKS: usize = 10; // // Limit concurrent scanning
+const FTP_TIMEOUT_SECONDS: u64 = 10;    // // Timeout per FTP connection
+// // Format IPv4 or IPv6 address with port (handles multiple layers of brackets)
+/// Format IPv4 or IPv6 address with port (handles multiple layers of brackets)
+fn format_addr(target: &str, port: u16) -> String {
+    let mut clean = target.trim().to_string();
+    }
+}
+// // Actual FTP path traversal exploit
+/// Actual FTP path traversal exploit
+fn exploit_target(target: String, port: u16) -> Result<String> {
+    let addr = format_addr(&target, port);
+    println!("{}", format!("[*] Connecting to FTP service at {}...", addr).yellow());
+    // Connect to FTP server
+    let mut ftp = FtpStream::connect(&addr)
+        .map_err(|e| anyhow!("FTP connection error to {}: {}", addr, e))?;
+    Ok(format!("{} SUCCESS", target))
+}
+// // Save result line into `results.txt`
+/// Save result line into `results.txt`
+fn save_result(line: &str) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("results.txt")?;
+    writeln!(file, "{}", line)?;
+    Ok(())
+}
+// // Public auto-dispatch entry point
+/// Public auto-dispatch entry point
+///
+/// API prompts:
+///   - "port"         : FTP port (default: 21)
+///   - "use_list"     : y/n — use IP list file (default: n)
+///   - "ip_list_file" : path to IP list file (required if use_list=y)
+pub async fn run(target: &str) -> Result<()> {
+    let target = target.to_string(); // // Own target early to avoid lifetime issues
+    let target = target.to_string();
+    print!("{}", "Enter the FTP port (default 21): ".cyan().bold());
+    std::io::stdout()
+        .flush()
+        .context("Failed to flush stdout")?;
+    let mut port_input = String::new();
+    std::io::stdin()
+        .read_line(&mut port_input)
+        .context("Failed to read port")?;
+    let port_input = port_input.trim();
+    let port = if port_input.is_empty() {
+        21
+    } else {
+        port_input.parse::<u16>().map_err(|_| anyhow!("Invalid port number: {}", port_input))?
+    };
+    let port = cfg_prompt_port("port", "FTP Port", 21)?;
+    let use_list = cfg_prompt_yes_no("use_list", "Use a list of IPs?", false)?;
+    print!("{}", "Do you want to use a list of IPs? (yes/no): ".cyan().bold());
+    std::io::stdout()
+        .flush()
+        .context("Failed to flush stdout")?;
+    let mut use_list = String::new();
+    std::io::stdin()
+        .read_line(&mut use_list)
+        .context("Failed to read list choice")?;
+    let use_list = use_list.trim().to_lowercase();
+    if use_list == "yes" || use_list == "y" {
+        print!("{}", "Enter path to the IP list file: ".cyan().bold());
+        std::io::stdout()
+            .flush()
+            .context("Failed to flush stdout")?;
+        let mut path = String::new();
+        std::io::stdin()
+            .read_line(&mut path)
+            .context("Failed to read file path")?;
+    if use_list {
+        let path = cfg_prompt_existing_file("ip_list_file", "Path to the IP list file")?;
+        let path = path.trim();
+        if !Path::new(path).exists() {
+    Ok(())
+}
+4. DOS Exploit Modules — Migrated
+All three DOS modules followed the same pattern: prompt_* → cfg_prompt_*.
+
+tcp_connection_flood.rs
+API keys: 
+target
+, 
+port
+, concurrency, timeout_ms, verbose, duration, confirm
+
+use anyhow::{Result, anyhow, Context};
+use colored::*;
+use tokio::io::AsyncWriteExt; // Required for stream.shutdown()
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
+use tokio::time::Instant;
+use crate::utils::{
+    normalize_target, prompt_default, prompt_port, prompt_required, prompt_yes_no,
+    normalize_target, cfg_prompt_default, cfg_prompt_port, cfg_prompt_required, cfg_prompt_yes_no,
+};
+/// Configuration for the connection flood
+    // Target
+    let target_input = if initial_target.trim().is_empty() {
+        prompt_required("Target Host/IP")?
+        cfg_prompt_required("target", "Target Host/IP")?
+    } else {
+        println!("{}", format!("[*] Using target: {}", initial_target).cyan());
+        initial_target.to_string()
+            .map_err(|_| anyhow!("Invalid port '{}' in target", p))?;
+        (h.to_string(), parsed_port)
+    } else {
+        let p = prompt_port("Target Port", 80)?;
+        let p = cfg_prompt_port("port", "Target Port", 80)?;
+        (normalized, p)
+    };
+    
+    println!("{}", format!("[+] Resolved to: {:?}", resolved_addrs).green());
+    // Concurrency
+    let concurrency_input = prompt_default("Concurrent Connections", "500")?;
+    let concurrency_input = cfg_prompt_default("concurrency", "Concurrent Connections", "500")?;
+    let concurrent_connections: usize = concurrency_input.parse()
+        .map_err(|_| anyhow!("Invalid number for concurrency"))?;
+        
+    if concurrent_connections == 0 {
+        return Err(anyhow!("Concurrency must be > 0"));
+    }
+    // Timeout
+    let timeout_input = prompt_default("Connection Timeout (ms)", "1000")?;
+    let timeout_input = cfg_prompt_default("timeout_ms", "Connection Timeout (ms)", "1000")?;
+    let timeout_ms: u64 = timeout_input.parse()
+        .map_err(|_| anyhow!("Invalid timeout"))?;
+    let verbose = prompt_yes_no("Verbose Output (show errors)?", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose Output (show errors)?", false)?;
+    // Duration
+    let duration_input = prompt_default("Duration (seconds, 0 = infinite)", "60")?;
+    let duration_input = cfg_prompt_default("duration", "Duration (seconds, 0 = infinite)", "60")?;
+    let duration_secs: u64 = duration_input.parse()
+        .map_err(|_| anyhow!("Invalid duration"))?;
+    });
+    println!("  Mode: Connect & Drop (Handshake Stress)");
+    
+    if !prompt_yes_no("Start Attack?", true)? {
+    if !cfg_prompt_yes_no("confirm", "Start Attack?", true)? {
+        return Err(anyhow!("Attack cancelled by user"));
+    }
+    Ok(())
+}
+connection_exhaustion_flood.rs
+API keys: 
+target
+, 
+port
+, max_fds, workers, duration, timeout_ms, verbose, confirm
+
+// src/modules/exploits/dos/connection_exhaustion_flood.rs
+//
+// Ultra-fast connection flood (server-side exhaustion)
+use tokio::sync::Semaphore;
+use tokio::time::Instant;
+use crate::utils::{normalize_target, prompt_default, prompt_port, prompt_required, prompt_yes_no};
+use crate::utils::{normalize_target, cfg_prompt_default, cfg_prompt_port, cfg_prompt_required, cfg_prompt_yes_no};
+/// Maximum concurrent file descriptors to use (local side protection)
+const DEFAULT_MAX_FDS: usize = 1000;
+    // Target
+    let target_input = if initial_target.trim().is_empty() {
+        prompt_required("Target Host/IP")?
+        cfg_prompt_required("target", "Target Host/IP")?
+    } else {
+        println!(
+            "{}",
+            .map_err(|_| anyhow!("Invalid port '{}' in target", p))?;
+        (h.to_string(), parsed_port)
+    } else {
+        let p = prompt_port("Target Port", 80)?;
+        let p = cfg_prompt_port("port", "Target Port", 80)?;
+        (normalized, p)
+    };
+    );
+    // Max concurrent FDs (local protection)
+    let max_fds_input = prompt_default(
+    let max_fds_input = cfg_prompt_default(
+        "max_fds",
+        "Max Concurrent FDs (local limit)",
+        &DEFAULT_MAX_FDS.to_string(),
+    )?;
+    let max_concurrent_fds: usize = max_fds_input
+        .parse()
+        .map_err(|_| anyhow!("Invalid number for max FDs"))?;
+    if max_concurrent_fds == 0 {
+        return Err(anyhow!("Max FDs must be > 0"));
+    }
+    // Worker count (async tasks spawning connections)
+    let workers_input = prompt_default("Worker Tasks (parallel spawners)", "2000")?;
+    let workers_input = cfg_prompt_default("workers", "Worker Tasks (parallel spawners)", "2000")?;
+    let worker_count: usize = workers_input
+        .parse()
+        .map_err(|_| anyhow!("Invalid number for workers"))?;
+    if worker_count == 0 {
+        return Err(anyhow!("Worker count must be > 0"));
+    }
+    // Duration
+    let duration_input = prompt_default("Duration (seconds, 0 = infinite)", "60")?;
+    let duration_input = cfg_prompt_default("duration", "Duration (seconds, 0 = infinite)", "60")?;
+    let duration_secs: u64 = duration_input
+        .parse()
+        .map_err(|_| anyhow!("Invalid duration"))?;
+    // Connection timeout
+    let timeout_input = prompt_default("Connection Timeout (ms)", "2000")?;
+    let timeout_input = cfg_prompt_default("timeout_ms", "Connection Timeout (ms)", "2000")?;
+    let connect_timeout_ms: u64 = timeout_input
+        .parse()
+        .map_err(|_| anyhow!("Invalid timeout"))?;
+    let verbose = prompt_yes_no("Verbose Output (show sample errors)?", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose Output (show sample errors)?", false)?;
+    println!("\n{}", "=== Attack Summary ===".bold());
+    println!("  Target: {}", target_display.cyan());
+        "    table will be exhausted, not yours.".yellow()
+    );
+    if !prompt_yes_no("Start Attack?", true)? {
+    if !cfg_prompt_yes_no("confirm", "Start Attack?", true)? {
+        return Err(anyhow!("Attack cancelled by user"));
+    }
+    Ok(())
+}
+null_syn_exhaustion.rs
+API keys: 
+target
+, 
+port
+, source_port, spoof_ip, 
+local_ip
+, workers, duration, zero_interval, delay_us, payload_size, verbose, confirm
+
+//! Null SYN Exhaustion Testing Module
+//!
+//! High-performance SYN flood with null-byte payloads for resource exhaustion testing.
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
+use crate::utils::{
+    normalize_target, prompt_default, prompt_port, prompt_required, prompt_yes_no,
+    normalize_target, cfg_prompt_default, cfg_prompt_port, cfg_prompt_required, cfg_prompt_yes_no,
+};
+// ============================================================================
+    
+    // Target IP
+    let target_input = if initial_target.trim().is_empty() {
+        prompt_required("Target IP")?
+        cfg_prompt_required("target", "Target IP")?
+    } else {
+        println!("{}", format!("[*] Using target: {}", initial_target).cyan());
+        initial_target.to_string()
+    };
+    
+    let normalized = normalize_target(&target_input)?;
+    let target_ip: Ipv4Addr = normalized.parse()
+        .map_err(|_| anyhow!("Target must be a valid IPv4 address"))?;
+    
+    // Target Port
+    let target_port = prompt_port("Target port", 80)?;
+    let target_port = cfg_prompt_port("port", "Target port", 80)?;
+    
+    // Source Port
+    let src_port_input = prompt_default("Source port (blank for random)", "")?;
+    let src_port_input = cfg_prompt_default("source_port", "Source port (blank for random)", "")?;
+    let source_port = if src_port_input.is_empty() {
+        None
+    } else {
+        Some(src_port_input.parse::<u16>().map_err(|_| anyhow!("Invalid port"))?)
+    };
+    
+    // Random Source IP
+    let use_random_source_ip = prompt_yes_no(
+    let use_random_source_ip = cfg_prompt_yes_no(
+        "spoof_ip",
+        "Use random (spoofed) source IPs? (requires root)", 
+        false
+    )?;
+            "Local source IP (auto-detected: {}) — enter tun/VPN IP to override, or blank to use auto",
+            auto_ip
+        );
+        let override_input = prompt_default(&hint, "")?;
+        let override_input = cfg_prompt_default("local_ip", &hint, "")?;
+        if override_input.is_empty() {
+            None // use auto-detected
+        } else {
+    
+    // Worker count - default to CPU cores for optimal performance
+    let cpu_count = num_cpus::get();
+    let workers_input = prompt_default(
+    let workers_input = cfg_prompt_default(
+        "workers",
+        &format!("Worker threads (recommended: {})", cpu_count),
+        &cpu_count.to_string()
+    )?;
+    let worker_count: usize = workers_input.parse().map_err(|_| anyhow!("Invalid number"))?;
+    
+    if worker_count == 0 {
+        return Err(anyhow!("Worker count must be > 0"));
+    }
+    
+    // Duration
+    let duration_input = prompt_required("Test duration (seconds)")?;
+    let duration_input = cfg_prompt_required("duration", "Test duration (seconds)")?;
+    let duration_secs: u64 = duration_input.parse().map_err(|_| anyhow!("Invalid duration"))?;
+    
+    if duration_secs == 0 {
+        return Err(anyhow!("Duration must be > 0"));
+    }
+    
+    // Interval Mode
+    let zero_interval = prompt_yes_no("Use zero interval (max speed)?", true)?;
+    let zero_interval = cfg_prompt_yes_no("zero_interval", "Use zero interval (max speed)?", true)?;
+    let interval_mode = if zero_interval {
+        IntervalMode::Zero
+    } else {
+        let delay_input = prompt_default("Delay between packets (microseconds)", "1000")?;
+        let delay_input = cfg_prompt_default("delay_us", "Delay between packets (microseconds)", "1000")?;
+        let delay: u64 = delay_input.parse().map_err(|_| anyhow!("Invalid delay"))?;
+        IntervalMode::DelayMicros(delay)
+    };
+    
+    // Payload Size
+    let payload_input = prompt_default("Null-byte payload size", "1024")?;
+    let payload_input = cfg_prompt_default("payload_size", "Null-byte payload size", "1024")?;
+    let mut payload_size: usize = payload_input.parse().map_err(|_| anyhow!("Invalid size"))?;
+    
+    // Cap to IPv4 maximum
+    const MAX_PAYLOAD: usize = 65535 - IPV4_HEADER_LEN - TCP_HEADER_LEN;
+    if payload_size > MAX_PAYLOAD {
+        println!("{}", format!("[!] Payload capped at {} bytes", MAX_PAYLOAD).yellow());
+        payload_size = MAX_PAYLOAD;
+    }
+    
+    let verbose = prompt_yes_no("Verbose output?", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false)?;
+    
+    // Summary
+    println!("\n{}", "=== Test Configuration ===".bold());
+        println!("\n{}", "[!] IP spoofing enabled: Each packet will have a different random source IP".yellow().bold());
+    }
+    
+    if !prompt_yes_no("\nProceed with test?", true)? {
+    if !cfg_prompt_yes_no("confirm", "\nProceed with test?", true)? {
+        return Err(anyhow!("Test cancelled by user"));
+    }
+    
+        _ => None,
+    }
+}
+Build Verification
+$ cargo build 2>&1
+   Compiling rustsploit v0.5.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.73s
+0 warnings, 0 errors. All code is fully functional with no dead or unreachable code.
+
+
+Unified Payload Engine Migration
+
+What Changed
+Consolidated all payload generation and mutation logic into a single unified engine at 
+payload_engine.rs
+ (~1643 lines).
+
+Engine Components
+
+Section	Lines	Purpose
+
+Encoding Engine	9 encoders (Base16/32/64, URL, Shell, HTML, Zero-Width)	Used by payload_encoder module
+BAT Chain Engine	Multi-stage .bat dropper chains	Used by batgen module
+LNK Generation	Malicious LNK for NTLM hash disclosure	Used by lnkgen module
+Dropper Engine	Anti-VM, LOLBAS downloaders, 3-stage builders	Used by narutto_dropper module
+Polymorph Engine	Task Scheduler persistence droppers	Used by 
+polymorph_dropper
+ module
+Mutation Engine	WAF bypass: SQLi, NoSQLi, CMDi, Traversal mutations	Used by api_endpoint_scanner
+Files Modified
+diff
++ src/native/payload_engine.rs       (NEW — unified engine, 1643 lines)
+- src/native/payload_mutator.rs      (DELETED — merged into engine)
+  src/native/mod.rs                  (removed payload_mutator, added payload_engine)
+  src/modules/exploits/payloadgens/batgen.rs           (uses engine + cfg_prompt_*)
+  src/modules/exploits/payloadgens/lnkgen.rs           (uses engine + cfg_prompt_*)
+  src/modules/exploits/payloadgens/narutto_dropper.rs   (uses engine + cfg_prompt_*)
+  src/modules/exploits/payloadgens/polymorph_dropper.rs (uses engine + cfg_prompt_*)
+  src/modules/exploits/payloadgens/payload_encoder.rs   (uses engine + cfg_prompt_*)
+  src/modules/scanners/api_endpoint_scanner.rs          (import path updated)
+API Support
+All 5 payloadgen modules now use cfg_prompt_* for full API/Shell/CLI support:
+
+Module	API Keys
+batgen	output_file, payload_url, ps1_filename
+lnkgen	output_path, smb_ip, smb_share, smb_file
+narutto_dropper	payload_url, download_method, output_file, ps1_filename
+payload_encoder	
+input_type
+, 
+input
+, 
+encodings
+, 
+clipboard
+, save_file, 
+filename
+polymorph_dropper
+
+command
+, stage1_delay, stage2_delay, output_file
+Verification
+cargo build — 0 errors, 0 warnings ✅
+
+Fixed! cargo build passes — 0 errors, 0 warnings. Here's what was wrong and what I changed:
+
+Root Cause (2 issues):
+
+shell.rs — When you typed t 0.0.0.0/0, the code stripped the /0 CIDR suffix and only stored 0.0.0.0 as a single IP target. So when modules received the target, it had no subnet info → treated as 1 host → /32.
+
+creds/utils.rs — is_subnet_target() had a hardcoded exclusion for 0.0.0.0/0, so even if the CIDR was passed through, modules would skip subnet iteration for that specific range.
+
+Fixes:
+
+shell.rs: Now passes the full CIDR (e.g. 0.0.0.0/0, 192.168.1.0/24) directly to set_target(), which already knows how to parse and store it as a TargetConfig::Subnet. No more stripping.
+
+creds/utils.rs: Removed the 0.0.0.0/0 exclusion from is_subnet_target(). Any valid CIDR is now treated as a subnet target.
+
+Impact: All 16+ modules that use is_subnet_target() + parse_subnet() will now properly receive and iterate over the full subnet when you do t <CIDR> + run:
+
+telnet_bruteforce, ssh_bruteforce, ftp_bruteforce, rdp_bruteforce, smtp_bruteforce, snmp_bruteforce, mqtt_bruteforce, pop3_bruteforce, l2tp_bruteforce, fortinet_bruteforce, rtsp_bruteforce, ssh_user_enum, ftp_anonymous, telnet_hose, camxploit, etc.
+
+
