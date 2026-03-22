@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines};
-use crate::native::payload_mutator::{self, PayloadCategory, MutatorConfig};
+use crate::native::payload_engine::{self as payload_mutator, PayloadCategory, MutatorConfig};
 use serde_json::json;
 
 // =========================================================================

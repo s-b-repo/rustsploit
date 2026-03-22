@@ -192,23 +192,19 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
 
                             match sanitize_target(raw_value) {
                                 Ok(valid_target) => {
-                                    // If user provides CIDR (e.g. 192.168.81.1/24), extract just the IP.
-                                    // "set target" always targets a SINGLE IP.
-                                    // Use "set subnet" / "sn" to scan an entire subnet.
-                                    let (ip_only, subnet_note) = if valid_target.contains('/') {
-                                        let ip_part = valid_target.split('/').next().unwrap_or(&valid_target).to_string();
-                                        let prefix = valid_target.split('/').nth(1).unwrap_or("");
-                                        (ip_part, Some(format!("/{}", prefix)))
-                                    } else {
-                                        (valid_target.clone(), None)
-                                    };
+                                    // Pass the full target (including CIDR) to set_target.
+                                    // set_target() detects CIDR and stores as Subnet automatically.
+                                    // This allows modules to receive the full CIDR and iterate hosts.
+                                    let display_target = valid_target.clone();
 
-                                    match config::GLOBAL_CONFIG.set_target(&ip_only) {
+                                    match config::GLOBAL_CONFIG.set_target(&valid_target) {
                                         Ok(_) => {
-                                            if let Some(ref sn) = subnet_note {
-                                                println!("{}", format!("Target set to: {} (subnet context: {})", ip_only, sn).green());
+                                            if valid_target.contains('/') {
+                                                let ip_part = valid_target.split('/').next().unwrap_or(&valid_target);
+                                                let prefix = valid_target.split('/').nth(1).unwrap_or("");
+                                                println!("{}", format!("Target set to: {} (subnet: /{})", ip_part, prefix).green());
                                             } else {
-                                                println!("{}", format!("Target set to: {}", ip_only).green());
+                                                println!("{}", format!("Target set to: {}", display_target).green());
                                             }
                                         }
                                         Err(e) => {
