@@ -11,7 +11,7 @@ Rustsploit is a modular offensive tooling framework for embedded targets, writte
 **Debian / Ubuntu / Kali:**
 ```bash
 sudo apt update
-sudo apt install pkg-config libssl-dev rustc libdbus-1-dev freerdp2-x11
+sudo apt install pkg-config libssl-dev rustc libdbus-1-dev 
 ```
 
 **Arch Linux:**
