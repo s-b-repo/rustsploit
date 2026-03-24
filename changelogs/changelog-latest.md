@@ -13710,4 +13710,91 @@ Impact: All 16+ modules that use is_subnet_target() + parse_subnet() will now pr
 
 telnet_bruteforce, ssh_bruteforce, ftp_bruteforce, rdp_bruteforce, smtp_bruteforce, snmp_bruteforce, mqtt_bruteforce, pop3_bruteforce, l2tp_bruteforce, fortinet_bruteforce, rtsp_bruteforce, ssh_user_enum, ftp_anonymous, telnet_hose, camxploit, etc.
 
+Walkthrough: API Support for Network Exploits
+Summary
+Added API/CLI/Shell support to 19 exploit files across 
+network_infra/
+, 
+routers/
+, and 
+telnet/
+ directories. All modules now work via API (/api/run), CLI (--module), and shell (
+run
+).
 
+Pattern
+Replaced interactive-only prompt functions with cfg_prompt_* equivalents:
+
+Old	New	Notes
+prompt_required(msg)
+cfg_prompt_required(key, msg)
+Required field
+prompt_default(msg, def)
+cfg_prompt_default(key, msg, def)
+With default
+prompt_port(msg, def)
+cfg_prompt_port(key, msg, def)
+Port number
+prompt_yes_no(msg, def)
+cfg_prompt_yes_no(key, msg, def)
+Boolean
+prompt_int_range(...)
+cfg_prompt_int_range(...)
+Integer range
+Raw stdin reads	Various cfg_prompt_*	Direct I/O replaced
+Local 
+prompt()
+ helpers	
+cfg_prompt_required
+Removed dead code
+Files Modified
+Network Infra (16 files)
+Fortinet: 
+fortios_auth_bypass
+, 
+fortios_ssl_vpn
+, 
+fortiweb_rce
+, 
+fortisiem_rce
+, 
+fortiweb_sqli_rce
+, 
+forticloud_sso
+
+Ivanti: 
+ivanti_epmm
+ (ivanti_connect_secure skipped — no prompts)
+
+QNAP: 
+qnap_qts_rce
+
+Trend Micro: 
+cve_2025_5777
+, 
+cve_2025_69258
+, 
+cve_2025_69259
+, 
+cve_2025_69260
+
+VMware: 
+esxi_vm_escape
+, 
+vcenter_backup_rce
+, 
+vcenter_file_read
+, 
+esxi_vsock_client
+
+Routers (2 files)
+ruijie_rsr_router
+, 
+ubiquiti_edgerouter
+
+Telnet (1 file)
+telnet_auth_bypass
+ (telnet_bruteforce.rs and telnet_hose.rs already API-compatible)
+
+ 
+converted more modules to api support so tired gang

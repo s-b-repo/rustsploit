@@ -25,6 +25,9 @@ Welcome to the Rustsploit documentation hub. Use the links below to navigate to 
 | [Changelog](Changelog.md) | Release notes and version history |
 | [Contributing](Contributing.md) | Fork guide, PR checklist, code style |
 | [Credits](Credits.md) | Authors, acknowledgements, legal notice |
+| [Future Features](Future-Features.md) | Roadmap: Plugins, Config Loading, Source Port modifications |
+| [About Me](About-Me.md) | Information about the author |
+| [Donation](Donation.md) | Ways to support the project |
 
 ---
 
