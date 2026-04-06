@@ -19,9 +19,9 @@ pub struct Cli {
     #[arg(long)]
     pub api: bool,
 
-    /// API key for authentication (required when --api is used)
+    /// Path to PQ authorized keys file (default: ~/.rustsploit/pq_authorized_keys)
     #[arg(long, requires = "api")]
-    pub api_key: Option<String>,
+    pub pq_authorized_keys: Option<String>,
 
     /// Network interface to bind API server to (default: 127.0.0.1)
     #[arg(long, requires = "api", default_value = "127.0.0.1")]
@@ -42,4 +42,16 @@ pub struct Cli {
     /// Output format (text, json)
     #[arg(long, default_value = "text")]
     pub output_format: Option<String>,
+
+    /// Execute a resource script file on startup
+    #[arg(short = 'r', long = "resource")]
+    pub resource: Option<String>,
+
+    /// Path to PQ host key file (default: ~/.rustsploit/pq_host_key)
+    #[arg(long, requires = "api")]
+    pub pq_host_key: Option<String>,
+
+    /// Launch MCP (Model Context Protocol) server over stdio
+    #[arg(long)]
+    pub mcp: bool,
 }

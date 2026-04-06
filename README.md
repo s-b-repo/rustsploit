@@ -34,11 +34,21 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 ## Highlights
 
 -  **Auto-discovered modules:** `build.rs` indexes `src/modules/**` — drop in new code, no manual registration needed
--  **Interactive shell:** Color prompts, shortcuts (`help/?`, `modules/m`, `run/go`), command chaining with `&`
+-  **Interactive shell:** 40+ commands with shortcuts, command chaining (`&`), tab completion, and command history
+-  **Module metadata:** Optional `info()` and `check()` functions per module — CVE references, author, rank, non-destructive vulnerability verification
+-  **Global options (`setg`):** Persistent key-value settings that apply across all modules — like Metasploit's datastore
+-  **Credential store:** Track discovered credentials across sessions with `creds` commands and JSON persistence
+-  **Host/service tracking:** Workspace-based engagement tracking with `hosts`, `services`, `notes` commands
+-  **Loot management:** Structured evidence collection with file storage and metadata indexing
+-  **Resource scripts:** Automate workflows from files, auto-load startup scripts, save command history with `makerc`
+-  **Background jobs:** Run modules asynchronously with `run -j`, manage with `jobs` commands
+-  **Export/reporting:** Export all engagement data to JSON, CSV, or human-readable summary reports
+-  **Console logging:** `spool` command captures all output to file for documentation
 -  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, MQTT, Fortinet — with IPv6 and TLS support
 -  **Exploit coverage:** CVEs for GNU inetutils-telnetd, Apache Tomcat, TP-Link, Ivanti, Zabbix, OpenSSH, Jenkins, PAN-OS, Heartbleed, and more
 -  **Scanners & utilities:** Port scanner, ping sweep, SSDP, HTTP title grabber, DNS recursion tester, directory bruteforcer, sequential fuzzer
--  **REST API server:** Authentication, rate limiting, IP tracking, dynamic key rotation, hardening mode
+-  **REST API server:** 30+ endpoints — authentication, rate limiting, IP tracking, full CRUD for credentials, hosts, services, loot, jobs
+-  **Plugin system:** Third-party modules via `src/modules/plugins/` with build-time discovery and startup safety warnings
 -  **Security hardened:** Input validation, path traversal protection, honeypot detection, memory-safe operations
 -  **IPv4/IPv6 ready:** Both address families work out-of-the-box across all modules
 

@@ -9,12 +9,10 @@ Rustsploit implements defence-in-depth throughout the codebase. All contributors
 | File | Constant | Value | Purpose |
 |------|----------|-------|---------|
 | `shell.rs` | `MAX_INPUT_LENGTH` | 4096 | Maximum shell input length |
-| `shell.rs` | `MAX_TARGET_LENGTH` | 512 | Maximum target string length |
+| `sanitize.rs` | `MAX_TARGET_LENGTH` | 2048 | Maximum target string length |
 | `shell.rs` | `MAX_URL_LENGTH` | 2048 | Maximum URL length |
 | `shell.rs` | `MAX_PATH_LENGTH` | 4096 | Maximum file path length |
-| `shell.rs` | `MAX_PROXY_LIST_SIZE` | 10,000 | Maximum proxy entries |
 | `utils.rs` | `MAX_FILE_SIZE` | 10 MB | Maximum file size to read |
-| `utils.rs` | `MAX_PROXIES` | 100,000 | Maximum proxies to process |
 | `config.rs` | `MAX_HOSTNAME_LENGTH` | 253 | DNS hostname limit |
 | `api.rs` | `MAX_REQUEST_BODY_SIZE` | 1 MB | API request body limit |
 | `api.rs` | `MAX_TRACKED_IPS` | 100,000 | IP tracker limit |
@@ -31,14 +29,22 @@ if input.len() > MAX_INPUT_LENGTH {
 }
 ```
 
-### 2. Control Character Rejection
+### 2. Input Sanitization
 
-Only null bytes (`\0`) are stripped — other control characters pass through as literal text to preserve payload compatibility (e.g., ANSI escapes for exploit payloads):
+The `sanitize_string_input()` function performs multiple layers of cleaning:
+
+1. **Null byte removal** -- inputs containing `\0` are rejected outright
+2. **Control character filtering** -- all control characters (except `\t`) are stripped from the input
+3. **Length enforcement** -- inputs exceeding `MAX_COMMAND_LENGTH` are rejected
 
 ```rust
-// Strip only null bytes — all other characters are passed as literal text
-let sanitized = input.replace('\0', "");
+// Reject null bytes, then filter control characters (except tab)
+let sanitized: String = input.chars()
+    .filter(|c| !c.is_control() || *c == '\t')
+    .collect();
 ```
+
+For command-specific validation (`validate_command_input`), null bytes are stripped and length is enforced against `MAX_COMMAND_LENGTH`.
 
 If suspicious patterns (`bash`, `sudo`, `../`) are detected, a warning is printed but the string is still returned unmodified:
 
@@ -156,3 +162,21 @@ Standard across mass-scan capable modules (e.g., `camxploit`, `telnet_hose`, `te
 | Public DNS | 1.1.1.1, 8.8.8.8, etc. |
 
 Uses the `ipnetwork` crate for proper CIDR matching.
+
+---
+
+## Persistent Storage Security
+
+All persistent data uses atomic write-to-temp-then-rename to prevent corruption:
+
+| File | Purpose | Sensitivity |
+|------|---------|-------------|
+| `~/.rustsploit/global_options.json` | Global options (setg) | Low — user preferences |
+| `~/.rustsploit/creds.json` | Discovered credentials | **High — contains passwords/hashes** |
+| `~/.rustsploit/workspaces/<name>.json` | Hosts, services, notes | Medium — engagement data |
+| `~/.rustsploit/loot_index.json` | Loot metadata | Medium |
+| `~/.rustsploit/loot/` | Loot files | **High — may contain sensitive data** |
+| `~/.rustsploit/results/` | Module output files | Medium |
+| `~/.rustsploit/history.txt` | Shell command history | Medium |
+
+**Important:** The `creds.json` and `loot/` files may contain sensitive data. Protect `~/.rustsploit/` with appropriate file permissions (e.g., `chmod 700`).

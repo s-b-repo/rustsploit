@@ -10,8 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use crate::utils::{
-    cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, normalize_target, cfg_prompt_existing_file
+    cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, normalize_target, cfg_prompt_existing_file,
+    safe_read_to_string, url_encode,
 };
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use base64::{Engine as _, engine::general_purpose};
 use rand::seq::IndexedRandom;
 
@@ -88,13 +90,15 @@ fn get_charset(config: &SequentialFuzzerConfig) -> Vec<char> {
 fn encode_payload(input: &str, encoding: EncodingType) -> String {
     match encoding {
         EncodingType::None => input.to_string(),
-        EncodingType::Url => urlencoding::encode(input).to_string(),
-        EncodingType::DoubleUrl => urlencoding::encode(&urlencoding::encode(input).to_string()).to_string(),
+        EncodingType::Url => url_encode(input).to_string(),
+        EncodingType::DoubleUrl => url_encode(&url_encode(input).to_string()).to_string(),
         EncodingType::Hex => {
-            input.chars().map(|c| format!("\\x{:02X}", c as u8)).collect()
+            // Encode each byte of the UTF-8 representation
+            input.as_bytes().iter().map(|b| format!("\\x{:02X}", b)).collect()
         },
         EncodingType::Unicode => {
-            input.chars().map(|c| format!("\\u00{:02X}", c as u8)).collect()
+            // Use actual Unicode code points for proper encoding
+            input.chars().map(|c| format!("\\u{:04X}", c as u32)).collect()
         },
         EncodingType::HtmlEntity => {
              input.chars().map(|c| {
@@ -109,22 +113,23 @@ fn encode_payload(input: &str, encoding: EncodingType) -> String {
              }).collect()
         },
         EncodingType::Decimal => {
-             input.chars().map(|c| format!("&#{};", c as u8)).collect()
+             // Use Unicode code point for proper decimal encoding
+             input.chars().map(|c| format!("&#{};", c as u32)).collect()
         },
         EncodingType::Octal => {
-             input.chars().map(|c| format!("\\{:03o}", c as u8)).collect()
+             input.as_bytes().iter().map(|b| format!("\\{:03o}", b)).collect()
         },
         EncodingType::Base64 => {
              general_purpose::STANDARD.encode(input)
         },
         EncodingType::Mixed => {
-             // Randomly apply an encoding per character (simplified: raw or url or hex)
+             // Randomly apply an encoding per byte (simplified: raw or url or hex)
              let mut rng = rand::rng();
-             input.chars().map(|c| {
+             input.as_bytes().iter().map(|b| {
                  match [0, 1, 2].choose(&mut rng).unwrap_or(&0) {
-                     0 => c.to_string(),
-                     1 => format!("%{:02X}", c as u8),
-                     _ => format!("\\x{:02X}", c as u8),
+                     0 => String::from(*b as char),
+                     1 => format!("%{:02X}", b),
+                     _ => format!("\\x{:02X}", b),
                  }
              }).collect()
         }
@@ -134,29 +139,48 @@ fn encode_payload(input: &str, encoding: EncodingType) -> String {
 // --- Main Entry ---
 
 pub async fn run(target: &str) -> Result<()> {
+    if is_mass_scan_target(target) {
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "HTTP-Fuzzer",
+            default_port: 80,
+            state_file: "sequential_fuzzer_mass_state.log",
+            default_output: "sequential_fuzzer_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    Some(format!("[{}] {}:{} HTTP-Fuzzer open\n", ts, ip, port))
+                } else {
+                    None
+                }
+            }
+        }).await;
+    }
+
     print_banner();
 
     // Menu
-    println!("{}", "Select Operation Mode:".cyan().bold());
-    println!("1. Quick Attack (All ASCII, No Encoding)");
-    println!("2. Create Template (Wizard -> Save)");
-    println!("3. Load Template (Load -> Run)");
-    println!("4. Custom Attack (Wizard -> Run)");
+    crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
+    crate::mprintln!("1. Quick Attack (All ASCII, No Encoding)");
+    crate::mprintln!("2. Create Template (Wizard -> Save)");
+    crate::mprintln!("3. Load Template (Load -> Run)");
+    crate::mprintln!("4. Custom Attack (Wizard -> Run)");
     
-    let choice = cfg_prompt_default("mode", "Selection", "1")?;
+    let choice = cfg_prompt_default("mode", "Selection", "1").await?;
     
     let config = match choice.as_str() {
         "1" => setup_quick_attack(target).await?,
         "2" => {
             let cfg = setup_wizard(target).await?;
             save_template(&cfg).await?;
-            println!("\n{}", "Template saved. Exiting module.".green());
+            crate::mprintln!("\n{}", "Template saved. Exiting module.".green());
             return Ok(());
         },
         "3" => load_template().await?,
         "4" => setup_wizard(target).await?,
         _ => {
-            println!("{}", "Invalid selection. Defaulting to Quick Attack.".yellow());
+            crate::mprintln!("{}", "Invalid selection. Defaulting to Quick Attack.".yellow());
             setup_quick_attack(target).await?
         }
     };
@@ -165,26 +189,26 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan());
-    println!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red());
-    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan());
+    crate::mprintln!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red());
+    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
 }
 
 // --- Setup ---
 
 async fn setup_quick_attack(initial_target: &str) -> Result<SequentialFuzzerConfig> {
-    println!("\n{}", "--- Quick Attack Setup ---".blue().bold());
+    crate::mprintln!("\n{}", "--- Quick Attack Setup ---".blue().bold());
     let url = parse_target_interactive(initial_target).await?;
     
     // Forced Input for Reliability
-    let min_len_str = cfg_prompt_required("min_length", "Min Sequence Length (e.g. 1)")?;
+    let min_len_str = cfg_prompt_required("min_length", "Min Sequence Length (e.g. 1)").await?;
     let min_len: usize = min_len_str.parse().unwrap_or(1);
     
-    let max_len_str = cfg_prompt_required("max_length", "Max Sequence Length (e.g. 3)")?;
+    let max_len_str = cfg_prompt_required("max_length", "Max Sequence Length (e.g. 3)").await?;
     let max_len: usize = max_len_str.parse().unwrap_or(3);
     
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose Mode? (Print all 403s)", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose Mode? (Print all 403s)", false).await?;
 
     Ok(SequentialFuzzerConfig {
         target_url: url,
@@ -199,54 +223,54 @@ async fn setup_quick_attack(initial_target: &str) -> Result<SequentialFuzzerConf
 }
 
 async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
-    println!("\n{}", "--- Configuration Wizard ---".blue().bold());
+    crate::mprintln!("\n{}", "--- Configuration Wizard ---".blue().bold());
     
     // 1. Target
     let url = parse_target_interactive(initial_target).await?;
     
     // 2. Charset
-    println!("\n{}", "Select Charset:".cyan());
-    println!("1. SQL Injection ({})", CHARSET_SQL);
-    println!("2. Path Traversal ({})", CHARSET_TRAVERSAL);
-    println!("3. Command Injection ({})", CHARSET_CMD);
-    println!("4. All Printable ASCII (Standard Brute)");
-    println!("5. Custom");
+    crate::mprintln!("\n{}", "Select Charset:".cyan());
+    crate::mprintln!("1. SQL Injection ({})", CHARSET_SQL);
+    crate::mprintln!("2. Path Traversal ({})", CHARSET_TRAVERSAL);
+    crate::mprintln!("3. Command Injection ({})", CHARSET_CMD);
+    crate::mprintln!("4. All Printable ASCII (Standard Brute)");
+    crate::mprintln!("5. Custom");
     
-    let c_mode_str = cfg_prompt_required("charset", "Charset Selection (1-5)")?;
+    let c_mode_str = cfg_prompt_required("charset", "Charset Selection (1-5)").await?;
     let c_mode: u8 = c_mode_str.parse().unwrap_or(4);
 
     let custom = if c_mode == 5 {
-        Some(cfg_prompt_required("custom_charset", "Custom Charset String")?)
+        Some(cfg_prompt_required("custom_charset", "Custom Charset String").await?)
     } else {
         None
     };
     
     // 3. Lengths
     // Using cfg_prompt_required to prevent skipping issues with buffered inputs
-    let min_len_str = cfg_prompt_required("min_length", "Min Sequence Length (e.g. 1)")?;
+    let min_len_str = cfg_prompt_required("min_length", "Min Sequence Length (e.g. 1)").await?;
     let min_len: usize = min_len_str.parse().unwrap_or(1);
     
-    let max_len_str = cfg_prompt_required("max_length", "Max Sequence Length (e.g. 3)")?;
+    let max_len_str = cfg_prompt_required("max_length", "Max Sequence Length (e.g. 3)").await?;
     let max_len: usize = max_len_str.parse().unwrap_or(3);
     
     if max_len > 4 && c_mode == 4 {
-        println!("{}", "[!] Warning: Brute forcing printable ASCII > 4 chars will take a VERY long time.".yellow());
+        crate::mprintln!("{}", "[!] Warning: Brute forcing printable ASCII > 4 chars will take a VERY long time.".yellow());
     }
 
     // 4. Encoding
-    println!("\n{}", "Select Encoding (WAF Bypass):".cyan());
-    println!("0. None (Raw)");
-    println!("1. URL Encode (%XX)");
-    println!("2. Double URL Encode (%25XX)");
-    println!("3. Hex Encode (\\xXX)");
-    println!("4. Unicode (\\u00XX)");
-    println!("5. HTML Entity (&quot;)");
-    println!("6. Decimal (&#DDD;)");
-    println!("7. Octal (\\OOO)");
-    println!("8. Base64");
-    println!("9. Mixed/Random");
+    crate::mprintln!("\n{}", "Select Encoding (WAF Bypass):".cyan());
+    crate::mprintln!("0. None (Raw)");
+    crate::mprintln!("1. URL Encode (%XX)");
+    crate::mprintln!("2. Double URL Encode (%25XX)");
+    crate::mprintln!("3. Hex Encode (\\xXX)");
+    crate::mprintln!("4. Unicode (\\u00XX)");
+    crate::mprintln!("5. HTML Entity (&quot;)");
+    crate::mprintln!("6. Decimal (&#DDD;)");
+    crate::mprintln!("7. Octal (\\OOO)");
+    crate::mprintln!("8. Base64");
+    crate::mprintln!("9. Mixed/Random");
     
-    let enc_choice_str = cfg_prompt_required("encoding", "Encoding Selection (0-9)")?;
+    let enc_choice_str = cfg_prompt_required("encoding", "Encoding Selection (0-9)").await?;
     let enc_choice: u8 = enc_choice_str.parse().unwrap_or(0);
 
     let encoding = match enc_choice {
@@ -263,16 +287,16 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     };
     
     // 5. Config
-    let concurrency_str = cfg_prompt_required("concurrency", "Concurrency (Threads)")?;
+    let concurrency_str = cfg_prompt_required("concurrency", "Concurrency (Threads)").await?;
     let concurrency: usize = concurrency_str.parse().unwrap_or(50);
     
-    let cookies = if cfg_prompt_yes_no("add_cookies", "Add Cookies?", false)? {
-        Some(cfg_prompt_required("cookies", "Cookie Header Value")?)
+    let cookies = if cfg_prompt_yes_no("add_cookies", "Add Cookies?", false).await? {
+        Some(cfg_prompt_required("cookies", "Cookie Header Value").await?)
     } else {
         None
     };
     
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose Mode? (Print all 403s)", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose Mode? (Print all 403s)", false).await?;
 
     Ok(SequentialFuzzerConfig {
         target_url: url,
@@ -289,7 +313,7 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
 
 async fn parse_target_interactive(raw: &str) -> Result<String> {
     let base = if raw.is_empty() {
-        normalize_target(&cfg_prompt_required("target_url", "Target URL")?)?
+        normalize_target(&cfg_prompt_required("target_url", "Target URL").await?)?
     } else {
         normalize_target(raw)?
     };
@@ -303,8 +327,8 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
 
     // Ensure trailing slash
     if !url.ends_with('/') {
-        println!("{}", format!("[*] Current Target: {}", url).cyan());
-        if cfg_prompt_yes_no("append_slash", "Target does not end with '/'. Append it?", true)? {
+        crate::mprintln!("{}", format!("[*] Current Target: {}", url).cyan());
+        if cfg_prompt_yes_no("append_slash", "Target does not end with '/'. Append it?", true).await? {
             Ok(format!("{}/", url))
         } else {
             Ok(url)
@@ -317,18 +341,18 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
 // --- Persistence ---
 
 async fn save_template(config: &SequentialFuzzerConfig) -> Result<()> {
-    let name = cfg_prompt_default("template_name", "Template Name", "fuzz_template.json")?;
+    let name = cfg_prompt_default("template_name", "Template Name", "fuzz_template.json").await?;
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&name, json).context("Failed to write template")?;
-    println!("Saved to {}", name);
+    crate::mprintln!("Saved to {}", name);
     Ok(())
 }
 
 async fn load_template() -> Result<SequentialFuzzerConfig> {
-    let path = cfg_prompt_existing_file("template_file", "Template File")?;
-    let content = fs::read_to_string(&path)?;
+    let path = cfg_prompt_existing_file("template_file", "Template File").await?;
+    let content = safe_read_to_string(&path, None)?;
     let config: SequentialFuzzerConfig = serde_json::from_str(&content).context("Invalid JSON")?;
-    println!("{}", "Loaded Config.".green());
+    crate::mprintln!("{}", "Loaded Config.".green());
     Ok(config)
 }
 
@@ -344,7 +368,7 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let out_dir = format!("scans/fuzz_{}", timestamp);
     fs::create_dir_all(&out_dir).context("Failed to create output dir")?;
-    println!("Output Directory: {}", out_dir.cyan());
+    crate::mprintln!("Output Directory: {}", out_dir.cyan());
 
     // 2. Spawn Writer Actor
     let (tx, mut rx) = mpsc::channel::<WriterMessage>(1000);
@@ -389,7 +413,7 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
                              format!("[{}]", status).white().to_string()
                          };
                          
-                         println!("{} Size: {} | {}", 
+                         crate::mprintln!("{} Size: {} | {}", 
                              status_display, 
                              res.size.to_string().dimmed(), 
                              res.path
@@ -406,15 +430,12 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
     });
 
     // 3. Engine Setup
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let client = crate::utils::build_http_client(Duration::from_secs(10))?;
         
     let charset = get_charset(&config);
     let sem = Arc::new(Semaphore::new(config.concurrency));
     
-    println!("{}", "Starting Fuzzer... Press Ctrl+C to abort (not handled cleanly)".yellow());
+    crate::mprintln!("{}", "Starting Fuzzer... Press Ctrl+C to abort (not handled cleanly)".yellow());
     
     // 4. Generator Loop
     // Memory Fix: Do not store JoinHandles in a Vec.
@@ -435,14 +456,14 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
     // 5. Wait for all tasks to finish
     // We do this by attempting to acquire ALL permits.
     // This will block until all active tasks release their permits.
-    println!("Generation done. Waiting for active tasks to complete...");
+    crate::mprintln!("Generation done. Waiting for active tasks to complete...");
     let _ = sem.acquire_many(config.concurrency as u32).await;
     
     // Stop Writer
     let _ = tx.send(WriterMessage::Stop).await;
     let final_buffer = writer_handle.await?;
     
-    println!("\n{}", "Scan Complete. Sorting results...".blue());
+    crate::mprintln!("\n{}", "Scan Complete. Sorting results...".blue());
     
     // 6. Sort and Final Save
     let mut total_403 = 0;
@@ -461,11 +482,11 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
             let _ = writeln!(content, "[Size: {}] {}", r.size, r.path);
         }
         fs::write(&file_path, content)?;
-        println!("Saved sorted results for status {} to {}", status, file_path.green());
+        crate::mprintln!("Saved sorted results for status {} to {}", status, file_path.green());
     }
     
     if total_403 > 0 && !config.verbose {
-         println!("{}", format!("\n[*] Aggregated {} '403 Forbidden' responses. (Use verbose mode to see them)", total_403).yellow());
+         crate::mprintln!("{}", format!("\n[*] Aggregated {} '403 Forbidden' responses. (Use verbose mode to see them)", total_403).yellow());
     }
 
     Ok(())
@@ -551,5 +572,16 @@ async fn spawn_combinations_iterative(
         if carry {
             return;
         }
+    }
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "Sequential Fuzzer".to_string(),
+        description: "Sequential character-based HTTP fuzzer with multiple encoding types, injection charsets, and concurrent request support.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
     }
 }

@@ -1,219 +1,230 @@
-use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Result};
 use colored::*;
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     io::Write,
-    net::{SocketAddr, UdpSocket, IpAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use tokio::{
-    sync::Mutex,
-    sync::Semaphore,
-    task::spawn_blocking,
-    time::sleep,
-    fs::OpenOptions,
-    io::AsyncWriteExt,
-};
+use tokio::task::spawn_blocking;
 
+use crate::modules::creds::utils::{
+    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
+};
 use crate::utils::{
-    load_lines, prompt_default, normalize_target,
-    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
-    cfg_prompt_port,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_port, cfg_prompt_yes_no, load_lines, normalize_target,
 };
-use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
 
-const PROGRESS_INTERVAL_SECS: u64 = 2;
-const STATE_FILE: &str = "snmp_hose_state.log";
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SNMP Brute Force".to_string(),
+        description: "Brute-force SNMPv1/v2c community strings. Discovers read/write community strings on network devices with concurrent scanning and subnet/mass scan support.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
+}
 
-// Hardcoded exclusions (Private + Cloudflare + Google + Link Local etc)
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
-    // Cloudflare
-    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
-    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
-    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
-    "1.1.1.1/32", "1.0.0.1/32",
-    // Google
-    "8.8.8.8/32", "8.8.4.4/32"
-];
+/// Prompt for SNMP version, returning 0 for v1 or 1 for v2c.
+async fn prompt_snmp_version() -> Result<u8> {
+    loop {
+        let input = cfg_prompt_default("snmp_version", "SNMP Version (1 or 2c)", "2c").await?;
+        match input.trim().to_lowercase().as_str() {
+            "1" => return Ok(0),
+            "2c" | "2" => return Ok(1),
+            _ => crate::mprintln!("Invalid version. Enter '1' or '2c'."),
+        }
+    }
+}
+
+/// Format SNMP version byte as a display string.
+fn version_label(v: u8) -> &'static str {
+    if v == 0 {
+        "v1"
+    } else {
+        "v2c"
+    }
+}
 
 pub async fn run(target: &str) -> Result<()> {
-    println!("\n{}", "=== SNMPv1/v2c Brute Force Module ===".bold().cyan());
-    println!("{}", "    Community String Discovery Tool".cyan());
-    println!();
-    println!("{}", format!("[*] Target: {}", target).cyan());
+    crate::mprintln!(
+        "\n{}",
+        "=== SNMPv1/v2c Brute Force Module ===".bold().cyan()
+    );
+    crate::mprintln!("{}", "    Community String Discovery Tool".cyan());
+    crate::mprintln!();
+    crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
-    // Check for Mass Scan Mode
-    let is_mass_scan = target == "random" || target == "0.0.0.0" 
-        || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+    // --- Mass scan mode ---
+    if is_mass_scan_target(target) {
+        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
 
-    if is_mass_scan {
-        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-        return run_mass_scan(target).await;
+        let communities_file =
+            cfg_prompt_existing_file("community_wordlist", "Community string wordlist").await?;
+        let snmp_version = prompt_snmp_version().await?;
+        let communities = Arc::new(load_lines(&communities_file)?);
+        if communities.is_empty() {
+            return Err(anyhow!("Community wordlist cannot be empty"));
+        }
+        let timeout_secs =
+            cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300).await? as u64;
+
+        let cfg = MassScanConfig {
+            protocol_name: "SNMP",
+            default_port: 161,
+            state_file: "snmp_hose_state.log",
+            default_output: "snmp_mass_results.txt",
+            default_concurrency: 500,
+        };
+
+        return run_mass_scan(target, cfg, move |ip: IpAddr, port: u16| {
+            let communities = communities.clone();
+            async move {
+                let addr = format!("{}:{}", ip, port);
+                let timeout = Duration::from_secs(timeout_secs);
+                for community in communities.iter() {
+                    match try_snmp_community(&addr, community, snmp_version, timeout).await {
+                        Ok(true) => {
+                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                            let line = format!("[{}] {}:{}\n", now, ip, community);
+                            crate::mprintln!(
+                                "\r{}",
+                                format!("[+] FOUND: {} -> community: '{}'", addr, community)
+                                    .green()
+                                    .bold()
+                            );
+                            return Some(line);
+                        }
+                        Ok(false) => {}
+                        Err(_) => return None,
+                    }
+                }
+                None
+            }
+        })
+        .await;
     }
 
+    // --- Subnet scan mode (SNMP-specific, UDP — no TCP pre-check) ---
     if is_subnet_target(target) {
-        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+        crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
         return run_subnet_scan(target).await;
     }
 
-    // --- Standard Single-Target Logic ---
+    // --- Single-target bruteforce via the generic engine ---
 
-    let default_port = 161;
-    let port = cfg_prompt_port("port", "SNMP Port", default_port)?
-    ;
-    
-    let communities_file = cfg_prompt_existing_file("community_wordlist", "Community string wordlist file path")?;
-    
-    // Custom prompt for version since it's specific
-    let snmp_version = {
-        let config = crate::config::get_module_config();
-        if let Some(val) = config.custom_prompts.get("snmp_version") {
-            match val.trim().to_lowercase().as_str() {
-                "1" => 0,
-                "2c" | "2" => 1,
-                _ => 1, // default to v2c
-            }
-        } else {
-            loop {
-                let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
-                match input.trim().to_lowercase().as_str() {
-                    "1" => break 0,
-                    "2c" | "2" => break 1,
-                    _ => println!("Invalid version. Enter '1' or '2c'."),
-                }
-            }
-        }
-    };
-    
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 50, 1, 1000)? as usize;
-    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
-    
-    let output_file = cfg_prompt_output_file("output_file", "Output file", "snmp_results.txt")?;
-    
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300)? as u64;
+    let port = cfg_prompt_port("port", "SNMP Port", 161).await?;
+    let communities_file =
+        cfg_prompt_existing_file("community_wordlist", "Community string wordlist file path")
+            .await?;
+    let snmp_version = prompt_snmp_version().await?;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent tasks", 50, 1, 1000).await? as usize;
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+    let output_file =
+        cfg_prompt_output_file("output_file", "Output file", "snmp_results.txt").await?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300).await? as u64;
 
-    let connect_addr = format!("{}:{}", normalize_target(target)?, port);
-
-    let found = Arc::new(Mutex::new(Vec::new()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new(BruteforceStats::new());
-
-    println!("\n[*] Starting SNMP brute-force on {}", connect_addr);
-    println!("[*] SNMP Version: {}", if snmp_version == 0 { "v1" } else { "v2c" });
+    let norm_target = normalize_target(target)?;
 
     let communities = load_lines(&communities_file)?;
     if communities.is_empty() {
-        println!("[!] Community wordlist is empty. Exiting.");
+        crate::mprintln!("[!] Community wordlist is empty. Exiting.");
         return Ok(());
     }
-    println!("{}", format!("[*] Loaded {} community strings", communities.len()).cyan());
-    println!();
+    crate::mprintln!(
+        "{}",
+        format!("[*] Loaded {} community strings", communities.len()).cyan()
+    );
+    crate::mprintln!("[*] SNMP Version: {}", version_label(snmp_version));
 
-    // Start progress reporter
-    let stats_clone = stats.clone();
-    let stop_clone = stop.clone();
-    let start_time = Instant::now();
-    let progress_handle = tokio::spawn(async move {
-        loop {
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
-            stats_clone.print_progress();
-        }
-    });
+    // Build combos: empty username, community string as password.
+    let empty_users = vec![String::new()];
+    let combos = generate_combos(&empty_users, &communities, true);
 
-    let communities = Arc::new(communities);
-    let mut tasks = FuturesUnordered::new();
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let config = BruteforceConfig {
+        target: norm_target.clone(),
+        port,
+        concurrency,
+        stop_on_success,
+        verbose,
+        delay_ms: 10,
+        max_retries: 2,
+        service_name: "snmp",
+        source_module: "creds/generic/snmp_bruteforce",
+    };
 
-    for community in communities.iter() {
-        if stop_on_success && stop.load(Ordering::Relaxed) {
-            break;
-        }
+    let timeout = Duration::from_secs(timeout_secs);
 
-        let permit = semaphore.clone().acquire_owned().await?;
-        let addr_clone = connect_addr.clone();
-        let community_clone = community.clone();
-        let found_clone = Arc::clone(&found);
-        let stop_clone = Arc::clone(&stop);
-        let stats_clone = Arc::clone(&stats);
-        let stop_flag = stop_on_success;
-        let verbose_flag = verbose;
-        let version = snmp_version;
-        let timeout = Duration::from_secs(timeout_secs);
-
-        tasks.push(tokio::spawn(async move {
-            let _permit = permit;
-            
-            if stop_flag && stop_clone.load(Ordering::Relaxed) {
-                return;
-            }
-
-            match try_snmp_community(&addr_clone, &community_clone, version, timeout).await {
-                Ok(true) => {
-                    println!("\r{}", format!("[+] {} -> community: '{}'", addr_clone, community_clone).green().bold());
-                    found_clone
-                        .lock()
-                        .await
-                        .push((addr_clone.clone(), community_clone.clone()));
-                    stats_clone.record_success();
-                    if stop_flag {
-                        stop_clone.store(true, Ordering::Relaxed);
+    // The try_login closure adapts SNMP community-string testing to the
+    // engine's (target, port, user, password) interface.  On success it
+    // stores the credential with CredType::Key (SNMP community strings
+    // are keys, not passwords).  The engine also stores with
+    // CredType::Password — a harmless duplicate that keeps the generic
+    // engine simple.
+    let result = run_bruteforce(
+        &config,
+        combos,
+        move |target: String, port: u16, _user: String, community: String| {
+            let timeout = timeout;
+            async move {
+                let addr = format!("{}:{}", target, port);
+                match try_snmp_community(&addr, &community, snmp_version, timeout).await {
+                    Ok(true) => {
+                        // Store with CredType::Key for SNMP semantics
+                        let _ = crate::cred_store::store_credential(
+                            &target,
+                            port,
+                            "snmp",
+                            "",
+                            &community,
+                            crate::cred_store::CredType::Key,
+                            "creds/generic/snmp_bruteforce",
+                        )
+                        .await;
+                        LoginResult::Success
                     }
-                }
-                Ok(false) => {
-                    stats_clone.record_failure();
-                    if verbose_flag {
-                        println!("\r{}", format!("[-] {} -> community: '{}'", addr_clone, community_clone).dimmed());
-                    }
-                }
-                Err(e) => {
-                    stats_clone.record_error(e.to_string()).await;
-                    if verbose_flag {
-                        println!("\r{}", format!("[!] {}: error: {}", addr_clone, e).red());
-                    }
+                    Ok(false) => LoginResult::AuthFailed,
+                    Err(e) => LoginResult::Error {
+                        message: e.to_string(),
+                        retryable: true,
+                    },
                 }
             }
+        },
+    )
+    .await?;
 
-            sleep(Duration::from_millis(10)).await;
-        }));
-        
-        // Drain
-        while let std::task::Poll::Ready(Some(_)) = futures::future::poll_fn(|cx| std::task::Poll::Ready(tasks.poll_next_unpin(cx))).await {}
-    }
-
-    while let Some(_) = tasks.next().await {}
-
-    // Stop progress reporter
-    stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-
-    // Print final statistics
-    let elapsed = start_time.elapsed();
-    println!("[*] Elapsed: {:.1}s", elapsed.as_secs_f64());
-    stats.print_final().await;
-
-    let creds = found.lock().await;
-    if creds.is_empty() {
-        println!("{}", "[-] No valid community strings found.".yellow());
+    // Print results — adapt the engine's generic output for SNMP display
+    if result.found.is_empty() {
+        crate::mprintln!("{}", "[-] No valid community strings found.".yellow());
     } else {
-        println!("{}", format!("[+] Found {} valid community string(s):", creds.len()).green().bold());
-        
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&output_file) {
-            for (host, community) in creds.iter() {
-                println!("     {} -> community: '{}'", host, community);
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[+] Found {} valid community string(s):",
+                result.found.len()
+            )
+            .green()
+            .bold()
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&output_file)
+        {
+            for (host, _user, community) in &result.found {
+                crate::mprintln!("     {} -> community: '{}'", host, community);
                 let _ = writeln!(file, "{} -> community: '{}'", host, community);
             }
-            println!("[+] Results saved to '{}'", output_file);
+            crate::mprintln!("[+] Results saved to '{}'", output_file);
         }
     }
 
@@ -223,7 +234,7 @@ pub async fn run(target: &str) -> Result<()> {
 async fn try_snmp_community(
     normalized_addr: &str,
     community: &str,
-    version: u8,  // 0 = v1, 1 = v2c
+    version: u8, // 0 = v1, 1 = v2c
     timeout: Duration,
 ) -> Result<bool> {
     let community_owned = community.to_string();
@@ -236,9 +247,9 @@ async fn try_snmp_community(
             .map_err(|e| anyhow!("Invalid address '{}': {}", addr_owned, e))?;
 
         // Create UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        let socket = crate::utils::blocking_udp_bind(None)
             .map_err(|e| anyhow!("Failed to bind socket: {}", e))?;
-        
+
         socket
             .set_read_timeout(Some(timeout))
             .map_err(|e| anyhow!("Failed to set read timeout: {}", e))?;
@@ -257,7 +268,7 @@ async fn try_snmp_community(
         let result: bool = match socket.recv_from(&mut buf) {
             Ok((size, _)) => {
                 let response = &buf[..size];
-                
+
                 // Parse SNMP response to verify it's valid
                 // A valid SNMP response should:
                 // 1. Start with 0x30 (SEQUENCE)
@@ -267,12 +278,11 @@ async fn try_snmp_community(
                     // Try to parse the response to check error status
                     // If we can parse it and error status is 0, it's valid
                     match parse_snmp_response(response) {
-                        Ok(true) => true,  // Valid community string
+                        Ok(true) => true,   // Valid community string
                         Ok(false) => false, // Invalid community (error in response)
                         Err(_) => {
-                            // Can't parse, but got a response - might be valid
-                            // Some devices send malformed responses but still indicate valid community
-                            true
+                            // Can't parse response — treat as invalid to avoid false positives
+                            false
                         }
                     }
                 } else {
@@ -284,10 +294,11 @@ async fn try_snmp_community(
                 // Handle timeout and EAGAIN/EWOULDBLOCK errors as invalid community
                 // EAGAIN (os error 11) can occur on Linux when socket would block
                 let error_kind = e.kind();
-                if error_kind == std::io::ErrorKind::TimedOut 
+                if error_kind == std::io::ErrorKind::TimedOut
                     || error_kind == std::io::ErrorKind::WouldBlock
                     || e.raw_os_error() == Some(11) // EAGAIN on Linux
-                    || e.raw_os_error() == Some(35) // EAGAIN on macOS
+                    || e.raw_os_error() == Some(35)
+                // EAGAIN on macOS
                 {
                     // Timeout or would block - community string is likely invalid
                     false
@@ -316,16 +327,16 @@ fn parse_snmp_response(response: &[u8]) -> Result<bool> {
     // Try to find the PDU (GetResponse-PDU = 0xa2)
     // The structure is: SEQUENCE (version, community, PDU)
     // We need to skip version and community to get to the PDU
-    
+
     let mut pos = 1;
-    
+
     // Skip length of outer SEQUENCE
     if pos >= response.len() {
         return Err(anyhow!("Response too short"));
     }
     let (_len, len_bytes) = parse_ber_length(&response[pos..])?;
     pos += len_bytes;
-    
+
     // Skip version (INTEGER)
     if pos >= response.len() || response[pos] != 0x02 {
         return Err(anyhow!("Invalid version field"));
@@ -333,7 +344,7 @@ fn parse_snmp_response(response: &[u8]) -> Result<bool> {
     pos += 1;
     let (vlen, vlen_bytes) = parse_ber_length(&response[pos..])?;
     pos += vlen_bytes + vlen;
-    
+
     // Skip community (OCTET STRING)
     if pos >= response.len() || response[pos] != 0x04 {
         return Err(anyhow!("Invalid community field"));
@@ -341,23 +352,23 @@ fn parse_snmp_response(response: &[u8]) -> Result<bool> {
     pos += 1;
     let (clen, clen_bytes) = parse_ber_length(&response[pos..])?;
     pos += clen_bytes + clen;
-    
+
     // Now we should be at the PDU
     // GetResponse-PDU = 0xa2, GetRequest-PDU = 0xa0
     if pos >= response.len() {
         return Err(anyhow!("Response too short for PDU"));
     }
-    
+
     let pdu_tag = response[pos];
     if pdu_tag != 0xa2 && pdu_tag != 0xa0 {
         // Not a GetResponse or GetRequest, might be an error
         return Ok(false);
     }
-    
+
     pos += 1;
     let (_pdu_len, pdu_len_bytes) = parse_ber_length(&response[pos..])?;
     pos += pdu_len_bytes;
-    
+
     // PDU structure: request-id, error-status, error-index, variable-bindings
     // Skip request-id (INTEGER)
     if pos >= response.len() || response[pos] != 0x02 {
@@ -366,7 +377,7 @@ fn parse_snmp_response(response: &[u8]) -> Result<bool> {
     pos += 1;
     let (rid_len, rid_len_bytes) = parse_ber_length(&response[pos..])?;
     pos += rid_len_bytes + rid_len;
-    
+
     // Read error-status (INTEGER)
     if pos >= response.len() || response[pos] != 0x02 {
         return Err(anyhow!("Invalid error-status field"));
@@ -376,7 +387,7 @@ fn parse_snmp_response(response: &[u8]) -> Result<bool> {
     if es_len == 0 || pos + es_len_bytes + es_len > response.len() {
         return Err(anyhow!("Invalid error-status length"));
     }
-    
+
     // Read the error status value
     let error_status = if es_len == 1 {
         response[pos + es_len_bytes] as u32
@@ -388,7 +399,7 @@ fn parse_snmp_response(response: &[u8]) -> Result<bool> {
         }
         val
     };
-    
+
     // Error status 0 = noError, anything else is an error
     Ok(error_status == 0)
 }
@@ -399,9 +410,9 @@ fn parse_ber_length(data: &[u8]) -> Result<(usize, usize)> {
     if data.is_empty() {
         return Err(anyhow!("Empty length field"));
     }
-    
+
     let first_byte = data[0];
-    
+
     if (first_byte & 0x80) == 0 {
         // Short form: single byte
         Ok((first_byte as usize, 1))
@@ -417,12 +428,12 @@ fn parse_ber_length(data: &[u8]) -> Result<(usize, usize)> {
         if data.len() < 1 + num_bytes {
             return Err(anyhow!("Not enough bytes for length field"));
         }
-        
+
         let mut length = 0usize;
         for i in 0..num_bytes {
             length = (length << 8) | (data[1 + i] as usize);
         }
-        
+
         Ok((length, 1 + num_bytes))
     }
 }
@@ -431,34 +442,34 @@ fn parse_ber_length(data: &[u8]) -> Result<(usize, usize)> {
 /// This is a simplified implementation that creates a basic SNMPv1/v2c GET request
 fn build_snmp_get_request(community: &str, version: u8) -> Vec<u8> {
     // Build components first, then assemble with proper length encoding
-    
+
     // OID for sysDescr: 1.3.6.1.2.1.1.1.0
     let oid_encoded = encode_oid_value(&[1, 3, 6, 1, 2, 1, 1, 1, 0]);
     let oid_tlv = build_tlv(0x06, &oid_encoded); // 0x06 = OBJECT IDENTIFIER
-    
+
     // NULL value
     let null_tlv = vec![0x05, 0x00]; // NULL type, length 0
-    
+
     // VarBind: SEQUENCE of (OID, NULL)
     let mut var_bind = Vec::new();
     var_bind.extend_from_slice(&oid_tlv);
     var_bind.extend_from_slice(&null_tlv);
     let var_bind_tlv = build_tlv(0x30, &var_bind); // 0x30 = SEQUENCE
-    
+
     // VarBindList: SEQUENCE of VarBind
     let mut var_bind_list_content = Vec::new();
     var_bind_list_content.extend_from_slice(&var_bind_tlv);
     let var_bind_list_tlv = build_tlv(0x30, &var_bind_list_content); // 0x30 = SEQUENCE
-    
+
     // Request ID
     let request_id_tlv = encode_integer_tlv(1u32);
-    
+
     // Error status (0 = noError)
     let error_status_tlv = encode_integer_tlv(0u32);
-    
+
     // Error index (0 = noError)
     let error_index_tlv = encode_integer_tlv(0u32);
-    
+
     // PDU: GetRequest-PDU
     let mut pdu_content = Vec::new();
     pdu_content.extend_from_slice(&request_id_tlv);
@@ -466,29 +477,27 @@ fn build_snmp_get_request(community: &str, version: u8) -> Vec<u8> {
     pdu_content.extend_from_slice(&error_index_tlv);
     pdu_content.extend_from_slice(&var_bind_list_tlv);
     let pdu_tlv = build_tlv(0xa0, &pdu_content); // 0xa0 = GetRequest-PDU
-    
+
     // Version
     let version_tlv = encode_integer_tlv(version as u32);
-    
+
     // Community string
     let community_bytes = community.as_bytes();
     let community_tlv = build_tlv(0x04, community_bytes); // 0x04 = OCTET STRING
-    
+
     // SNMP Message: SEQUENCE of (version, community, PDU)
     let mut message_content = Vec::new();
     message_content.extend_from_slice(&version_tlv);
     message_content.extend_from_slice(&community_tlv);
     message_content.extend_from_slice(&pdu_tlv);
-    let message = build_tlv(0x30, &message_content); // 0x30 = SEQUENCE
-    
-    message
+    build_tlv(0x30, &message_content) // 0x30 = SEQUENCE
 }
 
 /// Builds a TLV (Type-Length-Value) structure
 fn build_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
     result.push(tag);
-    
+
     let length = value.len();
     if length < 128 {
         // Short form: single byte length
@@ -499,21 +508,21 @@ fn build_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
         let mut len = length;
         let mut num_bytes = 0;
         let mut len_bytes = Vec::new();
-        
+
         while len > 0 {
             len_bytes.push((len & 0xFF) as u8);
             len >>= 8;
             num_bytes += 1;
         }
-        
+
         // Reverse to get big-endian representation
         len_bytes.reverse();
-        
+
         // First byte: 0x80 | number of length bytes
         result.push(0x80 | (num_bytes as u8));
         result.extend_from_slice(&len_bytes);
     }
-    
+
     result.extend_from_slice(value);
     result
 }
@@ -533,7 +542,7 @@ fn encode_integer_tlv(value: u32) -> Vec<u8> {
             val >>= 8;
         }
         bytes.reverse();
-        
+
         // If high bit is set, prepend 0x00 to make it positive
         if bytes[0] & 0x80 != 0 {
             bytes.insert(0, 0x00);
@@ -555,7 +564,6 @@ fn encode_oid_value(oid: &[u32]) -> Vec<u8> {
     encoded
 }
 
-
 /// Encodes a sub-identifier using base-128 encoding
 fn encode_sub_id(mut value: u32, output: &mut Vec<u8>) {
     let mut bytes = Vec::new();
@@ -575,238 +583,73 @@ fn encode_sub_id(mut value: u32, output: &mut Vec<u8>) {
     output.extend_from_slice(&bytes);
 }
 
-
-
-/// Run mass scan logic (Hose style)
-async fn run_mass_scan(target: &str) -> Result<()> {
-    println!("{}", "[*] Preparing Mass Scan configuration...".blue());
-    
-    let port = cfg_prompt_port("port", "SNMP Port", 161)?;
-    let communities_file = cfg_prompt_existing_file("community_wordlist", "Community string wordlist")?;
-    
-    let snmp_version = {
-        let config = crate::config::get_module_config();
-        if let Some(val) = config.custom_prompts.get("snmp_version") {
-            match val.trim().to_lowercase().as_str() {
-                "1" => 0,
-                "2c" | "2" => 1,
-                _ => 1,
-            }
-        } else {
-            loop {
-                let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
-                match input.trim().to_lowercase().as_str() {
-                    "1" => break 0,
-                    "2c" | "2" => break 1,
-                    _ => println!("Invalid version. Enter '1' or '2c'."),
-                }
-            }
-        }
-    };
-    
+async fn run_subnet_scan(target: &str) -> Result<()> {
+    let port = cfg_prompt_port("port", "SNMP Port", 161).await?;
+    let communities_file =
+        cfg_prompt_existing_file("community_wordlist", "Community string wordlist").await?;
+    let snmp_version = prompt_snmp_version().await?;
     let communities = load_lines(&communities_file)?;
     if communities.is_empty() {
-        return Err(anyhow!("Community wordlist cannot be empty"));
+        return Err(anyhow!("Community wordlist empty"));
     }
-    
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300)? as u64;
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "snmp_mass_results.txt")?;
-    
-    // Parse exclusions
-    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
-    
-    // Shared State
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-    let creds_pkg = Arc::new((communities, snmp_version, timeout_secs));
-    
-    // Stats Reporter
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!(
-                "[*] Status: {} IPs scanned, {} SNMP devices found",
-                s_checked.load(Ordering::Relaxed),
-                s_found.load(Ordering::Relaxed).to_string().green().bold()
-            );
-        }
-    });
-    
-    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
-    
-    if run_random {
-        println!("{}", "[*] Starting Random Internet Scan...".green());
-        loop {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let exc = exclusions.clone();
-            let cp = creds_pkg.clone();
-            let sc = stats_checked.clone();
-            let sf = stats_found.clone();
-            let of = output_file.clone();
-            
-            tokio::spawn(async move {
-                let ip = generate_random_public_ip(&exc);
-                
-                if !is_ip_checked(&ip, STATE_FILE).await {
-                    mark_ip_checked(&ip, STATE_FILE).await;
-                    mass_scan_host(ip, port, cp, sf, of, verbose).await;
-                }
-                
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-    } else {
-        // File mode
-        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
-        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
-        
-        for ip_str in lines {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let cp = creds_pkg.clone();
-            let sc = stats_checked.clone();
-            let sf = stats_found.clone();
-            let of = output_file.clone();
-            
-            let ip_addr = match ip_str.parse::<IpAddr>() {
-                Ok(ip) => Some(ip),
-                Err(_) => None
-            };
-            
-            tokio::spawn(async move {
-                if let Some(ip) = ip_addr {
-                    if !is_ip_checked(&ip, STATE_FILE).await {
-                        mark_ip_checked(&ip, STATE_FILE).await;
-                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
+
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000).await? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300).await? as u64;
+    let output_file = cfg_prompt_output_file(
+        "output_file",
+        "Output result file",
+        "snmp_subnet_results.txt",
+    )
+    .await?;
+
+    // SNMP uses community strings, not user/pass pairs.
+    // Map: empty username, community string as password.
+    let empty_users = vec![String::new()];
+    let timeout = Duration::from_secs(timeout_secs);
+
+    run_subnet_bruteforce(
+        target,
+        port,
+        empty_users,
+        communities,
+        &SubnetScanConfig {
+            concurrency,
+            verbose,
+            output_file,
+            service_name: "snmp",
+            source_module: "creds/generic/snmp_bruteforce",
+            skip_tcp_check: true, // SNMP is UDP — no TCP pre-check
+        },
+        move |ip: IpAddr, port: u16, _user: String, community: String| {
+            let timeout = timeout;
+            async move {
+                let addr = format!("{}:{}", ip, port);
+                match try_snmp_community(&addr, &community, snmp_version, timeout).await {
+                    Ok(true) => {
+                        // Store with CredType::Key for SNMP semantics
+                        let _ = crate::cred_store::store_credential(
+                            &ip.to_string(),
+                            port,
+                            "snmp",
+                            "",
+                            &community,
+                            crate::cred_store::CredType::Key,
+                            "creds/generic/snmp_bruteforce",
+                        )
+                        .await;
+                        LoginResult::Success
                     }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-        
-        // Wait for finish
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
-        }
-    }
-    
-    Ok(())
-}
-
-async fn run_subnet_scan(target: &str) -> Result<()> {
-    let network = parse_subnet(target)?;
-    let count = subnet_host_count(&network);
-    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
-
-    let port = cfg_prompt_port("port", "SNMP Port", 161)?;
-    let communities_file = cfg_prompt_existing_file("community_wordlist", "Community string wordlist")?;
-    let snmp_version = {
-        let config = crate::config::get_module_config();
-        if let Some(val) = config.custom_prompts.get("snmp_version") {
-            match val.trim().to_lowercase().as_str() { "1" => 0, _ => 1 }
-        } else {
-            loop {
-                let input = prompt_default("SNMP Version (1 or 2c)", "2c")?;
-                match input.trim().to_lowercase().as_str() { "1" => break 0, "2c" | "2" => break 1, _ => println!("Invalid version.") }
-            }
-        }
-    };
-    let communities = load_lines(&communities_file)?;
-    if communities.is_empty() { return Err(anyhow!("Community wordlist empty")); }
-
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 3, 1, 300)? as u64;
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "snmp_subnet_results.txt")?;
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-    let creds_pkg = Arc::new((communities, snmp_version, timeout_secs));
-    let total = count;
-
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!("[*] Status: {}/{} IPs scanned, {} SNMP devices found",
-                s_checked.load(Ordering::Relaxed), total,
-                s_found.load(Ordering::Relaxed).to_string().green().bold());
-        }
-    });
-
-    for ip in network.iter() {
-        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
-        let cp = creds_pkg.clone();
-        let sc = stats_checked.clone();
-        let sf = stats_found.clone();
-        let of = output_file.clone();
-
-        tokio::spawn(async move {
-            mass_scan_host(ip, port, cp, sf, of, verbose).await;
-            sc.fetch_add(1, Ordering::Relaxed);
-            drop(permit);
-        });
-    }
-
-    for _ in 0..concurrency {
-        let _ = semaphore.acquire().await.context("Semaphore")?;
-    }
-
-    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} SNMP services found.",
-        stats_checked.load(Ordering::Relaxed),
-        stats_found.load(Ordering::Relaxed)).cyan().bold());
-    Ok(())
-}
-
-async fn mass_scan_host(
-    ip: IpAddr,
-    port: u16,
-    creds: Arc<(Vec<String>, u8, u64)>,
-    stats_found: Arc<AtomicUsize>,
-    output_file: String,
-    verbose: bool,
-) {
-    let addr = format!("{}:{}", ip, port);
-    let (communities, version, timeout_secs) = &*creds;
-    let timeout = Duration::from_secs(*timeout_secs);
-    
-    for community in communities {
-        match try_snmp_community(&addr, community, *version, timeout).await {
-            Ok(true) => {
-                let result_str = format!("{} -> community: '{}'", addr, community);
-                println!("\\r{}", format!("[+] FOUND: {}", result_str).green().bold());
-                
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&output_file)
-                    .await
-                {
-                    let _ = file.write_all(format!("{}\\n", result_str).as_bytes()).await;
-                }
-                
-                stats_found.fetch_add(1, Ordering::Relaxed);
-                return; // Stop on first valid community for this host
-            }
-            Ok(false) => {
-                if verbose {
-                    println!("\\r{}", format!("[-] {} community '{}' failed", addr, community).dimmed());
+                    Ok(false) => LoginResult::AuthFailed,
+                    Err(e) => LoginResult::Error {
+                        message: e.to_string(),
+                        retryable: false, // UDP timeout = host not responding
+                    },
                 }
             }
-            Err(_) => {
-                // Connection error
-                return;
-            }
-        }
-    }
+        },
+    )
+    .await
 }
-

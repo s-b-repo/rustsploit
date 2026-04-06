@@ -11,17 +11,17 @@ use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use telnet::{Telnet, Event};
-use threadpool::ThreadPool;
 use crossbeam_channel::unbounded;
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
     cfg_prompt_int_range, cfg_prompt_existing_file, cfg_prompt_output_file,
 };
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SMTP_PORT: u16 = 25;
@@ -68,7 +68,7 @@ impl Statistics {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
 
-        print!(
+        crate::mprint!(
             "\r{} {} checked | {} valid | {} invalid | {} err | {:.1}/s    ",
             "[Progress]".cyan(),
             total.to_string().bold(),
@@ -81,31 +81,31 @@ impl Statistics {
     }
 
     fn print_final(&self) {
-        println!();
+        crate::mprintln!();
         let total = self.total_checked.load(Ordering::Relaxed);
         let valid = self.valid_users.load(Ordering::Relaxed);
         let invalid = self.invalid_users.load(Ordering::Relaxed);
         let errors = self.error_attempts.load(Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_secs_f64();
 
-        println!("{}", "=== Statistics ===".bold());
-        println!("  Total checked:     {}", total);
-        println!("  Valid users:        {}", valid.to_string().green().bold());
-        println!("  Invalid users:      {}", invalid);
-        println!("  Errors:             {}", errors.to_string().red());
-        println!("  Elapsed time:       {:.2}s", elapsed);
+        crate::mprintln!("{}", "=== Statistics ===".bold());
+        crate::mprintln!("  Total checked:     {}", total);
+        crate::mprintln!("  Valid users:        {}", valid.to_string().green().bold());
+        crate::mprintln!("  Invalid users:      {}", invalid);
+        crate::mprintln!("  Errors:             {}", errors.to_string().red());
+        crate::mprintln!("  Elapsed time:       {:.2}s", elapsed);
         if elapsed > 0.0 {
-            println!("  Average rate:       {:.1} checks/s", total as f64 / elapsed);
+            crate::mprintln!("  Average rate:       {:.1} checks/s", total as f64 / elapsed);
         }
     }
 }
 
 fn display_banner() {
-    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   SMTP Username Enumeration Scanner                        ║".cyan());
-    println!("{}", "║   Enumerates usernames using SMTP VRFY command             ║".cyan());
-    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   SMTP Username Enumeration Scanner                        ║".cyan());
+    crate::mprintln!("{}", "║   Enumerates usernames using SMTP VRFY command             ║".cyan());
+    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 }
 
 #[derive(Clone)]
@@ -126,22 +126,41 @@ struct SmtpUserEnumConfig {
 
 /// Main entry point
 pub async fn run(target: &str) -> Result<()> {
-    display_banner();
-    println!("{}", format!("[*] Initial target: {}", target).cyan());
-    println!();
+    if is_mass_scan_target(target) {
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "SMTP-Enum",
+            default_port: 25,
+            state_file: "smtp_user_enum_mass_state.log",
+            default_output: "smtp_user_enum_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    Some(format!("[{}] {}:{} SMTP-Enum open\n", ts, ip, port))
+                } else {
+                    None
+                }
+            }
+        }).await;
+    }
 
-    println!("{}", "[ Configuration Menu ]".bold().green());
-    println!("  1. Single target (use current target only)");
-    println!("  2. Targets from file (ignore current target)");
-    println!("  3. Current target + targets from file");
-    println!();
-    let mode = cfg_prompt_default("mode", "Select mode [1-3] (default 1)", "1")?;
+    display_banner();
+    crate::mprintln!("{}", format!("[*] Initial target: {}", target).cyan());
+    crate::mprintln!();
+
+    crate::mprintln!("{}", "[ Configuration Menu ]".bold().green());
+    crate::mprintln!("  1. Single target (use current target only)");
+    crate::mprintln!("  2. Targets from file (ignore current target)");
+    crate::mprintln!("  3. Current target + targets from file");
+    crate::mprintln!();
+    let mode = cfg_prompt_default("mode", "Select mode [1-3] (default 1)", "1").await?;
 
     // Build initial target list based on selected mode
     let mut targets: Vec<String> = Vec::new();
     match mode.trim() {
         "2" => {
-            let file_path = cfg_prompt_existing_file("target_file", "Targets file (one IP/hostname per line)")?;
+            let file_path = cfg_prompt_existing_file("target_file", "Targets file (one IP/hostname per line)").await?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 2"));
             }
@@ -155,7 +174,7 @@ pub async fn run(target: &str) -> Result<()> {
             if !target.trim().is_empty() {
                 targets.push(target.trim().to_string());
             }
-            let file_path = cfg_prompt_existing_file("additional_target_file", "Additional targets file (one IP/hostname per line)")?;
+            let file_path = cfg_prompt_existing_file("additional_target_file", "Additional targets file (one IP/hostname per line)").await?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 3"));
             }
@@ -173,11 +192,11 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    let port = cfg_prompt_port("port", "SMTP Port", DEFAULT_SMTP_PORT)?;
-    let username_wordlist = cfg_prompt_existing_file("wordlist", "Username wordlist file")?;
-    let threads = cfg_prompt_int_range("threads", "Threads", DEFAULT_THREADS as i64, 1, 1024)? as usize;
-    let timeout_ms = cfg_prompt_int_range("timeout_ms", "Timeout in milliseconds", DEFAULT_TIMEOUT_MS as i64, 100, 60000)? as u64;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let port = cfg_prompt_port("port", "SMTP Port", DEFAULT_SMTP_PORT).await?;
+    let username_wordlist = cfg_prompt_existing_file("wordlist", "Username wordlist file").await?;
+    let threads = cfg_prompt_int_range("threads", "Threads", DEFAULT_THREADS as i64, 1, 1024).await? as usize;
+    let timeout_ms = cfg_prompt_int_range("timeout_ms", "Timeout in milliseconds", DEFAULT_TIMEOUT_MS as i64, 100, 60000).await? as u64;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
 
     if targets.is_empty() {
         return Err(anyhow!("No targets specified for SMTP enumeration"));
@@ -202,7 +221,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         match normalize_target(raw, config.port) {
             Ok(addr) => normalized_targets.push((raw.clone(), addr)),
             Err(e) => {
-                println!(
+                crate::mprintln!(
                     "{}",
                     format!("[!] Skipping target '{}': {}", raw, e).yellow()
                 );
@@ -227,8 +246,8 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
             return Err(anyhow!("Username wordlist is empty."));
         }
 
-        println!("{}", format!("[*] Loaded {} username(s).", usernames.len()).cyan());
-        println!(
+        crate::mprintln!("{}", format!("[*] Loaded {} username(s).", usernames.len()).cyan());
+        crate::mprintln!(
             "{}",
             format!(
                 "[*] Total targets: {} (port {})",
@@ -237,15 +256,15 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
             )
             .cyan()
         );
-        println!("{}", format!("[*] Threads: {}", config.threads).cyan());
-        println!("{}", format!("[*] Timeout: {}ms", config.timeout_ms).cyan());
-        println!();
+        crate::mprintln!("{}", format!("[*] Threads: {}", config.threads).cyan());
+        crate::mprintln!("{}", format!("[*] Timeout: {}ms", config.timeout_ms).cyan());
+        crate::mprintln!();
 
         let found = Arc::new(Mutex::new(Vec::new()));
         let unknown = Arc::new(Mutex::new(Vec::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Statistics::new());
-        let pool = ThreadPool::new(config.threads);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.threads));
         let (tx, rx) = unbounded();
 
         // Queue work: every username against every target (in-memory mode)
@@ -266,7 +285,8 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
             }
         });
 
-        // Worker threads
+        // Worker tasks
+        let mut handles = Vec::new();
         for _ in 0..config.threads {
             let rx = rx.clone();
             let stop_flag = Arc::clone(&stop_flag);
@@ -274,16 +294,31 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
             let unknown = Arc::clone(&unknown);
             let stats = Arc::clone(&stats);
             let config = config.clone();
+            let semaphore = Arc::clone(&semaphore);
 
-            pool.execute(move || {
+            let handle = tokio::spawn(async move {
                 while let Ok((raw_target, addr, username)) = rx.recv() {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    match verify_smtp_user(&addr, &username, config.timeout_ms) {
+                    let _permit = semaphore.acquire().await;
+
+                    let addr_c = addr.clone();
+                    let username_c = username.clone();
+                    let timeout_ms = config.timeout_ms;
+                    let result = tokio::task::spawn_blocking(move || {
+                        verify_smtp_user(&addr_c, &username_c, timeout_ms)
+                    }).await;
+
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow::anyhow!("Task join error: {}", e)),
+                    };
+
+                    match result {
                         Ok(Some(response)) => {
-                            println!(
+                            crate::mprintln!(
                                 "\r{}",
                                 format!(
                                     "[+] VALID: {}@{} - {}",
@@ -304,7 +339,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                         Ok(None) => {
                             stats.record_check(false, false);
                             if config.verbose {
-                                println!(
+                                crate::mprintln!(
                                     "\r{}",
                                     format!("[-] Invalid: {}@{}", username, raw_target).dimmed()
                                 );
@@ -322,7 +357,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                     ));
                                 }
                                 if config.verbose {
-                                    eprintln!(
+                                    crate::meprintln!(
                                         "\r{}",
                                         format!(
                                             "[?] {}@{} -> {}",
@@ -332,15 +367,18 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                     );
                                 }
                             } else if config.verbose {
-                                eprintln!("\r{}", format!("[!] {}: {}", username, msg).red());
+                                crate::meprintln!("\r{}", format!("[!] {}: {}", username, msg).red());
                             }
                         }
                     }
                 }
             });
+            handles.push(handle);
         }
 
-        pool.join();
+        for handle in handles {
+            let _ = handle.await;
+        }
 
         // Stop progress reporter
         stop_flag.store(true, Ordering::Relaxed);
@@ -352,7 +390,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
 
     // Streaming mode for very large username lists
     let size_mb = (size_bytes as f64) / (1024.0 * 1024.0);
-    println!(
+    crate::mprintln!(
         "{}",
         format!(
             "[*] Large username wordlist detected (~{:.1} MB) – streaming line by line",
@@ -360,7 +398,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         )
         .cyan()
     );
-    println!(
+    crate::mprintln!(
         "{}",
         format!(
             "[*] Total targets: {} (port {})",
@@ -369,15 +407,15 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         )
         .cyan()
     );
-    println!("{}", format!("[*] Threads: {}", config.threads).cyan());
-    println!("{}", format!("[*] Timeout: {}ms", config.timeout_ms).cyan());
-    println!();
+    crate::mprintln!("{}", format!("[*] Threads: {}", config.threads).cyan());
+    crate::mprintln!("{}", format!("[*] Timeout: {}ms", config.timeout_ms).cyan());
+    crate::mprintln!();
     
     let found = Arc::new(Mutex::new(Vec::new()));
     let unknown = Arc::new(Mutex::new(Vec::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Statistics::new());
-    let pool = ThreadPool::new(config.threads);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.threads));
     let (tx, rx) = unbounded();
 
     // Producer thread: read usernames file line-by-line and enqueue work
@@ -390,7 +428,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
             if let Err(e) =
                 enqueue_streaming_usernames(&path_clone, &targets_clone, tx_clone)
             {
-                eprintln!(
+                crate::meprintln!(
                     "\r{}",
                     format!("[!] Username producer error: {}", e).red()
                 );
@@ -409,7 +447,8 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         }
     });
     
-    // Worker threads
+    // Worker tasks
+    let mut handles = Vec::new();
     for _ in 0..config.threads {
         let rx = rx.clone();
         let stop_flag = Arc::clone(&stop_flag);
@@ -417,16 +456,31 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         let unknown = Arc::clone(&unknown);
         let stats = Arc::clone(&stats);
         let config = config.clone();
-        
-        pool.execute(move || {
+        let semaphore = Arc::clone(&semaphore);
+
+        let handle = tokio::spawn(async move {
             while let Ok((raw_target, addr, username)) = rx.recv() {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                
-                match verify_smtp_user(&addr, &username, config.timeout_ms) {
+
+                let _permit = semaphore.acquire().await;
+
+                let addr_c = addr.clone();
+                let username_c = username.clone();
+                let timeout_ms = config.timeout_ms;
+                let result = tokio::task::spawn_blocking(move || {
+                    verify_smtp_user(&addr_c, &username_c, timeout_ms)
+                }).await;
+
+                let result = match result {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow::anyhow!("Task join error: {}", e)),
+                };
+
+                match result {
                     Ok(Some(response)) => {
-                        println!(
+                        crate::mprintln!(
                             "\r{}",
                             format!(
                                 "[+] VALID: {}@{} - {}",
@@ -447,7 +501,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                     Ok(None) => {
                         stats.record_check(false, false);
                         if config.verbose {
-                            println!(
+                            crate::mprintln!(
                                 "\r{}",
                                 format!("[-] Invalid: {}@{}", username, raw_target).dimmed()
                             );
@@ -465,7 +519,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                 ));
                             }
                             if config.verbose {
-                                eprintln!(
+                                crate::meprintln!(
                                     "\r{}",
                                     format!(
                                         "[?] {}@{} -> {}",
@@ -475,15 +529,18 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                 );
                             }
                         } else if config.verbose {
-                            eprintln!("\r{}", format!("[!] {}: {}", username, msg).red());
+                            crate::meprintln!("\r{}", format!("[!] {}: {}", username, msg).red());
                         }
                     }
                 }
             }
         });
+        handles.push(handle);
     }
-    
-    pool.join();
+
+    for handle in handles {
+        let _ = handle.await;
+    }
     
     // Stop progress reporter
     stop_flag.store(true, Ordering::Relaxed);
@@ -501,9 +558,10 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
         .next()
         .ok_or_else(|| anyhow!("Could not resolve address"))?;
     
-    let stream = TcpStream::connect_timeout(&socket, Duration::from_millis(timeout_ms))
+    let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(timeout_ms))
         .context("Connection timeout")?;
-    
+    let _ = stream.set_nodelay(true);
+
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;
     
@@ -535,14 +593,18 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
     let vrfy_cmd = format!("VRFY {}\r\n", username);
     telnet.write(vrfy_cmd.as_bytes())?;
     
-    // Read VRFY response
+    // Read VRFY response (cap at 8KB to prevent OOM from malicious servers)
     let start = Instant::now();
     let mut response_text = String::new();
-    
+    const MAX_RESPONSE: usize = 8192;
+
     while start.elapsed() < timeout {
         match telnet.read() {
             Ok(Event::Data(data)) => {
                 let response = String::from_utf8_lossy(&data);
+                if response_text.len() + response.len() > MAX_RESPONSE {
+                    break; // Cap response accumulation
+                }
                 response_text.push_str(&response);
                 
                 // Check for valid user responses (250, 251)
@@ -644,57 +706,68 @@ async fn finalize_and_report(
     // Print final statistics
     stats.print_final();
 
-    let found_guard = found.lock().unwrap_or_else(|e| e.into_inner());
-    if found_guard.is_empty() {
-        println!("{}", "[-] No valid usernames found.".yellow());
-    } else {
-        println!(
-            "{}",
-            format!("[+] Found {} valid username(s):", found_guard.len())
-                .green()
-                .bold()
-        );
-        for (username, response) in found_guard.iter() {
-            println!("  {}  {} - {}", "✓".green(), username, response);
+    let found_empty = {
+        let found_guard = found.lock().unwrap_or_else(|e| e.into_inner());
+        if found_guard.is_empty() {
+            crate::mprintln!("{}", "[-] No valid usernames found.".yellow());
+            true
+        } else {
+            crate::mprintln!(
+                "{}",
+                format!("[+] Found {} valid username(s):", found_guard.len())
+                    .green()
+                    .bold()
+            );
+            for (username, response) in found_guard.iter() {
+                crate::mprintln!("  {}  {} - {}", "✓".green(), username, response);
+            }
+            false
         }
+    }; // guard dropped here — before any .await
 
-        if cfg_prompt_yes_no("save_valid", "Save valid usernames?", false)?
-        {
-            let filename = cfg_prompt_output_file("valid_output", "What should the valid results be saved as?", "smtp_valid_users.txt")?;
+    if !found_empty {
+        if cfg_prompt_yes_no("save_valid", "Save valid usernames?", false).await? {
+            let filename = cfg_prompt_output_file("valid_output", "What should the valid results be saved as?", "smtp_valid_users.txt").await?;
             if filename.is_empty() {
-                println!("{}", "[-] Filename cannot be empty.".red());
+                crate::mprintln!("{}", "[-] Filename cannot be empty.".red());
             } else {
+                let found_guard = found.lock().unwrap_or_else(|e| e.into_inner());
                 save_results(&filename, &found_guard)?;
-                println!("{}", format!("[+] Results saved to {}", filename).green());
+                crate::mprintln!("{}", format!("[+] Results saved to {}", filename).green());
             }
         }
     }
-    drop(found_guard);
 
-    let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
-    if !unknown_guard.is_empty() {
-        println!(
-            "{}",
-            format!(
-                "[?] Collected {} unknown VRFY response(s).",
-                unknown_guard.len()
-            )
-            .yellow()
-            .bold()
-        );
+    let unknown_has_data = {
+        let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
+        if !unknown_guard.is_empty() {
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[?] Collected {} unknown VRFY response(s).",
+                    unknown_guard.len()
+                )
+                .yellow()
+                .bold()
+            );
+            true
+        } else {
+            false
+        }
+    }; // guard dropped before await
 
-        if cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false)?
-        {
+    if unknown_has_data {
+        if cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false).await? {
             let default_name = "smtp_unknown_responses.txt";
-            let chosen = cfg_prompt_output_file("unknown_output", "What should the unknown results be saved as?", default_name)?;
-
+            let chosen = cfg_prompt_output_file("unknown_output", "What should the unknown results be saved as?", default_name).await?;
+            let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = save_unknown_responses(&chosen, &unknown_guard) {
-                println!(
+                crate::mprintln!(
                     "{}",
                     format!("[!] Failed to save unknown responses: {}", e).red()
                 );
             } else {
-                println!(
+                crate::mprintln!(
                     "{}",
                     format!("[+] Unknown responses saved to {}", chosen).green()
                 );
@@ -764,6 +837,17 @@ fn normalize_target(host: &str, port: u16) -> Result<String> {
         Err(anyhow!("DNS resolution failed: {}", formatted))
     } else {
         Ok(formatted)
+    }
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SMTP User Enumeration".to_string(),
+        description: "Enumerates valid usernames on SMTP servers using VRFY commands with wordlist-based concurrent scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
     }
 }
 

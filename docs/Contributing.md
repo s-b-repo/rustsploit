@@ -26,10 +26,54 @@ Contributions are welcome — bug reports, new modules, framework improvements, 
 | Exploit | `src/modules/exploits/<vendor_or_category>/` |
 | Scanner | `src/modules/scanners/` |
 | Credential | `src/modules/creds/generic/` or `creds/<vendor>/` |
+| Plugin | `src/modules/plugins/` |
 
 Use subfolders for vendor families (e.g., `exploits/cisco/`, `exploits/cameras/`).
 
+### Recommended: Add Module Metadata
+
+Consider adding `info()` and/or `check()` functions to your module:
+
+```rust
+use crate::module_info::{ModuleInfo, ModuleRank, CheckResult};
+
+pub fn info() -> ModuleInfo {
+    ModuleInfo {
+        name: "My Module".to_string(),
+        description: "What this module does.".to_string(),
+        authors: vec!["Your Name".to_string()],
+        references: vec!["CVE-XXXX-YYYY".to_string()],
+        disclosure_date: Some("2025-01-15".to_string()),
+        rank: ModuleRank::Good,
+    }
+}
+
+pub async fn check(target: &str) -> CheckResult {
+    // Non-destructive verification only
+    CheckResult::Unknown("Not implemented".to_string())
+}
+```
+
+### Auto-Store Findings
+
+If your module discovers credentials, hosts, or services, use the framework helpers:
+
+```rust
+crate::cred_store::store_credential(host, port, "ssh", user, pass,
+    crate::cred_store::CredType::Password, "my_module");
+crate::workspace::track_host(ip, Some("hostname"), None);
+crate::workspace::track_service(ip, 22, "tcp", "ssh", Some("OpenSSH 8.9"));
+```
+
 ---
+
+## Code Rules
+
+These rules are enforced across the entire codebase:
+
+- **No `unsafe` blocks.** Do not use `unsafe` Rust anywhere in this codebase.
+- **No dead code.** All code must be intentional and used. Do not leave unused functions, imports, or variables.
+- **All prompts must use `cfg_prompt_*()` variants** (from `src/utils/prompt.rs`), not raw `prompt_*()` functions. The `cfg_prompt_*` functions check API custom_prompts and global options before falling back to interactive stdin, which is required for API compatibility. Using raw prompt functions will cause modules to block when called via the API.
 
 ## Code Style
 

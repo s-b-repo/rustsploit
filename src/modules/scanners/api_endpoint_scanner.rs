@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines};
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::native::payload_engine::{self as payload_mutator, PayloadCategory, MutatorConfig};
 use serde_json::json;
 
@@ -114,23 +115,42 @@ struct GenericPayload {
 // =========================================================================
 
 pub async fn run(target: &str) -> Result<()> {
-    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   API Endpoint Pentest Module                             ║".cyan());
-    println!("{}", "║   Tests API endpoints for common issues                   ║".cyan());
-    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    if is_mass_scan_target(target) {
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "API-Scanner",
+            default_port: 80,
+            state_file: "api_endpoint_scanner_mass_state.log",
+            default_output: "api_endpoint_scanner_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    Some(format!("[{}] {}:{} API-Scanner open\n", ts, ip, port))
+                } else {
+                    None
+                }
+            }
+        }).await;
+    }
+
+    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   API Endpoint Pentest Module                             ║".cyan());
+    crate::mprintln!("{}", "║   Tests API endpoints for common issues                   ║".cyan());
+    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 
     // 1. Input parsing & Configuration
-    let output_dir_name = cfg_prompt_default("output_dir", "Output directory name", "api_scan_results")?;
-    let use_spoofing = cfg_prompt_yes_no("use_spoofing", "Enable IP Spoofing/Bypass headers logic? (Applies to all selected modules)", false)?;
-    let use_generic_payload = cfg_prompt_yes_no("use_generic_payload", "Send generic JSON payload with POST/PUT/PATCH? (Better for API compatibility)", true)?;
+    let output_dir_name = cfg_prompt_default("output_dir", "Output directory name", "api_scan_results").await?;
+    let use_spoofing = cfg_prompt_yes_no("use_spoofing", "Enable IP Spoofing/Bypass headers logic? (Applies to all selected modules)", false).await?;
+    let use_generic_payload = cfg_prompt_yes_no("use_generic_payload", "Send generic JSON payload with POST/PUT/PATCH? (Better for API compatibility)", true).await?;
     
     // Method Selection
     let mut methods = vec![Method::GET, Method::POST];
-    if cfg_prompt_yes_no("enable_delete", "Enable DELETE method? (WARNING: Destructive)", false)? {
+    if cfg_prompt_yes_no("enable_delete", "Enable DELETE method? (WARNING: Destructive)", false).await? {
         methods.push(Method::DELETE);
     }
-    if cfg_prompt_yes_no("enable_extended_methods", "Enable Extended HTTP methods (PUT, PATCH, HEAD, OPTIONS, CONNECT, TRACE, DEBUG)?", false)? {
+    if cfg_prompt_yes_no("enable_extended_methods", "Enable Extended HTTP methods (PUT, PATCH, HEAD, OPTIONS, CONNECT, TRACE, DEBUG)?", false).await? {
         methods.extend(vec![
             Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
             Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
@@ -138,14 +158,14 @@ pub async fn run(target: &str) -> Result<()> {
         ]);
     }
 
-    println!("1. Baseline (Standard Requests)");
-    println!("2. SQL Injection");
-    println!("3. NoSQL Injection");
-    println!("4. Command Injection");
-    println!("5. Path Traversal");
-    println!("6. ID/Payload Enumeration");
+    crate::mprintln!("1. Baseline (Standard Requests)");
+    crate::mprintln!("2. SQL Injection");
+    crate::mprintln!("3. NoSQL Injection");
+    crate::mprintln!("4. Command Injection");
+    crate::mprintln!("5. Path Traversal");
+    crate::mprintln!("6. ID/Payload Enumeration");
     
-    let module_selection = cfg_prompt_default("modules", "Selection", "1")?;
+    let module_selection = cfg_prompt_default("modules", "Selection", "1").await?;
     let mut modules = Vec::new();
     
     for s in module_selection.split(',') {
@@ -156,7 +176,7 @@ pub async fn run(target: &str) -> Result<()> {
             "4" => modules.push(ScanModule::CMDi),
             "5" => modules.push(ScanModule::PathTraversal),
             "6" => modules.push(ScanModule::IdEnumeration),
-            _ => println!("{}", format!("Invalid module selection: {}", s).yellow()),
+            _ => crate::mprintln!("{}", format!("Invalid module selection: {}", s).yellow()),
         }
     }
     if use_spoofing {
@@ -168,40 +188,40 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No modules selected!"));
     }
 
-    let concurrency = cfg_prompt_int_range("concurrency", "Concurrency limit", 10, 1, 100)? as usize;
+    let concurrency = cfg_prompt_int_range("concurrency", "Concurrency limit", 10, 1, 100).await? as usize;
     
     // Bug 10: Configurable timeout
-    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 10, 1, 60)? as u64;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 10, 1, 60).await? as u64;
 
     // Injection Attacks Configuration
     let sqli_payloads = if modules.contains(&ScanModule::SQLi) {
-        configure_injection_payloads("SQL", SQLI_PAYLOADS)?
+        configure_injection_payloads("SQL", SQLI_PAYLOADS).await?
     } else { None };
 
     let nosqli_payloads = if modules.contains(&ScanModule::NoSQLi) {
-        configure_injection_payloads("NoSQL", NOSQLI_PAYLOADS)?
+        configure_injection_payloads("NoSQL", NOSQLI_PAYLOADS).await?
     } else { None };
 
     let cmdi_payloads = if modules.contains(&ScanModule::CMDi) {
-        configure_injection_payloads("Command", CMDI_PAYLOADS)?
+        configure_injection_payloads("Command", CMDI_PAYLOADS).await?
     } else { None };
 
     let traversal_payloads = if modules.contains(&ScanModule::PathTraversal) {
-        configure_injection_payloads("Path Traversal", TRAVERSAL_PAYLOADS)?
+        configure_injection_payloads("Path Traversal", TRAVERSAL_PAYLOADS).await?
     } else { None };
 
     // ID Enumeration Configuration
     let (id_start, id_end, id_file_path) = if modules.contains(&ScanModule::IdEnumeration) {
-        println!("\n{}", "Configure ID/Payload Enumeration:".cyan().bold());
-        println!("1. Numeric Range (e.g. 1-100)");
-        println!("2. File List (e.g. valid_ids.txt)");
-        let enum_choice = cfg_prompt_default("enum_mode", "Selection", "1")?;
+        crate::mprintln!("\n{}", "Configure ID/Payload Enumeration:".cyan().bold());
+        crate::mprintln!("1. Numeric Range (e.g. 1-100)");
+        crate::mprintln!("2. File List (e.g. valid_ids.txt)");
+        let enum_choice = cfg_prompt_default("enum_mode", "Selection", "1").await?;
         
         if enum_choice == "2" {
-            (None, None, Some(cfg_prompt_existing_file("id_file", "Path to ID/Payload file")?))
+            (None, None, Some(cfg_prompt_existing_file("id_file", "Path to ID/Payload file").await?))
         } else {
-             let start = cfg_prompt_int_range("id_start", "Start ID", 1, 0, 1000000)? as usize;
-             let end = cfg_prompt_int_range("id_end", "End ID", 100, start as i64, 1000000)? as usize;
+             let start = cfg_prompt_int_range("id_start", "Start ID", 1, 0, 1000000).await? as usize;
+             let end = cfg_prompt_int_range("id_end", "End ID", 100, start as i64, 1000000).await? as usize;
              if start > end {
                  return Err(anyhow!("Start ID must be less than or equal to End ID"));
              }
@@ -214,21 +234,21 @@ pub async fn run(target: &str) -> Result<()> {
     // Mutation Engine Configuration
     let has_injection = modules.iter().any(|m| matches!(m, ScanModule::SQLi | ScanModule::NoSQLi | ScanModule::CMDi | ScanModule::PathTraversal));
     let mutation_enabled = if has_injection {
-        println!("\n{}", "Dynamic Payload Mutation Engine:".cyan().bold());
-        cfg_prompt_yes_no("enable_mutations", "Enable dynamic payload mutations? (WAF bypass, exhaustive encoding)", true)?
+        crate::mprintln!("\n{}", "Dynamic Payload Mutation Engine:".cyan().bold());
+        cfg_prompt_yes_no("enable_mutations", "Enable dynamic payload mutations? (WAF bypass, exhaustive encoding)", true).await?
     } else {
         false
     };
 
     let mutator_config = if mutation_enabled {
-        let depth = cfg_prompt_int_range("mutation_depth", "Mutation depth (generations of mutations)", 3, 1, 10)? as usize;
-        let max_variants = cfg_prompt_int_range("max_variants", "Max variants per seed payload", 15, 1, 50)? as usize;
-        let max_total = cfg_prompt_int_range("max_total_payloads", "Max total payloads per category", 500, 10, 5000)? as usize;
+        let depth = cfg_prompt_int_range("mutation_depth", "Mutation depth (generations of mutations)", 3, 1, 10).await? as usize;
+        let max_variants = cfg_prompt_int_range("max_variants", "Max variants per seed payload", 15, 1, 50).await? as usize;
+        let max_total = cfg_prompt_int_range("max_total_payloads", "Max total payloads per category", 500, 10, 5000).await? as usize;
         let traversal_depth = if modules.contains(&ScanModule::PathTraversal) {
-            cfg_prompt_int_range("traversal_max_depth", "Max traversal directory depth", 15, 1, 30)? as usize
+            cfg_prompt_int_range("traversal_max_depth", "Max traversal directory depth", 15, 1, 30).await? as usize
         } else { 15 };
-        let exhaustive = cfg_prompt_yes_no("exhaustive_encoding", "Exhaustive encoding chains? (tries every combination)", true)?;
-        println!("[+] Mutation engine: depth={}, max_variants={}, max_total={}, exhaustive={}",
+        let exhaustive = cfg_prompt_yes_no("exhaustive_encoding", "Exhaustive encoding chains? (tries every combination)", true).await?;
+        crate::mprintln!("[+] Mutation engine: depth={}, max_variants={}, max_total={}, exhaustive={}",
             depth, max_variants, max_total, exhaustive);
         MutatorConfig {
             depth,
@@ -248,29 +268,26 @@ pub async fn run(target: &str) -> Result<()> {
         format!("https://{}", target.trim_end_matches('/'))
     };
 
-    println!("[*] Using target: {}", target_base.cyan());
+    crate::mprintln!("[*] Using target: {}", target_base.cyan());
 
     // 2. Endpoint Source Selection
-    println!("\n{}", "Select Endpoint Source:".cyan().bold());
-    println!("1. Load from file (Known endpoints)");
-    println!("2. Brute-force/Enumerate (Discover using wordlist)");
-    let source_choice = cfg_prompt_default("endpoint_source", "Selection", "1")?;
+    crate::mprintln!("\n{}", "Select Endpoint Source:".cyan().bold());
+    crate::mprintln!("1. Load from file (Known endpoints)");
+    crate::mprintln!("2. Brute-force/Enumerate (Discover using wordlist)");
+    let source_choice = cfg_prompt_default("endpoint_source", "Selection", "1").await?;
 
     let mut endpoints = if source_choice == "2" {
         // Enumerate
-        let base_path = cfg_prompt_default("base_path", "Base Path (e.g. /api/)", "/")?;
-        let wordlist_path = cfg_prompt_wordlist("wordlist", "Wordlist path")?;
+        let base_path = cfg_prompt_default("base_path", "Base Path (e.g. /api/)", "/").await?;
+        let wordlist_path = cfg_prompt_wordlist("wordlist", "Wordlist path").await?;
         
         // Setup simple client for enumeration
-        let enum_client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?;
+        let enum_client = crate::utils::build_http_client(std::time::Duration::from_secs(5))?;
             
         enumerate_endpoints(&enum_client, &target_base, &base_path, &wordlist_path, concurrency).await?
     } else {
         // Load from file
-        let endpoint_file = cfg_prompt_existing_file("endpoint_file", "Path to endpoint list file")?;
+        let endpoint_file = cfg_prompt_existing_file("endpoint_file", "Path to endpoint list file").await?;
         parse_endpoint_file(&endpoint_file)?
     };
     
@@ -281,20 +298,16 @@ pub async fn run(target: &str) -> Result<()> {
     if endpoints.is_empty() {
         return Err(anyhow!("No valid endpoints found/discovered. Exiting."));
     }
-    println!("[*] Processing {} endpoints", endpoints.len().to_string().cyan());
+    crate::mprintln!("[*] Processing {} endpoints", endpoints.len().to_string().cyan());
 
     // 3. Setup Client
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .context("Failed to build HTTP client")?;
+    let client = crate::utils::build_http_client(std::time::Duration::from_secs(timeout_secs))?;
 
     // 4. Create Output Directory
     fs::create_dir_all(&output_dir_name).context("Failed to create output directory")?;
     // Get absolute path for logging
     let abs_output_dir = fs::canonicalize(&output_dir_name)?;
-    println!("[*] Saving results to: {}", abs_output_dir.display().to_string().cyan());
+    crate::mprintln!("[*] Saving results to: {}", abs_output_dir.display().to_string().cyan());
 
     let config = Arc::new(ScanConfig {
         target_base,
@@ -315,7 +328,7 @@ pub async fn run(target: &str) -> Result<()> {
     let client = Arc::new(client);
 
     // 5. Run Concurrent Scan
-    println!("{}", "\n[*] Starting scan...".cyan().bold());
+    crate::mprintln!("{}", "\n[*] Starting scan...".cyan().bold());
     let start_time = Instant::now();
     let counter = Arc::new(AtomicUsize::new(0));
     let total = endpoints.len();
@@ -329,9 +342,9 @@ pub async fn run(target: &str) -> Result<()> {
                 let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
                 // Print progress occasionally
                 if current % 10 == 0 || current == total {
-                    print!("\r[*] Progress: {}/{}", current, total);
+                    crate::mprint!("\r[*] Progress: {}/{}", current, total);
                     if let Err(e) = std::io::stdout().flush() {
-                        eprintln!("\n[!] Failed to flush stdout: {}", e);
+                        crate::meprintln!("\n[!] Failed to flush stdout: {}", e);
                     }
                 }
                 
@@ -343,9 +356,9 @@ pub async fn run(target: &str) -> Result<()> {
     // Collect all results
     let results: Vec<()> = stream.collect().await;
 
-    println!("\n{}", "\n[+] Scan completed!".green().bold());
-    println!("[+] Processed {} endpoints.", results.len());
-    println!("Time elapsed: {:.2?}", start_time.elapsed());
+    crate::mprintln!("\n{}", "\n[+] Scan completed!".green().bold());
+    crate::mprintln!("[+] Processed {} endpoints.", results.len());
+    crate::mprintln!("Time elapsed: {:.2?}", start_time.elapsed());
     Ok(())
 }
 
@@ -353,17 +366,17 @@ pub async fn run(target: &str) -> Result<()> {
 //                             SETUP HELPERS
 // =========================================================================
 
-fn configure_injection_payloads(name: &str, default_payloads: &[&str]) -> Result<Option<Vec<String>>> {
-    println!(); // Add spacing
-    if !cfg_prompt_yes_no(&format!("test_{}", name.to_lowercase()), &format!("Test for {} Injection?", name), false)? {
+async fn configure_injection_payloads(name: &str, default_payloads: &[&str]) -> Result<Option<Vec<String>>> {
+    crate::mprintln!(); // Add spacing
+    if !cfg_prompt_yes_no(&format!("test_{}", name.to_lowercase()), &format!("Test for {} Injection?", name), false).await? {
         return Ok(None);
     }
 
-    if cfg_prompt_yes_no(&format!("default_{}_payloads", name.to_lowercase()), &format!("Use default {} payloads?", name), true)? {
+    if cfg_prompt_yes_no(&format!("default_{}_payloads", name.to_lowercase()), &format!("Use default {} payloads?", name), true).await? {
         return Ok(Some(default_payloads.iter().map(|&s| s.to_string()).collect()));
     }
 
-    let file_path = cfg_prompt_existing_file(&format!("{}_payload_file", name.to_lowercase()), &format!("Path to custom {} payload file", name))?;
+    let file_path = cfg_prompt_existing_file(&format!("{}_payload_file", name.to_lowercase()), &format!("Path to custom {} payload file", name)).await?;
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let payloads: Vec<String> = reader.lines()
@@ -405,21 +418,21 @@ fn parse_endpoint_file(path: &str) -> Result<Vec<Endpoint>> {
             });
         } else {
              // Should not happen due to is_empty check, but good to report if logic changes
-             println!("{}", format!("[!] Skipping line {} - unknown format: '{}'", idx + 1, line).yellow());
+             crate::mprintln!("{}", format!("[!] Skipping line {} - unknown format: '{}'", idx + 1, line).yellow());
         }
     }
     Ok(endpoints)
 }
 
 async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str, wordlist_path: &str, concurrency: usize) -> Result<Vec<Endpoint>> {
-    println!("{}", "\n[*] Starting Endpoint Enumeration...".cyan());
+    crate::mprintln!("{}", "\n[*] Starting Endpoint Enumeration...".cyan());
     
     let lines = load_lines(wordlist_path)?;
     if lines.is_empty() {
         return Err(anyhow!("Wordlist is empty"));
     }
     let total = lines.len();
-    println!("[*] Enumerating {} potential endpoints with concurrency {}", total, concurrency);
+    crate::mprintln!("[*] Enumerating {} potential endpoints with concurrency {}", total, concurrency);
     
     let base_url = format!("{}{}", 
         target_base.trim_end_matches('/'), 
@@ -443,7 +456,7 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
             async move {
                 let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
                  if current % 50 == 0 || current == total {
-                    print!("\r[*] Brute-force Progress: {}/{}", current, total);
+                    crate::mprint!("\r[*] Brute-force Progress: {}/{}", current, total);
                 if let Err(_e) = std::io::stdout().flush() {
                     // Ignore flush errors in tough loops
                 }
@@ -480,14 +493,14 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
         .collect()
         .await;
 
-    println!(); // Newline after progress
+    crate::mprintln!(); // Newline after progress
 
     if results.is_empty() {
-        println!("{}", "[-] No endpoints occurred.".yellow());
+        crate::mprintln!("{}", "[-] No endpoints occurred.".yellow());
     } else {
-        println!("{}", format!("[+] Discovered {} endpoints!", results.len()).green().bold());
+        crate::mprintln!("{}", format!("[+] Discovered {} endpoints!", results.len()).green().bold());
         for ep in &results {
-            println!("    - {}", ep.path);
+            crate::mprintln!("    - {}", ep.path);
         }
     }
     
@@ -504,7 +517,7 @@ fn expand_with_mutations(seeds: &[String], category: PayloadCategory, config: &S
         return seeds.to_vec();
     }
     let mutated = payload_mutator::mutate_payloads(seeds, category, &config.mutator_config);
-    println!("  [~] {} seeds → {} payloads ({:?}, depth={})",
+    crate::mprintln!("  [~] {} seeds → {} payloads ({:?}, depth={})",
         seeds.len(), mutated.len(), category, config.mutator_config.depth);
     mutated
 }
@@ -529,7 +542,7 @@ async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint: Endpoint)
     let endpoint_dir = Path::new(&config.output_dir).join(&sanitized_key);
     
     if let Err(e) = fs::create_dir_all(&endpoint_dir) {
-        eprintln!("\n{}", format!("[!] Failed to create dir for {}: {}", endpoint.key, e).red());
+        crate::meprintln!("\n{}", format!("[!] Failed to create dir for {}: {}", endpoint.key, e).red());
         return;
     }
 
@@ -592,13 +605,13 @@ async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint: Endpoint)
 async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir: &Path, config: &ScanConfig) {
     let enum_dir = dir.join("enumeration");
     if let Err(e) = fs::create_dir_all(&enum_dir) {
-        eprintln!("[!] Failed to create enumeration directory: {}", e);
+        crate::meprintln!("[!] Failed to create enumeration directory: {}", e);
         return;
     }
     
     let bodies_dir = enum_dir.join("bodies");
     if let Err(e) = fs::create_dir_all(&bodies_dir) {
-        eprintln!("[!] Failed to create bodies directory: {}", e);
+        crate::meprintln!("[!] Failed to create bodies directory: {}", e);
         return;
     }
 
@@ -607,7 +620,7 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
     let mut results_file_handle = match OpenOptions::new().create(true).append(true).open(&results_file) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("[!] Failed to open results file: {}", e);
+            crate::meprintln!("[!] Failed to open results file: {}", e);
             return;
         }
     };
@@ -667,7 +680,7 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
                       // Log hit with shared handle
                       // Log hit with shared handle
                       if let Err(e) = run_enum_logging_handle(&mut results_file_handle, &payload, &label, status, &target_url) {
-                          eprintln!("[!] Logging failed: {}", e);
+                          crate::meprintln!("[!] Logging failed: {}", e);
                       }
                       
                       // If 200, save body
@@ -677,9 +690,11 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
                                 Ok(b) => b,
                                 Err(_) => bytes::Bytes::new(),
                             };
-                            if let Ok(mut f) = File::create(body_file) {
+                            if let Ok(mut f) = File::create(&body_file) {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(&body_file, std::fs::Permissions::from_mode(0o600));
                                 if let Err(e) = f.write_all(&body) {
-                                    eprintln!("[!] Failed to write body: {}", e);
+                                    crate::meprintln!("[!] Failed to write body: {}", e);
                                 }
                             }
                        }
@@ -776,14 +791,14 @@ async fn perform_request(client: &Client, url: &str, method: Method, result_file
     match req_builder.send().await {
         Ok(resp) => {
             if let Err(e) = log_response(resp, result_file, &full_label, url, user_agent).await {
-                eprintln!("\n{}", format!("[!] Failed to log response for {}: {}", full_label, e).red());
+                crate::meprintln!("\n{}", format!("[!] Failed to log response for {}: {}", full_label, e).red());
             }
         },
         Err(e) => {
              // Log error to file
              if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(result_file) {
                  if let Err(write_err) = writeln!(file, "=== {} {} ===\nError: {}\n", full_label, url, e) {
-                     eprintln!("[!] Failed to write error log: {}", write_err);
+                     crate::meprintln!("[!] Failed to write error log: {}", write_err);
                  }
              }
         }
@@ -812,15 +827,23 @@ async fn log_response(resp: Response, path: &Path, method: &str, url: &str, user
         }
     }
 
-    // Streaming check or limited read
-    let body_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-             // Don't fail the whole log just for body read error
-             writeln!(file, "Failed to read body: {}", e)?;
-             return Ok(());
+    // Streaming check: cap body at 5MB to prevent OOM when Content-Length is missing
+    let max_body = 5_000_000usize;
+    let mut body_data = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk_bytes) => {
+                body_data.extend_from_slice(&chunk_bytes);
+                if body_data.len() > max_body {
+                    writeln!(file, "  Body truncated (exceeded {}B limit)", max_body)?;
+                    break;
+                }
+            }
+            Err(_) => break,
         }
-    };
+    }
+    let body_bytes = bytes::Bytes::from(body_data);
     let body_len = body_bytes.len();
     let max_len = 1_000_000;
     let truncated = body_len > max_len;
@@ -854,4 +877,15 @@ async fn log_response(resp: Response, path: &Path, method: &str, url: &str, user
     writeln!(file, "=======================================================\n")?;
 
     Ok(())
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "API Endpoint Scanner".to_string(),
+        description: "Comprehensive REST API endpoint discovery and vulnerability scanner with fuzzing, authentication bypass, and injection detection.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }

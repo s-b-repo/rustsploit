@@ -1,12 +1,20 @@
 # Utilities & Helpers
 
-Rustsploit provides three utility modules that every module developer should know:
+Rustsploit provides several utility modules that every module developer should know:
 
 | Module | Import Path | Purpose |
 |--------|-------------|---------|
 | **Core Utils** | `crate::utils` | Target normalization, file loading, config-aware prompts, input validation |
 | **Creds Utils** | `crate::modules::creds::utils` | Bruteforce statistics, subnet helpers, IP exclusion, scan state tracking |
 | **Config** | `crate::config` | Global target state, module config, API prompt keys, results directory |
+| **Global Options** | `crate::global_options` | Persistent `setg` options — checked by `cfg_prompt_*` after custom_prompts |
+| **Cred Store** | `crate::cred_store` | Store/query discovered credentials. Call `store_credential()` from modules |
+| **Workspace** | `crate::workspace` | Track hosts/services. Call `track_host()` / `track_service()` from modules |
+| **Loot** | `crate::loot` | Store collected evidence. Call `store_loot()` from modules |
+| **Module Info** | `crate::module_info` | `ModuleInfo`, `ModuleRank`, `CheckResult` types for `info()`/`check()` |
+| **Spool** | `crate::spool` | Console output logging. Call `spool::sprintln()` for spool-aware output |
+| **Jobs** | `crate::jobs` | Background job management via `JOB_MANAGER` |
+| **Export** | `crate::export` | Export engagement data to JSON/CSV/summary |
 
 ---
 
@@ -67,6 +75,25 @@ let target = normalize_target(user_input)?;
 ### Config-Aware Prompt Wrappers (`cfg_prompt_*`)
 
 These are the **recommended prompts for module authors**. They check `ModuleConfig.custom_prompts` first (populated by the API), falling back to interactive stdin when running in shell mode. This makes your module work seamlessly in both shell and API modes.
+
+#### `cfg_prompt_required(key, msg) → Result<String>`
+
+Required string prompt with no default. In API mode, errors if the key is missing from `custom_prompts`. Priority: custom_prompts > run_context target (for "target" key) > global_options > interactive stdin.
+
+```rust
+use crate::utils::cfg_prompt_required;
+
+let community = cfg_prompt_required("community", "SNMP community string").await?;
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `key` | `&str` | Lookup key in `ModuleConfig.custom_prompts` |
+| `msg` | `&str` | Prompt message shown to user in shell mode |
+
+**Errors** in API mode if key is missing (required field).
+
+---
 
 #### `cfg_prompt_yes_no(key, msg, default_yes) → Result<bool>`
 
@@ -176,6 +203,26 @@ let output = cfg_prompt_output_file("output_file", "Output file", "results.txt")
 
 ---
 
+#### `cfg_prompt_wordlist(key, msg) → Result<String>`
+
+Wordlist file prompt. Validates the file exists, rejects path traversal and unsafe paths (same security as `cfg_prompt_existing_file`). Priority: custom_prompts > global_options > interactive stdin.
+
+```rust
+use crate::utils::cfg_prompt_wordlist;
+
+let wordlist = cfg_prompt_wordlist("wordlist", "Path to wordlist file").await?;
+let lines = load_lines(&wordlist)?;
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `key` | `&str` | Prompt key for API mode |
+| `msg` | `&str` | Interactive prompt message |
+
+**Errors** in API mode if key is missing (required field). Also errors if the file does not exist.
+
+---
+
 ### Complete Module Integration Example
 
 Here's a typical module using all the core utils together:
@@ -183,8 +230,9 @@ Here's a typical module using all the core utils together:
 ```rust
 use crate::utils::{
     load_lines, normalize_target,
-    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_default, cfg_prompt_port, cfg_prompt_output_file,
+    cfg_prompt_required, cfg_prompt_yes_no, cfg_prompt_existing_file,
+    cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_port,
+    cfg_prompt_output_file, cfg_prompt_wordlist,
 };
 
 pub async fn run(target: &str) -> anyhow::Result<()> {
@@ -479,7 +527,7 @@ pub enum TargetConfig {
 
 ### `ModuleConfig` & API Prompt Keys
 
-`ModuleConfig` bridges modules to the API. When the API server receives a `/api/run` request, it populates a `ModuleConfig` with the JSON `"prompts"` object. The `cfg_prompt_*` functions in `utils.rs` read these values instead of prompting stdin.
+`ModuleConfig` bridges modules to the API. When the API server receives a `/api/run` request, it populates a `ModuleConfig` with the JSON `"prompts"` object. The `cfg_prompt_*` functions in `src/utils/prompt.rs` read these values instead of prompting stdin.
 
 #### Struct Fields
 
@@ -567,14 +615,13 @@ std::fs::write(&out_path, results)?;
 | `MAX_MODULE_PATH_LENGTH` | 512 | Maximum module path length |
 | `MAX_COMMAND_LENGTH` | 8192 | Maximum command/input length |
 | `MAX_PATH_LENGTH` | 4096 | Maximum file path length |
-| `MAX_DEPTH` | 6 | Maximum module discovery depth |
 | `MAX_HOSTNAME_LENGTH` | 253 | Maximum hostname length (config.rs) |
 
 ---
 
 ## Extending Utils
 
-Add new reusable helpers to `utils.rs`, `creds/utils.rs`, or `config.rs` rather than copy-pasting into individual modules. Common candidates:
+Add new reusable helpers to `src/utils/` (the appropriate submodule: `prompt.rs`, `sanitize.rs`, `target.rs`, `network.rs`, or `modules.rs`), `creds/utils.rs`, or `config.rs` rather than copy-pasting into individual modules. Common candidates:
 - HTTP header templates
 - Response fingerprinting helpers
 - Common error formatters

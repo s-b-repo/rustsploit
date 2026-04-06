@@ -8,7 +8,9 @@ use std::fs;
 use std::time::{Duration, Instant};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
+    safe_read_to_string,
 };
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const METHODS: &[&str] = &[
     "GET",
@@ -36,45 +38,67 @@ struct TargetResult {
 }
 
 pub async fn run(initial_target: &str) -> Result<()> {
+    if crate::utils::get_global_source_port().await.is_some() {
+        crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
+    }
+    if is_mass_scan_target(initial_target) {
+        return run_mass_scan(initial_target, MassScanConfig {
+            protocol_name: "HTTP-Methods",
+            default_port: 80,
+            state_file: "http_method_scanner_mass_state.log",
+            default_output: "http_method_scanner_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    Some(format!("[{}] {}:{} HTTP-Methods open\n", ts, ip, port))
+                } else {
+                    None
+                }
+            }
+        }).await;
+    }
+
     banner();
 
     let mut targets = collect_initial_targets(initial_target);
 
-    let additional = cfg_prompt_default("additional_targets", "Enter additional comma-separated targets (optional)", "")?;
+    let additional = cfg_prompt_default("additional_targets", "Enter additional comma-separated targets (optional)", "").await?;
     if !additional.is_empty() {
         targets.extend(split_targets(&additional));
     }
 
-    let file_path = cfg_prompt_default("target_file", "Path to file with targets (optional)", "")?;
+    let file_path = cfg_prompt_default("target_file", "Path to file with targets (optional)", "").await?;
     if !file_path.is_empty() {
         let file_targets = load_targets_from_file(&file_path)?;
         targets.extend(file_targets);
     }
 
-    let default_scheme_input = cfg_prompt_default("scheme", "Preferred scheme (http/https)", "https")?;
+    let default_scheme_input = cfg_prompt_default("scheme", "Preferred scheme (http/https)", "https").await?;
     let default_scheme = match default_scheme_input.to_lowercase().as_str() {
         "http" => "http",
         _ => "https",
     };
 
-    let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false)?;
+    let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false).await?;
     let ports = if use_ports {
-        let ports_str = cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "")?;
+        let ports_str = cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "").await?;
         parse_ports_from_string(&ports_str)
     } else {
         Vec::new()
     };
 
-    let timeout_secs = cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120)? as u64;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120).await? as u64;
 
-    let verbose = cfg_prompt_yes_no("verbose", "Enable verbose output?", false)?;
-    let save_output = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Enable verbose output?", false).await?;
+    let save_output = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
 
     let mut normalized = normalize_targets(targets, default_scheme);
     if !ports.is_empty() {
         let expanded = expand_targets_with_ports(&normalized, &ports);
         if expanded.is_empty() {
-            println!("[!] No valid port combinations derived; continuing without port tunneling.");
+            crate::mprintln!("[!] No valid port combinations derived; continuing without port tunneling.");
         } else {
             normalized = expanded;
         }
@@ -85,6 +109,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
+    .danger_accept_invalid_certs(true)
     .user_agent("RustSploit-HTTP-Method-Scanner/1.0")
     .timeout(Duration::from_secs(timeout_secs))
     .redirect(reqwest::redirect::Policy::limited(5))
@@ -96,11 +121,11 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let mut total_errors = 0usize;
     let start_time = Instant::now();
 
-    println!("{}", format!("[*] Scanning {} target(s) with {} methods each...", 
+    crate::mprintln!("{}", format!("[*] Scanning {} target(s) with {} methods each...", 
         normalized.len(), METHODS.len()).cyan().bold());
 
     for target in &normalized {
-        println!("\n{}", format!("=== Target: {} ===", target).bold());
+        crate::mprintln!("\n{}", format!("=== Target: {} ===", target).bold());
         let mut method_results = Vec::new();
 
         for &method_name in METHODS {
@@ -129,15 +154,15 @@ pub async fn run(initial_target: &str) -> Result<()> {
                     if ok {
                         total_success += 1;
                         if verbose {
-                            println!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).green());
+                            crate::mprintln!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).green());
                         } else {
-                            println!("{}", format!("  [{}] {}", method_name, status).green());
+                            crate::mprintln!("{}", format!("  [{}] {}", method_name, status).green());
                         }
                     } else {
                         if verbose {
-                            println!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).yellow());
+                            crate::mprintln!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).yellow());
                         } else {
-                            println!("{}", format!("  [{}] {}", method_name, status).yellow());
+                            crate::mprintln!("{}", format!("  [{}] {}", method_name, status).yellow());
                         }
                     }
                     method_results.push(MethodResult {
@@ -151,9 +176,9 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 Err(err) => {
                     total_errors += 1;
                     if verbose {
-                        println!("{}", format!("  [{}] {} -> error: {} ({:.2?})", method_name, target, err, elapsed).red());
+                        crate::mprintln!("{}", format!("  [{}] {} -> error: {} ({:.2?})", method_name, target, err, elapsed).red());
                     } else {
-                        println!("{}", format!("  [{}] error: {}", method_name, err).red());
+                        crate::mprintln!("{}", format!("  [{}] error: {}", method_name, err).red());
                     }
                     method_results.push(MethodResult {
                         method: method_name,
@@ -176,16 +201,16 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let total_requests = normalized.len() * METHODS.len();
 
     // Print statistics
-    println!();
-    println!("{}", "=== Scan Statistics ===".bold());
-    println!("  Targets:        {}", normalized.len());
-    println!("  Methods tested: {}", METHODS.len());
-    println!("  Total requests: {}", total_requests);
-    println!("  Successful:     {}", total_success.to_string().green());
-    println!("  Errors:         {}", total_errors.to_string().red());
-    println!("  Duration:       {:.2}s", total_elapsed.as_secs_f64());
+    crate::mprintln!();
+    crate::mprintln!("{}", "=== Scan Statistics ===".bold());
+    crate::mprintln!("  Targets:        {}", normalized.len());
+    crate::mprintln!("  Methods tested: {}", METHODS.len());
+    crate::mprintln!("  Total requests: {}", total_requests);
+    crate::mprintln!("  Successful:     {}", total_success.to_string().green());
+    crate::mprintln!("  Errors:         {}", total_errors.to_string().red());
+    crate::mprintln!("  Duration:       {:.2}s", total_elapsed.as_secs_f64());
     if total_elapsed.as_secs() > 0 {
-        println!("  Rate:           {:.1} requests/s", total_requests as f64 / total_elapsed.as_secs_f64());
+        crate::mprintln!("  Rate:           {:.1} requests/s", total_requests as f64 / total_elapsed.as_secs_f64());
     }
 
     if save_output {
@@ -193,21 +218,21 @@ pub async fn run(initial_target: &str) -> Result<()> {
             "http_method_scan_{}.txt",
             Utc::now().format("%Y%m%d_%H%M%S")
         );
-        let output_path = cfg_prompt_output_file("output_file", "Enter output file path", &default_name)?;
+        let output_path = cfg_prompt_output_file("output_file", "Enter output file path", &default_name).await?;
         write_report(&output_path, &all_results)?;
-        println!("[*] Results saved to {}", output_path);
+        crate::mprintln!("[*] Results saved to {}", output_path);
     }
 
-    println!("\n[*] Scan complete.");
+    crate::mprintln!("\n[*] Scan complete.");
     Ok(())
 }
 
 fn banner() {
-    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   HTTP Method Capability Scanner                             ║".cyan());
-    println!("{}", "║   Checks support for common HTTP verbs (GET, POST, etc.)     ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   HTTP Method Capability Scanner                             ║".cyan());
+    crate::mprintln!("{}", "║   Checks support for common HTTP verbs (GET, POST, etc.)     ║".cyan());
+    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 }
 
 fn collect_initial_targets(initial_target: &str) -> Vec<String> {
@@ -228,7 +253,7 @@ fn split_targets(input: &str) -> Vec<String> {
 }
 
 fn load_targets_from_file(path: &str) -> Result<Vec<String>> {
-    let data = fs::read_to_string(path)
+    let data = safe_read_to_string(path, None)
     .with_context(|| format!("Failed to read target file: {}", path))?;
     Ok(split_targets(&data))
 }
@@ -321,4 +346,15 @@ fn write_report(path: &str, results: &[TargetResult]) -> Result<()> {
 
     fs::write(path, lines.join("\n"))
     .with_context(|| format!("Failed to write report to {}", path))
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "HTTP Method Scanner".to_string(),
+        description: "Enumerates allowed HTTP methods on a target to identify dangerous or misconfigured endpoints.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }
