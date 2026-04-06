@@ -6,6 +6,7 @@ use tokio::time::{timeout, Duration};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_port,
 };
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::op::ResponseCode;
@@ -23,15 +24,33 @@ struct TargetSpec {
 }
 
 fn display_banner() {
-    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   DNS Recursion & Amplification Scanner                      ║".cyan());
-    println!("{}", "║   Detects open resolvers that may be abused for DoS attacks  ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   DNS Recursion & Amplification Scanner                      ║".cyan());
+    crate::mprintln!("{}", "║   Detects open resolvers that may be abused for DoS attacks  ║".cyan());
+    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 }
 
 /// Scan DNS resolvers for open recursion with improved input validation.
 pub async fn run(initial_target: &str) -> Result<()> {
+    if is_mass_scan_target(initial_target) {
+        return run_mass_scan(initial_target, MassScanConfig {
+            protocol_name: "DNS-Recursion",
+            default_port: 53,
+            state_file: "dns_recursion_mass_state.log",
+            default_output: "dns_recursion_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                let sock = crate::utils::udp_bind(None).await.ok()?;
+                let addr = format!("{}:{}", ip, port);
+                sock.send_to(&[0u8; 2], &addr).await.ok()?;
+                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                Some(format!("[{}] {}:{} DNS-Recursion open\n", ts, ip, port))
+            }
+        }).await;
+    }
+
     display_banner();
 
     let mut targets = vec![
@@ -44,19 +63,19 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     let needs_default_port = targets.iter().any(|t| t.port.is_none());
     let default_port = if needs_default_port {
-        cfg_prompt_port("port", "Default DNS port", 53)?
+        cfg_prompt_port("port", "Default DNS port", 53).await?
     } else {
         53
     };
 
-    let query_name_input = cfg_prompt_default("domain", "Domain to query", "google.com")?;
+    let query_name_input = cfg_prompt_default("domain", "Domain to query", "google.com").await?;
     let query_name = validate_domain_input(&query_name_input)?;
 
     let record_input =
-        cfg_prompt_default("record_type", "Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY")?;
+        cfg_prompt_default("record_type", "Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY").await?;
     let record_type = parse_record_type(&record_input)?;
 
-    println!(
+    crate::mprintln!(
         "[*] Prepared {} query for {} across {} target(s)",
         record_type,
         query_name,
@@ -72,12 +91,12 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let mut tested_count = 0usize;
     let start_time = std::time::Instant::now();
 
-    println!();
+    crate::mprintln!();
 
     for spec in targets.drain(..) {
         let port = spec.port.unwrap_or(default_port);
         let display = format_endpoint(&spec.host, port);
-        println!(
+        crate::mprintln!(
             "\n[*] Processing target {} (input: {})",
             display.cyan(),
             spec.input
@@ -87,11 +106,11 @@ pub async fn run(initial_target: &str) -> Result<()> {
         
         match resolve_target(&spec.host, port).await {
             Ok((socket_addr, resolved_display)) => {
-                println!("{}", format!("[*] Target resolver: {}", resolved_display).cyan());
+                crate::mprintln!("{}", format!("[*] Target resolver: {}", resolved_display).cyan());
                 match query_target(socket_addr, &resolved_display, &name, record_type, &mut vulnerable_count).await {
                     Ok(()) => any_success = true,
                     Err(err) => {
-                        eprintln!(
+                        crate::meprintln!(
                             "{}",
                             format!("[!] Query failed for {}: {}", resolved_display, err).red()
                         );
@@ -100,7 +119,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 }
             }
             Err(err) => {
-                eprintln!(
+                crate::meprintln!(
                     "{}",
                     format!("[!] Failed to resolve {}: {}", spec.input, err).red()
                 );
@@ -112,20 +131,20 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let elapsed = start_time.elapsed();
 
     // Print statistics
-    println!();
-    println!("{}", "=== Scan Statistics ===".bold());
-    println!("  Targets tested:       {}", tested_count);
-    println!("  Vulnerable (open):    {}", if vulnerable_count > 0 { 
+    crate::mprintln!();
+    crate::mprintln!("{}", "=== Scan Statistics ===".bold());
+    crate::mprintln!("  Targets tested:       {}", tested_count);
+    crate::mprintln!("  Vulnerable (open):    {}", if vulnerable_count > 0 { 
         vulnerable_count.to_string().red().bold().to_string() 
     } else { 
         "0".green().to_string() 
     });
-    println!("  Duration:             {:.2}s", elapsed.as_secs_f64());
+    crate::mprintln!("  Duration:             {:.2}s", elapsed.as_secs_f64());
 
     if vulnerable_count > 0 {
-        println!();
-        println!("{}", "[!] WARNING: Open recursive DNS resolvers detected!".red().bold());
-        println!("{}", "    These can be abused for DNS amplification attacks.".yellow());
+        crate::mprintln!();
+        crate::mprintln!("{}", "[!] WARNING: Open recursive DNS resolvers detected!".red().bold());
+        crate::mprintln!("{}", "    These can be abused for DNS amplification attacks.".yellow());
     }
 
     if any_success {
@@ -142,7 +161,7 @@ async fn query_target(
     record_type: RecordType,
     vulnerable_count: &mut usize,
 ) -> Result<()> {
-    println!(
+    crate::mprintln!(
         "[*] Sending {} query (timeout 5s) to {}",
         record_type, display_target
     );
@@ -179,8 +198,8 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
     let truncated = message.truncated();
     let rcode = message.response_code();
 
-    println!();
-    println!(
+    crate::mprintln!();
+    crate::mprintln!(
         "{}",
         format!(
             "[*] Response code: {:?} | Answers: {} | Authority: {} | Additional: {}",
@@ -192,16 +211,16 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
     );
 
     if truncated {
-        println!("{}", "[!] Response was truncated (TC flag set).".yellow());
+        crate::mprintln!("{}", "[!] Response was truncated (TC flag set).".yellow());
     }
 
-    println!(
+    crate::mprintln!(
         "{}",
         format!("[*] Flags: RD={} RA={} AA={}", recursion_desired, recursion_available, authoritative).dimmed()
     );
 
     if recursion_available && rcode != ResponseCode::Refused {
-        println!(
+        crate::mprintln!(
             "{}",
             format!(
                 "[+] {} appears to allow recursion (RA flag set) for {} {} queries.",
@@ -212,14 +231,14 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
             .green()
             .bold()
         );
-        println!(
+        crate::mprintln!(
             "{}",
             "    This resolver may be abused for reflection/amplification attacks (ANY/DNSSEC)."
                 .yellow()
         );
         true
     } else if recursion_available && rcode == ResponseCode::Refused {
-        println!(
+        crate::mprintln!(
             "{}",
             format!(
                 "[-] {} reports recursion available but refused the request (likely ACL protected).",
@@ -229,7 +248,7 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
         );
         false
     } else {
-        println!(
+        crate::mprintln!(
             "{}",
             format!(
                 "[-] {} does not appear to allow recursion (RA flag unset or query refused).",
@@ -304,4 +323,15 @@ fn validate_domain_input(input: &str) -> Result<String> {
         ));
     }
     Ok(without_dot.to_lowercase())
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "DNS Recursion Scanner".to_string(),
+        description: "Detects open DNS resolvers vulnerable to recursion and amplification attacks.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }

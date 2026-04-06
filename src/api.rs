@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -12,13 +12,13 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use subtle::ConstantTimeEq;
 use tower::ServiceBuilder;
 use tower_http::{
     limit::RequestBodyLimitLayer,
     trace::TraceLayer,
 };
 
+use colored::*;
 use crate::commands;
 
 /// Maximum request body size (1MB)
@@ -43,7 +43,7 @@ fn load_ip_whitelist() -> Vec<String> {
                 .collect()
         }
         Err(e) => {
-            eprintln!("[WARN] Failed to read IP whitelist {}: {}", path.display(), e);
+            tracing::warn!(path = %path.display(), error = %e, "Failed to read IP whitelist");
             Vec::new()
         }
     }
@@ -59,7 +59,6 @@ fn dirs_path() -> std::path::PathBuf {
 
 #[derive(Clone)]
 pub struct ApiState {
-    api_key: String,
     verbose: bool,
     /// Optional IP whitelist — if non-empty, only these IPs can access the API
     ip_whitelist: Arc<Vec<String>>,
@@ -67,12 +66,15 @@ pub struct ApiState {
     current_module: Arc<Mutex<Option<String>>>,
     /// Per-IP rate limiter: IP -> (request_count, window_start)
     rate_limiter: Arc<Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>>,
+    /// Limits concurrent module execution to avoid resource exhaustion.
+    /// No longer serializes to 1 — per-task output capture allows concurrency.
+    run_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Max requests per IP per window
-const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
-/// Rate limit window duration (1 second)
-const RATE_LIMIT_WINDOW_SECS: u64 = 1;
+const RATE_LIMIT_MAX_REQUESTS: u32 = 30;
+/// Rate limit window duration in seconds
+const RATE_LIMIT_WINDOW_SECS: u64 = 10;
 
 // ─── Request / Response Types ───────────────────────────────────────
 
@@ -163,66 +165,10 @@ fn validate_target(target: &str) -> bool {
     !target.is_empty() && target.len() <= 2048 && !target.chars().any(|c| c.is_control())
 }
 
-/// Check if a target IP is a blocked internal/metadata address.
-/// Blocks loopback, RFC-1918 private ranges, link-local, cloud metadata,
-/// and any hostname that resolves to "localhost".
-fn is_blocked_target(target: &str) -> bool {
-    // Strip port suffix and brackets (IPv6) to isolate the host part
-    let host = {
-        let s = target.split(':').next().unwrap_or(target);
-        s.trim_matches('[').trim_matches(']')
-    };
-
-    // Block localhost by name
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                // Loopback 127.0.0.0/8
-                if o[0] == 127 { return true; }
-                // Unspecified 0.0.0.0
-                if v4.is_unspecified() { return true; }
-                // Link-local / metadata 169.254.0.0/16
-                if o[0] == 169 && o[1] == 254 { return true; }
-                // RFC-1918: 10.0.0.0/8
-                if o[0] == 10 { return true; }
-                // RFC-1918: 172.16.0.0/12
-                if o[0] == 172 && o[1] >= 16 && o[1] <= 31 { return true; }
-                // RFC-1918: 192.168.0.0/16
-                if o[0] == 192 && o[1] == 168 { return true; }
-                // Carrier-grade NAT 100.64.0.0/10
-                if o[0] == 100 && (o[1] & 0xC0) == 64 { return true; }
-            }
-            std::net::IpAddr::V6(v6) => {
-                // Unspecified (::)
-                if v6.is_unspecified() { return true; }
-                // Loopback (::1)
-                if v6.is_loopback() { return true; }
-                // Link-local (fe80::/10)
-                let seg = v6.segments();
-                if (seg[0] & 0xFFC0) == 0xFE80 { return true; }
-                // Unique local (fc00::/7)
-                if (seg[0] & 0xFE00) == 0xFC00 { return true; }
-            }
-        }
-    }
-
-    // Raw-string fallback for targets not yet parsed (e.g. "169.254.169.254:80")
-    host.starts_with("127.")
-        || host.starts_with("169.254.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || (host.starts_with("172.") && {
-            // 172.16.0.0/12
-            host[4..].split('.').next()
-                .and_then(|n| n.parse::<u8>().ok())
-                .map(|n| n >= 16 && n <= 31)
-                .unwrap_or(false)
-        })
+/// Target blocking is disabled — all targets are allowed.
+/// This is a pentesting framework; operators are responsible for their own targeting.
+fn is_blocked_target(_target: &str) -> bool {
+    false
 }
 
 /// Check if exec input contains shell metacharacters that could enable injection.
@@ -232,91 +178,9 @@ fn contains_shell_metacharacters(input: &str) -> bool {
         || input.contains("${")
 }
 
-// ─── Auth Middleware ────────────────────────────────────────────────
-
-async fn auth_middleware(
-    State(state): State<ApiState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Response {
-    // Rate limiting (runs first, before auth, to prevent unauthenticated floods)
-    {
-        let ip = addr.ip();
-        let now = Instant::now();
-        if let Ok(mut limiter) = state.rate_limiter.lock() {
-            // Prune stale entries to prevent unbounded HashMap growth
-            if limiter.len() > 10_000 {
-                limiter.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < 60);
-            }
-            let entry = limiter.entry(ip).or_insert((0, now));
-            if now.duration_since(entry.1).as_secs() >= RATE_LIMIT_WINDOW_SECS {
-                *entry = (1, now);
-            } else {
-                entry.0 += 1;
-                if entry.0 > RATE_LIMIT_MAX_REQUESTS {
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(err_response(
-                            format!(
-                                "Rate limit exceeded: max {} requests per second",
-                                RATE_LIMIT_MAX_REQUESTS
-                            ),
-                            "RATE_LIMITED",
-                        )),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-
-    // IP whitelist check (if configured)
-    if !state.ip_whitelist.is_empty() {
-        let client_ip = addr.ip().to_string();
-        if !state.ip_whitelist.iter().any(|allowed| allowed == &client_ip) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(err_response(
-                    format!("IP {} not in whitelist", client_ip),
-                    "IP_BLOCKED",
-                )),
-            )
-                .into_response();
-        }
-    }
-
-    // Extract API key from Authorization header
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    let provided_key = if let Some(key) = auth_header.strip_prefix("Bearer ") {
-        key
-    } else if let Some(key) = auth_header.strip_prefix("ApiKey ") {
-        key
-    } else {
-        auth_header
-    };
-
-    // Constant-time comparison
-    let valid = provided_key.as_bytes().ct_eq(state.api_key.as_bytes());
-    if !bool::from(valid) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(err_response("Invalid API key", "AUTH_FAILED")),
-        )
-            .into_response();
-    }
-
-    if state.verbose {
-        eprintln!("[API] Authenticated request from {}", addr.ip());
-    }
-
-    next.run(request).await
-}
+// Auth middleware removed — authentication is now via PQ handshake (SSH-style identity keys).
+// The PQ middleware in pq_middleware.rs handles decryption and verifies the session.
+// Unauthenticated requests without X-PQ-Session header are rejected by the PQ middleware.
 
 // ─── Endpoint Handlers ─────────────────────────────────────────────
 
@@ -327,27 +191,20 @@ async fn health_check() -> Json<ApiResponse> {
 /// GET /api/modules — list all modules (like CLI `modules`)
 async fn list_modules() -> Json<ApiResponse> {
     let modules = commands::discover_modules();
-    let mut exploits = Vec::new();
-    let mut scanners = Vec::new();
-    let mut creds = Vec::new();
 
+    // Group modules by category dynamically
+    let mut by_category: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
     for module in &modules {
-        if module.starts_with("exploits/") {
-            exploits.push(module.clone());
-        } else if module.starts_with("scanners/") {
-            scanners.push(module.clone());
-        } else if module.starts_with("creds/") {
-            creds.push(module.clone());
-        }
+        let category = module.split('/').next().unwrap_or("other").to_string();
+        by_category.entry(category).or_default().push(module.clone());
     }
 
     Json(ok_response(
         format!("{} modules available", modules.len()),
         Some(serde_json::json!({
             "total": modules.len(),
-            "exploits": exploits,
-            "scanners": scanners,
-            "creds": creds,
+            "categories": commands::categories(),
+            "modules": by_category,
         })),
     ))
 }
@@ -378,12 +235,18 @@ async fn search_modules(
     ))
 }
 
-/// GET /api/module/{category}/{name} — check if module exists (like CLI `use`)
+/// GET /api/module/*path — check if module exists + return metadata
+/// Accepts any depth: /api/module/scanners/port_scanner or /api/module/creds/generic/ftp_anonymous
 async fn get_module_info(
-    axum::extract::Path((category, name)): axum::extract::Path<(String, String)>,
+    axum::extract::Path(module_path): axum::extract::Path<String>,
 ) -> Response {
-    let module_path = format!("{}/{}", category, name);
+    let module_path = module_path.trim_matches('/').to_string();
+    let category = module_path.split('/').next().unwrap_or("").to_string();
+    let name = module_path.split('/').last().unwrap_or("").to_string();
+
     if commands::discover_modules().contains(&module_path) {
+        let info = commands::module_info(&module_path);
+        let info_data = info.map(|i| serde_json::to_value(&i).ok()).flatten();
         (
             StatusCode::OK,
             Json(ok_response(
@@ -393,6 +256,7 @@ async fn get_module_info(
                     "category": category,
                     "name": name,
                     "exists": true,
+                    "info": info_data,
                 })),
             )),
         )
@@ -406,6 +270,243 @@ async fn get_module_info(
             )),
         )
             .into_response()
+    }
+}
+
+// ─── Global Options API ────────────────────────────────────────────
+
+/// GET /api/options — list all global options
+async fn get_options() -> Json<ApiResponse> {
+    let opts = crate::global_options::GLOBAL_OPTIONS.all().await;
+    Json(ok_response(
+        format!("{} global options", opts.len()),
+        Some(serde_json::json!({ "options": opts })),
+    ))
+}
+
+/// POST /api/options — set a global option
+async fn set_option(Json(payload): Json<HashMap<String, String>>) -> Json<ApiResponse> {
+    let mut set_count = 0;
+    for (key, value) in &payload {
+        crate::global_options::GLOBAL_OPTIONS.set(key, value).await;
+        set_count += 1;
+    }
+    Json(ok_response(format!("{} option(s) set", set_count), None))
+}
+
+/// DELETE /api/options — clear a specific option (via query param or body)
+async fn delete_option(Json(payload): Json<HashMap<String, String>>) -> Json<ApiResponse> {
+    let mut removed = 0;
+    for key in payload.keys() {
+        if crate::global_options::GLOBAL_OPTIONS.unset(key).await {
+            removed += 1;
+        }
+    }
+    Json(ok_response(format!("{} option(s) removed", removed), None))
+}
+
+// ─── Credential Store API ──────────────────────────────────────────
+
+/// GET /api/creds — list all credentials
+async fn list_creds() -> Json<ApiResponse> {
+    tracing::info!("API: credentials listed");
+    let creds = crate::cred_store::CRED_STORE.list().await;
+    Json(ok_response(
+        format!("{} credentials", creds.len()),
+        Some(serde_json::to_value(&creds).unwrap_or_default()),
+    ))
+}
+
+/// POST /api/creds — add a credential
+async fn add_cred(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    let port = payload.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let service = payload.get("service").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let username = payload.get("username").and_then(|v| v.as_str()).unwrap_or("");
+    let secret = payload.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+    let cred_type_str = payload.get("cred_type").and_then(|v| v.as_str()).unwrap_or("password");
+    let source = payload.get("source_module").and_then(|v| v.as_str()).unwrap_or("api");
+
+    if host.is_empty() || username.is_empty() {
+        return Json(err_response("host and username are required", "INVALID_INPUT"));
+    }
+
+    let cred_type = match cred_type_str {
+        "hash" => crate::cred_store::CredType::Hash,
+        "key" => crate::cred_store::CredType::Key,
+        "token" => crate::cred_store::CredType::Token,
+        _ => crate::cred_store::CredType::Password,
+    };
+
+    let id = crate::cred_store::CRED_STORE.add(host, port, service, username, secret, cred_type, source).await;
+    tracing::info!(host = %host, service = %service, "API: credential added");
+    Json(ok_response("Credential added", Some(serde_json::json!({ "id": id }))))
+}
+
+/// DELETE /api/creds — delete a credential by ID
+async fn delete_cred(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if crate::cred_store::CRED_STORE.delete(id).await {
+        tracing::info!(id = %id, "API: credential deleted");
+        Json(ok_response("Credential deleted", None))
+    } else {
+        Json(err_response("Credential not found", "NOT_FOUND"))
+    }
+}
+
+// ─── Workspace API ─────────────────────────────────────────────────
+
+/// GET /api/hosts — list tracked hosts
+async fn list_hosts() -> Json<ApiResponse> {
+    let hosts = crate::workspace::WORKSPACE.hosts().await;
+    Json(ok_response(
+        format!("{} hosts", hosts.len()),
+        Some(serde_json::to_value(&hosts).unwrap_or_default()),
+    ))
+}
+
+/// POST /api/hosts — add a host
+async fn add_host(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let ip = payload.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+    if ip.is_empty() {
+        return Json(err_response("ip is required", "INVALID_INPUT"));
+    }
+    let hostname = payload.get("hostname").and_then(|v| v.as_str());
+    let os_guess = payload.get("os_guess").and_then(|v| v.as_str());
+    crate::workspace::WORKSPACE.add_host(ip, hostname, os_guess).await;
+    Json(ok_response("Host added", None))
+}
+
+/// GET /api/services — list tracked services
+async fn list_services() -> Json<ApiResponse> {
+    let services = crate::workspace::WORKSPACE.services().await;
+    Json(ok_response(
+        format!("{} services", services.len()),
+        Some(serde_json::to_value(&services).unwrap_or_default()),
+    ))
+}
+
+/// POST /api/services — add a service
+async fn add_service(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    let port = payload.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let protocol = payload.get("protocol").and_then(|v| v.as_str()).unwrap_or("tcp");
+    let service_name = payload.get("service_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let version = payload.get("version").and_then(|v| v.as_str());
+
+    if host.is_empty() || port == 0 {
+        return Json(err_response("host and port are required", "INVALID_INPUT"));
+    }
+    crate::workspace::WORKSPACE.add_service(host, port, protocol, service_name, version).await;
+    Json(ok_response("Service added", None))
+}
+
+/// GET /api/workspace — show current workspace info
+async fn get_workspace() -> Json<ApiResponse> {
+    let name = crate::workspace::WORKSPACE.current_name().await;
+    let workspaces = crate::workspace::WORKSPACE.list_workspaces().await;
+    Json(ok_response("Workspace info", Some(serde_json::json!({
+        "current": name,
+        "available": workspaces,
+    }))))
+}
+
+/// POST /api/workspace — switch workspace
+async fn switch_workspace(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return Json(err_response("name is required", "INVALID_INPUT"));
+    }
+    crate::workspace::WORKSPACE.switch(name).await;
+    Json(ok_response(format!("Switched to workspace '{}'", name), None))
+}
+
+// ─── Loot API ──────────────────────────────────────────────────────
+
+/// GET /api/loot — list loot entries
+async fn list_loot() -> Json<ApiResponse> {
+    let loot = crate::loot::LOOT_STORE.list().await;
+    Json(ok_response(
+        format!("{} loot items", loot.len()),
+        Some(serde_json::to_value(&loot).unwrap_or_default()),
+    ))
+}
+
+/// POST /api/loot — add loot
+async fn add_loot(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    let loot_type = payload.get("loot_type").and_then(|v| v.as_str()).unwrap_or("other");
+    let description = payload.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let data = payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let source = payload.get("source_module").and_then(|v| v.as_str()).unwrap_or("api");
+
+    if host.is_empty() {
+        return Json(err_response("host is required", "INVALID_INPUT"));
+    }
+
+    match crate::loot::LOOT_STORE.add_text(host, loot_type, description, data, source).await {
+        Some(id) => Json(ok_response("Loot stored", Some(serde_json::json!({ "id": id })))),
+        None => Json(err_response("Failed to store loot", "INTERNAL_ERROR")),
+    }
+}
+
+// ─── Jobs API ──────────────────────────────────────────────────────
+
+/// GET /api/jobs — list background jobs
+async fn list_jobs() -> Json<ApiResponse> {
+    let jobs = crate::jobs::JOB_MANAGER.list();
+    let job_data: Vec<serde_json::Value> = jobs.iter().map(|(id, module, target, started, status)| {
+        serde_json::json!({
+            "id": id,
+            "module": module,
+            "target": target,
+            "started": started,
+            "status": status,
+        })
+    }).collect();
+    Json(ok_response(
+        format!("{} jobs", job_data.len()),
+        Some(serde_json::json!({ "jobs": job_data })),
+    ))
+}
+
+/// DELETE /api/jobs/{id} — kill a job
+async fn kill_job(axum::extract::Path(id): axum::extract::Path<u32>) -> Json<ApiResponse> {
+    if crate::jobs::JOB_MANAGER.kill(id) {
+        Json(ok_response(format!("Job {} cancelled", id), None))
+    } else {
+        Json(err_response(format!("Job {} not found", id), "NOT_FOUND"))
+    }
+}
+
+// ─── Export API ────────────────────────────────────────────────────
+
+/// GET /api/export — export engagement data
+async fn export_data(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
+
+    // Gather data inline for API response
+    let loot_entries = crate::loot::LOOT_STORE.list().await;
+    let data = serde_json::json!({
+        "workspace": crate::workspace::WORKSPACE.current_name().await,
+        "exported_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "hosts": crate::workspace::WORKSPACE.hosts().await,
+        "services": crate::workspace::WORKSPACE.services().await,
+        "credentials": crate::cred_store::CRED_STORE.list().await,
+        "loot": loot_entries,
+    });
+
+    match format {
+        "json" => (
+            StatusCode::OK,
+            Json(ok_response("Export complete", Some(data))),
+        ).into_response(),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(err_response("Use format=json for API export", "INVALID_INPUT")),
+        ).into_response(),
     }
 }
 
@@ -505,17 +606,6 @@ async fn run_module(
         )
             .into_response();
     }
-    if is_blocked_target(target_raw) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(err_response(
-                "Target is a blocked internal/metadata address (link-local 169.254.0.0/16 or 0.0.0.0)",
-                "BLOCKED_TARGET",
-            )),
-        )
-            .into_response();
-    }
-
     // Check module exists
     if !commands::discover_modules().contains(&module_name.to_string()) {
         return (
@@ -559,6 +649,22 @@ async fn run_module(
 
     // Inject dedicated fields into custom_prompts so cfg_prompt_* picks them up.
     // Only insert if not already set by the explicit prompts map.
+    if let Some(v) = module_config.port {
+        module_config.custom_prompts.entry("port".into())
+            .or_insert(v.to_string());
+    }
+    if let Some(ref v) = module_config.username_wordlist {
+        module_config.custom_prompts.entry("username_wordlist".into())
+            .or_insert(v.clone());
+    }
+    if let Some(ref v) = module_config.password_wordlist {
+        module_config.custom_prompts.entry("password_wordlist".into())
+            .or_insert(v.clone());
+    }
+    if let Some(v) = module_config.concurrency {
+        module_config.custom_prompts.entry("concurrency".into())
+            .or_insert(v.to_string());
+    }
     if let Some(v) = module_config.save_results {
         module_config.custom_prompts.entry("save_results".into())
             .or_insert(if v { "y".into() } else { "n".into() });
@@ -580,57 +686,61 @@ async fn run_module(
             .or_insert(v.clone());
     }
 
-    crate::config::set_module_config(module_config);
+    // Strip "target" from custom_prompts to prevent SSRF bypass via prompt injection.
+    // The validated target is passed directly to run_module() — modules should NOT
+    // read a different target from custom_prompts.
+    module_config.custom_prompts.remove("target");
 
     let verbose = state.verbose || payload.verbose.unwrap_or(false);
 
     if state.verbose {
-        eprintln!(
-            "[API] Running module '{}' against '{}' (verbose={})",
-            module_name, target_raw, verbose
+        tracing::info!(
+            module = module_name,
+            target = target_raw,
+            verbose,
+            "Running module via API"
         );
     }
 
-    // Run synchronously with stdout/stderr capture
-    // CWD to results directory so module File::create calls write there
-    let results_dir = crate::config::results_dir();
-    let original_dir = std::env::current_dir().ok();
-    let _ = std::env::set_current_dir(&results_dir);
+    tracing::info!(module = %module_name, target = %target_raw, "API: dispatching module");
 
-    // Capture stdout during module execution.
-    let captured_output = {
-        use std::io::Read;
-        let mut stdout_buf = gag::BufferRedirect::stdout()
-            .unwrap_or_else(|_| gag::BufferRedirect::stdout().unwrap());
-        let mut stderr_buf = gag::BufferRedirect::stderr()
-            .unwrap_or_else(|_| gag::BufferRedirect::stderr().unwrap());
-
-        let result = commands::run_module(module_name, target_raw, verbose).await;
-
-        let mut stdout_output = String::new();
-        let mut stderr_output = String::new();
-        let _ = stdout_buf.read_to_string(&mut stdout_output);
-        let _ = stderr_buf.read_to_string(&mut stderr_output);
-        drop(stdout_buf);
-        drop(stderr_buf);
-
-        (result, stdout_output, stderr_output)
+    // Acquire concurrency permit to avoid resource exhaustion
+    let _permit = match state.run_semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(err_response(
+                    "Server is shutting down",
+                    "SERVICE_UNAVAILABLE",
+                )),
+            )
+                .into_response();
+        }
     };
 
-    // Restore CWD
-    if let Some(dir) = original_dir {
-        let _ = std::env::set_current_dir(dir);
-    }
+    // Per-task output capture — no process-global gag, no serialization needed.
+    // Each API request gets its own OutputBuffer via task-local storage,
+    // so multiple modules can run concurrently without output interleaving.
+    let output_buf = crate::output::OutputBuffer::new();
+    let buf_clone = output_buf.clone();
 
-    // Clear module config after execution
-    crate::config::clear_module_config();
+    // Run inside a task-local RunContext so cfg_prompt_* reads per-request
+    // config instead of the process-global MODULE_CONFIG.
+    let (result, run_ctx) = crate::context::run_with_context_target(module_config, target_raw.to_string(), || async {
+        crate::output::OUTPUT_BUFFER.scope(buf_clone, async {
+            commands::run_module(module_name, target_raw, verbose).await
+        }).await
+    }).await;
 
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let (result, stdout_output, stderr_output) = captured_output;
+    let duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let stdout_output = output_buf.drain_stdout();
+    let stderr_output = output_buf.drain_stderr();
+    let module_output = run_ctx.output.take();
 
     // Truncate output to prevent huge responses (max 64KB)
     let max_output = 64 * 1024;
-    let stdout_truncated = if stdout_output.len() > max_output {
+    let output_truncated = if stdout_output.len() > max_output {
         format!("{}\n... (output truncated at {} bytes)", &stdout_output[..max_output], stdout_output.len())
     } else {
         stdout_output
@@ -649,8 +759,9 @@ async fn run_module(
                     "target": target_raw,
                     "status": "completed",
                     "duration_ms": duration_ms,
-                    "output": stdout_truncated,
+                    "output": output_truncated,
                     "stderr": stderr_output,
+                    "findings": module_output.findings,
                 })),
             )),
         )
@@ -872,16 +983,7 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
         )
             .into_response();
     }
-    if is_blocked_target(target_raw) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(err_response(
-                "Target is a blocked internal/metadata address (link-local 169.254.0.0/16 or 0.0.0.0)",
-                "BLOCKED_TARGET",
-            )),
-        )
-            .into_response();
-    }
+
 
     let ip = match crate::utils::extract_ip_from_target(target_raw) {
         Some(ip) => ip,
@@ -911,7 +1013,13 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
         let ip = ip.clone();
         let sem = semaphore.clone();
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.ok();
+            let _permit = match sem.acquire().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    eprintln!("[!] Semaphore acquire failed: {}", e);
+                    return None;
+                }
+            };
             let addr = format!("{}:{}", ip, port);
             let conn = tokio::time::timeout(scan_timeout, tokio::net::TcpStream::connect(&addr))
                 .await;
@@ -954,12 +1062,14 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
 
 /// POST /api/shell — run interactive-shell commands remotely (mirrors the interactive `rsf>` shell)
 ///
-/// Use this endpoint to execute the same commands as the interactive shell:
-/// `use`, `set target`, `set subnet`, `show_target`, `clear_target`, `run`, `run_all`, `find`, `modules`, `back`.
+/// Supports all interactive shell commands: `use`, `set target`, `set subnet`, `show_target`,
+/// `clear_target`, `run`, `run_all`, `find`, `modules`, `back`, `info`, `check`, `setg`, `unsetg`,
+/// `show_options`, `creds`, `hosts`, `services`, `notes`, `workspace`, `loot`, `export`, `jobs`, `spool`.
 ///
 /// For direct module execution with prompts, prefer POST /api/run instead.
 /// Supports secure command chaining via JSON array `commands` field.
 /// Each command is individually validated — no shell metacharacters allowed.
+/// Interactive-prompt commands (creds add, services add, loot add) accept inline arguments.
 async fn shell_command(
     State(state): State<ApiState>,
     Json(payload): Json<ShellRequest>,
@@ -1023,17 +1133,60 @@ async fn shell_command(
                     command: trimmed.to_string(),
                     success: true,
                     output: "Available commands (same as interactive shell):\n\
+                             \n\
+                             ── Navigation & Discovery ──\n\
                              help | h | ?                  — This help\n\
                              modules | ls | m              — List all modules\n\
                              find <kw> | f1 <kw>          — Search modules by keyword\n\
                              use <path> | u <path>        — Select a module\n\
+                             info [path] | i              — Show module metadata\n\
+                             back | b                     — Deselect current module\n\
+                             \n\
+                             ── Targeting ──\n\
                              set target <ip> | t <ip>     — Set target (single IP/hostname)\n\
                              set subnet <CIDR> | sn <CIDR>— Set target to CIDR subnet\n\
+                             set port <port>              — Set global port\n\
                              show_target | st             — Show current target & module\n\
                              clear_target | ct            — Clear target\n\
+                             \n\
+                             ── Execution ──\n\
                              run [target]                 — Run selected module\n\
+                             run -j                       — Run module as background job\n\
                              run_all [target]             — Run all modules against target\n\
-                             back | b                     — Deselect current module\n\
+                             check | ch                   — Non-destructive vulnerability check\n\
+                             \n\
+                             ── Global Options ──\n\
+                             setg <key> <val> | sg        — Set global option\n\
+                             unsetg <key> | ug            — Unset global option\n\
+                             show_options | so            — Display all global options\n\
+                             \n\
+                             ── Data Management ──\n\
+                             creds                        — List credentials\n\
+                             creds add <host> <port> <svc> <user> <secret> [type] — Add credential\n\
+                             creds search <query>         — Search credentials\n\
+                             creds delete <id>            — Delete credential\n\
+                             creds clear                  — Clear all credentials\n\
+                             hosts                        — List tracked hosts\n\
+                             hosts add <ip>               — Add host\n\
+                             hosts delete <ip>            — Remove host and its services\n\
+                             hosts clear                  — Clear all hosts and services\n\
+                             services                     — List tracked services\n\
+                             services add <host> <port> <proto> <name> [ver] — Add service\n\
+                             services delete <host> <port> — Remove a service\n\
+                             notes <ip> <text>            — Add note to host\n\
+                             workspace [name] | ws        — List or switch workspaces\n\
+                             loot                         — List loot\n\
+                             loot add <host> <type> <desc> <data> — Add loot\n\
+                             loot search <query>          — Search loot\n\
+                             loot delete <id>             — Delete loot entry\n\
+                             loot clear                   — Clear all loot\n\
+                             \n\
+                             ── Automation & Export ──\n\
+                             export <json|csv|summary> <file> — Export engagement data\n\
+                             spool [off|file]             — Control output logging\n\
+                             jobs | j                     — List background jobs\n\
+                             jobs -k <id>                 — Kill a background job\n\
+                             jobs clean                   — Clean up finished jobs\n\
                              exit                         — (no-op in API mode)"
                         .to_string(),
                     duration_ms: None,
@@ -1042,22 +1195,18 @@ async fn shell_command(
 
             "modules" => {
                 let modules = commands::discover_modules();
-                let mut exploits = Vec::new();
-                let mut scanners = Vec::new();
-                let mut creds = Vec::new();
+                let mut by_category: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
                 for m in &modules {
-                    if m.starts_with("exploits/") { exploits.push(m.as_str()); }
-                    else if m.starts_with("scanners/") { scanners.push(m.as_str()); }
-                    else if m.starts_with("creds/") { creds.push(m.as_str()); }
+                    let cat = m.split('/').next().unwrap_or("other");
+                    by_category.entry(cat).or_default().push(m.as_str());
                 }
                 results.push(ShellResult {
                     command: trimmed.to_string(),
                     success: true,
                     output: serde_json::json!({
                         "total": modules.len(),
-                        "exploits": exploits,
-                        "scanners": scanners,
-                        "creds": creds,
+                        "categories": commands::categories(),
+                        "modules": by_category,
                     }).to_string(),
                     duration_ms: None,
                 });
@@ -1148,6 +1297,60 @@ async fn shell_command(
             }
 
             "set" => {
+                // Handle "set port <val>" and "set source_port <val>" as global option shortcuts
+                if let Some(val) = rest.strip_prefix("port ") {
+                    let val = val.trim();
+                    match val.parse::<u16>() {
+                        Ok(p) if p > 0 => {
+                            crate::global_options::GLOBAL_OPTIONS.set("port", val).await;
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: format!("Global port set to: {}", val),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        }
+                        _ => {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: "Invalid port. Must be 1-65535.".to_string(),
+                                duration_ms: None,
+                            });
+                        }
+                    }
+                } else if let Some(val) = rest.strip_prefix("source_port ") {
+                    let val = val.trim();
+                    if val == "0" || val.is_empty() {
+                        crate::global_options::GLOBAL_OPTIONS.unset("source_port").await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: "Source port cleared (will use OS-assigned).".to_string(),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    } else {
+                        match val.parse::<u16>() {
+                            Ok(p) if p > 0 => {
+                                crate::global_options::GLOBAL_OPTIONS.set("source_port", val).await;
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: true,
+                                    output: format!("Global source port set to: {}", val),
+                                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                                });
+                            }
+                            _ => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: "Invalid source port. Must be 1-65535 (or 0 to clear).".to_string(),
+                                    duration_ms: None,
+                                });
+                            }
+                        }
+                    }
+                } else {
                 // Mirror shell.rs: `set target <ip>`, `t <ip>`, `set subnet <cidr>`, `sn <cidr>`
                 // Peel off leading "target ", "t ", "subnet ", "sn " keywords to extract the value
                 let raw_value = if rest.starts_with("target ") {
@@ -1198,6 +1401,7 @@ async fn shell_command(
                         }
                     }
                 }
+                } // close else from port/source_port handling
             }
 
             "set_subnet" => {
@@ -1302,19 +1506,14 @@ async fn shell_command(
             }
 
             "run" => {
+                let background = rest.trim() == "-j" || rest.trim() == "--job";
+                let rest_for_target = if background { String::new() } else { rest.clone() };
+
                 let module_path = state.current_module.lock().ok().and_then(|cm| cm.clone());
-                if module_path.is_none() {
-                    results.push(ShellResult {
-                        command: trimmed.to_string(),
-                        success: false,
-                        output: "No module selected. Use 'use <module>' first.".to_string(),
-                        duration_ms: None,
-                    });
-                } else {
-                    let module_path = module_path.unwrap();
+                if let Some(module_path) = module_path {
                     // Resolve target: from rest arg, or global config
-                    let target = if !rest.is_empty() {
-                        rest.clone()
+                    let target = if !rest_for_target.is_empty() {
+                        rest_for_target.clone()
                     } else if crate::config::GLOBAL_CONFIG.has_target() {
                         crate::config::GLOBAL_CONFIG.get_target().unwrap_or_default()
                     } else {
@@ -1328,7 +1527,7 @@ async fn shell_command(
                     };
 
                     // SSRF guard — shell 'run' must also validate the resolved target
-                    if !validate_target(&target) || is_blocked_target(&target) {
+                    if !validate_target(&target) {
                         results.push(ShellResult {
                             command: trimmed.to_string(),
                             success: false,
@@ -1339,25 +1538,59 @@ async fn shell_command(
                     }
 
                     let verbose = state.verbose;
-                    let run_start = std::time::Instant::now();
-                    match commands::run_module(&module_path, &target, verbose).await {
-                        Ok(_) => {
-                            results.push(ShellResult {
-                                command: trimmed.to_string(),
-                                success: true,
-                                output: format!("Module '{}' executed against '{}'", module_path, target),
-                                duration_ms: Some(run_start.elapsed().as_millis() as u64),
-                            });
-                        }
-                        Err(e) => {
-                            results.push(ShellResult {
-                                command: trimmed.to_string(),
-                                success: false,
-                                output: format!("Module failed: {}", e),
-                                duration_ms: Some(run_start.elapsed().as_millis() as u64),
-                            });
+
+                    if background {
+                        // Background job: spawn via JOB_MANAGER
+                        let job_id = crate::jobs::JOB_MANAGER.spawn(
+                            module_path.clone(), target.clone(), verbose,
+                        );
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Job {} started: {} against {}", job_id, module_path, target),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    } else {
+                        // Foreground execution
+                        let run_start = std::time::Instant::now();
+                        let _permit = match state.run_semaphore.acquire().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: "Server is shutting down".to_string(),
+                                    duration_ms: None,
+                                });
+                                continue;
+                            }
+                        };
+                        match commands::run_module(&module_path, &target, verbose).await {
+                            Ok(_) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: true,
+                                    output: format!("Module '{}' executed against '{}'", module_path, target),
+                                    duration_ms: Some(run_start.elapsed().as_millis() as u64),
+                                });
+                            }
+                            Err(e) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: format!("Module failed: {}", e),
+                                    duration_ms: Some(run_start.elapsed().as_millis() as u64),
+                                });
+                            }
                         }
                     }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "No module selected. Use 'use <module>' first.".to_string(),
+                        duration_ms: None,
+                    });
                 }
             }
 
@@ -1377,7 +1610,7 @@ async fn shell_command(
                 };
 
                 // SSRF guard — run_all must check the resolved target too
-                if !validate_target(&target) || is_blocked_target(&target) {
+                if !validate_target(&target) {
                     results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
@@ -1393,6 +1626,13 @@ async fn shell_command(
                 let mut ok_count = 0usize;
                 let mut fail_count = 0usize;
                 for m in &modules {
+                    let _permit = match state.run_semaphore.acquire().await {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            fail_count += 1;
+                            continue;
+                        }
+                    };
                     match commands::run_module(m, &target, verbose).await {
                         Ok(_) => ok_count += 1,
                         Err(_) => fail_count += 1,
@@ -1405,6 +1645,812 @@ async fn shell_command(
                         ok_count, fail_count, modules.len()),
                     duration_ms: Some(run_start.elapsed().as_millis() as u64),
                 });
+            }
+
+            // ═══════════════════════════════════════════════
+            // INFO — Module metadata
+            // ═══════════════════════════════════════════════
+            "info" => {
+                let module_path = if !rest.is_empty() {
+                    Some(rest.clone())
+                } else {
+                    state.current_module.lock().ok().and_then(|cm| cm.clone())
+                };
+                if let Some(ref path) = module_path {
+                    if let Some(info) = commands::module_info(path) {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: serde_json::json!({
+                                "module": path,
+                                "info": info,
+                            }).to_string(),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    } else {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: format!("No metadata available for '{}'. Modules can provide metadata by adding a pub fn info() -> ModuleInfo function.", path),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "No module selected. Use 'info <module_path>' or select a module first.".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // CHECK — Non-destructive vulnerability check
+            // ═══════════════════════════════════════════════
+            "check" => {
+                let module_path = state.current_module.lock().ok().and_then(|cm| cm.clone());
+                if let Some(ref path) = module_path {
+                    let target = crate::config::GLOBAL_CONFIG.get_target();
+                    if let Some(ref t) = target {
+                        if !validate_target(t) || is_blocked_target(t) {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: "Target is invalid or blocked (internal/private address)".to_string(),
+                                duration_ms: None,
+                            });
+                        } else {
+                            match commands::check_module(path, t).await {
+                                Some(result) => {
+                                    results.push(ShellResult {
+                                        command: trimmed.to_string(),
+                                        success: true,
+                                        output: serde_json::json!({
+                                            "module": path,
+                                            "target": t,
+                                            "result": result,
+                                        }).to_string(),
+                                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                                    });
+                                }
+                                None => {
+                                    results.push(ShellResult {
+                                        command: trimmed.to_string(),
+                                        success: false,
+                                        output: format!("Module '{}' does not support the check method.", path),
+                                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "No target set. Use 'set target <value>' first.".to_string(),
+                            duration_ms: None,
+                        });
+                    }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "No module selected. Use 'use <module>' first.".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // GLOBAL OPTIONS
+            // ═══════════════════════════════════════════════
+            "setg" => {
+                if let Some((key, value)) = rest.split_once(char::is_whitespace) {
+                    let key = key.trim();
+                    let value = value.trim();
+                    if key.is_empty() || value.is_empty() || key.len() > 256 || value.len() > 256 {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: setg <key> <value> (max 256 chars each)".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        crate::global_options::GLOBAL_OPTIONS.set(key, value).await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("{} => {}", key, value),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: setg <key> <value>".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            "unsetg" => {
+                let key = rest.trim();
+                if key.is_empty() {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: unsetg <key>".to_string(),
+                        duration_ms: None,
+                    });
+                } else if crate::global_options::GLOBAL_OPTIONS.unset(key).await {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: format!("Unset global option '{}'", key),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: format!("Global option '{}' was not set.", key),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                }
+            }
+
+            "show_options" => {
+                let opts = crate::global_options::GLOBAL_OPTIONS.all().await;
+                results.push(ShellResult {
+                    command: trimmed.to_string(),
+                    success: true,
+                    output: serde_json::json!({ "options": opts }).to_string(),
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                });
+            }
+
+            // ═══════════════════════════════════════════════
+            // CREDENTIALS
+            // ═══════════════════════════════════════════════
+            "creds" => {
+                if rest.is_empty() {
+                    let entries = crate::cred_store::CRED_STORE.list().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "credentials": entries }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if let Some(args) = rest.strip_prefix("add ") {
+                    // Parse: creds add <host> <port> <service> <username> <secret> [type]
+                    let parts: Vec<&str> = args.splitn(6, char::is_whitespace).collect();
+                    if parts.len() < 5 {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: creds add <host> <port> <service> <username> <secret> [type]".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let host = parts[0].trim();
+                        let port: u16 = match parts[1].trim().parse() {
+                            Ok(p) if p > 0 => p,
+                            _ => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: "Invalid port number. Must be 1-65535.".to_string(),
+                                    duration_ms: None,
+                                });
+                                continue;
+                            }
+                        };
+                        let service = parts[2].trim();
+                        let username = parts[3].trim();
+                        let (secret, cred_type) = if parts.len() >= 6 {
+                            (parts[4].trim(), match parts[5].trim() {
+                                "hash" => crate::cred_store::CredType::Hash,
+                                "key" => crate::cred_store::CredType::Key,
+                                "token" => crate::cred_store::CredType::Token,
+                                _ => crate::cred_store::CredType::Password,
+                            })
+                        } else {
+                            (parts[4].trim(), crate::cred_store::CredType::Password)
+                        };
+                        let id = crate::cred_store::CRED_STORE.add(host, port, service, username, secret, cred_type, "api-shell").await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Credential stored (ID: {})", id),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else if let Some(query) = rest.strip_prefix("search ") {
+                    let found = crate::cred_store::CRED_STORE.search(query.trim()).await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "results": found }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if let Some(id) = rest.strip_prefix("delete ") {
+                    let deleted = crate::cred_store::CRED_STORE.delete(id.trim()).await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: deleted,
+                        output: if deleted {
+                            format!("Credential '{}' deleted.", id.trim())
+                        } else {
+                            format!("Credential '{}' not found.", id.trim())
+                        },
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if rest == "clear" {
+                    crate::cred_store::CRED_STORE.clear().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: "All credentials cleared.".to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if rest == "add" {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: creds add <host> <port> <service> <username> <secret> [type]".to_string(),
+                        duration_ms: None,
+                    });
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: creds [add <host> <port> <svc> <user> <secret> [type]|search <query>|delete <id>|clear]".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // SPOOL — Output logging
+            // ═══════════════════════════════════════════════
+            "spool" => {
+                if rest.is_empty() {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: "Use 'spool <filename>' to start or 'spool off' to stop.".to_string(),
+                        duration_ms: None,
+                    });
+                } else if rest == "off" {
+                    if let Some(name) = crate::spool::SPOOL.stop() {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Spool stopped. Output saved to '{}'", name),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    } else {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: "Spool was not active.".to_string(),
+                            duration_ms: None,
+                        });
+                    }
+                } else {
+                    match crate::spool::SPOOL.start(&rest) {
+                        Ok(()) => {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: format!("Spooling output to '{}'", rest),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        }
+                        Err(e) => {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: format!("Failed to start spool: {}", e),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // RESOURCE / MAKERC — Blocked in API mode
+            // ═══════════════════════════════════════════════
+            "resource" => {
+                results.push(ShellResult {
+                    command: trimmed.to_string(),
+                    success: false,
+                    output: "Resource scripts are disabled in API mode for security. Send commands directly via the 'commands' JSON array.".to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            "makerc" => {
+                results.push(ShellResult {
+                    command: trimmed.to_string(),
+                    success: false,
+                    output: "makerc is not applicable in API mode (no shell history).".to_string(),
+                    duration_ms: None,
+                });
+            }
+
+            // ═══════════════════════════════════════════════
+            // HOSTS
+            // ═══════════════════════════════════════════════
+            "hosts" => {
+                if rest.is_empty() {
+                    let entries = crate::workspace::WORKSPACE.hosts().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "hosts": entries }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if let Some(ip) = rest.strip_prefix("add ") {
+                    let ip = ip.trim();
+                    if ip.is_empty() {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: hosts add <ip>".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        crate::workspace::WORKSPACE.add_host(ip, None, None).await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Host '{}' added to workspace.", ip),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else if let Some(ip) = rest.strip_prefix("delete ") {
+                    let ip = ip.trim();
+                    if ip.is_empty() {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: hosts delete <ip>".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let deleted = crate::workspace::WORKSPACE.delete_host(ip).await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: deleted,
+                            output: if deleted {
+                                format!("Host '{}' and its services removed.", ip)
+                            } else {
+                                format!("Host '{}' not found.", ip)
+                            },
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else if rest == "clear" {
+                    crate::workspace::WORKSPACE.clear_hosts().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: "All hosts and services cleared.".to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: hosts [add <ip>|delete <ip>|clear]".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // SERVICES
+            // ═══════════════════════════════════════════════
+            "services" => {
+                if rest.is_empty() {
+                    let entries = crate::workspace::WORKSPACE.services().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "services": entries }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if let Some(args) = rest.strip_prefix("add ") {
+                    // Parse: services add <host> <port> <proto> <service_name> [version]
+                    let parts: Vec<&str> = args.splitn(5, char::is_whitespace).collect();
+                    if parts.len() < 4 {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: services add <host> <port> <protocol> <service_name> [version]".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let host = parts[0].trim();
+                        let port: u16 = match parts[1].trim().parse() {
+                            Ok(p) if p > 0 => p,
+                            _ => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: "Invalid port number. Must be 1-65535.".to_string(),
+                                    duration_ms: None,
+                                });
+                                continue;
+                            }
+                        };
+                        let proto = parts[2].trim();
+                        let svc = parts[3].trim();
+                        let version = if parts.len() >= 5 { Some(parts[4].trim()) } else { None };
+                        crate::workspace::WORKSPACE.add_service(host, port, proto, svc, version).await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Service {}:{}/{} added.", host, port, svc),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else if rest == "add" {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: services add <host> <port> <protocol> <service_name> [version]".to_string(),
+                        duration_ms: None,
+                    });
+                } else if let Some(args) = rest.strip_prefix("delete ") {
+                    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+                    if parts.len() < 2 {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: services delete <host> <port>".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let host = parts[0].trim();
+                        match parts[1].trim().parse::<u16>() {
+                            Ok(port) if port > 0 => {
+                                let deleted = crate::workspace::WORKSPACE.delete_service(host, port).await;
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: deleted,
+                                    output: if deleted {
+                                        format!("Service {}:{} removed.", host, port)
+                                    } else {
+                                        format!("Service {}:{} not found.", host, port)
+                                    },
+                                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                                });
+                            }
+                            _ => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: "Invalid port number. Must be 1-65535.".to_string(),
+                                    duration_ms: None,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: services [add <host> <port> <proto> <name> [version]|delete <host> <port>]".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // NOTES
+            // ═══════════════════════════════════════════════
+            "notes" => {
+                if let Some((ip, note)) = rest.split_once(char::is_whitespace) {
+                    let ip = ip.trim();
+                    let note = note.trim();
+                    if ip.is_empty() || note.is_empty() {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: notes <ip> <note text>".to_string(),
+                            duration_ms: None,
+                        });
+                    } else if crate::workspace::WORKSPACE.add_note(ip, note).await {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Note added to host '{}'.", ip),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    } else {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: format!("Host '{}' not found. Add it first with 'hosts add {}'.", ip, ip),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: notes <ip> <note text>".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // WORKSPACE
+            // ═══════════════════════════════════════════════
+            "workspace" => {
+                if rest.is_empty() {
+                    let current = crate::workspace::WORKSPACE.current_name().await;
+                    let workspaces = crate::workspace::WORKSPACE.list_workspaces().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({
+                            "current": current,
+                            "workspaces": workspaces,
+                        }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else {
+                    let name = rest.trim();
+                    if name.is_empty() || name.len() > 64 {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Workspace name must be 1-64 characters.".to_string(),
+                            duration_ms: None,
+                        });
+                    } else if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                        crate::workspace::WORKSPACE.switch(name).await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: true,
+                            output: format!("Switched to workspace '{}'", name),
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    } else {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Workspace name must be alphanumeric (with _ and -).".to_string(),
+                            duration_ms: None,
+                        });
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // LOOT
+            // ═══════════════════════════════════════════════
+            "loot" => {
+                if rest.is_empty() {
+                    let entries = crate::loot::LOOT_STORE.list().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "loot": entries }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if let Some(args) = rest.strip_prefix("add ") {
+                    // Parse: loot add <host> <type> <description> <data>
+                    let parts: Vec<&str> = args.splitn(4, char::is_whitespace).collect();
+                    if parts.len() < 4 {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: loot add <host> <type> <description> <data>".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let host = parts[0].trim();
+                        let ltype = parts[1].trim();
+                        let desc = parts[2].trim();
+                        let data = parts[3].trim();
+                        if let Some(id) = crate::loot::LOOT_STORE.add_text(host, ltype, desc, data, "api-shell").await {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: format!("Loot stored (ID: {})", id),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        } else {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: "Failed to store loot.".to_string(),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        }
+                    }
+                } else if let Some(query) = rest.strip_prefix("search ") {
+                    let found = crate::loot::LOOT_STORE.search(query.trim()).await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "results": found }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if rest == "add" {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: loot add <host> <type> <description> <data>".to_string(),
+                        duration_ms: None,
+                    });
+                } else if let Some(id) = rest.strip_prefix("delete ") {
+                    let id = id.trim();
+                    if id.is_empty() {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: loot delete <id>".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let deleted = crate::loot::LOOT_STORE.delete(id).await;
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: deleted,
+                            output: if deleted {
+                                format!("Loot '{}' deleted.", id)
+                            } else {
+                                format!("Loot '{}' not found.", id)
+                            },
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
+                        });
+                    }
+                } else if rest == "clear" {
+                    crate::loot::LOOT_STORE.clear().await;
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: "All loot cleared.".to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: loot [add <host> <type> <desc> <data>|search <query>|delete <id>|clear]".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // EXPORT
+            // ═══════════════════════════════════════════════
+            "export" => {
+                if let Some((fmt, path)) = rest.split_once(char::is_whitespace) {
+                    let path = path.trim();
+                    if path.is_empty() || path.contains("..") || path.contains('\0') || path.contains('/') || path.contains('\\') {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Invalid file path.".to_string(),
+                            duration_ms: None,
+                        });
+                    } else {
+                        let export_result = match fmt.trim() {
+                            "json" => crate::export::export_json(path).await,
+                            "csv" => crate::export::export_csv(path).await,
+                            "summary" => crate::export::export_summary(path).await,
+                            _ => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: "Usage: export <json|csv|summary> <filename>".to_string(),
+                                    duration_ms: None,
+                                });
+                                continue;
+                            }
+                        };
+                        match export_result {
+                            Ok(()) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: true,
+                                    output: format!("Exported {} to '{}'", fmt.trim(), path),
+                                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                                });
+                            }
+                            Err(e) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: format!("Export failed: {}", e),
+                                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: export <json|csv|summary> <filename>".to_string(),
+                        duration_ms: None,
+                    });
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // JOBS
+            // ═══════════════════════════════════════════════
+            "jobs" => {
+                if rest.is_empty() {
+                    let job_list = crate::jobs::JOB_MANAGER.list();
+                    let jobs_json: Vec<serde_json::Value> = job_list.iter().map(|(id, module, target, started, status)| {
+                        serde_json::json!({
+                            "id": id,
+                            "module": module,
+                            "target": target,
+                            "started": started,
+                            "status": status,
+                        })
+                    }).collect();
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: serde_json::json!({ "jobs": jobs_json }).to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else if let Some(id_str) = rest.strip_prefix("-k ") {
+                    if let Ok(id) = id_str.trim().parse::<u32>() {
+                        if crate::jobs::JOB_MANAGER.kill(id) {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: true,
+                                output: format!("Job {} cancelled.", id),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        } else {
+                            results.push(ShellResult {
+                                command: trimmed.to_string(),
+                                success: false,
+                                output: format!("Job {} not found.", id),
+                                duration_ms: Some(start.elapsed().as_millis() as u64),
+                            });
+                        }
+                    } else {
+                        results.push(ShellResult {
+                            command: trimmed.to_string(),
+                            success: false,
+                            output: "Usage: jobs -k <id>".to_string(),
+                            duration_ms: None,
+                        });
+                    }
+                } else if rest == "clean" {
+                    crate::jobs::JOB_MANAGER.cleanup();
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: true,
+                        output: "Finished jobs cleaned up.".to_string(),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    });
+                } else {
+                    results.push(ShellResult {
+                        command: trimmed.to_string(),
+                        success: false,
+                        output: "Usage: jobs [-k <id>|clean]".to_string(),
+                        duration_ms: None,
+                    });
+                }
             }
 
             "exit" => {
@@ -1431,7 +2477,7 @@ async fn shell_command(
     let total = results.len();
 
     (
-        if all_ok { StatusCode::OK } else { StatusCode::OK },
+        if all_ok { StatusCode::OK } else { StatusCode::BAD_REQUEST },
         Json(ok_response(
             format!("{} shell command(s) executed", total),
             Some(serde_json::json!({
@@ -1441,13 +2487,115 @@ async fn shell_command(
     ).into_response()
 }
 
+// ─── TLS Helpers ────────────────────────────────────────────────────
+
+// ─── Security Headers Middleware ────────────────────────────────────
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "X-XSS-Protection",
+        HeaderValue::from_static("1; mode=block"),
+    );
+    headers.insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(
+        "Content-Security-Policy",
+        HeaderValue::from_static("default-src 'none'"),
+    );
+    // HSTS: only useful when TLS is active, but safe to always set
+    headers.insert(
+        "Strict-Transport-Security",
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    response
+}
+
+// ─── Rate Limiting Middleware ───────────────────────────────────────
+
+async fn rate_limit_middleware(
+    State(state): State<ApiState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+    let now = Instant::now();
+
+    let allowed = {
+        let mut limiter = state.rate_limiter.lock().unwrap();
+        let entry = limiter.entry(ip).or_insert((0, now));
+
+        // Reset window if expired
+        if now.duration_since(entry.1).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+            *entry = (0, now);
+        }
+
+        entry.0 += 1;
+        entry.0 <= RATE_LIMIT_MAX_REQUESTS
+    };
+
+    if !allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(err_response(
+                format!("Rate limit exceeded ({} requests per {}s)", RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECS),
+                "RATE_LIMITED",
+            )),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+// ─── IP Whitelist Middleware ────────────────────────────────────────
+
+async fn ip_whitelist_middleware(
+    State(state): State<ApiState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.ip_whitelist.is_empty() {
+        let ip_str = addr.ip().to_string();
+        if !state.ip_whitelist.contains(&ip_str) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(err_response(
+                    "Your IP is not in the whitelist",
+                    "IP_BLOCKED",
+                )),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
 // ─── Server Entry Point ─────────────────────────────────────────────
 
 pub async fn start_api_server(
     bind_address: &str,
-    api_key: String,
     verbose: bool,
+    host_key_path: &std::path::Path,
+    authorized_keys_path: &std::path::Path,
 ) -> Result<()> {
+    // Load or generate PQ host identity key
+    let host_identity = crate::pq_channel::HostIdentity::load_or_generate(host_key_path)
+        .context("Failed to load/generate PQ host key")?;
+
+    // Load authorized client keys
+    let authorized_keys = crate::pq_channel::load_authorized_keys(authorized_keys_path)
+        .context("Failed to load authorized keys")?;
+
+    let pq_sessions = crate::pq_channel::new_session_store();
+
     // Load optional IP whitelist
     let whitelist = load_ip_whitelist();
     if !whitelist.is_empty() {
@@ -1457,31 +2605,38 @@ pub async fn start_api_server(
         }
     } else {
         println!("🌐 No IP whitelist configured (all IPs allowed)");
-        println!("   Tip: Create ~/.rustsploit/ip_whitelist.conf to restrict access");
     }
 
     let state = ApiState {
-        api_key: api_key.clone(),
         verbose,
         ip_whitelist: Arc::new(whitelist),
         current_module: Arc::new(Mutex::new(None)),
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+        run_semaphore: Arc::new(tokio::sync::Semaphore::new(num_cpus::get().max(4))),
     };
 
-    println!("🚀 Starting RustSploit API server...");
+    let n_plugins = crate::commands::plugin_count();
+    if n_plugins > 0 {
+        eprintln!("{}", "[!] WARNING: Third-party plugins loaded. RustSploit is NOT responsible for third-party plugin behavior.".red().bold());
+        eprintln!("[!] Loaded plugins: {}", n_plugins);
+    }
+
+    println!("🚀 Starting RustSploit API server (PQ-encrypted, no TLS)...");
     println!("📍 Binding to: {}", bind_address);
-    // Do NOT print the API key in plaintext — log only a masked hint
-    println!("🔑 API key: {}...{} ({}  chars)",
-        &api_key[..api_key.len().min(4)],
-        &api_key[api_key.len().saturating_sub(2)..],
-        api_key.len());
+    println!("🔑 Host key fingerprint: {}", host_identity.fingerprint());
+    println!("🔐 Authorized clients: {}", authorized_keys.len());
+    for key in &authorized_keys {
+        println!("   ✓ {} ({})",
+            key.name,
+            crate::pq_channel::fingerprint(&key.x25519_public, &key.mlkem_ek));
+    }
     println!("📢 Verbose: {}", verbose);
 
     // Protected routes (require API key)
     let protected = Router::new()
         .route("/api/modules", get(list_modules))
         .route("/api/modules/search", get(search_modules))
-        .route("/api/module/{category}/{name}", get(get_module_info))
+        .route("/api/module/{*path}", get(get_module_info))
         .route("/api/run", post(run_module))
         .route("/api/target", get(get_target))
         .route("/api/target", post(set_target))
@@ -1490,15 +2645,47 @@ pub async fn start_api_server(
         .route("/api/shell", post(shell_command))
         .route("/api/results", get(list_results))
         .route("/api/results/{filename}", get(get_result_file))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        // Global options
+        .route("/api/options", get(get_options))
+        .route("/api/options", post(set_option))
+        .route("/api/options", axum::routing::delete(delete_option))
+        // Credential store
+        .route("/api/creds", get(list_creds))
+        .route("/api/creds", post(add_cred))
+        .route("/api/creds", axum::routing::delete(delete_cred))
+        // Workspace / hosts / services
+        .route("/api/hosts", get(list_hosts))
+        .route("/api/hosts", post(add_host))
+        .route("/api/services", get(list_services))
+        .route("/api/services", post(add_service))
+        .route("/api/workspace", get(get_workspace))
+        .route("/api/workspace", post(switch_workspace))
+        // Loot
+        .route("/api/loot", get(list_loot))
+        .route("/api/loot", post(add_loot))
+        // Jobs
+        .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/{id}", axum::routing::delete(kill_job))
+        // Export
+        .route("/api/export", get(export_data))
+        .layer(axum::middleware::from_fn(crate::pq_middleware::pq_middleware));
 
-    // Public routes + merge protected
+    // PQ shared state as Extension (accessible by middleware and handshake handler)
+    let pq_state = Arc::new(crate::pq_middleware::PqSharedState {
+        sessions: pq_sessions,
+        host_identity: Arc::new(host_identity),
+        authorized_keys: Arc::new(authorized_keys),
+    });
+
+    // Public routes: health check + PQ handshake (must be unauthenticated)
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/pq/handshake", post(crate::pq_middleware::handshake_handler))
         .merge(protected)
+        .layer(axum::Extension(pq_state))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), ip_whitelist_middleware))
+        .layer(axum::middleware::from_fn(security_headers))
         .layer(
             ServiceBuilder::new()
                 .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_SIZE))
@@ -1506,15 +2693,17 @@ pub async fn start_api_server(
         )
         .with_state(state);
 
+    // PQ-encrypted server — no TLS, no API keys
+    // All API routes are encrypted via the PQ middleware layer.
+    // Authentication is via the PQ handshake (SSH-style identity keys).
+    println!("✅ API server is running on http://{}", bind_address);
+    println!("🔐 Transport: Post-Quantum encryption (ML-KEM-768 + X25519 + ChaCha20-Poly1305)");
+    println!("🔑 Authentication: SSH-style identity keys (no API keys, no TLS)");
+    println!("   Clients must complete PQ handshake at POST /pq/handshake before API access");
+
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
         .context(format!("Failed to bind to {}", bind_address))?;
-
-    println!("✅ API server is running!");
-    println!(
-        "📖 Example: curl -H 'Authorization: Bearer {}' http://{}/api/modules",
-        api_key, bind_address
-    );
 
     axum::serve(
         listener,

@@ -4,7 +4,6 @@
 //! to check RDP credentials without spawning external processes.
 
 use anyhow::{anyhow, Result};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -77,11 +76,10 @@ pub async fn try_login(
         return Ok(RdpLoginResult::ConnectionFailed(format!("Write CR: {}", e)));
     }
 
-    // 3. Read X.224 Connection Confirm
+    // 3. Read X.224 Connection Confirm (read full TPKT frame)
     let mut buf = vec![0u8; 1024];
-    let n = match timeout(timeout_duration, stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        Ok(Ok(_)) => return Ok(RdpLoginResult::ConnectionFailed("Empty CC response".into())),
+    let n = match timeout(timeout_duration, read_tpkt_frame(&mut stream, &mut buf)).await {
+        Ok(Ok(n)) => n,
         Ok(Err(e)) => return Ok(RdpLoginResult::ConnectionFailed(format!("Read CC: {}", e))),
         Err(_) => return Ok(RdpLoginResult::ConnectionFailed("CC timeout".into())),
     };
@@ -114,6 +112,34 @@ pub async fn try_login(
     Ok(RdpLoginResult::ProtocolError(
         "Server uses legacy RDP security; cannot auth-check natively".into(),
     ))
+}
+
+// ============================================================================
+// TPKT Frame Reader — ensures full PDU is read (handles partial TCP reads)
+// ============================================================================
+
+async fn read_tpkt_frame<S: AsyncReadExt + Unpin>(stream: &mut S, buf: &mut [u8]) -> Result<usize> {
+    // Read at least 4 bytes for the TPKT header
+    let mut total = 0;
+    while total < 4 {
+        let n = stream.read(&mut buf[total..]).await?;
+        if n == 0 { return Err(anyhow!("Connection closed before TPKT header")); }
+        total += n;
+    }
+    if buf[0] != TPKT_VERSION {
+        return Err(anyhow!("Bad TPKT version 0x{:02x}", buf[0]));
+    }
+    let frame_len = ((buf[2] as usize) << 8) | buf[3] as usize;
+    if frame_len > buf.len() {
+        return Err(anyhow!("TPKT frame too large: {} bytes", frame_len));
+    }
+    // Read remaining bytes
+    while total < frame_len {
+        let n = stream.read(&mut buf[total..frame_len]).await?;
+        if n == 0 { return Err(anyhow!("Connection closed mid-TPKT frame")); }
+        total += n;
+    }
+    Ok(total)
 }
 
 // ============================================================================
@@ -158,17 +184,19 @@ fn parse_x224_cc(data: &[u8]) -> Result<u32> {
         return Err(anyhow!("Not CC (type=0x{:02x})", data[5]));
     }
     // Check for negotiation response (last 8 bytes of TPKT)
-    if tpkt_len >= 19 {
+    if tpkt_len >= 19 && data.len() >= tpkt_len {
         let off = tpkt_len - 8;
-        if data[off] == RDP_NEG_RSP {
-            return Ok(u32::from_le_bytes([
-                data[off + 4], data[off + 5], data[off + 6], data[off + 7],
-            ]));
-        } else if data[off] == RDP_NEG_FAILURE {
-            let failure_code = u32::from_le_bytes([
-                data[off + 4], data[off + 5], data[off + 6], data[off + 7],
-            ]);
-            return Err(anyhow!("Server rejected negotiation (failure code: 0x{:08x})", failure_code));
+        if off + 8 <= data.len() {
+            if data[off] == RDP_NEG_RSP {
+                return Ok(u32::from_le_bytes([
+                    data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+                ]));
+            } else if data[off] == RDP_NEG_FAILURE {
+                let failure_code = u32::from_le_bytes([
+                    data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+                ]);
+                return Err(anyhow!("Server rejected negotiation (failure code: 0x{:08x})", failure_code));
+            }
         }
     }
     Ok(PROTO_RDP)
@@ -178,61 +206,21 @@ fn parse_x224_cc(data: &[u8]) -> Result<u32> {
 // TLS Upgrade
 // ============================================================================
 
-#[derive(Debug)]
-struct NoCertVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 async fn tls_upgrade(
     stream: TcpStream,
     addr: &str,
     timeout_duration: Duration,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-        .with_no_client_auth();
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    // Use a dummy server name (we bypass verification anyway)
-    let host = addr.split(':').next().unwrap_or("localhost");
+    let connector = crate::native::async_tls::make_dangerous_tls_connector();
+    // Extract host — handle IPv6 bracket notation like [::1]:3389
+    let host = if addr.starts_with('[') {
+        addr.split(']').next().unwrap_or("localhost").trim_start_matches('[')
+    } else {
+        addr.split(':').next().unwrap_or("localhost")
+    };
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap());
+        .or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()))
+        .map_err(|_| anyhow!("Invalid server name"))?;
 
     match timeout(timeout_duration, connector.connect(server_name, stream)).await {
         Ok(Ok(tls)) => Ok(tls),
@@ -567,8 +555,19 @@ fn ber_len(buf: &mut Vec<u8>, len: usize) {
     } else if len < 0x100 {
         buf.push(0x81);
         buf.push(len as u8);
-    } else {
+    } else if len < 0x10000 {
         buf.push(0x82);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    } else if len < 0x1000000 {
+        buf.push(0x83);
+        buf.push((len >> 16) as u8);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    } else {
+        buf.push(0x84);
+        buf.push((len >> 24) as u8);
+        buf.push((len >> 16) as u8);
         buf.push((len >> 8) as u8);
         buf.push(len as u8);
     }
@@ -710,22 +709,41 @@ fn extract_integer(data: &[u8]) -> Option<i64> {
     if pos < data.len() && data[pos] == 0x02 {
         pos += 1;
         let len = ber_read_len(data, &mut pos);
-        if pos + len <= data.len() {
-            let mut val: i64 = 0;
-            for i in 0..len {
-                val = (val << 8) | data[pos + i] as i64;
-            }
-            return Some(val);
+        if len == 0 || pos + len > data.len() { return None; }
+        // Sign-extend: if first byte has high bit set, the value is negative
+        let mut val: i64 = if data[pos] & 0x80 != 0 { -1 } else { 0 };
+        for i in 0..len {
+            val = (val << 8) | data[pos + i] as i64;
         }
+        return Some(val);
     }
     None
 }
 
 fn encode_ber_int(val: i64) -> Vec<u8> {
-    if val <= 0x7f { return vec![val as u8]; }
+    if val == 0 { return vec![0x00]; }
     let bytes = val.to_be_bytes();
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
-    bytes[start..].to_vec()
+    if val > 0 {
+        // Skip leading zero bytes, but keep a 0x00 prefix if high bit is set
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        if bytes[start] & 0x80 != 0 {
+            let mut r = vec![0x00];
+            r.extend_from_slice(&bytes[start..]);
+            r
+        } else {
+            bytes[start..].to_vec()
+        }
+    } else {
+        // Negative: skip leading 0xFF bytes, but keep one if next byte's high bit is 0
+        let start = bytes.iter().position(|&b| b != 0xFF).unwrap_or(7);
+        if bytes[start] & 0x80 == 0 {
+            let mut r = vec![0xFF];
+            r.extend_from_slice(&bytes[start..]);
+            r
+        } else {
+            bytes[start..].to_vec()
+        }
+    }
 }
 
 // ============================================================================

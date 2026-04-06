@@ -11,7 +11,7 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -26,6 +26,7 @@ use tokio::{
     time::sleep,
 };
 use ipnetwork::IpNetwork;
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
@@ -36,18 +37,18 @@ const DEFAULT_THREADS: usize = 50;
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
 fn display_banner() {
-    println!("{}", "╔═══════════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   SSH Service Scanner                                             ║".cyan());
-    println!("{}", "║   Scan networks for SSH services and grab banners                 ║".cyan());
-    println!("{}", "║                                                                   ║".cyan());
-    println!("{}", "║   Features:                                                       ║".cyan());
-    println!("{}", "║   - CIDR range support                                            ║".cyan());
-    println!("{}", "║   - IPv4/IPv6 support                                             ║".cyan());
-    println!("{}", "║   - Banner grabbing                                               ║".cyan());
-    println!("{}", "║   - Concurrent scanning                                           ║".cyan());
-    println!("{}", "║   - Results export                                                ║".cyan());
-    println!("{}", "╚═══════════════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   SSH Service Scanner                                             ║".cyan());
+    crate::mprintln!("{}", "║   Scan networks for SSH services and grab banners                 ║".cyan());
+    crate::mprintln!("{}", "║                                                                   ║".cyan());
+    crate::mprintln!("{}", "║   Features:                                                       ║".cyan());
+    crate::mprintln!("{}", "║   - CIDR range support                                            ║".cyan());
+    crate::mprintln!("{}", "║   - IPv4/IPv6 support                                             ║".cyan());
+    crate::mprintln!("{}", "║   - Banner grabbing                                               ║".cyan());
+    crate::mprintln!("{}", "║   - Concurrent scanning                                           ║".cyan());
+    crate::mprintln!("{}", "║   - Results export                                                ║".cyan());
+    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 }
 
 /// Statistics tracking
@@ -85,7 +86,7 @@ impl Statistics {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 { scanned as f64 / elapsed } else { 0.0 };
         
-        print!(
+        crate::mprint!(
             "\r{} {} scanned | {} SSH | {} errors | {:.1}/s    ",
             "[Progress]".cyan(),
             scanned.to_string().bold(),
@@ -97,12 +98,12 @@ impl Statistics {
     }
     
     fn print_summary(&self) {
-        println!();
-        println!("{}", "=== Scan Summary ===".cyan().bold());
-        println!("Total scanned: {}", self.total_scanned.load(Ordering::Relaxed));
-        println!("SSH services found: {}", self.ssh_found.load(Ordering::Relaxed).to_string().green());
-        println!("Errors: {}", self.errors.load(Ordering::Relaxed));
-        println!("Elapsed: {:.2}s", self.start_time.elapsed().as_secs_f64());
+        crate::mprintln!();
+        crate::mprintln!("{}", "=== Scan Summary ===".cyan().bold());
+        crate::mprintln!("Total scanned: {}", self.total_scanned.load(Ordering::Relaxed));
+        crate::mprintln!("SSH services found: {}", self.ssh_found.load(Ordering::Relaxed).to_string().green());
+        crate::mprintln!("Errors: {}", self.errors.load(Ordering::Relaxed));
+        crate::mprintln!("Elapsed: {:.2}s", self.start_time.elapsed().as_secs_f64());
     }
 }
 
@@ -136,12 +137,12 @@ fn grab_ssh_banner(host: &str, port: u16, timeout_secs: u64) -> Option<String> {
     let timeout = Duration::from_secs(timeout_secs);
     
     for addr in addrs {
-        if let Ok(stream) = TcpStream::connect_timeout(&addr, timeout) {
+        if let Ok(stream) = crate::utils::blocking_tcp_connect(&addr, timeout) {
             let _ = stream.set_read_timeout(Some(timeout));
             let _ = stream.set_write_timeout(Some(timeout));
             
             let mut stream = stream;
-            let mut buffer = [0u8; 256];
+            let mut buffer = [0u8; 1024];
             
             match stream.read(&mut buffer) {
                 Ok(n) if n > 0 => {
@@ -173,7 +174,16 @@ fn parse_targets(spec: &str, port: u16) -> Vec<(String, u16)> {
         // Try CIDR
         if s.contains('/') {
             if let Ok(network) = s.parse::<IpNetwork>() {
-                for ip in network.iter().take(65536) {
+                const MAX_CIDR_HOSTS: usize = 65536;
+                let host_count: u128 = match network.size() {
+                    ipnetwork::NetworkSize::V4(n) => n as u128,
+                    ipnetwork::NetworkSize::V6(n) => n,
+                };
+                if host_count > MAX_CIDR_HOSTS as u128 {
+                    crate::mprintln!("{}", format!("[!] CIDR {} has {} hosts — scanning first {} only",
+                        s, host_count, MAX_CIDR_HOSTS).yellow());
+                }
+                for ip in network.iter().take(MAX_CIDR_HOSTS) {
                     targets.push((ip.to_string(), port));
                 }
                 continue;
@@ -237,7 +247,7 @@ pub async fn scan_ssh(
     timeout_secs: u64,
 ) -> Vec<SshScanResult> {
     let total = targets.len();
-    println!("{}", format!("[*] Scanning {} targets...", total).cyan());
+    crate::mprintln!("{}", format!("[*] Scanning {} targets...", total).cyan());
     
     let results = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let stats = Arc::new(Statistics::new());
@@ -278,7 +288,7 @@ pub async fn scan_ssh(
                         port,
                         banner: banner.clone(),
                     };
-                    println!("\r{}", format!("[+] {}:{} - {}", host, port, banner).green());
+                    crate::mprintln!("\r{}", format!("[+] {}:{} - {}", host, port, banner).green());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     results.lock().await.push(result);
                 }
@@ -314,7 +324,9 @@ pub async fn scan_ssh(
 /// Save results to file
 fn save_results(results: &[SshScanResult], path: &str) -> Result<()> {
     let mut file = File::create(path)?;
-    
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+
     writeln!(file, "# SSH Scan Results")?;
     writeln!(file, "# Generated by RustSploit SSH Scanner")?;
     writeln!(file, "# Total: {} SSH services found", results.len())?;
@@ -324,27 +336,46 @@ fn save_results(results: &[SshScanResult], path: &str) -> Result<()> {
         writeln!(file, "{}:{} - {}", result.host, result.port, result.banner)?;
     }
     
-    println!("{}", format!("[+] Results saved to: {}", path).green());
+    crate::mprintln!("{}", format!("[+] Results saved to: {}", path).green());
     Ok(())
 }
 
 /// Main entry point
 pub async fn run(target: &str) -> Result<()> {
+    if is_mass_scan_target(target) {
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "SSH-Scanner",
+            default_port: 22,
+            state_file: "ssh_scanner_mass_state.log",
+            default_output: "ssh_scanner_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    Some(format!("[{}] {}:{} SSH-Scanner open\n", ts, ip, port))
+                } else {
+                    None
+                }
+            }
+        }).await;
+    }
+
     display_banner();
-    
+
     let mut targets = Vec::new();
     
     // Parse initial target
     if !target.trim().is_empty() {
-        println!("{}", format!("[*] Initial target: {}", target).cyan());
+        crate::mprintln!("{}", format!("[*] Initial target: {}", target).cyan());
     }
     
     // Get port
-    let port_str = cfg_prompt_default("port", "SSH Port", "22")?;
+    let port_str = cfg_prompt_default("port", "SSH Port", "22").await?;
     let port: u16 = port_str.parse().unwrap_or(DEFAULT_SSH_PORT);
     
     // Get additional targets
-    let more_targets = cfg_prompt_default("additional_targets", "Additional targets (comma-separated, CIDR, or leave empty)", "")?;
+    let more_targets = cfg_prompt_default("additional_targets", "Additional targets (comma-separated, CIDR, or leave empty)", "").await?;
     
     // Add initial target
     if !target.trim().is_empty() {
@@ -357,16 +388,16 @@ pub async fn run(target: &str) -> Result<()> {
     }
     
     // Load from file?
-    if cfg_prompt_yes_no("load_from_file", "Load targets from file?", false)? {
-        let file_path = cfg_prompt_default("target_file", "File path", "")?;
+    if cfg_prompt_yes_no("load_from_file", "Load targets from file?", false).await? {
+        let file_path = cfg_prompt_default("target_file", "File path", "").await?;
         if !file_path.is_empty() {
             match load_targets_from_file(&file_path, port) {
                 Ok(file_targets) => {
-                    println!("{}", format!("[*] Loaded {} targets from file", file_targets.len()).cyan());
+                    crate::mprintln!("{}", format!("[*] Loaded {} targets from file", file_targets.len()).cyan());
                     targets.extend(file_targets);
                 }
                 Err(e) => {
-                    println!("{}", format!("[-] Failed to load file: {}", e).red());
+                    crate::mprintln!("{}", format!("[-] Failed to load file: {}", e).red());
                 }
             }
         }
@@ -380,30 +411,41 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No targets specified"));
     }
     
-    println!("{}", format!("[*] Total unique targets: {}", targets.len()).cyan());
+    crate::mprintln!("{}", format!("[*] Total unique targets: {}", targets.len()).cyan());
     
     // Get scan options
-    let threads_str = cfg_prompt_default("threads", "Concurrent threads", &DEFAULT_THREADS.to_string())?;
+    let threads_str = cfg_prompt_default("threads", "Concurrent threads", &DEFAULT_THREADS.to_string()).await?;
     let threads: usize = threads_str.parse().unwrap_or(DEFAULT_THREADS);
-    let timeout_str = cfg_prompt_default("timeout", "Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string())?;
+    let timeout_str = cfg_prompt_default("timeout", "Connection timeout (seconds)", &DEFAULT_TIMEOUT_SECS.to_string()).await?;
     let timeout: u64 = timeout_str.parse().unwrap_or(DEFAULT_TIMEOUT_SECS);
     
-    println!();
+    crate::mprintln!();
     
     // Run scan
     let results = scan_ssh(targets, threads, timeout).await;
     
     // Save results?
-    if !results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true)? {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "ssh_scan_results.txt")?;
+    if !results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
+        let output_path = cfg_prompt_output_file("output_file", "Output file", "ssh_scan_results.txt").await?;
         if let Err(e) = save_results(&results, &output_path) {
-            println!("{}", format!("[-] Failed to save: {}", e).red());
+            crate::mprintln!("{}", format!("[-] Failed to save: {}", e).red());
         }
     }
     
-    println!();
-    println!("{}", format!("[*] SSH scanner complete. Found {} services.", results.len()).green());
-    
+    crate::mprintln!();
+    crate::mprintln!("{}", format!("[*] SSH scanner complete. Found {} services.", results.len()).green());
+
     Ok(())
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SSH Service Scanner".to_string(),
+        description: "Scans networks for SSH services with banner grabbing, CIDR range support, and concurrent scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }
 

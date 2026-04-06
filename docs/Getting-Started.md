@@ -65,10 +65,17 @@ cargo run
 
 ### CLI (non-interactive)
 ```bash
-cargo run -- --command exploit --module heartbleed --target 192.168.1.1
+cargo run -- -m exploits/heartbleed -t 192.168.1.1
 ```
 
 See [CLI Reference](CLI-Reference.md) for all flags.
+
+### API Server
+```bash
+cargo run -- --api
+```
+
+This starts the PQ-encrypted API server on port 8080. On first run it generates a host key pair at `~/.rustsploit/pq_host_key` and prints its fingerprint. Clients must be listed in `~/.rustsploit/pq_authorized_keys` to connect. No TLS or API keys — authentication uses SSH-style post-quantum identity keys. See [API Server](API-Server.md) and [API Usage Examples](API-Usage-Examples.md) for details.
 
 ---
 
@@ -91,7 +98,7 @@ python3 scripts/setup_docker.py
 The helper will:
 1. Confirm you are in the repository root (`Cargo.toml` present).
 2. Ask how the API should bind (`127.0.0.1`, `0.0.0.0`, detected LAN IP, or custom `host:port`).
-3. Let you enter or auto-generate an API key (printable ASCII, max 128 chars).
+3. Generate or configure PQ identity keys for the API server.
 4. Toggle hardening mode and tune the IP limit.
 5. Generate:
    - `docker/Dockerfile.api`
@@ -109,7 +116,7 @@ python3 scripts/setup_docker.py \
   --bind 0.0.0.0:8443 \
   --generate-key \
   --enable-hardening \
-  --ip-limit 5 \
+  # PQ identity keys auto-generated on first run
   --skip-up \
   --force \
   --non-interactive

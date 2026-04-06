@@ -23,6 +23,8 @@ pub enum TargetConfig {
     Single(String),
     /// CIDR subnet (e.g., "192.168.1.0/24")
     Subnet(IpNetwork),
+    /// Comma-separated list of targets (IPs, hostnames, and/or CIDRs)
+    Multi(Vec<String>),
 }
 
 impl GlobalConfig {
@@ -54,10 +56,64 @@ impl GlobalConfig {
         if trimmed.chars().any(|c| c.is_control()) {
             return Err(anyhow!("Target cannot contain control characters"));
         }
-        
-        // Check for path traversal attempts
+
+        // Mass scan keywords: "random", "0.0.0.0" — store as-is
+        if trimmed == "random" || trimmed == "0.0.0.0" {
+            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+            return Ok(());
+        }
+
+        // File-based target list: resolve canonical path to prevent traversal,
+        // then store if the file exists. This check must come before the ".."
+        // rejection so relative file paths like "../targets.txt" work.
+        let path = std::path::Path::new(trimmed);
+        if path.exists() && path.is_file() {
+            // Resolve to canonical path (eliminates .., symlinks, etc.)
+            let canonical = path.canonicalize()
+                .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", trimmed, e))?;
+            let canonical_str = canonical.to_string_lossy().to_string();
+            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            *target_guard = Some(TargetConfig::Single(canonical_str));
+            return Ok(());
+        }
+
+        // Check for path traversal attempts (only for non-file targets)
         if trimmed.contains("..") || trimmed.contains("//") {
             return Err(anyhow!("Target contains invalid characters (path traversal)"));
+        }
+
+        // Comma-separated multi-target: "10.0.0.1, 192.168.1.0/24, example.com"
+        if trimmed.contains(',') {
+            let targets: Vec<String> = trimmed
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if targets.is_empty() {
+                return Err(anyhow!("No valid targets in comma-separated list"));
+            }
+            if targets.len() == 1 {
+                // Single target after parsing — recurse without comma
+                return self.set_target(&targets[0]);
+            }
+            // Validate each individual target
+            const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
+            for t in &targets {
+                // Allow mass scan keywords, CIDRs, file paths, and hostnames/IPs
+                if MASS_SCAN_KEYWORDS.contains(&t.as_str()) {
+                    continue;
+                }
+                if std::path::Path::new(t.as_str()).is_file() {
+                    continue;
+                }
+                if t.parse::<IpNetwork>().is_err() {
+                    Self::validate_hostname_or_ip(t)?;
+                }
+            }
+            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            *target_guard = Some(TargetConfig::Multi(targets));
+            return Ok(());
         }
 
         // Try to parse as CIDR subnet first
@@ -90,7 +146,10 @@ impl GlobalConfig {
         
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
-        let valid_chars = Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("Regex compilation failed");
+        static VALID_CHARS: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+            Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("hardcoded regex must compile")
+        });
+        let valid_chars = &*VALID_CHARS;
         if !valid_chars.is_match(target) {
             return Err(anyhow!(
                 "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"
@@ -125,26 +184,9 @@ impl GlobalConfig {
         guard.as_ref().map(|t| match t {
             TargetConfig::Single(ip) => ip.clone(),
             TargetConfig::Subnet(net) => net.to_string(),
+            TargetConfig::Multi(targets) => targets.join(", "),
         })
     }
-
-    /// Get a single IP address from the global target
-    /// For subnets, returns the network address (first IP)
-    pub fn get_single_target_ip(&self) -> Result<String> {
-        let guard = self.target.read().map_err(|_| anyhow!("Config lock poisoned"))?;
-        
-        match guard.as_ref() {
-            Some(TargetConfig::Single(ip)) => {
-                Ok(ip.clone())
-            }
-            Some(TargetConfig::Subnet(net)) => {
-                // Return the network address (first IP in the subnet)
-                Ok(net.network().to_string())
-            }
-            None => Err(anyhow!("No global target set")),
-        }
-    }
-
 
     /// Check if global target is set
     pub fn has_target(&self) -> bool {
@@ -153,7 +195,7 @@ impl GlobalConfig {
 
     /// Check if global target is a subnet
     pub fn is_subnet(&self) -> bool {
-        self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)))).unwrap_or(false)
+        self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)) | Some(TargetConfig::Multi(_)))).unwrap_or(false)
     }
 
     /// Get the target subnet if set
@@ -173,33 +215,39 @@ impl GlobalConfig {
         match target_guard.as_ref() {
             Some(TargetConfig::Single(_)) => Some(1),
             Some(TargetConfig::Subnet(net)) => {
-                // Calculate size from prefix length
-                let size = match net {
-                    IpNetwork::V4(net4) => {
-                        let prefix = net4.prefix() as u32;
-                        if prefix >= 32 {
-                            1u64
-                        } else {
-                            2u64.pow(32 - prefix)
-                        }
+                Some(Self::network_size(net))
+            }
+            Some(TargetConfig::Multi(targets)) => {
+                let mut total = 0u64;
+                for t in targets {
+                    if let Ok(net) = t.parse::<IpNetwork>() {
+                        total = total.saturating_add(Self::network_size(&net));
+                    } else {
+                        total = total.saturating_add(1);
                     }
-                    IpNetwork::V6(net6) => {
-                        let prefix = net6.prefix() as u32;
-                        if prefix >= 128 {
-                            1u64
-                        } else {
-                            let exp = 128u32.saturating_sub(prefix);
-                            if exp > 63 {
-                                u64::MAX
-                            } else {
-                                2u64.pow(exp)
-                            }
-                        }
-                    }
-                };
-                Some(size)
+                }
+                Some(total)
             }
             None => None,
+        }
+    }
+
+    /// Calculate the number of IPs in a network
+    fn network_size(net: &IpNetwork) -> u64 {
+        match net {
+            IpNetwork::V4(net4) => {
+                let prefix = net4.prefix() as u32;
+                if prefix >= 32 { 1u64 } else { 2u64.pow(32 - prefix) }
+            }
+            IpNetwork::V6(net6) => {
+                let prefix = net6.prefix() as u32;
+                if prefix >= 128 {
+                    1u64
+                } else {
+                    let exp = 128u32.saturating_sub(prefix);
+                    if exp > 63 { u64::MAX } else { 2u64.pow(exp) }
+                }
+            }
         }
     }
 
@@ -312,11 +360,6 @@ impl ModuleConfig {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Clear all settings
-    pub fn clear(&mut self) {
-        *self = Self::default();
-    }
 }
 
 impl Default for ModuleConfig {
@@ -342,25 +385,28 @@ pub static MODULE_CONFIG: Lazy<Arc<RwLock<ModuleConfig>>> = Lazy::new(|| {
     Arc::new(RwLock::new(ModuleConfig::new()))
 });
 
-/// Set module config from API request
-pub fn set_module_config(config: ModuleConfig) {
-    if let Ok(mut guard) = MODULE_CONFIG.write() {
-        *guard = config;
-    }
-}
-
-/// Get a clone of the current module config
+/// Get a clone of the current module config.
+/// Checks the task-local RunContext first (for concurrent API runs),
+/// then falls back to the global MODULE_CONFIG.
 pub fn get_module_config() -> ModuleConfig {
+    // Try task-local context first (set by API handler per-request)
+    let task_local = crate::context::RUN_CONTEXT.try_with(|ctx| ctx.config.clone());
+    if let Ok(config) = task_local {
+        return config;
+    }
+    // Fallback to global (for CLI/shell mode)
     MODULE_CONFIG.read()
         .map(|g| g.clone())
         .unwrap_or_default()
 }
 
-/// Clear module config (should be called after module execution)
-pub fn clear_module_config() {
-    if let Ok(mut guard) = MODULE_CONFIG.write() {
-        guard.clear();
-    }
+/// Get the per-request target from the task-local RunContext, if set.
+/// Returns `None` in shell/CLI mode or when no context is active.
+pub fn get_run_target() -> Option<String> {
+    crate::context::RUN_CONTEXT
+        .try_with(|ctx| ctx.target.clone())
+        .ok()
+        .flatten()
 }
 
 /// Get the results directory (~/.rustsploit/results/) — creates it if needed.
@@ -371,7 +417,8 @@ pub fn results_dir() -> std::path::PathBuf {
         .join(".rustsploit")
         .join("results");
     if !dir.exists() {
-        let _ = std::fs::create_dir_all(&dir);
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir);
     }
     dir
 }

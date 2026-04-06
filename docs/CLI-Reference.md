@@ -7,13 +7,15 @@ Rustsploit modules can be executed without the interactive shell using Clap-base
 ## Basic Syntax
 
 ```bash
-cargo run -- [FLAGS] --command <TYPE> --module <NAME> --target <HOST>
+cargo run -- [FLAGS] -m <MODULE> -t <TARGET>
 ```
 
 Or if using the compiled binary:
 ```bash
-./rustsploit [FLAGS] --command <TYPE> --module <NAME> --target <HOST>
+./rustsploit [FLAGS] -m <MODULE> -t <TARGET>
 ```
+
+An optional positional argument (`exploit`, `scanner`, `creds`) can be used to specify the module category, but it is not required -- the dispatcher resolves modules by name automatically.
 
 ---
 
@@ -21,9 +23,9 @@ Or if using the compiled binary:
 
 | Flag | Values | Description |
 |------|--------|-------------|
-| `--command` / `-c` | `exploit`, `scanner`, `creds` | Module category to run |
 | `--module` / `-m` | module name or path | Module to execute (short name or qualified path) |
 | `--target` / `-t` | IP / hostname / CIDR | Target to run against |
+| *(positional)* | `exploit`, `scanner`, `creds` | Optional module category subcommand |
 
 ---
 
@@ -34,11 +36,11 @@ Or if using the compiled binary:
 | `--list-modules` | | Print all available modules and exit |
 | `--verbose` | `-v` | Enable detailed logging |
 | `--output-format` | | Control output: `text` (default) or `json` |
-| `--api` | | Start the REST API server instead of shell/CLI |
-| `--api-key <key>` | | API authentication key (required with `--api`) |
-| `--harden` | | Enable hardening mode (requires `--api`) |
-| `--interface <addr:port>` | | Bind address for API server (default: `0.0.0.0:8080`) |
-| `--ip-limit <n>` | | Max unique IPs before key rotation (default: 10, requires `--harden`) |
+| `--api` | | Start the PQ-encrypted REST API server |
+| `--interface <addr:port>` | | Bind address for API server (default: `127.0.0.1:8080`) |
+| `--pq-host-key <path>` | | PQ host key file (default: `~/.rustsploit/pq_host_key`) |
+| `--pq-authorized-keys <path>` | | Authorized client keys file (default: `~/.rustsploit/pq_authorized_keys`) |
+| `--resource` | `-r` | Execute a resource script file on startup |
 
 ---
 
@@ -46,13 +48,16 @@ Or if using the compiled binary:
 
 ```bash
 # Run an exploit
-cargo run -- --command exploit --module heartbleed --target 192.168.1.1
+cargo run -- -m heartbleed -t 192.168.1.1
 
 # Run a scanner
-cargo run -- --command scanner --module port_scanner --target 192.168.1.1
+cargo run -- -m port_scanner -t 192.168.1.1
 
 # Run a credential module
-cargo run -- --command creds --module ssh_bruteforce --target 192.168.1.1
+cargo run -- -m ssh_bruteforce -t 192.168.1.1
+
+# Run using a qualified module path
+cargo run -- -m exploits/sample_exploit -t 127.0.0.1
 
 # List all modules
 cargo run -- --list-modules
@@ -61,7 +66,10 @@ cargo run -- --list-modules
 cargo run -- -m exploits/sample_exploit -t 127.0.0.1 -v
 
 # Run with JSON output
-cargo run -- --command scanner --module port_scanner --target 10.0.0.1 --output-format json
+cargo run -- -m port_scanner -t 10.0.0.1 --output-format json
+
+# Execute a resource script
+cargo run -- -r scripts/scan.rc
 ```
 
 ---
@@ -82,9 +90,8 @@ Use `--list-modules` or the shell's `modules` command for the authoritative list
 
 | Situation | Message |
 |-----------|---------|
-| `-m` used without `-t` | `⚠ Warning: module set but no target specified` |
-| `-t` used without `-m` | `ℹ Note: target available in shell` |
-| `--harden` without `--api` | Error — hardening requires API mode |
+| `-m` used without `-t` | `⚠ Warning: --module specified without --target. Launching shell...` |
+| `-t` used without `-m` | Target is stored and available in the interactive shell |
 
 ---
 

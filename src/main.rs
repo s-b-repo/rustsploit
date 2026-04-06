@@ -3,6 +3,7 @@ use clap::Parser;
 use colored::*;
 use std::net::SocketAddr;
 use std::process;
+use tracing_subscriber::EnvFilter;
 
 mod cli;
 mod shell;
@@ -11,10 +12,21 @@ mod modules;
 mod utils;
 mod api;
 mod config;
+mod context;
 mod native;
+pub mod output;
+pub mod module_info;
+pub mod global_options;
+pub mod cred_store;
+pub mod spool;
+pub mod workspace;
+pub mod loot;
+pub mod export;
+pub mod jobs;
+pub mod mcp;
+pub mod pq_channel;
+pub mod pq_middleware;
 
-/// Maximum length for API key to prevent memory exhaustion
-const MAX_API_KEY_LENGTH: usize = 256;
 
 /// Maximum length for interface/bind address
 const MAX_BIND_ADDRESS_LENGTH: usize = 128;
@@ -47,21 +59,28 @@ fn validate_bind_address(addr: &str) -> Result<String> {
     Ok(with_port)
 }
 
-/// Validates API key format
-fn validate_api_key(key: &str) -> Result<String> {
-    let trimmed = key.trim();
+/// Returns the path to the PQ host key file.
+fn pq_host_key_path(custom: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = custom {
+        std::path::PathBuf::from(p)
+    } else {
+        home::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".rustsploit")
+            .join("pq_host_key")
+    }
+}
 
-    if trimmed.is_empty() {
-        return Err(anyhow!("API key cannot be empty"));
+/// Returns the path to the PQ authorized keys file.
+fn pq_authorized_keys_path(custom: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = custom {
+        std::path::PathBuf::from(p)
+    } else {
+        home::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".rustsploit")
+            .join("pq_authorized_keys")
     }
-    if trimmed.len() > MAX_API_KEY_LENGTH {
-        return Err(anyhow!("API key too long (max {} characters)", MAX_API_KEY_LENGTH));
-    }
-    if !trimmed.chars().all(|c| c.is_ascii_graphic()) {
-        return Err(anyhow!("API key must contain only printable ASCII characters"));
-    }
-
-    Ok(trimmed.to_string())
 }
 
 #[tokio::main]
@@ -73,30 +92,51 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Initialize structured logging
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new("warn")
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
     let cli_args = cli::Cli::parse();
 
-    utils::verbose_log(cli_args.verbose, "CLI arguments parsed successfully");
+    tracing::debug!("CLI arguments parsed successfully");
 
     // Handle list_modules flag
     if cli_args.list_modules {
-        utils::verbose_log(cli_args.verbose, "Listing all modules...");
+        tracing::debug!("Listing all modules...");
         utils::list_all_modules();
         return Ok(());
     }
 
-    // API server mode
+    // API server mode — PQ-encrypted, no TLS, no API keys
     if cli_args.api {
-        let api_key_raw = cli_args
-            .api_key
-            .as_ref()
-            .ok_or_else(|| anyhow!("--api-key is required when using --api mode"))?;
+        let host_key_path = pq_host_key_path(cli_args.pq_host_key.as_deref());
+        let auth_keys_path = pq_authorized_keys_path(cli_args.pq_authorized_keys.as_deref());
 
-        let api_key = validate_api_key(api_key_raw).context("Invalid API key")?;
         let interface = cli_args.interface.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         let bind_address = validate_bind_address(&interface).context("Invalid bind address")?;
 
-        utils::verbose_log(cli_args.verbose, &format!("Starting API server on {}...", bind_address));
-        api::start_api_server(&bind_address, api_key, cli_args.verbose).await?;
+        tracing::debug!("Starting PQ-encrypted API server on {}...", bind_address);
+        api::start_api_server(
+            &bind_address,
+            cli_args.verbose,
+            &host_key_path,
+            &auth_keys_path,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // MCP server mode
+    if cli_args.mcp {
+        tracing::debug!("Starting MCP server on stdio...");
+        mcp::run_mcp_server().await?;
         return Ok(());
     }
 
@@ -109,35 +149,43 @@ async fn run() -> Result<()> {
 
     // Set global target if provided
     if let Some(ref target) = cli_args.set_target {
-        utils::verbose_log(cli_args.verbose, &format!("Setting global target to: {}", target));
+        tracing::debug!("Setting global target to: {}", target);
         config::GLOBAL_CONFIG.set_target(target)?;
         println!("{} Global target set to: {}", "✓".green(), target);
     }
 
     // Handle subcommands from CLI
     if let Some(cmd) = &cli_args.command {
-        utils::verbose_log(cli_args.verbose, &format!("Executing subcommand: {}", cmd));
+        tracing::debug!("Executing subcommand: {}", cmd);
         commands::handle_command(cmd, &cli_args).await?;
     }
     // Run module directly if both -m and -t are provided
     else if let Some(ref module) = cli_args.module {
         if let Some(ref target) = cli_args.target {
-            utils::verbose_log(cli_args.verbose, &format!("Running module '{}' against '{}'", module, target));
+            tracing::debug!("Running module '{}' against '{}'", module, target);
             commands::run_module(module, target, cli_args.verbose).await?;
         } else if config::GLOBAL_CONFIG.has_target() {
             let target = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
-            utils::verbose_log(cli_args.verbose, &format!("Running module '{}' against global target '{}'", module, target));
+            tracing::debug!("Running module '{}' against global target '{}'", module, target);
             commands::run_module(module, &target, cli_args.verbose).await?;
         } else {
             eprintln!("{}", "⚠ Warning: --module specified without --target. Launching shell...".yellow());
-            utils::verbose_log(cli_args.verbose, "Launching interactive shell...");
-            shell::interactive_shell(cli_args.verbose).await?;
+            tracing::debug!("Launching interactive shell...");
+            if let Some(ref rc) = cli_args.resource {
+                shell::interactive_shell_with_resource(cli_args.verbose, Some(rc)).await?;
+            } else {
+                shell::interactive_shell(cli_args.verbose).await?;
+            }
         }
     }
     // Launch interactive shell
     else {
-        utils::verbose_log(cli_args.verbose, "Launching interactive shell...");
-        shell::interactive_shell(cli_args.verbose).await?;
+        tracing::debug!("Launching interactive shell...");
+        if let Some(ref rc) = cli_args.resource {
+            shell::interactive_shell_with_resource(cli_args.verbose, Some(rc)).await?;
+        } else {
+            shell::interactive_shell(cli_args.verbose).await?;
+        }
     }
 
     Ok(())

@@ -35,11 +35,20 @@
 | `clap` | CLI argument parsing |
 | `anyhow` | Error handling |
 | `colored` | Terminal color output |
+| `axum` | REST API framework |
 | `suppaftp` | FTP/FTPS (v7, tokio async) |
 | `hickory-client` | DNS (v0.25, builder pattern) |
 | `ipnetwork` | CIDR range matching |
 | `rustls` | TLS (v0.23+) |
 | `bytes` | Buffer management (`BytesMut`) |
+| `subtle` | Constant-time API key comparison |
+| `strsim` | Fuzzy module name matching (Levenshtein) |
+| `rustyline` | Interactive shell line editing |
+| `serde` / `serde_json` | Serialization / JSON persistence |
+| `ssh2` | SSH protocol support |
+| `des` / `aes` / `cipher` | Cryptographic primitives |
+| `chrono` | Date/time handling |
+| `uuid` | Unique identifier generation |
 
 ---
 

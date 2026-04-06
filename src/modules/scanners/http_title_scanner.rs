@@ -9,49 +9,73 @@ use std::fs;
 use std::time::{Duration, Instant};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
+    safe_read_to_string,
 };
+use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 pub async fn run(initial_target: &str) -> Result<()> {
+    if crate::utils::get_global_source_port().await.is_some() {
+        crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
+    }
+    if is_mass_scan_target(initial_target) {
+        return run_mass_scan(initial_target, MassScanConfig {
+            protocol_name: "HTTP-Title",
+            default_port: 80,
+            state_file: "http_title_scanner_mass_state.log",
+            default_output: "http_title_scanner_mass_results.txt",
+            default_concurrency: 500,
+        }, move |ip, port| {
+            async move {
+                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    Some(format!("[{}] {}:{} HTTP-Title open\n", ts, ip, port))
+                } else {
+                    None
+                }
+            }
+        }).await;
+    }
+
     banner();
 
     let mut targets = collect_initial_targets(initial_target);
 
-    let additional = cfg_prompt_default("additional_targets", "Enter additional comma-separated targets (optional)", "")?;
+    let additional = cfg_prompt_default("additional_targets", "Enter additional comma-separated targets (optional)", "").await?;
     if !additional.is_empty() {
         targets.extend(split_targets(&additional));
     }
 
-    let file_path = cfg_prompt_default("target_file", "Path to file with targets (optional)", "")?;
+    let file_path = cfg_prompt_default("target_file", "Path to file with targets (optional)", "").await?;
     if !file_path.is_empty() {
         let file_targets = load_targets_from_file(&file_path)?;
         targets.extend(file_targets);
     }
 
-    let check_http = cfg_prompt_yes_no("check_http", "Check HTTP (http://)?", true)?;
-    let check_https = cfg_prompt_yes_no("check_https", "Check HTTPS (https://)?", true)?;
+    let check_http = cfg_prompt_yes_no("check_http", "Check HTTP (http://)?", true).await?;
+    let check_https = cfg_prompt_yes_no("check_https", "Check HTTPS (https://)?", true).await?;
 
     if !check_http && !check_https {
-        println!("[!] Neither HTTP nor HTTPS selected; nothing to scan.");
+        crate::mprintln!("[!] Neither HTTP nor HTTPS selected; nothing to scan.");
         return Ok(());
     }
 
-    let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false)?;
+    let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false).await?;
     let ports = if use_ports {
-        let ports_str = cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "")?;
+        let ports_str = cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "").await?;
         parse_ports_from_string(&ports_str)
     } else {
         Vec::new()
     };
 
-    let timeout_secs = cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120)? as u64;
-    let save_output = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
-    let verbose = cfg_prompt_yes_no("verbose", "Enable verbose output?", false)?;
+    let timeout_secs = cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120).await? as u64;
+    let save_output = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
+    let verbose = cfg_prompt_yes_no("verbose", "Enable verbose output?", false).await?;
 
     let mut normalized = normalize_targets(targets, check_http, check_https);
     if !ports.is_empty() {
         let expanded = expand_targets_with_ports(&normalized, &ports);
         if expanded.is_empty() {
-            println!("[!] No valid port combinations derived; continuing without port tunneling.");
+            crate::mprintln!("[!] No valid port combinations derived; continuing without port tunneling.");
         } else {
             normalized = expanded;
         }
@@ -62,6 +86,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
+        .danger_accept_invalid_certs(true)
         .user_agent("RustSploit-HTTP-Title-Scanner/1.0")
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -75,13 +100,13 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let start_time = Instant::now();
     let total_targets = normalized.len();
 
-    println!("{}", format!("[*] Scanning {} target(s)...", total_targets).cyan().bold());
-    println!();
+    crate::mprintln!("{}", format!("[*] Scanning {} target(s)...", total_targets).cyan().bold());
+    crate::mprintln!();
 
     for (idx, url) in normalized.iter().enumerate() {
         // Progress indicator
         if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
-            print!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)", 
+            crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)", 
                 idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
@@ -89,28 +114,28 @@ pub async fn run(initial_target: &str) -> Result<()> {
         match fetch_title(&client, url, &title_re).await {
             Ok(result) => {
                 if let Some(title) = &result.title {
-                    println!("\r{}", format!("[+] {} -> {}", url, title).green());
+                    crate::mprintln!("\r{}", format!("[+] {} -> {}", url, title).green());
                     success_count += 1;
                 } else if let Some(status) = result.status {
                     if status.is_success() {
-                        println!("\r{}", format!("[+] {} -> <no title> (status: {})", url, status).green());
+                        crate::mprintln!("\r{}", format!("[+] {} -> <no title> (status: {})", url, status).green());
                         success_count += 1;
                     } else {
-                        println!("\r{}", format!("[~] {} -> <no title> (status: {})", url, status).yellow());
+                        crate::mprintln!("\r{}", format!("[~] {} -> <no title> (status: {})", url, status).yellow());
                     }
                 } else {
-                    println!("\r{}", format!("[~] {} -> <no title>", url).yellow());
+                    crate::mprintln!("\r{}", format!("[~] {} -> <no title>", url).yellow());
                 }
                 if verbose {
                     if let Some(status) = result.status {
-                        println!("    Status: {}", status);
+                        crate::mprintln!("    Status: {}", status);
                     }
-                    println!("    Duration: {} ms", result.duration_ms);
+                    crate::mprintln!("    Duration: {} ms", result.duration_ms);
                 }
                 all_results.push(result);
             }
             Err(err) => {
-                println!("\r{}", format!("[-] {} -> error: {}", url, err).red());
+                crate::mprintln!("\r{}", format!("[-] {} -> error: {}", url, err).red());
                 error_count += 1;
                 all_results.push(TitleResult {
                     url: url.clone(),
@@ -126,14 +151,14 @@ pub async fn run(initial_target: &str) -> Result<()> {
     let elapsed = start_time.elapsed();
     
     // Print statistics
-    println!();
-    println!("{}", "=== Scan Statistics ===".bold());
-    println!("  Total scanned:  {}", total_targets);
-    println!("  Successful:     {}", success_count.to_string().green());
-    println!("  Errors:         {}", error_count.to_string().red());
-    println!("  Duration:       {:.2}s", elapsed.as_secs_f64());
+    crate::mprintln!();
+    crate::mprintln!("{}", "=== Scan Statistics ===".bold());
+    crate::mprintln!("  Total scanned:  {}", total_targets);
+    crate::mprintln!("  Successful:     {}", success_count.to_string().green());
+    crate::mprintln!("  Errors:         {}", error_count.to_string().red());
+    crate::mprintln!("  Duration:       {:.2}s", elapsed.as_secs_f64());
     if elapsed.as_secs() > 0 {
-        println!("  Rate:           {:.1} requests/s", total_targets as f64 / elapsed.as_secs_f64());
+        crate::mprintln!("  Rate:           {:.1} requests/s", total_targets as f64 / elapsed.as_secs_f64());
     }
 
     if save_output {
@@ -141,12 +166,12 @@ pub async fn run(initial_target: &str) -> Result<()> {
             "http_title_scan_{}.txt",
             Utc::now().format("%Y%m%d_%H%M%S")
         );
-        let output_path = cfg_prompt_output_file("output_file", "Enter output file path", &default_name)?;
+        let output_path = cfg_prompt_output_file("output_file", "Enter output file path", &default_name).await?;
         write_report(&output_path, &all_results)?;
-        println!("[*] Results saved to {}", output_path);
+        crate::mprintln!("[*] Results saved to {}", output_path);
     }
 
-    println!("\n[*] Scan complete.");
+    crate::mprintln!("\n[*] Scan complete.");
     Ok(())
 }
 
@@ -172,12 +197,15 @@ async fn fetch_title(client: &Client, url: &str, title_re: &Regex) -> Result<Tit
     let start = std::time::Instant::now();
     let response = client.get(url).send().await.context("Request failed")?;
     let status = response.status();
-    let text = match response.text().await {
-        Ok(t) => t,
+    // Read at most 256KB to prevent OOM from malicious responses
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
         Err(e) => {
             return Err(anyhow!("Failed to read response body: {}", e));
         }
     };
+    let truncated = if bytes.len() > 256 * 1024 { &bytes[..256 * 1024] } else { &bytes };
+    let text = String::from_utf8_lossy(truncated).to_string();
     let title = title_re
         .captures(&text)
         .and_then(|cap| cap.get(1))
@@ -223,7 +251,7 @@ fn split_targets(input: &str) -> Vec<String> {
 }
 
 fn load_targets_from_file(path: &str) -> Result<Vec<String>> {
-    let data = fs::read_to_string(path)
+    let data = safe_read_to_string(path, None)
         .with_context(|| format!("Failed to read target file: {}", path))?;
     Ok(split_targets(&data))
 }
@@ -324,9 +352,20 @@ fn write_report(path: &str, results: &[TitleResult]) -> Result<()> {
 }
 
 fn banner() {
-    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   HTTP Title Scanner                                         ║".cyan());
-    println!("{}", "║   Enumerate page titles over HTTP/HTTPS endpoints            ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║   HTTP Title Scanner                                         ║".cyan());
+    crate::mprintln!("{}", "║   Enumerate page titles over HTTP/HTTPS endpoints            ║".cyan());
+    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "HTTP Title Scanner".to_string(),
+        description: "Enumerates HTML page titles across HTTP and HTTPS endpoints for target fingerprinting.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }

