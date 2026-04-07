@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use ipnet::IpNet;
+use ipnetwork::IpNetwork;
 use libc;
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::{self, MutableIpv4Packet};
@@ -19,12 +19,15 @@ use std::{
 };
 use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Duration};
 
-use rand::Rng;
-use std::mem::MaybeUninit;
+use rand::RngExt;
+use std::io::Read;
+use crate::utils::{
+    cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_int_range,
+};
 
 #[derive(Clone, Debug)]
 struct PingConfig {
-    targets: Vec<IpNet>,
+    targets: Vec<IpNetwork>,
     methods: Vec<PingMethod>,
     concurrency: usize,
     timeout_secs: u64,
@@ -115,8 +118,8 @@ pub async fn run(initial_target: &str) -> Result<()> {
     execute_ping_sweep(&config).await
 }
 
-fn parse_target(input: &str) -> Result<IpNet> {
-    if let Ok(net) = input.parse::<IpNet>() {
+fn parse_target(input: &str) -> Result<IpNetwork> {
+    if let Ok(net) = input.parse::<IpNetwork>() {
         return Ok(net);
     }
 
@@ -127,7 +130,7 @@ fn parse_target(input: &str) -> Result<IpNet> {
         };
         let cidr = format!("{}/{}", ip, prefix);
         let net = cidr
-            .parse::<IpNet>()
+            .parse::<IpNetwork>()
             .context("failed to convert host to /32 or /128 network")?;
         return Ok(net);
     }
@@ -136,22 +139,22 @@ fn parse_target(input: &str) -> Result<IpNet> {
 }
 
 async fn gather_configuration(initial: &str) -> Result<PingConfig> {
-    println!("{}", "=== Ping Sweep Configuration ===".bold());
+    crate::mprintln!("{}", "=== Ping Sweep Configuration ===".bold());
 
-    let mut nets: Vec<IpNet> = Vec::new();
+    let mut nets: Vec<IpNetwork> = Vec::new();
 
     let initial_trimmed = initial.trim();
     if !initial_trimmed.is_empty() {
         match parse_target(initial_trimmed) {
             Ok(net) => {
-                println!(
+                crate::mprintln!(
                     "{}",
                     format!("[*] Loaded initial target {}", net).green()
                 );
                 nets.push(net);
             }
             Err(e) => {
-                eprintln!(
+                crate::meprintln!(
                     "{}",
                     format!("    Initial target '{}' skipped: {}", initial_trimmed, e)
                         .yellow()
@@ -160,43 +163,42 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
         }
     }
 
-    if prompt_yes_no("Add additional targets manually?", false)? {
+    if cfg_prompt_yes_no("add_manual_targets", "Add additional targets manually?", false).await? {
         loop {
-            let entry = prompt_line(
-                "Enter target (IP or CIDR, leave blank to stop): ",
-                true,
-            )?;
+            let entry = cfg_prompt_default("manual_target", "Enter target (IP or CIDR, leave blank to stop)", "").await?;
             if entry.is_empty() {
                 break;
             }
             match parse_target(&entry) {
                 Ok(net) => {
-                    println!("{}", format!("    + {}", net).cyan());
+                    crate::mprintln!("{}", format!("    + {}", net).cyan());
                     nets.push(net);
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("    ! {}", e).red());
+                    crate::meprintln!("{}", format!("    ! {}", e).red());
                 }
             }
         }
     }
 
-    if prompt_yes_no("Load targets from file?", false)? {
-        let path = prompt_line("Path to file: ", false)?;
-        let file_targets = load_targets_from_file(&path)?;
-        if file_targets.is_empty() {
-            println!("{}", "    No targets parsed from file.".yellow());
-        } else {
-            println!(
-                "{}",
-                format!(
-                    "    Loaded {} targets from '{}'",
-                    file_targets.len(),
-                    path
-                )
-                .green()
-            );
-            nets.extend(file_targets);
+    if cfg_prompt_yes_no("load_from_file", "Load targets from file?", false).await? {
+        let path = cfg_prompt_default("target_file", "Path to file", "").await?;
+        if !path.is_empty() {
+            let file_targets = load_targets_from_file(&path)?;
+            if file_targets.is_empty() {
+                crate::mprintln!("{}", "    No targets parsed from file.".yellow());
+            } else {
+                crate::mprintln!(
+                    "{}",
+                    format!(
+                        "    Loaded {} targets from '{}'",
+                        file_targets.len(),
+                        path
+                    )
+                    .green()
+                );
+                nets.extend(file_targets);
+            }
         }
     }
 
@@ -207,30 +209,30 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
     }
 
     // Deduplicate targets
-    let mut unique: HashSet<IpNet> = HashSet::new();
+    let mut unique: HashSet<IpNetwork> = HashSet::new();
     for net in nets {
         unique.insert(net);
     }
-    let targets: Vec<IpNet> = unique.into_iter().collect();
+    let targets: Vec<IpNetwork> = unique.into_iter().collect();
 
     let timeout_secs =
-        prompt_u64("Probe timeout (seconds)", 3, Some(1), Some(60))?;
+        cfg_prompt_int_range("timeout", "Probe timeout (seconds)", 3, 1, 60).await? as u64;
     let concurrency =
-        prompt_usize("Max concurrent hosts", 100, Some(1), Some(10_000))?;
-    let verbose = prompt_yes_no("Verbose output (show down hosts/errors)?", false)?;
+        cfg_prompt_int_range("concurrency", "Max concurrent hosts", 100, 1, 10000).await? as usize;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose output (show down hosts/errors)?", false).await?;
 
     // Ask about saving results
-    let save_up_hosts = if prompt_yes_no("Save up hosts to file?", false)? {
+    let save_up_hosts = if cfg_prompt_yes_no("save_up_hosts", "Save up hosts to file?", false).await? {
         let default_file = "ping_sweep_up_hosts.txt";
-        let file_path = prompt_with_default("Output file for up hosts", default_file)?;
+        let file_path = cfg_prompt_default("up_hosts_file", "Output file for up hosts", default_file).await?;
         Some(file_path)
     } else {
         None
     };
 
-    let save_down_hosts = if prompt_yes_no("Save down hosts to file?", false)? {
+    let save_down_hosts = if cfg_prompt_yes_no("save_down_hosts", "Save down hosts to file?", false).await? {
         let default_file = "ping_sweep_down_hosts.txt";
-        let file_path = prompt_with_default("Output file for down hosts", default_file)?;
+        let file_path = cfg_prompt_default("down_hosts_file", "Output file for down hosts", default_file).await?;
         Some(file_path)
     } else {
         None
@@ -239,54 +241,54 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
     let methods = loop {
         let mut methods = Vec::new();
 
-        if prompt_yes_no("Use ICMP ping (system ping/ping6)?", true)? {
+        if cfg_prompt_yes_no("use_icmp", "Use ICMP ping (system ping/ping6)?", true).await? {
             methods.push(PingMethod::Icmp);
         }
 
-        if prompt_yes_no("Use TCP connect probes?", false)? {
+        if cfg_prompt_yes_no("use_tcp", "Use TCP connect probes?", false).await? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports (comma separated)", default_ports)?;
+                cfg_prompt_default("tcp_ports", "TCP ports (comma separated)", default_ports).await?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
-                println!("{}", "    No valid ports provided.".yellow());
+                crate::mprintln!("{}", "    No valid ports provided.".yellow());
             } else {
                 methods.push(PingMethod::Tcp { ports });
             }
         }
 
-        if prompt_yes_no("Use SYN scan (stealth scan, requires root)?", false)? {
+        if cfg_prompt_yes_no("use_syn", "Use SYN scan (stealth scan, requires root)?", false).await? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports for SYN scan (comma separated)", default_ports)?;
+                cfg_prompt_default("syn_ports", "TCP ports for SYN scan (comma separated)", default_ports).await?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
-                println!("{}", "    No valid ports provided.".yellow());
+                crate::mprintln!("{}", "    No valid ports provided.".yellow());
             } else {
                 methods.push(PingMethod::Syn { ports });
             }
         }
 
-        if prompt_yes_no("Use ACK scan (filter detection, requires root)?", false)? {
+        if cfg_prompt_yes_no("use_ack", "Use ACK scan (filter detection, requires root)?", false).await? {
             let default_ports = "80,443";
             let port_input =
-                prompt_with_default("TCP ports for ACK scan (comma separated)", default_ports)?;
+                cfg_prompt_default("ack_ports", "TCP ports for ACK scan (comma separated)", default_ports).await?;
             let ports = parse_ports(&port_input)?;
             if ports.is_empty() {
-                println!("{}", "    No valid ports provided.".yellow());
+                crate::mprintln!("{}", "    No valid ports provided.".yellow());
             } else {
                 methods.push(PingMethod::Ack { ports });
             }
         }
 
         if methods.is_empty() {
-            println!("{}", "Select at least one method.".red().bold());
+            crate::mprintln!("{}", "Select at least one method.".red().bold());
             continue;
         }
         break methods;
     };
 
-    println!(
+    crate::mprintln!(
         "{}",
         format!(
             "\n[*] Targets: {} | Methods: {} | Concurrency: {} | Timeout: {}s",
@@ -309,7 +311,7 @@ async fn gather_configuration(initial: &str) -> Result<PingConfig> {
     })
 }
 
-fn load_targets_from_file(path: &str) -> Result<Vec<IpNet>> {
+fn load_targets_from_file(path: &str) -> Result<Vec<IpNetwork>> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open target file '{}'", path))?;
     let reader = BufReader::new(file);
@@ -326,7 +328,7 @@ fn load_targets_from_file(path: &str) -> Result<Vec<IpNet>> {
             match parse_target(token) {
                 Ok(net) => nets.push(net),
                 Err(e) => {
-                    eprintln!(
+                    crate::meprintln!(
                         "{}",
                         format!("    [file:{}] skipped '{}': {}", idx + 1, token, e)
                             .yellow()
@@ -350,13 +352,13 @@ fn methods_summary(methods: &[PingMethod]) -> String {
 async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     let mut host_set: HashSet<IpAddr> = HashSet::new();
     for net in &config.targets {
-        for host in net.hosts() {
+        for host in net.iter() {
             host_set.insert(host);
         }
     }
 
     if host_set.is_empty() {
-        println!("{}", "No host addresses derived from supplied targets.".yellow());
+        crate::mprintln!("{}", "No host addresses derived from supplied targets.".yellow());
         return Ok(());
     }
 
@@ -364,7 +366,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     hosts.sort();
 
     let total_hosts = hosts.len();
-    println!(
+    crate::mprintln!(
         "{}",
         format!(
             "\n[*] Beginning sweep of {} hosts using {} method(s)...",
@@ -409,7 +411,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     Ok(mut labels) => successes.append(&mut labels),
                     Err(err) => {
                         if verbose {
-                            eprintln!(
+                            crate::meprintln!(
                                 "{}",
                                 format!(
                                     "[!] {} ({}) error: {}",
@@ -432,7 +434,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
             if processed % 100 == 0 || processed == total_hosts {
                 let elapsed = start_time.elapsed().as_secs();
                 let rate = if elapsed > 0 { (processed as u64) / elapsed } else { 0 };
-                print!(
+                crate::mprint!(
                     "\r{}",
                     format!(
                         "[*] Progress: {}/{} hosts ({:.1}%) | Up: {} | Rate: {}/s",
@@ -449,7 +451,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 
             if !successes.is_empty() {
                 success_clone.fetch_add(1, Ordering::Relaxed);
-                println!(
+                crate::mprintln!(
                     "\r{}",
                     format!(
                         "[+] Host {} is up ({})",
@@ -468,7 +470,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     list.push(ip_string.clone());
                 }
                 if verbose {
-                    println!("\r{}", format!("[-] Host {} is down", ip_string).dimmed());
+                    crate::mprintln!("\r{}", format!("[-] Host {} is down", ip_string).dimmed());
                 }
             }
         }));
@@ -479,11 +481,11 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     }
     
     // Clear progress line
-    print!("\r{}\r", " ".repeat(80));
+    crate::mprint!("\r{}\r", " ".repeat(80));
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     let up_hosts = success_counter.load(Ordering::Relaxed);
-    println!(
+    crate::mprintln!(
         "{}",
         format!(
             "\n[*] Sweep complete: {}/{} hosts responded.",
@@ -498,14 +500,14 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
         if !up_list.is_empty() {
             match save_hosts_to_file(&up_list, up_file) {
                 Ok(_) => {
-                    println!("{}", format!("[+] Saved {} up hosts to '{}'", up_list.len(), up_file).green());
+                    crate::mprintln!("{}", format!("[+] Saved {} up hosts to '{}'", up_list.len(), up_file).green());
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("[!] Failed to save up hosts to '{}': {}", up_file, e).red());
+                    crate::meprintln!("{}", format!("[!] Failed to save up hosts to '{}': {}", up_file, e).red());
                 }
             }
         } else {
-            println!("{}", format!("[*] No up hosts to save to '{}'", up_file).yellow());
+            crate::mprintln!("{}", format!("[*] No up hosts to save to '{}'", up_file).yellow());
         }
     }
 
@@ -514,14 +516,14 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
         if !down_list.is_empty() {
             match save_hosts_to_file(&down_list, down_file) {
                 Ok(_) => {
-                    println!("{}", format!("[+] Saved {} down hosts to '{}'", down_list.len(), down_file).green());
+                    crate::mprintln!("{}", format!("[+] Saved {} down hosts to '{}'", down_list.len(), down_file).green());
                 }
                 Err(e) => {
-                    eprintln!("{}", format!("[!] Failed to save down hosts to '{}': {}", down_file, e).red());
+                    crate::meprintln!("{}", format!("[!] Failed to save down hosts to '{}': {}", down_file, e).red());
                 }
             }
         } else {
-            println!("{}", format!("[*] No down hosts to save to '{}'", down_file).yellow());
+            crate::mprintln!("{}", format!("[*] No down hosts to save to '{}'", down_file).yellow());
         }
     }
 
@@ -531,7 +533,9 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 fn save_hosts_to_file(hosts: &[String], file_path: &str) -> Result<()> {
     let mut file = File::create(file_path)
         .with_context(|| format!("Failed to create file '{}'", file_path))?;
-    
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600));
+
     for host in hosts {
         writeln!(file, "{}", host)
             .with_context(|| format!("Failed to write to file '{}'", file_path))?;
@@ -739,27 +743,20 @@ async fn syn_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result
         let src_ip_clone = src_ip;
         let src_port_clone = src_port;
         
-        let recv_result = task::spawn_blocking(move || -> Result<Option<(Vec<u8>, SocketAddr)>, std::io::Error> {
-            let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
-            match sock_clone.recv_from(&mut buf) {
-                Ok((len, addr)) => {
-                    // Safe conversion: we know len is valid and within buf bounds
-                    if len > buf.len() {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid buffer length"));
-                    }
-                    let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
-                    let sock_addr = addr.as_socket().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "convert"))?;
-                    Ok(Some((slice.to_vec(), sock_addr)))
-                }
+        let recv_result = task::spawn_blocking(move || -> Result<Option<Vec<u8>>, std::io::Error> {
+            let mut buf = [0u8; 1500];
+            let mut sock = sock_clone;
+            match Read::read(&mut sock, &mut buf) {
+                Ok(len) => Ok(Some(buf[..len].to_vec())),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
                 Err(e) => Err(e),
             }
         })
         .await
-        .context("Blocking task for recv_from failed")?;
+        .context("Blocking task for recv failed")?;
         
         match recv_result {
-            Ok(Some((data, _))) => {
+            Ok(Some(data)) => {
                 if data.len() < IPV4_HEADER_LEN {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
@@ -918,27 +915,20 @@ async fn ack_probe_single(ip: &Ipv4Addr, port: u16, timeout: Duration) -> Result
         let src_ip_clone = src_ip;
         let src_port_clone = src_port;
         
-        let recv_result = task::spawn_blocking(move || -> Result<Option<(Vec<u8>, SocketAddr)>, std::io::Error> {
-            let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
-            match sock_clone.recv_from(&mut buf) {
-                Ok((len, addr)) => {
-                    // Safe conversion: we know len is valid and within buf bounds
-                    if len > buf.len() {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid buffer length"));
-                    }
-                    let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
-                    let sock_addr = addr.as_socket().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "convert"))?;
-                    Ok(Some((slice.to_vec(), sock_addr)))
-                }
+        let recv_result = task::spawn_blocking(move || -> Result<Option<Vec<u8>>, std::io::Error> {
+            let mut buf = [0u8; 1500];
+            let mut sock = sock_clone;
+            match Read::read(&mut sock, &mut buf) {
+                Ok(len) => Ok(Some(buf[..len].to_vec())),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
                 Err(e) => Err(e),
             }
         })
         .await
-        .context("Blocking task for recv_from failed")?;
+        .context("Blocking task for recv failed")?;
         
         match recv_result {
-            Ok(Some((data, _))) => {
+            Ok(Some(data)) => {
                 if data.len() < IPV4_HEADER_LEN {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
@@ -1010,143 +1000,13 @@ fn get_local_ipv4() -> Option<Ipv4Addr> {
     None
 }
 
-fn prompt_line(message: &str, allow_empty: bool) -> Result<String> {
-    print!("{}", message.cyan().bold());
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim().to_string();
-    if !allow_empty && trimmed.is_empty() {
-        return Err(anyhow!("Input cannot be empty."));
-    }
-    Ok(trimmed)
-}
-
-fn prompt_with_default(message: &str, default: &str) -> Result<String> {
-    print!(
-        "{}",
-        format!("{} [{}]: ", message, default).cyan().bold()
-    );
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read input")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn prompt_yes_no(message: &str, default_yes: bool) -> Result<bool> {
-    let default_hint = if default_yes { "Y/n" } else { "y/N" };
-    loop {
-        print!(
-            "{}",
-            format!("{} [{}]: ", message, default_hint).cyan().bold()
-        );
-        std::io::stdout()
-            .flush()
-            .context("Failed to flush stdout")?;
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .context("Failed to read input")?;
-        let trimmed = input.trim().to_lowercase();
-        match trimmed.as_str() {
-            "" => return Ok(default_yes),
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => println!("{}", "Please answer with 'y' or 'n'.".yellow()),
-        }
-    }
-}
-
-fn prompt_usize(
-    message: &str,
-    default: usize,
-    min: Option<usize>,
-    max: Option<usize>,
-) -> Result<usize> {
-    loop {
-        let response = prompt_with_default(message, &default.to_string())?;
-        match response.parse::<usize>() {
-            Ok(value) => {
-                if let Some(minimum) = min {
-                    if value < minimum {
-                        println!(
-                            "{}",
-                            format!("Value must be >= {}", minimum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                if let Some(maximum) = max {
-                    if value > maximum {
-                        println!(
-                            "{}",
-                            format!("Value must be <= {}", maximum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                return Ok(value);
-            }
-            Err(_) => println!("{}", "Enter a valid positive integer.".yellow()),
-        }
-    }
-}
-
-fn prompt_u64(
-    message: &str,
-    default: u64,
-    min: Option<u64>,
-    max: Option<u64>,
-) -> Result<u64> {
-    loop {
-        let response = prompt_with_default(message, &default.to_string())?;
-        match response.parse::<u64>() {
-            Ok(value) => {
-                if let Some(minimum) = min {
-                    if value < minimum {
-                        println!(
-                            "{}",
-                            format!("Value must be >= {}", minimum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                if let Some(maximum) = max {
-                    if value > maximum {
-                        println!(
-                            "{}",
-                            format!("Value must be <= {}", maximum).yellow()
-                        );
-                        continue;
-                    }
-                }
-                return Ok(value);
-            }
-            Err(_) => println!("{}", "Enter a valid positive integer.".yellow()),
-        }
-    }
-}
-
 fn parse_ports(input: &str) -> Result<Vec<u16>> {
     let mut ports = Vec::new();
     for token in input.replace(',', " ").split_whitespace() {
         match token.parse::<u16>() {
             Ok(port) => ports.push(port),
             Err(_) => {
-                println!(
+                crate::mprintln!(
                     "{}",
                     format!("    Skipping invalid port '{}'", token).yellow()
                 );
@@ -1156,4 +1016,15 @@ fn parse_ports(input: &str) -> Result<Vec<u16>> {
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "ICMP Ping Sweep".to_string(),
+        description: "Network host discovery via ICMP echo, TCP connect, SYN, and ACK probes with CIDR range support.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }

@@ -6227,3 +6227,50 @@ Features: Automatic MD5 password hashing for RTSP config compatibility.
 Audited: Checked all tplink modules (vn020_dos, wr740n_dos, tapo_c200).
 Polished: Ensured all modules run with clear, consistent banners and user instructions.
 Secured: Enforced utils::normalize_target across all TP-Link modules to ensure robust IP/Hostname handling.
+
+DOS Module Audit & Documentation Update
+Fix bugs, apply best practices, and update documentation for 3 DOS modules and 2 READMEs.
+
+Proposed Changes
+connection_exhaustion_flood.rs
+[MODIFY] 
+connection_exhaustion_flood.rs
+#	Issue	Fix
+1	Infinite loop unreachable (line 312): duration=0 mode enters loop { sleep(60).await } — code after it (stop_flag, report) never executes	Replace with tokio::signal::ctrl_c() to allow graceful shutdown
+2	Format string bug (line 349): "[+] Local FD usage was bounded to {} concurrent." — {} is a literal format placeholder but is passed to .green(), not format!()	Wrap in format!(...) with config.max_concurrent_fds
+3	Unsafe port parse (line 78): .unwrap_or(80) silently defaults on garbage input	Use .map_err() with proper error
+tcp_connection_flood.rs
+[MODIFY] 
+tcp_connection_flood.rs
+#	Issue	Fix
+1	Unsafe port parse (line 59): .unwrap_or(80)	Proper error handling
+2	Unused import (line 3): tokio::io::AsyncWriteExt imported but stream.shutdown() uses it — verify if actually needed after Ok(mut stream) → actually IS used on line 178	Keep — but verify it compiles
+3	Division-by-zero risk (line 147): s_start.elapsed().as_secs_f64() could be 0.0 on first tick	Add .max(0.001) guard
+4	Slow random sampling (line 183): rand::random::<f32>() < 0.001 — uses full crypto RNG for error sampling	Replace with counter-based sampling (wrapping_add + modulo, like connection_exhaustion_flood)
+5	No infinite mode: Duration is always >0	Add duration=0 support with ctrl_c
+null_syn_exhaustion.rs
+[MODIFY] 
+null_syn_exhaustion.rs
+#	Issue	Fix
+1	Total length overflow (line 185): total_len = self.buffer.len() as u16 — if payload_size is > 65495, this will truncate	Already capped at line 484-488, but add debug_assert
+NOTE
+
+null_syn_exhaustion.rs
+ is well-optimized with custom FastRng, pre-allocated PacketBuilder, batched stats, and native OS threads. Only minor hardening needed.
+
+Documentation Updates
+[MODIFY] 
+README.md
+Add DOS modules to module catalog table (exploits/dos/*)
+Add camxploit mass scan enhancements to highlights (EXCLUDED_RANGES, service filtering, output file)
+Add EXCLUDED_RANGES pattern to highlights section
+[MODIFY] 
+docs/readme.md
+Add DOS module section under "Recent Module Enhancements"
+Document connection_exhaustion_flood (FD-bounded, semaphore)
+Update "DoS / Stress Testing Optimizations" section with connection_exhaustion_flood
+Verification Plan
+bash
+cargo check 2>&1 | tail -5     # Must exit 0
+grep -n "unwrap_or(80)" src/modules/exploits/dos/*.rs  # Must return empty
+grep -n "rand::random" src/modules/exploits/dos/*.rs   # Must return empty

