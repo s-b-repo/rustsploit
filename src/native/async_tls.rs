@@ -70,18 +70,25 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
-/// Create a `TlsConnector` that accepts **any** server certificate.
-///
-/// Use this wherever you previously copy-pasted the `NoVerify` pattern.
-///
-/// ```ignore
-/// let connector = crate::native::async_tls::make_dangerous_tls_connector();
-/// let tls_stream = connector.connect(server_name, tcp_stream).await?;
-/// ```
-pub fn make_dangerous_tls_connector() -> TlsConnector {
+/// Cached singleton — the config never varies so we build it once.
+static DANGEROUS_TLS: std::sync::LazyLock<TlsConnector> = std::sync::LazyLock::new(|| {
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+});
+
+/// Create a `TlsConnector` that accepts **any** server certificate.
+///
+/// Returns a cached singleton — `TlsConnector` wraps `Arc<ClientConfig>`,
+/// so the clone is cheap (just an Arc bump).
+///
+/// ```ignore
+/// let connector = crate::native::async_tls::make_dangerous_tls_connector();
+/// let tls_stream = connector.connect(server_name, tcp_stream).await?;
+/// ```
+#[inline]
+pub fn make_dangerous_tls_connector() -> TlsConnector {
+    DANGEROUS_TLS.clone()
 }

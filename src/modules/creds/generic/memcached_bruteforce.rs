@@ -3,12 +3,12 @@ use colored::*;
 use std::{io::Write, net::IpAddr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     time::timeout,
 };
 
 use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -99,8 +99,8 @@ pub async fn run(target: &str) -> Result<()> {
                 let read_timeout = Duration::from_secs(3);
 
                 // Try to connect and send version command
-                let mut stream = match timeout(connect_timeout, TcpStream::connect(&addr)).await {
-                    Ok(Ok(s)) => s,
+                let mut stream = match crate::utils::network::tcp_connect(&addr, connect_timeout).await {
+                    Ok(s) => s,
                     _ => return None,
                 };
 
@@ -236,6 +236,7 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "memcached",
+                jitter_ms: 0,
                 source_module: "creds/generic/memcached_bruteforce",
                 skip_tcp_check: false,
             },
@@ -386,12 +387,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every pass with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     // Load wordlists
     let mut usernames = Vec::new();
@@ -447,7 +443,11 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     let ct = Duration::from_secs(connection_timeout);
     let rt = Duration::from_millis(READ_TIMEOUT_MS);
 
@@ -478,6 +478,7 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "memcached",
+            jitter_ms: 0,
             source_module: "creds/generic/memcached_bruteforce",
         },
         combos,
@@ -572,10 +573,9 @@ async fn check_memcached_open(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> MemcachedStatus {
-    let mut stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return MemcachedStatus::Unreachable(e.to_string()),
-        Err(_) => return MemcachedStatus::Unreachable("Connection timeout".to_string()),
+    let mut stream = match crate::utils::network::tcp_connect(addr, connect_timeout).await {
+        Ok(s) => s,
+        Err(e) => return MemcachedStatus::Unreachable(e.to_string()),
     };
 
     // Send text protocol "version" command
@@ -678,16 +678,15 @@ async fn try_memcached_sasl(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<bool> {
-    let mut stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let mut stream = match crate::utils::network::tcp_connect(addr, connect_timeout).await {
+        Ok(s) => s,
+        Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("Connection refused") || err_str.contains("connect") {
                 return Err(anyhow!("Connection refused: {}", err_str));
             }
             return Err(anyhow!("Connection error: {}", err_str));
         }
-        Err(_) => return Err(anyhow!("Connection timeout")),
     };
 
     let packet = build_sasl_auth_packet(username, password);

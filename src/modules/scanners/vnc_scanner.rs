@@ -67,9 +67,8 @@ async fn scan_vnc(
 ) -> Result<VncResult> {
     let addr = format!("{}:{}", target, port);
 
-    let mut stream = timeout(timeout_dur, tokio::net::TcpStream::connect(&addr))
+    let mut stream = crate::utils::network::tcp_connect(&addr, timeout_dur)
         .await
-        .context("Connection timed out")?
         .context("Failed to connect to VNC server")?;
 
     // Step 1: Read server RFB version string (12 bytes: "RFB XXX.YYY\n")

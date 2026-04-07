@@ -75,7 +75,7 @@ async fn write_response(
 async fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(req.id)),
-        "initialized" => {
+        "initialized" | "notifications/initialized" => {
             // Notification — no response.
             eprintln!("[MCP] Client initialized");
             None
@@ -84,6 +84,11 @@ async fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
         "tools/call" => Some(handle_tools_call(req.id, req.params).await),
         "resources/list" => Some(handle_resources_list(req.id)),
         "resources/read" => Some(handle_resources_read(req.id, req.params).await),
+        other if other.starts_with("notifications/") => {
+            // All notifications are fire-and-forget — never respond.
+            eprintln!("[MCP] Ignoring notification: {}", other);
+            None
+        }
         other => Some(JsonRpcResponse::error(
             req.id,
             -32601,

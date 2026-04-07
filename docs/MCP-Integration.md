@@ -34,7 +34,7 @@ The server reads one JSON-RPC 2.0 request per line from stdin and writes one res
 
 ---
 
-## Tools (30)
+## Tools (42)
 
 ### Module Tools
 
@@ -179,7 +179,7 @@ src/mcp/
   mod.rs         -- Module re-exports
   types.rs       -- JSON-RPC 2.0 types, MCP capability structs, Tool/Resource/ToolResult types
   server.rs      -- Stdio event loop, request routing, response serialization
-  tools.rs       -- 30 tool definitions and dispatch handlers
+  tools.rs       -- 42 tool definitions and dispatch handlers
   resources.rs   -- 7 resource definitions and read handlers
   client.rs      -- MCP client implementation (for connecting to external MCP servers)
 ```

@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Duration};
+use tokio::{process::Command, sync::Semaphore, task, time::Duration};
 
 use rand::RngExt;
 use std::io::Read;
@@ -446,7 +446,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     )
                     .dimmed()
                 );
-                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
             }
 
             if !successes.is_empty() {
@@ -482,7 +482,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     
     // Clear progress line
     crate::mprint!("\r{}\r", " ".repeat(80));
-    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
 
     let up_hosts = success_counter.load(Ordering::Relaxed);
     crate::mprintln!(
@@ -607,12 +607,11 @@ async fn tcp_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<
         
         tasks.push(tokio::spawn(async move {
             let socket = SocketAddr::new(ip, port);
-            match tokio::time::timeout(timeout, TcpStream::connect(socket)).await {
-                Ok(Ok(_stream)) => {
+            match crate::utils::network::tcp_connect_addr(socket, timeout).await {
+                Ok(_stream) => {
                     // Connection successful - drop stream immediately
                     Some(format!("TCP/{}", port))
                 }
-                Ok(Err(_)) => None,
                 Err(_) => None,
             }
         }));
@@ -988,8 +987,7 @@ fn get_local_ipv4() -> Option<Ipv4Addr> {
     }
     
     // Fallback to UDP connection trick if pnet fails
-    use std::net::UdpSocket;
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+    if let Ok(socket) = crate::utils::network::blocking_udp_bind(None) {
         if socket.connect("8.8.8.8:80").is_ok() {
             if let Ok(local_addr) = socket.local_addr() {
                 if let IpAddr::V4(ipv4) = local_addr.ip() {

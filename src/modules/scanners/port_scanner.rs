@@ -66,6 +66,7 @@ const COMMON_PORTS: &[u16] = &[
 ];
 
 // Service detection map
+#[inline]
 fn get_service_name(port: u16) -> &'static str {
     match port {
         21 => "FTP",
@@ -435,6 +436,12 @@ async fn scan_tcp(
 
     // Bind to custom source port if configured
     if let Some(src_port) = source_port {
+        // Allow multiple sockets to share the same source port — each connects
+        // to a different remote addr:port, so there is no actual conflict.
+        if let Err(e) = socket.set_reuse_address(true) { crate::meprintln!("[!] SO_REUSEADDR error: {}", e); }
+        #[cfg(target_os = "linux")]
+        if let Err(e) = socket.set_reuse_port(true) { crate::meprintln!("[!] SO_REUSEPORT error: {}", e); }
+
         let bind_addr = if addr.is_ipv4() {
             SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), src_port)
         } else {
@@ -495,7 +502,7 @@ async fn grab_banner(stream: &mut TcpStream, port: u16) -> (String, String) {
         Ok(Ok(n)) if n > 0 => {
             let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
             let service = detect_service_from_banner(&banner, port);
-            return (banner, service);
+            return (banner, service.to_string());
         }
         _ => {}
     }
@@ -525,7 +532,7 @@ async fn grab_banner(stream: &mut TcpStream, port: u16) -> (String, String) {
             if let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
                 if n > 0 {
                     let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                    return (banner, "SSH".into());
+                    return (banner, "SSH".to_string());
                 }
             }
         }
@@ -535,7 +542,7 @@ async fn grab_banner(stream: &mut TcpStream, port: u16) -> (String, String) {
                 if n > 0 {
                     let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
                     let service = detect_service_from_banner(&banner, port);
-                    return (banner, service);
+                    return (banner, service.to_string());
                 }
             }
         }
@@ -544,25 +551,26 @@ async fn grab_banner(stream: &mut TcpStream, port: u16) -> (String, String) {
     ("".into(), "".into())
 }
 
-fn detect_service_from_banner(banner: &str, port: u16) -> String {
+#[inline]
+fn detect_service_from_banner(banner: &str, port: u16) -> &'static str {
     let banner_lower = banner.to_lowercase();
-    
+
     if banner_lower.contains("ssh") {
-        "SSH".into()
+        "SSH"
     } else if banner_lower.contains("ftp") {
-        "FTP".into()
+        "FTP"
     } else if banner_lower.contains("smtp") {
-        "SMTP".into()
+        "SMTP"
     } else if banner_lower.contains("pop3") {
-        "POP3".into()
+        "POP3"
     } else if banner_lower.contains("imap") {
-        "IMAP".into()
+        "IMAP"
     } else if banner_lower.contains("http") {
-        "HTTP".into()
+        "HTTP"
     } else if banner_lower.contains("mysql") {
-        "MySQL".into()
+        "MySQL"
     } else {
-        get_service_name(port).to_string()
+        get_service_name(port)
     }
 }
 
@@ -586,12 +594,25 @@ async fn scan_udp(
 ) -> Option<String> {
     // Bind address (source port logic)
     let sock = if let Some(src_port) = source_port {
+        let domain = if ip.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let raw = match Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) {
+            Ok(s) => s,
+            Err(_) => return Some("ERROR".into()),
+        };
+        if let Err(e) = raw.set_reuse_address(true) { crate::meprintln!("[!] SO_REUSEADDR error: {}", e); }
+        #[cfg(target_os = "linux")]
+        if let Err(e) = raw.set_reuse_port(true) { crate::meprintln!("[!] SO_REUSEPORT error: {}", e); }
+        if let Err(e) = raw.set_nonblocking(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+
         let bind_addr = if ip.is_ipv4() {
             SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), src_port)
         } else {
             SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), src_port)
         };
-        match UdpSocket::bind(bind_addr).await {
+        if let Err(e) = raw.bind(&bind_addr.into()) { crate::meprintln!("[!] Socket bind error: {}", e); }
+
+        let std_sock: std::net::UdpSocket = raw.into();
+        match UdpSocket::from_std(std_sock) {
             Ok(s) => s,
             Err(_) => return Some("ERROR".into()),
         }
@@ -730,7 +751,7 @@ impl ProgressTracker {
         ).cyan());
         // Note: This is in a sync context (ProgressTracker), so we use blocking flush
         // The ProgressTracker is called from async context but uses sync printing
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
         
         if self.current == self.total {
             crate::mprintln!();

@@ -17,6 +17,7 @@ Rustsploit provides several utility modules that every module developer should k
 | **Export** | `crate::export` | Export engagement data to JSON/CSV/summary |
 | **Output** | `crate::output` | Formatted output helpers with spool integration and color support |
 | **Payload Engine** | `crate::native::payload_engine` | Payload encoding/mutation (XOR, Base64, hex, zero-width, custom) for AV evasion |
+| **DoS Utils** | `crate::native::dos_utils` | FastRng (XorShift128+), checksum_16, sum_16, is_spoof_enabled |
 
 ---
 
@@ -618,6 +619,16 @@ std::fs::write(&out_path, results)?;
 | `MAX_COMMAND_LENGTH` | 8192 | Maximum command/input length |
 | `MAX_PATH_LENGTH` | 4096 | Maximum file path length |
 | `MAX_HOSTNAME_LENGTH` | 253 | Maximum hostname length (config.rs) |
+
+---
+
+### `tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream>`
+
+Zero-allocation TCP connection for resolved IP addresses. Skips DNS resolution and string parsing. Automatically binds to global source port if set.
+
+### `build_http_client(timeout: Duration) -> Result<reqwest::Client>`
+
+Returns a cached reqwest::Client (keyed by timeout). Clients are Arc-based internally so cloning is cheap. Enables HTTP keep-alive and connection pooling across module runs.
 
 ---
 

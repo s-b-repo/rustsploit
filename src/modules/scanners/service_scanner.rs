@@ -378,12 +378,9 @@ fn parse_port_list(input: &str) -> Result<Vec<u16>> {
 
 async fn mass_scan_probe(ip: &str, port: u16) -> Option<String> {
     let addr = format!("{}:{}", ip, port);
-    let stream = timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+    let mut stream = crate::utils::network::tcp_connect(&addr, Duration::from_secs(3))
         .await
-        .ok()?
         .ok()?;
-
-    let mut stream = stream;
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         ip
@@ -417,8 +414,8 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
     let addr = format!("{}:{}", target, port);
     let dur = Duration::from_secs(timeout_secs);
 
-    let stream = match timeout(dur, TcpStream::connect(&addr)).await {
-        Ok(Ok(s)) => s,
+    let stream = match crate::utils::network::tcp_connect(&addr, dur).await {
+        Ok(s) => s,
         _ => return None,
     };
 

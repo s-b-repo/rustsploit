@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use serde::{Serialize, Deserialize};
 use colored::*;
 
@@ -31,7 +31,7 @@ impl LootStore {
 
         let loot_dir = base.join("loot");
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) { eprintln!("[!] Directory creation error: {}", e); }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
 
         let index_path = base.join("loot_index.json");
         let entries = if index_path.exists() {
@@ -39,9 +39,9 @@ impl LootStore {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
+                        crate::meprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
                         let backup = index_path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&index_path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&index_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
                         Vec::new()
                     }
                 },
@@ -72,7 +72,7 @@ impl LootStore {
     ) -> Option<String> {
         // Validate size
         if data.len() > Self::MAX_LOOT_SIZE {
-            eprintln!("[!] Loot too large: {} bytes (max {} MB)", data.len(), Self::MAX_LOOT_SIZE / 1024 / 1024);
+            crate::meprintln!("[!] Loot too large: {} bytes (max {} MB)", data.len(), Self::MAX_LOOT_SIZE / 1024 / 1024);
             return None;
         }
         // Validate inputs (BUG 29 fix: also validate description and source_module)
@@ -103,7 +103,7 @@ impl LootStore {
 
         // Verify the resolved path is within loot_dir (prevent traversal)
         if !file_path.starts_with(&self.loot_dir) {
-            eprintln!("[!] Loot path escapes loot directory");
+            crate::meprintln!("[!] Loot path escapes loot directory");
             return None;
         }
 
@@ -236,25 +236,25 @@ impl LootStore {
     pub async fn display(&self) {
         let entries = self.list().await;
         if entries.is_empty() {
-            println!("{}", "No loot stored.".dimmed());
+            crate::mprintln!("{}", "No loot stored.".dimmed());
             return;
         }
-        println!();
-        println!("{}", format!("Loot ({} items):", entries.len()).bold().underline());
-        println!();
-        println!("  {:<10} {:<18} {:<15} {:<30} {}",
+        crate::mprintln!();
+        crate::mprintln!("{}", format!("Loot ({} items):", entries.len()).bold().underline());
+        crate::mprintln!();
+        crate::mprintln!("  {:<10} {:<18} {:<15} {:<30} {}",
             "ID".bold(), "Host".bold(), "Type".bold(), "Description".bold(), "Module".bold());
-        println!("  {}", "-".repeat(90).dimmed());
+        crate::mprintln!("  {}", "-".repeat(90).dimmed());
         for e in &entries {
             let desc = if e.description.len() > 28 {
                 format!("{}...", &e.description[..25])
             } else {
                 e.description.clone()
             };
-            println!("  {:<10} {:<18} {:<15} {:<30} {}",
+            crate::mprintln!("  {:<10} {:<18} {:<15} {:<30} {}",
                 e.id.yellow(), e.host.green(), e.loot_type, desc, e.source_module);
         }
-        println!();
+        crate::mprintln!();
     }
 }
 

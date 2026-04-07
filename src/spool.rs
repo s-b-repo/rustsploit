@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use colored::*;
 
 /// Global spool state for console logging.

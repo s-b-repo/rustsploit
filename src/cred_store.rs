@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use serde::{Serialize, Deserialize};
 use colored::*;
 
@@ -58,9 +58,9 @@ impl CredStore {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: creds.json is corrupted ({}). Starting fresh.", e);
+                        crate::meprintln!("[!] Warning: creds.json is corrupted ({}). Starting fresh.", e);
                         let backup = file_path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&file_path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&file_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
                         Vec::new()
                     }
                 },
@@ -168,7 +168,7 @@ impl CredStore {
     async fn save_locked(&self, entries: &[CredEntry]) {
         if let Some(parent) = self.file_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                eprintln!("[!] Warning: Failed to create creds directory: {}", e);
+                crate::meprintln!("[!] Warning: Failed to create creds directory: {}", e);
                 return;
             }
         }
@@ -176,21 +176,21 @@ impl CredStore {
         let json = match serde_json::to_string_pretty(entries) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[!] Warning: Failed to serialize credentials: {}", e);
+                crate::meprintln!("[!] Warning: Failed to serialize credentials: {}", e);
                 return;
             }
         };
         if let Err(e) = tokio::fs::write(&tmp, &json).await {
-            eprintln!("[!] Warning: Failed to write creds temp file: {}", e);
+            crate::meprintln!("[!] Warning: Failed to write creds temp file: {}", e);
             return;
         }
         if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
-            eprintln!("[!] Warning: Failed to save credentials (rename): {}", e);
+            crate::meprintln!("[!] Warning: Failed to save credentials (rename): {}", e);
             return;
         }
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await {
-            eprintln!("[!] Warning: Failed to set permissions on creds.json: {}", e);
+            crate::meprintln!("[!] Warning: Failed to set permissions on creds.json: {}", e);
         }
     }
 
@@ -198,42 +198,42 @@ impl CredStore {
     pub async fn display(&self) {
         let entries = self.list().await;
         if entries.is_empty() {
-            println!("{}", "No credentials stored. Use 'creds add' to add one.".dimmed());
+            crate::mprintln!("{}", "No credentials stored. Use 'creds add' to add one.".dimmed());
             return;
         }
-        println!();
-        println!("{}", format!("Credentials ({} total):", entries.len()).bold().underline());
-        println!();
-        println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
+        crate::mprintln!();
+        crate::mprintln!("{}", format!("Credentials ({} total):", entries.len()).bold().underline());
+        crate::mprintln!();
+        crate::mprintln!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
             "ID".bold(), "Host".bold(), "Port".bold(), "Service".bold(),
             "Username".bold(), "Secret".bold(), "Type".bold(), "Valid".bold());
-        println!("  {}", "-".repeat(100).dimmed());
+        crate::mprintln!("  {}", "-".repeat(100).dimmed());
         for e in &entries {
             let valid_str = if e.valid { "yes".green() } else { "no".red() };
-            println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
+            crate::mprintln!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
                 e.id, e.host, e.port, e.service, e.username,
                 if e.secret.len() > 8 { format!("{}...", &e.secret[..5]) } else { e.secret.clone() },
                 e.cred_type, valid_str);
         }
-        println!();
+        crate::mprintln!();
     }
 
     /// Display search results.
     pub fn display_results(&self, results: &[CredEntry]) {
         if results.is_empty() {
-            println!("{}", "No matching credentials found.".dimmed());
+            crate::mprintln!("{}", "No matching credentials found.".dimmed());
             return;
         }
-        println!();
-        println!("{}", format!("Found {} credential(s):", results.len()).bold());
-        println!();
+        crate::mprintln!();
+        crate::mprintln!("{}", format!("Found {} credential(s):", results.len()).bold());
+        crate::mprintln!();
         for e in results {
-            println!("  [{}] {}@{}:{} ({}) - {} [{}]",
+            crate::mprintln!("  [{}] {}@{}:{} ({}) - {} [{}]",
                 e.id.yellow(), e.username.green(), e.host, e.port,
                 e.service, e.cred_type,
                 if e.valid { "valid".green() } else { "invalid".red() });
         }
-        println!();
+        crate::mprintln!();
     }
 }
 

@@ -156,7 +156,7 @@ impl GlobalConfig {
         
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
-        static VALID_CHARS: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
+        static VALID_CHARS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
             Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("hardcoded regex must compile")
         });
         let valid_chars = &*VALID_CHARS;
@@ -270,7 +270,7 @@ impl GlobalConfig {
 }
 
 /// Global configuration instance
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 
 pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new());
 
@@ -428,7 +428,7 @@ pub fn results_dir() -> std::path::PathBuf {
         .join("results");
     if !dir.exists() {
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { eprintln!("[!] Directory creation error: {}", e); }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
     }
     dir
 }

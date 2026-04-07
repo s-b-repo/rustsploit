@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use colored::*;
 
 /// Persistent global options that apply across all modules.
@@ -24,9 +24,9 @@ impl GlobalOptions {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: global_options.json is corrupted ({}). Starting fresh.", e);
+                        crate::meprintln!("[!] Warning: global_options.json is corrupted ({}). Starting fresh.", e);
                         let backup = file_path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&file_path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&file_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
                         HashMap::new()
                     }
                 },
@@ -53,16 +53,16 @@ impl GlobalOptions {
     /// Returns false if validation fails (BUG 16 fix).
     pub async fn set(&self, key: &str, value: &str) -> bool {
         if key.is_empty() || key.len() > Self::MAX_KEY_LEN {
-            eprintln!("[!] Option key too long (max {} chars)", Self::MAX_KEY_LEN);
+            crate::meprintln!("[!] Option key too long (max {} chars)", Self::MAX_KEY_LEN);
             return false;
         }
         if value.len() > Self::MAX_VALUE_LEN {
-            eprintln!("[!] Option value too long (max {} chars)", Self::MAX_VALUE_LEN);
+            crate::meprintln!("[!] Option value too long (max {} chars)", Self::MAX_VALUE_LEN);
             return false;
         }
         let mut opts = self.options.write().await;
         if opts.len() >= Self::MAX_OPTIONS && !opts.contains_key(key) {
-            eprintln!("[!] Too many global options (max {}). Unset some first.", Self::MAX_OPTIONS);
+            crate::meprintln!("[!] Too many global options (max {}). Unset some first.", Self::MAX_OPTIONS);
             return false;
         }
         opts.insert(key.to_string(), value.to_string());
@@ -105,7 +105,7 @@ impl GlobalOptions {
     async fn save_locked(&self, opts: &HashMap<String, String>) {
         if let Some(parent) = self.file_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                eprintln!("[!] Warning: Failed to create config directory: {}", e);
+                crate::meprintln!("[!] Warning: Failed to create config directory: {}", e);
                 return;
             }
         }
@@ -113,21 +113,21 @@ impl GlobalOptions {
         let json = match serde_json::to_string_pretty(opts) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[!] Warning: Failed to serialize global options: {}", e);
+                crate::meprintln!("[!] Warning: Failed to serialize global options: {}", e);
                 return;
             }
         };
         if let Err(e) = tokio::fs::write(&tmp, &json).await {
-            eprintln!("[!] Warning: Failed to write global options temp file: {}", e);
+            crate::meprintln!("[!] Warning: Failed to write global options temp file: {}", e);
             return;
         }
         if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
-            eprintln!("[!] Warning: Failed to save global options (rename): {}", e);
+            crate::meprintln!("[!] Warning: Failed to save global options (rename): {}", e);
             return;
         }
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await {
-            eprintln!("[!] Warning: Failed to set permissions on global_options.json: {}", e);
+            crate::meprintln!("[!] Warning: Failed to set permissions on global_options.json: {}", e);
         }
     }
 
@@ -135,22 +135,22 @@ impl GlobalOptions {
     pub async fn display(&self) {
         let opts = self.all().await;
         if opts.is_empty() {
-            println!("{}", "No global options set. Use 'setg <key> <value>' to set one.".dimmed());
+            crate::mprintln!("{}", "No global options set. Use 'setg <key> <value>' to set one.".dimmed());
             return;
         }
-        println!();
-        println!("{}", "Global Options:".bold().underline());
-        println!();
-        println!("  {:<30} {}", "Key".bold(), "Value".bold());
-        println!("  {:<30} {}", "---".dimmed(), "-----".dimmed());
+        crate::mprintln!();
+        crate::mprintln!("{}", "Global Options:".bold().underline());
+        crate::mprintln!();
+        crate::mprintln!("  {:<30} {}", "Key".bold(), "Value".bold());
+        crate::mprintln!("  {:<30} {}", "---".dimmed(), "-----".dimmed());
         let mut keys: Vec<_> = opts.keys().collect();
         keys.sort();
         for key in keys {
             if let Some(val) = opts.get(key) {
-                println!("  {:<30} {}", key.green(), val);
+                crate::mprintln!("  {:<30} {}", key.green(), val);
             }
         }
-        println!();
+        crate::mprintln!();
     }
 }
 

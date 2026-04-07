@@ -108,7 +108,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
         if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
             crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)", 
                 idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
-            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
         }
 
         match fetch_title(&client, url, &title_re).await {

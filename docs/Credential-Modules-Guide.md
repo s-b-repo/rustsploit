@@ -41,9 +41,51 @@ All bruteforce modules use the shared engine (`crate::modules::creds::utils`):
 | `run_bruteforce()` | Single-target credential testing with concurrency, progress, retry |
 | `run_subnet_bruteforce()` | CIDR subnet scanning with per-host credential testing |
 | `run_mass_scan()` | Random/file/CIDR mass scanning with lightweight probes |
-| `generate_combos()` | Generate user/password pairs (combo or linear mode) |
+| `generate_combos_mode()` | Generate user/password pairs (linear, combo, or spray mode) |
+| `load_credential_file()` | Load user:pass pairs from a colon-separated file |
 
 Avoid custom concurrency — always use the engine which handles semaphores, progress reporting, lockout detection, and credential storage.
+
+---
+
+## Combo Modes
+
+All bruteforce modules support three credential combination strategies via `ComboMode`:
+
+| Mode | Ordering | Use Case |
+|------|----------|----------|
+| `Linear` | Pair user[i] with pass[i], cycling shorter list | Paired credentials from a breach dump |
+| `Combo` | Full cross product (every user x every password) | Standard bruteforce |
+| `Spray` | For each password, try all users before next password | Active Directory lockout avoidance |
+
+Modules prompt: `Combo mode (linear/combo/spray) [combo]:`
+
+---
+
+## Credential File Support
+
+Modules can load `user:pass` pairs directly from a file (one pair per line, colon-separated):
+
+```rust
+use crate::modules::creds::utils::load_credential_file;
+let extra = load_credential_file("creds.txt")?;
+combos.extend(extra);
+```
+
+---
+
+## Jitter Support
+
+`BruteforceConfig.jitter_ms` adds random delay (0..jitter_ms) between attempts to evade IDS pattern detection. Default is 0 (disabled). Also supported in `SubnetScanConfig`.
+
+---
+
+## Protocol Safety
+
+- **Redis** — all commands use RESP array format (length-prefixed) to prevent \r\n injection
+- **HTTP** — redirect responses are inspected for login/auth/signin/sso paths to prevent false positives
+- **FTP** — 421 (connection limit) responses are classified as retryable errors with backoff
+- **SMTP** — connection timeout is 10 seconds (configurable), not the previous 2 seconds
 
 ---
 

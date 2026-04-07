@@ -253,7 +253,7 @@ fn enumerate_users_blocking(
             usernames.len(),
             user
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
 
         match sample_auth_timing(host, port, user, samples, timeout_secs) {
             Some(t) => {

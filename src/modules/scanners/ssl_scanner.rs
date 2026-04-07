@@ -21,7 +21,6 @@ use crate::utils::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 const DEFAULT_PORT: u16 = 443;
@@ -550,13 +549,9 @@ async fn scan_target(
 
     // TCP connect with timeout
     let addr = format!("{}:{}", host, port);
-    let tcp_stream = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        TcpStream::connect(&addr),
-    )
-    .await
-    .context("TCP connection timed out")?
-    .context("TCP connection failed")?;
+    let tcp_stream = crate::utils::network::tcp_connect(&addr, Duration::from_secs(timeout_secs))
+        .await
+        .context("TCP connection failed")?;
 
     // Build server name — for IP addresses, use the IP directly
     let server_name = ServerName::try_from(host.to_string())

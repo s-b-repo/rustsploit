@@ -7,13 +7,18 @@ use std::time::Duration;
 use std::io::{BufRead, BufReader, Write};
 use base64::{engine::general_purpose, Engine as _};
 
+/// Default SMTP timeout in milliseconds (10 seconds).
+/// Real SMTP servers often do reverse DNS lookups on connect, taking 5-10s.
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
 use crate::utils::{
     load_lines,
-    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
 };
 use crate::modules::creds::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
 };
 
@@ -68,7 +73,7 @@ pub async fn run(target: &str) -> Result<()> {
                         let u = user.clone();
                         let p = pass.clone();
                         let res = tokio::task::spawn_blocking(move || {
-                            try_smtp_login(&t, port, &u, &p)
+                            try_smtp_login(&t, port, &u, &p, DEFAULT_TIMEOUT_MS)
                         }).await;
 
                         match res {
@@ -113,13 +118,14 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "smtp",
+            jitter_ms: 0,
             source_module: "creds/generic/smtp_bruteforce",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
                 let target_str = ip.to_string();
                 let res = tokio::task::spawn_blocking(move || {
-                    try_smtp_login(&target_str, port, &user, &pass)
+                    try_smtp_login(&target_str, port, &user, &pass, DEFAULT_TIMEOUT_MS)
                 }).await;
                 match res {
                     Ok(Ok(true)) => LoginResult::Success,
@@ -146,7 +152,7 @@ pub async fn run(target: &str) -> Result<()> {
     let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000).await? as u64;
 
     let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", true).await?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
     let output_file = cfg_prompt_output_file("output_file", "Output file for results", "smtp_results.txt").await?;
 
@@ -157,12 +163,16 @@ pub async fn run(target: &str) -> Result<()> {
     }
     crate::mprintln!("[*] Loaded {} usernames, {} passwords", usernames.len(), passwords.len());
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     let try_login = move |target: String, port: u16, user: String, pass: String| {
         async move {
             let res = tokio::task::spawn_blocking(move || {
-                try_smtp_login(&target, port, &user, &pass)
+                try_smtp_login(&target, port, &user, &pass, DEFAULT_TIMEOUT_MS)
             }).await;
             match res {
                 Ok(Ok(true)) => LoginResult::Success,
@@ -188,6 +198,7 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms,
         max_retries: 2,
         service_name: "smtp",
+        jitter_ms: 0,
         source_module: "creds/generic/smtp_bruteforce",
     }, combos, try_login).await?;
 
@@ -208,13 +219,14 @@ fn read_smtp_line(reader: &mut BufReader<&TcpStream>) -> Result<String> {
     Ok(line.trim_end().to_string())
 }
 
-fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Result<bool> {
+fn try_smtp_login(target: &str, port: u16, username: &str, password: &str, timeout_ms: u64) -> Result<bool> {
     let addr = format!("{}:{}", target, port);
+    let timeout = Duration::from_millis(timeout_ms);
     let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Resolution failed"))?;
-    let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(2000))?;
+    let stream = crate::utils::blocking_tcp_connect(&socket, timeout)?;
     if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
-    stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(2000)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
 
     let mut reader = BufReader::new(&stream);
     // We write via a reference to the same stream (TcpStream is duplex)

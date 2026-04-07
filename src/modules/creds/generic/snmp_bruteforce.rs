@@ -9,7 +9,8 @@ use std::{
 
 
 use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    generate_combos_mode, ComboMode,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -146,7 +147,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Build combos: empty username, community string as password.
     let empty_users = vec![String::new()];
-    let combos = generate_combos(&empty_users, &communities, true);
+    let combos = generate_combos_mode(&empty_users, &communities, ComboMode::Combo);
 
     let config = BruteforceConfig {
         target: norm_target.clone(),
@@ -157,6 +158,7 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 10,
         max_retries: 2,
         service_name: "snmp",
+        jitter_ms: 0,
         source_module: "creds/generic/snmp_bruteforce",
     };
 
@@ -577,6 +579,7 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "snmp",
+            jitter_ms: 0,
             source_module: "creds/generic/snmp_bruteforce",
             skip_tcp_check: true, // SNMP is UDP — no TCP pre-check
         },

@@ -19,7 +19,7 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 - **20 new exploit modules** — XWiki RCE, Dify default creds, SolarWinds WHD, MCPJam RCE, Langflow RCE, SAP NetWeaver (CVSS 10.0), SharePoint ToolPane, Craft CMS x2, Laravel Livewire, CitrixBleed 2, HPE OneView (CVSS 10.0), F5 BIG-IP, SonicWall SMA, Ivanti ICS x2, Tomcat PUT, WSUS, Erlang SSH (CVSS 10.0), FreePBX
 - **8 new scanners** — ssl_scanner, service_scanner, redis_scanner, vnc_scanner, snmp_scanner, waf_detector, subdomain_scanner, nbns_scanner
 - **9 new credential modules** — vnc, imap, mysql, postgres, redis, elasticsearch, couchdb, memcached, http_basic bruteforce
-- **MCP integration** — Model Context Protocol server with 30 tools and 7 resources for Claude Desktop and external tool connectivity
+- **MCP integration** — Model Context Protocol server with 42 tools and 7 resources for Claude Desktop and external tool connectivity
 - **Payload mutation engine** — 9 WAF bypass strategies (URL encode, case toggle, comment injection, unicode homoglyph, etc.) in `src/native/payload_engine.rs`
 - **Native RDP bruteforce** — TCP+TLS+CredSSP/NTLM authentication, no xfreerdp/rdesktop dependency
 - **Mass scan engine unification** — shared `run_mass_scan()` engine replaced ~900 lines of duplicated code across 13 cred modules
@@ -39,6 +39,17 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
   - Zabbix SQLi: removed unused payload variable
   - Jenkins LFI: fixed async deadlock
   - Apache Tomcat: replaced hardcoded session IDs with proper generation
+
+### Performance & Infrastructure (2026-04-07)
+
+- **Dependency cleanup** — removed 5 redundant crates (aes-gcm, subtle, hyper, hyper-util, futures-util), migrated once_cell to std::sync::LazyLock (10 files), updated sha1/sha2/hkdf to latest
+- **Compile performance** — trimmed tokio from "full" to 10 specific features, removed socket2 "all", optimized build.rs regex (compile once, pre-filter before regex match)
+- **Connection speed** — cached reqwest::Client pool (72+ modules benefit), cached TLS connector singleton, zero-alloc tcp_connect_addr() eliminating 65K String allocs per full port scan
+- **Source port enforcement** — 63 raw TcpStream::connect and 3 UdpSocket::bind bypasses fixed across 44 files; all 190 modules now respect `setg source_port`
+- **Bruteforce engine** — fixed Redis command injection (RESP format), SMTP 2s to 10s timeout, FTP 421 retry, HTTP redirect false positives; added ComboMode::Spray, jitter_ms, credential file loading, HTTP client reuse
+- **Spool compliance** — converted 500+ raw println!/eprintln! to crate::mprintln!/crate::meprintln! across all modules and infrastructure
+- **Zero warnings** — eliminated all compiler warnings, dead code, unused imports
+- **DoS spoofing infrastructure** — unified FastRng, checksum, gen_ipv4_public into src/native/dos_utils.rs; global `setg spoof_ip true` support; ~300 lines of duplicated code removed from 8 modules
 
 ---
 

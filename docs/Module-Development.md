@@ -316,3 +316,25 @@ let encoded = encode_payload(raw_payload, EncodingType::Xor { key: 0x41 })?;
 ```
 
 The engine is used by the `payload_encoder` and `narutto_dropper` exploit modules. When writing new exploit modules that deliver payloads, prefer using the mutation engine over hardcoded encoding to benefit from future encoding additions.
+
+---
+
+## Mandatory Framework Rules
+
+### Network Connections
+- **TCP**: MUST use `crate::utils::network::tcp_connect()` or `tcp_connect_addr()` — never raw `TcpStream::connect`
+- **UDP**: MUST use `crate::utils::network::udp_bind()` or `blocking_udp_bind()` — never raw `UdpSocket::bind("0.0.0.0:0")`
+- **HTTP**: MUST use `crate::utils::build_http_client()` for reqwest clients (cached, connection pooling)
+- **TLS**: Use `crate::native::async_tls::make_dangerous_tls_connector()` (cached singleton)
+- **Blocking TCP**: Use `crate::utils::blocking_tcp_connect()` for SSH and other blocking protocols
+
+These utilities automatically respect `setg source_port` for firewall bypass testing.
+
+### Console Output
+- MUST use `crate::mprintln!()` / `crate::meprintln!()` — never raw `println!` / `eprintln!`
+- This ensures output is captured by the spool logging system when active
+
+### DoS Modules
+- Use `crate::native::dos_utils::FastRng` for packet randomization
+- Use `crate::native::dos_utils::checksum_16()` for IP/TCP/UDP checksums
+- Use `crate::native::dos_utils::is_spoof_enabled()` to check global `setg spoof_ip true`

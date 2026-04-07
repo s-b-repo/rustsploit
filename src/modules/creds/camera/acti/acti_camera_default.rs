@@ -3,7 +3,7 @@ use suppaftp::tokio::AsyncFtpStream;
 use colored::*;
 use ssh2::Session;
 use telnet::{Telnet, Event};
-use std::{net::TcpStream, time::Duration};
+use std::time::Duration;
 use tokio::{join, task};
 use crate::utils::url_encode;
 use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
@@ -105,7 +105,7 @@ pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String
             Ok(sa) => sa,
             Err(_) => continue,
         };
-        if let Ok(stream) = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+        if let Ok(stream) = crate::utils::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
             let mut session = Session::new().context("Failed to create SSH session")?;
             session.set_tcp_stream(stream);
             session.handshake().context("SSH handshake failed")?;

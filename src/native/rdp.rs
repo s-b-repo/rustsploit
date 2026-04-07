@@ -61,10 +61,9 @@ pub async fn try_login(
     requested_protocols: u32,
 ) -> Result<RdpLoginResult> {
     // 1. TCP connect
-    let stream = match timeout(timeout_duration, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Ok(RdpLoginResult::ConnectionFailed(e.to_string())),
-        Err(_) => return Ok(RdpLoginResult::ConnectionFailed("Connection timeout".into())),
+    let stream = match crate::utils::network::tcp_connect(addr, timeout_duration).await {
+        Ok(s) => s,
+        Err(e) => return Ok(RdpLoginResult::ConnectionFailed(e.to_string())),
     };
 
     // 2. X.224 Connection Request

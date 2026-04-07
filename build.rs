@@ -43,6 +43,11 @@ fn main() {
         println!("cargo:rerun-if-changed=src/modules/{}", cat);
     }
 
+    // Compile regexes once, reuse across all categories
+    let run_re = Regex::new(r"pub\s+async\s+fn\s+run\s*\(\s*[^)]*:\s*&str\s*\)").unwrap();
+    let info_re = Regex::new(r"pub\s+fn\s+info\s*\(\s*\)\s*->\s*(?:crate::)?(?:module_info::)?ModuleInfo").unwrap();
+    let check_re = Regex::new(r"pub\s+async\s+fn\s+check\s*\(\s*[^)]*:\s*&str\s*\)\s*->\s*(?:crate::)?(?:module_info::)?CheckResult").unwrap();
+
     // Generate a dispatcher for each category
     let mut registry_entries: Vec<RegistryEntry> = Vec::new();
 
@@ -52,7 +57,7 @@ fn main() {
         let out_file = format!("{}_dispatch.rs", dispatch_name(cat));
         let display_name = capitalize(cat);
 
-        match generate_dispatch(&root, &out_file, &mod_prefix, &display_name) {
+        match generate_dispatch(&root, &out_file, &mod_prefix, &display_name, &run_re, &info_re, &check_re) {
             Ok(_module_count) => {
                 registry_entries.push(RegistryEntry {
                     category: cat.clone(),
@@ -107,6 +112,9 @@ fn generate_dispatch(
     out_file: &str,
     mod_prefix: &str,
     category_name: &str,
+    run_re: &Regex,
+    info_re: &Regex,
+    check_re: &Regex,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR").map_err(|_| "OUT_DIR environment variable not set")?;
     let dest_path = Path::new(&out_dir).join(out_file);
@@ -116,7 +124,7 @@ fn generate_dispatch(
         return Err(format!("Module directory '{}' does not exist", root).into());
     }
 
-    let mappings = find_modules(root_path)?;
+    let mappings = find_modules(root_path, run_re, info_re, check_re)?;
 
     // Sort for deterministic output
     let mut sorted_mappings: Vec<_> = mappings.into_iter().collect();
@@ -355,11 +363,8 @@ fn generate_registry(entries: &[RegistryEntry]) -> Result<(), Box<dyn std::error
 
 /// Finds all valid modules recursively using WalkDir.
 /// Returns (module_key, module_path, capabilities) tuples.
-fn find_modules(root: &Path) -> Result<HashSet<(String, String, ModuleCapabilities)>, Box<dyn std::error::Error>> {
+fn find_modules(root: &Path, run_re: &Regex, info_re: &Regex, check_re: &Regex) -> Result<HashSet<(String, String, ModuleCapabilities)>, Box<dyn std::error::Error>> {
     let mut mappings = HashSet::new();
-    let run_re = Regex::new(r"pub\s+async\s+fn\s+run\s*\(\s*[^)]*:\s*&str\s*\)")?;
-    let info_re = Regex::new(r"pub\s+fn\s+info\s*\(\s*\)\s*->\s*(?:crate::)?(?:module_info::)?ModuleInfo")?;
-    let check_re = Regex::new(r"pub\s+async\s+fn\s+check\s*\(\s*[^)]*:\s*&str\s*\)\s*->\s*(?:crate::)?(?:module_info::)?CheckResult")?;
 
     for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -372,11 +377,12 @@ fn find_modules(root: &Path) -> Result<HashSet<(String, String, ModuleCapabiliti
 
                 let mut content = String::new();
                 if File::open(path).and_then(|mut f| f.read_to_string(&mut content)).is_ok() {
+                    // Fast pre-filter: skip files that can't possibly match
+                    if !content.contains("fn run") { continue; }
                     if run_re.is_match(&content) {
                         let caps = ModuleCapabilities {
-
-                            has_info: info_re.is_match(&content),
-                            has_check: check_re.is_match(&content),
+                            has_info: content.contains("fn info") && info_re.is_match(&content),
+                            has_check: content.contains("fn check") && check_re.is_match(&content),
                         };
                         mappings.insert((rel_str.clone(), rel_str, caps));
                     }

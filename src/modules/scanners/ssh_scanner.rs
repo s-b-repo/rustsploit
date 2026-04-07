@@ -94,7 +94,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
     }
 
     fn print_summary(&self) {
@@ -289,7 +289,7 @@ pub async fn scan_ssh(
                         banner: banner.clone(),
                     };
                     crate::mprintln!("\r{}", format!("[+] {}:{} - {}", host, port, banner).green());
-                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
                     results.lock().await.push(result);
                 }
                 Ok(None) => {

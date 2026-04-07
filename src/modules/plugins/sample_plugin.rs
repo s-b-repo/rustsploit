@@ -24,11 +24,8 @@ pub async fn run(target: &str) -> Result<()> {
         }, move |ip, port| {
             async move {
                 let addr = format!("{}:{}", ip, port);
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    tokio::net::TcpStream::connect(&addr),
-                ).await {
-                    Ok(Ok(_)) => {
+                match crate::utils::network::tcp_connect(&addr, std::time::Duration::from_secs(3)).await {
+                    Ok(_) => {
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                         Some(format!("[{}] {}:{} open\n", ts, ip, port))
                     }
