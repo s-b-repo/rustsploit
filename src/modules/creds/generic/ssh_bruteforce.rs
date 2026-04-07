@@ -85,7 +85,7 @@ pub async fn run(target: &str) -> Result<()> {
                 // Try common defaults
                 let creds = [("root","root"),("admin","admin"),("root",""),("admin",""),("root","123456"),("admin","password")];
                 for (user, pass) in creds {
-                    if sess.userauth_password(user, pass).is_ok() {
+                    if sess.userauth_password(user, pass).is_ok() && sess.authenticated() {
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                         return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                     }

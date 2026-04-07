@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use colored::*;
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::{Write, BufWriter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
@@ -72,10 +72,10 @@ pub async fn run(target: &str) -> Result<()> {
                     };
                     let domain = if ip.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
                     if let Ok(sock) = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP)) {
-                        let _ = sock.set_reuse_address(true);
-                        let _ = sock.set_nonblocking(true);
+                        if let Err(e) = sock.set_reuse_address(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+                        if let Err(e) = sock.set_nonblocking(true) { crate::meprintln!("[!] Socket option error: {}", e); }
                         if sock.bind(&bind.into()).is_ok() {
-                            let _ = sock.connect(&dest.into());
+                            let _connect = sock.connect(&dest.into());
                             let std_stream: std::net::TcpStream = sock.into();
                             if let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) {
                                 if let Ok(Ok(())) = tokio::time::timeout(
@@ -201,7 +201,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     let elapsed = start_time.elapsed();
@@ -236,9 +236,11 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Save results
     if !settings.output_file.is_empty() {
-        let file = File::create(&settings.output_file)?;
+        let file = OpenOptions::new().create(true).append(true).open(&settings.output_file)?;
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&settings.output_file, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&settings.output_file, std::fs::Permissions::from_mode(0o600)) {
+            crate::meprintln!("[!] Permission error on {}: {}", settings.output_file, e);
+        }
         let mut writer = BufWriter::new(file);
         writeln!(writer, "Source Port Scan Results")?;
         writeln!(writer, "Target: {}:{} ({})", ip_str, settings.dest_port, protocol_label)?;
@@ -334,9 +336,9 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
         Err(e) => return ProbeResult::Error(e.to_string()),
     };
 
-    let _ = socket.set_reuse_address(true);
-    let _ = socket.set_nonblocking(true);
-    let _ = socket.set_tcp_nodelay(true);
+    if let Err(e) = socket.set_reuse_address(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+    if let Err(e) = socket.set_nonblocking(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+    if let Err(e) = socket.set_tcp_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
 
     // Bind to the specific source port
     let bind_addr = if ip.is_ipv4() {
@@ -522,7 +524,7 @@ impl ProgressTracker {
             "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
             self.current, self.total, pct, rate, eta
         ).cyan());
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
 
         if self.current == self.total {
             crate::mprintln!();

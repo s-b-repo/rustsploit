@@ -389,7 +389,7 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
                     let line = format!("[Size: {}] {}\n", res.size, res.path);
                     
                     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&file_path) {
-                        let _ = file.write_all(line.as_bytes());
+                        if let Err(e) = file.write_all(line.as_bytes()) { crate::meprintln!("[!] Write error: {}", e); }
                     }
 
                     // 2. Print Control (Real-time Output)
@@ -457,10 +457,12 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
     // We do this by attempting to acquire ALL permits.
     // This will block until all active tasks release their permits.
     crate::mprintln!("Generation done. Waiting for active tasks to complete...");
-    let _ = sem.acquire_many(config.concurrency as u32).await;
+    if let Err(e) = sem.acquire_many(config.concurrency as u32).await { crate::meprintln!("[!] Semaphore error: {}", e); }
     
     // Stop Writer
-    let _ = tx.send(WriterMessage::Stop).await;
+    if let Err(e) = tx.send(WriterMessage::Stop).await {
+        crate::meprintln!("[!] Channel send error: {}", e);
+    }
     let final_buffer = writer_handle.await?;
     
     crate::mprintln!("\n{}", "Scan Complete. Sorting results...".blue());
@@ -479,7 +481,7 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
         let mut content = String::new();
         for r in results {
             // Avoid unwrap on string write (very unlikely to fail on memory, but strictness requested)
-            let _ = writeln!(content, "[Size: {}] {}", r.size, r.path);
+            if let Err(e) = writeln!(content, "[Size: {}] {}", r.size, r.path) { crate::meprintln!("[!] Write error: {}", e); }
         }
         fs::write(&file_path, content)?;
         crate::mprintln!("Saved sorted results for status {} to {}", status, file_path.green());
@@ -553,8 +555,9 @@ async fn spawn_combinations_iterative(
                     status,
                     size,
                 };
-                // If receiver dropped, we just stop sending.
-                let _ = tx.send(WriterMessage::Result(res)).await;
+                if let Err(e) = tx.send(WriterMessage::Result(res)).await {
+                    crate::meprintln!("[!] Channel send error: {}", e);
+                }
             }
         });
         

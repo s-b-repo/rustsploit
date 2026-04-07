@@ -15,6 +15,8 @@ Rustsploit provides several utility modules that every module developer should k
 | **Spool** | `crate::spool` | Console output logging. Call `spool::sprintln()` for spool-aware output |
 | **Jobs** | `crate::jobs` | Background job management via `JOB_MANAGER` |
 | **Export** | `crate::export` | Export engagement data to JSON/CSV/summary |
+| **Output** | `crate::output` | Formatted output helpers with spool integration and color support |
+| **Payload Engine** | `crate::native::payload_engine` | Payload encoding/mutation (XOR, Base64, hex, zero-width, custom) for AV evasion |
 
 ---
 

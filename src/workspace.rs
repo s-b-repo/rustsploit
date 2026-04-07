@@ -50,7 +50,7 @@ impl Workspace {
             .join(".rustsploit")
             .join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) { eprintln!("[!] Directory creation error: {}", e); }
 
         let data = Self::load_sync(&base_dir, "default");
         Self {
@@ -74,7 +74,7 @@ impl Workspace {
                     Err(e) => {
                         eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        let _ = std::fs::copy(&path, &backup);
+                        if let Err(e) = std::fs::copy(&path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
                         WorkspaceData::default()
                     }
                 },
@@ -98,7 +98,7 @@ impl Workspace {
                     Err(e) => {
                         eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        let _ = tokio::fs::copy(&path, &backup).await;
+                        if let Err(e) = tokio::fs::copy(&path, &backup).await { crate::meprintln!("[!] Copy error: {}", e); }
                         WorkspaceData::default()
                     }
                 },
@@ -110,10 +110,11 @@ impl Workspace {
         } else {
             WorkspaceData::default()
         };
-        // Update name and data together to maintain consistency.
-        // Name is updated AFTER data is successfully loaded/defaulted.
-        *self.name.write().await = name.to_string();
+        // Update data FIRST, then name, to maintain consistency (BUG 23 fix).
+        // A reader between these two lines sees old name + new data,
+        // which is safer than new name + old data (stale workspace).
         *self.data.write().await = data;
+        *self.name.write().await = name.to_string();
     }
 
     /// Save current workspace to disk.
@@ -130,7 +131,9 @@ impl Workspace {
                     eprintln!("[!] Failed to save workspace: {}", e);
                 } else {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+                    if let Err(e) = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
+                        crate::meprintln!("[!] Permission error on {}: {}", path.display(), e);
+                    }
                 }
             }
         }
@@ -203,11 +206,18 @@ impl Workspace {
         self.save().await;
     }
 
+    /// Maximum notes per host to prevent unbounded growth (BUG 25 fix).
+    const MAX_NOTES_PER_HOST: usize = 10_000;
+
     /// Add a note to a host.
     pub async fn add_note(&self, ip: &str, note: &str) -> bool {
         let found = {
             let mut data = self.data.write().await;
             if let Some(host) = data.hosts.iter_mut().find(|h| h.ip == ip) {
+                if host.notes.len() >= Self::MAX_NOTES_PER_HOST {
+                    eprintln!("[!] Maximum notes per host reached ({}).", Self::MAX_NOTES_PER_HOST);
+                    return false;
+                }
                 host.notes.push(note.to_string());
                 true
             } else {

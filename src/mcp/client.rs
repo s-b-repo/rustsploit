@@ -125,9 +125,11 @@ impl McpClient {
         // Drop stdin to signal EOF to the child process
         drop(self.stdin);
         // Wait for the child to exit (with a timeout to avoid indefinite hangs)
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
+        if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+            eprintln!("[!] Process wait timeout: {}", e);
+        }
         // If it didn't exit, kill it
-        let _ = self.child.kill().await;
+        if let Err(e) = self.child.kill().await { eprintln!("[!] Process kill error: {}", e); }
         Ok(())
     }
 

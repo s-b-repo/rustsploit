@@ -27,6 +27,8 @@ Contributions are welcome — bug reports, new modules, framework improvements, 
 | Scanner | `src/modules/scanners/` |
 | Credential | `src/modules/creds/generic/` or `creds/<vendor>/` |
 | Plugin | `src/modules/plugins/` |
+| MCP tool | `src/mcp/tools.rs` |
+| Payload mutation strategy | `src/native/payload_engine.rs` |
 
 Use subfolders for vendor families (e.g., `exploits/cisco/`, `exploits/cameras/`).
 

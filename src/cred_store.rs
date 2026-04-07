@@ -60,7 +60,7 @@ impl CredStore {
                     Err(e) => {
                         eprintln!("[!] Warning: creds.json is corrupted ({}). Starting fresh.", e);
                         let backup = file_path.with_extension("json.bak");
-                        let _ = std::fs::copy(&file_path, &backup);
+                        if let Err(e) = std::fs::copy(&file_path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
                         Vec::new()
                     }
                 },
@@ -90,14 +90,17 @@ impl CredStore {
         cred_type: CredType,
         source_module: &str,
     ) -> String {
-        // Input validation
+        // Input validation (BUG 19 fix: also validate service and source_module)
         if host.is_empty() || host.len() > Self::MAX_FIELD_LEN {
             return String::new();
         }
         if secret.len() > Self::MAX_FIELD_LEN || username.len() > Self::MAX_FIELD_LEN {
             return String::new();
         }
-        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+        if service.len() > Self::MAX_FIELD_LEN || source_module.len() > Self::MAX_FIELD_LEN {
+            return String::new();
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
         let entry = CredEntry {
             id: id.clone(),
             host: host.to_string(),
@@ -161,17 +164,33 @@ impl CredStore {
         self.save_locked(&[]).await;
     }
 
+    /// Save to disk. Logs warnings on failure instead of silently ignoring (BUG 20 fix).
     async fn save_locked(&self, entries: &[CredEntry]) {
         if let Some(parent) = self.file_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                eprintln!("[!] Warning: Failed to create creds directory: {}", e);
+                return;
+            }
         }
         let tmp = self.file_path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(entries) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, &self.file_path).await;
-                use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await;
+        let json = match serde_json::to_string_pretty(entries) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[!] Warning: Failed to serialize credentials: {}", e);
+                return;
             }
+        };
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
+            eprintln!("[!] Warning: Failed to write creds temp file: {}", e);
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
+            eprintln!("[!] Warning: Failed to save credentials (rename): {}", e);
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await {
+            eprintln!("[!] Warning: Failed to set permissions on creds.json: {}", e);
         }
     }
 
@@ -193,7 +212,7 @@ impl CredStore {
             let valid_str = if e.valid { "yes".green() } else { "no".red() };
             println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
                 e.id, e.host, e.port, e.service, e.username,
-                if e.secret.len() > 18 { format!("{}...", &e.secret[..15]) } else { e.secret.clone() },
+                if e.secret.len() > 8 { format!("{}...", &e.secret[..5]) } else { e.secret.clone() },
                 e.cred_type, valid_str);
         }
         println!();

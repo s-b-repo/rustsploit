@@ -60,7 +60,7 @@ rustsploit/
 │   ├── modules/
 │   │   ├── exploits/         # Exploit modules (137 modules, 24 with check)
 │   │   ├── scanners/         # Scanner modules (24 modules)
-│   │   ├── creds/            # Credential modules (19 modules)
+│   │   ├── creds/            # Credential modules (28 modules)
 │   │   └── plugins/          # Plugin modules (1 module)
 │   ├── native/               # Native integrations
 │   │   ├── mod.rs
@@ -277,3 +277,42 @@ fn is_excluded_ip(ip: Ipv4Addr) -> bool { ... }
 The `EXCLUDED_RANGES` constant covers bogons, private, reserved, documentation CIDRs, and public DNS servers. Copy this pattern from an existing mass-scan module (e.g., `telnet_hose` or `hikvision_rce`).
 
 Honeypot detection is disabled in mass-scan mode to avoid interactive prompts.
+
+---
+
+### MCP Tool Development
+
+Rustsploit exposes an MCP (Model Context Protocol) tool interface under `src/mcp/`. MCP tools allow AI agents to invoke framework functionality programmatically through a structured JSON-RPC protocol.
+
+**Adding an MCP tool:**
+
+1. Create a new handler in `src/mcp/` that implements the MCP tool interface.
+2. Define the tool's input schema (JSON Schema) and output format.
+3. Register the tool in the MCP tool registry so it appears in `tools/list` responses.
+4. Use the existing module dispatch system to route MCP tool calls to the appropriate exploit, scanner, or credential module.
+
+MCP tools follow the same security model as the REST API: input validation, sanitization, and rate limiting all apply. The MCP layer is a thin adapter over the existing shell command dispatch -- it does not bypass any framework security controls.
+
+---
+
+### Payload Mutation Engine
+
+The payload mutation engine (`src/native/payload_engine.rs`) provides encoding, obfuscation, and transformation of payloads for AV/EDR evasion. Module authors can use it to dynamically encode payloads before delivery.
+
+**Supported encodings:**
+
+- XOR with configurable key
+- Base64 (standard and URL-safe)
+- Hex encoding
+- Zero-width Unicode steganography
+- Custom alphabet substitution
+
+**Usage in modules:**
+
+```rust
+use crate::native::payload_engine::{encode_payload, EncodingType};
+
+let encoded = encode_payload(raw_payload, EncodingType::Xor { key: 0x41 })?;
+```
+
+The engine is used by the `payload_encoder` and `narutto_dropper` exploit modules. When writing new exploit modules that deliver payloads, prefer using the mutation engine over hardcoded encoding to benefit from future encoding additions.

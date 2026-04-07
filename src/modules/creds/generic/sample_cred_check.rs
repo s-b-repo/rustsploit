@@ -73,11 +73,14 @@ pub async fn run(target: &str) -> Result<()> {
     if resp.status().is_success() {
         crate::mprintln!("{}", "[+] Default credentials admin:admin are valid!".green().bold());
         // Persist discovered credential to the framework's credential store
-        let _ = crate::cred_store::store_credential(
-            target, 80, "http", "admin", "admin",
-            crate::cred_store::CredType::Password,
-            "creds/generic/sample_cred_check",
-        ).await;
+        {
+            let id = crate::cred_store::store_credential(
+                target, 80, "http", "admin", "admin",
+                crate::cred_store::CredType::Password,
+                "creds/generic/sample_cred_check",
+            ).await;
+            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+        }
     } else {
         crate::mprintln!("{}", "[-] Default credentials admin:admin failed.".yellow());
     }

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
 
 use std::time::{Duration, Instant};
@@ -165,9 +165,11 @@ pub async fn run(target: &str) -> Result<()> {
     // Save results
     if save_results && !results.is_empty() {
         let filename = cfg_prompt_output_file("output_file", "Output filename", "http_scan_results.txt").await?;
-        let mut file = File::create(&filename).context("Failed to create output file")?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&filename).context("Failed to create output file")?;
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o600)) {
+            crate::meprintln!("[!] Permission error on {}: {}", filename, e);
+        }
         writeln!(file, "HTTP Connectivity Scan Results")?;
         writeln!(file, "Target: {}", target)?;
         writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64())?;

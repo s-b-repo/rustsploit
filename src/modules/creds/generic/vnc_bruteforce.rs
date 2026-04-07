@@ -758,11 +758,15 @@ async fn try_vnc_auth(addr: &str, password: &str) -> VncResult {
                     let reason_len = u32::from_be_bytes(len_buf) as usize;
                     if reason_len > 0 && reason_len < 4096 {
                         let mut reason = vec![0u8; reason_len];
-                        let _ = tokio::time::timeout(
+                        match tokio::time::timeout(
                             Duration::from_millis(READ_TIMEOUT_MS),
                             stream.read_exact(&mut reason),
                         )
-                        .await;
+                        .await {
+                            Err(_) => crate::meprintln!("[!] VNC reason read timed out"),
+                            Ok(Err(e)) => crate::meprintln!("[!] VNC reason read error: {}", e),
+                            Ok(Ok(_)) => {}
+                        }
                     }
                 }
             }

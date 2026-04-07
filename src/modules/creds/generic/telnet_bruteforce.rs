@@ -212,16 +212,19 @@ pub async fn run(target: &str) -> Result<()> {
                         for &(user, pass) in DEFAULT_CREDENTIALS {
                             match try_telnet_login(&addr, user, pass, &cfg).await {
                                 Ok(true) => {
-                                    let _ = crate::cred_store::store_credential(
-                                        &ip.to_string(),
-                                        p,
-                                        "telnet",
-                                        user,
-                                        pass,
-                                        crate::cred_store::CredType::Password,
-                                        "creds/generic/telnet_bruteforce",
-                                    )
-                                    .await;
+                                    {
+                                        let id = crate::cred_store::store_credential(
+                                            &ip.to_string(),
+                                            p,
+                                            "telnet",
+                                            user,
+                                            pass,
+                                            crate::cred_store::CredType::Password,
+                                            "creds/generic/telnet_bruteforce",
+                                        )
+                                        .await;
+                                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                    }
                                     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                                     crate::mprintln!(
                                         "\r{}",
@@ -717,10 +720,12 @@ pub async fn run(target: &str) -> Result<()> {
 
 /// Parse comma-separated port list (e.g. "23,2323,8023").
 fn parse_ports(input: &str) -> Vec<u16> {
+    let mut seen = std::collections::HashSet::new();
     input
         .split(',')
         .filter_map(|s| s.trim().parse::<u16>().ok())
         .filter(|&p| p > 0)
+        .filter(|p| seen.insert(*p))
         .collect()
 }
 
@@ -740,7 +745,7 @@ async fn try_telnet_login(addr: &str, user: &str, pass: &str, cfg: &TelnetConfig
         .map_err(|e| anyhow!("{}: {}", addr, e))?;
 
     // Disable Nagle — telnet sends small packets, latency matters more than throughput
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
 
     let mut buf = String::with_capacity(RECENT_BUF_CAP);
     let mut raw = [0u8; 4096];
@@ -764,7 +769,7 @@ async fn try_telnet_login(addr: &str, user: &str, pass: &str, cfg: &TelnetConfig
             || lower.contains("press a key")
             || lower.contains("any key to continue")
         {
-            let _ = send_line(&mut stream, "", cfg.read_timeout).await;
+            if let Err(e) = send_line(&mut stream, "", cfg.read_timeout).await { crate::meprintln!("[!] Write error: {}", e); }
             tokio::time::sleep(Duration::from_millis(300)).await;
             buf.clear();
             drain_and_negotiate(&mut stream, &mut buf, &mut raw, cfg.read_timeout).await;
@@ -1011,9 +1016,9 @@ async fn drain_and_negotiate(
                 // can proceed with negotiation without waiting.
                 if !responses.is_empty() {
                     for resp in &responses {
-                        let _ = stream.write_all(resp).await;
+                        if let Err(e) = stream.write_all(resp).await { crate::meprintln!("[!] Write error: {}", e); }
                     }
-                    let _ = stream.flush().await;
+                    if let Err(e) = stream.flush().await { crate::meprintln!("[!] Flush error: {}", e); }
                 }
 
                 let text = strip_control_and_ansi(&clean);
@@ -1245,7 +1250,7 @@ async fn send_line(stream: &mut TcpStream, data: &str, write_timeout: Duration) 
         .map_err(|_| anyhow!("Write timeout"))?
         .map_err(|e| anyhow!("Write error: {}", e))?;
 
-    let _ = stream.flush().await;
+    if let Err(e) = stream.flush().await { crate::meprintln!("[!] Flush error: {}", e); }
     Ok(())
 }
 

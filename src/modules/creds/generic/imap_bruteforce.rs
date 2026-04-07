@@ -493,7 +493,7 @@ fn attempt_imap_login(
 
         let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
-        let _ = stream.set_nodelay(true);
+        if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
         stream.set_read_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
 
@@ -522,7 +522,7 @@ fn attempt_imap_login(
 
         if response.contains("A001 OK") {
             // Clean logout
-            let _ = stream.write_all(b"A002 LOGOUT\r\n");
+            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") { crate::meprintln!("[!] IMAP LOGOUT write error: {}", e); }
             return Ok(true);
         }
         if response.contains("A001 NO") || response.contains("A001 BAD") {
@@ -545,7 +545,7 @@ fn attempt_imap_login(
 
         let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
-        let _ = stream.set_nodelay(true);
+        if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
         stream.set_read_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
 
@@ -569,7 +569,7 @@ fn attempt_imap_login(
 
         if response.contains("A001 OK") {
             // Clean logout
-            let _ = stream.write_all(b"A002 LOGOUT\r\n");
+            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") { crate::meprintln!("[!] IMAP LOGOUT write error: {}", e); }
             return Ok(true);
         }
         if response.contains("A001 NO") || response.contains("A001 BAD") {

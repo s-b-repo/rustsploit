@@ -296,6 +296,7 @@ pre-fill interactive prompts so modules run non-interactively via the API.
 | Key | Type | Used By | Description |
 |-----|------|---------|-------------|
 | `port` | u16 | Most modules | Target service port |
+| `source_port` | u16 | Scanners/exploits | Source port for outbound connections |
 | `target` | string | Some modules | Override target when empty |
 | `command` | string | RCE exploits | Command to execute |
 | `username` | string | Auth exploits/creds | Username or login |
@@ -366,3 +367,16 @@ pre-fill interactive prompts so modules run non-interactively via the API.
   }
 }
 ```
+
+---
+
+### MCP Protocol
+
+Rustsploit also exposes an MCP (Model Context Protocol) server via JSON-RPC 2.0 over stdio, enabling integration with Claude Desktop and other MCP-compatible tools. The MCP server provides 30 tools and 7 resources covering module execution, credential management, workspace tracking, loot storage, global options, background jobs, and data export.
+
+Start the MCP server with:
+```bash
+cargo run -- --mcp
+```
+
+See [MCP Integration](MCP-Integration.md) for full details on tools, resources, and configuration.

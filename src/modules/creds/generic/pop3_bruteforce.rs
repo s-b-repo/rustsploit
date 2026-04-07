@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use colored::*;
 use native_tls::TlsConnector;
-use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -315,78 +314,59 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 /// POP3 login result: Ok(true) = authenticated, Ok(false) = auth rejected, Err = classified error.
+/// Shared POP3 authentication logic for both SSL and plain connections.
+fn pop3_authenticate(stream: &mut (impl std::io::Read + std::io::Write), user: &str, pass: &str) -> std::result::Result<bool, Pop3Error> {
+    let mut buffer = [0; 1024];
+    // Read banner
+    stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+
+    // Send USER
+    stream.write_all(format!("USER {}\r\n", user).as_bytes())
+        .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+    let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+    if !String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
+        return Ok(false);
+    }
+
+    // Send PASS
+    stream.write_all(format!("PASS {}\r\n", pass).as_bytes())
+        .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+    let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+    if String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
+        if let Err(e) = stream.write_all(b"QUIT\r\n") { crate::meprintln!("[!] POP3 QUIT write error: {}", e); }
+        if let Err(e) = stream.flush() { eprintln!("[!] Flush error: {}", e); }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn attempt_pop3_login(target: &str, port: u16, user: &str, pass: &str, use_ssl: bool, timeout_secs: u64) -> std::result::Result<bool, Pop3Error> {
     let addr = format!("{}:{}", target, port);
     let timeout = Duration::from_secs(timeout_secs);
+
+    let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+        .map_err(|e| Pop3Error::from_anyhow(e.into()))?
+        .next()
+        .ok_or_else(|| Pop3Error { error_type: Pop3ErrorType::ConnectionRefused, message: "Resolution failed".to_string() })?;
+    let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
+        .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+    stream.set_read_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
 
     if use_ssl {
         let connector = TlsConnector::new().map_err(|e| Pop3Error {
             error_type: Pop3ErrorType::TlsError,
             message: e.to_string(),
         })?;
-        let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?
-            .next()
-            .ok_or_else(|| Pop3Error { error_type: Pop3ErrorType::ConnectionRefused, message: "Resolution failed".to_string() })?;
-        let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        let _ = stream.set_nodelay(true);
-        stream.set_read_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        stream.set_write_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-
-        let mut stream = connector.connect(target, stream).map_err(|e| Pop3Error {
+        let mut tls_stream = connector.connect(target, stream).map_err(|e| Pop3Error {
             error_type: Pop3ErrorType::TlsError,
             message: e.to_string(),
         })?;
-
-        // Read banner
-        let mut buffer = [0; 1024];
-        stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-
-        stream.write_all(format!("USER {}\r\n", user).as_bytes())
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        if !String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
-            return Ok(false);
-        }
-
-        stream.write_all(format!("PASS {}\r\n", pass).as_bytes())
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        if String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
-            stream.write_all(b"QUIT\r\n").ok();
-            return Ok(true);
-        }
+        pop3_authenticate(&mut tls_stream, user, pass)
     } else {
-        let socket_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr)
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?
-            .next()
-            .ok_or_else(|| Pop3Error { error_type: Pop3ErrorType::ConnectionRefused, message: "Resolution failed".to_string() })?;
-        let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        let _ = stream.set_nodelay(true);
-        stream.set_read_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        stream.set_write_timeout(Some(timeout)).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-
-        // Read banner
-        let mut buffer = [0; 1024];
-        stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-
-        stream.write_all(format!("USER {}\r\n", user).as_bytes())
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        if !String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
-            return Ok(false);
-        }
-
-        stream.write_all(format!("PASS {}\r\n", pass).as_bytes())
-            .map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
-        if String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
-            stream.write_all(b"QUIT\r\n").ok();
-            return Ok(true);
-        }
+        let mut plain_stream = stream;
+        pop3_authenticate(&mut plain_stream, user, pass)
     }
-
-    Ok(false)
 }

@@ -40,7 +40,7 @@ curl -H "Authorization: Bearer my-secret-key" \
     "scanners/dir_brute",
     "creds/generic/ssh_bruteforce"
   ],
-  "count": 181,
+  "count": 190,
   "request_id": "abc123",
   "timestamp": "2026-03-17T14:01:00Z",
   "duration_ms": 2
@@ -514,3 +514,56 @@ curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/status
 # 6. View IPs
 curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/ips
 ```
+
+---
+
+## Multi-Target Examples
+
+The API supports multiple target formats: single IP, CIDR subnets, comma-separated lists, and hostname resolution.
+
+```bash
+# Single IP
+curl -X POST http://localhost:8080/api/run \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}'
+
+# CIDR subnet
+curl -X POST http://localhost:8080/api/run \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"module": "scanners/port_scanner", "target": "192.168.1.0/24"}'
+
+# Comma-separated list
+curl -X POST http://localhost:8080/api/run \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"module": "scanners/port_scanner", "target": "10.0.0.1,10.0.0.2,10.0.0.3"}'
+
+# Hostname (resolved via DNS)
+curl -X POST http://localhost:8080/api/run \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"module": "exploits/heartbleed", "target": "vulnerable.example.com"}'
+```
+
+---
+
+## MCP Integration
+
+The MCP (Model Context Protocol) server runs over stdio with JSON-RPC 2.0 transport. It is designed for integration with Claude Desktop and other MCP-compatible clients.
+
+```bash
+# Start the MCP server
+cargo run -- --mcp
+```
+
+MCP tools can be invoked by any MCP-compatible client. Example tool calls (JSON-RPC 2.0 format):
+
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_modules", "arguments": {"category": "exploits"}}}
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run_module", "arguments": {"module_path": "scanners/port_scanner", "target": "192.168.1.1"}}}
+{"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "rustsploit:///status"}}
+```
+
+See [MCP Integration](MCP-Integration.md) for the full tool and resource reference.

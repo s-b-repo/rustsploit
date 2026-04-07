@@ -147,7 +147,7 @@ fn history_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".rustsploit");
     use std::os::unix::fs::DirBuilderExt;
-    let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir);
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { eprintln!("[!] Directory creation error: {}", e); }
     dir.join("history.txt")
 }
 
@@ -241,7 +241,7 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
     let mut rl = Editor::with_config(rl_config)?;
     rl.set_helper(Some(RsfCompleter::new()));
     let hist = history_path();
-    let _ = rl.load_history(&hist);
+    if let Err(e) = rl.load_history(&hist) { eprintln!("[!] History load error: {}", e); }
 
     // Auto-load startup.rc if it exists
     let startup_rc = home::home_dir()
@@ -313,7 +313,7 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         }
     }
 
-    let _ = rl.save_history(&hist);
+    if let Err(e) = rl.save_history(&hist) { eprintln!("[!] History save error: {}", e); }
     Ok(())
 }
 
@@ -329,10 +329,12 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
     };
     let cmd_input = normalized.as_str();
 
-    match split_command(cmd_input) {
-        Some((cmd, rest)) => {
-            let command_key = resolve_command(&cmd);
-            match command_key.as_str() {
+    let (cmd, rest) = split_command(cmd_input);
+    if cmd.is_empty() {
+        return false;
+    }
+    let command_key = resolve_command(&cmd);
+    match command_key.as_str() {
                 "exit" => {
                     println!("Exiting...");
                     return true;
@@ -654,7 +656,11 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         // Interactive cred add
                         let host = match utils::prompt_required("Host").await { Ok(v) => v, Err(_) => return false };
                         let port_str = match utils::prompt_default("Port", "0").await { Ok(v) => v, Err(_) => return false };
-                        let port: u16 = port_str.parse().unwrap_or(0);
+                        let port: u16 = match port_str.parse() {
+                            Ok(p) if p > 0 => p,
+                            Ok(_) => 0, // port 0 = unknown, acceptable for creds
+                            Err(_) => { println!("{}", "[!] Invalid port number.".red()); return false; }
+                        };
                         let service = match utils::prompt_default("Service", "unknown").await { Ok(v) => v, Err(_) => return false };
                         let username = match utils::prompt_required("Username").await { Ok(v) => v, Err(_) => return false };
                         let secret = match utils::prompt_required("Password/Hash/Key").await { Ok(v) => v, Err(_) => return false };
@@ -711,25 +717,50 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     if rest.is_empty() {
                         println!("{}", "Usage: resource <script_file>".yellow());
                     } else {
-                        let depth = ctx.resource_depth;
-                        ctx.resource_depth += 1;
-                        execute_resource_file_inner(ctx, &rest, depth).await;
-                        ctx.resource_depth = depth;
+                        let fname = rest.trim();
+                        // Validate path — reject traversal and null bytes
+                        if fname.contains('\0') || fname.contains("..") {
+                            println!("{}", "[!] Invalid resource script path (path traversal not allowed).".red());
+                        } else if fname.len() > 4096 {
+                            println!("{}", "[!] Resource script path too long.".red());
+                        } else {
+                            // Warn if script is from outside ~/.rustsploit/
+                            if std::path::Path::new(fname).is_absolute() {
+                                let rustsploit_dir = home::home_dir()
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                    .join(".rustsploit");
+                                if !fname.starts_with(&rustsploit_dir.to_string_lossy().as_ref()) {
+                                    println!("{}", format!("[*] Warning: executing script from outside ~/.rustsploit/: {}", fname).yellow());
+                                }
+                            }
+                            let depth = ctx.resource_depth;
+                            ctx.resource_depth += 1;
+                            execute_resource_file_inner(ctx, fname, depth).await;
+                            ctx.resource_depth = depth;
+                        }
                     }
                 }
                 "makerc" => {
                     if rest.is_empty() {
                         println!("{}", "Usage: makerc <output_file>".yellow());
                     } else {
-                        let hist_path = history_path();
-                        match std::fs::read_to_string(&hist_path) {
-                            Ok(contents) => {
-                                match std::fs::write(&rest, &contents) {
-                                    Ok(_) => println!("{}", format!("[+] Command history saved to '{}'", rest).green()),
-                                    Err(e) => println!("{}", format!("[!] Failed to write: {}", e).red()),
+                        // Validate path — reject absolute paths, traversal, and directory separators
+                        let fname = rest.trim();
+                        if fname.contains("..") || fname.contains('\0') || fname.starts_with('/') || fname.starts_with('\\') || fname.contains('/') || fname.contains('\\') || fname.starts_with('.') {
+                            println!("{}", "[!] Invalid filename. Use a simple filename like 'session.rc' (no paths or traversal).".red());
+                        } else if fname.len() > 255 {
+                            println!("{}", "[!] Filename too long (max 255 chars).".red());
+                        } else {
+                            let hist_path = history_path();
+                            match std::fs::read_to_string(&hist_path) {
+                                Ok(contents) => {
+                                    match std::fs::write(fname, &contents) {
+                                        Ok(_) => println!("{}", format!("[+] Command history saved to '{}'", fname).green()),
+                                        Err(e) => println!("{}", format!("[!] Failed to write: {}", e).red()),
+                                    }
                                 }
+                                Err(e) => println!("{}", format!("[!] Failed to read history: {}", e).red()),
                             }
-                            Err(e) => println!("{}", format!("[!] Failed to read history: {}", e).red()),
                         }
                     }
                 }
@@ -770,7 +801,10 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     } else if rest == "add" {
                         let host = match utils::prompt_required("Host IP").await { Ok(v) => v, Err(_) => return false };
                         let port_str = match utils::prompt_required("Port").await { Ok(v) => v, Err(_) => return false };
-                        let port: u16 = port_str.parse().unwrap_or(0);
+                        let port: u16 = match port_str.parse() {
+                            Ok(p) if p > 0 => p,
+                            _ => { println!("{}", "[!] Invalid port number (must be 1-65535).".red()); return false; }
+                        };
                         let proto = match utils::prompt_default("Protocol", "tcp").await { Ok(v) => v, Err(_) => return false };
                         let svc = match utils::prompt_required("Service name").await { Ok(v) => v, Err(_) => return false };
                         let ver = match utils::prompt_default("Version", "").await { Ok(v) => v, Err(_) => return false };
@@ -829,7 +863,9 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         println!();
                     } else {
                         let name = rest.trim();
-                        if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                        if name.is_empty() || name.len() > 64 {
+                            println!("{}", "Workspace name must be 1-64 characters.".red());
+                        } else if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
                             crate::workspace::WORKSPACE.switch(name).await;
                             println!("{}", format!("[+] Switched to workspace '{}'", name).green());
                         } else {
@@ -886,8 +922,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 "export" => {
                     if let Some((fmt, path)) = rest.split_once(char::is_whitespace) {
                         let path = path.trim();
-                        if path.is_empty() || path.contains("..") {
-                            println!("{}", "Invalid file path.".red());
+                        if let Err(e) = crate::export::validate_export_path(path) {
+                            println!("{}", format!("[!] {}", e).red());
                         } else {
                             match fmt.trim() {
                                 "json" => {
@@ -1128,11 +1164,6 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     println!("{}", format!("Unknown command: '{}'. Type 'help' or '?' for usage.", cmd_input).red());
                 }
             }
-        }
-        None => {
-            println!("{}", format!("Unknown command: '{}'. Type 'help' or '?' for usage.", cmd_input).red());
-        }
-    }
     false
 }
 
@@ -1169,11 +1200,11 @@ fn execute_resource_file_inner<'a>(ctx: &'a mut ShellContext, path: &'a str, dep
 }
 
 
-fn split_command(input: &str) -> Option<(String, String)> {
+fn split_command(input: &str) -> (String, String) {
     let mut parts = input.splitn(2, char::is_whitespace);
-    let cmd = parts.next()?.to_lowercase();
+    let cmd = parts.next().unwrap_or("").to_lowercase();
     let rest = parts.next().unwrap_or("").trim().to_string();
-    Some((cmd, rest))
+    (cmd, rest)
 }
 
 pub fn resolve_command(cmd: &str) -> String {

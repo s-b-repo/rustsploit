@@ -42,23 +42,33 @@ impl SpoolState {
     }
 
     fn start_at_path(&self, resolved: &Path, display_name: &str) -> Result<(), String> {
-        // Reject symlinks
-        if resolved.is_symlink() {
+        // Acquire lock FIRST (before creating file) to prevent orphaned files
+        let mut guard = self.file.write().map_err(|_| "Failed to acquire spool lock".to_string())?;
+
+        // Open file with O_NOFOLLOW equivalent: reject symlinks atomically
+        // by using create_new=false + checking symlink metadata after open
+        use std::fs::OpenOptions;
+        // Reject pre-existing symlinks
+        if resolved.exists() && resolved.is_symlink() {
             return Err("Symlinks not allowed for spool files".to_string());
         }
-        match File::create(resolved) {
+        match OpenOptions::new().write(true).create(true).truncate(true).open(resolved) {
             Ok(f) => {
-                if let Ok(mut guard) = self.file.write() {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let mut file = f;
-                    let _ = writeln!(file, "# RustSploit Console Log - Started {}", ts);
-                    let _ = writeln!(file, "# ==========================================");
-                    let _ = writeln!(file);
-                    let _ = file.flush();
-                    *guard = Some((file, display_name.to_string()));
-                    return Ok(());
+                // Verify the opened file isn't a symlink (post-open check)
+                if let Ok(meta) = resolved.symlink_metadata() {
+                    if meta.file_type().is_symlink() {
+                        drop(f);
+                        return Err("Symlinks not allowed for spool files".to_string());
+                    }
                 }
-                Err("Failed to acquire spool lock".to_string())
+                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                let mut file = f;
+                if let Err(e) = writeln!(file, "# RustSploit Console Log - Started {}", ts) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = writeln!(file, "# ==========================================") { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = writeln!(file) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
+                *guard = Some((file, display_name.to_string()));
+                Ok(())
             }
             Err(e) => Err(format!("Failed to create spool file: {}", e)),
         }
@@ -69,9 +79,9 @@ impl SpoolState {
         if let Ok(mut guard) = self.file.write() {
             if let Some((mut file, name)) = guard.take() {
                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                let _ = writeln!(file);
-                let _ = writeln!(file, "# Spool ended {}", ts);
-                let _ = file.flush();
+                if let Err(e) = writeln!(file) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = writeln!(file, "# Spool ended {}", ts) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
                 return Some(name);
             }
         }
@@ -88,12 +98,14 @@ impl SpoolState {
         self.file.read().ok()?.as_ref().map(|(_, name)| name.clone())
     }
 
-    /// Write a line to the spool file (if active).
+    /// Write a line to the spool file (if active). Flushes after write (BUG 11 fix).
     pub fn write_line(&self, msg: &str) {
         if let Ok(mut guard) = self.file.write() {
             if let Some((ref mut file, _)) = *guard {
                 if let Err(e) = writeln!(file, "{}", msg) {
                     eprintln!("[!] Spool write error: {}", e);
+                } else {
+                    if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
                 }
             }
         }

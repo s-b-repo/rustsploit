@@ -77,7 +77,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
     }
 
     fn print_final(&self) {
@@ -377,12 +377,12 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         }
 
         for handle in handles {
-            let _ = handle.await;
+            if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
         }
 
         // Stop progress reporter
         stop_flag.store(true, Ordering::Relaxed);
-        let _ = progress_handle.join();
+        if let Err(e) = progress_handle.join() { crate::meprintln!("[!] Thread join error: {:?}", e); }
 
         // Final reporting including unknown responses
         return finalize_and_report(found, unknown, stats).await;
@@ -539,13 +539,13 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
     }
 
     for handle in handles {
-        let _ = handle.await;
+        if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
     }
-    
+
     // Stop progress reporter
     stop_flag.store(true, Ordering::Relaxed);
-    let _ = progress_handle.join();
-    
+    if let Err(e) = progress_handle.join() { crate::meprintln!("[!] Thread join error: {:?}", e); }
+
     // Final reporting including unknown responses
     finalize_and_report(found, unknown, stats).await
 }
@@ -560,7 +560,7 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
     
     let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(timeout_ms))
         .context("Connection timeout")?;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
 
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;

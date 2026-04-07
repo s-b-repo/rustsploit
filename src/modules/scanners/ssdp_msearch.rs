@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use colored::*;
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
 
 use std::net::SocketAddr;
@@ -70,7 +70,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     let target = clean_ipv6_brackets(target);
     // Validate target format
-    let _ = normalize_target(&target, port)
+    let _normalized = normalize_target(&target, port)
         .with_context(|| format!("Failed to normalize target '{}'", target))?;
 
     // Determine search targets
@@ -157,9 +157,11 @@ pub async fn run(target: &str) -> Result<()> {
     // Save results if requested
     if save_results && !results.is_empty() {
         let filename = format!("ssdp_scan_{}.txt", target.replace([':', '.', '[', ']'], "_"));
-        if let Ok(mut file) = File::create(&filename) {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&filename) {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o600));
+            if let Err(e) = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o600)) {
+                crate::meprintln!("[!] Permission error on {}: {}", filename, e);
+            }
             writeln!(file, "SSDP M-SEARCH Scan Results").ok();
             writeln!(file, "Target: {}:{}", target, port).ok();
             writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()).ok();

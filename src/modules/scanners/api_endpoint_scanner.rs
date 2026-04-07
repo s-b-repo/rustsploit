@@ -692,7 +692,9 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
                             };
                             if let Ok(mut f) = File::create(&body_file) {
                                 use std::os::unix::fs::PermissionsExt;
-                                let _ = std::fs::set_permissions(&body_file, std::fs::Permissions::from_mode(0o600));
+                                if let Err(e) = std::fs::set_permissions(&body_file, std::fs::Permissions::from_mode(0o600)) {
+                                    crate::meprintln!("[!] Permission error on {}: {}", body_file.display(), e);
+                                }
                                 if let Err(e) = f.write_all(&body) {
                                     crate::meprintln!("[!] Failed to write body: {}", e);
                                 }

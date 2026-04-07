@@ -171,7 +171,7 @@ impl BruteforceStats {
                 rate
             );
         }
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
     }
 
     pub async fn print_final(&self) {
@@ -257,13 +257,17 @@ pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr 
     loop {
         attempts += 1;
         if attempts > 100_000 {
-            // Fallback: return a random non-excluded IP from common ranges
-            return IpAddr::V4(std::net::Ipv4Addr::new(
+            // Fallback: generate from common public ranges and re-check exclusions
+            let fallback = IpAddr::V4(std::net::Ipv4Addr::new(
                 rng.random_range(1..224),
                 rng.random_range(0..256) as u8,
                 rng.random_range(0..256) as u8,
                 rng.random_range(1..255) as u8,
             ));
+            if !exclusions.iter().any(|net| net.contains(fallback)) {
+                return fallback;
+            }
+            continue; // Fallback was excluded too — keep trying
         }
 
         let octets: [u8; 4] = rng.random();
@@ -289,27 +293,54 @@ pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr 
     }
 }
 
+/// In-memory dedup set for mass scan IP tracking.
+/// Avoids the TOCTOU race of file-based is_ip_checked + mark_ip_checked.
+static CHECKED_IPS: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Atomically check AND mark an IP — returns true if already checked (skip it).
+/// Uses in-memory HashSet for race-free dedup, with file append for persistence.
 pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
-    let needle = format!("checked: {}", ip.to_string());
-    match tokio::fs::read_to_string(state_file).await {
-        Ok(contents) => contents.lines().any(|line| line.contains(&needle)),
-        Err(_) => false,
+    let ip_str = ip.to_string();
+    let mut set = CHECKED_IPS.lock().await;
+    if set.contains(&ip_str) {
+        return true;
     }
+    // Check file on first access (cold start after restart)
+    if set.is_empty() {
+        if let Ok(contents) = tokio::fs::read_to_string(state_file).await {
+            for line in contents.lines() {
+                if let Some(checked_ip) = line.strip_prefix("checked: ") {
+                    set.insert(checked_ip.to_string());
+                }
+            }
+            if set.contains(&ip_str) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
+/// Mark an IP as checked (in memory + persisted to file).
 pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
     if state_file.contains("..") {
         crate::meprintln!("[!] Invalid state file path: {}", state_file);
         return;
     }
-    let data = format!("checked: {}\n", ip.to_string());
+    let ip_str = ip.to_string();
+    {
+        let mut set = CHECKED_IPS.lock().await;
+        set.insert(ip_str.clone());
+    }
+    let data = format!("checked: {}\n", ip_str);
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
         .open(state_file)
         .await
     {
-        let _ = file.write_all(data.as_bytes()).await;
+        if let Err(e) = file.write_all(data.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
     }
 }
 
@@ -425,7 +456,7 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
                 }
             }
             Err(e) => {
@@ -503,7 +534,9 @@ where
                     mark_ip_checked(&ip, state_file).await;
                     if let Some(line) = probe(ip, port).await {
                         sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
+                        if let Err(e) = tx.send(line).await {
+                            crate::meprintln!("[!] Channel send error: {}", e);
+                        }
                     }
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -535,7 +568,9 @@ where
                     mark_ip_checked(&ip_addr, state_file).await;
                     if let Some(line) = probe(ip_addr, port).await {
                         sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
+                        if let Err(e) = tx.send(line).await {
+                            crate::meprintln!("[!] Channel send error: {}", e);
+                        }
                     }
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -545,7 +580,7 @@ where
 
         // Wait for all tasks to finish
         for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+            if let Err(e) = semaphore.acquire().await { crate::meprintln!("[!] Semaphore error: {}", e); }
         }
     } else {
         // File mode
@@ -584,7 +619,9 @@ where
                         mark_ip_checked(&ip, state_file).await;
                         if let Some(line) = probe(ip, port).await {
                             sf.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(line).await;
+                            if let Err(e) = tx.send(line).await {
+                                crate::meprintln!("[!] Channel send error: {}", e);
+                            }
                         }
                     }
                 }
@@ -595,7 +632,7 @@ where
 
         // Wait for all tasks to finish
         for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+            if let Err(e) = semaphore.acquire().await { crate::meprintln!("[!] Semaphore error: {}", e); }
         }
     }
 
@@ -682,7 +719,7 @@ impl BruteforceResult {
             Ok(mut file) => {
                 use std::io::Write;
                 for (host, user, pass) in &self.found {
-                    let _ = writeln!(file, "{}:{}:{}", host, user, pass);
+                    if let Err(e) = writeln!(file, "{}:{}:{}", host, user, pass) { crate::meprintln!("[!] Write error: {}", e); }
                 }
                 crate::mprintln!("[+] Results saved to '{}'", file_path.display());
             }
@@ -811,11 +848,14 @@ where
                 match result {
                     LoginResult::Success => {
                         crate::mprintln!("\r{}", format!("[+] {} -> {}:{}", display, user, pass).green().bold());
-                        let _ = crate::cred_store::store_credential(
-                            &target, port, service, &user, &pass,
-                            crate::cred_store::CredType::Password,
-                            source,
-                        ).await;
+                        {
+                            let id = crate::cred_store::store_credential(
+                                &target, port, service, &user, &pass,
+                                crate::cred_store::CredType::Password,
+                                source,
+                            ).await;
+                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                        }
                         found_c.lock().await.push((display.clone(), user.clone(), pass.clone()));
                         stats_c.record_success();
                         if stop_on_success {
@@ -874,7 +914,7 @@ where
     }
 
     stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    if let Err(e) = progress_handle.await { crate::meprintln!("[!] Progress task error: {}", e); }
     stats.print_final().await;
 
     let found_creds = found.lock().await.clone();
@@ -980,7 +1020,7 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
                 }
             }
             Err(e) => {
@@ -1029,17 +1069,22 @@ where
                         LoginResult::Success => {
                             let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
                             crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                            let _ = crate::cred_store::store_credential(
-                                &ip.to_string(),
-                                port,
-                                service,
-                                user,
-                                pass,
-                                crate::cred_store::CredType::Password,
-                                source,
-                            )
-                            .await;
-                            let _ = tx.send(format!("{}\n", msg)).await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    &ip.to_string(),
+                                    port,
+                                    service,
+                                    user,
+                                    pass,
+                                    crate::cred_store::CredType::Password,
+                                    source,
+                                )
+                                .await;
+                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
+                            if let Err(e) = tx.send(format!("{}\n", msg)).await {
+                                crate::meprintln!("[!] Channel send error: {}", e);
+                            }
                             sf.fetch_add(1, Ordering::Relaxed);
                             break 'outer;
                         }
@@ -1070,12 +1115,12 @@ where
 
     // Wait for all tasks
     for _ in 0..config.concurrency {
-        let _ = semaphore.acquire().await.context("Semaphore")?;
+        let _permit = semaphore.acquire().await.context("Semaphore")?;
     }
 
     // Shut down writer task
     drop(tx);
-    let _ = writer_handle.await;
+    if let Err(e) = writer_handle.await { crate::meprintln!("[!] Task error: {}", e); }
 
     progress_stop.store(true, Ordering::Relaxed);
     crate::mprintln!(

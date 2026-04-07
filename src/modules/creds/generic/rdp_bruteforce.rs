@@ -229,6 +229,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let addr = format_socket_address(&ip.to_string(), port);
                 let timeout_duration = Duration::from_secs(timeout_secs);
 
+                let mut consecutive_errors = 0u32;
                 for user in users.iter() {
                     for pass in passes.iter() {
                         match try_rdp_login(&addr, user, pass, timeout_duration, security_level)
@@ -246,17 +247,25 @@ pub async fn run(target: &str) -> Result<()> {
                                 );
                                 return Some(line);
                             }
+                            Ok(false) => {
+                                consecutive_errors = 0; // Auth failure = server responsive
+                            }
                             Err(e) => {
+                                consecutive_errors += 1;
                                 let err = e.to_string().to_lowercase();
                                 if err.contains("refused")
                                     || err.contains("timeout")
                                     || err.contains("reset")
                                     || err.contains("not found")
                                 {
-                                    return None;
+                                    return None; // Host unreachable, skip
+                                }
+                                // Backoff on consecutive errors to avoid hammering
+                                if consecutive_errors >= 3 {
+                                    let delay = crate::modules::creds::utils::backoff_delay(500, consecutive_errors.min(5), 8);
+                                    tokio::time::sleep(delay).await;
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }

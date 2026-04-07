@@ -421,7 +421,7 @@ pub async fn run(target: &str) -> Result<()> {
                 opts.mode(0o600);
                 if let Ok(mut file) = opts.open(&filename) {
                     for (host, user, pass, path) in &all_found {
-                        let _ = writeln!(file, "{} -> {}:{} [path={}]", host, user, pass, path);
+                        if let Err(e) = writeln!(file, "{} -> {}:{} [path={}]", host, user, pass, path) { crate::meprintln!("[!] Write error: {}", e); }
                     }
                     crate::mprintln!("[+] Results saved to '{}'", filename.display());
                 }
@@ -508,9 +508,11 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
                         Ok(false) => LoginResult::AuthFailed,
                         Err(e) => {
                             let msg = e.to_string().to_lowercase();
-                            let retryable = !msg.contains("refused")
-                                && !msg.contains("timeout")
-                                && !msg.contains("reset");
+                            // Connection errors are retryable; auth errors are not
+                            let retryable = msg.contains("refused")
+                                || msg.contains("timeout")
+                                || msg.contains("reset")
+                                || msg.contains("connection");
                             LoginResult::Error {
                                 message: e.to_string(),
                                 retryable,

@@ -177,3 +177,54 @@ All 28 credential modules support mass scanning via the framework's multi-target
 - **Comma-separated targets** — splits and runs against each target
 
 Modules use `is_mass_scan_target()` to detect mass-scan mode and `run_mass_scan()` to delegate to the framework dispatcher. This is handled at the framework level, so individual modules do not need custom mass-scan loops.
+
+---
+
+### Mass Scan Engine
+
+The mass scan engine (`crate::modules::creds::utils::run_mass_scan`) provides a high-performance framework for internet-wide credential testing. It handles:
+
+- **Random IP generation** with `EXCLUDED_RANGES` enforcement (bogons, private, reserved, documentation, and public DNS ranges)
+- **Persistent state tracking** via `is_ip_checked()` / `mark_ip_checked()` to resume interrupted scans
+- **Configurable concurrency** with semaphore-based worker pools (default 500 workers for mass scan)
+- **Graceful shutdown** on Ctrl+C with state persistence
+
+Modules call `run_mass_scan()` with a closure that performs the per-host probe. The engine manages IP generation, deduplication, and state. See `telnet_hose` and `camxploit` for reference implementations.
+
+---
+
+### ETA, Backoff, and Lockout Detection
+
+Credential modules should implement lockout-aware brute forcing to avoid triggering account lockout policies:
+
+- **Exponential backoff** -- When repeated authentication failures are detected from a single target, increase delay between attempts. The bruteforce engine tracks consecutive failures per host.
+- **Lockout detection** -- Monitor for protocol-specific lockout indicators:
+  - SSH: `Too many authentication failures` or connection refused after N attempts
+  - RDP: `ERR_CONNECT_LOGON_TYPE_NOT_GRANTED` or `ERRCONNECT_ACCOUNT_LOCKED_OUT`
+  - HTTP: `429 Too Many Requests` or `403 Forbidden` after prior successes
+  - SMTP: `421` temporary rejection
+- **ETA calculation** -- `BruteforceStats` tracks attempts/second and remaining combinations. Call `stats.print_progress()` for inline ETA display.
+- **Per-host cooldown** -- When lockout is detected, pause attempts against that host for a configurable duration (default 300 seconds) while continuing against other targets in subnet/mass-scan mode.
+
+---
+
+### Streaming Wordlists
+
+For large wordlist files (>150 MB), credential modules should use streaming mode instead of loading the entire file into memory. The streaming approach reads and processes entries in chunks:
+
+```rust
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::fs::File;
+
+let file = File::open(&wordlist_path).await?;
+let reader = BufReader::new(file);
+let mut lines = reader.lines();
+
+while let Some(line) = lines.next_line().await? {
+    let entry = line.trim().to_string();
+    if entry.is_empty() { continue; }
+    // ... process entry ...
+}
+```
+
+The RDP bruteforce module (`rdp_bruteforce`) demonstrates this pattern with chunked password processing. When wordlists exceed the streaming threshold, the module reads passwords in batches of 10,000 rather than loading all entries at once. This keeps memory usage constant regardless of wordlist size.

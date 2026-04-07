@@ -302,10 +302,12 @@ fn save_results_to_file(
     target: &str,
 ) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)
         .with_context(|| format!("Failed to create output file: {}", path))?;
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        crate::meprintln!("[!] Permission error on {}: {}", path, e);
+    }
 
     writeln!(f, "Service Version Scan Results for {}", target)?;
     writeln!(f, "Timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;

@@ -268,7 +268,7 @@ async fn send_and_receive_one(
                 if ip_pkt.get_next_level_protocol() == IpNextHeaderProtocols::Icmp {
                     if let Some(icmp_pkt) = icmp::IcmpPacket::new(ip_pkt.payload()) {
                         let icmp_type = icmp_pkt.get_icmp_type();
-                        let _ = icmp_pkt.get_icmp_code();
+                        let _icmp_code = icmp_pkt.get_icmp_code();
                         let mut matched = false;
 
                         if icmp_type == IcmpTypes::TimeExceeded || icmp_type == IcmpTypes::DestinationUnreachable {
