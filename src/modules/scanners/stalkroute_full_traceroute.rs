@@ -1,6 +1,6 @@
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::{self, MutableIpv4Packet};
-use std::io::Write;
+use std::io::Read;
 use pnet_packet::icmp::{self, echo_request, echo_reply, IcmpTypes};
 use pnet_packet::udp::{self, MutableUdpPacket};
 use pnet_packet::tcp::{self, MutableTcpPacket, TcpFlags};
@@ -8,7 +8,7 @@ use pnet_packet::Packet;
 use pnet_packet::icmp::IcmpPacket;
 use std::sync::Arc;
 
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -24,7 +24,6 @@ use colored::*;
 
 use anyhow::{Result, Context, anyhow, bail};
 
-use std::mem::MaybeUninit;
 
 const IPV4_FLAG_DF: u16 = 2;
 
@@ -244,28 +243,26 @@ async fn send_and_receive_one(
         }
 
         let sock_clone = receiver_socket.try_clone().context("Socket clone failed")?;
-        let recv = task::spawn_blocking(move || -> Result<Option<(Vec<u8>, SocketAddr)>, std::io::Error> {
-            let mut buf = [MaybeUninit::<u8>::uninit(); 1500];
-            match sock_clone.recv_from(&mut buf) {
-                Ok((len, addr)) => {
-                    // Safe conversion: we know len is valid and within buf bounds
-                    if len > buf.len() {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid buffer length"));
-                    }
-                    let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
-                    let sock_addr = addr.as_socket().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "convert"))?;
-                    Ok(Some((slice.to_vec(), sock_addr)))
-                }
+        let recv = task::spawn_blocking(move || -> Result<Option<Vec<u8>>, std::io::Error> {
+            let mut buf = [0u8; 1500];
+            let mut sock = sock_clone;
+            match Read::read(&mut sock, &mut buf) {
+                Ok(len) => Ok(Some(buf[..len].to_vec())),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
                 Err(e) => Err(e),
             }
         })
         .await
-        .context("Blocking task for recv_from failed")?;
+        .context("Blocking task for recv failed")?;
 
-        if let Some((data, sa)) = recv? {
+        if let Some(data) = recv? {
             let rtt = start.elapsed().as_secs_f32() * 1000.0;
-            let responder = if let IpAddr::V4(ip) = sa.ip() { ip } else { continue; };
+            // Parse source IP from the raw IP header (raw sockets include it)
+            let responder = if data.len() >= 20 {
+                Ipv4Addr::new(data[12], data[13], data[14], data[15])
+            } else {
+                continue;
+            };
 
             if let Some(ip_pkt) = ipv4::Ipv4Packet::new(&data) {
                 if ip_pkt.get_next_level_protocol() == IpNextHeaderProtocols::Icmp {
@@ -334,7 +331,7 @@ async fn send_and_receive_one(
 }
 
 async fn execute_traceroute(target_name: &str) -> Result<()> {
-    println!("{}", format!("[+] Traceroute to {} (max {} hops)", target_name, MAX_TTL).cyan());
+    crate::mprintln!("{}", format!("[+] Traceroute to {} (max {} hops)", target_name, MAX_TTL).cyan());
 
     let resolved_ips = tokio::net::lookup_host(format!("{}:0", target_name))
         .await
@@ -353,7 +350,7 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
         None => bail!("Could not resolve {} to an IPv4 address", target_name),
     };
 
-    println!("{}", format!("[*] Resolved {} to {}", target_name, dst_ip).green());
+    crate::mprintln!("{}", format!("[*] Resolved {} to {}", target_name, dst_ip).green());
 
     let src_ip_override_opt: Option<Ipv4Addr> = SPOOF_SRC_IP_CONFIG.and_then(|s| s.parse().ok());
 
@@ -379,7 +376,6 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 (icmp_probe_id, packet_bytes, protocol_used, os_sig_params)
             };
 
-            let _t0 = Instant::now();
             let response = send_and_receive_one(
                 dst_ip,
                 &packet_bytes,
@@ -394,14 +390,14 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 ttl_responded = true;
                 let rtt_str = format!("{:.1}ms", res.rtt_ms);
 
-                print!("{}{:<16} ", line_prefix, res.source_ip.to_string().bright_white());
-                print!("{} ", res.icmp_info.description);
-                println!("({}) {}", res.probe_protocol_used.dimmed(), rtt_str);
+                crate::mprint!("{}{:<16} ", line_prefix, res.source_ip.to_string().bright_white());
+                crate::mprint!("{} ", res.icmp_info.description);
+                crate::mprintln!("({}) {}", res.probe_protocol_used.dimmed(), rtt_str);
 
                 if res.source_ip == dst_ip {
                     if res.icmp_info.icmp_type == IcmpTypes::EchoReply.0 ||
                         (res.icmp_info.icmp_type == IcmpTypes::DestinationUnreachable.0 && res.source_ip == dst_ip) {
-                        println!("{}", format!("[+] Target reached: {}", res.source_ip).green());
+                        crate::mprintln!("{}", format!("[+] Target reached: {}", res.source_ip).green());
                         return Ok(());
                     }
                 }
@@ -415,7 +411,7 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
         }
 
         if !ttl_responded {
-            println!("{}{}", line_prefix, "BLOCKED / FILTERED".red().bold());
+            crate::mprintln!("{}{}", line_prefix, "BLOCKED / FILTERED".red().bold());
         }
     }
 
@@ -423,40 +419,43 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 }
 
 pub async fn run(target: &str) -> Result<()> {
-    let mut user_input = String::new();
-    print!("Are you running this as sudo? (yes/no): ");
-    std::io::stdout()
-        .flush()
-        .context("Failed to flush stdout")?;
-    std::io::stdin()
-        .read_line(&mut user_input)
-        .context("Failed to read input")?;
+    let user_input = crate::utils::cfg_prompt_default("sudo_confirm", "Are you running this as sudo? (yes/no)", "no").await?;
 
     if user_input.trim().to_lowercase() == "yes" {
-        // Safe wrapper for geteuid - it's a simple system call that cannot fail
-        let euid = unsafe { libc::geteuid() };
-        if euid != 0 {
-            println!("don't lie");
-            std::process::exit(1);
+        let output = std::process::Command::new("id").arg("-u").output()
+            .context("Failed to run 'id -u'")?;
+        let uid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let uid: u32 = uid_str.parse().unwrap_or(1);
+        if uid != 0 {
+            bail!("Must be running as root (sudo)");
         }
     } else if user_input.trim().to_lowercase() == "no" {
-        println!("Please run this script as sudo.");
-        std::process::exit(1);
+        bail!("Root privileges required. Run with sudo.");
     } else {
-        println!("Invalid input. Exiting.");
-        std::process::exit(1);
+        bail!("Invalid input for sudo confirmation");
     }
 
-    println!("by suicidalteddy");
-    println!("github.com/s-b-repo");
-    println!("medium.com/@suicdalteddy/about");
+    crate::mprintln!("by suicidalteddy");
+    crate::mprintln!("github.com/s-b-repo");
+    crate::mprintln!("medium.com/@suicdalteddy/about");
 
     if target.is_empty() {
         bail!("No target provided.");
     }
 
     execute_traceroute(target).await.map_err(|e| {
-        eprintln!("{}", format!("[-] Error: {}", e).red());
+        crate::meprintln!("{}", format!("[-] Error: {}", e).red());
         e
     })
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "StalkRoute Full Traceroute".to_string(),
+        description: "Advanced traceroute with ICMP, TCP, and UDP probes, OS fingerprint spoofing, and decoy packet generation.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }

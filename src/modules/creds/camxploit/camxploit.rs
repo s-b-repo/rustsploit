@@ -3,8 +3,7 @@ use colored::*;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use base64::prelude::*;
-use rand::Rng;
-use std::net::{IpAddr, Ipv4Addr};
+use crate::modules::creds::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count, EXCLUDED_RANGES};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
@@ -20,15 +19,6 @@ use tokio::time::timeout;
 
 const PORT_SCAN_TIMEOUT: u64 = 2;
 const TIMEOUT: u64 = 5;
-
-// Bogon/Private/Reserved exclusion ranges for mass scanning
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
-    "198.51.100.0/24", "203.0.113.0/24", "192.0.2.0/24",  // Documentation ranges
-    "1.1.1.1/32", "1.0.0.1/32", "8.8.8.8/32", "8.8.4.4/32",  // Public DNS
-];
 
 // Ports to ignore when filtering scan results — hosts with ONLY these ports open
 // are not cameras and should be skipped in mass scan mode
@@ -175,34 +165,53 @@ const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
 ];
 
 pub async fn run(target: &str) -> Result<()> {
+    if crate::utils::get_global_source_port().await.is_some() {
+        crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
+    }
     let target = target.trim().to_string();
     print_banner();
+
+    // Subnet handling — iterate over each IP in the CIDR
+    if is_subnet_target(&target) {
+        let network = parse_subnet(&target)?;
+        let count = subnet_host_count(&network);
+        crate::mprintln!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
+        for ip in network.iter() {
+            let ip_str = ip.to_string();
+            crate::mprintln!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
+            if let Err(e) = Box::pin(run(&ip_str)).await {
+                crate::mprintln!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
+            }
+        }
+        crate::mprintln!("\n{}", "[*] Subnet scan complete.".green().bold());
+        return Ok(());
+    }
 
     if target == "0.0.0.0" || target == "0.0.0.0/0" {
         return run_mass_scan().await;
     }
 
-    println!("{}", format!("[*] Target: {}", target).cyan());
+    crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     // 1. Port Scan
-    println!("{}", format!("\n[*] Scanning {} ports...", COMMON_PORTS.len()).yellow());
+    crate::mprintln!("{}", format!("\n[*] Scanning {} ports...", COMMON_PORTS.len()).yellow());
     let (open_ports, rtsp_ports) = check_ports(&target).await;
 
     if open_ports.is_empty() {
-        println!("{}", "[-] No open camera ports found.".red());
-        println!("{}", "[!] Ensure the target is online and not behind a strict firewall.".yellow());
+        crate::mprintln!("{}", "[-] No open camera ports found.".red());
+        crate::mprintln!("{}", "[!] Ensure the target is online and not behind a strict firewall.".yellow());
         return Ok(());
     }
 
-    println!("{}", format!("\n[+] Found {} open ports: {:?}", open_ports.len(), open_ports).green());
+    crate::mprintln!("{}", format!("\n[+] Found {} open ports: {:?}", open_ports.len(), open_ports).green());
 
     // 2. Camera Detection & Fingerprinting
     let client = create_client()?;
     let is_camera = check_if_camera(&target, &open_ports, &client).await;
     
     if !is_camera {
-        println!("{}", "\n[-] Target does not appear to be a camera based on initial checks.".yellow());
-        println!("{}", "[*] Proceeding with additional checks...".cyan());
+        crate::mprintln!("{}", "\n[-] Target does not appear to be a camera based on initial checks.".yellow());
+        crate::mprintln!("{}", "[*] Proceeding with additional checks...".cyan());
     }
 
     check_login_pages(&target, &open_ports, &client).await;
@@ -217,16 +226,16 @@ pub async fn run(target: &str) -> Result<()> {
     // 5. Additional Information
 
 
-    println!("{}", "\n[✅] Scan Completed!".green().bold());
+    crate::mprintln!("{}", "\n[✅] Scan Completed!".green().bold());
     Ok(())
 }
 
 fn print_banner() {
-    println!("{}", "\n╔══════════════════════════════════════════════════════════════╗".green().bold());
-    println!("{}", "║  💀 CamXploit Rust Port - Camera Exploitation Scanner      ║".green().bold());
-    println!("{}", "║  🔍 Discover open CCTV cameras & security flaws            ║".cyan().bold());
-    println!("{}", "║  ⚠️  For educational & security research purposes only!    ║".yellow().bold());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".green().bold());
+    crate::mprintln!("{}", "\n╔══════════════════════════════════════════════════════════════╗".green().bold());
+    crate::mprintln!("{}", "║  💀 CamXploit Rust Port - Camera Exploitation Scanner      ║".green().bold());
+    crate::mprintln!("{}", "║  🔍 Discover open CCTV cameras & security flaws            ║".cyan().bold());
+    crate::mprintln!("{}", "║  ⚠️  For educational & security research purposes only!    ║".yellow().bold());
+    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".green().bold());
 }
 
 fn create_client() -> Result<Client> {
@@ -314,7 +323,7 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
             // Logging
             let (svc_name, svc_desc) = port_map.get(&port).unwrap_or(&("Unknown", ""));
             let rtsp_tag = if is_rtsp { " [RTSP DETECTED]".bright_green() } else { "".normal() };
-            println!("  ✅ [OPEN] {}/tcp {}{}{}", port, svc_name, svc_desc, rtsp_tag);
+            crate::mprintln!("  ✅ [OPEN] {}/tcp {}{}{}", port, svc_name, svc_desc, rtsp_tag);
         }
     }
 
@@ -351,7 +360,7 @@ async fn probe_rtsp(target: &str, port: u16) -> bool {
 // =================================================================================
 
 async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> bool {
-    println!("{}", "\n[📷] Analyzing Ports for Camera Indicators...".cyan());
+    crate::mprintln!("{}", "\n[📷] Analyzing Ports for Camera Indicators...".cyan());
     let found = Arc::new(Mutex::new(false));
     let mut tasks = Vec::new();
 
@@ -375,25 +384,25 @@ async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> b
                 if headers.contains("hikvision") || headers.contains("dahua") || headers.contains("axis") || 
                    headers.contains("camera") || headers.contains("dvr") || headers.contains("nvr") ||
                    headers.contains("ipcam") || headers.contains("webcam") {
-                    println!("    ✅ Camera Server Header detected on port {}", port);
+                    crate::mprintln!("    ✅ Camera Server Header detected on port {}", port);
                     indicators = true;
                 }
                 
                 // Body indicators
                 if body.contains("cp plus") || body.contains("cpplus") || body.contains("uvr") {
-                     println!("    ✅ CP Plus indicator on port {}", port);
+                     crate::mprintln!("    ✅ CP Plus indicator on port {}", port);
                      indicators = true;
                 }
 
                 if body.contains("webcam") || body.contains("surveillance") || body.contains("snapshot") ||
                    body.contains("ipcam") || body.contains("netcam") {
-                     println!("    ✅ Camera keyword in body on port {}", port);
+                     crate::mprintln!("    ✅ Camera keyword in body on port {}", port);
                      indicators = true;
                 }
                 
                 // Auth requirement check
                 if status == reqwest::StatusCode::UNAUTHORIZED {
-                    println!("    ✅ Authentication required on port {} (potential camera)", port);
+                    crate::mprintln!("    ✅ Authentication required on port {} (potential camera)", port);
                     indicators = true;
                 }
 
@@ -414,7 +423,7 @@ async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> b
 }
 
 async fn check_login_pages(target: &str, open_ports: &[u16], client: &Client) {
-    println!("{}", "\n[🔍] Checking for authentication pages...".cyan());
+    crate::mprintln!("{}", "\n[🔍] Checking for authentication pages...".cyan());
     
     let mut found_count = 0;
     
@@ -426,7 +435,7 @@ async fn check_login_pages(target: &str, open_ports: &[u16], client: &Client) {
                 let status = resp.status();
                 if status.is_success() || status == reqwest::StatusCode::UNAUTHORIZED || 
                    status == reqwest::StatusCode::FORBIDDEN {
-                    println!("  ✅ Found: {} (Status: {})", url, status);
+                    crate::mprintln!("  ✅ Found: {} (Status: {})", url, status);
                     found_count += 1;
                 }
             }
@@ -434,12 +443,12 @@ async fn check_login_pages(target: &str, open_ports: &[u16], client: &Client) {
     }
     
     if found_count == 0 {
-        println!("  {} No common login pages found", "[-]".yellow());
+        crate::mprintln!("  {} No common login pages found", "[-]".yellow());
     }
 }
 
 async fn fingerprint_camera(target: &str, open_ports: &[u16], client: &Client) {
-    println!("{}", "\n[📡] Fingerprinting Camera Type & Firmware...".cyan());
+    crate::mprintln!("{}", "\n[📡] Fingerprinting Camera Type & Firmware...".cyan());
     
     let mut found_brand = false;
     
@@ -452,29 +461,29 @@ async fn fingerprint_camera(target: &str, open_ports: &[u16], client: &Client) {
              let body = resp.text().await.unwrap_or_default().to_lowercase();
              
              if headers.contains("hikvision") || body.contains("hikvision") {
-                 println!("🔥 {} on port {}!", "Hikvision Camera Detected".bright_red().bold(), port);
+                 crate::mprintln!("🔥 {} on port {}!", "Hikvision Camera Detected".bright_red().bold(), port);
                  found_brand = true;
              } else if headers.contains("dahua") || body.contains("dahua") {
-                 println!("🔥 {} on port {}!", "Dahua Camera Detected".bright_red().bold(), port);
+                 crate::mprintln!("🔥 {} on port {}!", "Dahua Camera Detected".bright_red().bold(), port);
                  found_brand = true;
              } else if headers.contains("axis") || body.contains("axis") {
-                 println!("🔥 {} on port {}!", "Axis Camera Detected".bright_red().bold(), port);
+                 crate::mprintln!("🔥 {} on port {}!", "Axis Camera Detected".bright_red().bold(), port);
                  found_brand = true;
              } else if body.contains("cp plus") || body.contains("cpplus") {
-                 println!("🔥 {} on port {}!", "CP Plus Camera Detected".bright_red().bold(), port);
+                 crate::mprintln!("🔥 {} on port {}!", "CP Plus Camera Detected".bright_red().bold(), port);
                  found_brand = true;
              } else if body.contains("foscam") || headers.contains("foscam") {
-                 println!("🔥 {} on port {}!", "Foscam Camera Detected".bright_red().bold(), port);
+                 crate::mprintln!("🔥 {} on port {}!", "Foscam Camera Detected".bright_red().bold(), port);
                  found_brand = true;
              } else if body.contains("vivotek") || headers.contains("vivotek") {
-                 println!("🔥 {} on port {}!", "Vivotek Camera Detected".bright_red().bold(), port);
+                 crate::mprintln!("🔥 {} on port {}!", "Vivotek Camera Detected".bright_red().bold(), port);
                  found_brand = true;
              }
         }
     }
     
     if !found_brand {
-        println!("  {} Could not identify specific camera brand", "[-]".yellow());
+        crate::mprintln!("  {} Could not identify specific camera brand", "[-]".yellow());
     }
 }
 
@@ -483,8 +492,8 @@ async fn fingerprint_camera(target: &str, open_ports: &[u16], client: &Client) {
 // =================================================================================
 
 async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[u16], client: &Client) {
-    println!("{}", "\n[🔑] Testing common credentials...".cyan());
-    println!("{}", "[ℹ️] Prioritizing RTSP ports and Web ports with authentication.".yellow());
+    crate::mprintln!("{}", "\n[🔑] Testing common credentials...".cyan());
+    crate::mprintln!("{}", "[ℹ️] Prioritizing RTSP ports and Web ports with authentication.".yellow());
 
     let all_creds_vec = get_default_credentials();
     let all_creds = all_creds_vec.as_slice();
@@ -501,24 +510,29 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
     
     // Test RTSP ports first
     if !rtsp_ports.is_empty() {
-        println!("{}", "\n[🎯] Testing RTSP Authentication...".cyan());
+        crate::mprintln!("{}", "\n[🎯] Testing RTSP Authentication...".cyan());
         for &port in rtsp_ports {
             for &(user, pass) in &priority_creds {
                 if test_rtsp_auth(target, port, user, pass).await {
-                    println!("🔥 {} RTSP {}:{} @ rtsp://{}:{}/", 
-                        "SUCCESS!".bright_green().bold(), 
-                        user, 
-                        if pass.is_empty() { "<empty>" } else { pass }, 
-                        target, 
+                    crate::mprintln!("🔥 {} RTSP {}:{} @ rtsp://{}:{}/",
+                        "SUCCESS!".bright_green().bold(),
+                        user,
+                        if pass.is_empty() { "<empty>" } else { pass },
+                        target,
                         port
                     );
+                    let _ = crate::cred_store::store_credential(
+                        target, port, "rtsp", user, pass,
+                        crate::cred_store::CredType::Password,
+                        "creds/camxploit/camxploit",
+                    ).await;
                 }
             }
         }
     }
     
     // Test HTTP/HTTPS ports
-    println!("{}", "\n[🎯] Testing HTTP Basic Auth...".cyan());
+    crate::mprintln!("{}", "\n[🎯] Testing HTTP Basic Auth...".cyan());
     for &port in open_ports {
         if rtsp_ports.contains(&port) {
             continue; // Already tested
@@ -537,12 +551,17 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                     tested.insert((user, pass));
                     if let Ok(resp) = client.get(&url).basic_auth(user, Some(pass)).send().await {
                         if resp.status().is_success() {
-                            println!("🔥 {} HTTP Basic {}:{} @ {}", 
+                            crate::mprintln!("🔥 {} HTTP Basic {}:{} @ {}",
                                 "SUCCESS!".bright_green().bold(),
                                 user,
                                 if pass.is_empty() { "<empty>" } else { pass },
                                 url
                             );
+                            let _ = crate::cred_store::store_credential(
+                                target, port, "http", user, pass,
+                                crate::cred_store::CredType::Password,
+                                "creds/camxploit/camxploit",
+                            ).await;
                         }
                     }
                 }
@@ -550,15 +569,20 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                 // Then try remaining creds from the full list
                 for &(user, pass) in all_creds {
                     if tested.contains(&(user, pass)) { continue; }
-                    
+
                     if let Ok(resp) = client.get(&url).basic_auth(user, Some(pass)).send().await {
                         if resp.status().is_success() {
-                             println!("🔥 {} HTTP Basic {}:{} @ {}", 
+                             crate::mprintln!("🔥 {} HTTP Basic {}:{} @ {}",
                                 "SUCCESS!".bright_green().bold(),
                                 user,
                                 if pass.is_empty() { "<empty>" } else { pass },
                                 url
                             );
+                            let _ = crate::cred_store::store_credential(
+                                target, port, "http", user, pass,
+                                crate::cred_store::CredType::Password,
+                                "creds/camxploit/camxploit",
+                            ).await;
                         }
                     }
                 }
@@ -593,11 +617,11 @@ async fn test_rtsp_auth(target: &str, port: u16, user: &str, pass: &str) -> bool
 // =================================================================================
 
 async fn detect_live_streams(target: &str, open_ports: &[u16], rtsp_ports: &[u16], client: &Client) {
-    println!("{}", "\n[🎥] Detecting Live Streams...".cyan());
+    crate::mprintln!("{}", "\n[🎥] Detecting Live Streams...".cyan());
 
     // Show RTSP links
     if !rtsp_ports.is_empty() {
-        println!("{}", "\n[🎯] RTSP Ports Found - Potential RTSP URLs:".bright_cyan());
+        crate::mprintln!("{}", "\n[🎯] RTSP Ports Found - Potential RTSP URLs:".bright_cyan());
         let common_paths = [
             "/", 
             "/live.sdp", 
@@ -613,14 +637,14 @@ async fn detect_live_streams(target: &str, open_ports: &[u16], rtsp_ports: &[u16
         
         for &port in rtsp_ports {
             for path in common_paths {
-                 println!("  🎥 RTSP: rtsp://{}:{}{}", target, port, path);
+                 crate::mprintln!("  🎥 RTSP: rtsp://{}:{}{}", target, port, path);
             }
         }
-        println!("{}", "     💡 Tip: Use VLC Media Player (Media -> Open Network Stream) to test these URLs".yellow());
+        crate::mprintln!("{}", "     💡 Tip: Use VLC Media Player (Media -> Open Network Stream) to test these URLs".yellow());
     }
 
     // Check HTTP streams on open ports
-    println!("{}", "\n[🔍] Checking HTTP/HTTPS Streams...".cyan());
+    crate::mprintln!("{}", "\n[🔍] Checking HTTP/HTTPS Streams...".cyan());
     let stream_paths = [
         "/video", 
         "/stream", 
@@ -649,10 +673,10 @@ async fn detect_live_streams(target: &str, open_ports: &[u16], rtsp_ports: &[u16
                          .unwrap_or("");
                      
                      if ct.contains("video") || ct.contains("stream") || ct.contains("image") || ct.contains("mjpeg") {
-                         println!("  ✅ Potential Stream: {} (Type: {})", url, ct);
+                         crate::mprintln!("  ✅ Potential Stream: {} (Type: {})", url, ct);
                          found_streams = true;
                      } else if status == reqwest::StatusCode::UNAUTHORIZED {
-                         println!("  ⚠️  Protected Stream: {} (Auth Required)", url);
+                         crate::mprintln!("  ⚠️  Protected Stream: {} (Auth Required)", url);
                          found_streams = true;
                      }
                  }
@@ -661,7 +685,7 @@ async fn detect_live_streams(target: &str, open_ports: &[u16], rtsp_ports: &[u16
     }
     
     if !found_streams && rtsp_ports.is_empty() {
-        println!("  {} No live streams detected", "[-]".yellow());
+        crate::mprintln!("  {} No live streams detected", "[-]".yellow());
     }
 }
 
@@ -686,17 +710,7 @@ fn build_exclusion_list() -> Vec<ipnetwork::IpNetwork> {
         .collect()
 }
 
-/// Generate a random public IP, excluding reserved/bogon ranges
-fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> Ipv4Addr {
-    let mut rng = rand::rng();
-    loop {
-        let ip = Ipv4Addr::from(rng.random::<u32>());
-        let ip_addr = IpAddr::V4(ip);
-        if !exclusions.iter().any(|net| net.contains(ip_addr)) {
-            return ip;
-        }
-    }
-}
+
 
 /// Check if all open ports are in the ignored services list (SSH/Telnet/RDP)
 /// Returns true if the host should be skipped (only non-camera services found)
@@ -708,30 +722,31 @@ fn is_only_ignored_services(open_ports: &[u16]) -> bool {
 }
 
 async fn run_mass_scan() -> Result<()> {
-    println!("{}", "=== MASS SCAN MODE ACTIVATED ===".red().bold().blink());
-    println!("{}", "WARNING: This will scan random IP addresses indefinitely.".yellow());
-    println!("{}", "[*] Excluded ranges: bogons, private, reserved, documentation, public DNS".cyan());
-    println!("{}", "[*] Service filter: hosts with only SSH/Telnet/RDP will be skipped".cyan());
-    println!();
+    crate::mprintln!("{}", "=== MASS SCAN MODE ACTIVATED ===".red().bold().blink());
+    crate::mprintln!("{}", "WARNING: This will scan random IP addresses indefinitely.".yellow());
+    crate::mprintln!("{}", "[*] Excluded ranges: bogons, private, reserved, documentation, public DNS".cyan());
+    crate::mprintln!("{}", "[*] Service filter: hosts with only SSH/Telnet/RDP will be skipped".cyan());
+    crate::mprintln!();
 
     // Build exclusion list
     let exclusions = build_exclusion_list();
-    println!("{}", format!("[+] Loaded {} IP exclusion ranges", exclusions.len()).green());
+    crate::mprintln!("{}", format!("[+] Loaded {} IP exclusion ranges", exclusions.len()).green());
 
     // Prompt for thread count
-    let thread_count = crate::utils::prompt_int("Threads", 200)? as usize;
+    let thread_count = crate::utils::cfg_prompt_int_range("concurrency", "Threads", 200, 1, 5000).await? as usize;
 
     // Prompt for output file
-    let output_file = crate::utils::prompt_default(
+    let output_file = crate::utils::cfg_prompt_output_file(
+        "output_file",
         "Output file for discovered cameras",
         "camxploit_results.txt",
-    )?;
+    ).await?;
 
-    println!("{}", format!(
+    crate::mprintln!("{}", format!(
         "[*] Starting mass scan with {} threads... Press Ctrl+C to stop.",
         thread_count
     ).cyan());
-    println!();
+    crate::mprintln!();
 
     let exclusions = Arc::new(exclusions);
     let scanned_count = Arc::new(AtomicU64::new(0));
@@ -752,7 +767,7 @@ async fn run_mass_scan() -> Result<()> {
                 let total = scanned.load(Ordering::Relaxed);
                 let elapsed = start_time.elapsed().as_secs().max(1);
                 let rate = total / elapsed;
-                println!(
+                crate::mprintln!(
                     "[*] Progress: {} scanned | {} cameras found | {} skipped (non-camera) | {} IPs/sec",
                     total,
                     found.load(Ordering::Relaxed),
@@ -793,7 +808,7 @@ async fn run_mass_scan() -> Result<()> {
                 return;
             }
 
-            println!(
+            crate::mprintln!(
                 "{}",
                 format!(
                     "\n[+] Target: {} - {} open ports (camera-relevant): {:?}",
@@ -808,7 +823,7 @@ async fn run_mass_scan() -> Result<()> {
             let client = match create_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to create client: {}", e);
+                    crate::meprintln!("Failed to create client: {}", e);
                     drop(permit);
                     return;
                 }
@@ -845,5 +860,16 @@ async fn run_mass_scan() -> Result<()> {
 
             drop(permit);
         });
+    }
+}
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "CamXploit — Camera Discovery & Credential Scanner".to_string(),
+        description: "Comprehensive IP camera discovery, fingerprinting, and default credential testing across RTSP, HTTP, and HTTPS. Supports Hikvision, Dahua, Axis, CP Plus, Foscam, Vivotek, and generic cameras.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Great,
     }
 }

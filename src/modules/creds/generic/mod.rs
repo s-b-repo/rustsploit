@@ -16,3 +16,12 @@
     pub mod fortinet_bruteforce;
     pub mod l2tp_bruteforce;
     pub mod mqtt_bruteforce;
+    pub mod http_basic_bruteforce;
+    pub mod redis_bruteforce;
+    pub mod imap_bruteforce;
+    pub mod mysql_bruteforce;
+    pub mod postgres_bruteforce;
+    pub mod vnc_bruteforce;
+    pub mod elasticsearch_bruteforce;
+    pub mod couchdb_bruteforce;
+    pub mod memcached_bruteforce;

