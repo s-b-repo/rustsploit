@@ -72,7 +72,7 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
                     crate::mprintln!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
-                    let _ = ftp.quit().await;
+                    if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
                     let result = Some((ServiceType::Ftp, username.to_string(), password.to_string()));
                     // Respect stop_on_success: if true, stop after first valid credential
                     if config.stop_on_success {
@@ -81,7 +81,7 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
                     // If false, continue checking but still return first found (for consistency)
                     return Ok(result);
                 }
-                let _ = ftp.quit().await;
+                if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
             }
             Err(_) => continue,
         }
@@ -139,8 +139,8 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
         let port: u16 = parts[0].parse().unwrap_or(23);
 
         if let Ok(mut telnet) = Telnet::connect((host, port), 500) {
-            let _ = telnet.write(format!("{}\r\n", username).as_bytes());
-            let _ = telnet.write(format!("{}\r\n", password).as_bytes());
+            if let Err(e) = telnet.write(format!("{}\r\n", username).as_bytes()) { crate::meprintln!("[!] Telnet write error: {}", e); }
+            if let Err(e) = telnet.write(format!("{}\r\n", password).as_bytes()) { crate::meprintln!("[!] Telnet write error: {}", e); }
 
             // Give device time to respond
             std::thread::sleep(Duration::from_millis(500));
@@ -317,11 +317,14 @@ pub async fn run(target: &str) -> Result<()> {
                 "HTTP" => (80, "http"),
                 _ => (0, "unknown"),
             };
-            let _ = crate::cred_store::store_credential(
-                target, svc_port, svc_name, user, pass,
-                crate::cred_store::CredType::Password,
-                "creds/camera/acti/acti_camera_default",
-            ).await;
+            {
+                let id = crate::cred_store::store_credential(
+                    target, svc_port, svc_name, user, pass,
+                    crate::cred_store::CredType::Password,
+                    "creds/camera/acti/acti_camera_default",
+                ).await;
+                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+            }
         }
     } else {
         crate::mprintln!();

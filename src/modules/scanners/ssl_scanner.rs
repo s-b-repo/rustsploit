@@ -1036,8 +1036,15 @@ pub async fn run(target: &str) -> Result<()> {
             lines.push(String::new());
         }
 
-        std::fs::write(&output_path, lines.join("\n"))
-            .with_context(|| format!("Failed to write results to {}", output_path))?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+            f.write_all(lines.join("\n").as_bytes())
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+        }
         crate::mprintln!(
             "{}",
             format!("[+] Results saved to: {}", output_path).green()

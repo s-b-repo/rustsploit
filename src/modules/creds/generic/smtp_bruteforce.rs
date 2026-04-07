@@ -212,7 +212,7 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Re
     let addr = format!("{}:{}", target, port);
     let socket = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("Resolution failed"))?;
     let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(2000))?;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
     stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2000)))?;
 
@@ -235,7 +235,8 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Re
     let mut ehlo_seen = false;
 
     // Read multi-line EHLO response (250-... continues, 250 ... ends)
-    for _ in 0..10 {
+    // RFC allows arbitrary continuation lines; use generous limit
+    for _ in 0..100 {
         let line = read_smtp_line(&mut reader).context("EHLO read")?;
         if line.contains("AUTH") && line.contains("PLAIN") { plain_ok = true; }
         if line.contains("AUTH") && line.contains("LOGIN") { login_ok = true; }
@@ -256,7 +257,8 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Re
 
         let resp = read_smtp_line(&mut reader).context("Auth response")?;
         if resp.starts_with("235") {
-            let _ = writer.write_all(b"QUIT\r\n");
+            if let Err(e) = writer.write_all(b"QUIT\r\n") { crate::meprintln!("[!] Write error: {}", e); }
+            if let Err(e) = writer.flush() { crate::meprintln!("[!] Write error: {}", e); }
             return Ok(true);
         }
         if resp.starts_with("5") { return Ok(false); }
@@ -285,7 +287,8 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str) -> Re
 
         let resp = read_smtp_line(&mut reader).context("Auth final response")?;
         if resp.starts_with("235") {
-            let _ = writer.write_all(b"QUIT\r\n");
+            if let Err(e) = writer.write_all(b"QUIT\r\n") { crate::meprintln!("[!] Write error: {}", e); }
+            if let Err(e) = writer.flush() { crate::meprintln!("[!] Write error: {}", e); }
             return Ok(true);
         }
         if resp.starts_with("5") { return Ok(false); }

@@ -54,7 +54,7 @@ async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     let count = open_count.load(Ordering::Relaxed);
@@ -130,7 +130,7 @@ async fn scan_targets(
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     let mut out = results.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -167,9 +167,11 @@ fn save_results(
     output_file: &str,
 ) -> Result<()> {
     use std::io::Write;
-    let mut file = std::fs::File::create(output_file)?;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(output_file)?;
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(output_file, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(output_file, std::fs::Permissions::from_mode(0o600)) {
+        crate::meprintln!("[!] Permission error on {}: {}", output_file, e);
+    }
     writeln!(file, "Honeypot Detection Results")?;
     writeln!(file, "=========================")?;
     writeln!(file, "Scan time: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;

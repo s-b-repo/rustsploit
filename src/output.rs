@@ -140,7 +140,7 @@ pub fn _mprint_raw(text: &str) {
     if buffered.is_err() {
         use std::io::Write;
         print!("{}", text);
-        let _ = std::io::stdout().flush();
+        if let Err(e) = std::io::stdout().flush() { eprintln!("[!] Stdout flush error: {}", e); }
     }
 }
 
@@ -172,7 +172,7 @@ pub fn _meprint_raw(text: &str) {
     if buffered.is_err() {
         use std::io::Write;
         eprint!("{}", text);
-        let _ = std::io::stderr().flush();
+        if let Err(e) = std::io::stderr().flush() { eprintln!("[!] Stderr flush error: {}", e); }
     }
 }
 
@@ -249,7 +249,7 @@ impl OutputAccumulator {
 
 /// Record a structured finding. Silently no-ops if no RunContext is active.
 pub fn add_finding(finding: Finding) {
-    let _ = crate::context::RUN_CONTEXT.try_with(|ctx| {
+    let _tls = crate::context::RUN_CONTEXT.try_with(|ctx| {
         ctx.output.add_finding(finding);
     });
 }

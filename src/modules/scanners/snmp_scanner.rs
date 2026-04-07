@@ -288,7 +288,7 @@ pub async fn run(target: &str) -> Result<()> {
 
         for community in &communities {
             crate::mprint!("  [*] Testing '{}' ... ", community);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
 
             match test_community(&socket, &addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
                 Ok(Some(sys_descr)) => {
@@ -339,8 +339,15 @@ pub async fn run(target: &str) -> Result<()> {
     if save_results && !valid_communities.is_empty() {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "snmp_scan_results.txt").await?;
         let content = valid_communities.join("\n");
-        std::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content))
-            .with_context(|| format!("Failed to write results to {}", output_path))?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+            f.write_all(format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content).as_bytes())
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

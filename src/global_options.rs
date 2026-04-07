@@ -26,7 +26,7 @@ impl GlobalOptions {
                     Err(e) => {
                         eprintln!("[!] Warning: global_options.json is corrupted ({}). Starting fresh.", e);
                         let backup = file_path.with_extension("json.bak");
-                        let _ = std::fs::copy(&file_path, &backup);
+                        if let Err(e) = std::fs::copy(&file_path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
                         HashMap::new()
                     }
                 },
@@ -42,28 +42,46 @@ impl GlobalOptions {
         }
     }
 
+    /// Maximum key length for global options.
+    const MAX_KEY_LEN: usize = 256;
+    /// Maximum value length for global options.
+    const MAX_VALUE_LEN: usize = 4096;
+    /// Maximum number of global options to prevent memory abuse.
+    const MAX_OPTIONS: usize = 1000;
+
     /// Set a global option. Persists to disk.
-    pub async fn set(&self, key: &str, value: &str) {
-        let snapshot = {
-            let mut opts = self.options.write().await;
-            opts.insert(key.to_string(), value.to_string());
-            opts.clone()
-        };
+    /// Returns false if validation fails (BUG 16 fix).
+    pub async fn set(&self, key: &str, value: &str) -> bool {
+        if key.is_empty() || key.len() > Self::MAX_KEY_LEN {
+            eprintln!("[!] Option key too long (max {} chars)", Self::MAX_KEY_LEN);
+            return false;
+        }
+        if value.len() > Self::MAX_VALUE_LEN {
+            eprintln!("[!] Option value too long (max {} chars)", Self::MAX_VALUE_LEN);
+            return false;
+        }
+        let mut opts = self.options.write().await;
+        if opts.len() >= Self::MAX_OPTIONS && !opts.contains_key(key) {
+            eprintln!("[!] Too many global options (max {}). Unset some first.", Self::MAX_OPTIONS);
+            return false;
+        }
+        opts.insert(key.to_string(), value.to_string());
+        let snapshot = opts.clone();
+        drop(opts);
         self.save_locked(&snapshot).await;
+        true
     }
 
     /// Remove a global option. Persists to disk.
     pub async fn unset(&self, key: &str) -> bool {
-        let snapshot = {
-            let mut opts = self.options.write().await;
-            let removed = opts.remove(key).is_some();
-            if removed { Some(opts.clone()) } else { None }
-        };
-        if let Some(data) = snapshot {
-            self.save_locked(&data).await;
-            return true;
+        let mut opts = self.options.write().await;
+        let removed = opts.remove(key).is_some();
+        if removed {
+            let snapshot = opts.clone();
+            drop(opts);
+            self.save_locked(&snapshot).await;
         }
-        false
+        removed
     }
 
     /// Get a global option value.
@@ -83,17 +101,33 @@ impl GlobalOptions {
     }
 
     /// Save to disk using atomic write (write to temp, then rename).
+    /// Logs warnings on failure instead of silently ignoring (BUG 15 fix).
     async fn save_locked(&self, opts: &HashMap<String, String>) {
         if let Some(parent) = self.file_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                eprintln!("[!] Warning: Failed to create config directory: {}", e);
+                return;
+            }
         }
         let tmp = self.file_path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(opts) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, &self.file_path).await;
-                use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await;
+        let json = match serde_json::to_string_pretty(opts) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[!] Warning: Failed to serialize global options: {}", e);
+                return;
             }
+        };
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
+            eprintln!("[!] Warning: Failed to write global options temp file: {}", e);
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
+            eprintln!("[!] Warning: Failed to save global options (rename): {}", e);
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await {
+            eprintln!("[!] Warning: Failed to set permissions on global_options.json: {}", e);
         }
     }
 

@@ -118,9 +118,9 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
     }
-    
+
     fn print_summary(&self) {
         crate::mprintln!();
         crate::mprintln!("{}", "=== Spray Summary ===".cyan().bold());
@@ -305,14 +305,17 @@ pub async fn password_spray(
                                 password: password.clone(),
                             };
                             crate::mprintln!("\r{}", format!("[PWNED] {}:{} @ {}:{}", user, password, host, port).red().bold());
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
                             results.lock().await.push(cred);
                             // Persist credential to framework credential store
-                            let _ = crate::cred_store::store_credential(
-                                &host, port, "ssh", &user, &password,
-                                crate::cred_store::CredType::Password,
-                                "creds/generic/ssh_spray",
-                            ).await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    &host, port, "ssh", &user, &password,
+                                    crate::cred_store::CredType::Password,
+                                    "creds/generic/ssh_spray",
+                                ).await;
+                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
                             // Signal stop if stop_on_success is enabled
                             if stop_on_success {
                                 success_stop_clone.store(true, Ordering::Relaxed);
@@ -346,12 +349,12 @@ pub async fn password_spray(
     
     // Wait for all tasks
     for handle in handles {
-        let _ = handle.await;
+        if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
     }
-    
+
     // Stop progress reporter
     stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    if let Err(e) = progress_handle.await { crate::meprintln!("[!] Progress task error: {}", e); }
     
     // Print summary
     stats.print_summary();
@@ -421,8 +424,8 @@ pub async fn run(target: &str) -> Result<()> {
                         &addr,
                         std::time::Duration::from_secs(10),
                     ).ok()?;
-                    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+                    if let Err(e) = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))) { crate::meprintln!("[!] Socket option error: {}", e); }
+                    if let Err(e) = tcp.set_write_timeout(Some(std::time::Duration::from_secs(10))) { crate::meprintln!("[!] Socket option error: {}", e); }
                     let mut sess = ssh2::Session::new().ok()?;
                     sess.set_tcp_stream(tcp);
                     if sess.handshake().is_err() { continue; }

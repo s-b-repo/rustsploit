@@ -10,16 +10,29 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 - **137 exploit modules** (24 with `check()`) — cameras, routers, network infrastructure, webapps, frameworks, SSH, DoS, crypto, FTP, IPMI, telnet, Bluetooth, VoIP, Windows, payload generators
 - **24 scanner modules**
-- **19 credential modules** — all with full mass scan support (random, CIDR, file, comma-separated targets)
+- **28 credential modules** — all with full mass scan support (random, CIDR, file, comma-separated targets)
 - **1 plugin module**
-- **181 total modules**
+- **190 total modules**
 
 ### Highlights
 
-- **Framework-level multi-target dispatcher** — comma-separated, CIDR, file-based, and random target modes now work for ALL modules, handled by the framework rather than individual module code
+- **20 new exploit modules** — XWiki RCE, Dify default creds, SolarWinds WHD, MCPJam RCE, Langflow RCE, SAP NetWeaver (CVSS 10.0), SharePoint ToolPane, Craft CMS x2, Laravel Livewire, CitrixBleed 2, HPE OneView (CVSS 10.0), F5 BIG-IP, SonicWall SMA, Ivanti ICS x2, Tomcat PUT, WSUS, Erlang SSH (CVSS 10.0), FreePBX
+- **8 new scanners** — ssl_scanner, service_scanner, redis_scanner, vnc_scanner, snmp_scanner, waf_detector, subdomain_scanner, nbns_scanner
+- **9 new credential modules** — vnc, imap, mysql, postgres, redis, elasticsearch, couchdb, memcached, http_basic bruteforce
+- **MCP integration** — Model Context Protocol server with 30 tools and 7 resources for Claude Desktop and external tool connectivity
+- **Payload mutation engine** — 9 WAF bypass strategies (URL encode, case toggle, comment injection, unicode homoglyph, etc.) in `src/native/payload_engine.rs`
+- **Native RDP bruteforce** — TCP+TLS+CredSSP/NTLM authentication, no xfreerdp/rdesktop dependency
+- **Mass scan engine unification** — shared `run_mass_scan()` engine replaced ~900 lines of duplicated code across 13 cred modules
+- **Bruteforce uplift** — ETA countdown, exponential backoff with jitter, account lockout detection across all 10 active bruteforce modules
+- **Output system rewrite** — task-local `mprintln!` macros replace 4683 println! calls, enabling concurrent API module execution
+- **Async prompts** — all cfg_prompt_* functions now async via `spawn_blocking`, freeing the tokio runtime during stdin reads
+- **Source port binding** — `set source_port` for firewall bypass testing across TCP, UDP, and SSH connections
+- **Streaming wordlists** — 100GB+ password files processed with constant memory via chunked streaming
+- **WPair BLE exploit** — 51 device database, 6 exploit strategies, TUI mode, headless API mode
+- **Framework-level multi-target dispatcher** — comma-separated, CIDR, file-based, and random target modes work for ALL 190 modules
 - **All modules use `cfg_prompt_*`** — ensures full API/CLI/MCP compatibility via the priority chain (custom_prompts > global_options > stdin)
 - **Honeypot detection system** — warns operators when a target exhibits honeypot characteristics
-- **`#[cfg(unix)]` guards** on Unix-specific permissions code for cross-platform compilation
+- **4-round security audit** — 32+ bug fixes across 22 files (path traversal, SSRF, race conditions, silent save failures, input validation)
 - **Bug fixes:**
   - SharePoint exploit: fixed header typo
   - Langflow exploit: corrected escape order

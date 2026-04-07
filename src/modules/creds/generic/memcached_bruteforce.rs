@@ -123,16 +123,19 @@ pub async fn run(target: &str) -> Result<()> {
                 if response.contains("VERSION") {
                     // Open Memcached instance (no auth)
                     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let _ = crate::cred_store::store_credential(
-                        &ip.to_string(),
-                        port,
-                        "memcached",
-                        "(open)",
-                        "(no auth)",
-                        crate::cred_store::CredType::Password,
-                        "creds/generic/memcached_bruteforce",
-                    )
-                    .await;
+                    {
+                        let id = crate::cred_store::store_credential(
+                            &ip.to_string(),
+                            port,
+                            "memcached",
+                            "(open)",
+                            "(no auth)",
+                            crate::cred_store::CredType::Password,
+                            "creds/generic/memcached_bruteforce",
+                        )
+                        .await;
+                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                    }
                     return Some(format!(
                         "[{}] {}:{} Memcached OPEN (no auth) - {}\n",
                         ts,
@@ -158,16 +161,19 @@ pub async fn run(target: &str) -> Result<()> {
                         {
                             if result {
                                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = crate::cred_store::store_credential(
-                                    &ip.to_string(),
-                                    port,
-                                    "memcached",
-                                    user,
-                                    pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/memcached_bruteforce",
-                                )
-                                .await;
+                                {
+                                    let id = crate::cred_store::store_credential(
+                                        &ip.to_string(),
+                                        port,
+                                        "memcached",
+                                        user,
+                                        pass,
+                                        crate::cred_store::CredType::Password,
+                                        "creds/generic/memcached_bruteforce",
+                                    )
+                                    .await;
+                                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                }
                                 return Some(format!(
                                     "[{}] {}:{}:{}:{}\n",
                                     ts, ip, port, user, pass
@@ -286,16 +292,19 @@ pub async fn run(target: &str) -> Result<()> {
                     .bold()
             );
 
-            let _ = crate::cred_store::store_credential(
-                &normalized,
-                port,
-                "memcached",
-                "(open)",
-                "(no auth)",
-                crate::cred_store::CredType::Password,
-                "creds/generic/memcached_bruteforce",
-            )
-            .await;
+            {
+                let id = crate::cred_store::store_credential(
+                    &normalized,
+                    port,
+                    "memcached",
+                    "(open)",
+                    "(no auth)",
+                    crate::cred_store::CredType::Password,
+                    "creds/generic/memcached_bruteforce",
+                )
+                .await;
+                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+            }
 
             let continue_brute =
                 cfg_prompt_yes_no("continue_bruteforce", "Continue with SASL brute-force anyway?", false).await?;

@@ -97,22 +97,32 @@ impl GlobalConfig {
                 // Single target after parsing — recurse without comma
                 return self.set_target(&targets[0]);
             }
-            // Validate each individual target
+            // Validate each individual target, canonicalizing file paths
             const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
+            let mut validated_targets = Vec::with_capacity(targets.len());
             for t in &targets {
                 // Allow mass scan keywords, CIDRs, file paths, and hostnames/IPs
                 if MASS_SCAN_KEYWORDS.contains(&t.as_str()) {
+                    validated_targets.push(t.clone());
                     continue;
                 }
-                if std::path::Path::new(t.as_str()).is_file() {
+                let path = std::path::Path::new(t.as_str());
+                if path.exists() && path.is_file() {
+                    // Canonicalize file paths to prevent traversal
+                    let canonical = path.canonicalize()
+                        .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", t, e))?;
+                    validated_targets.push(canonical.to_string_lossy().to_string());
                     continue;
                 }
-                if t.parse::<IpNetwork>().is_err() {
-                    Self::validate_hostname_or_ip(t)?;
+                if t.parse::<IpNetwork>().is_ok() {
+                    validated_targets.push(t.clone());
+                    continue;
                 }
+                Self::validate_hostname_or_ip(t)?;
+                validated_targets.push(t.clone());
             }
             let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
-            *target_guard = Some(TargetConfig::Multi(targets));
+            *target_guard = Some(TargetConfig::Multi(validated_targets));
             return Ok(());
         }
 
@@ -418,7 +428,7 @@ pub fn results_dir() -> std::path::PathBuf {
         .join("results");
     if !dir.exists() {
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { eprintln!("[!] Directory creation error: {}", e); }
     }
     dir
 }

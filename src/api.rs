@@ -165,15 +165,31 @@ fn validate_target(target: &str) -> bool {
     !target.is_empty() && target.len() <= 2048 && !target.chars().any(|c| c.is_control())
 }
 
-/// Target blocking is disabled — all targets are allowed.
-/// This is a pentesting framework; operators are responsible for their own targeting.
-fn is_blocked_target(_target: &str) -> bool {
+/// Check if a target is a cloud metadata / link-local address that should never be hit
+/// from the API. Loopback and RFC-1918 are intentionally allowed — this is a pentesting
+/// framework and operators need to scan internal ranges. Only metadata endpoints that
+/// indicate a cloud SSRF are blocked.
+fn is_blocked_target(target: &str) -> bool {
+    let lower = target.to_lowercase();
+    // Block cloud metadata endpoints (SSRF canary)
+    if lower.starts_with("169.254.169.254")
+        || lower.starts_with("metadata.google.internal")
+        || lower.starts_with("100.100.100.200") // Alibaba metadata
+    {
+        return true;
+    }
+    // Block IPv6 link-local metadata equivalents
+    if lower.starts_with("fd00:ec2::254")
+        || lower.starts_with("[fd00:ec2::254]")
+    {
+        return true;
+    }
     false
 }
 
 /// Check if exec input contains shell metacharacters that could enable injection.
 fn contains_shell_metacharacters(input: &str) -> bool {
-    input.chars().any(|c| matches!(c, '&' | '|' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r'))
+    input.chars().any(|c| matches!(c, '&' | '|' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r' | '(' | ')' | '{' | '}'))
         || input.contains("$(")
         || input.contains("${")
 }
@@ -371,6 +387,14 @@ async fn add_host(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
     if ip.is_empty() {
         return Json(err_response("ip is required", "INVALID_INPUT"));
     }
+    // Validate IP format (BUG 36 fix)
+    if ip.len() > 256 || ip.chars().any(|c| c.is_control()) {
+        return Json(err_response("Invalid IP address format", "INVALID_INPUT"));
+    }
+    // Accept valid IPv4, IPv6, or hostnames (alphanumeric + dots + colons + hyphens)
+    if !ip.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']')) {
+        return Json(err_response("IP/hostname contains invalid characters", "INVALID_INPUT"));
+    }
     let hostname = payload.get("hostname").and_then(|v| v.as_str());
     let os_guess = payload.get("os_guess").and_then(|v| v.as_str());
     crate::workspace::WORKSPACE.add_host(ip, hostname, os_guess).await;
@@ -417,8 +441,200 @@ async fn switch_workspace(Json(payload): Json<serde_json::Value>) -> Json<ApiRes
     if name.is_empty() {
         return Json(err_response("name is required", "INVALID_INPUT"));
     }
+    // Validate workspace name — same rules as shell.rs
+    if name.len() > 64 {
+        return Json(err_response("Workspace name too long (max 64 chars)", "INVALID_INPUT"));
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Json(err_response("Workspace name must be alphanumeric, underscore, or hyphen only", "INVALID_INPUT"));
+    }
     crate::workspace::WORKSPACE.switch(name).await;
     Json(ok_response(format!("Switched to workspace '{}'", name), None))
+}
+
+/// DELETE /api/hosts — delete a host by IP
+async fn delete_host(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let ip = payload.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+    if ip.is_empty() {
+        return Json(err_response("ip is required", "INVALID_INPUT"));
+    }
+    if crate::workspace::WORKSPACE.delete_host(ip).await {
+        tracing::info!(ip = %ip, "API: host deleted");
+        Json(ok_response(format!("Host '{}' and its services removed", ip), None))
+    } else {
+        Json(err_response(format!("Host '{}' not found", ip), "NOT_FOUND"))
+    }
+}
+
+/// DELETE /api/services — delete a service by host and port
+async fn delete_service(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    let port = payload.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    if host.is_empty() || port == 0 {
+        return Json(err_response("host and port (>0) are required", "INVALID_INPUT"));
+    }
+    if crate::workspace::WORKSPACE.delete_service(host, port).await {
+        tracing::info!(host = %host, port = %port, "API: service deleted");
+        Json(ok_response(format!("Service {}:{} removed", host, port), None))
+    } else {
+        Json(err_response(format!("Service {}:{} not found", host, port), "NOT_FOUND"))
+    }
+}
+
+/// POST /api/hosts/notes — add a note to a host
+async fn add_host_note(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let ip = payload.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+    let note = payload.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    if ip.is_empty() || note.is_empty() {
+        return Json(err_response("ip and note are required", "INVALID_INPUT"));
+    }
+    if note.len() > 4096 {
+        return Json(err_response("Note too long (max 4096 chars)", "INVALID_INPUT"));
+    }
+    if crate::workspace::WORKSPACE.add_note(ip, note).await {
+        Json(ok_response(format!("Note added to host '{}'", ip), None))
+    } else {
+        Json(err_response(format!("Host '{}' not found", ip), "NOT_FOUND"))
+    }
+}
+
+/// POST /api/run_all — run a module against all IPs in a CIDR subnet.
+/// No size cap — any CIDR works. Uses semaphore-bounded concurrency (default 50).
+/// Large subnets (>1M) are warned but not blocked.
+async fn run_all(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("");
+    let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("");
+    let verbose = payload.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
+    let concurrency = payload.get("concurrency").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let concurrency = concurrency.clamp(1, 500);
+
+    if module.is_empty() || target.is_empty() {
+        return Json(err_response("module and target (CIDR subnet) are required", "INVALID_INPUT"));
+    }
+    if !validate_module_name(module) {
+        return Json(err_response("Invalid module name", "INVALID_INPUT"));
+    }
+    let network: ipnetwork::IpNetwork = match target.parse() {
+        Ok(n) => n,
+        Err(_) => return Json(err_response("target must be a valid CIDR subnet (e.g., 192.168.1.0/24)", "INVALID_INPUT")),
+    };
+    let host_count = match network {
+        ipnetwork::IpNetwork::V4(n) => 2u64.saturating_pow(32 - n.prefix() as u32),
+        ipnetwork::IpNetwork::V6(n) => {
+            if n.prefix() >= 64 { 2u64.saturating_pow(128 - n.prefix() as u32) } else { u64::MAX }
+        }
+    };
+
+    // Semaphore-bounded concurrent execution — lazy iteration, no memory cap
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let success = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let module_str = module.to_string();
+    for ip in network.iter() {
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let sc = success.clone();
+        let fc = failed.clone();
+        let mod_name = module_str.clone();
+        let ip_str = ip.to_string();
+
+        tokio::spawn(async move {
+            match crate::commands::run_module(&mod_name, &ip_str, verbose).await {
+                Ok(_) => { sc.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                Err(_) => { fc.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            }
+            drop(permit);
+        });
+    }
+
+    // Wait for all tasks by draining semaphore permits
+    for _ in 0..concurrency {
+        if let Err(e) = semaphore.acquire().await { crate::meprintln!("[!] Semaphore error: {}", e); }
+    }
+
+    let s = success.load(std::sync::atomic::Ordering::Relaxed);
+    let f = failed.load(std::sync::atomic::Ordering::Relaxed);
+    Json(ok_response(
+        format!("run_all complete: {} success, {} failed out of {} IPs", s, f, s + f),
+        Some(serde_json::json!({
+            "module": module,
+            "target": target,
+            "host_count": host_count,
+            "concurrency": concurrency,
+            "success": s,
+            "failed": f,
+        })),
+    ))
+}
+
+/// POST /api/check — run a non-destructive vulnerability check
+async fn check_module(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let module = payload.get("module").and_then(|v| v.as_str()).unwrap_or("");
+    let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("");
+    if module.is_empty() || target.is_empty() {
+        return Json(err_response("module and target are required", "INVALID_INPUT"));
+    }
+    if !validate_module_name(module) {
+        return Json(err_response("Invalid module name", "INVALID_INPUT"));
+    }
+    match crate::commands::check_module(module, target).await {
+        Some(result) => {
+            let result_str = format!("{}", result);
+            Json(ok_response("Check complete", Some(serde_json::json!({
+                "module": module,
+                "target": target,
+                "result": result_str,
+            }))))
+        }
+        None => Json(err_response(format!("Module '{}' does not support check()", module), "NOT_SUPPORTED")),
+    }
+}
+
+/// GET /api/creds/search?q= — search credentials
+async fn search_creds(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<ApiResponse> {
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    if query.is_empty() {
+        return Json(err_response("Query parameter 'q' is required", "INVALID_INPUT"));
+    }
+    let results = crate::cred_store::CRED_STORE.search(query).await;
+    Json(ok_response(
+        format!("{} credentials matched", results.len()),
+        Some(serde_json::to_value(&results).unwrap_or_default()),
+    ))
+}
+
+/// GET /api/loot/search?q= — search loot
+async fn search_loot(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<ApiResponse> {
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    if query.is_empty() {
+        return Json(err_response("Query parameter 'q' is required", "INVALID_INPUT"));
+    }
+    let results = crate::loot::LOOT_STORE.search(query).await;
+    Json(ok_response(
+        format!("{} loot items matched", results.len()),
+        Some(serde_json::to_value(&results).unwrap_or_default()),
+    ))
+}
+
+/// DELETE /api/loot — delete a loot entry by ID
+async fn delete_loot(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() {
+        return Json(err_response("id is required", "INVALID_INPUT"));
+    }
+    if crate::loot::LOOT_STORE.delete(id).await {
+        tracing::info!(id = %id, "API: loot deleted");
+        Json(ok_response("Loot deleted", None))
+    } else {
+        Json(err_response("Loot not found", "NOT_FOUND"))
+    }
 }
 
 // ─── Loot API ──────────────────────────────────────────────────────
@@ -503,9 +719,33 @@ async fn export_data(
             StatusCode::OK,
             Json(ok_response("Export complete", Some(data))),
         ).into_response(),
+        "csv" => {
+            match crate::export::export_csv_string().await {
+                Ok(csv) => (
+                    StatusCode::OK,
+                    Json(ok_response("CSV export complete", Some(serde_json::json!({ "content": csv, "format": "csv" })))),
+                ).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(err_response(format!("CSV export failed: {}", e), "EXPORT_ERROR")),
+                ).into_response(),
+            }
+        }
+        "summary" => {
+            match crate::export::export_summary_string().await {
+                Ok(summary) => (
+                    StatusCode::OK,
+                    Json(ok_response("Summary export complete", Some(serde_json::json!({ "content": summary, "format": "summary" })))),
+                ).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(err_response(format!("Summary export failed: {}", e), "EXPORT_ERROR")),
+                ).into_response(),
+            }
+        }
         _ => (
             StatusCode::BAD_REQUEST,
-            Json(err_response("Use format=json for API export", "INVALID_INPUT")),
+            Json(err_response("Invalid format. Use format=json, format=csv, or format=summary", "INVALID_INPUT")),
         ).into_response(),
     }
 }
@@ -2528,7 +2768,16 @@ async fn rate_limit_middleware(
     let now = Instant::now();
 
     let allowed = {
-        let mut limiter = state.rate_limiter.lock().unwrap();
+        let mut limiter = match state.rate_limiter.lock() {
+            Ok(l) => l,
+            Err(e) => e.into_inner(), // Recover from poisoned mutex
+        };
+
+        // Prune stale entries to prevent unbounded memory growth
+        if limiter.len() > 10_000 {
+            limiter.retain(|_, (_, last)| now.duration_since(*last).as_secs() < RATE_LIMIT_WINDOW_SECS);
+        }
+
         let entry = limiter.entry(ip).or_insert((0, now));
 
         // Reset window if expired
@@ -2638,6 +2887,7 @@ pub async fn start_api_server(
         .route("/api/modules/search", get(search_modules))
         .route("/api/module/{*path}", get(get_module_info))
         .route("/api/run", post(run_module))
+        .route("/api/run_all", post(run_all))
         .route("/api/target", get(get_target))
         .route("/api/target", post(set_target))
         .route("/api/target", axum::routing::delete(clear_target))
@@ -2653,16 +2903,24 @@ pub async fn start_api_server(
         .route("/api/creds", get(list_creds))
         .route("/api/creds", post(add_cred))
         .route("/api/creds", axum::routing::delete(delete_cred))
+        .route("/api/creds/search", get(search_creds))
         // Workspace / hosts / services
         .route("/api/hosts", get(list_hosts))
         .route("/api/hosts", post(add_host))
+        .route("/api/hosts", axum::routing::delete(delete_host))
+        .route("/api/hosts/notes", post(add_host_note))
         .route("/api/services", get(list_services))
         .route("/api/services", post(add_service))
+        .route("/api/services", axum::routing::delete(delete_service))
         .route("/api/workspace", get(get_workspace))
         .route("/api/workspace", post(switch_workspace))
         // Loot
         .route("/api/loot", get(list_loot))
         .route("/api/loot", post(add_loot))
+        .route("/api/loot", axum::routing::delete(delete_loot))
+        .route("/api/loot/search", get(search_loot))
+        // Check (non-destructive vuln verification)
+        .route("/api/check", post(check_module))
         // Jobs
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}", axum::routing::delete(kill_job))

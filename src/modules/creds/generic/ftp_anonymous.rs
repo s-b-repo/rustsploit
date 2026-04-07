@@ -102,12 +102,12 @@ pub async fn run(target: &str) -> Result<()> {
                                         "\r{}",
                                         format!("[+] FOUND: {}", msg).green().bold()
                                     );
-                                    let _ = ftp.quit().await;
+                                    if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
                                     return Some(format!("{}\n", msg));
                                 }
                                 _ => {}
                             }
-                            let _ = ftp.quit().await;
+                            if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
                         }
                     }
                     _ => {}
@@ -195,17 +195,20 @@ pub async fn run(target: &str) -> Result<()> {
                     ),
                 }
                 // Persist credential to framework credential store
-                let _ = crate::cred_store::store_credential(
-                    domain,
-                    21,
-                    "ftp",
-                    "anonymous",
-                    "anonymous@",
-                    crate::cred_store::CredType::Password,
-                    "creds/generic/ftp_anonymous",
-                )
-                .await;
-                let _ = ftp.quit().await;
+                {
+                    let id = crate::cred_store::store_credential(
+                        domain,
+                        21,
+                        "ftp",
+                        "anonymous",
+                        "anonymous@",
+                        crate::cred_store::CredType::Password,
+                        "creds/generic/ftp_anonymous",
+                    )
+                    .await;
+                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                }
+                if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
                 return Ok(());
             } else if let Err(e) = result {
                 if e.to_string().contains("530") {
@@ -327,17 +330,20 @@ pub async fn run(target: &str) -> Result<()> {
                 ),
             }
             // Persist credential to framework credential store
-            let _ = crate::cred_store::store_credential(
-                domain,
-                21,
-                "ftp",
-                "anonymous",
-                "anonymous@",
-                crate::cred_store::CredType::Password,
-                "creds/generic/ftp_anonymous",
-            )
-            .await;
-            let _ = ftps.quit().await;
+            {
+                let id = crate::cred_store::store_credential(
+                    domain,
+                    21,
+                    "ftp",
+                    "anonymous",
+                    "anonymous@",
+                    crate::cred_store::CredType::Password,
+                    "creds/generic/ftp_anonymous",
+                )
+                .await;
+                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+            }
+            if let Err(e) = ftps.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
         }
         Err(e) if e.to_string().contains("530") => {
             crate::mprintln!("{}", "[-] Anonymous login rejected (FTPS)".yellow());

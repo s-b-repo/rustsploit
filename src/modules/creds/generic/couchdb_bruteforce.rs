@@ -120,16 +120,19 @@ pub async fn run(target: &str) -> Result<()> {
                             if let Ok(b) = r.text().await {
                                 if b.contains("\"ok\":true") || b.contains("\"ok\": true") {
                                     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                    let _ = crate::cred_store::store_credential(
-                                        &ip.to_string(),
-                                        port,
-                                        "couchdb",
-                                        user,
-                                        pass,
-                                        crate::cred_store::CredType::Password,
-                                        "creds/generic/couchdb_bruteforce",
-                                    )
-                                    .await;
+                                    {
+                                        let id = crate::cred_store::store_credential(
+                                            &ip.to_string(),
+                                            port,
+                                            "couchdb",
+                                            user,
+                                            pass,
+                                            crate::cred_store::CredType::Password,
+                                            "creds/generic/couchdb_bruteforce",
+                                        )
+                                        .await;
+                                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                    }
                                     return Some(format!(
                                         "[{}] {}:{}:{}:{}\n",
                                         ts, ip, port, user, pass

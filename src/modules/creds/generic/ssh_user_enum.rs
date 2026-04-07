@@ -98,8 +98,8 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         Err(_) => return None,
     };
 
-    let _ = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)));
-    let _ = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs)));
+    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs))) { crate::meprintln!("[!] Socket option error: {}", e); }
+    if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs))) { crate::meprintln!("[!] Socket option error: {}", e); }
 
     let mut sess = match Session::new() {
         Ok(s) => s,
@@ -117,7 +117,7 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         std::process::id(),
         start.elapsed().as_nanos()
     );
-    let _ = sess.userauth_password(username, &invalid_password);
+    let _auth_result = sess.userauth_password(username, &invalid_password);
 
     let elapsed = start.elapsed().as_secs_f64();
     Some(elapsed)
@@ -253,7 +253,7 @@ fn enumerate_users_blocking(
             usernames.len(),
             user
         );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
 
         match sample_auth_timing(host, port, user, samples, timeout_secs) {
             Some(t) => {

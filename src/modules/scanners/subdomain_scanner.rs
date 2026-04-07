@@ -197,7 +197,7 @@ pub async fn run(target: &str) -> Result<()> {
                     done, total,
                     found.load(Ordering::Relaxed).to_string().green()
                 );
-                let _ = std::io::Write::flush(&mut std::io::stdout());
+                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
             }
         });
 
@@ -205,7 +205,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     for handle in handles {
-        let _ = handle.await;
+        if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     crate::mprintln!(); // Clear progress line
@@ -239,8 +239,15 @@ pub async fn run(target: &str) -> Result<()> {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(&output_path, format!("Subdomain Enumeration - {}\n\n{}", domain, content))
-            .with_context(|| format!("Failed to write results to {}", output_path))?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+            f.write_all(format!("Subdomain Enumeration - {}\n\n{}", domain, content).as_bytes())
+                .with_context(|| format!("Failed to write results to {}", output_path))?;
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

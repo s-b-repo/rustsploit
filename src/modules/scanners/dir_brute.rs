@@ -421,7 +421,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
     
     // Await all
     for t in tasks {
-        let _ = t.await;
+        if let Err(e) = t.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     crate::mprintln!("\n{}", "Scan Complete.".green().bold());

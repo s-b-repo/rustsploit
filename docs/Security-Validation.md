@@ -180,3 +180,30 @@ All persistent data uses atomic write-to-temp-then-rename to prevent corruption:
 | `~/.rustsploit/history.txt` | Shell command history | Medium |
 
 **Important:** The `creds.json` and `loot/` files may contain sensitive data. Protect `~/.rustsploit/` with appropriate file permissions (e.g., `chmod 700`).
+
+---
+
+## Cloud Metadata SSRF Protection
+
+The API server (`api.rs`) blocks requests targeting cloud metadata endpoints to prevent SSRF attacks:
+
+| Blocked Target | Cloud Provider |
+|----------------|---------------|
+| `169.254.169.254` | AWS / GCP / Azure metadata |
+| `metadata.google.internal` | GCP metadata |
+| `100.100.100.200` | Alibaba Cloud metadata |
+
+These checks apply to all module execution requests (`POST /api/run`) and target-setting operations. Requests targeting these addresses are rejected before any module code executes.
+
+---
+
+## MCP Input Validation
+
+The MCP server (`src/mcp/`) applies the same validation rules as the REST API:
+
+- **Tool parameters** are validated before dispatch. Missing required fields return a JSON-RPC error (`-32602 Invalid params`).
+- **Target injection prevention**: The `run_module` tool strips any `target` key from the `prompts` object to prevent prompt-injection SSRF bypass. The target is only accepted from the top-level `target` parameter.
+- **Module path validation**: Module paths are checked against the build-time discovered module list before execution.
+- **Credential redaction**: The `rustsploit:///credentials` resource redacts secrets (first 3 characters + `***`) to prevent accidental exposure through MCP resource reads.
+- **No file system access**: MCP tools do not expose direct file read/write operations. Export data is returned inline as JSON, not written to disk.
+- **Rate limiting**: MCP runs over stdio (single client), so no per-IP rate limiting is needed. Concurrency is bounded by the framework's semaphore (CPU count, min 4).

@@ -31,7 +31,7 @@ impl LootStore {
 
         let loot_dir = base.join("loot");
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) { eprintln!("[!] Directory creation error: {}", e); }
 
         let index_path = base.join("loot_index.json");
         let entries = if index_path.exists() {
@@ -41,7 +41,7 @@ impl LootStore {
                     Err(e) => {
                         eprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
                         let backup = index_path.with_extension("json.bak");
-                        let _ = std::fs::copy(&index_path, &backup);
+                        if let Err(e) = std::fs::copy(&index_path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
                         Vec::new()
                     }
                 },
@@ -75,12 +75,15 @@ impl LootStore {
             eprintln!("[!] Loot too large: {} bytes (max {} MB)", data.len(), Self::MAX_LOOT_SIZE / 1024 / 1024);
             return None;
         }
-        // Validate inputs
+        // Validate inputs (BUG 29 fix: also validate description and source_module)
         if host.is_empty() || host.len() > 256 {
             return None;
         }
+        if description.len() > 4096 || source_module.len() > 4096 || loot_type.len() > 256 {
+            return None;
+        }
 
-        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+        let id = uuid::Uuid::new_v4().simple().to_string();
         let ext = match loot_type {
             "config" => "conf",
             "password_file" => "txt",
@@ -108,7 +111,9 @@ impl LootStore {
             return None;
         }
         use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).await;
+        if let Err(e) = tokio::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).await {
+            crate::meprintln!("[!] Permission error on {}: {}", file_path.display(), e);
+        }
 
         let entry = LootEntry {
             id: id.clone(),
@@ -174,7 +179,7 @@ impl LootStore {
         };
         if let Some(fname) = filename {
             if let Some(path) = self.file_path(&fname) {
-                let _ = tokio::fs::remove_file(&path).await;
+                if let Err(e) = tokio::fs::remove_file(&path).await { crate::meprintln!("[!] File remove error: {}", e); }
             }
         }
         removed
@@ -191,7 +196,7 @@ impl LootStore {
         self.save_locked(&[]).await;
         for fname in filenames {
             if let Some(path) = self.file_path(&fname) {
-                let _ = tokio::fs::remove_file(&path).await;
+                if let Err(e) = tokio::fs::remove_file(&path).await { crate::meprintln!("[!] File remove error: {}", e); }
             }
         }
     }
@@ -218,9 +223,11 @@ impl LootStore {
         let tmp = self.index_path.with_extension("json.tmp");
         if let Ok(json) = serde_json::to_string_pretty(entries) {
             if tokio::fs::write(&tmp, &json).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, &self.index_path).await;
+                if let Err(e) = tokio::fs::rename(&tmp, &self.index_path).await { crate::meprintln!("[!] File rename error: {}", e); }
                 use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::set_permissions(&self.index_path, std::fs::Permissions::from_mode(0o600)).await;
+                if let Err(e) = tokio::fs::set_permissions(&self.index_path, std::fs::Permissions::from_mode(0o600)).await {
+                    crate::meprintln!("[!] Permission error on {}: {}", self.index_path.display(), e);
+                }
             }
         }
     }

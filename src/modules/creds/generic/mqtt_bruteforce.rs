@@ -354,16 +354,19 @@ pub async fn run(target: &str) -> Result<()> {
         match try_mqtt_auth(&addr, "", "", &client_id, use_tls).await {
             AttackResult::Success(_, _) => {
                 crate::mprintln!("{}", "[+] ANONYMOUS ACCESS ALLOWED!".green().bold());
-                let _ = crate::cred_store::store_credential(
-                    &normalized_target,
-                    port,
-                    "mqtt",
-                    "(anonymous)",
-                    "(no password)",
-                    crate::cred_store::CredType::Password,
-                    "creds/generic/mqtt_bruteforce",
-                )
-                .await;
+                {
+                    let id = crate::cred_store::store_credential(
+                        &normalized_target,
+                        port,
+                        "mqtt",
+                        "(anonymous)",
+                        "(no password)",
+                        crate::cred_store::CredType::Password,
+                        "creds/generic/mqtt_bruteforce",
+                    )
+                    .await;
+                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                }
                 if stop_on_success {
                     crate::mprintln!(
                         "{}",
@@ -647,7 +650,7 @@ where
 
     // Send DISCONNECT on success
     if return_code == MqttReturnCode::Accepted {
-        let _ = stream.write_all(&[MQTT_PACKET_DISCONNECT, 0x00]).await;
+        if let Err(e) = stream.write_all(&[MQTT_PACKET_DISCONNECT, 0x00]).await { crate::meprintln!("[!] Write error: {}", e); }
         return Ok(true);
     }
 
@@ -655,7 +658,12 @@ where
         return Ok(false);
     }
 
-    Err(anyhow!("MQTT error: {}", return_code.description()))
+    // ServerUnavailable (0x03) is transient — return Ok(false) so engine retries
+    // UnacceptableProtocol (0x01) and IdentifierRejected (0x02) are config errors — not retryable
+    match return_code {
+        MqttReturnCode::ServerUnavailable => Ok(false),
+        _ => Err(anyhow!("MQTT error: {}", return_code.description())),
+    }
 }
 
 fn build_connect_packet(username: &str, password: &str, client_id: &str) -> Result<Vec<u8>> {

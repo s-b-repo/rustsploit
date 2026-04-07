@@ -498,11 +498,12 @@ async fn try_fortinet_login(
         Err(_) => return Err(anyhow!("Timeout reading login response")),
     };
 
-    // Check for explicit success indicators
+    // Check for explicit success indicators (case-insensitive)
+    let body_lower = response_body.to_lowercase();
     let success_indicators = ["redir", "\"1\"", "success", "/remote/index", "portal"];
     if success_indicators
         .iter()
-        .any(|&indicator| response_body.contains(indicator))
+        .any(|&indicator| body_lower.contains(indicator))
     {
         return Ok(true);
     }

@@ -37,6 +37,9 @@ pub struct Job {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Maximum number of tracked jobs (BUG 7 fix).
+const MAX_JOBS: usize = 1000;
+
 /// Manages background jobs.
 pub struct JobManager {
     jobs: RwLock<HashMap<u32, Job>>,
@@ -94,6 +97,12 @@ impl JobManager {
         };
 
         if let Ok(mut jobs) = self.jobs.write() {
+            // Evict finished jobs if at capacity (BUG 7 fix)
+            if jobs.len() >= MAX_JOBS {
+                jobs.retain(|_, j| {
+                    j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+                });
+            }
             jobs.insert(id, job);
         }
 
@@ -104,7 +113,7 @@ impl JobManager {
     pub fn kill(&self, id: u32) -> bool {
         if let Ok(mut jobs) = self.jobs.write() {
             if let Some(job) = jobs.get_mut(&id) {
-                let _ = job.cancel_tx.send(true);
+                if let Err(e) = job.cancel_tx.send(true) { eprintln!("[!] Job cancel signal error: {}", e); }
                 if let Some(handle) = job.handle.take() {
                     handle.abort();
                 }
@@ -115,32 +124,40 @@ impl JobManager {
         false
     }
 
-    /// List all jobs. Auto-cleans finished jobs older than 5 minutes.
+    /// List all jobs. Updates status for finished jobs and auto-cleans old ones.
     pub fn list(&self) -> Vec<(u32, String, String, String, String)> {
-        // Auto-cleanup finished jobs
-        self.cleanup();
+        // Use a single write lock to both update statuses and collect results
         let mut result = Vec::new();
-        if let Ok(jobs) = self.jobs.read() {
+        if let Ok(mut jobs) = self.jobs.write() {
+            // Update status for finished jobs (BUG 6 fix)
+            for job in jobs.values_mut() {
+                if let Some(ref handle) = job.handle {
+                    if handle.is_finished() {
+                        if matches!(job.status, JobStatus::Running) {
+                            job.status = JobStatus::Completed;
+                        }
+                    }
+                }
+            }
+            // Auto-cleanup finished jobs (inline, avoids separate cleanup() lock)
+            jobs.retain(|_, job| {
+                if let Some(ref handle) = job.handle {
+                    !handle.is_finished()
+                } else {
+                    false
+                }
+            });
+            // Collect results
             let mut ids: Vec<_> = jobs.keys().collect();
             ids.sort();
             for &id in &ids {
                 if let Some(job) = jobs.get(id) {
-                    // Check if handle is finished
-                    let status = if let Some(ref handle) = job.handle {
-                        if handle.is_finished() {
-                            "Completed".to_string()
-                        } else {
-                            format!("{}", job.status)
-                        }
-                    } else {
-                        format!("{}", job.status)
-                    };
                     result.push((
                         *id,
                         job.module.clone(),
                         job.target.clone(),
                         job.started_at.format("%H:%M:%S").to_string(),
-                        status,
+                        format!("{}", job.status),
                     ));
                 }
             }

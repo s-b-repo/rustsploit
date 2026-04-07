@@ -9,7 +9,7 @@ use pnet_packet::Packet;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashSet,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
@@ -446,7 +446,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     )
                     .dimmed()
                 );
-                let _ = std::io::Write::flush(&mut std::io::stdout());
+                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
             }
 
             if !successes.is_empty() {
@@ -477,12 +477,12 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
     
     // Clear progress line
     crate::mprint!("\r{}\r", " ".repeat(80));
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
 
     let up_hosts = success_counter.load(Ordering::Relaxed);
     crate::mprintln!(
@@ -531,10 +531,12 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 }
 
 fn save_hosts_to_file(hosts: &[String], file_path: &str) -> Result<()> {
-    let mut file = File::create(file_path)
+    let mut file = OpenOptions::new().create(true).append(true).open(file_path)
         .with_context(|| format!("Failed to create file '{}'", file_path))?;
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600)) {
+        crate::meprintln!("[!] Permission error on {}: {}", file_path, e);
+    }
 
     for host in hosts {
         writeln!(file, "{}", host)

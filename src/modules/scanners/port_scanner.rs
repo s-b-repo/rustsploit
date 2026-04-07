@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use colored::*;
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::{Write, BufWriter},
     net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
@@ -226,9 +226,11 @@ pub async fn run_with_settings(
     let (resolved_ip_str, resolved_ip) = resolve_target(target)?;
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let file = {
-        let f = File::create(output_file)?;
+        let f = OpenOptions::new().create(true).append(true).open(output_file)?;
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(output_file, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(output_file, std::fs::Permissions::from_mode(0o600)) {
+            crate::meprintln!("[!] Permission error on {}: {}", output_file, e);
+        }
         Arc::new(Mutex::new(BufWriter::new(f)))
     };
     
@@ -283,7 +285,7 @@ pub async fn run_with_settings(
                                 line
                             };
                             
-                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
+                            if let Err(e) = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line) { crate::meprintln!("[!] Write error: {}", e); }
                             crate::mprintln!("{}", output_line);
                         }
                         "CLOSED" => {
@@ -338,7 +340,7 @@ pub async fn run_with_settings(
                             let service_name = get_service_name(port);
                             let line = format!("[UDP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
                             
-                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
+                            if let Err(e) = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line) { crate::meprintln!("[!] Write error: {}", e); }
                             crate::mprintln!("{}", line);
                         }
                         "CLOSED" => stats_guard.udp_closed += 1,
@@ -358,10 +360,10 @@ pub async fn run_with_settings(
 
     // Await all tasks
     for task in tcp_tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
     for task in udp_tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     let elapsed = start_time.elapsed();
@@ -422,14 +424,14 @@ async fn scan_tcp(
     // Set options
     if let Some(ttl_val) = ttl {
         if domain == Domain::IPV4 {
-            let _ = socket.set_ttl_v4(ttl_val);
+            if let Err(e) = socket.set_ttl_v4(ttl_val) { crate::meprintln!("[!] Socket option error: {}", e); }
         } else {
-            let _ = socket.set_unicast_hops_v6(ttl_val);
+            if let Err(e) = socket.set_unicast_hops_v6(ttl_val) { crate::meprintln!("[!] Socket option error: {}", e); }
         }
     }
-    
-    let _ = socket.set_nonblocking(true);
-    let _ = socket.set_tcp_nodelay(true);
+
+    if let Err(e) = socket.set_nonblocking(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+    if let Err(e) = socket.set_tcp_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
 
     // Bind to custom source port if configured
     if let Some(src_port) = source_port {
@@ -438,7 +440,7 @@ async fn scan_tcp(
         } else {
             SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), src_port)
         };
-        let _ = socket.bind(&bind_addr.into());
+        if let Err(e) = socket.bind(&bind_addr.into()) { crate::meprintln!("[!] Socket bind error: {}", e); }
     }
 
     // Connect (non-blocking)
@@ -466,7 +468,7 @@ async fn scan_tcp(
                                 let mut rng = rng();
                                 (0..len).map(|_| rng.random()).collect()
                             };
-                            let _ = stream.write_all(&payload).await;
+                            if let Err(e) = stream.write_all(&payload).await { crate::meprintln!("[!] Write error: {}", e); }
                         }
                     }
                     
@@ -602,7 +604,7 @@ async fn scan_udp(
     
     // Set TTL if configured
     if let Some(ttl_val) = ttl {
-        let _ = sock.set_ttl(ttl_val);
+        if let Err(e) = sock.set_ttl(ttl_val) { crate::meprintln!("[!] Socket option error: {}", e); }
     }
 
     let target = SocketAddr::new(*ip, port);
@@ -619,7 +621,7 @@ async fn scan_udp(
         b"\x00\x00\x10\x10".to_vec()
     };
     
-    let _ = sock.send_to(&payload, target).await;
+    if let Err(e) = sock.send_to(&payload, target).await { crate::meprintln!("[!] UDP send error: {}", e); }
     
     let mut buf = [0u8; 1500];
     match timeout(Duration::from_secs(timeout_secs), sock.recv_from(&mut buf)).await {
@@ -728,7 +730,7 @@ impl ProgressTracker {
         ).cyan());
         // Note: This is in a sync context (ProgressTracker), so we use blocking flush
         // The ProgressTracker is called from async context but uses sync printing
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
         
         if self.current == self.total {
             crate::mprintln!();

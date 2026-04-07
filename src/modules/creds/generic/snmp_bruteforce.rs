@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use tokio::task::spawn_blocking;
 
 use crate::modules::creds::utils::{
     generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
@@ -179,16 +178,19 @@ pub async fn run(target: &str) -> Result<()> {
                 match try_snmp_community(&addr, &community, snmp_version, timeout).await {
                     Ok(true) => {
                         // Store with CredType::Key for SNMP semantics
-                        let _ = crate::cred_store::store_credential(
-                            &target,
-                            port,
-                            "snmp",
-                            "",
-                            &community,
-                            crate::cred_store::CredType::Key,
-                            "creds/generic/snmp_bruteforce",
-                        )
-                        .await;
+                        {
+                            let id = crate::cred_store::store_credential(
+                                &target,
+                                port,
+                                "snmp",
+                                "",
+                                &community,
+                                crate::cred_store::CredType::Key,
+                                "creds/generic/snmp_bruteforce",
+                            )
+                            .await;
+                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                        }
                         LoginResult::Success
                     }
                     Ok(false) => LoginResult::AuthFailed,
@@ -222,7 +224,7 @@ pub async fn run(target: &str) -> Result<()> {
         {
             for (host, _user, community) in &result.found {
                 crate::mprintln!("     {} -> community: '{}'", host, community);
-                let _ = writeln!(file, "{} -> community: '{}'", host, community);
+                if let Err(e) = writeln!(file, "{} -> community: '{}'", host, community) { crate::meprintln!("[!] Write error: {}", e); }
             }
             crate::mprintln!("[+] Results saved to '{}'", output_file);
         }
@@ -231,90 +233,45 @@ pub async fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// Try an SNMP community string via async UDP (no spawn_blocking overhead).
 async fn try_snmp_community(
     normalized_addr: &str,
     community: &str,
     version: u8, // 0 = v1, 1 = v2c
     timeout: Duration,
 ) -> Result<bool> {
-    let community_owned = community.to_string();
-    let addr_owned = normalized_addr.to_string();
+    let addr: SocketAddr = normalized_addr
+        .parse()
+        .map_err(|e| anyhow!("Invalid address '{}': {}", normalized_addr, e))?;
 
-    let result = spawn_blocking(move || -> Result<bool, anyhow::Error> {
-        // Parse the address
-        let addr: SocketAddr = addr_owned
-            .parse()
-            .map_err(|e| anyhow!("Invalid address '{}': {}", addr_owned, e))?;
+    // Async UDP socket
+    let socket = crate::utils::udp_bind(None).await
+        .map_err(|e| anyhow!("Failed to bind UDP socket: {}", e))?;
 
-        // Create UDP socket
-        let socket = crate::utils::blocking_udp_bind(None)
-            .map_err(|e| anyhow!("Failed to bind socket: {}", e))?;
+    let message = build_snmp_get_request(community, version);
 
-        socket
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| anyhow!("Failed to set read timeout: {}", e))?;
+    // Send SNMP GET request
+    socket
+        .send_to(&message, &addr)
+        .await
+        .map_err(|e| anyhow!("Failed to send SNMP request: {}", e))?;
 
-        // Build SNMP GET request manually
-        // OID: 1.3.6.1.2.1.1.1.0 (sysDescr)
-        let message = build_snmp_get_request(&community_owned, version);
-
-        // Send request
-        socket
-            .send_to(&message, &addr)
-            .map_err(|e| anyhow!("Failed to send SNMP request: {}", e))?;
-
-        // Receive response
-        let mut buf = vec![0u8; 4096];
-        let result: bool = match socket.recv_from(&mut buf) {
-            Ok((size, _)) => {
-                let response = &buf[..size];
-
-                // Parse SNMP response to verify it's valid
-                // A valid SNMP response should:
-                // 1. Start with 0x30 (SEQUENCE)
-                // 2. Contain version, community, and PDU
-                // 3. Have error status = 0 (noError) in the response PDU
-                if size >= 20 && response[0] == 0x30 {
-                    // Try to parse the response to check error status
-                    // If we can parse it and error status is 0, it's valid
-                    match parse_snmp_response(response) {
-                        Ok(true) => true,   // Valid community string
-                        Ok(false) => false, // Invalid community (error in response)
-                        Err(_) => {
-                            // Can't parse response — treat as invalid to avoid false positives
-                            false
-                        }
-                    }
-                } else {
-                    // Malformed response - likely invalid
-                    false
+    // Receive response with timeout
+    let mut buf = vec![0u8; 4096];
+    match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+        Ok(Ok((size, _))) => {
+            let response = &buf[..size];
+            if size >= 20 && response[0] == 0x30 {
+                match parse_snmp_response(response) {
+                    Ok(valid) => Ok(valid),
+                    Err(_) => Ok(false),
                 }
+            } else {
+                Ok(false)
             }
-            Err(e) => {
-                // Handle timeout and EAGAIN/EWOULDBLOCK errors as invalid community
-                // EAGAIN (os error 11) can occur on Linux when socket would block
-                let error_kind = e.kind();
-                if error_kind == std::io::ErrorKind::TimedOut
-                    || error_kind == std::io::ErrorKind::WouldBlock
-                    || e.raw_os_error() == Some(11) // EAGAIN on Linux
-                    || e.raw_os_error() == Some(35)
-                // EAGAIN on macOS
-                {
-                    // Timeout or would block - community string is likely invalid
-                    false
-                } else {
-                    // Other errors might be transient, but log them
-                    // For now, treat as invalid to avoid false positives
-                    false
-                }
-            }
-        };
-        Ok(result)
-    })
-    .await
-    .map_err(|e| anyhow!("Task join error: {}", e))?;
-
-    result
+        }
+        Ok(Err(_)) | Err(_) => Ok(false), // Timeout or recv error = invalid community
+    }
 }
 
 /// Parses SNMP response to check if error status is 0 (noError)
@@ -630,16 +587,19 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
                 match try_snmp_community(&addr, &community, snmp_version, timeout).await {
                     Ok(true) => {
                         // Store with CredType::Key for SNMP semantics
-                        let _ = crate::cred_store::store_credential(
-                            &ip.to_string(),
-                            port,
-                            "snmp",
-                            "",
-                            &community,
-                            crate::cred_store::CredType::Key,
-                            "creds/generic/snmp_bruteforce",
-                        )
-                        .await;
+                        {
+                            let id = crate::cred_store::store_credential(
+                                &ip.to_string(),
+                                port,
+                                "snmp",
+                                "",
+                                &community,
+                                crate::cred_store::CredType::Key,
+                                "creds/generic/snmp_bruteforce",
+                            )
+                            .await;
+                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                        }
                         LoginResult::Success
                     }
                     Ok(false) => LoginResult::AuthFailed,

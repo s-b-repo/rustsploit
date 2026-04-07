@@ -292,10 +292,10 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let _ = semaphore.acquire().await;
         }
 
-        print_scan_summary("Mass Scan",
-            checked.load(Ordering::Relaxed),
-            success_count.load(Ordering::Relaxed),
-            fail_count.load(Ordering::Relaxed));
+        let sc = success_count.load(Ordering::Relaxed);
+        let fc = fail_count.load(Ordering::Relaxed);
+        print_scan_summary("Mass Scan", checked.load(Ordering::Relaxed), sc, fc);
+        auto_log_result(&category, &module_name, "random", sc > 0, &format!("mass_scan ok={} err={}", sc, fc));
         return Ok(());
     }
 
@@ -361,10 +361,10 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let _ = semaphore.acquire().await;
         }
 
-        print_scan_summary("File Target Scan",
-            total.load(Ordering::Relaxed),
-            success_count.load(Ordering::Relaxed),
-            fail_count.load(Ordering::Relaxed));
+        let sc = success_count.load(Ordering::Relaxed);
+        let fc = fail_count.load(Ordering::Relaxed);
+        print_scan_summary("File Target Scan", total.load(Ordering::Relaxed), sc, fc);
+        auto_log_result(&category, &module_name, target, sc > 0, &format!("file_scan ok={} err={}", sc, fc));
         return Ok(());
     }
 
@@ -464,10 +464,10 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let _ = semaphore.acquire().await;
         }
 
-        print_scan_summary("Subnet Scan",
-            host_count as usize,
-            success_count.load(Ordering::Relaxed),
-            fail_count.load(Ordering::Relaxed));
+        let sc = success_count.load(Ordering::Relaxed);
+        let fc = fail_count.load(Ordering::Relaxed);
+        print_scan_summary("Subnet Scan", host_count as usize, sc, fc);
+        auto_log_result(&category, &module_name, target, sc > 0, &format!("subnet_scan ok={} err={}", sc, fc));
         return Ok(());
     }
 
@@ -479,7 +479,9 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
         ).red().bold());
         return Ok(());
     }
-    registry::dispatch_by_category(category, module_name, target).await?;
+    let result = registry::dispatch_by_category(category, module_name, target).await;
+    auto_log_result(category, module_name, target, result.is_ok(), "");
+    result?;
     Ok(())
 }
 
@@ -529,6 +531,36 @@ fn print_scan_summary(label: &str, total: usize, success: usize, failed: usize) 
     crate::mprintln!("  Total:      {}", total);
     crate::mprintln!("  {}", format!("Successful: {}", success).green());
     crate::mprintln!("  {}", format!("Failed:     {}", failed).red());
+}
+
+/// Auto-save a module execution log entry to ~/.rustsploit/results/ in append mode.
+/// Called after every module dispatch so all modules (exploit, scanner, creds) get
+/// persistent output regardless of whether the module itself saves to file.
+fn auto_log_result(category: &str, module_name: &str, target: &str, success: bool, detail: &str) {
+    // Check if auto_save_results is enabled (default: on)
+    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.try_get("auto_save_results") {
+        if matches!(val.to_lowercase().as_str(), "n" | "no" | "false" | "0" | "off" | "disabled") {
+            return;
+        }
+    }
+    let results_dir = crate::config::results_dir();
+    // Sanitize module name for filename
+    let safe_name: String = module_name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let filename = format!("{}_{}.txt", category, safe_name);
+    let path = results_dir.join(&filename);
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let status = if success { "SUCCESS" } else { "COMPLETED" };
+    let line = if detail.is_empty() {
+        format!("[{}] {} {}/{} target={}\n", timestamp, status, category, module_name, target)
+    } else {
+        format!("[{}] {} {}/{} target={} {}\n", timestamp, status, category, module_name, target, detail)
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        if let Err(e) = file.write_all(line.as_bytes()) { crate::meprintln!("[!] Write error: {}", e); }
+    }
 }
 
 /// Helper to aggregate all available modules from generated registry

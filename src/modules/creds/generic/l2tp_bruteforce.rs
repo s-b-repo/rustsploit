@@ -773,7 +773,7 @@ fn try_l2tp_login_sync(
                         offset = 2;
                     }
 
-                    if pkt.payload.len() > offset + 4 {
+                    if pkt.payload.len() > offset + 6 {
                         let protocol =
                             u16::from_be_bytes([pkt.payload[offset], pkt.payload[offset + 1]]);
                         if protocol == PPP_CHAP {
@@ -807,6 +807,7 @@ fn try_l2tp_login_sync(
         match session.recv_packet(timeout) {
             Ok(pkt) => {
                 if !pkt.is_control && pkt.payload.len() > 4 {
+                    if pkt.payload.len() < 3 { continue; }
                     let mut offset = 0;
                     if pkt.payload[0] == 0xFF && pkt.payload[1] == 0x03 {
                         offset = 2;

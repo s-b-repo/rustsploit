@@ -415,7 +415,7 @@ async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> b
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     let result = *found.lock().await;
@@ -521,11 +521,14 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                         target,
                         port
                     );
-                    let _ = crate::cred_store::store_credential(
-                        target, port, "rtsp", user, pass,
-                        crate::cred_store::CredType::Password,
-                        "creds/camxploit/camxploit",
-                    ).await;
+                    {
+                        let id = crate::cred_store::store_credential(
+                            target, port, "rtsp", user, pass,
+                            crate::cred_store::CredType::Password,
+                            "creds/camxploit/camxploit",
+                        ).await;
+                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                    }
                 }
             }
         }
@@ -557,11 +560,14 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                                 if pass.is_empty() { "<empty>" } else { pass },
                                 url
                             );
-                            let _ = crate::cred_store::store_credential(
-                                target, port, "http", user, pass,
-                                crate::cred_store::CredType::Password,
-                                "creds/camxploit/camxploit",
-                            ).await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    target, port, "http", user, pass,
+                                    crate::cred_store::CredType::Password,
+                                    "creds/camxploit/camxploit",
+                                ).await;
+                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
                         }
                     }
                 }
@@ -578,11 +584,14 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                                 if pass.is_empty() { "<empty>" } else { pass },
                                 url
                             );
-                            let _ = crate::cred_store::store_credential(
-                                target, port, "http", user, pass,
-                                crate::cred_store::CredType::Password,
-                                "creds/camxploit/camxploit",
-                            ).await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    target, port, "http", user, pass,
+                                    crate::cred_store::CredType::Password,
+                                    "creds/camxploit/camxploit",
+                                ).await;
+                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
                         }
                     }
                 }
@@ -850,11 +859,11 @@ async fn run_mass_scan() -> Result<()> {
                     .open(outfile.as_str())
                 {
                     use std::io::Write;
-                    let _ = writeln!(
+                    if let Err(e) = writeln!(
                         file,
                         "CAMERA: {} | ports: {:?} | rtsp: {:?}",
                         target, open_ports, rtsp_ports
-                    );
+                    ) { crate::meprintln!("[!] Write error: {}", e); }
                 }
             }
 

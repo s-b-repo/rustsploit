@@ -344,8 +344,16 @@ fn write_report(path: &str, results: &[TargetResult]) -> Result<()> {
         lines.push(String::new());
     }
 
-    fs::write(path, lines.join("\n"))
-    .with_context(|| format!("Failed to write report to {}", path))
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(path)
+            .with_context(|| format!("Failed to write report to {}", path))?;
+        writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
+            .with_context(|| format!("Failed to write report to {}", path))?;
+        f.write_all(lines.join("\n").as_bytes())
+            .with_context(|| format!("Failed to write report to {}", path))?;
+    }
+    Ok(())
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {

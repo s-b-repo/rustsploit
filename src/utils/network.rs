@@ -74,7 +74,7 @@ pub async fn tcp_connect_with_source(
         socket.bind(&bind_addr.into())?;
 
         // Initiate non-blocking connect
-        let _ = socket.connect(&dest.into());
+        let _connect = socket.connect(&dest.into());
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream)?;
 
@@ -266,7 +266,7 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
     }
 
     open_count.load(std::sync::atomic::Ordering::Relaxed) >= 11

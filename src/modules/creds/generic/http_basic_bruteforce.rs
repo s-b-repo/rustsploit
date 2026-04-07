@@ -195,15 +195,18 @@ pub async fn run(target: &str) -> Result<()> {
                     {
                         Ok(resp) if resp.status().as_u16() == 200 => {
                             let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let _ = crate::cred_store::store_credential(
-                                &ip.to_string(),
-                                port,
-                                "http-basic",
-                                user,
-                                pass,
-                                crate::cred_store::CredType::Password,
-                                "creds/generic/http_basic_bruteforce",
-                            ).await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    &ip.to_string(),
+                                    port,
+                                    "http-basic",
+                                    user,
+                                    pass,
+                                    crate::cred_store::CredType::Password,
+                                    "creds/generic/http_basic_bruteforce",
+                                ).await;
+                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
                             return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                         }
                         _ => continue,

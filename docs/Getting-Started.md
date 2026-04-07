@@ -77,6 +77,27 @@ cargo run -- --api
 
 This starts the PQ-encrypted API server on port 8080. On first run it generates a host key pair at `~/.rustsploit/pq_host_key` and prints its fingerprint. Clients must be listed in `~/.rustsploit/pq_authorized_keys` to connect. No TLS or API keys — authentication uses SSH-style post-quantum identity keys. See [API Server](API-Server.md) and [API Usage Examples](API-Usage-Examples.md) for details.
 
+### MCP Integration
+```bash
+cargo run -- --mcp
+```
+
+This starts the MCP (Model Context Protocol) server over stdio using JSON-RPC 2.0 transport. It exposes 30 tools and 7 resources for integration with Claude Desktop and other MCP-compatible clients. No network listener is opened — communication is over stdin/stdout.
+
+To use with Claude Desktop, add to your `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "rustsploit": {
+      "command": "/path/to/rustsploit",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+See [MCP Integration](MCP-Integration.md) for the full tool and resource reference.
+
 ---
 
 ## Docker Deployment

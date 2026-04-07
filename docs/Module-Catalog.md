@@ -4,7 +4,7 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 > **Module categories:** `exploits/`, `scanners/`, `creds/`, `plugins/` -- all auto-discovered at build time. Adding a new subdirectory under `src/modules/` automatically creates a new category.
 
-**Totals:** 137 exploit modules (24 with `check()`), 24 scanners, 19 credential modules, 1 plugin.
+**Totals:** 137 exploit modules (24 with `check()`), 24 scanners, 28 credential modules, 1 plugin.
 
 ---
 
@@ -357,6 +357,15 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `creds/generic/ssh_spray` | SSH password spray across multiple targets with lockout-aware delays |
 | `creds/generic/enablebruteforce` | Raises file descriptor limits (ulimit) for high-concurrency brute-force operations |
 | `creds/generic/sample_cred_check` | Sample module testing HTTP Basic Auth with default admin:admin credentials |
+| `creds/generic/vnc_bruteforce` | VNC DES challenge-response brute force with password-only auth and bit-reversed DES key |
+| `creds/generic/imap_bruteforce` | IMAP/IMAPS brute force with LOGIN command, implicit TLS, and RFC 3501 escaping |
+| `creds/generic/mysql_bruteforce` | MySQL native wire protocol brute force with HandshakeV10 parsing and SHA1 salt extraction |
+| `creds/generic/postgres_bruteforce` | PostgreSQL wire protocol brute force with MD5 and cleartext auth support |
+| `creds/generic/redis_bruteforce` | Redis AUTH brute force with legacy and ACL (Redis 6+) support, INFO version detection |
+| `creds/generic/elasticsearch_bruteforce` | Elasticsearch HTTP Basic Auth brute force with cluster detection and open-access check |
+| `creds/generic/couchdb_bruteforce` | CouchDB session auth brute force with Basic fallback and `/_all_dbs` verification |
+| `creds/generic/memcached_bruteforce` | Memcached SASL PLAIN brute force via binary protocol with open-access detection |
+| `creds/generic/http_basic_bruteforce` | HTTP Basic Authentication brute force with HTTPS, custom paths, and redirect detection |
 
 ### Camera
 

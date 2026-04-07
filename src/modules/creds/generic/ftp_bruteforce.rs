@@ -274,14 +274,14 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, _verbos
         Ok(Ok(mut ftp)) => {
             match ftp.login(user, pass).await {
                 Ok(_) => {
-                    let _ = ftp.quit().await;
+                    if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
                     return Ok(true);
                 }
                 Err(e) => {
                     let msg = e.to_string();
                     match FtpErrorType::classify_error(&msg) {
                         FtpErrorType::AuthenticationFailed => return Ok(false),
-                        FtpErrorType::TlsRequired => { let _ = ftp.quit().await; }
+                        FtpErrorType::TlsRequired => { if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); } }
                         FtpErrorType::ConnectionLimitExceeded => {
                             sleep(Duration::from_secs(1)).await;
                             return Ok(false);
@@ -316,7 +316,7 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, _verbos
 
     match ftp_tls.login(user, pass).await {
         Ok(_) => {
-            let _ = ftp_tls.quit().await;
+            if let Err(e) = ftp_tls.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
             Ok(true)
         }
         Err(e) => {

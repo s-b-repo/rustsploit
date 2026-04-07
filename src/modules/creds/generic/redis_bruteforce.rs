@@ -184,11 +184,14 @@ pub async fn run(target: &str) -> Result<()> {
                     Ok(Ok(true)) => {
                         // PING succeeded without auth — Redis has no auth
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let _ = crate::cred_store::store_credential(
-                            &target_str, port, "redis", "", "(no auth)",
-                            crate::cred_store::CredType::Password,
-                            "creds/generic/redis_bruteforce",
-                        ).await;
+                        {
+                            let id = crate::cred_store::store_credential(
+                                &target_str, port, "redis", "", "(no auth)",
+                                crate::cred_store::CredType::Password,
+                                "creds/generic/redis_bruteforce",
+                            ).await;
+                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                        }
                         return Some(format!("[{}] {}:{}:(no auth)\n", ts, ip, port));
                     }
                     Ok(Ok(false)) => {
@@ -208,11 +211,14 @@ pub async fn run(target: &str) -> Result<()> {
                         match res {
                             Ok(Ok(true)) => {
                                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = crate::cred_store::store_credential(
-                                    &target_str, port, "redis", user, pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/redis_bruteforce",
-                                ).await;
+                                {
+                                    let id = crate::cred_store::store_credential(
+                                        &target_str, port, "redis", user, pass,
+                                        crate::cred_store::CredType::Password,
+                                        "creds/generic/redis_bruteforce",
+                                    ).await;
+                                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                }
                                 return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                             }
                             Ok(Ok(false)) => continue,
@@ -229,11 +235,14 @@ pub async fn run(target: &str) -> Result<()> {
                         match res {
                             Ok(Ok(true)) => {
                                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = crate::cred_store::store_credential(
-                                    &target_str, port, "redis", "", pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/redis_bruteforce",
-                                ).await;
+                                {
+                                    let id = crate::cred_store::store_credential(
+                                        &target_str, port, "redis", "", pass,
+                                        crate::cred_store::CredType::Password,
+                                        "creds/generic/redis_bruteforce",
+                                    ).await;
+                                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                }
                                 return Some(format!("[{}] {}:{}::{}\n", ts, ip, port, pass));
                             }
                             Ok(Ok(false)) => continue,
@@ -523,7 +532,7 @@ fn redis_ping(target: &str, port: u16, timeout_secs: u64) -> std::result::Result
 
     let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
         .map_err(|e| RedisError::from_anyhow(e.into()))?;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
     stream.set_read_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
     stream.set_write_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
 
@@ -573,7 +582,7 @@ fn attempt_redis_login(
 
     let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
         .map_err(|e| RedisError::from_anyhow(e.into()))?;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
     stream.set_read_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
     stream.set_write_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
 
@@ -611,7 +620,7 @@ fn attempt_redis_login(
             }
         }
         // Clean disconnect
-        let _ = stream.write_all(b"QUIT\r\n");
+        if let Err(e) = stream.write_all(b"QUIT\r\n") { crate::meprintln!("[!] Redis QUIT write error: {}", e); }
         return Ok(true);
     }
 
