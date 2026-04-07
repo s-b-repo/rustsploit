@@ -66,36 +66,36 @@ impl std::fmt::Display for CheckResult {
 
 /// Pretty-print module info to the console.
 pub fn display_module_info(module_path: &str, info: &ModuleInfo) {
-    println!();
-    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║                       Module Information                      ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
-    println!();
-    println!("  {:<16} {}", "Path:".bold(), module_path);
-    println!("  {:<16} {}", "Name:".bold(), info.name);
-    println!("  {:<16} {}", "Rank:".bold(), format!("{}", info.rank).green());
+    crate::mprintln!();
+    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║                       Module Information                      ║".cyan());
+    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
+    crate::mprintln!("  {:<16} {}", "Path:".bold(), module_path);
+    crate::mprintln!("  {:<16} {}", "Name:".bold(), info.name);
+    crate::mprintln!("  {:<16} {}", "Rank:".bold(), format!("{}", info.rank).green());
     if let Some(ref date) = info.disclosure_date {
-        println!("  {:<16} {}", "Disclosed:".bold(), date);
+        crate::mprintln!("  {:<16} {}", "Disclosed:".bold(), date);
     }
-    println!();
-    println!("  {}", "Description:".bold());
+    crate::mprintln!();
+    crate::mprintln!("  {}", "Description:".bold());
     for line in info.description.lines() {
-        println!("    {}", line);
+        crate::mprintln!("    {}", line);
     }
-    println!();
+    crate::mprintln!();
     if !info.authors.is_empty() {
-        println!("  {}", "Authors:".bold());
+        crate::mprintln!("  {}", "Authors:".bold());
         for author in &info.authors {
-            println!("    - {}", author);
+            crate::mprintln!("    - {}", author);
         }
-        println!();
+        crate::mprintln!();
     }
     if !info.references.is_empty() {
-        println!("  {}", "References:".bold());
+        crate::mprintln!("  {}", "References:".bold());
         for reference in &info.references {
-            println!("    - {}", reference);
+            crate::mprintln!("    - {}", reference);
         }
-        println!();
+        crate::mprintln!();
     }
 }
 

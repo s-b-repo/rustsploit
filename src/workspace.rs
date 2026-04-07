@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use serde::{Serialize, Deserialize};
 use colored::*;
 
@@ -50,7 +50,7 @@ impl Workspace {
             .join(".rustsploit")
             .join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) { eprintln!("[!] Directory creation error: {}", e); }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
 
         let data = Self::load_sync(&base_dir, "default");
         Self {
@@ -72,9 +72,9 @@ impl Workspace {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
+                        crate::meprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&path, &backup) { eprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
                         WorkspaceData::default()
                     }
                 },
@@ -96,14 +96,14 @@ impl Workspace {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
+                        crate::meprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
                         if let Err(e) = tokio::fs::copy(&path, &backup).await { crate::meprintln!("[!] Copy error: {}", e); }
                         WorkspaceData::default()
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Starting empty.", name, e);
+                    crate::meprintln!("[!] Warning: Failed to read workspace '{}': {}. Starting empty.", name, e);
                     WorkspaceData::default()
                 }
             }
@@ -128,7 +128,7 @@ impl Workspace {
         if let Ok(json) = serde_json::to_string_pretty(&data_snapshot) {
             if tokio::fs::write(&tmp, &json).await.is_ok() {
                 if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-                    eprintln!("[!] Failed to save workspace: {}", e);
+                    crate::meprintln!("[!] Failed to save workspace: {}", e);
                 } else {
                     use std::os::unix::fs::PermissionsExt;
                     if let Err(e) = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
@@ -215,7 +215,7 @@ impl Workspace {
             let mut data = self.data.write().await;
             if let Some(host) = data.hosts.iter_mut().find(|h| h.ip == ip) {
                 if host.notes.len() >= Self::MAX_NOTES_PER_HOST {
-                    eprintln!("[!] Maximum notes per host reached ({}).", Self::MAX_NOTES_PER_HOST);
+                    crate::meprintln!("[!] Maximum notes per host reached ({}).", Self::MAX_NOTES_PER_HOST);
                     return false;
                 }
                 host.notes.push(note.to_string());
@@ -315,47 +315,47 @@ impl Workspace {
     pub async fn display_hosts(&self) {
         let hosts = self.hosts().await;
         if hosts.is_empty() {
-            println!("{}", "No hosts tracked. Use 'hosts add <ip>' to add one.".dimmed());
+            crate::mprintln!("{}", "No hosts tracked. Use 'hosts add <ip>' to add one.".dimmed());
             return;
         }
         let name = self.current_name().await;
-        println!();
-        println!("{}", format!("Hosts ({} total) - Workspace: {}", hosts.len(), name).bold().underline());
-        println!();
-        println!("  {:<18} {:<25} {:<15} {:<20} {}",
+        crate::mprintln!();
+        crate::mprintln!("{}", format!("Hosts ({} total) - Workspace: {}", hosts.len(), name).bold().underline());
+        crate::mprintln!();
+        crate::mprintln!("  {:<18} {:<25} {:<15} {:<20} {}",
             "IP".bold(), "Hostname".bold(), "OS".bold(), "Last Seen".bold(), "Notes".bold());
-        println!("  {}", "-".repeat(90).dimmed());
+        crate::mprintln!("  {}", "-".repeat(90).dimmed());
         for h in &hosts {
-            println!("  {:<18} {:<25} {:<15} {:<20} {}",
+            crate::mprintln!("  {:<18} {:<25} {:<15} {:<20} {}",
                 h.ip.green(),
                 h.hostname.as_deref().unwrap_or("-"),
                 h.os_guess.as_deref().unwrap_or("-"),
                 &h.last_seen,
                 h.notes.len());
         }
-        println!();
+        crate::mprintln!();
     }
 
     /// Display services table.
     pub async fn display_services(&self) {
         let services = self.services().await;
         if services.is_empty() {
-            println!("{}", "No services tracked. Use 'services add' to add one.".dimmed());
+            crate::mprintln!("{}", "No services tracked. Use 'services add' to add one.".dimmed());
             return;
         }
         let name = self.current_name().await;
-        println!();
-        println!("{}", format!("Services ({} total) - Workspace: {}", services.len(), name).bold().underline());
-        println!();
-        println!("  {:<18} {:<8} {:<8} {:<15} {}",
+        crate::mprintln!();
+        crate::mprintln!("{}", format!("Services ({} total) - Workspace: {}", services.len(), name).bold().underline());
+        crate::mprintln!();
+        crate::mprintln!("  {:<18} {:<8} {:<8} {:<15} {}",
             "Host".bold(), "Port".bold(), "Proto".bold(), "Service".bold(), "Version".bold());
-        println!("  {}", "-".repeat(70).dimmed());
+        crate::mprintln!("  {}", "-".repeat(70).dimmed());
         for s in &services {
-            println!("  {:<18} {:<8} {:<8} {:<15} {}",
+            crate::mprintln!("  {:<18} {:<8} {:<8} {:<15} {}",
                 s.host.green(), s.port, s.protocol, s.service_name,
                 s.version.as_deref().unwrap_or("-"));
         }
-        println!();
+        crate::mprintln!();
     }
 }
 

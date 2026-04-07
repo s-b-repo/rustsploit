@@ -25,3 +25,4 @@
     pub mod elasticsearch_bruteforce;
     pub mod couchdb_bruteforce;
     pub mod memcached_bruteforce;
+    pub mod proxy_bruteforce;

@@ -171,7 +171,7 @@ impl BruteforceStats {
                 rate
             );
         }
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
     }
 
     pub async fn print_final(&self) {
@@ -295,44 +295,39 @@ pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr 
 
 /// In-memory dedup set for mass scan IP tracking.
 /// Avoids the TOCTOU race of file-based is_ip_checked + mark_ip_checked.
-static CHECKED_IPS: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+static CHECKED_IPS: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// Atomically check AND mark an IP — returns true if already checked (skip it).
-/// Uses in-memory HashSet for race-free dedup, with file append for persistence.
-pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
-    let ip_str = ip.to_string();
-    let mut set = CHECKED_IPS.lock().await;
-    if set.contains(&ip_str) {
-        return true;
-    }
-    // Check file on first access (cold start after restart)
-    if set.is_empty() {
-        if let Ok(contents) = tokio::fs::read_to_string(state_file).await {
-            for line in contents.lines() {
-                if let Some(checked_ip) = line.strip_prefix("checked: ") {
-                    set.insert(checked_ip.to_string());
-                }
-            }
-            if set.contains(&ip_str) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Mark an IP as checked (in memory + persisted to file).
-pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
+/// Atomically check AND mark an IP in a single lock acquisition.
+/// Returns `true` if the IP was already checked (caller should skip it).
+/// On first call, loads persisted state from file (cold start recovery).
+/// Persists the new entry to file for restart durability.
+pub async fn check_and_mark_ip(ip: &impl ToString, state_file: &str) -> bool {
     if state_file.contains("..") {
         crate::meprintln!("[!] Invalid state file path: {}", state_file);
-        return;
+        return false;
     }
     let ip_str = ip.to_string();
     {
         let mut set = CHECKED_IPS.lock().await;
-        set.insert(ip_str.clone());
+
+        // Cold start: load persisted state from file on first access
+        if set.is_empty() {
+            if let Ok(contents) = tokio::fs::read_to_string(state_file).await {
+                for line in contents.lines() {
+                    if let Some(checked_ip) = line.strip_prefix("checked: ") {
+                        set.insert(checked_ip.to_string());
+                    }
+                }
+            }
+        }
+
+        if !set.insert(ip_str.clone()) {
+            // Already present — skip this IP
+            return true;
+        }
     }
+    // Persist outside the lock to minimize hold time
     let data = format!("checked: {}\n", ip_str);
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
@@ -342,7 +337,9 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
     {
         if let Err(e) = file.write_all(data.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
     }
+    false
 }
+
 
 pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
     let mut exclusion_subnets = Vec::new();
@@ -530,8 +527,7 @@ where
 
             tokio::spawn(async move {
                 let ip = generate_random_public_ip(&exc);
-                if !is_ip_checked(&ip, state_file).await {
-                    mark_ip_checked(&ip, state_file).await;
+                if !check_and_mark_ip(&ip, state_file).await {
                     if let Some(line) = probe(ip, port).await {
                         sf.fetch_add(1, Ordering::Relaxed);
                         if let Err(e) = tx.send(line).await {
@@ -564,8 +560,7 @@ where
             let probe = probe.clone();
 
             tokio::spawn(async move {
-                if !is_ip_checked(&ip_addr, state_file).await {
-                    mark_ip_checked(&ip_addr, state_file).await;
+                if !check_and_mark_ip(&ip_addr, state_file).await {
                     if let Some(line) = probe(ip_addr, port).await {
                         sf.fetch_add(1, Ordering::Relaxed);
                         if let Err(e) = tx.send(line).await {
@@ -615,8 +610,7 @@ where
 
             tokio::spawn(async move {
                 if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    if !is_ip_checked(&ip, state_file).await {
-                        mark_ip_checked(&ip, state_file).await;
+                    if !check_and_mark_ip(&ip, state_file).await {
                         if let Some(line) = probe(ip, port).await {
                             sf.fetch_add(1, Ordering::Relaxed);
                             if let Err(e) = tx.send(line).await {
@@ -666,6 +660,17 @@ pub enum LoginResult {
     Error { message: String, retryable: bool },
 }
 
+/// Credential combination strategy.
+#[derive(Clone, Copy, Debug)]
+pub enum ComboMode {
+    /// Pair user\[i\] with pass\[i\], cycling the shorter list.
+    Linear,
+    /// Full cross product: every user × every password.
+    Combo,
+    /// Password spray: for each password, try all users (avoids account lockout).
+    Spray,
+}
+
 /// Common configuration for the bruteforce engine.
 #[derive(Clone)]
 pub struct BruteforceConfig {
@@ -675,6 +680,8 @@ pub struct BruteforceConfig {
     pub stop_on_success: bool,
     pub verbose: bool,
     pub delay_ms: u64,
+    /// Random jitter added to delay_ms (0..jitter_ms) for IDS evasion.
+    pub jitter_ms: u64,
     pub max_retries: usize,
     pub service_name: &'static str,
     pub source_module: &'static str,
@@ -731,33 +738,69 @@ impl BruteforceResult {
     }
 }
 
-/// Generate credential pairs from username and password lists.
-/// In combo mode, produces the full cross product (user × pass).
-/// In linear mode, pairs user\[i\] with pass\[i\], cycling the shorter list.
-pub fn generate_combos(
+/// Generate credential pairs with full combo mode control.
+/// - Linear: pairs user\[i\] with pass\[i\], cycling the shorter list.
+/// - Combo: full cross product (user × pass).
+/// - Spray: for each password, try all users (lockout-safe ordering).
+pub fn generate_combos_mode(
     usernames: &[String],
     passwords: &[String],
-    combo_mode: bool,
+    mode: ComboMode,
 ) -> Vec<(String, String)> {
     if usernames.is_empty() || passwords.is_empty() {
         return Vec::new();
     }
-    let mut combos = Vec::new();
-    if combo_mode {
-        for u in usernames {
+    match mode {
+        ComboMode::Combo => {
+            let mut combos = Vec::with_capacity(usernames.len() * passwords.len());
+            for u in usernames {
+                for p in passwords {
+                    combos.push((u.clone(), p.clone()));
+                }
+            }
+            combos
+        }
+        ComboMode::Spray => {
+            let mut combos = Vec::with_capacity(usernames.len() * passwords.len());
             for p in passwords {
+                for u in usernames {
+                    combos.push((u.clone(), p.clone()));
+                }
+            }
+            combos
+        }
+        ComboMode::Linear => {
+            let max_len = std::cmp::max(usernames.len(), passwords.len());
+            let mut combos = Vec::with_capacity(max_len);
+            for i in 0..max_len {
+                let u = &usernames[i % usernames.len()];
+                let p = &passwords[i % passwords.len()];
                 combos.push((u.clone(), p.clone()));
             }
-        }
-    } else {
-        let max_len = std::cmp::max(usernames.len(), passwords.len());
-        for i in 0..max_len {
-            let u = &usernames[i % usernames.len()];
-            let p = &passwords[i % passwords.len()];
-            combos.push((u.clone(), p.clone()));
+            combos
         }
     }
-    combos
+}
+
+/// Load user:pass credential pairs from a file (one pair per line, colon-separated).
+pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
+    let lines = crate::utils::load_lines(path)?;
+    let mut combos = Vec::new();
+    for line in lines {
+        if let Some((user, pass)) = line.split_once(':') {
+            combos.push((user.to_string(), pass.to_string()));
+        }
+    }
+    Ok(combos)
+}
+
+/// Parse combo mode from user input string.
+pub fn parse_combo_mode(input: &str) -> ComboMode {
+    match input.trim().to_lowercase().as_str() {
+        "combo" | "cross" => ComboMode::Combo,
+        "spray" | "password_spray" => ComboMode::Spray,
+        _ => ComboMode::Linear,
+    }
 }
 
 /// Run the generic bruteforce engine against a single target.
@@ -830,6 +873,7 @@ where
         let stop_on_success = config.stop_on_success;
         let max_retries = config.max_retries;
         let delay_ms = config.delay_ms;
+        let jitter_ms = config.jitter_ms;
 
         tasks.push(tokio::spawn(async move {
             if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
@@ -897,8 +941,11 @@ where
                 }
             }
 
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            if delay_ms > 0 || jitter_ms > 0 {
+                let jitter = if jitter_ms > 0 {
+                    rand::rng().random_range(0..=jitter_ms)
+                } else { 0 };
+                tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
             }
         }));
 
@@ -937,6 +984,8 @@ pub struct SubnetScanConfig {
     pub verbose: bool,
     pub output_file: String,
     pub service_name: &'static str,
+    /// Random jitter added to delay between attempts (0..jitter_ms).
+    pub jitter_ms: u64,
     pub source_module: &'static str,
     /// Skip the TCP port pre-check before attempting credentials.
     /// Set to `true` for UDP-based protocols (SNMP, L2TP) where a TCP
@@ -1043,15 +1092,13 @@ where
         let try_login = try_login.clone();
         let verbose = config.verbose;
         let skip_tcp = config.skip_tcp_check;
+        let jitter_ms = config.jitter_ms;
 
         tokio::spawn(async move {
             // Quick TCP port check (skipped for UDP protocols)
             if !skip_tcp {
                 let sa = SocketAddr::new(ip, port);
-                if tokio::time::timeout(
-                    Duration::from_millis(3000),
-                    tokio::net::TcpStream::connect(&sa),
-                )
+                if crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
                 .await
                 .is_err()
                 {
@@ -1105,6 +1152,11 @@ where
                                 break 'outer; // host unreachable, skip
                             }
                         }
+                    }
+                    // Apply jitter between attempts if configured
+                    if jitter_ms > 0 {
+                        let jitter = rand::rng().random_range(0..=jitter_ms);
+                        tokio::time::sleep(Duration::from_millis(jitter)).await;
                     }
                 }
             }

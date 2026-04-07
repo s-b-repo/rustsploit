@@ -524,7 +524,7 @@ impl ProgressTracker {
             "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
             self.current, self.total, pct, rate, eta
         ).cyan());
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
 
         if self.current == self.total {
             crate::mprintln!();

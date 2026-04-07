@@ -4,7 +4,7 @@
 
 use anyhow::{Result, anyhow, Context};
 use colored::*;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use regex::Regex;
 use std::net::ToSocketAddrs;
 use url::Url;

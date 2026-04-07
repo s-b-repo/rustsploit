@@ -147,7 +147,7 @@ fn history_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".rustsploit");
     use std::os::unix::fs::DirBuilderExt;
-    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { eprintln!("[!] Directory creation error: {}", e); }
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
     dir.join("history.txt")
 }
 
@@ -178,8 +178,8 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
 }
 
 async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> Result<()> {
-    println!("Welcome to RustSploit Shell (inspired by RouterSploit)");
-    println!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
+    crate::mprintln!("Welcome to RustSploit Shell (inspired by RouterSploit)");
+    crate::mprintln!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
 
     // Show global target if set
     if config::GLOBAL_CONFIG.has_target() {
@@ -189,46 +189,46 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         };
         if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
             if size > 1 {
-                println!("{}", format!("[*] Global target set: {} ({} IPs)", target_str, size).cyan());
+                crate::mprintln!("{}", format!("[*] Global target set: {} ({} IPs)", target_str, size).cyan());
             } else {
-                println!("{}", format!("[*] Global target set: {}", target_str).cyan());
+                crate::mprintln!("{}", format!("[*] Global target set: {}", target_str).cyan());
             }
         } else {
-            println!("{}", format!("[*] Global target set: {}", target_str).cyan());
+            crate::mprintln!("{}", format!("[*] Global target set: {}", target_str).cyan());
         }
     }
 
     // Check for third-party plugins
     let n_plugins = crate::commands::plugin_count();
     if n_plugins > 0 {
-        println!();
-        println!("{}", "╔══════════════════════════════════════════════════════════════════════════╗".red());
-        println!("{}", "║                  WARNING: THIRD-PARTY PLUGINS DETECTED                  ║".red().bold());
-        println!("{}", "╠══════════════════════════════════════════════════════════════════════════╣".red());
-        println!("{}", "║  This instance has loaded third-party plugin modules from the           ║".red());
-        println!("{}", "║  plugins/ directory. These modules are NOT developed, maintained,       ║".red());
-        println!("{}", "║  reviewed, or endorsed by the RustSploit project.                       ║".red());
-        println!("{}", "║                                                                         ║".red());
-        println!("{}", "║  DISCLAIMER:                                                            ║".red());
-        println!("{}", "║  - Third-party plugins may contain malicious code, backdoors, or        ║".red());
-        println!("{}", "║    vulnerabilities that could compromise your system or network.         ║".red());
-        println!("{}", "║  - The RustSploit developers are NOT responsible or liable for any      ║".red());
-        println!("{}", "║    damage, data loss, unauthorized access, legal consequences, or       ║".red());
-        println!("{}", "║    other harm caused by third-party plugins.                            ║".red());
-        println!("{}", "║  - Use third-party plugins entirely at your own risk.                   ║".red());
-        println!("{}", "║  - Only install plugins from sources you trust and have audited.        ║".red());
-        println!("{}", "║  - Plugins have full access to your system with the same privileges     ║".red());
-        println!("{}", "║    as RustSploit itself.                                                ║".red());
-        println!("{}",  format!("║  Loaded plugins: {:<56}║", n_plugins).red());
-        println!("{}", "║  To disable: remove files from src/modules/plugins/ and rebuild.        ║".red());
-        println!("{}", "╚══════════════════════════════════════════════════════════════════════════╝".red());
-        println!();
+        crate::mprintln!();
+        crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════════════════╗".red());
+        crate::mprintln!("{}", "║                  WARNING: THIRD-PARTY PLUGINS DETECTED                  ║".red().bold());
+        crate::mprintln!("{}", "╠══════════════════════════════════════════════════════════════════════════╣".red());
+        crate::mprintln!("{}", "║  This instance has loaded third-party plugin modules from the           ║".red());
+        crate::mprintln!("{}", "║  plugins/ directory. These modules are NOT developed, maintained,       ║".red());
+        crate::mprintln!("{}", "║  reviewed, or endorsed by the RustSploit project.                       ║".red());
+        crate::mprintln!("{}", "║                                                                         ║".red());
+        crate::mprintln!("{}", "║  DISCLAIMER:                                                            ║".red());
+        crate::mprintln!("{}", "║  - Third-party plugins may contain malicious code, backdoors, or        ║".red());
+        crate::mprintln!("{}", "║    vulnerabilities that could compromise your system or network.         ║".red());
+        crate::mprintln!("{}", "║  - The RustSploit developers are NOT responsible or liable for any      ║".red());
+        crate::mprintln!("{}", "║    damage, data loss, unauthorized access, legal consequences, or       ║".red());
+        crate::mprintln!("{}", "║    other harm caused by third-party plugins.                            ║".red());
+        crate::mprintln!("{}", "║  - Use third-party plugins entirely at your own risk.                   ║".red());
+        crate::mprintln!("{}", "║  - Only install plugins from sources you trust and have audited.        ║".red());
+        crate::mprintln!("{}", "║  - Plugins have full access to your system with the same privileges     ║".red());
+        crate::mprintln!("{}", "║    as RustSploit itself.                                                ║".red());
+        crate::mprintln!("{}",  format!("║  Loaded plugins: {:<56}║", n_plugins).red());
+        crate::mprintln!("{}", "║  To disable: remove files from src/modules/plugins/ and rebuild.        ║".red());
+        crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════════════════╝".red());
+        crate::mprintln!();
     }
 
     // Show global options count if any are set
     let gopts = crate::global_options::GLOBAL_OPTIONS.all().await;
     if !gopts.is_empty() {
-        println!("{}", format!("[*] {} global option(s) loaded (use 'show options' to view)", gopts.len()).cyan());
+        crate::mprintln!("{}", format!("[*] {} global option(s) loaded (use 'show options' to view)", gopts.len()).cyan());
     }
 
     let mut ctx = ShellContext::new(verbose);
@@ -241,7 +241,7 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
     let mut rl = Editor::with_config(rl_config)?;
     rl.set_helper(Some(RsfCompleter::new()));
     let hist = history_path();
-    if let Err(e) = rl.load_history(&hist) { eprintln!("[!] History load error: {}", e); }
+    if let Err(e) = rl.load_history(&hist) { crate::meprintln!("[!] History load error: {}", e); }
 
     // Auto-load startup.rc if it exists
     let startup_rc = home::home_dir()
@@ -249,13 +249,13 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         .join(".rustsploit")
         .join("startup.rc");
     if startup_rc.exists() {
-        println!("{}", format!("[*] Loading startup script: {}", startup_rc.display()).cyan());
+        crate::mprintln!("{}", format!("[*] Loading startup script: {}", startup_rc.display()).cyan());
         execute_resource_file_inner(&mut ctx, &startup_rc.to_string_lossy(), 0).await;
     }
 
     // Execute CLI-provided resource file (-r flag)
     if let Some(rc_file) = resource_file {
-        println!("{}", format!("[*] Loading resource script: {}", rc_file).cyan());
+        crate::mprintln!("{}", format!("[*] Loading resource script: {}", rc_file).cyan());
         execute_resource_file_inner(&mut ctx, rc_file, 0).await;
     }
 
@@ -267,7 +267,7 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         };
 
         if raw_input.len() > MAX_INPUT_LENGTH {
-            println!(
+            crate::mprintln!(
                 "{}",
                 format!(
                     "[!] Input length exceeds {} characters and was ignored.",
@@ -292,7 +292,7 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         .collect();
 
         if trimmed.split('&').count() > MAX_COMMAND_CHAIN_LENGTH {
-            println!(
+            crate::mprintln!(
                 "{}",
                 format!("[!] Command chain exceeds maximum length of {}. Truncating.", MAX_COMMAND_CHAIN_LENGTH)
                     .yellow()
@@ -313,7 +313,7 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         }
     }
 
-    if let Err(e) = rl.save_history(&hist) { eprintln!("[!] History save error: {}", e); }
+    if let Err(e) = rl.save_history(&hist) { crate::meprintln!("[!] History save error: {}", e); }
     Ok(())
 }
 
@@ -336,13 +336,13 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
     let command_key = resolve_command(&cmd);
     match command_key.as_str() {
                 "exit" => {
-                    println!("Exiting...");
+                    crate::mprintln!("Exiting...");
                     return true;
                 }
                 "back" => {
                     ctx.current_module = None;
                     config::GLOBAL_CONFIG.clear_target();
-                    println!("{}", "Cleared current module and target.".green());
+                    crate::mprintln!("{}", "Cleared current module and target.".green());
                 }
                 "show_target" | "target" => {
                     if config::GLOBAL_CONFIG.has_target() {
@@ -355,35 +355,35 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
                             if is_multi {
                                 let count = target_str.split(',').count();
-                                println!("{}", format!("Target (multi): {} ({} entries, ~{} IPs)", target_str, count, size).green());
+                                crate::mprintln!("{}", format!("Target (multi): {} ({} entries, ~{} IPs)", target_str, count, size).green());
                             } else if size > 1 && is_subnet {
-                                println!("{}", format!("Target (subnet): {} ({} IPs)", target_str, size).green());
+                                crate::mprintln!("{}", format!("Target (subnet): {} ({} IPs)", target_str, size).green());
                             } else {
-                                println!("{}", format!("Target: {}", target_str).green());
+                                crate::mprintln!("{}", format!("Target: {}", target_str).green());
                             }
                         } else {
-                            println!("{}", format!("Target: {}", target_str).green());
+                            crate::mprintln!("{}", format!("Target: {}", target_str).green());
                         }
                     } else {
-                        println!("{}", "No target set.".dimmed());
+                        crate::mprintln!("{}", "No target set.".dimmed());
                     }
                     // Show port settings if set
                     if let Some(port) = crate::global_options::GLOBAL_OPTIONS.get("port").await {
-                        println!("{}", format!("Port:        {}", port).green());
+                        crate::mprintln!("{}", format!("Port:        {}", port).green());
                     }
                     if let Some(sport) = crate::global_options::GLOBAL_OPTIONS.get("source_port").await {
-                        println!("{}", format!("Source Port: {}", sport).green());
+                        crate::mprintln!("{}", format!("Source Port: {}", sport).green());
                     }
                 }
                 "clear_target" => {
                     config::GLOBAL_CONFIG.clear_target();
-                    println!("{}", "Cleared target.".green());
+                    crate::mprintln!("{}", "Cleared target.".green());
                 }
                 "help" => render_help(),
                 "modules" => utils::list_all_modules(),
                 "find" => {
                     if rest.is_empty() {
-                        println!("{}", "Usage: find <keyword>".yellow());
+                        crate::mprintln!("{}", "Usage: find <keyword>".yellow());
                     } else {
                         utils::find_modules(&rest);
                     }
@@ -391,16 +391,16 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
 
                 "use" => {
                     if rest.is_empty() {
-                        println!("{}", "Usage: use <module_path>".yellow());
+                        crate::mprintln!("{}", "Usage: use <module_path>".yellow());
                     } else if let Some(safe_path) = sanitize_module_path(&rest) {
                         if utils::module_exists(&safe_path) {
                             ctx.current_module = Some(safe_path.clone());
-                            println!("{}", format!("Module '{}' selected.", safe_path).green());
+                            crate::mprintln!("{}", format!("Module '{}' selected.", safe_path).green());
                         } else {
-                            println!("{}", format!("Module '{}' not found.", rest).red());
+                            crate::mprintln!("{}", format!("Module '{}' not found.", rest).red());
                         }
                     } else {
-                        println!(
+                        crate::mprintln!(
                             "{}",
                             "Module path contains invalid characters or traversal attempts."
                             .red()
@@ -414,22 +414,22 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         match val.parse::<u16>() {
                             Ok(p) if p > 0 => {
                                 crate::global_options::GLOBAL_OPTIONS.set("port", val).await;
-                                println!("{}", format!("Global port set to: {}", val).green());
+                                crate::mprintln!("{}", format!("Global port set to: {}", val).green());
                             }
-                            _ => println!("{}", "Invalid port. Must be 1-65535.".yellow()),
+                            _ => crate::mprintln!("{}", "Invalid port. Must be 1-65535.".yellow()),
                         }
                     } else if let Some(val) = rest.strip_prefix("source_port ") {
                         let val = val.trim();
                         if val == "0" || val.is_empty() {
                             crate::global_options::GLOBAL_OPTIONS.unset("source_port").await;
-                            println!("{}", "Source port cleared (will use OS-assigned).".green());
+                            crate::mprintln!("{}", "Source port cleared (will use OS-assigned).".green());
                         } else {
                             match val.parse::<u16>() {
                                 Ok(p) if p > 0 => {
                                     crate::global_options::GLOBAL_OPTIONS.set("source_port", val).await;
-                                    println!("{}", format!("Global source port set to: {}", val).green());
+                                    crate::mprintln!("{}", format!("Global source port set to: {}", val).green());
                                 }
-                                _ => println!("{}", "Invalid source port. Must be 1-65535 (or 0 to clear).".yellow()),
+                                _ => crate::mprintln!("{}", "Invalid source port. Must be 1-65535 (or 0 to clear).".yellow()),
                             }
                         }
                     } else {
@@ -447,21 +447,21 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     let raw_value = raw_value.trim();
 
                     if raw_value.is_empty() {
-                        println!("{}", "Usage: set target <value>".yellow());
-                        println!("{}", "  Shortcuts: t <value>, target <value>".dimmed());
-                        println!("{}", "  For subnets: set subnet <CIDR> or sn <CIDR>".dimmed());
-                        println!("{}", "  set port <1-65535>    — Set target port for all modules".dimmed());
-                        println!("{}", "  set source_port <val> — Set source port (0 to clear)".dimmed());
-                        println!("{}", "  Examples:".dimmed());
-                        println!("{}", "    t 192.168.1.1".dimmed());
-                        println!("{}", "    t 10.0.0.1, 192.168.1.1, 172.16.0.5".dimmed());
-                        println!("{}", "    t 10.0.0.0/24, 192.168.1.1".dimmed());
-                        println!("{}", "    sn 10.16.0.0/24".dimmed());
-                        println!("{}", "    set target example.com".dimmed());
-                        println!("{}", "    set target random".dimmed());
-                        println!("{}", "    set target /path/to/targets.txt".dimmed());
-                        println!("{}", "    set port 8080".dimmed());
-                        println!("{}", "    set source_port 31337".dimmed());
+                        crate::mprintln!("{}", "Usage: set target <value>".yellow());
+                        crate::mprintln!("{}", "  Shortcuts: t <value>, target <value>".dimmed());
+                        crate::mprintln!("{}", "  For subnets: set subnet <CIDR> or sn <CIDR>".dimmed());
+                        crate::mprintln!("{}", "  set port <1-65535>    — Set target port for all modules".dimmed());
+                        crate::mprintln!("{}", "  set source_port <val> — Set source port (0 to clear)".dimmed());
+                        crate::mprintln!("{}", "  Examples:".dimmed());
+                        crate::mprintln!("{}", "    t 192.168.1.1".dimmed());
+                        crate::mprintln!("{}", "    t 10.0.0.1, 192.168.1.1, 172.16.0.5".dimmed());
+                        crate::mprintln!("{}", "    t 10.0.0.0/24, 192.168.1.1".dimmed());
+                        crate::mprintln!("{}", "    sn 10.16.0.0/24".dimmed());
+                        crate::mprintln!("{}", "    set target example.com".dimmed());
+                        crate::mprintln!("{}", "    set target random".dimmed());
+                        crate::mprintln!("{}", "    set target /path/to/targets.txt".dimmed());
+                        crate::mprintln!("{}", "    set port 8080".dimmed());
+                        crate::mprintln!("{}", "    set source_port 31337".dimmed());
                     } else {
                         match sanitize_target(raw_value) {
                             Ok(valid_target) => {
@@ -471,8 +471,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     match utils::prompt_domain_target(&valid_target).await {
                                         Ok((resolved, _url)) => resolved,
                                         Err(e) => {
-                                            println!("{}", format!("[!] Domain targeting failed: {}", e).red());
-                                            println!("{}", "[*] Falling back to raw target".yellow());
+                                            crate::mprintln!("{}", format!("[!] Domain targeting failed: {}", e).red());
+                                            crate::mprintln!("{}", "[*] Falling back to raw target".yellow());
                                             valid_target.clone()
                                         }
                                     }
@@ -485,25 +485,25 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                         if final_target.contains(',') {
                                             let count = final_target.split(',').count();
                                             if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
-                                                println!("{}", format!("Target set to: {} ({} entries, ~{} IPs)", final_target, count, size).green());
+                                                crate::mprintln!("{}", format!("Target set to: {} ({} entries, ~{} IPs)", final_target, count, size).green());
                                             } else {
-                                                println!("{}", format!("Target set to: {} ({} entries)", final_target, count).green());
+                                                crate::mprintln!("{}", format!("Target set to: {} ({} entries)", final_target, count).green());
                                             }
                                         } else if final_target.contains('/') {
                                             let ip_part = final_target.split('/').next().unwrap_or(&final_target);
                                             let prefix = final_target.split('/').nth(1).unwrap_or("");
-                                            println!("{}", format!("Target set to: {} (subnet: /{})", ip_part, prefix).green());
+                                            crate::mprintln!("{}", format!("Target set to: {} (subnet: /{})", ip_part, prefix).green());
                                         } else {
-                                            println!("{}", format!("Target set to: {}", final_target).green());
+                                            crate::mprintln!("{}", format!("Target set to: {}", final_target).green());
                                         }
                                     }
                                     Err(e) => {
-                                        println!("{}", format!("[!] Failed to set target: {}", e).red());
+                                        crate::mprintln!("{}", format!("[!] Failed to set target: {}", e).red());
                                     }
                                 }
                             }
                             Err(reason) => {
-                                println!("{}", format!("[!] {}", reason).yellow());
+                                crate::mprintln!("{}", format!("[!] {}", reason).yellow());
                             }
                         }
                     }
@@ -524,39 +524,39 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     let raw_value = raw_value.trim();
 
                     if raw_value.is_empty() {
-                        println!("{}", "Usage: set subnet <CIDR>".yellow());
-                        println!("{}", "  Shortcuts: sn <CIDR>, subnet <CIDR>".dimmed());
-                        println!("{}", "  Examples:".dimmed());
-                        println!("{}", "    sn 192.168.1.0/24".dimmed());
-                        println!("{}", "    set subnet 10.0.0.0/16".dimmed());
+                        crate::mprintln!("{}", "Usage: set subnet <CIDR>".yellow());
+                        crate::mprintln!("{}", "  Shortcuts: sn <CIDR>, subnet <CIDR>".dimmed());
+                        crate::mprintln!("{}", "  Examples:".dimmed());
+                        crate::mprintln!("{}", "    sn 192.168.1.0/24".dimmed());
+                        crate::mprintln!("{}", "    set subnet 10.0.0.0/16".dimmed());
                     } else {
                         // Validate it's a CIDR subnet, not a plain IP
                         if !raw_value.contains('/') {
-                            println!("{}", "[!] Not a subnet. Use CIDR notation (e.g. 192.168.1.0/24).".yellow());
-                            println!("{}", "    For single IPs, use: set target <IP>".dimmed());
+                            crate::mprintln!("{}", "[!] Not a subnet. Use CIDR notation (e.g. 192.168.1.0/24).".yellow());
+                            crate::mprintln!("{}", "    For single IPs, use: set target <IP>".dimmed());
                         } else {
                             match sanitize_target(raw_value) {
                                 Ok(valid_target) => {
                                     // Verify it actually parses as CIDR
                                     if valid_target.parse::<IpNetwork>().is_err() {
-                                        println!("{}", format!("[!] Invalid CIDR notation: {}", valid_target).red());
+                                        crate::mprintln!("{}", format!("[!] Invalid CIDR notation: {}", valid_target).red());
                                     } else {
                                         match config::GLOBAL_CONFIG.set_target(&valid_target) {
                                             Ok(_) => {
                                                 if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
-                                                    println!("{}", format!("Subnet set to: {} ({} IPs)", valid_target, size).green());
+                                                    crate::mprintln!("{}", format!("Subnet set to: {} ({} IPs)", valid_target, size).green());
                                                 } else {
-                                                    println!("{}", format!("Subnet set to: {}", valid_target).green());
+                                                    crate::mprintln!("{}", format!("Subnet set to: {}", valid_target).green());
                                                 }
                                             }
                                             Err(e) => {
-                                                println!("{}", format!("[!] Failed to set subnet: {}", e).red());
+                                                crate::mprintln!("{}", format!("[!] Failed to set subnet: {}", e).red());
                                             }
                                         }
                                     }
                                 }
                                 Err(reason) => {
-                                    println!("{}", format!("[!] {}", reason).yellow());
+                                    crate::mprintln!("{}", format!("[!] {}", reason).yellow());
                                 }
                             }
                         }
@@ -577,11 +577,11 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         if let Some(info) = commands::module_info(path) {
                             crate::module_info::display_module_info(path, &info);
                         } else {
-                            println!("{}", format!("No metadata available for '{}'.", path).dimmed());
-                            println!("{}", "Modules can provide metadata by adding a pub fn info() -> ModuleInfo function.".dimmed());
+                            crate::mprintln!("{}", format!("No metadata available for '{}'.", path).dimmed());
+                            crate::mprintln!("{}", "Modules can provide metadata by adding a pub fn info() -> ModuleInfo function.".dimmed());
                         }
                     } else {
-                        println!("{}", "No module selected. Use 'info <module_path>' or select a module first.".yellow());
+                        crate::mprintln!("{}", "No module selected. Use 'info <module_path>' or select a module first.".yellow());
                     }
                 }
 
@@ -593,24 +593,24 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     if let Some(ref path) = module_path {
                         let target = config::GLOBAL_CONFIG.get_target();
                         if let Some(ref t) = target {
-                            println!("{}", format!("[*] Checking {} against {}...", path, t).cyan());
+                            crate::mprintln!("{}", format!("[*] Checking {} against {}...", path, t).cyan());
                             match commands::check_module(path, t).await {
                                 Some(result) => {
                                     use crate::module_info::CheckResult;
                                     match &result {
-                                        CheckResult::Vulnerable(msg) => println!("{}", format!("[+] VULNERABLE: {}", msg).green().bold()),
-                                        CheckResult::NotVulnerable(msg) => println!("{}", format!("[-] Not vulnerable: {}", msg).red()),
-                                        CheckResult::Unknown(msg) => println!("{}", format!("[?] Unknown: {}", msg).yellow()),
-                                        CheckResult::Error(msg) => println!("{}", format!("[!] Error: {}", msg).red()),
+                                        CheckResult::Vulnerable(msg) => crate::mprintln!("{}", format!("[+] VULNERABLE: {}", msg).green().bold()),
+                                        CheckResult::NotVulnerable(msg) => crate::mprintln!("{}", format!("[-] Not vulnerable: {}", msg).red()),
+                                        CheckResult::Unknown(msg) => crate::mprintln!("{}", format!("[?] Unknown: {}", msg).yellow()),
+                                        CheckResult::Error(msg) => crate::mprintln!("{}", format!("[!] Error: {}", msg).red()),
                                     }
                                 }
-                                None => println!("{}", format!("Module '{}' does not support the check method.", path).dimmed()),
+                                None => crate::mprintln!("{}", format!("Module '{}' does not support the check method.", path).dimmed()),
                             }
                         } else {
-                            println!("{}", "No target set. Use 'set target <value>' first.".yellow());
+                            crate::mprintln!("{}", "No target set. Use 'set target <value>' first.".yellow());
                         }
                     } else {
-                        println!("{}", "No module selected. Use 'use <module>' first.".yellow());
+                        crate::mprintln!("{}", "No module selected. Use 'use <module>' first.".yellow());
                     }
                 }
 
@@ -622,24 +622,24 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let key = key.trim();
                         let value = value.trim();
                         if key.is_empty() || value.is_empty() {
-                            println!("{}", "Usage: setg <key> <value>".yellow());
+                            crate::mprintln!("{}", "Usage: setg <key> <value>".yellow());
                         } else {
                             crate::global_options::GLOBAL_OPTIONS.set(key, value).await;
-                            println!("{}", format!("{} => {}", key.green(), value).to_string());
+                            crate::mprintln!("{}", format!("{} => {}", key.green(), value).to_string());
                         }
                     } else {
-                        println!("{}", "Usage: setg <key> <value>".yellow());
-                        println!("{}", "  Example: setg port 8080".dimmed());
+                        crate::mprintln!("{}", "Usage: setg <key> <value>".yellow());
+                        crate::mprintln!("{}", "  Example: setg port 8080".dimmed());
                     }
                 }
                 "unsetg" => {
                     let key = rest.trim();
                     if key.is_empty() {
-                        println!("{}", "Usage: unsetg <key>".yellow());
+                        crate::mprintln!("{}", "Usage: unsetg <key>".yellow());
                     } else if crate::global_options::GLOBAL_OPTIONS.unset(key).await {
-                        println!("{}", format!("Unset global option '{}'", key).green());
+                        crate::mprintln!("{}", format!("Unset global option '{}'", key).green());
                     } else {
-                        println!("{}", format!("Global option '{}' was not set.", key).dimmed());
+                        crate::mprintln!("{}", format!("Global option '{}' was not set.", key).dimmed());
                     }
                 }
                 "show_options" => {
@@ -659,7 +659,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let port: u16 = match port_str.parse() {
                             Ok(p) if p > 0 => p,
                             Ok(_) => 0, // port 0 = unknown, acceptable for creds
-                            Err(_) => { println!("{}", "[!] Invalid port number.".red()); return false; }
+                            Err(_) => { crate::mprintln!("{}", "[!] Invalid port number.".red()); return false; }
                         };
                         let service = match utils::prompt_default("Service", "unknown").await { Ok(v) => v, Err(_) => return false };
                         let username = match utils::prompt_required("Username").await { Ok(v) => v, Err(_) => return false };
@@ -672,21 +672,21 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                             _ => crate::cred_store::CredType::Password,
                         };
                         let id = crate::cred_store::CRED_STORE.add(&host, port, &service, &username, &secret, cred_type, "manual").await;
-                        println!("{}", format!("[+] Credential stored (ID: {})", id).green());
+                        crate::mprintln!("{}", format!("[+] Credential stored (ID: {})", id).green());
                     } else if let Some(query) = rest.strip_prefix("search ") {
                         let results = crate::cred_store::CRED_STORE.search(query.trim()).await;
                         crate::cred_store::CRED_STORE.display_results(&results);
                     } else if let Some(id) = rest.strip_prefix("delete ") {
                         if crate::cred_store::CRED_STORE.delete(id.trim()).await {
-                            println!("{}", format!("[+] Credential '{}' deleted.", id.trim()).green());
+                            crate::mprintln!("{}", format!("[+] Credential '{}' deleted.", id.trim()).green());
                         } else {
-                            println!("{}", format!("[-] Credential '{}' not found.", id.trim()).red());
+                            crate::mprintln!("{}", format!("[-] Credential '{}' not found.", id.trim()).red());
                         }
                     } else if rest == "clear" {
                         crate::cred_store::CRED_STORE.clear().await;
-                        println!("{}", "[+] All credentials cleared.".green());
+                        crate::mprintln!("{}", "[+] All credentials cleared.".green());
                     } else {
-                        println!("{}", "Usage: creds [add|search <query>|delete <id>|clear]".yellow());
+                        crate::mprintln!("{}", "Usage: creds [add|search <query>|delete <id>|clear]".yellow());
                     }
                 }
 
@@ -698,14 +698,14 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         crate::spool::display_status();
                     } else if rest == "off" {
                         if let Some(name) = crate::spool::SPOOL.stop() {
-                            println!("{}", format!("[+] Spool stopped. Output saved to '{}'", name).green());
+                            crate::mprintln!("{}", format!("[+] Spool stopped. Output saved to '{}'", name).green());
                         } else {
-                            println!("{}", "Spool was not active.".dimmed());
+                            crate::mprintln!("{}", "Spool was not active.".dimmed());
                         }
                     } else {
                         match crate::spool::SPOOL.start(&rest) {
-                            Ok(()) => println!("{}", format!("[+] Spooling output to '{}'", rest).green()),
-                            Err(e) => println!("{}", format!("[!] Failed to start spool: {}", e).red()),
+                            Ok(()) => crate::mprintln!("{}", format!("[+] Spooling output to '{}'", rest).green()),
+                            Err(e) => crate::mprintln!("{}", format!("[!] Failed to start spool: {}", e).red()),
                         }
                     }
                 }
@@ -715,14 +715,14 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 // ═══════════════════════════════════════════════
                 "resource" => {
                     if rest.is_empty() {
-                        println!("{}", "Usage: resource <script_file>".yellow());
+                        crate::mprintln!("{}", "Usage: resource <script_file>".yellow());
                     } else {
                         let fname = rest.trim();
                         // Validate path — reject traversal and null bytes
                         if fname.contains('\0') || fname.contains("..") {
-                            println!("{}", "[!] Invalid resource script path (path traversal not allowed).".red());
+                            crate::mprintln!("{}", "[!] Invalid resource script path (path traversal not allowed).".red());
                         } else if fname.len() > 4096 {
-                            println!("{}", "[!] Resource script path too long.".red());
+                            crate::mprintln!("{}", "[!] Resource script path too long.".red());
                         } else {
                             // Warn if script is from outside ~/.rustsploit/
                             if std::path::Path::new(fname).is_absolute() {
@@ -730,7 +730,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                                     .join(".rustsploit");
                                 if !fname.starts_with(&rustsploit_dir.to_string_lossy().as_ref()) {
-                                    println!("{}", format!("[*] Warning: executing script from outside ~/.rustsploit/: {}", fname).yellow());
+                                    crate::mprintln!("{}", format!("[*] Warning: executing script from outside ~/.rustsploit/: {}", fname).yellow());
                                 }
                             }
                             let depth = ctx.resource_depth;
@@ -742,24 +742,24 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 }
                 "makerc" => {
                     if rest.is_empty() {
-                        println!("{}", "Usage: makerc <output_file>".yellow());
+                        crate::mprintln!("{}", "Usage: makerc <output_file>".yellow());
                     } else {
                         // Validate path — reject absolute paths, traversal, and directory separators
                         let fname = rest.trim();
                         if fname.contains("..") || fname.contains('\0') || fname.starts_with('/') || fname.starts_with('\\') || fname.contains('/') || fname.contains('\\') || fname.starts_with('.') {
-                            println!("{}", "[!] Invalid filename. Use a simple filename like 'session.rc' (no paths or traversal).".red());
+                            crate::mprintln!("{}", "[!] Invalid filename. Use a simple filename like 'session.rc' (no paths or traversal).".red());
                         } else if fname.len() > 255 {
-                            println!("{}", "[!] Filename too long (max 255 chars).".red());
+                            crate::mprintln!("{}", "[!] Filename too long (max 255 chars).".red());
                         } else {
                             let hist_path = history_path();
                             match std::fs::read_to_string(&hist_path) {
                                 Ok(contents) => {
                                     match std::fs::write(fname, &contents) {
-                                        Ok(_) => println!("{}", format!("[+] Command history saved to '{}'", fname).green()),
-                                        Err(e) => println!("{}", format!("[!] Failed to write: {}", e).red()),
+                                        Ok(_) => crate::mprintln!("{}", format!("[+] Command history saved to '{}'", fname).green()),
+                                        Err(e) => crate::mprintln!("{}", format!("[!] Failed to write: {}", e).red()),
                                     }
                                 }
-                                Err(e) => println!("{}", format!("[!] Failed to read history: {}", e).red()),
+                                Err(e) => crate::mprintln!("{}", format!("[!] Failed to read history: {}", e).red()),
                             }
                         }
                     }
@@ -774,25 +774,25 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     } else if let Some(ip) = rest.strip_prefix("add ") {
                         let ip = ip.trim();
                         if ip.is_empty() {
-                            println!("{}", "Usage: hosts add <ip>".yellow());
+                            crate::mprintln!("{}", "Usage: hosts add <ip>".yellow());
                         } else {
                             crate::workspace::WORKSPACE.add_host(ip, None, None).await;
-                            println!("{}", format!("[+] Host '{}' added to workspace.", ip).green());
+                            crate::mprintln!("{}", format!("[+] Host '{}' added to workspace.", ip).green());
                         }
                     } else if let Some(ip) = rest.strip_prefix("delete ") {
                         let ip = ip.trim();
                         if ip.is_empty() {
-                            println!("{}", "Usage: hosts delete <ip>".yellow());
+                            crate::mprintln!("{}", "Usage: hosts delete <ip>".yellow());
                         } else if crate::workspace::WORKSPACE.delete_host(ip).await {
-                            println!("{}", format!("[+] Host '{}' and its services removed.", ip).green());
+                            crate::mprintln!("{}", format!("[+] Host '{}' and its services removed.", ip).green());
                         } else {
-                            println!("{}", format!("[-] Host '{}' not found.", ip).red());
+                            crate::mprintln!("{}", format!("[-] Host '{}' not found.", ip).red());
                         }
                     } else if rest == "clear" {
                         crate::workspace::WORKSPACE.clear_hosts().await;
-                        println!("{}", "[+] All hosts and services cleared.".green());
+                        crate::mprintln!("{}", "[+] All hosts and services cleared.".green());
                     } else {
-                        println!("{}", "Usage: hosts [add <ip>|delete <ip>|clear]".yellow());
+                        crate::mprintln!("{}", "Usage: hosts [add <ip>|delete <ip>|clear]".yellow());
                     }
                 }
                 "services" => {
@@ -803,33 +803,33 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let port_str = match utils::prompt_required("Port").await { Ok(v) => v, Err(_) => return false };
                         let port: u16 = match port_str.parse() {
                             Ok(p) if p > 0 => p,
-                            _ => { println!("{}", "[!] Invalid port number (must be 1-65535).".red()); return false; }
+                            _ => { crate::mprintln!("{}", "[!] Invalid port number (must be 1-65535).".red()); return false; }
                         };
                         let proto = match utils::prompt_default("Protocol", "tcp").await { Ok(v) => v, Err(_) => return false };
                         let svc = match utils::prompt_required("Service name").await { Ok(v) => v, Err(_) => return false };
                         let ver = match utils::prompt_default("Version", "").await { Ok(v) => v, Err(_) => return false };
                         let version = if ver.is_empty() { None } else { Some(ver.as_str()) };
                         crate::workspace::WORKSPACE.add_service(&host, port, &proto, &svc, version).await;
-                        println!("{}", format!("[+] Service {}:{}/{} added.", host, port, svc).green());
+                        crate::mprintln!("{}", format!("[+] Service {}:{}/{} added.", host, port, svc).green());
                     } else if let Some(args) = rest.strip_prefix("delete ") {
                         let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                         if parts.len() < 2 {
-                            println!("{}", "Usage: services delete <host> <port>".yellow());
+                            crate::mprintln!("{}", "Usage: services delete <host> <port>".yellow());
                         } else {
                             let host = parts[0].trim();
                             match parts[1].trim().parse::<u16>() {
                                 Ok(port) if port > 0 => {
                                     if crate::workspace::WORKSPACE.delete_service(host, port).await {
-                                        println!("{}", format!("[+] Service {}:{} removed.", host, port).green());
+                                        crate::mprintln!("{}", format!("[+] Service {}:{} removed.", host, port).green());
                                     } else {
-                                        println!("{}", format!("[-] Service {}:{} not found.", host, port).red());
+                                        crate::mprintln!("{}", format!("[-] Service {}:{} not found.", host, port).red());
                                     }
                                 }
-                                _ => println!("{}", "Invalid port number.".yellow()),
+                                _ => crate::mprintln!("{}", "Invalid port number.".yellow()),
                             }
                         }
                     } else {
-                        println!("{}", "Usage: services [add|delete <host> <port>]".yellow());
+                        crate::mprintln!("{}", "Usage: services [add|delete <host> <port>]".yellow());
                     }
                 }
                 "notes" => {
@@ -837,39 +837,39 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let ip = ip.trim();
                         let note = note.trim();
                         if ip.is_empty() || note.is_empty() {
-                            println!("{}", "Usage: notes <ip> <note text>".yellow());
+                            crate::mprintln!("{}", "Usage: notes <ip> <note text>".yellow());
                         } else if crate::workspace::WORKSPACE.add_note(ip, note).await {
-                            println!("{}", format!("[+] Note added to host '{}'.", ip).green());
+                            crate::mprintln!("{}", format!("[+] Note added to host '{}'.", ip).green());
                         } else {
-                            println!("{}", format!("[-] Host '{}' not found. Add it first with 'hosts add {}'.", ip, ip).red());
+                            crate::mprintln!("{}", format!("[-] Host '{}' not found. Add it first with 'hosts add {}'.", ip, ip).red());
                         }
                     } else {
-                        println!("{}", "Usage: notes <ip> <note text>".yellow());
+                        crate::mprintln!("{}", "Usage: notes <ip> <note text>".yellow());
                     }
                 }
                 "workspace" => {
                     if rest.is_empty() {
                         let current = crate::workspace::WORKSPACE.current_name().await;
                         let workspaces = crate::workspace::WORKSPACE.list_workspaces().await;
-                        println!();
-                        println!("{}", "Workspaces:".bold().underline());
+                        crate::mprintln!();
+                        crate::mprintln!("{}", "Workspaces:".bold().underline());
                         for ws in &workspaces {
                             if *ws == current {
-                                println!("  {} {}", "*".green().bold(), ws.green().bold());
+                                crate::mprintln!("  {} {}", "*".green().bold(), ws.green().bold());
                             } else {
-                                println!("    {}", ws);
+                                crate::mprintln!("    {}", ws);
                             }
                         }
-                        println!();
+                        crate::mprintln!();
                     } else {
                         let name = rest.trim();
                         if name.is_empty() || name.len() > 64 {
-                            println!("{}", "Workspace name must be 1-64 characters.".red());
+                            crate::mprintln!("{}", "Workspace name must be 1-64 characters.".red());
                         } else if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
                             crate::workspace::WORKSPACE.switch(name).await;
-                            println!("{}", format!("[+] Switched to workspace '{}'", name).green());
+                            crate::mprintln!("{}", format!("[+] Switched to workspace '{}'", name).green());
                         } else {
-                            println!("{}", "Workspace name must be alphanumeric (with _ and -).".red());
+                            crate::mprintln!("{}", "Workspace name must be alphanumeric (with _ and -).".red());
                         }
                     }
                 }
@@ -886,33 +886,33 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let desc = match utils::prompt_required("Description").await { Ok(v) => v, Err(_) => return false };
                         let data = match utils::prompt_required("Data/content").await { Ok(v) => v, Err(_) => return false };
                         if let Some(id) = crate::loot::LOOT_STORE.add_text(&host, &ltype, &desc, &data, "manual").await {
-                            println!("{}", format!("[+] Loot stored (ID: {})", id).green());
+                            crate::mprintln!("{}", format!("[+] Loot stored (ID: {})", id).green());
                         } else {
-                            println!("{}", "[!] Failed to store loot.".red());
+                            crate::mprintln!("{}", "[!] Failed to store loot.".red());
                         }
                     } else if let Some(query) = rest.strip_prefix("search ") {
                         let results = crate::loot::LOOT_STORE.search(query.trim()).await;
                         if results.is_empty() {
-                            println!("{}", "No matching loot found.".dimmed());
+                            crate::mprintln!("{}", "No matching loot found.".dimmed());
                         } else {
                             for l in &results {
-                                println!("  [{}] {} ({}) from {} - {}", l.id.yellow(), l.loot_type, l.host.green(), l.source_module, l.description);
+                                crate::mprintln!("  [{}] {} ({}) from {} - {}", l.id.yellow(), l.loot_type, l.host.green(), l.source_module, l.description);
                             }
                         }
                     } else if let Some(id) = rest.strip_prefix("delete ") {
                         let id = id.trim();
                         if id.is_empty() {
-                            println!("{}", "Usage: loot delete <id>".yellow());
+                            crate::mprintln!("{}", "Usage: loot delete <id>".yellow());
                         } else if crate::loot::LOOT_STORE.delete(id).await {
-                            println!("{}", format!("[+] Loot '{}' deleted.", id).green());
+                            crate::mprintln!("{}", format!("[+] Loot '{}' deleted.", id).green());
                         } else {
-                            println!("{}", format!("[-] Loot '{}' not found.", id).red());
+                            crate::mprintln!("{}", format!("[-] Loot '{}' not found.", id).red());
                         }
                     } else if rest == "clear" {
                         crate::loot::LOOT_STORE.clear().await;
-                        println!("{}", "[+] All loot cleared.".green());
+                        crate::mprintln!("{}", "[+] All loot cleared.".green());
                     } else {
-                        println!("{}", "Usage: loot [add|search <query>|delete <id>|clear]".yellow());
+                        crate::mprintln!("{}", "Usage: loot [add|search <query>|delete <id>|clear]".yellow());
                     }
                 }
 
@@ -923,29 +923,29 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     if let Some((fmt, path)) = rest.split_once(char::is_whitespace) {
                         let path = path.trim();
                         if let Err(e) = crate::export::validate_export_path(path) {
-                            println!("{}", format!("[!] {}", e).red());
+                            crate::mprintln!("{}", format!("[!] {}", e).red());
                         } else {
                             match fmt.trim() {
                                 "json" => {
                                     if let Err(e) = crate::export::export_json(path).await {
-                                        println!("{}", format!("[!] Export failed: {}", e).red());
+                                        crate::mprintln!("{}", format!("[!] Export failed: {}", e).red());
                                     }
                                 }
                                 "csv" => {
                                     if let Err(e) = crate::export::export_csv(path).await {
-                                        println!("{}", format!("[!] Export failed: {}", e).red());
+                                        crate::mprintln!("{}", format!("[!] Export failed: {}", e).red());
                                     }
                                 }
                                 "summary" => {
                                     if let Err(e) = crate::export::export_summary(path).await {
-                                        println!("{}", format!("[!] Export failed: {}", e).red());
+                                        crate::mprintln!("{}", format!("[!] Export failed: {}", e).red());
                                     }
                                 }
-                                _ => println!("{}", "Usage: export <json|csv|summary> <filename>".yellow()),
+                                _ => crate::mprintln!("{}", "Usage: export <json|csv|summary> <filename>".yellow()),
                             }
                         }
                     } else {
-                        println!("{}", "Usage: export <json|csv|summary> <filename>".yellow());
+                        crate::mprintln!("{}", "Usage: export <json|csv|summary> <filename>".yellow());
                     }
                 }
 
@@ -958,18 +958,18 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     } else if let Some(id_str) = rest.strip_prefix("-k ") {
                         if let Ok(id) = id_str.trim().parse::<u32>() {
                             if crate::jobs::JOB_MANAGER.kill(id) {
-                                println!("{}", format!("[+] Job {} cancelled.", id).green());
+                                crate::mprintln!("{}", format!("[+] Job {} cancelled.", id).green());
                             } else {
-                                println!("{}", format!("[-] Job {} not found.", id).red());
+                                crate::mprintln!("{}", format!("[-] Job {} not found.", id).red());
                             }
                         } else {
-                            println!("{}", "Usage: jobs -k <id>".yellow());
+                            crate::mprintln!("{}", "Usage: jobs -k <id>".yellow());
                         }
                     } else if rest == "clean" {
                         crate::jobs::JOB_MANAGER.cleanup();
-                        println!("{}", "[+] Finished jobs cleaned up.".green());
+                        crate::mprintln!("{}", "[+] Finished jobs cleaned up.".green());
                     } else {
-                        println!("{}", "Usage: jobs [-k <id>|clean]".yellow());
+                        crate::mprintln!("{}", "Usage: jobs [-k <id>|clean]".yellow());
                     }
                 }
 
@@ -984,11 +984,11 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let target = if config::GLOBAL_CONFIG.has_target() {
                             match config::GLOBAL_CONFIG.get_target() {
                                 Some(t) => {
-                                    println!("{}", format!("[*] Using target: {}", t).cyan());
+                                    crate::mprintln!("{}", format!("[*] Using target: {}", t).cyan());
                                     Some(t)
                                 }
                                 None => {
-                                    println!("{}", "[!] Error getting target".red());
+                                    crate::mprintln!("{}", "[!] Error getting target".red());
                                     None
                                 }
                             }
@@ -998,7 +998,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
 
                         // Interactive prompt if no target is set
                         let target = if target.is_none() {
-                            println!("{}", "[!] Warning: No target set.".yellow());
+                            crate::mprintln!("{}", "[!] Warning: No target set.".yellow());
 
                             match utils::prompt_yes_no("Do you want to provide a target address?", true).await {
                                 Ok(true) => {
@@ -1007,21 +1007,21 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                             match sanitize_target(&input) {
                                                 Ok(valid_target) => {
                                                     if let Err(e) = config::GLOBAL_CONFIG.set_target(&valid_target) {
-                                                         println!("{}", format!("[!] Failed to set target: {}", e).red());
+                                                         crate::mprintln!("{}", format!("[!] Failed to set target: {}", e).red());
                                                          None
                                                     } else {
-                                                         println!("{}", format!("[*] Target set to '{}'", valid_target).green());
+                                                         crate::mprintln!("{}", format!("[*] Target set to '{}'", valid_target).green());
                                                          Some(valid_target)
                                                     }
                                                 },
                                                 Err(e) => {
-                                                    println!("{}", format!("[!] Invalid target: {}", e).red());
+                                                    crate::mprintln!("{}", format!("[!] Invalid target: {}", e).red());
                                                     None
                                                 }
                                             }
                                         },
                                         Err(e) => {
-                                            println!("{}", format!("[!] Error reading input: {}", e).red());
+                                            crate::mprintln!("{}", format!("[!] Error reading input: {}", e).red());
                                             None
                                         }
                                     }
@@ -1030,7 +1030,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     match utils::prompt_yes_no("Continue with localhost (127.0.0.1)?", false).await {
                                         Ok(true) => Some("127.0.0.1".to_string()),
                                         _ => {
-                                            println!("{}", "[!] Execution aborted.".red());
+                                            crate::mprintln!("{}", "[!] Execution aborted.".red());
                                             None
                                         }
                                     }
@@ -1049,7 +1049,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     t.clone(),
                                     ctx.verbose,
                                 );
-                                println!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
+                                crate::mprintln!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
                             } else {
                                 // Normal foreground execution
                                 let is_mass_scan = crate::modules::creds::utils::is_mass_scan_target(t);
@@ -1063,7 +1063,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 let mut skip_target = false;
                                 if honeypot_on && !is_mass_scan {
                                     if crate::utils::network::quick_honeypot_check(t).await {
-                                        println!("{}", format!(
+                                        crate::mprintln!("{}", format!(
                                             "[!] Target {} appears to be a honeypot (11+ common ports open)",
                                             t
                                         ).red().bold());
@@ -1072,35 +1072,35 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                             true,
                                         ).await.unwrap_or(true);
                                         if proceed {
-                                            println!("{}", "[*] Skipping honeypot target.".yellow());
+                                            crate::mprintln!("{}", "[*] Skipping honeypot target.".yellow());
                                             skip_target = true;
                                         }
                                     }
                                 }
 
                                 if !skip_target {
-                                    println!("Running module '{}' against target '{}'", module_path, t);
+                                    crate::mprintln!("Running module '{}' against target '{}'", module_path, t);
                                     if let Err(e) = commands::run_module(module_path, t, ctx.verbose).await {
-                                        eprintln!("[!] Module failed: {:?}", e);
+                                        crate::meprintln!("[!] Module failed: {:?}", e);
                                     }
                                 }
                             }
                         } else {
-                            println!("{}", "No target set. Use 'set target <value>' (or 't <value>') first.".yellow());
-                            println!("{}", "  Examples:".dimmed());
-                            println!("{}", "    set target 192.168.1.1".dimmed());
-                            println!("{}", "    set target 192.168.1.0/24".dimmed());
+                            crate::mprintln!("{}", "No target set. Use 'set target <value>' (or 't <value>') first.".yellow());
+                            crate::mprintln!("{}", "  Examples:".dimmed());
+                            crate::mprintln!("{}", "    set target 192.168.1.1".dimmed());
+                            crate::mprintln!("{}", "    set target 192.168.1.0/24".dimmed());
                         }
                     } else {
-                        println!("{}", "No module selected. Use 'use <module>' first.".yellow());
+                        crate::mprintln!("{}", "No module selected. Use 'use <module>' first.".yellow());
                     }
                 }
                 "run_all" => {
                     if let Some(ref module_path) = ctx.current_module {
                         if !config::GLOBAL_CONFIG.has_target() {
-                            println!("{}", "No global target set. Use 'set target <ip/subnet>' first.".yellow());
+                            crate::mprintln!("{}", "No global target set. Use 'set target <ip/subnet>' first.".yellow());
                         } else if !config::GLOBAL_CONFIG.is_subnet() {
-                            println!("{}", "Global target is not a subnet. Use 'run' for single targets.".yellow());
+                            crate::mprintln!("{}", "Global target is not a subnet. Use 'run' for single targets.".yellow());
                         } else {
                             match config::GLOBAL_CONFIG.get_target_subnet() {
                                 Some(subnet) => {
@@ -1112,9 +1112,9 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                         }
                                     };
 
-                                    println!("{}", format!("[*] Running module '{}' against subnet {}", module_path, subnet).cyan().bold());
+                                    crate::mprintln!("{}", format!("[*] Running module '{}' against subnet {}", module_path, subnet).cyan().bold());
                                     if total_size > 1000000 {
-                                         println!("{}", format!("[!] Warning: Subnet is very large (~{} IPs). This will take a long time.", total_size).yellow());
+                                         crate::mprintln!("{}", format!("[!] Warning: Subnet is very large (~{} IPs). This will take a long time.", total_size).yellow());
                                     }
 
                                     let mut success_count = 0;
@@ -1129,10 +1129,10 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     for ip in subnet.iter() {
                                         idx += 1;
                                         let ip_str = ip.to_string();
-                                        println!("\n{}", format!("[{}/{}] Running against: {}", idx, total_size, ip_str).yellow());
+                                        crate::mprintln!("\n{}", format!("[{}/{}] Running against: {}", idx, total_size, ip_str).yellow());
 
                                         if hp_on && crate::utils::network::quick_honeypot_check(&ip_str).await {
-                                            println!("{}", format!("[!] {} — honeypot detected, skipping", ip_str).red());
+                                            crate::mprintln!("{}", format!("[!] {} — honeypot detected, skipping", ip_str).red());
                                             fail_count += 1;
                                             continue;
                                         }
@@ -1140,28 +1140,28 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                         match commands::run_module(module_path, &ip_str, ctx.verbose).await {
                                             Ok(_) => success_count += 1,
                                             Err(e) => {
-                                                eprintln!("[!] Module failed: {:?}", e);
+                                                crate::meprintln!("[!] Module failed: {:?}", e);
                                                 fail_count += 1;
                                             }
                                         }
                                     }
 
-                                    println!("\n{}", "=== Run All Summary ===".cyan().bold());
-                                    println!("{}", format!("Total IPs: {}", total_size).green());
-                                    println!("{}", format!("Successful: {}", success_count).green());
-                                    println!("{}", format!("Failed: {}", fail_count).red());
+                                    crate::mprintln!("\n{}", "=== Run All Summary ===".cyan().bold());
+                                    crate::mprintln!("{}", format!("Total IPs: {}", total_size).green());
+                                    crate::mprintln!("{}", format!("Successful: {}", success_count).green());
+                                    crate::mprintln!("{}", format!("Failed: {}", fail_count).red());
                                 }
                                 None => {
-                                     println!("{}", "[!] Error retrieving subnet configuration.".red());
+                                     crate::mprintln!("{}", "[!] Error retrieving subnet configuration.".red());
                                 }
                             }
                         }
                     } else {
-                        println!("{}", "No module selected. Use 'use <module>' first.".yellow());
+                        crate::mprintln!("{}", "No module selected. Use 'use <module>' first.".yellow());
                     }
                 }
                 _ => {
-                    println!("{}", format!("Unknown command: '{}'. Type 'help' or '?' for usage.", cmd_input).red());
+                    crate::mprintln!("{}", format!("Unknown command: '{}'. Type 'help' or '?' for usage.", cmd_input).red());
                 }
             }
     false
@@ -1176,7 +1176,7 @@ const MAX_RESOURCE_DEPTH: usize = 16;
 fn execute_resource_file_inner<'a>(ctx: &'a mut ShellContext, path: &'a str, depth: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
     Box::pin(async move {
         if depth >= MAX_RESOURCE_DEPTH {
-            println!("{}", format!("[!] Resource script nesting too deep (max {}). Aborting to prevent infinite recursion.", MAX_RESOURCE_DEPTH).red());
+            crate::mprintln!("{}", format!("[!] Resource script nesting too deep (max {}). Aborting to prevent infinite recursion.", MAX_RESOURCE_DEPTH).red());
             return;
         }
         match std::fs::read_to_string(path) {
@@ -1185,15 +1185,15 @@ fn execute_resource_file_inner<'a>(ctx: &'a mut ShellContext, path: &'a str, dep
                 for line in contents.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
-                    println!("{}", format!("[rc] {}", trimmed).dimmed());
+                    crate::mprintln!("{}", format!("[rc] {}", trimmed).dimmed());
                     let should_exit = execute_single_command(ctx, trimmed).await;
                     count += 1;
                     if should_exit { break; }
                 }
-                println!("{}", format!("[+] Resource script complete ({} commands executed)", count).green());
+                crate::mprintln!("{}", format!("[+] Resource script complete ({} commands executed)", count).green());
             }
             Err(e) => {
-                println!("{}", format!("[!] Failed to read resource file '{}': {}", path, e).red());
+                crate::mprintln!("{}", format!("[!] Failed to read resource file '{}': {}", path, e).red());
             }
         }
     })
@@ -1278,106 +1278,106 @@ fn sanitize_target(input: &str) -> std::result::Result<String, &'static str> {
 }
 
 fn render_help() {
-    println!();
-    println!("{}", "╔══════════════════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║                      RustSploit Command Reference                       ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════════════════╝".cyan());
-    println!();
+    crate::mprintln!();
+    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════════════════╗".cyan());
+    crate::mprintln!("{}", "║                      RustSploit Command Reference                       ║".cyan());
+    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!();
 
     // --- Navigation & Discovery ---
-    println!("  {}", "Navigation & Discovery".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "help".green(), "h | ?".dimmed(), "Show this screen");
-    println!("    {:<20} {:<24} {}", "modules".green(), "ls | m".dimmed(), "List all available modules");
-    println!("    {:<20} {:<24} {}", "find <kw>".green(), "f1 <kw>".dimmed(), "Search modules by keyword");
-    println!("    {:<20} {:<24} {}", "use <path>".green(), "u <path>".dimmed(), "Select a module to load");
-    println!("    {:<20} {:<24} {}", "info [path]".green(), "i".dimmed(), "Show module metadata (CVE, author, rank)");
-    println!("    {:<20} {:<24} {}", "back".green(), "b | clear".dimmed(), "Deselect current module and target");
-    println!();
+    crate::mprintln!("  {}", "Navigation & Discovery".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "help".green(), "h | ?".dimmed(), "Show this screen");
+    crate::mprintln!("    {:<20} {:<24} {}", "modules".green(), "ls | m".dimmed(), "List all available modules");
+    crate::mprintln!("    {:<20} {:<24} {}", "find <kw>".green(), "f1 <kw>".dimmed(), "Search modules by keyword");
+    crate::mprintln!("    {:<20} {:<24} {}", "use <path>".green(), "u <path>".dimmed(), "Select a module to load");
+    crate::mprintln!("    {:<20} {:<24} {}", "info [path]".green(), "i".dimmed(), "Show module metadata (CVE, author, rank)");
+    crate::mprintln!("    {:<20} {:<24} {}", "back".green(), "b | clear".dimmed(), "Deselect current module and target");
+    crate::mprintln!();
 
     // --- Targeting ---
-    println!("  {}", "Targeting".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "set target".green(), "t <val>".dimmed(), "Set global target (IP, domain, CIDR, or comma-separated)");
-    println!("    {:<20} {:<24} {}", "set subnet".green(), "sn <CIDR>".dimmed(), "Set target to a CIDR subnet");
-    println!("    {:<20} {:<24} {}", "set port".green(), "".dimmed(), "Set target port for all modules");
-    println!("    {:<20} {:<24} {}", "set source_port".green(), "".dimmed(), "Set source port (0 to clear)");
-    println!("    {:<20} {:<24} {}", "show_target".green(), "st".dimmed(), "Display current targets");
-    println!("    {:<20} {:<24} {}", "clear_target".green(), "ct".dimmed(), "Clear all targets");
-    println!();
+    crate::mprintln!("  {}", "Targeting".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "set target".green(), "t <val>".dimmed(), "Set global target (IP, domain, CIDR, or comma-separated)");
+    crate::mprintln!("    {:<20} {:<24} {}", "set subnet".green(), "sn <CIDR>".dimmed(), "Set target to a CIDR subnet");
+    crate::mprintln!("    {:<20} {:<24} {}", "set port".green(), "".dimmed(), "Set target port for all modules");
+    crate::mprintln!("    {:<20} {:<24} {}", "set source_port".green(), "".dimmed(), "Set source port (0 to clear)");
+    crate::mprintln!("    {:<20} {:<24} {}", "show_target".green(), "st".dimmed(), "Display current targets");
+    crate::mprintln!("    {:<20} {:<24} {}", "clear_target".green(), "ct".dimmed(), "Clear all targets");
+    crate::mprintln!();
 
     // --- Execution ---
-    println!("  {}", "Execution".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "run".green(), "go".dimmed(), "Execute the selected module");
-    println!("    {:<20} {:<24} {}", "run -j".green(), "".dimmed(), "Run module as background job");
-    println!("    {:<20} {:<24} {}", "run_all".green(), "ra".dimmed(), "Run module against all IPs in subnet");
-    println!("    {:<20} {:<24} {}", "check".green(), "ch".dimmed(), "Non-destructive vulnerability check");
-    println!();
+    crate::mprintln!("  {}", "Execution".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "run".green(), "go".dimmed(), "Execute the selected module");
+    crate::mprintln!("    {:<20} {:<24} {}", "run -j".green(), "".dimmed(), "Run module as background job");
+    crate::mprintln!("    {:<20} {:<24} {}", "run_all".green(), "ra".dimmed(), "Run module against all IPs in subnet");
+    crate::mprintln!("    {:<20} {:<24} {}", "check".green(), "ch".dimmed(), "Non-destructive vulnerability check");
+    crate::mprintln!();
 
     // --- Global Options ---
-    println!("  {}", "Global Options".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "setg <k> <v>".green(), "sg".dimmed(), "Set a global option (persists across modules)");
-    println!("    {:<20} {:<24} {}", "unsetg <key>".green(), "ug".dimmed(), "Remove a global option");
-    println!("    {:<20} {:<24} {}", "show options".green(), "so".dimmed(), "Display all global options");
-    println!();
+    crate::mprintln!("  {}", "Global Options".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "setg <k> <v>".green(), "sg".dimmed(), "Set a global option (persists across modules)");
+    crate::mprintln!("    {:<20} {:<24} {}", "unsetg <key>".green(), "ug".dimmed(), "Remove a global option");
+    crate::mprintln!("    {:<20} {:<24} {}", "show options".green(), "so".dimmed(), "Display all global options");
+    crate::mprintln!();
 
     // --- Data Management ---
-    println!("  {}", "Data Management".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "creds".green(), "".dimmed(), "List stored credentials");
-    println!("    {:<20} {:<24} {}", "creds add".green(), "".dimmed(), "Add a credential interactively");
-    println!("    {:<20} {:<24} {}", "creds search <q>".green(), "".dimmed(), "Search credentials");
-    println!("    {:<20} {:<24} {}", "hosts".green(), "".dimmed(), "List tracked hosts");
-    println!("    {:<20} {:<24} {}", "hosts add <ip>".green(), "".dimmed(), "Add a host to workspace");
-    println!("    {:<20} {:<24} {}", "services".green(), "svcs".dimmed(), "List tracked services");
-    println!("    {:<20} {:<24} {}", "notes <ip> <text>".green(), "".dimmed(), "Add a note to a host");
-    println!("    {:<20} {:<24} {}", "loot".green(), "".dimmed(), "List collected loot");
-    println!("    {:<20} {:<24} {}", "workspace [name]".green(), "ws".dimmed(), "Show/switch workspaces");
-    println!();
+    crate::mprintln!("  {}", "Data Management".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "creds".green(), "".dimmed(), "List stored credentials");
+    crate::mprintln!("    {:<20} {:<24} {}", "creds add".green(), "".dimmed(), "Add a credential interactively");
+    crate::mprintln!("    {:<20} {:<24} {}", "creds search <q>".green(), "".dimmed(), "Search credentials");
+    crate::mprintln!("    {:<20} {:<24} {}", "hosts".green(), "".dimmed(), "List tracked hosts");
+    crate::mprintln!("    {:<20} {:<24} {}", "hosts add <ip>".green(), "".dimmed(), "Add a host to workspace");
+    crate::mprintln!("    {:<20} {:<24} {}", "services".green(), "svcs".dimmed(), "List tracked services");
+    crate::mprintln!("    {:<20} {:<24} {}", "notes <ip> <text>".green(), "".dimmed(), "Add a note to a host");
+    crate::mprintln!("    {:<20} {:<24} {}", "loot".green(), "".dimmed(), "List collected loot");
+    crate::mprintln!("    {:<20} {:<24} {}", "workspace [name]".green(), "ws".dimmed(), "Show/switch workspaces");
+    crate::mprintln!();
 
     // --- Automation & Export ---
-    println!("  {}", "Automation & Export".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "resource <file>".green(), "rc".dimmed(), "Execute a resource script");
-    println!("    {:<20} {:<24} {}", "makerc <file>".green(), "".dimmed(), "Save command history to file");
-    println!("    {:<20} {:<24} {}", "spool <file>".green(), "".dimmed(), "Log console output to file");
-    println!("    {:<20} {:<24} {}", "spool off".green(), "".dimmed(), "Stop console logging");
-    println!("    {:<20} {:<24} {}", "export json <f>".green(), "".dimmed(), "Export all data to JSON");
-    println!("    {:<20} {:<24} {}", "export csv <f>".green(), "".dimmed(), "Export all data to CSV");
-    println!("    {:<20} {:<24} {}", "export summary <f>".green(), "".dimmed(), "Export human-readable report");
-    println!();
+    crate::mprintln!("  {}", "Automation & Export".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "resource <file>".green(), "rc".dimmed(), "Execute a resource script");
+    crate::mprintln!("    {:<20} {:<24} {}", "makerc <file>".green(), "".dimmed(), "Save command history to file");
+    crate::mprintln!("    {:<20} {:<24} {}", "spool <file>".green(), "".dimmed(), "Log console output to file");
+    crate::mprintln!("    {:<20} {:<24} {}", "spool off".green(), "".dimmed(), "Stop console logging");
+    crate::mprintln!("    {:<20} {:<24} {}", "export json <f>".green(), "".dimmed(), "Export all data to JSON");
+    crate::mprintln!("    {:<20} {:<24} {}", "export csv <f>".green(), "".dimmed(), "Export all data to CSV");
+    crate::mprintln!("    {:<20} {:<24} {}", "export summary <f>".green(), "".dimmed(), "Export human-readable report");
+    crate::mprintln!();
 
     // --- Jobs ---
-    println!("  {}", "Background Jobs".bold().underline());
-    println!();
-    println!("    {:<20} {:<24} {}", "jobs".green(), "j".dimmed(), "List background jobs");
-    println!("    {:<20} {:<24} {}", "jobs -k <id>".green(), "".dimmed(), "Kill a background job");
-    println!("    {:<20} {:<24} {}", "jobs clean".green(), "".dimmed(), "Clean up finished jobs");
-    println!();
+    crate::mprintln!("  {}", "Background Jobs".bold().underline());
+    crate::mprintln!();
+    crate::mprintln!("    {:<20} {:<24} {}", "jobs".green(), "j".dimmed(), "List background jobs");
+    crate::mprintln!("    {:<20} {:<24} {}", "jobs -k <id>".green(), "".dimmed(), "Kill a background job");
+    crate::mprintln!("    {:<20} {:<24} {}", "jobs clean".green(), "".dimmed(), "Clean up finished jobs");
+    crate::mprintln!();
 
     // --- Other ---
-    println!("    {:<20} {:<24} {}", "exit".green(), "quit | q".dimmed(), "Leave the shell");
-    println!();
+    crate::mprintln!("    {:<20} {:<24} {}", "exit".green(), "quit | q".dimmed(), "Leave the shell");
+    crate::mprintln!();
 
     // --- Tips ---
-    println!("{}", "┌──────────────────────────────────────────────────────────────────────────┐".dimmed());
-    println!("{}", "│  Tips                                                                    │".dimmed());
-    println!("{}",  "├──────────────────────────────────────────────────────────────────────────┤".dimmed());
-    println!("  {} Chain commands with {}: {}",
+    crate::mprintln!("{}", "┌──────────────────────────────────────────────────────────────────────────┐".dimmed());
+    crate::mprintln!("{}", "│  Tips                                                                    │".dimmed());
+    crate::mprintln!("{}",  "├──────────────────────────────────────────────────────────────────────────┤".dimmed());
+    crate::mprintln!("  {} Chain commands with {}: {}",
         ">>".dimmed(),
         "&".cyan().bold(),
         format!("set target 10.0.0.1 & use scanners/smtp_user_enum & run").cyan());
-    println!("  {} Use {} to set options that apply to all modules.",
+    crate::mprintln!("  {} Use {} to set options that apply to all modules.",
         ">>".dimmed(), "setg".cyan().bold());
-    println!("  {} Use {} to save engagement data.",
+    crate::mprintln!("  {} Use {} to save engagement data.",
         ">>".dimmed(), "export json report.json".cyan().bold());
-    println!("  {} Max {} chained commands per line.",
+    crate::mprintln!("  {} Max {} chained commands per line.",
         ">>".dimmed(),
         MAX_COMMAND_CHAIN_LENGTH);
-    println!("{}", "└──────────────────────────────────────────────────────────────────────────┘".dimmed());
-    println!();
+    crate::mprintln!("{}", "└──────────────────────────────────────────────────────────────────────────┘".dimmed());
+    crate::mprintln!();
 }
 
 
@@ -1394,7 +1394,7 @@ async fn prompt_string_default(message: &str, default: &str) -> io::Result<Strin
 
     // Length check
     if input.len() > MAX_PROMPT_INPUT_LENGTH {
-        println!("{}", format!("Input too long (max {} characters). Using default.", MAX_PROMPT_INPUT_LENGTH).yellow());
+        crate::mprintln!("{}", format!("Input too long (max {} characters). Using default.", MAX_PROMPT_INPUT_LENGTH).yellow());
         return Ok(default.to_string());
     }
 
@@ -1406,19 +1406,19 @@ async fn prompt_string_default(message: &str, default: &str) -> io::Result<Strin
 
     // Check for control characters
     if trimmed.chars().any(|c| c.is_control()) {
-        println!("{}", "Input cannot contain control characters. Using default.".yellow());
+        crate::mprintln!("{}", "Input cannot contain control characters. Using default.".yellow());
         return Ok(default.to_string());
     }
 
     // If this looks like a URL, validate it
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         if trimmed.len() > MAX_URL_LENGTH {
-            println!("{}", format!("URL too long (max {} characters). Using default.", MAX_URL_LENGTH).yellow());
+            crate::mprintln!("{}", format!("URL too long (max {} characters). Using default.", MAX_URL_LENGTH).yellow());
             return Ok(default.to_string());
         }
 
         if Url::parse(trimmed).is_err() {
-            println!("{}", "Invalid URL format. Using default.".yellow());
+            crate::mprintln!("{}", "Invalid URL format. Using default.".yellow());
             return Ok(default.to_string());
         }
     }

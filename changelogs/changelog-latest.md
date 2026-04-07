@@ -17734,3 +17734,407 @@ Now I can see the real categories:
   ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤                                                                                                                                                        
   │ Total                    │ 114 error-swallowing  │ 97 properly handled │ 98    │
   └──────────────────────────┴───────────────────────┴─────────────────────┴───────┘     
+  
+  
+  Root Cause
+When a custom source port is configured, every concurrent TCP/UDP scan task tried to bind() to the exact same local port. With hundreds of concurrent tasks, only the first socket succeeds — all others get EADDRINUSE (os error 98).
+
+Fix
+Added SO_REUSEADDR + SO_REUSEPORT on both TCP (line ~437) and UDP (line ~593) sockets before the bind() call. This tells the kernel to allow multiple sockets to share the same local address:port, which is valid because each socket connects to a different remote address:port.
+
+TCP (
+
+scan_tcp
+): Two socket2 calls added before the existing bind().
+UDP (
+
+scan_udp
+): Switched from UdpSocket::bind() to socket2::Socket → set reuse options → bind() → convert to tokio::UdpSocket via from_std().
+
+  Cannot update yet (5 of 8):                                                                                   
+   
+  ┌───────────────────────────────┬──────────────────────────────────────────────────────────────────────┐      
+  │             Crate             │                                Reason                                │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ cipher 0.4 → 0.5              │ aes 0.8 requires cipher ^0.4 — no compatible aes release exists yet  │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ kem 0.3.0-pre.0 → 0.3.0       │ ml-kem 0.2.3 pins =0.3.0-pre.0 exactly                               │      
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤      
+  │ rand_core 0.6 → 0.10          │ x25519-dalek 2.0 requires rand_core ^0.6 API (OsRng removed in 0.10) │      
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤      
+  │ generic-array 0.14.7 → 0.14.9 │ Transitive dep — will update when parent crates allow it             │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤      
+  │ matchit 0.8.4 → 0.8.6         │ Transitive dep (from axum) — controlled by axum's version constraint │
+  └───────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+  
+    Removed 5 dependencies:                                                                                       
+                                                                                                                
+  ┌────────────────────┬──────────────────────────────────────────────────────┐                                 
+  │       Crate        │                        Reason                        │                                 
+  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
+  │ aes-gcm            │ Not imported anywhere                                │                                 
+  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
+  │ subtle             │ Not imported anywhere                                │                                 
+  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
+  │ hyper + hyper-util │ Only transitive (axum pulls them in)                 │                                 
+  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
+  │ futures-util       │ Replaced with futures re-exports (2 files changed)   │
+  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
+  │ once_cell          │ Replaced with std::sync::LazyLock (10 files changed) │                               
+  └────────────────────┴──────────────────────────────────────────────────────┘                                 
+                                                                                                              
+  Kept (justified):                                                                                             
+                                                                                                              
+  ┌────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │               Crate                │                               Reason                               │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ crossbeam-channel                  │ Needed for MPMC (multi-consumer) pattern in smtp_user_enum         │
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ http                               │ Used directly by h2's API (http::Request::builder())               │   
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤   
+  │ All three hash crates              │ Different algorithms, different use sites                          │   
+  │ (sha1/sha2/md5)                    │                                                                    │   
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤ 
+  │ All three TLS crates               │ Different purposes (async TLS, cert inspection, native-tls for     │   
+  │                                    │ suppaftp)                                                          │ 
+  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤   
+  │ data-encoding / base64 / hex       │ Different encoding formats (base32, base64, hex)                   │ 
+  └────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘ 
+  
+  ● All done. Here's a summary of every performance improvement:                                                  
+                                                                                                                
+  Build/Compile Performance                                                                                     
+                                                             
+  ┌───────────────────────────────────────────────────────┬────────────┬──────────────────────────────────┐     
+  │                        Change                         │    File    │              Impact              │
+  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
+  │ Trimmed tokio "full" → 10 specific features           │ Cargo.toml │ Fewer tokio modules compiled     │
+  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
+  │ Trimmed socket2 "all" → defaults                      │ Cargo.toml │ Fewer platform features compiled │     
+  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
+  │ Compile 3 regexes once in main(), not 4× per category │ build.rs   │ 4× fewer regex compilations      │     
+  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
+  │ Fast contains("fn run") pre-filter before regex       │ build.rs   │ Skips regex on non-module files  │     
+  └───────────────────────────────────────────────────────┴────────────┴──────────────────────────────────┘     
+                                                                                                                
+  Connection Creation Speed                                                                                     
+                                                                                                                
+  ┌───────────────────────────────────────────┬──────────────┬──────────────────────────────────────────────┐   
+  │                  Change                   │     File     │                    Impact                    │   
+  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤   
+  │ Cached reqwest::Client pool keyed by      │ network.rs   │ 72+ modules share connection pools, TLS      │   
+  │ timeout                                   │              │ session reuse                                │   
+  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤   
+  │ Cached TLS connector in LazyLock          │ async_tls.rs │ Built once instead of per-call               │
+  │ singleton                                 │              │                                              │   
+  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤ 
+  │ tcp_connect_addr(SocketAddr) — zero-alloc │ network.rs   │ Skips format!() + DNS for resolved IPs       │   
+  │  path                                     │              │                                              │   
+  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤
+  │ tcp_port_open() uses SocketAddr directly  │ network.rs   │ Eliminates 65K String allocs per full-port   │   
+  │                                           │              │ scan                                         │ 
+  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤   
+  │ Honeypot check pre-parses IP once         │ network.rs   │ Eliminates 30 format!()+DNS per honeypot     │   
+  │                                           │              │ check                                        │
+  └───────────────────────────────────────────┴──────────────┴──────────────────────────────────────────────┘   
+                                                                                                              
+  Runtime Hot-Path Performance                                                                                  
+  
+  ┌─────────────────────────────────────────────┬─────────────────────────┬────────────────────────────────┐    
+  │                   Change                    │          File           │             Impact             │  
+  ├─────────────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤  
+  │ detect_service_from_banner() returns        │ port_scanner.rs         │ No String alloc for known      │  
+  │ &'static str                                │                         │ services                       │  
+  ├─────────────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤    
+  │ #[inline] on tcp_port_open,                 │ network.rs,             │ Better inlining in dev profile │    
+  │ get_service_name, etc.                      │ port_scanner.rs         │                                │    
+  ├─────────────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤    
+  │ check_and_mark_ip() — single lock           │ creds/utils.rs          │ Half the lock contention in    │  
+  │ acquisition                                 │                         │ mass scans                     │    
+  └─────────────────────────────────────────────┴─────────────────────────┴────────────────────────────────┘
+
+ All 190 modules detected, MCP fully functional. Here's the final audit summary:                               
+                                                                                          
+  Source port compliance: 100%                                                                                  
+                                                                                                                
+  ┌────────────────────────────────┬────────────────┬──────────────────────────────────────────────────────┐    
+  │            Category            │     Before     │                        After                         │    
+  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤    
+  │ Raw TcpStream::connect in      │ 59 instances   │ 0 — all use                                          │ 
+  │ modules                        │ across 44      │ tcp_connect/tcp_connect_addr/blocking_tcp_connect    │ 
+  │                                │ files          │                                                      │    
+  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤ 
+  │ Raw                            │ 3 instances    │ 0 — all use blocking_udp_bind                        │    
+  │ UdpSocket::bind("0.0.0.0:0")   │ across 3 files │                                                      │ 
+  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤    
+  │ Only in network.rs (framework  │ 4 instances    │ 4 instances (correct — this IS the implementation)   │    
+  │ utility)                       │                │                                                      │
+  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤    
+  │ Build warnings                 │ 31 unused      │ 0 — cleaned by cargo fix                             │
+  │                                │ imports        │                                                      │    
+  └────────────────────────────────┴────────────────┴──────────────────────────────────────────────────────┘
+  Phase 1: Critical Bug Fixes                                                                                   
+                                                                                   
+  ┌───────────────────┬──────────────────────────┬──────────────────────────────────────────────────────────┐   
+  │        Fix        │           File           │                          Impact                          │
+  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤   
+  │ Redis command     │                          │ format!("AUTH {} {}") → RESP array format                │   
+  │ injection         │ redis_bruteforce.rs      │ (length-prefixed, injection-proof). Added resp_cmd()     │
+  │                   │                          │ helper. Applied to AUTH, PING, INFO, QUIT.               │   
+  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤
+  │ SMTP 2s timeout   │ smtp_bruteforce.rs       │ Hardcoded 2000ms → configurable DEFAULT_TIMEOUT_MS =     │   
+  │                   │                          │ 10_000 (10s). Threaded through all closures.             │   
+  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤   
+  │ FTP 421           │                          │ ConnectionLimitExceeded returns Err(anyhow!(...))        │   
+  │ misclassified     │ ftp_bruteforce.rs        │ instead of Ok(false) → engine retries with backoff       │   
+  │                   │                          │ instead of skipping credential.                          │   
+  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤   
+  │ HTTP redirect     │ http_basic_bruteforce.rs │ Checks Location header for login/auth/signin/sso paths → │   
+  │ false positives   │                          │  classifies as AuthFailed instead of Success.            │   
+  └───────────────────┴──────────────────────────┴──────────────────────────────────────────────────────────┘   
+                                                                                                                
+  Phase 2: Consistency & Quality                            
+
+  ┌───────────────────┬──────────────────────────┬─────────────────────────────────────────────────────────┐    
+  │    Improvement    │          Files           │                         Detail                          │ 
+  ├───────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤    
+  │ FTP               │ ftp_bruteforce.rs        │ Added delay_ms and max_retries prompts (was hardcoded 0 │ 
+  │ user-configurable │                          │  and 3). Fixed _verbose → active TLS fallback logging.  │ 
+  ├───────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤    
+  │                   │                          │ Build reqwest::Client once with Arc, share across all   │ 
+  │ HTTP client reuse │ http_basic_bruteforce.rs │ attempts. Enables keep-alive connection pooling. Added  │    
+  │                   │                          │ redirect(Policy::none()).                               │ 
+  ├───────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤    
+  │                   │ utils.rs + all 20        │ New jitter_ms: u64 in BruteforceConfig and              │
+  │ jitter_ms field   │ modules                  │ SubnetScanConfig. Engine adds random 0..jitter_ms to    │    
+  │                   │                          │ each delay for IDS evasion. All modules default to 0.   │
+  └───────────────────┴──────────────────────────┴─────────────────────────────────────────────────────────┘    
+                                                            
+  Phase 3: New Features (Core Engine)                                                                           
+  
+  ┌─────────────────┬──────────┬────────────────────────────────────────────────────────────────────────────┐   
+  │     Feature     │   File   │                                   Detail                                   │
+  ├─────────────────┼──────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Password spray  │          │ ComboMode::Spray iterates one password across all users before next        │
+  │ mode            │ utils.rs │ password — critical for AD lockout avoidance. generate_combos_mode()       │
+  │                 │          │ function.                                                                  │   
+  ├─────────────────┼──────────┼────────────────────────────────────────────────────────────────────────────┤
+  │ Credential file │ utils.rs │ load_credential_file(path) loads user:pass pairs from file. Modules can    │   
+  │  support        │          │ extend combos from credential files.                                       │
+  ├─────────────────┼──────────┼────────────────────────────────────────────────────────────────────────────┤   
+  │ Combo mode      │ utils.rs │ parse_combo_mode("spray") parses user input to ComboMode enum.             │
+  │ parser          │          │                                                                            │   
+  └─────────────────┴──────────┴────────────────────────────────────────────────────────────────────────────┘
+● Final results — zero warnings, zero dead code, zero bypasses:                                                                                                                                                                             
+                                                                                                                                                                                                                                            
+  ┌────────────────────────────────────────┬───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+  │                 Check                  │          Before           │                                  After                                  │                                                                                          
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ Compiler warnings                      │ 4 (dead code)             │ 0                                                                       │
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ ComboMode::Spray                       │ Never constructed         │ Wired into all 20 bruteforce modules                                    │
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ load_credential_file()                 │ Never called              │ Wired into all 18 modules with combo prompts                            │
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ parse_combo_mode()                     │ Never called              │ Used by all 18 modules                                                  │
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ SubnetScanConfig.jitter_ms             │ Never read                │ Used in run_subnet_bruteforce() inner loop                              │                                                                                          
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ generate_combos() (old wrapper)        │ Dead code after migration │ Removed                                                                 │                                                                                          
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ Raw println!/eprintln! bypassing spool │ 500+ instances            │ 0 in target files — all converted to crate::mprintln!/crate::meprintln! │                                                                                          
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ MCP modules                            │ 190                       │ 190                                                                     │
+  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
+  │ Build errors                           │ 0                         │ 0                                                                       │
+  └────────────────────────────────────────┴───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘   
+  
+  New: src/native/dos_utils.rs — Unified DoS Spoofing Infrastructure                                                                                                                                                                        
+                                                                                                                                                                                                                                            
+  ┌──────────────────────────┬────────────────────────────────────────────────────────────────────────────────────┐
+  │        Component         │                                      Purpose                                       │                                                                                                                         
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ FastRng                  │ XorShift128+ PRNG with thread-seeded init, gen_ipv4_public(), gen_ephemeral_port() │                                                                                                                         
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
+  │ checksum_16() / sum_16() │ RFC 1071 Internet checksum for IP/TCP/UDP/ICMP headers                             │                                                                                                                         
+  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                         
+  │ is_spoof_enabled()       │ Reads setg spoof_ip true global option                                             │                                                                                                                         
+  └──────────────────────────┴────────────────────────────────────────────────────────────────────────────────────┘                                                                                                                         
+                                                                                                                                                                                                                                            
+  Updated 8 Raw-Packet DoS Modules                                                                                                                                                                                                          
+                                                                                                                                                                                                                                            
+  Each module had its duplicated FastRng, checksum, and gen_ipv4_public code removed and replaced with imports from crate::native::dos_utils.                                                                                               
+                                                                                                                                                                                                                                            
+  ┌─────────────────────────┬────────────────────────────────────────────────────────────┬───────────────────────────────────┐                                                                                                              
+  │         Module          │                     Local Code Removed                     │         Spoof Integration         │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ null_syn_exhaustion     │ ~55 lines FastRng + checksum methods                       │ Global spoof_ip as prompt default │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤
+  │ syn_ack_flood           │ ~38 lines FastRng + checksum methods                       │ Always spoofs (reflection attack) │                                                                                                              
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ udp_flood               │ ~52 lines FastRng + standalone gen_ipv4_public + checksums │ Global spoof_ip as prompt default │                                                                                                              
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ icmp_flood              │ ~48 lines FastRng + standalone gen_ipv4_public + checksums │ Global spoof_ip as prompt default │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ dns_amplification       │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ ntp_amplification       │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ ssdp_amplification      │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
+  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
+  │ memcached_amplification │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
+  └─────────────────────────┴────────────────────────────────────────────────────────────┴───────────────────────────────────┘                                                                                                              
+  
+  Usage                                                                                                                                                                                                                                     
+                                                            
+  rsf> setg spoof_ip true     # Enable spoofing globally
+  rsf> use exploits/dos/udp_flood                                                                                                                                                                                                           
+  rsf> run 10.0.0.1           # Spoof prompt defaults to "yes"
+                                                                                                                                                                                                                                            
+  The 5 TCP/HTTP-based DoS modules (slowloris, rudy, http_flood, connection_exhaustion, tcp_connection_flood) are unaffected — they require valid TCP handshakes and cannot spoof.                                                          
+                                                                                                                                                                                           
+
+
+## Session: 2026-04-07 — Performance, Source Port, Bruteforce, Spool, DoS
+
+### Dependency Cleanup
+- Removed 5 redundant crates: aes-gcm (unused), subtle (unused), hyper + hyper-util (transitive only), futures-util (consolidated into futures)
+- Migrated once_cell::sync::Lazy to std::sync::LazyLock across 10 files
+- Updated sha1 0.10 to 0.11, sha2 0.10 to 0.11, hkdf 0.12 to 0.13
+
+### Compile Performance
+- Tokio: replaced "full" feature with 10 specific features (rt-multi-thread, macros, net, time, io-util, io-std, fs, process, sync, signal)
+- socket2: removed "all" feature flag
+- build.rs: compile 3 regexes once in main() instead of 4x per category; added content.contains("fn run") pre-filter before regex
+
+### Connection Speed
+- Cached reqwest::Client pool keyed by timeout in build_http_client() — 72+ modules share connection pools
+- Cached TLS connector singleton in make_dangerous_tls_connector() via LazyLock
+- Added tcp_connect_addr(SocketAddr, Duration) — zero-allocation path skipping DNS/string parsing
+- tcp_port_open() now uses SocketAddr directly — eliminates 65K String allocs per full port scan
+- Honeypot check pre-parses IP once, uses tcp_connect_addr per port
+- Added #[inline] to hot-path functions
+
+### Source Port Enforcement
+- Fixed 63 raw TcpStream::connect calls across 44 module files to use tcp_connect/tcp_connect_addr/blocking_tcp_connect
+- Fixed 3 raw UdpSocket::bind("0.0.0.0:0") calls to use blocking_udp_bind
+- All 190 modules now respect `setg source_port` for firewall bypass testing
+- Removed 31 unused TcpStream imports via cargo fix
+
+### Bruteforce Engine Improvements
+- Redis: switched from inline AUTH format to RESP array format (injection-proof)
+- SMTP: timeout changed from hardcoded 2000ms to configurable DEFAULT_TIMEOUT_MS (10s)
+- FTP: ConnectionLimitExceeded (421) now returns retryable Error instead of AuthFailed
+- FTP: delay_ms and max_retries now user-configurable (was hardcoded 0 and 3)
+- FTP: _verbose parameter activated for TLS fallback logging
+- HTTP Basic: redirect responses checked for login/auth/signin/sso in Location header
+- HTTP Basic: reqwest::Client built once with Arc, shared across attempts (connection pooling)
+- Added ComboMode enum: Linear, Combo, Spray (password spray for AD lockout avoidance)
+- Added generate_combos_mode() replacing generate_combos() across all 20 modules
+- Added load_credential_file() for user:pass file loading
+- Added parse_combo_mode() for user input parsing
+- Added jitter_ms field to BruteforceConfig and SubnetScanConfig
+- jitter_ms wired into both run_bruteforce() and run_subnet_bruteforce() inner loops
+- Merged is_ip_checked + mark_ip_checked into single-lock check_and_mark_ip()
+
+### Spool Compliance
+- Converted 500+ raw println!/eprintln! calls to crate::mprintln!/crate::meprintln!
+- Affected files: shell.rs, config.rs, export.rs, global_options.rs, jobs.rs, workspace.rs, module_info.rs, loot.rs, cred_store.rs, and all module files
+- Excluded: spool.rs (is the system), main.rs (pre-init), api.rs (headless), mcp/ (JSON-RPC)
+
+### Zero Warnings
+- Eliminated all 4 compiler warnings (ComboMode::Spray, load_credential_file, parse_combo_mode, SubnetScanConfig.jitter_ms)
+- Removed dead generate_combos() wrapper after all callers migrated
+- All code compiles with zero warnings
+
+### DoS Spoofing Infrastructure
+- Created src/native/dos_utils.rs with shared FastRng, checksum_16, sum_16, is_spoof_enabled
+- Updated 8 raw-packet DoS modules to use shared utilities (~300 lines of duplicated code removed)
+- Added global setg spoof_ip true support for null_syn_exhaustion, udp_flood, icmp_flood
+- Amplification modules (DNS, NTP, SSDP, Memcached) always spoof (required for reflection)
+
+All 7 documentation files updated. Here's the summary:                                                                                                                                                                                  
+                                                                                                                                                                                                                                            
+  ┌──────────────────────────────────┬──────────────────────────────────────────────────────────────────────────┐                                                                                                                           
+  │             Doc File             │                                 Changes                                  │                                                                                                                           
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ docs/Changelog.md                │ Added session section with 8 highlights, fixed MCP tool count (30 -> 42) │                                                                                                                           
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ docs/Credential-Modules-Guide.md │ Added Combo Modes (spray), credential files, jitter, protocol safety     │                                                                                                                           
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ docs/Module-Development.md       │ Added mandatory framework rules (source port, spool, DoS utils)          │                                                                                                                           
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ docs/Utilities-Helpers.md        │ Added dos_utils, tcp_connect_addr, cached build_http_client              │
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ docs/Exploit-Modules-Guide.md    │ Added DoS spoofing infrastructure section                                │
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ docs/MCP-Integration.md          │ Updated tool count from 30 to 42                                         │
+  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
+  │ changelogs/changelog-latest.md   │ Appended 59-line session summary                                         │
+  └──────────────────────────────────┴──────────────────────────────────────────────────────────────────────────┘      
+  New: src/modules/scanners/amplification_scanner.rs
+
+  Scans for 4 amplification protocols in one module:
+
+  ┌───────────┬───────┬─────────────────────────────────────┬──────────────────────┬────────────────────────────────────────────────┐
+  │ Protocol  │ Port  │                Probe                │ Amplification Factor │              Vulnerability Check               │
+  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
+  │ DNS       │ 53    │ ANY query for google.com (33 bytes) │ ~28-54x              │ Response with NOERROR/SERVFAIL = open resolver │
+  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
+  │ NTP       │ 123   │ MON_GETLIST_1 (8 bytes)             │ ~556x                │ Mode 6/7 response = monlist enabled            │
+  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
+  │ SSDP      │ 1900  │ M-SEARCH ssdp:all (107 bytes)       │ ~30x                 │ HTTP/1.1 response = UPnP exposed               │
+  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
+  │ Memcached │ 11211 │ UDP stats (15 bytes)                │ ~51,000x             │ Response with STAT = UDP exposed               │
+  └───────────┴───────┴─────────────────────────────────────┴──────────────────────┴────────────────────────────────────────────────┘
+
+  Features:
+  - Single-target mode with table output, risk rating, and remediation recommendations
+  - Mass scan mode via run_mass_scan() (random, CIDR, file targets)
+  - Protocol selection: dns,ntp,ssdp,memcached,all
+  - Configurable timeout (default 3000ms)
+  - Verbose mode with probe/response size details
+  - Color-coded amplification factors (>100x red, >10x yellow)
+  - Risk assessment: CRITICAL (>500x), HIGH (>50x), MEDIUM (>10x), LOW
+  - Uses crate::utils::udp_bind() for source port compliance
+
+  Usage:
+  use scanners/amplification_scanner
+  set target 8.8.8.8          # single target
+  run
+
+  set target 192.168.1.0/24   # subnet scan
+  run
+
+  set target random            # mass internet scan
+  run
+
+✻ Churned for 6m 20s
+  Here's the summary of everything created:                                                                                                                                                                                                 
+   
+  New Modules (4)                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                            
+  ┌────────────────────────────────┬────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  
+  │             Module             │    Type    │                                                                                      Description                                                                                       │  
+  ├────────────────────────────────┼────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
+  │ scanners/proxy_scanner         │ Scanner    │ Detects open HTTP CONNECT, SOCKS4, SOCKS5, and HTTP Forward proxies. Identifies auth-required vs open. Multi-port scanning (8080, 3128, 1080, 8888, 9050, etc). Mass scan support.     │  
+  ├────────────────────────────────┼────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
+  │ creds/generic/proxy_bruteforce │ Credential │ Bruteforces proxy authentication: HTTP CONNECT (Basic auth), SOCKS5 (RFC 1929 user/pass), HTTP Forward (Basic auth). Full bruteforce engine integration (spray, combo, linear,         │  
+  │                                │            │ credential files, jitter, retry).                                                                                                                                                      │  
+  ├────────────────────────────────┼────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
+  │ scanners/banner_grabber        │ Scanner    │ Grabs service banners from open ports with protocol-specific probes (HTTP HEAD, RTSP OPTIONS). Auto-identifies SSH, FTP, SMTP, HTTP, MySQL, Redis, VNC, etc. Mass scan support.        │  
+  ├────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────                                                                                                                                                                                                                 
+
+  ┌──────────────────────┬──────────────────────────────────────────┬─────────────────────────────────┐                                                                                                                                     
+  │         Type         │            Scanner Detection             │         Bruteforce Auth         │
+  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
+  │ HTTP CONNECT (Basic) │ Sends CONNECT, checks 200/407            │ Basic auth header               │                                                                                                                                   
+  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ SOCKS5 (no auth)     │ Greeting [05,02,00,02], checks method 00 │ -                               │                                                                                                                                     
+  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
+  │ SOCKS5 (user/pass)   │ Greeting, checks method 02               │ RFC 1929 auth packet            │                                                                                                                                     
+  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
+  │ SOCKS4               │ Connect packet, checks 5A response       │ - (SOCKS4 has no auth standard) │                                                                                                                                   
+  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
+  │ HTTP Forward         │ Full GET, checks 200 + body              │ Basic auth header               │                                                                                                                                   
+  └──────────────────────┴──────────────────────────────────────────┴─────────────────────────────────┘    

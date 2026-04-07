@@ -2,7 +2,6 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::modules::creds::utils::{run_mass_scan, MassScanConfig};
@@ -258,14 +257,8 @@ async fn do_telnet_session(
 ) -> Result<(bool, bool)> {
     // returns (success, banner_detected)
 
-    let stream_res = timeout(
-        Duration::from_millis(CONNECT_TIMEOUT_MS),
-        TcpStream::connect(socket),
-    )
-    .await;
-
-    let stream = match stream_res {
-        Ok(Ok(s)) => s,
+    let stream = match crate::utils::network::tcp_connect_addr(*socket, Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+        Ok(s) => s,
         _ => return Ok((false, false)), // Connect fail
     };
 

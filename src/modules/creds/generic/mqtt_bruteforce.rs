@@ -13,10 +13,10 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -244,6 +244,7 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "mqtt",
+                jitter_ms: 0,
                 source_module: "creds/generic/mqtt_bruteforce",
                 skip_tcp_check: false,
             },
@@ -325,8 +326,7 @@ pub async fn run(target: &str) -> Result<()> {
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
 
     // Combo mode
-    let combo_mode =
-        cfg_prompt_yes_no("combo_mode", "Full combination mode (user x pass)?", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     // Load wordlists
     let usernames = load_lines(&username_wordlist)?;
@@ -397,7 +397,11 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     // Generate credential combos
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     // Build the try_login closure capturing MQTT-specific config
     let try_login = move |_target: String, _port: u16, user: String, pass: String| {
@@ -429,6 +433,7 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries: 3,
             service_name: "mqtt",
+            jitter_ms: 0,
             source_module: "creds/generic/mqtt_bruteforce",
         },
         combos,
@@ -536,15 +541,9 @@ async fn try_mqtt_auth(
     use_tls: bool,
 ) -> AttackResult {
     // Connect with timeout
-    let stream = match tokio::time::timeout(
-        Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return AttackResult::ConnectionError(e.to_string()),
-        Err(_) => return AttackResult::ConnectionError("Connection timeout".to_string()),
+    let stream = match crate::utils::network::tcp_connect(addr, Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS)).await {
+        Ok(s) => s,
+        Err(e) => return AttackResult::ConnectionError(e.to_string()),
     };
 
     if use_tls {

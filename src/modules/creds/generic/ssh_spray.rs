@@ -118,7 +118,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
     }
 
     fn print_summary(&self) {
@@ -305,7 +305,7 @@ pub async fn password_spray(
                                 password: password.clone(),
                             };
                             crate::mprintln!("\r{}", format!("[PWNED] {}:{} @ {}:{}", user, password, host, port).red().bold());
-                            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+                            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
                             results.lock().await.push(cred);
                             // Persist credential to framework credential store
                             {

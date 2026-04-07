@@ -1261,9 +1261,8 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
                 }
             };
             let addr = format!("{}:{}", ip, port);
-            let conn = tokio::time::timeout(scan_timeout, tokio::net::TcpStream::connect(&addr))
-                .await;
-            if let Ok(Ok(_)) = conn {
+            let conn = crate::utils::network::tcp_connect(&addr, scan_timeout).await;
+            if let Ok(_) = conn {
                 Some(port)
             } else {
                 None

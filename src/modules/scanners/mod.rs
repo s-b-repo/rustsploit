@@ -22,3 +22,6 @@ pub mod waf_detector;
 pub mod subdomain_scanner;
 pub mod nbns_scanner;
 pub mod honeypot_scanner;
+pub mod amplification_scanner;
+pub mod proxy_scanner;
+pub mod banner_grabber;

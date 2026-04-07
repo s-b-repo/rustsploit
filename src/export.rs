@@ -41,7 +41,7 @@ pub async fn export_json(path: &str) -> Result<()> {
     let json = export_json_string().await?;
     std::fs::write(path, &json)
         .context(format!("Failed to write to '{}'", path))?;
-    println!("{}", format!("[+] Exported JSON to '{}'", path).green());
+    crate::mprintln!("{}", format!("[+] Exported JSON to '{}'", path).green());
     Ok(())
 }
 
@@ -101,7 +101,7 @@ pub async fn export_csv(path: &str) -> Result<()> {
     let output = export_csv_string().await?;
     std::fs::write(path, &output)
         .context(format!("Failed to write to '{}'", path))?;
-    println!("{}", format!("[+] Exported CSV to '{}'", path).green());
+    crate::mprintln!("{}", format!("[+] Exported CSV to '{}'", path).green());
     Ok(())
 }
 
@@ -166,7 +166,7 @@ pub async fn export_summary(path: &str) -> Result<()> {
     let report = export_summary_string().await?;
     std::fs::write(path, &report)
         .context(format!("Failed to write to '{}'", path))?;
-    println!("{}", format!("[+] Exported summary report to '{}'", path).green());
+    crate::mprintln!("{}", format!("[+] Exported summary report to '{}'", path).green());
     Ok(())
 }
 

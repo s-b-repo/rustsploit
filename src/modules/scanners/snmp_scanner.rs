@@ -288,7 +288,7 @@ pub async fn run(target: &str) -> Result<()> {
 
         for community in &communities {
             crate::mprint!("  [*] Testing '{}' ... ", community);
-            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
 
             match test_community(&socket, &addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
                 Ok(Some(sys_descr)) => {

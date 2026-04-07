@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
@@ -304,7 +303,7 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
             let addr = format!("{}:{}", t, port);
             
             // Basic TCP Connect
-            if timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), TcpStream::connect(&addr)).await.is_ok() {
+            if crate::utils::network::tcp_connect(&addr, Duration::from_secs(PORT_SCAN_TIMEOUT)).await.is_ok() {
                 // If open, probe for RTSP
                 let is_rtsp = probe_rtsp(&t, port).await;
                 return Some((port, is_rtsp));
@@ -335,7 +334,7 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
 async fn probe_rtsp(target: &str, port: u16) -> bool {
     // Sends a minimal RTSP OPTIONS request
     let addr = format!("{}:{}", target, port);
-    if let Ok(Ok(mut stream)) = timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), TcpStream::connect(&addr)).await {
+    if let Ok(mut stream) = crate::utils::network::tcp_connect(&addr, Duration::from_secs(PORT_SCAN_TIMEOUT)).await {
         let request = format!(
             "OPTIONS rtsp://{}:{}/ RTSP/1.0\r\nCSeq: 1\r\n\r\n",
             target, port
@@ -602,7 +601,7 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
 
 async fn test_rtsp_auth(target: &str, port: u16, user: &str, pass: &str) -> bool {
     let addr = format!("{}:{}", target, port);
-    if let Ok(Ok(mut stream)) = timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
+    if let Ok(mut stream) = crate::utils::network::tcp_connect(&addr, Duration::from_secs(2)).await {
         let auth_str = BASE64_STANDARD.encode(format!("{}:{}", user, pass));
         let request = format!(
             "OPTIONS rtsp://{}:{}/ RTSP/1.0\r\nAuthorization: Basic {}\r\nCSeq: 1\r\n\r\n",

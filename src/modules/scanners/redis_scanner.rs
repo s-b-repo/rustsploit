@@ -147,9 +147,8 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!();
     crate::mprintln!("{}", format!("[*] Connecting to {}...", addr).bold());
 
-    let mut stream = timeout(timeout_dur, tokio::net::TcpStream::connect(&addr))
+    let mut stream = crate::utils::network::tcp_connect(&addr, timeout_dur)
         .await
-        .context("Connection timed out")?
         .context("Failed to connect to Redis")?;
 
     // Step 1: PING

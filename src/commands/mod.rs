@@ -15,7 +15,7 @@ use crate::utils::normalize_target;
 use crate::modules::creds::utils::{
     is_subnet_target, parse_subnet, subnet_host_count,
     is_mass_scan_target, generate_random_public_ip, parse_exclusions,
-    is_ip_checked, mark_ip_checked, EXCLUDED_RANGES,
+    check_and_mark_ip, EXCLUDED_RANGES,
 };
 
 /// CLI dispatcher
@@ -254,12 +254,11 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
                 };
                 let ip_str = ip.to_string();
 
-                if is_ip_checked(&ip, &sf).await {
+                if check_and_mark_ip(&ip, &sf).await {
                     tc.fetch_add(1, Ordering::Relaxed);
                     drop(permit);
                     return;
                 }
-                mark_ip_checked(&ip, &sf).await;
 
                 // Quick honeypot check before running module
                 if honeypot_enabled && crate::utils::network::quick_honeypot_check(&ip_str).await {

@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -302,6 +303,7 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "telnet",
+                jitter_ms: 0,
                 source_module: "creds/generic/telnet_bruteforce",
                 skip_tcp_check: false,
             },
@@ -394,12 +396,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every pass with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     // Resolve target once (not in hot path)
     let resolved_target = normalize_target(target).unwrap_or_else(|_| target.to_string());
@@ -526,6 +523,7 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "telnet",
+            jitter_ms: 0,
             source_module: "creds/generic/telnet_bruteforce",
         };
 
@@ -540,7 +538,11 @@ pub async fn run(target: &str) -> Result<()> {
 
             // First: run default passwords if enabled (already in `passwords` vec)
             if !passwords.is_empty() {
-                let combos = generate_combos(&usernames, &passwords, combo_mode);
+                let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+                if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+                    let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+                    combos.extend(load_credential_file(&cred_path)?);
+                }
                 let result = run_bruteforce(
                     &bf_config,
                     combos,
@@ -582,7 +584,7 @@ pub async fn run(target: &str) -> Result<()> {
                         )
                         .cyan()
                     );
-                    let combos = generate_combos(&usernames, &chunk, combo_mode);
+                    let combos = generate_combos_mode(&usernames, &chunk, parse_combo_mode(&combo_input));
                     let result = run_bruteforce(
                         &bf_config,
                         combos,
@@ -617,7 +619,7 @@ pub async fn run(target: &str) -> Result<()> {
                     )
                     .cyan()
                 );
-                let combos = generate_combos(&usernames, &chunk, combo_mode);
+                let combos = generate_combos_mode(&usernames, &chunk, parse_combo_mode(&combo_input));
                 let result = run_bruteforce(
                     &bf_config,
                     combos,
@@ -635,7 +637,7 @@ pub async fn run(target: &str) -> Result<()> {
             }
         } else {
             // Normal mode: everything fits in memory
-            let combos = generate_combos(&usernames, &passwords, combo_mode);
+            let combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
             let result = run_bruteforce(
                 &bf_config,
                 combos,
@@ -739,9 +741,8 @@ fn parse_ports(input: &str) -> Vec<u16> {
 /// - `Err(_)`    — connection/protocol error
 async fn try_telnet_login(addr: &str, user: &str, pass: &str, cfg: &TelnetConfig) -> Result<bool> {
     // 1. TCP connect
-    let mut stream = timeout(cfg.connect_timeout, TcpStream::connect(addr))
+    let mut stream = crate::utils::network::tcp_connect(addr, cfg.connect_timeout)
         .await
-        .map_err(|_| anyhow!("{}: connection timeout", addr))?
         .map_err(|e| anyhow!("{}: {}", addr, e))?;
 
     // Disable Nagle — telnet sends small packets, latency matters more than throughput

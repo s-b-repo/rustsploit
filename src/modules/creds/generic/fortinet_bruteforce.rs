@@ -1,5 +1,6 @@
 use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -8,7 +9,7 @@ use crate::utils::{
 };
 use anyhow::{anyhow, Result};
 use colored::*;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use regex::Regex;
 use reqwest::{redirect::Policy, ClientBuilder};
 use std::{io::Write, net::IpAddr, time::Duration};
@@ -146,6 +147,7 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "fortinet-vpn",
+                jitter_ms: 0,
                 source_module: "creds/generic/fortinet_bruteforce",
                 skip_tcp_check: false,
             },
@@ -239,12 +241,7 @@ pub async fn run(target: &str) -> Result<()> {
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
 
     // Combo mode
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every password with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     // Load wordlists
     let users = load_lines(&usernames_file)?;
@@ -265,7 +262,11 @@ pub async fn run(target: &str) -> Result<()> {
         format!("[*] Loaded {} passwords", passwords.len()).green()
     );
 
-    let combos = generate_combos(&users, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&users, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     let timeout_duration = Duration::from_secs(connection_timeout);
 
     let normalized = normalize_target(target)?;
@@ -307,6 +308,7 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 100,
             max_retries: 2,
             service_name: "fortinet-vpn",
+            jitter_ms: 0,
             source_module: "creds/generic/fortinet_bruteforce",
         },
         combos,

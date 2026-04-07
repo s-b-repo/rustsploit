@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use serde::Serialize;
 use colored::*;
 use tokio::sync::watch;
@@ -73,15 +73,15 @@ impl JobManager {
                 result = crate::commands::run_module(&mod_clone, &tgt_clone, verbose) => {
                     match result {
                         Ok(_) => {
-                            println!("\n{}", format!("[*] Job completed: {} against {}", mod_clone, tgt_clone).green());
+                            crate::mprintln!("\n{}", format!("[*] Job completed: {} against {}", mod_clone, tgt_clone).green());
                         }
                         Err(e) => {
-                            eprintln!("\n{}", format!("[!] Job failed: {} - {}", mod_clone, e).red());
+                            crate::meprintln!("\n{}", format!("[!] Job failed: {} - {}", mod_clone, e).red());
                         }
                     }
                 }
                 _ = async { while rx.changed().await.is_ok() { if *rx.borrow() { break; } } } => {
-                    println!("\n{}", format!("[*] Job cancelled: {}", mod_clone).yellow());
+                    crate::mprintln!("\n{}", format!("[*] Job cancelled: {}", mod_clone).yellow());
                 }
             }
         });
@@ -113,7 +113,7 @@ impl JobManager {
     pub fn kill(&self, id: u32) -> bool {
         if let Ok(mut jobs) = self.jobs.write() {
             if let Some(job) = jobs.get_mut(&id) {
-                if let Err(e) = job.cancel_tx.send(true) { eprintln!("[!] Job cancel signal error: {}", e); }
+                if let Err(e) = job.cancel_tx.send(true) { crate::meprintln!("[!] Job cancel signal error: {}", e); }
                 if let Some(handle) = job.handle.take() {
                     handle.abort();
                 }
@@ -182,15 +182,15 @@ impl JobManager {
     pub fn display(&self) {
         let jobs = self.list();
         if jobs.is_empty() {
-            println!("{}", "No active jobs.".dimmed());
+            crate::mprintln!("{}", "No active jobs.".dimmed());
             return;
         }
-        println!();
-        println!("{}", format!("Background Jobs ({}):", jobs.len()).bold().underline());
-        println!();
-        println!("  {:<6} {:<35} {:<20} {:<12} {}",
+        crate::mprintln!();
+        crate::mprintln!("{}", format!("Background Jobs ({}):", jobs.len()).bold().underline());
+        crate::mprintln!();
+        crate::mprintln!("  {:<6} {:<35} {:<20} {:<12} {}",
             "ID".bold(), "Module".bold(), "Target".bold(), "Started".bold(), "Status".bold());
-        println!("  {}", "-".repeat(80).dimmed());
+        crate::mprintln!("  {}", "-".repeat(80).dimmed());
         for (id, module, target, started, status) in &jobs {
             let status_colored = if status == "Running" {
                 status.green().to_string()
@@ -201,10 +201,10 @@ impl JobManager {
             } else {
                 status.yellow().to_string()
             };
-            println!("  {:<6} {:<35} {:<20} {:<12} {}",
+            crate::mprintln!("  {:<6} {:<35} {:<20} {:<12} {}",
                 id, module, target, started, status_colored);
         }
-        println!();
+        crate::mprintln!();
     }
 }
 

@@ -197,7 +197,7 @@ pub async fn run(target: &str) -> Result<()> {
                     done, total,
                     found.load(Ordering::Relaxed).to_string().green()
                 );
-                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush error: {}", e); }
+                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
             }
         });
 

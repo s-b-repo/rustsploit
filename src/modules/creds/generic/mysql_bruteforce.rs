@@ -20,7 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -168,6 +169,7 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "mysql",
+                jitter_ms: 0,
                 source_module: "creds/generic/mysql_bruteforce",
                 skip_tcp_check: false,
             },
@@ -232,12 +234,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every pass with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let retry_on_error =
         cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
@@ -298,7 +295,11 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     crate::mprintln!(
         "\n{}",
@@ -339,6 +340,7 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "mysql",
+            jitter_ms: 0,
             source_module: "creds/generic/mysql_bruteforce",
         },
         combos,
@@ -661,15 +663,9 @@ fn build_handshake_response(username: &str, auth_response: &[u8], database: &str
 /// Attempt MySQL authentication against a target address.
 async fn try_mysql_auth(addr: &str, username: &str, password: &str) -> MysqlResult {
     // TCP connect with timeout
-    let mut stream = match tokio::time::timeout(
-        Duration::from_millis(CONNECT_TIMEOUT_MS),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return MysqlResult::ConnectionError(format!("Connect failed: {}", e)),
-        Err(_) => return MysqlResult::ConnectionError("Connection timeout".to_string()),
+    let mut stream = match crate::utils::network::tcp_connect(addr, Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+        Ok(s) => s,
+        Err(e) => return MysqlResult::ConnectionError(format!("Connect failed: {}", e)),
     };
 
     // Read server greeting (HandshakeV10)

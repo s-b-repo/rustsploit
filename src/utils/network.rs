@@ -3,10 +3,17 @@
 // Network utility functions: honeypot detection, TCP connection with source port, etc.
 
 use colored::*;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use super::target::extract_ip_from_target;
+
+/// Global cache of reqwest::Client instances keyed by timeout.
+/// reqwest::Client is Arc-based internally, so clone is cheap.
+static HTTP_CLIENTS: Lazy<std::sync::RwLock<HashMap<Duration, reqwest::Client>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
 
 /// Get the globally configured source port (from `setg source_port` or `set source_port`).
 /// Returns `None` if not set or invalid.
@@ -18,6 +25,7 @@ pub async fn get_global_source_port() -> Option<u16> {
 
 /// Synchronous version of `get_global_source_port` for use in blocking contexts.
 /// Uses `try_read()` which returns immediately without awaiting.
+#[inline]
 pub fn get_global_source_port_sync() -> Option<u16> {
     crate::global_options::GLOBAL_OPTIONS.try_get("source_port")
         .and_then(|v| v.trim().parse::<u16>().ok())
@@ -111,11 +119,58 @@ pub async fn tcp_connect_with_source(
     }
 }
 
+/// Create a TCP connection to a resolved `SocketAddr` with optional source port binding.
+/// Skips DNS resolution — use this when you already have an IP address.
+#[inline]
+pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
+    let src_port = get_global_source_port().await;
+
+    if let Some(port) = src_port {
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+
+        let bind_addr = if addr.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        };
+        socket.bind(&bind_addr.into())?;
+
+        let _connect = socket.connect(&addr.into());
+        let std_stream: std::net::TcpStream = socket.into();
+        let stream = TcpStream::from_std(std_stream)?;
+
+        tokio::time::timeout(timeout, stream.writable()).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"))??;
+
+        if let Some(err) = stream.take_error()? {
+            return Err(err);
+        }
+
+        Ok(stream)
+    } else {
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out")),
+        }
+    }
+}
+
 /// Quick TCP port open check with global source port support.
-/// Used by mass-scan probes as a drop-in replacement for raw TcpStream::connect.
+/// Uses zero-alloc SocketAddr path — no format!() or DNS resolution.
+#[inline]
 pub async fn tcp_port_open(ip: std::net::IpAddr, port: u16, timeout: Duration) -> bool {
-    let addr = format!("{}:{}", ip, port);
-    tcp_connect(&addr, timeout).await.is_ok()
+    tcp_connect_addr(SocketAddr::new(ip, port), timeout).await.is_ok()
 }
 
 /// Blocking TCP connection with automatic global source port binding.
@@ -206,7 +261,8 @@ pub fn blocking_udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<std::net:
 
 
 /// Build a standard reqwest HTTP client with common defaults.
-/// Prints a one-time info notice if source_port is set (reqwest doesn't support it).
+/// Returns a cached client if one with the same timeout already exists.
+/// reqwest::Client is Arc-based, so cloning is cheap and connection pools are shared.
 pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if get_global_source_port_sync().is_some()
@@ -217,10 +273,25 @@ pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::
             "[*] Note: source_port is set but HTTP (reqwest) does not support source port binding. TCP/UDP/SSH modules will use the configured source port.".yellow()
         );
     }
-    reqwest::Client::builder()
+
+    // Fast path: check cache with read lock
+    if let Ok(cache) = HTTP_CLIENTS.read() {
+        if let Some(client) = cache.get(&timeout) {
+            return Ok(client.clone());
+        }
+    }
+
+    // Slow path: build client and insert with write lock
+    let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(timeout)
-        .build()
+        .build()?;
+
+    if let Ok(mut cache) = HTTP_CLIENTS.write() {
+        cache.entry(timeout).or_insert_with(|| client.clone());
+    }
+
+    Ok(client)
 }
 
 /// Fast parallel honeypot check for a single IP. Returns true if likely honeypot.
@@ -237,6 +308,12 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
         return false;
     }
 
+    // Pre-parse IP once to avoid per-port allocations
+    let ip_addr: IpAddr = match parsed_ip.parse() {
+        Ok(addr) => addr,
+        Err(_) => return false,
+    };
+
     const QUICK_PORTS: &[u16] = &[
         21, 22, 23, 25, 53, 80, 110, 135, 139, 143,
         443, 445, 993, 995, 1433, 1723, 3306, 3389,
@@ -250,7 +327,7 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
     let mut tasks = Vec::with_capacity(QUICK_PORTS.len());
 
     for &port in QUICK_PORTS {
-        let ip_clone = parsed_ip.clone();
+        let addr = SocketAddr::new(ip_addr, port);
         let sem = semaphore.clone();
         let count = open_count.clone();
         tasks.push(tokio::spawn(async move {
@@ -258,8 +335,7 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
                 Ok(permit) => permit,
                 Err(_) => return,
             };
-            let addr = format!("{}:{}", ip_clone, port);
-            if tcp_connect(&addr, scan_timeout).await.is_ok() {
+            if tcp_connect_addr(addr, scan_timeout).await.is_ok() {
                 count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }));
