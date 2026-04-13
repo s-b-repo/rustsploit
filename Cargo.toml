@@ -95,6 +95,7 @@ hickory-proto = "0.25"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Misc utilities
 home = "0.5"                   # updated for edition 2024 compatibility

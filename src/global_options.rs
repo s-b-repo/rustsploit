@@ -4,29 +4,67 @@ use tokio::sync::RwLock;
 use std::sync::LazyLock as Lazy;
 use colored::*;
 
-/// Persistent global options that apply across all modules.
+/// Per-workspace options that apply across all modules within a workspace.
 /// Like Metasploit's `setg` — values are checked by `cfg_prompt_*`
 /// after custom_prompts but before interactive stdin.
+/// Each workspace gets its own options file at
+/// `~/.rustsploit/workspaces/{workspace}_options.json`.
 pub struct GlobalOptions {
     options: RwLock<HashMap<String, String>>,
-    file_path: PathBuf,
+    base_dir: PathBuf,
+    workspace: RwLock<String>,
 }
 
 impl GlobalOptions {
     fn new() -> Self {
-        let file_path = home::home_dir()
+        let base_dir = home::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".rustsploit")
+            .join("workspaces");
+
+        let workspace = "default".to_string();
+        let file_path = base_dir.join(format!("{}_options.json", workspace));
+
+        let options = Self::load_from_file_sync(&file_path);
+
+        // Migrate legacy global_options.json into default workspace
+        let legacy_path = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".rustsploit")
             .join("global_options.json");
+        if legacy_path.exists() && options.is_empty() {
+            let legacy = Self::load_from_file_sync(&legacy_path);
+            if !legacy.is_empty() {
+                crate::meprintln!("[*] Migrating {} options from legacy global_options.json to workspace 'default'", legacy.len());
+                if let Ok(json) = serde_json::to_string_pretty(&legacy) {
+                    let _ = std::fs::create_dir_all(&base_dir);
+                    let _ = std::fs::write(&file_path, &json);
+                }
+                let _ = std::fs::rename(&legacy_path, legacy_path.with_extension("json.migrated"));
+                return Self {
+                    options: RwLock::new(legacy),
+                    base_dir,
+                    workspace: RwLock::new(workspace),
+                };
+            }
+        }
 
-        let options = if file_path.exists() {
-            match std::fs::read_to_string(&file_path) {
+        Self {
+            options: RwLock::new(options),
+            base_dir,
+            workspace: RwLock::new(workspace),
+        }
+    }
+
+    fn load_from_file_sync(file_path: &PathBuf) -> HashMap<String, String> {
+        if file_path.exists() {
+            match std::fs::read_to_string(file_path) {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        crate::meprintln!("[!] Warning: global_options.json is corrupted ({}). Starting fresh.", e);
+                        crate::meprintln!("[!] Warning: {} is corrupted ({}). Starting fresh.", file_path.display(), e);
                         let backup = file_path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&file_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(file_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
                         HashMap::new()
                     }
                 },
@@ -34,12 +72,32 @@ impl GlobalOptions {
             }
         } else {
             HashMap::new()
-        };
-
-        Self {
-            options: RwLock::new(options),
-            file_path,
         }
+    }
+
+    fn file_path_for(&self, workspace: &str) -> PathBuf {
+        self.base_dir.join(format!("{}_options.json", workspace))
+    }
+
+    /// Switch to a different workspace's options.
+    pub async fn switch_workspace(&self, name: &str) {
+        // Save current
+        let snapshot = self.options.read().await.clone();
+        let current = self.workspace.read().await.clone();
+        self.save_to_path(&self.file_path_for(&current), &snapshot).await;
+
+        // Load new
+        let new_path = self.file_path_for(name);
+        let new_opts = if new_path.exists() {
+            match tokio::fs::read_to_string(&new_path).await {
+                Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+        *self.options.write().await = new_opts;
+        *self.workspace.write().await = name.to_string();
     }
 
     /// Maximum key length for global options.
@@ -101,33 +159,38 @@ impl GlobalOptions {
     }
 
     /// Save to disk using atomic write (write to temp, then rename).
-    /// Logs warnings on failure instead of silently ignoring (BUG 15 fix).
     async fn save_locked(&self, opts: &HashMap<String, String>) {
-        if let Some(parent) = self.file_path.parent() {
+        let workspace = self.workspace.read().await.clone();
+        let path = self.file_path_for(&workspace);
+        self.save_to_path(&path, opts).await;
+    }
+
+    async fn save_to_path(&self, path: &PathBuf, opts: &HashMap<String, String>) {
+        if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 crate::meprintln!("[!] Warning: Failed to create config directory: {}", e);
                 return;
             }
         }
-        let tmp = self.file_path.with_extension("json.tmp");
+        let tmp = path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(opts) {
             Ok(j) => j,
             Err(e) => {
-                crate::meprintln!("[!] Warning: Failed to serialize global options: {}", e);
+                crate::meprintln!("[!] Warning: Failed to serialize options: {}", e);
                 return;
             }
         };
         if let Err(e) = tokio::fs::write(&tmp, &json).await {
-            crate::meprintln!("[!] Warning: Failed to write global options temp file: {}", e);
+            crate::meprintln!("[!] Warning: Failed to write options temp file: {}", e);
             return;
         }
-        if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
-            crate::meprintln!("[!] Warning: Failed to save global options (rename): {}", e);
+        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+            crate::meprintln!("[!] Warning: Failed to save options (rename): {}", e);
             return;
         }
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await {
-            crate::meprintln!("[!] Warning: Failed to set permissions on global_options.json: {}", e);
+        if let Err(e) = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await {
+            crate::meprintln!("[!] Warning: Failed to set permissions on options file: {}", e);
         }
     }
 

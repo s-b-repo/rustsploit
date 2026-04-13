@@ -45,22 +45,24 @@ impl SpoolState {
         // Acquire lock FIRST (before creating file) to prevent orphaned files
         let mut guard = self.file.write().map_err(|_| "Failed to acquire spool lock".to_string())?;
 
-        // Open file with O_NOFOLLOW equivalent: reject symlinks atomically
-        // by using create_new=false + checking symlink metadata after open
+        // Open file with O_NOFOLLOW to atomically reject symlinks.
+        // This prevents the TOCTOU race where an attacker swaps the file
+        // with a symlink between the check and open().
         use std::fs::OpenOptions;
-        // Reject pre-existing symlinks
-        if resolved.exists() && resolved.is_symlink() {
-            return Err("Symlinks not allowed for spool files".to_string());
-        }
-        match OpenOptions::new().write(true).create(true).truncate(true).open(resolved) {
+        #[cfg(unix)]
+        let open_result = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(resolved)
+        };
+        #[cfg(not(unix))]
+        let open_result = OpenOptions::new().write(true).create(true).truncate(true).open(resolved);
+        match open_result {
             Ok(f) => {
-                // Verify the opened file isn't a symlink (post-open check)
-                if let Ok(meta) = resolved.symlink_metadata() {
-                    if meta.file_type().is_symlink() {
-                        drop(f);
-                        return Err("Symlinks not allowed for spool files".to_string());
-                    }
-                }
                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                 let mut file = f;
                 if let Err(e) = writeln!(file, "# RustSploit Console Log - Started {}", ts) { eprintln!("[!] Spool write error: {}", e); }
@@ -115,8 +117,30 @@ impl SpoolState {
 fn resolve_spool_path(path: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(path);
     if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            return Err(format!("Parent directory '{}' does not exist", parent.display()));
+        if !parent.as_os_str().is_empty() {
+            if !parent.exists() {
+                return Err(format!("Parent directory '{}' does not exist", parent.display()));
+            }
+            // Bug #96: O_NOFOLLOW on the target file is not enough — if the
+            // parent directory is itself a symlink (e.g. `./logs` → /tmp/evil),
+            // the spool file gets written inside the symlink target. Reject
+            // symlinked parents so spool files stay in the intended CWD subtree.
+            match std::fs::symlink_metadata(parent) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(format!(
+                        "Parent directory '{}' is a symlink — refusing to spool through it",
+                        parent.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to stat parent directory '{}': {}",
+                        parent.display(),
+                        e
+                    ));
+                }
+            }
         }
     }
     Ok(p)

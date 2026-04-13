@@ -592,3 +592,17 @@ pub async fn check_module(module_path: &str, target: &str) -> Option<crate::modu
     let module_name = parts.next()?;
     registry::check_by_category(category, module_name, target).await
 }
+
+/// Check if a module has a check() function without needing a target.
+pub fn has_check(module_path: &str) -> bool {
+    let mut parts = module_path.splitn(2, '/');
+    let category = match parts.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let module_name = match parts.next() {
+        Some(m) => m,
+        None => return false,
+    };
+    registry::check_available_by_category(category, module_name)
+}

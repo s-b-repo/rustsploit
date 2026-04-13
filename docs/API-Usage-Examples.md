@@ -4,9 +4,9 @@ Practical workflows for interacting with the Rustsploit REST API.
 
 > Start the server first: `cargo run -- --api`
 >
-> **Note:** Direct `curl` usage requires completing a PQ handshake first (programmatic clients only). For interactive use, connect via ArcticAlopex GUI which handles the PQ session automatically. The `curl` examples below show the plaintext request/response format — in practice, all traffic is PQ-encrypted.
+> **Important:** All API traffic is PQ-encrypted (ML-KEM-768 + X25519 + ChaCha20-Poly1305). Direct `curl` cannot be used — you must complete a PQ handshake at `POST /pq/handshake` first. For interactive use, connect via the **ArcticAlopex GUI** (`http://localhost:3000`) which handles PQ sessions automatically.
 >
-> The `Authorization: Bearer` headers shown below are **no longer used** — authentication is via PQ identity keys established during the handshake. The examples retain the header for reference only.
+> The examples below show the **plaintext request/response format** for reference. In practice, request bodies are encrypted and wrapped in the PQ envelope. See `docs/API-Server.md` for the full PQ handshake protocol.
 
 ---
 
@@ -26,8 +26,7 @@ curl http://localhost:8080/health
 ## List Available Modules
 
 ```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/modules
+curl      http://localhost:8080/api/modules
 ```
 
 **Response (truncated):**
@@ -52,8 +51,7 @@ curl -H "Authorization: Bearer my-secret-key" \
 ## Get Module Details
 
 ```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/module/exploits/sample_exploit
+curl      http://localhost:8080/api/module/exploits/sample_exploit
 ```
 
 ---
@@ -62,8 +60,7 @@ curl -H "Authorization: Bearer my-secret-key" \
 
 ```bash
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
      http://localhost:8080/api/validate
 ```
@@ -74,8 +71,7 @@ curl -X POST \
 
 ```bash
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
      http://localhost:8080/api/run
 ```
@@ -90,8 +86,7 @@ waiting on stdin.
 
 ```bash
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{"module": "exploits/heartbleed", "target": "10.10.10.10"}' \
      http://localhost:8080/api/run
 ```
@@ -101,8 +96,7 @@ curl -X POST \
 ```bash
 # TP-Link Archer RCE — supply credentials and command via API
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/routers/tplink/tplink_archer_rce_cve_2024_53375",
        "target": "192.168.1.1",
@@ -118,8 +112,7 @@ curl -X POST \
 ```bash
 # Zabbix SQL Injection — pre-select payload mode and credentials
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/webapps/zabbix/zabbix_7_0_0_sql_injection",
        "target": "10.10.10.10",
@@ -135,8 +128,7 @@ curl -X POST \
 ```bash
 # HTTP/2 Rapid Reset DoS test
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/frameworks/http2/cve_2023_44487_http2_rapid_reset",
        "target": "10.10.10.10",
@@ -158,8 +150,7 @@ curl -X POST \
 
 ```bash
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{
        "module": "creds/generic/ssh_bruteforce",
        "target": "10.10.10.10",
@@ -182,8 +173,7 @@ curl -X POST \
 
 ```bash
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+          -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/mongo/mongobleed",
        "target": "10.10.10.10:27017",
@@ -201,8 +191,7 @@ curl -X POST \
 ## Check Server Status & Statistics
 
 ```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/status
+curl      http://localhost:8080/api/status
 ```
 
 **Response:**
@@ -225,8 +214,7 @@ curl -H "Authorization: Bearer my-secret-key" \
 ## View Tracked IPs
 
 ```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/ips
+curl      http://localhost:8080/api/ips
 ```
 
 ---
@@ -234,8 +222,7 @@ curl -H "Authorization: Bearer my-secret-key" \
 ## View Auth Failure Stats
 
 ```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/auth-failures
+curl      http://localhost:8080/api/auth-failures
 ```
 
 ---
@@ -244,8 +231,7 @@ curl -H "Authorization: Bearer my-secret-key" \
 
 ```bash
 curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/rotate-key
+          http://localhost:8080/api/rotate-key
 ```
 
 The response includes the **new key** — store it immediately as the old key is invalidated.
@@ -253,6 +239,8 @@ The response includes the **new key** — store it immediately as the old key is
 ---
 
 ## Global Options
+
+> **Note:** Global options are scoped to the current workspace. Switching workspaces loads that workspace's own set of options.
 
 ```bash
 # Set global options
@@ -269,6 +257,8 @@ curl http://localhost:8080/api/options \
 ---
 
 ## Credential Store
+
+> **Note:** Credentials are scoped to the current workspace. Switching workspaces loads that workspace's own credential store.
 
 ```bash
 # Add a credential
@@ -503,8 +493,7 @@ curl http://localhost:8080/health
 curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/modules
 
 # 4. Port scan
-curl -X POST -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
+curl -X POST      -H "Content-Type: application/json" \
      -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
      http://localhost:8080/api/run
 

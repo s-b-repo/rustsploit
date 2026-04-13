@@ -866,7 +866,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         if name.is_empty() || name.len() > 64 {
                             crate::mprintln!("{}", "Workspace name must be 1-64 characters.".red());
                         } else if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-                            crate::workspace::WORKSPACE.switch(name).await;
+                            crate::workspace::switch_all(name).await;
                             crate::mprintln!("{}", format!("[+] Switched to workspace '{}'", name).green());
                         } else {
                             crate::mprintln!("{}", "Workspace name must be alphanumeric (with _ and -).".red());
@@ -1044,12 +1044,18 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         if let Some(ref t) = target {
                             if background {
                                 // Run as background job
-                                let job_id = crate::jobs::JOB_MANAGER.spawn(
+                                match crate::jobs::JOB_MANAGER.spawn(
                                     module_path.clone(),
                                     t.clone(),
                                     ctx.verbose,
-                                );
-                                crate::mprintln!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
+                                ) {
+                                    Ok(job_id) => {
+                                        crate::mprintln!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
+                                    }
+                                    Err(e) => {
+                                        crate::meprintln!("{}", format!("[!] {}", e).red());
+                                    }
+                                }
                             } else {
                                 // Normal foreground execution
                                 let is_mass_scan = crate::modules::creds::utils::is_mass_scan_target(t);

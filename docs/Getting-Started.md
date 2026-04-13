@@ -53,11 +53,7 @@ For a release-optimized binary:
 cargo build --release
 # Binary written to target/release/rustsploit
 ```
-## Quick install
-sudo su
-```
-sudo bash -c 'apt update -y && apt upgrade -y && apt install -y pkg-config libssl-dev rustc libdbus-1-dev git && curl --proto '"'"'=https'"'"' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source $HOME/.cargo/env && git clone https://github.com/s-b-repo/rustsploit.git && cd rustsploit && cargo build && cargo run'
-```
+
 ---
 
 ## Run
@@ -154,6 +150,53 @@ docker compose -f docker-compose.rustsploit.yml up -d --build
 
 ---
 
+## ArcticAlopex Web GUI
+
+ArcticAlopex is a multi-tenant web frontend for Rustsploit with RBAC, audit logging, and PQ-encrypted transport.
+
+### Prerequisites
+
+- Node.js 20+
+- Docker & Docker Compose (for PostgreSQL, Redis, MinIO)
+
+### Setup
+
+```bash
+cd arcticalopex
+
+# Start infrastructure
+docker compose up -d postgres redis minio
+
+# Configure
+cp .env.example .env
+sed -i "s/^MASTER_KEY=.*/MASTER_KEY=$(openssl rand -hex 32)/" .env
+
+# Install and initialize
+npm install
+npm run db:push
+
+# Start everything (from arcticalopex/)
+python3 tools/stack.py launch --docker
+```
+
+On first run the terminal prints a **6-digit setup PIN**. Open `http://localhost:3000/setup` to create the owner account.
+
+### Stack Manager
+
+| Command | Description |
+|---------|-------------|
+| `python3 tools/stack.py launch --docker` | Start all services with Docker infra |
+| `python3 tools/stack.py setup` | Interactive 7-step setup guide |
+| `python3 tools/stack.py stop` | Stop all running services |
+| `python3 tools/stack.py check` | Verify configuration only |
+| `python3 tools/stack.py troubleshoot` | Diagnose common issues |
+| `python3 tools/stack.py commands` | Print all commands (copy-paste) |
+| `python3 tools/stack.py config` | Create `.env` interactively |
+
+See [arcticalopex/README.md](../arcticalopex/README.md) for full documentation.
+
+---
+
 ## Privacy / VPN
 
 The built-in proxy system has been removed in favor of system-level VPN solutions.
@@ -168,4 +211,24 @@ Connect the VPN on your host before running Rustsploit and all traffic routes th
 
 ---
 
-> ⚠️ For authorized security testing and research only. Obtain explicit written permission before targeting any system you do not own.
+## Data Storage
+
+All persistent data is stored under `~/.rustsploit/`. Key paths:
+
+| Path | Description |
+|------|-------------|
+| `~/.rustsploit/workspaces/{name}.json` | Per-workspace hosts and services |
+| `~/.rustsploit/workspaces/{name}_creds.json` | Per-workspace credential store |
+| `~/.rustsploit/workspaces/{name}_options.json` | Per-workspace global options (`setg` values) |
+| `~/.rustsploit/workspaces/{name}_loot.json` | Per-workspace loot entries |
+| `~/.rustsploit/logs/` | Framework log files |
+| `~/.rustsploit/results/` | Saved module output and scan results |
+| `~/.rustsploit/pq_host_key` | API server post-quantum host key pair |
+| `~/.rustsploit/pq_authorized_keys` | Authorized client public keys |
+| `~/.rustsploit/startup.rc` | Auto-loaded resource script on shell startup |
+
+Each workspace isolates its own credentials, options, hosts, services, and loot. Switching workspaces (via `workspace <name>`, `POST /api/workspace`, or the MCP `switch_workspace` tool) loads the target workspace's data automatically.
+
+---
+
+> For authorized security testing and research only. Obtain explicit written permission before targeting any system you do not own.
