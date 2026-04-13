@@ -56,7 +56,7 @@ cargo build --release
 ## Quick install
 sudo su
 ```
-sudo bash -c 'apt update -y && apt upgrade -y && apt install -y pkg-config libssl-dev rustc libdbus-1-dev && curl --proto '"'"'=https'"'"' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source $HOME/.cargo/env && git clone https://github.com/s-b-repo/rustsploit.git && cd rustsploit && cargo build && cargo run'
+sudo bash -c 'apt update -y && apt upgrade -y && apt install -y pkg-config libssl-dev rustc libdbus-1-dev git && curl --proto '"'"'=https'"'"' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source $HOME/.cargo/env && git clone https://github.com/s-b-repo/rustsploit.git && cd rustsploit && cargo build && cargo run'
 ```
 ---
 
