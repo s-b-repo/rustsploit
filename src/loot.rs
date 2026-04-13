@@ -130,7 +130,14 @@ impl LootStore {
             entries.push(entry);
             entries.clone()
         };
-        self.save_locked(&snapshot).await;
+        if !self.save_locked(&snapshot).await {
+            // Rollback: remove from in-memory index and clean up the file
+            let mut entries = self.entries.write().await;
+            entries.retain(|e| e.id != id);
+            let _ = tokio::fs::remove_file(&file_path).await;
+            crate::meprintln!("[!] Loot add rolled back — index save failed");
+            return None;
+        }
         Some(id)
     }
 
@@ -171,7 +178,9 @@ impl LootStore {
             if entries.len() < before {
                 let snapshot = entries.clone();
                 drop(entries);
-                self.save_locked(&snapshot).await;
+                if !self.save_locked(&snapshot).await {
+                    crate::meprintln!("[!] Warning: loot delete index save failed — in-memory state may diverge");
+                }
                 (true, fname)
             } else {
                 (false, None)
@@ -193,7 +202,9 @@ impl LootStore {
             entries.clear();
             names
         };
-        self.save_locked(&[]).await;
+        if !self.save_locked(&[]).await {
+            crate::meprintln!("[!] Warning: loot clear index save failed");
+        }
         for fname in filenames {
             if let Some(path) = self.file_path(&fname) {
                 if let Err(e) = tokio::fs::remove_file(&path).await { crate::meprintln!("[!] File remove error: {}", e); }
@@ -219,17 +230,28 @@ impl LootStore {
         &self.loot_dir
     }
 
-    async fn save_locked(&self, entries: &[LootEntry]) {
+    async fn save_locked(&self, entries: &[LootEntry]) -> bool {
         let tmp = self.index_path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(entries) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
-                if let Err(e) = tokio::fs::rename(&tmp, &self.index_path).await { crate::meprintln!("[!] File rename error: {}", e); }
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = tokio::fs::set_permissions(&self.index_path, std::fs::Permissions::from_mode(0o600)).await {
-                    crate::meprintln!("[!] Permission error on {}: {}", self.index_path.display(), e);
-                }
+        let json = match serde_json::to_string_pretty(entries) {
+            Ok(j) => j,
+            Err(e) => {
+                crate::meprintln!("[!] Failed to serialize loot index: {}", e);
+                return false;
             }
+        };
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
+            crate::meprintln!("[!] Failed to write loot index tmp: {}", e);
+            return false;
         }
+        if let Err(e) = tokio::fs::rename(&tmp, &self.index_path).await {
+            crate::meprintln!("[!] File rename error: {}", e);
+            return false;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = tokio::fs::set_permissions(&self.index_path, std::fs::Permissions::from_mode(0o600)).await {
+            crate::meprintln!("[!] Permission error on {}: {}", self.index_path.display(), e);
+        }
+        true
     }
 
     /// Display loot table.

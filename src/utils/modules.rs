@@ -98,7 +98,14 @@ pub fn find_modules(keyword: &str) {
     }
 }
 
-/// Helper to load lines from a file.
+/// Maximum length of a single wordlist line, in bytes. Bug #95: without
+/// this, a malicious wordlist with a single 100 MB line would pass the
+/// total-file-size check and be consumed as one giant "word" in the
+/// bruteforce loop.
+const MAX_WORDLIST_LINE_LEN: usize = 256;
+
+/// Helper to load lines from a file. Skips (and logs) any line longer
+/// than `MAX_WORDLIST_LINE_LEN`.
 pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let metadata = fs::metadata(path.as_ref())
         .with_context(|| format!("Failed to stat file '{}'", path.as_ref().display()))?;
@@ -113,11 +120,30 @@ pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let file = fs::File::open(path.as_ref())
         .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
     let reader = BufReader::new(file);
-    Ok(reader
+    let mut skipped_long: usize = 0;
+    let result: Vec<String> = reader
         .lines()
         .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
         .filter(|line| !line.is_empty())
-        .collect())
+        .filter(|line| {
+            if line.len() > MAX_WORDLIST_LINE_LEN {
+                skipped_long += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if skipped_long > 0 {
+        tracing::warn!(
+            target: "wordlist",
+            skipped = skipped_long,
+            max_len = MAX_WORDLIST_LINE_LEN,
+            path = %path.as_ref().display(),
+            "skipped wordlist entries longer than the per-line cap"
+        );
+    }
+    Ok(result)
 }
 
 /// Read a text file to string with a size limit to prevent OOM.

@@ -406,22 +406,12 @@ fn build_tool_definitions() -> Vec<Tool> {
             description: "Export a human-readable engagement summary report".into(),
             input_schema: json!({ "type": "object", "properties": {} }),
         },
-        // ── Execute commands (resource script equivalent) ────────────
-        Tool {
-            name: "execute_commands".into(),
-            description: "Execute a sequence of shell commands (like a resource script but inline). Commands are executed in order.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "commands": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of shell commands to execute in order"
-                    }
-                },
-                "required": ["commands"]
-            }),
-        },
+        // Bug #94 — `execute_commands` was previously registered here as a
+        // silent-success stub that returned `{"status":"dispatched"}` without
+        // actually executing anything. LLM agents routing commands through it
+        // believed the commands had run. Removed from the tool registry until
+        // it's wired through to a real dispatch path (see handle_execute_commands
+        // below — kept around so the unused warning is explicit).
     ]
 }
 
@@ -506,7 +496,14 @@ pub async fn call_tool(name: &str, args: Value) -> ToolResult {
         "export_summary" => handle_export_summary().await,
 
         // ── Execute commands (resource script equivalent) ────────
-        "execute_commands" => handle_execute_commands(&args).await,
+        // execute_commands removed from the tool registry — bug #94. If a
+        // caller somehow still names it, return an explicit error instead of
+        // routing to the stub.
+        "execute_commands" => ToolResult::error(
+            "execute_commands is not available — the previous stub returned false success \
+             indications and has been removed. Use individual tools (set_target, run_module, \
+             get_jobs) instead.".to_string(),
+        ),
 
         _ => ToolResult::error(format!("Unknown tool: {}", name)),
     }
@@ -919,7 +916,7 @@ async fn handle_switch_workspace(args: &Value) -> ToolResult {
     if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
         return ToolResult::error("Workspace name must be alphanumeric, underscore, or hyphen only".to_string());
     }
-    crate::workspace::WORKSPACE.switch(name).await;
+    crate::workspace::switch_all(name).await;
     ToolResult::text(format!("Switched to workspace: {}", name))
 }
 
@@ -1002,6 +999,16 @@ async fn handle_run_all(args: &Value) -> ToolResult {
         Ok(n) => n,
         Err(_) => return ToolResult::error("target must be a valid CIDR subnet (e.g., 192.168.1.0/24)".to_string()),
     };
+    // Reject excessively large subnets to prevent DoS
+    match &network {
+        ipnetwork::IpNetwork::V4(n) if n.prefix() < 16 => {
+            return ToolResult::error("IPv4 CIDR prefix must be /16 or more specific (max 65536 hosts)".to_string());
+        }
+        ipnetwork::IpNetwork::V6(n) if n.prefix() < 48 => {
+            return ToolResult::error("IPv6 CIDR prefix must be /48 or more specific".to_string());
+        }
+        _ => {}
+    }
     let host_count = match network {
         ipnetwork::IpNetwork::V4(n) => 2u64.saturating_pow(32 - n.prefix() as u32),
         ipnetwork::IpNetwork::V6(n) => {
@@ -1092,37 +1099,8 @@ async fn handle_export_summary() -> ToolResult {
     }
 }
 
-// ── Execute commands (resource script equivalent) ──────────────────────────
-
-async fn handle_execute_commands(args: &Value) -> ToolResult {
-    let commands = match args.get("commands").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return ToolResult::error("Missing required parameter: commands (must be an array of strings)".to_string()),
-    };
-    if commands.is_empty() {
-        return ToolResult::error("commands array is empty".to_string());
-    }
-    if commands.len() > 100 {
-        return ToolResult::error("Too many commands (max 100 per call)".to_string());
-    }
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    for cmd_val in commands {
-        let cmd = match cmd_val.as_str() {
-            Some(s) => s.trim(),
-            None => {
-                results.push(json!({"command": cmd_val.to_string(), "success": false, "error": "not a string"}));
-                continue;
-            }
-        };
-        if cmd.is_empty() { continue; }
-        // Use the shell command dispatch via the global config + commands module
-        // For simplicity, handle basic commands: use, set target, run, show_target, etc.
-        results.push(json!({"command": cmd, "status": "dispatched"}));
-    }
-    ToolResult::json(&json!({
-        "executed": results.len(),
-        "results": results,
-        "note": "Commands dispatched. Use list_* tools to check results.",
-    }))
-}
+// Bug #94 — `handle_execute_commands` was a silent-success stub. It has
+// been deleted along with its registration in the tool list. If a future
+// contributor wants to re-introduce the feature, wire each command through
+// the real shell passthrough (same path as POST /api/shell) with ACL
+// re-gating via `gateShellCommand` and audit logging via `enqueueAudit`.

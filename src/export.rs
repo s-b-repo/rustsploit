@@ -1,6 +1,31 @@
 use anyhow::{Result, Context};
 use serde::Serialize;
 use colored::*;
+use std::io::Write;
+
+/// Write data to a file, rejecting symlinks atomically with O_NOFOLLOW.
+fn safe_write(path: &str, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .context(format!("Failed to open '{}' (symlinks not allowed)", path))?;
+        file.write_all(data)
+            .context(format!("Failed to write to '{}'", path))?;
+        file.flush()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data).context(format!("Failed to write to '{}'", path))?;
+        Ok(())
+    }
+}
 
 /// Full engagement data for export.
 #[derive(Serialize)]
@@ -39,8 +64,7 @@ pub async fn export_json_string() -> Result<String> {
 pub async fn export_json(path: &str) -> Result<()> {
     validate_export_path(path)?;
     let json = export_json_string().await?;
-    std::fs::write(path, &json)
-        .context(format!("Failed to write to '{}'", path))?;
+    safe_write(path, json.as_bytes())?;
     crate::mprintln!("{}", format!("[+] Exported JSON to '{}'", path).green());
     Ok(())
 }
@@ -99,8 +123,7 @@ pub async fn export_csv_string() -> Result<String> {
 pub async fn export_csv(path: &str) -> Result<()> {
     validate_export_path(path)?;
     let output = export_csv_string().await?;
-    std::fs::write(path, &output)
-        .context(format!("Failed to write to '{}'", path))?;
+    safe_write(path, output.as_bytes())?;
     crate::mprintln!("{}", format!("[+] Exported CSV to '{}'", path).green());
     Ok(())
 }
@@ -164,8 +187,7 @@ pub async fn export_summary_string() -> Result<String> {
 pub async fn export_summary(path: &str) -> Result<()> {
     validate_export_path(path)?;
     let report = export_summary_string().await?;
-    std::fs::write(path, &report)
-        .context(format!("Failed to write to '{}'", path))?;
+    safe_write(path, report.as_bytes())?;
     crate::mprintln!("{}", format!("[+] Exported summary report to '{}'", path).green());
     Ok(())
 }

@@ -25,6 +25,38 @@ Because it's generated at build time, there is **no manual registry drift** as l
 
 ---
 
+## Naming Convention
+
+### No Underscore Prefixes
+
+Do not use underscore prefixes on function names or variable names. All identifiers use standard Rust `snake_case` without leading underscores.
+
+```rust
+// CORRECT
+fn validate_input(data: &str) -> bool { ... }
+fn build_enriched_entry(path: &str) -> serde_json::Value { ... }
+pub async fn run(target: &str) -> Result<()> { ... }
+
+// WRONG — no leading underscores
+fn _validate_input(data: &str) -> bool { ... }
+let _unused = something();
+```
+
+### Variables Must Be Used
+
+All declared variables must be consumed. Do not use the `_` prefix on variables to suppress unused warnings. If a variable is unused, remove it or use it.
+
+```rust
+// WRONG — suppressing unused warning
+let _result = some_operation();
+
+// CORRECT — use the variable
+let result = some_operation();
+log::debug!("Result: {:?}", result);
+```
+
+---
+
 ## Code Rules
 
 - **No dead code.** All code must be intentional and used. Do not leave unused functions, imports, or variables.
@@ -45,8 +77,8 @@ rustsploit/
 │   ├── api.rs                # REST API server — auth, rate limiting, hardening
 │   ├── config.rs             # Global config and target validation
 │   ├── module_info.rs        # ModuleInfo, CheckResult, ModuleRank types
-│   ├── global_options.rs     # Persistent global options (setg/unsetg)
-│   ├── cred_store.rs         # Credential store (JSON persistence)
+│   ├── global_options.rs     # Per-workspace options (setg/unsetg)
+│   ├── cred_store.rs         # Per-workspace credential store (JSON persistence)
 │   ├── spool.rs              # Console output logging
 │   ├── workspace.rs          # Host/service tracking + workspaces
 │   ├── loot.rs               # Loot/evidence management
@@ -149,7 +181,8 @@ The `check` shell command and `POST /api/check` endpoint run this without exploi
 Modules can auto-store discovered data:
 
 ```rust
-// Store a found credential
+// Store a found credential (stored in the current workspace's credential store)
+// Credentials are isolated per workspace — switching workspaces switches the store.
 crate::cred_store::store_credential(host, port, "ssh", username, password,
     crate::cred_store::CredType::Password, "creds/generic/ssh_bruteforce");
 

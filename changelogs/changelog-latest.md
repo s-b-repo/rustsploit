@@ -1,3 +1,48 @@
+## v0.5.0 — Security & Isolation Hardening
+
+### Security Fixes (ArcticAlopex Frontend)
+- **API key hashing**: Replaced SHA256 with Argon2id via existing `hashApiKey()` function
+- **Permission checks**: Added ACL checks to 6 admin endpoints (GET/POST /api/users, GET/POST /api/roles, GET /api/audit, GET /api/activity) that previously only checked session existence
+- **Module restrictions**: Loaded `role_module_restrictions` from DB and passed to ACL `resolve()` engine (was always passing empty array)
+- **Export permission mismatch**: Fixed `export.data` → `export.json` permission name inconsistency
+- **PQ-aware health check**: Health worker now tests both plain HTTP and PQ-encrypted paths, reports healthy/degraded/unreachable
+- **Default-deny unmapped endpoints**: pathToPermission() now returns a sentinel for unmapped RSF endpoints instead of null (owner-only fallback)
+- **WebSocket error handling**: Separated JSON parse errors from session failures in WS message handler
+- **Credential redaction**: Recursive redaction across 15+ secret field names with nested object support
+- **TOTP encryption**: Secrets now encrypted with AES-256-GCM via MASTER_KEY before DB storage
+- **Per-account login lockout**: Added per-account rate limiting (10 attempts → 30 min lock) alongside existing IP-based limiter
+
+### Per-Workspace Isolation
+- **Credentials**: Each workspace now has its own credential store at `~/.rustsploit/workspaces/{name}_creds.json` (previously global `creds.json`)
+- **Options**: Each workspace now has its own options at `~/.rustsploit/workspaces/{name}_options.json` (previously global `global_options.json`)
+- **Auto-migration**: Legacy global files are automatically migrated to the default workspace on first run
+- **Workspace switch**: `workspace <name>` now switches credentials and options alongside hosts/services
+
+### Persistent File Logging
+- Added daily rolling log files at `~/.rustsploit/logs/rustsploit.YYYY-MM-DD.log`
+- Both console (stderr) and file logging run simultaneously via `tracing-appender`
+- Log files include timestamps, log levels, and target module information
+
+### Per-User Isolation (ArcticAlopex GUI)
+- **Credential ownership**: Each user now has their own credential store. Non-admin users only see credentials they added. Owners/admins can toggle "Show All" to view all tenant credentials.
+- **User preferences**: New per-user key-value preferences API (`/api/preferences`) with theme, default target, concurrency, auto-refresh, and other settings. Managed via Account Settings page.
+- **Credential ownership enforcement**: Non-admin users can only delete their own credentials (403 for others' creds).
+- **New DB tables**: `credential_owners` (maps RSF cred IDs to users), `user_preferences` (per-user key-value settings).
+
+### Audit & Activity Log Export
+- Audit and Activity pages now have CSV and JSON export buttons
+- Export API: `GET /api/audit?export=csv|json` and `GET /api/activity?export=csv|json`
+- Exports up to 10,000 entries with `Content-Disposition: attachment` for file download
+- Respects current search/filter when exporting
+
+### Dashboard & UI Fixes
+- Fixed Instance Health showing "unreachable" despite backend being up (was checking `data.healthy` instead of `data.success`)
+- Dashboard now checks health endpoint directly + uses stored DB status
+- Fixed activity feed auto-refresh glitching (unstable callback deps causing interval reset every 5 seconds)
+- Fixed audit page loading flash on refresh (skeleton only shows on initial load)
+
+---
+
 ## Framework Features - Metasploit/RouterSploit Parity
 
 Added 10 major framework features bringing Rustsploit closer to feature parity with Metasploit and RouterSploit.
@@ -18138,3 +18183,88 @@ All 7 documentation files updated. Here's the summary:
   ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
   │ HTTP Forward         │ Full GET, checks 200 + body              │ Basic auth header               │                                                                                                                                   
   └──────────────────────┴──────────────────────────────────────────┴─────────────────────────────────┘    
+  
+  
+    │ 1D  │ api.rs                            │ Rewrote is_blocked_target() with IP parsing — catches ::ffff:169.254.169.254, Azure wireserver 168.63.129.16, full 169.254.0.0/16 range │
+  ├─────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                     
+  │ 1E  │ api.rs                            │ Added is_blocked_target() to honeypot_check()                                                                                           │
+  ├─────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                     
+  │ 1F  │ api.rs                            │ Added is_blocked_target() to shell run_all command  
+  Phase 2 — High Severity                                                                                                                                                                                                                   
+                                         
+  ┌─────┬──────────────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+  │ Fix │         File         │                                        Issue                                        │
+  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 2A  │ api.rs, mcp/tools.rs │ Reject CIDR prefixes < /16 (IPv4) and < /48 (IPv6) — prevents /0 DoS                │
+  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 2B  │ api.rs               │ File read uses Read::take() to cap at 1MB at IO level — prevents OOM on large files │                                                                                                                      
+  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                      
+  │ 2C  │ api.rs               │ add_cred rejects port=0 and empty secret                                            │                                                                                                                      
+  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                      
+  │ 2D  │ loot.rs              │ save_locked returns bool; add() rolls back on failure                               │
+  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                      
+  │ 2E  │ cred_store.rs        │ Same persistence-integrity fix for credential store                                 │
+  └─────┴──────────────────────┴─────────────────────────────────────────────────────────────────────────────────────┘          
+  
+    Phase 3 — Swallowed Errors (12 locations)                                                                                                                                                                                                 
+                                         
+  All .catch(() => {}) / catch { /* ignore */ } replaced with toast.error() or console.error(). Most critical: permission save on roles page now shows error + keeps dirty state on failure.                                                
+  
+  Phase 4 — Crypto                                                                                                                                                                                                                          
+                                         
+  ┌─────┬──────────────────┬──────────────────────────────────────────────────────────────────┐
+  │ Fix │       File       │                              Issue                               │
+  ├─────┼──────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ 4A  │ pq_channel.rs    │ Nonces derived from `[epoch                                      │
+  ├─────┼──────────────────┼──────────────────────────────────────────────────────────────────┤
+  │ 4B  │ pq_middleware.rs │ Epoch monotonicity check prevents replay of older-epoch messages │                                                                                                                                             
+  └─────┴──────────────────┴──────────────────────────────────────────────────────────────────┘                                                                                                                                             
+                                                                        Security Fixes (10 items):                                                                
+  1. API key hashing: SHA256 → Argon2id                                                                                                                                                                                                     
+  2. ACL checks added to 6 unprotected admin endpoints                             
+  3. Module restrictions wired into ACL engine                                                                                                                                                                                              
+  4. Export permission name mismatch fixed                                         
+  5. PQ-aware health check (healthy/degraded/unreachable)                                                                                                                                                                                   
+  6. Default-deny for unmapped RSF endpoints                                       
+  7. WebSocket error handling separated                                                                                                                                                                                                     
+  8. Recursive credential redaction (15+ secret field names)                                                                                                                                                                                
+  9. TOTP secrets encrypted at rest (AES-256-GCM)                                                                                                                                                                                           
+  10. Per-account login lockout (10 attempts → 30 min)                                                                                                                                                                                      
+                                                                                                                                                                                                                                            
+  Per-Workspace Isolation:                                                                                                                                                                                                                  
+  - Credentials: ~/.rustsploit/workspaces/{name}_creds.json (was global creds.json)                                                                                                                                                         
+  - Options: ~/.rustsploit/workspaces/{name}_options.json (was global global_options.json)                                                                                                                                                  
+  - Auto-migration from legacy files on first run                                         
+  - Workspace switch now switches creds + options alongside hosts/services                                                                                                                                                                  
+                                                                          
+  Persistent File Logging:                                                                                                                                                                                                                  
+  - Daily rolling logs at ~/.rustsploit/logs/rustsploit.YYYY-MM-DD.log                                                                                                                                                                      
+  - Dual output: console (stderr) + file via tracing-appender                                                                                                                                                                               
+                                                                                                                                                                                                                                            
+  UI Fixes (4 items):                                                                                                                                                                                                                       
+  - Dashboard health: data.healthy → data.success + direct health endpoint check                                                                                                                                                            
+  - Activity feed: stabilized auto-refresh interval                                                                                                                                                                                         
+  - Audit page: skeleton only on initial load                                                                                                                                                                                               
+                                                                                                                                                                                                                                            
+  Docs Updated (12 files):                                  
+  changelog-latest.md, Changelog.md, Security-Validation.md, API-Server.md, Utilities-Helpers.md, Interactive-Shell.md, Getting-Started.md, MCP-Integration.md, API-Usage-Examples.md, Credential-Modules-Guide.md, Module-Development.md                                 
+  Rust API (src/api.rs) — 4 new REST endpoints                                                                      
+   
+  ┌──────────────────┬──────────┬───────────────────────────────┬──────────────────────────────────┐                
+  │     Endpoint     │  Method  │            Purpose            │             Replaces             │
+  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤                
+  │ /api/creds/clear │ POST     │ Clear all credentials         │ shell: "creds clear"             │
+  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤
+  │ /api/hosts/clear │ POST     │ Clear all hosts & services    │ shell: "hosts clear"             │                
+  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤
+  │ /api/loot/clear  │ POST     │ Clear all loot entries        │ shell: "loot clear"              │                
+  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤                
+  │ /api/spool       │ GET/POST │ Get status / start/stop spool │ shell: "spool status/off/<file>" │
+  └──────────────────┴──────────┴───────────────────────────────┴──────────────────────────────────┘  
+
+     Phase D (Rust):
+     cd /home/kali/Pictures/rustsploit/rustsploit
+     cargo build --release
+     # MCP execute_commands: if option (a) was taken, confirm the tool is gone from the schema.
+     # Wordlist per-line cap: create a wordlist with one 10MB line, run a bruteforce module, confirm tracing::warn fires and the line is skipped.
+     # Spool parent symlink: create `ln -s /tmp /home/kali/Pictures/rustsploit/rustsploit/test-logs`, try to spool into test-logs/out.txt, expect explicit error.

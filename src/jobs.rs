@@ -40,10 +40,15 @@ pub struct Job {
 /// Maximum number of tracked jobs (BUG 7 fix).
 const MAX_JOBS: usize = 1000;
 
+/// Default limit on concurrent running jobs (can be overridden via API).
+const DEFAULT_MAX_RUNNING: usize = 5;
+
 /// Manages background jobs.
 pub struct JobManager {
     jobs: RwLock<HashMap<u32, Job>>,
     next_id: AtomicU32,
+    /// Configurable limit on concurrent running jobs. Default: 5.
+    max_running: AtomicU32,
 }
 
 impl JobManager {
@@ -51,16 +56,46 @@ impl JobManager {
         Self {
             jobs: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(1),
+            max_running: AtomicU32::new(DEFAULT_MAX_RUNNING as u32),
         }
     }
 
-    /// Spawn a module as a background job. Returns the job ID.
+    /// Get the number of currently running jobs.
+    pub fn running_count(&self) -> usize {
+        self.jobs.read().map(|jobs| {
+            jobs.values().filter(|j| {
+                j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+            }).count()
+        }).unwrap_or(0)
+    }
+
+    /// Get the current max running jobs limit.
+    pub fn get_max_running(&self) -> u32 {
+        self.max_running.load(Ordering::Relaxed)
+    }
+
+    /// Set the max running jobs limit (1-100).
+    pub fn set_max_running(&self, limit: u32) {
+        let clamped = limit.clamp(1, 100);
+        self.max_running.store(clamped, Ordering::Relaxed);
+    }
+
+    /// Spawn a module as a background job. Returns Ok(job_id) or Err if limit reached.
     pub fn spawn(
         &self,
         module: String,
         target: String,
         verbose: bool,
-    ) -> u32 {
+    ) -> Result<u32, String> {
+        // Check running job limit before spawning
+        let running = self.running_count();
+        let max = self.max_running.load(Ordering::Relaxed) as usize;
+        if running >= max {
+            return Err(format!(
+                "Job limit reached: {}/{} concurrent jobs running. Kill a running job or increase the limit.",
+                running, max
+            ));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -106,7 +141,7 @@ impl JobManager {
             jobs.insert(id, job);
         }
 
-        id
+        Ok(id)
     }
 
     /// Kill a background job.

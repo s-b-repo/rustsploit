@@ -7,8 +7,8 @@ Rustsploit provides several utility modules that every module developer should k
 | **Core Utils** | `crate::utils` | Target normalization, file loading, config-aware prompts, input validation |
 | **Creds Utils** | `crate::modules::creds::utils` | Bruteforce statistics, subnet helpers, IP exclusion, scan state tracking |
 | **Config** | `crate::config` | Global target state, module config, API prompt keys, results directory |
-| **Global Options** | `crate::global_options` | Persistent `setg` options — checked by `cfg_prompt_*` after custom_prompts |
-| **Cred Store** | `crate::cred_store` | Store/query discovered credentials. Call `store_credential()` from modules |
+| **Global Options** | `crate::global_options` | Per-workspace `setg` options — isolated per workspace, checked by `cfg_prompt_*` after custom_prompts |
+| **Cred Store** | `crate::cred_store` | Per-workspace credential store. Each workspace has its own credentials at `workspaces/{name}_creds.json` |
 | **Workspace** | `crate::workspace` | Track hosts/services. Call `track_host()` / `track_service()` from modules |
 | **Loot** | `crate::loot` | Store collected evidence. Call `store_loot()` from modules |
 | **Module Info** | `crate::module_info` | `ModuleInfo`, `ModuleRank`, `CheckResult` types for `info()`/`check()` |

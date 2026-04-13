@@ -63,12 +63,14 @@ Optional params for `run_module`: `port` (integer), `verbose` (boolean), `prompt
 
 ### Credential Tools
 
+Credentials are per-workspace -- each workspace maintains its own credential store at `~/.rustsploit/workspaces/{name}_creds.json`. Switching workspaces via `switch_workspace` loads that workspace's credentials.
+
 | Tool | Description | Required Params |
 |------|-------------|-----------------|
-| `list_creds` | List all stored credentials | -- |
-| `search_creds` | Search credentials by host, service, or username | `query` |
-| `add_cred` | Add a credential to the store | `host`, `username`, `secret` |
-| `delete_cred` | Delete a credential by its ID | `id` |
+| `list_creds` | List all stored credentials in the current workspace | -- |
+| `search_creds` | Search credentials by host, service, or username in the current workspace | `query` |
+| `add_cred` | Add a credential to the current workspace's store | `host`, `username`, `secret` |
+| `delete_cred` | Delete a credential by its ID from the current workspace | `id` |
 
 Optional params for `add_cred`: `port` (integer), `service` (string), `cred_type` (password/hash/key/token).
 
@@ -98,11 +100,13 @@ Optional params for `add_loot`: `description`.
 
 ### Global Options Tools
 
+Options are per-workspace -- they are scoped to the current workspace and stored at `~/.rustsploit/workspaces/{name}_options.json`. Switching workspaces via `switch_workspace` loads that workspace's options.
+
 | Tool | Description | Required Params |
 |------|-------------|-----------------|
-| `list_options` | List all persistent global options (setg values) | -- |
-| `set_option` | Set a persistent global option | `key`, `value` |
-| `unset_option` | Remove a persistent global option | `key` |
+| `list_options` | List all persistent global options (setg values) for the current workspace | -- |
+| `set_option` | Set a persistent global option in the current workspace | `key`, `value` |
+| `unset_option` | Remove a persistent global option from the current workspace | `key` |
 
 ### Job Tools
 

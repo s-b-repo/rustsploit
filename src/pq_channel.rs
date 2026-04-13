@@ -378,8 +378,11 @@ pub fn encrypt_response(
     session.send_counter += 1;
     let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+    // Derive deterministic nonce from epoch + counter to eliminate birthday collision risk.
+    // Format: [4 bytes: epoch LE][8 bytes: counter LE] — unique per message per session.
     let mut nonce_bytes = [0u8; 12];
-    { use rand::RngExt; rand::rng().fill(&mut nonce_bytes); }
+    nonce_bytes[..4].copy_from_slice(&(session.epoch as u32).to_le_bytes());
+    nonce_bytes[4..].copy_from_slice(&(session.send_counter - 1).to_le_bytes());
     let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: plaintext, aad })
         .map_err(|e| anyhow::anyhow!("PQ encrypt failed: {e}"))?;
     Ok((ct, nonce_bytes, rekey_pub))

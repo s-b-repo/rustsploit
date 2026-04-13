@@ -271,6 +271,29 @@ fn generate_dispatch(
     }
 
     writeln!(file, "        _ => None,")?;
+    writeln!(file, "    }}\n}}\n")?;
+
+    // === Check availability (no target needed) ===
+    writeln!(file, "/// Check if a module has a check() function without needing a target.")?;
+    writeln!(file, "pub fn check_available(module_name: &str) -> bool {{")?;
+    writeln!(file, "    match module_name {{")?;
+
+    let mut check_avail_shorts: HashSet<String> = HashSet::new();
+
+    for (key, _, caps) in &sorted_mappings {
+        if !caps.has_check { continue; }
+        let short_key = key.rsplit('/').next().unwrap_or(key);
+
+        if short_key == *key {
+            writeln!(file, r#"        "{k}" => true,"#, k = key)?;
+        } else if check_avail_shorts.insert(short_key.to_string()) {
+            writeln!(file, r#"        "{short}" | "{full}" => true,"#, short = short_key, full = key)?;
+        } else {
+            writeln!(file, r#"        "{full}" => true,"#, full = key)?;
+        }
+    }
+
+    writeln!(file, "        _ => false,")?;
     writeln!(file, "    }}\n}}")?;
 
     let count = sorted_mappings.len();
@@ -355,6 +378,21 @@ fn generate_registry(entries: &[RegistryEntry]) -> Result<(), Box<dyn std::error
         )?;
     }
     writeln!(f, "        _ => None,")?;
+    writeln!(f, "    }}")?;
+    writeln!(f, "}}\n")?;
+
+    // Check availability (no target needed)
+    writeln!(f, "/// Check if a module has a check() function by category and module name.")?;
+    writeln!(f, "pub fn check_available_by_category(category: &str, module_name: &str) -> bool {{")?;
+    writeln!(f, "    match category {{")?;
+    for e in entries {
+        writeln!(
+            f,
+            "        \"{}\" => crate::commands::{}::check_available(module_name),",
+            e.category, e.dispatch_name
+        )?;
+    }
+    writeln!(f, "        _ => false,")?;
     writeln!(f, "    }}")?;
     writeln!(f, "}}")?;
 

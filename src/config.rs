@@ -274,44 +274,82 @@ use std::sync::LazyLock as Lazy;
 
 pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new());
 
-/// Module-level configuration for API-driven execution
-/// This is set by the API before running a module and read by modules
-/// to get pre-configured values instead of prompting the user
+/// Module-level configuration for API-driven execution.
+/// Set by the API before running a module; modules read values via `cfg_prompt_*`
+/// instead of prompting the user interactively.
 ///
 /// # Unified Prompt Keys
 ///
-/// These are the standardized `custom_prompts` keys used across all
-/// scanner modules (via `cfg_prompt_*` in utils.rs). Supply them in the
-/// JSON `"prompts"` object of an API `/api/run` request.
+/// Supply these in the JSON `"prompts"` object of an API `/api/run` request,
+/// or use the dedicated top-level fields (`port`, `concurrency`, etc.).
 ///
 /// ## Common Keys (used by many modules)
-/// | Key               | Type   | Description                                    |
-/// |-------------------|--------|------------------------------------------------|
-/// | `port`            | u16    | Target service port                            |
-/// | `timeout`         | int    | Connection/request timeout (seconds or ms)     |
-/// | `verbose`         | y/n    | Verbose output                                 |
-/// | `save_results`    | y/n    | Save results to file                           |
-/// | `output_file`     | string | Output filename for results                    |
-/// | `concurrency`     | int    | Number of concurrent threads/tasks             |
-/// | `threads`         | int    | Alias for concurrency (some modules)           |
-/// | `wordlist`        | path   | Path to wordlist file                          |
-/// | `target_file`     | path   | Path to file containing targets                |
-/// | `additional_targets` | string | Comma-separated additional targets           |
-/// | `mode`            | string | Operation mode selector (1, 2, 3, etc.)        |
+/// | Key                 | Type   | Description                                      |
+/// |---------------------|--------|--------------------------------------------------|
+/// | `port`              | u16    | Target service port (dedicated field)             |
+/// | `timeout`           | int    | Connection/request timeout (seconds or ms)        |
+/// | `verbose`           | y/n    | Verbose output (dedicated field)                  |
+/// | `save_results`      | y/n    | Save results to file (dedicated field)            |
+/// | `output_file`       | string | Output filename for results (dedicated field)     |
+/// | `concurrency`       | int    | Concurrent threads/tasks (dedicated field)        |
+/// | `threads`           | int    | Alias for concurrency (some modules)              |
+/// | `username_wordlist` | path   | Path to username wordlist (dedicated field)       |
+/// | `password_wordlist` | path   | Path to password wordlist (dedicated field)       |
+/// | `stop_on_success`   | y/n    | Stop on first success (dedicated field)           |
+/// | `combo_mode`        | string | "linear"/"combo"/"spray" (dedicated field)        |
+/// | `mode`              | string | Operation mode selector (1, 2, 3, etc.)           |
+/// | `target_file`       | path   | Path to file containing targets                   |
+/// | `wordlist`          | path   | Path to wordlist file (scanners)                  |
+///
+/// ## Credential Module Keys (creds/generic/*)
+///
+/// All bruteforce modules share: `port`, `username_wordlist`, `password_wordlist`,
+/// `concurrency`, `timeout`, `verbose`, `save_results`, `output_file`, `combo_mode`,
+/// `stop_on_success`, `cred_file` (y/n), `cred_file_path`.
+///
+/// Module-specific additions:
+/// - **ssh_bruteforce**: `use_defaults`, `use_username_wordlist`, `use_password_wordlist`,
+///   `max_retries`, `retry_on_error`, `save_unknown_responses`
+/// - **ssh_spray**: `password` (R), `targets_file`, `username_file`, `usernames`,
+///   `ssh_port`, `additional_targets`, `load_targets_file`, `load_usernames_file`
+/// - **ssh_user_enum**: `username_file` (R), `ssh_port`, `additional_targets`
+/// - **mqtt_bruteforce**: `client_id`, `use_tls`
+/// - **ftp_bruteforce**: `delay_ms`, `max_retries`, `use_defaults`
+/// - **smtp_bruteforce**: `delay_ms`, `use_tls`
+/// - **snmp_bruteforce**: `community_wordlist`, `version` (snmpv1/v2c/v3)
+/// - **rdp_bruteforce**: `domain`
+/// - **rtsp_bruteforce**: `paths_file`, `headers_file`, `use_custom_headers`
+/// - **http_basic_bruteforce**: `url_path`, `use_tls`, `max_retries`,
+///   `use_defaults`, `use_username_wordlist`, `use_password_wordlist`
+/// - **pop3_bruteforce**: `use_tls`, `delay_ms`, `max_retries`
+/// - **imap_bruteforce**: `use_tls`, `max_retries`
+/// - **l2tp_bruteforce**: `ipsec_psk`, `use_ipsec`
+/// - **proxy_bruteforce**: `proxy_type`
+/// - **telnet_bruteforce**: `login_prompt`, `password_prompt`, `success_pattern`
+/// - **telnet_hose**: `command`, `delay_ms`
+/// - **camxploit**: (mass scan, uses creds/utils shared runner)
+/// - **fortinet_bruteforce**: `vpn_realm`
+/// - **redis_bruteforce**: `use_acl`, `max_retries`
+/// - **vnc_bruteforce**: (password-only, no username_wordlist)
+/// - **memcached_bruteforce**: `use_sasl`
 ///
 /// ## Scanner-Specific Keys
 ///
 /// ### Port Scanner (`scanners/port_scanner`)
-/// `port_range`, `scan_method`, `show_only_open`, `ttl`, `source_port`, `data_length`
+/// `port_range`, `port_start`, `port_end`, `scan_method`, `show_only_open`,
+/// `ttl`, `source_port`, `data_length`
 ///
 /// ### SSH Scanner (`scanners/ssh_scanner`)
 /// `load_from_file`, `target_file`
+///
+/// ### Banner Grabber (`scanners/banner_grabber`)
+/// `port`, `target_file`, `additional_targets`
 ///
 /// ### DNS Recursion (`scanners/dns_recursion`)
 /// `domain`, `record_type`
 ///
 /// ### SMTP User Enum (`scanners/smtp_user_enum`)
-/// `timeout_ms`, `save_valid`, `valid_output`, `save_unknown`, `unknown_output`
+/// `threads`, `timeout_ms`, `save_valid`, `valid_output`, `save_unknown`, `unknown_output`
 ///
 /// ### Ping Sweep (`scanners/ping_sweep`)
 /// `add_manual_targets`, `manual_target`, `load_from_file`, `save_up_hosts`,
@@ -326,7 +364,7 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 ///
 /// ### Dir Brute (`scanners/dir_brute`)
 /// `scan_mode`, `delay_ms`, `random_agent`, `custom_cookies`, `cookies`,
-/// `use_https`, `base_path`, `template_name`, `template_file`, `sort_by`
+/// `use_https`, `base_path`, `template_name`, `template_file`, `sort_by`, `wordlist`
 ///
 /// ### Sequential Fuzzer (`scanners/sequential_fuzzer`)
 /// `min_length`, `max_length`, `charset`, `custom_charset`, `encoding`,
@@ -335,17 +373,74 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 /// ### API Endpoint Scanner (`scanners/api_endpoint_scanner`)
 /// `output_dir`, `use_spoofing`, `use_generic_payload`, `enable_delete`,
 /// `enable_extended_methods`, `modules`, `enum_mode`, `id_start`, `id_end`,
-/// `id_file`, `endpoint_source`, `base_path`, `endpoint_file`
+/// `id_file`, `endpoint_source`, `base_path`, `endpoint_file`, `wordlist`,
+/// `mutation_depth`, `max_variants`, `max_total_payloads`, `traversal_max_depth`
 ///
 /// ### IPMI Enum/Exploit (`scanners/ipmi_enum_exploit`)
 /// `cidr`, `target`, `test_cipher_zero`, `test_anonymous`, `test_default_creds`,
 /// `test_rakp_hash`, `continue_large_scan`, `destroy_confirm`
 ///
+/// ### Source Port Scanner (`scanners/source_port_scanner`)
+/// `dest_port`, `source_range`, `source_start`, `source_end`
+///
+/// ### NBNS Scanner (`scanners/nbns_scanner`)
+/// `retries`
+///
 /// ### SSDP MSearch (`scanners/ssdp_msearch`)
 /// `retries`, `search_target`
 ///
-/// ### Sample Scanner (`scanners/sample_scanner`)
-/// `check_http`, `check_https`
+/// ### Honeypot Scanner (`scanners/honeypot_scanner`)
+/// `port_timeout_ms`
+///
+/// ### Subdomain Scanner (`scanners/subdomain_scanner`)
+/// `domain` (R)
+///
+/// ### SSL Scanner (`scanners/ssl_scanner`)
+/// (uses standard `port`, `timeout`, `save_results`, `output_file`)
+///
+/// ### WAF Detector (`scanners/waf_detector`)
+/// `url_path`
+///
+/// ## Exploit-Specific Keys (selected, most use only `port` + `mode`)
+///
+/// ### Crypto
+/// - **heartbleed**: `port`
+/// - **geth_dos**: `targets_file`, `p2p_port`, `rpc_port`, `connections`, `duration`
+///
+/// ### DoS modules
+/// All share: `port`, `connections`/`threads`, `duration`
+/// - **syn_ack_flood**: `reflector_port`, `reflector`
+/// - **http_flood**: `path`, `method`
+/// - **slowloris**: `connections`
+/// - **rudy**: `path`, `content_type`
+///
+/// ### SSH exploits
+/// - **sshpwn_***: `port`, `username`, `password`/`key_path`
+/// - **erlang_otp_ssh_rce**: `port`, `command`
+/// - **openssh_regresshion**: `port`, `glibc_base`
+///
+/// ### Network Infrastructure
+/// - **forticloud_sso**: `port`, `shell_port`, `listener_ip`
+/// - **fortisiem_rce**: `lport`, `lhost`
+/// - **vcenter_backup_rce**: `mode`, `username`, `password`
+///
+/// ### Payload Generators
+/// - **batgen/lnkgen/polymorph_dropper/payload_encoder/narutto_dropper**:
+///   various `payload_url`, `output_path`, `encode_type`, `iterations`
+///
+/// ### Web Applications
+/// - **termix_xss**: `auth_port`, `file_port`, `ssh_port`
+/// - **spotube**: `mode`, `request_count`, `delay_ms`
+/// - **react2shell**: `mode`, `rhost`, `rport`
+///
+/// ### Cameras (mass-scan capable)
+/// - **hikvision_rce**: `output_file`
+/// - **acm_5611_rce**: `output_file`, `concurrency`
+/// - **abus_camera**: `output_file`
+///
+/// ### Sample modules
+/// - **sample_scanner**: `check_http`, `check_https`
+/// - **sample_exploit**: (minimal, target-only)
 #[derive(Clone, Debug)]
 pub struct ModuleConfig {
     pub port: Option<u16>,
@@ -356,7 +451,7 @@ pub struct ModuleConfig {
     pub save_results: Option<bool>,
     pub output_file: Option<String>,
     pub verbose: Option<bool>,
-    pub combo_mode: Option<bool>,
+    pub combo_mode: Option<String>,
     /// Generic key→value prompt overrides.
     /// When set, `cfg_prompt_*` functions in utils.rs return these values
     /// instead of prompting stdin. Keys match prompt names like "port", "mode", etc.

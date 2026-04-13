@@ -120,10 +120,14 @@ pub struct RunModuleRequest {
     pub save_results: Option<bool>,
     pub output_file: Option<String>,
     pub verbose: Option<bool>,
-    pub combo_mode: Option<bool>,
+    /// Combo mode: "linear", "combo", or "spray" (bruteforce modules)
+    pub combo_mode: Option<String>,
     /// Generic prompt overrides — any key/value pair that modules read via
     /// `cfg_prompt_*()`. Examples: {"mode": "1", "timeout": "5", "retries": "3"}
     pub prompts: Option<HashMap<String, String>>,
+    /// If true, run as a background job and return job_id immediately.
+    /// The caller can then poll GET /api/jobs to track progress.
+    pub background: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -171,19 +175,64 @@ fn validate_target(target: &str) -> bool {
 /// indicate a cloud SSRF are blocked.
 fn is_blocked_target(target: &str) -> bool {
     let lower = target.to_lowercase();
-    // Block cloud metadata endpoints (SSRF canary)
-    if lower.starts_with("169.254.169.254")
-        || lower.starts_with("metadata.google.internal")
-        || lower.starts_with("100.100.100.200") // Alibaba metadata
-    {
+
+    // Hostname-based checks (DNS names that resolve to metadata endpoints)
+    if lower.contains("metadata.google.internal") {
         return true;
     }
-    // Block IPv6 link-local metadata equivalents
-    if lower.starts_with("fd00:ec2::254")
-        || lower.starts_with("[fd00:ec2::254]")
-    {
-        return true;
+
+    // Strip brackets and port to extract a bare IP for parsing.
+    // Handles: "169.254.169.254", "169.254.169.254:80", "[::ffff:169.254.169.254]",
+    //          "[::ffff:169.254.169.254]:80"
+    let stripped = lower
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or(&lower);
+    // For IPv4 with port: "1.2.3.4:80" → "1.2.3.4"
+    let bare = if stripped.matches(':').count() == 1 {
+        stripped.split(':').next().unwrap_or(stripped)
+    } else {
+        stripped // IPv6 has multiple colons, don't strip
+    };
+
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return is_blocked_ip(ip);
     }
+    // Also try the bracket-stripped version directly (full IPv6)
+    if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+        return is_blocked_ip(ip);
+    }
+    false
+}
+
+/// Check an already-parsed IP against blocked cloud metadata / link-local ranges.
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    let ipv4 = match ip {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            // AWS EC2 IPv6 metadata: fd00:ec2::254
+            if segs[0] == 0xfd00 && segs[1] == 0x0ec2 {
+                return true;
+            }
+            // Check for IPv4-mapped IPv6 (::ffff:A.B.C.D)
+            v6.to_ipv4_mapped()
+        }
+    };
+
+    if let Some(v4) = ipv4 {
+        let o = v4.octets();
+        // AWS / GCP / DigitalOcean metadata
+        if o == [169, 254, 169, 254] { return true; }
+        // Entire link-local range (169.254.0.0/16) — metadata canary
+        if o[0] == 169 && o[1] == 254 { return true; }
+        // Azure wireserver
+        if o == [168, 63, 129, 16] { return true; }
+        // Alibaba Cloud metadata
+        if o == [100, 100, 100, 200] { return true; }
+    }
+
     false
 }
 
@@ -223,6 +272,51 @@ async fn list_modules() -> Json<ApiResponse> {
             "modules": by_category,
         })),
     ))
+}
+
+/// GET /api/modules/enriched — list all modules with full metadata inline
+async fn list_modules_enriched() -> Json<ApiResponse> {
+    let modules = commands::discover_modules();
+
+    let mut by_category: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+
+    for module_path in &modules {
+        let entry = build_enriched_entry(module_path);
+        let category = module_path.split('/').next().unwrap_or("other").to_string();
+        by_category.entry(category).or_default().push(entry);
+    }
+
+    Json(ok_response(
+        format!("{} modules available (enriched)", modules.len()),
+        Some(serde_json::json!({
+            "total": modules.len(),
+            "categories": commands::categories(),
+            "modules": by_category,
+        })),
+    ))
+}
+
+/// Build a single enriched module entry with metadata, info, and capability flags.
+fn build_enriched_entry(module_path: &str) -> serde_json::Value {
+    let category = module_path.split('/').next().unwrap_or("other");
+    let short_name = module_path.rsplit('/').next().unwrap_or(module_path);
+    let info = commands::module_info(module_path);
+    let has_info = info.is_some();
+    let has_check = commands::has_check(module_path);
+
+    let info_data = info.and_then(|i| {
+        serde_json::to_value(&i).ok()
+    });
+
+    serde_json::json!({
+        "path": module_path,
+        "short_name": short_name,
+        "category": category,
+        "has_info": has_info,
+        "has_check": has_check,
+        "info": info_data,
+    })
 }
 
 /// GET /api/modules/search?q=keyword — search modules (like CLI `find`)
@@ -346,6 +440,12 @@ async fn add_cred(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
     if host.is_empty() || username.is_empty() {
         return Json(err_response("host and username are required", "INVALID_INPUT"));
     }
+    if port == 0 {
+        return Json(err_response("port must be a valid non-zero port number (1-65535)", "INVALID_INPUT"));
+    }
+    if secret.is_empty() {
+        return Json(err_response("secret is required", "INVALID_INPUT"));
+    }
 
     let cred_type = match cred_type_str {
         "hash" => crate::cred_store::CredType::Hash,
@@ -368,6 +468,13 @@ async fn delete_cred(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse
     } else {
         Json(err_response("Credential not found", "NOT_FOUND"))
     }
+}
+
+/// POST /api/creds/clear — clear all credentials
+async fn clear_creds() -> Json<ApiResponse> {
+    crate::cred_store::CRED_STORE.clear().await;
+    tracing::info!("API: all credentials cleared");
+    Json(ok_response("All credentials cleared", None))
 }
 
 // ─── Workspace API ─────────────────────────────────────────────────
@@ -448,7 +555,7 @@ async fn switch_workspace(Json(payload): Json<serde_json::Value>) -> Json<ApiRes
     if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
         return Json(err_response("Workspace name must be alphanumeric, underscore, or hyphen only", "INVALID_INPUT"));
     }
-    crate::workspace::WORKSPACE.switch(name).await;
+    crate::workspace::switch_all(name).await;
     Json(ok_response(format!("Switched to workspace '{}'", name), None))
 }
 
@@ -464,6 +571,13 @@ async fn delete_host(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse
     } else {
         Json(err_response(format!("Host '{}' not found", ip), "NOT_FOUND"))
     }
+}
+
+/// POST /api/hosts/clear — clear all hosts and services
+async fn clear_hosts() -> Json<ApiResponse> {
+    crate::workspace::WORKSPACE.clear_hosts().await;
+    tracing::info!("API: all hosts and services cleared");
+    Json(ok_response("All hosts and services cleared", None))
 }
 
 /// DELETE /api/services — delete a service by host and port
@@ -518,6 +632,22 @@ async fn run_all(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
         Ok(n) => n,
         Err(_) => return Json(err_response("target must be a valid CIDR subnet (e.g., 192.168.1.0/24)", "INVALID_INPUT")),
     };
+    // Reject excessively large subnets to prevent DoS (OOM / CPU exhaustion)
+    match &network {
+        ipnetwork::IpNetwork::V4(n) if n.prefix() < 16 => {
+            return Json(err_response(
+                "IPv4 CIDR prefix must be /16 or more specific (max 65536 hosts)",
+                "CIDR_TOO_LARGE",
+            ));
+        }
+        ipnetwork::IpNetwork::V6(n) if n.prefix() < 48 => {
+            return Json(err_response(
+                "IPv6 CIDR prefix must be /48 or more specific",
+                "CIDR_TOO_LARGE",
+            ));
+        }
+        _ => {}
+    }
     let host_count = match network {
         ipnetwork::IpNetwork::V4(n) => 2u64.saturating_pow(32 - n.prefix() as u32),
         ipnetwork::IpNetwork::V6(n) => {
@@ -531,7 +661,16 @@ async fn run_all(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
     let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let module_str = module.to_string();
+    let skipped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     for ip in network.iter() {
+        let ip_str = ip.to_string();
+
+        // SSRF guard: check each individual IP against blocked targets
+        if is_blocked_target(&ip_str) {
+            skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => break,
@@ -539,7 +678,6 @@ async fn run_all(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
         let sc = success.clone();
         let fc = failed.clone();
         let mod_name = module_str.clone();
-        let ip_str = ip.to_string();
 
         tokio::spawn(async move {
             match crate::commands::run_module(&mod_name, &ip_str, verbose).await {
@@ -557,8 +695,9 @@ async fn run_all(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
 
     let s = success.load(std::sync::atomic::Ordering::Relaxed);
     let f = failed.load(std::sync::atomic::Ordering::Relaxed);
+    let sk = skipped.load(std::sync::atomic::Ordering::Relaxed);
     Json(ok_response(
-        format!("run_all complete: {} success, {} failed out of {} IPs", s, f, s + f),
+        format!("run_all complete: {} success, {} failed, {} skipped (blocked) out of {} IPs", s, f, sk, s + f + sk),
         Some(serde_json::json!({
             "module": module,
             "target": target,
@@ -566,6 +705,7 @@ async fn run_all(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
             "concurrency": concurrency,
             "success": s,
             "failed": f,
+            "skipped_blocked": sk,
         })),
     ))
 }
@@ -637,6 +777,67 @@ async fn delete_loot(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse
     }
 }
 
+/// POST /api/loot/clear — clear all loot entries
+async fn clear_loot() -> Json<ApiResponse> {
+    crate::loot::LOOT_STORE.clear().await;
+    tracing::info!("API: all loot cleared");
+    Json(ok_response("All loot cleared", None))
+}
+
+// ─── Spool API ────────────────────────────────────────────────────
+
+/// GET /api/spool — get spool status
+async fn get_spool() -> Json<ApiResponse> {
+    let active = crate::spool::SPOOL.is_active();
+    let file = crate::spool::SPOOL.current_file();
+    Json(ok_response(
+        if active { "Spool active" } else { "Spool inactive" },
+        Some(serde_json::json!({
+            "active": active,
+            "file": file,
+        })),
+    ))
+}
+
+/// POST /api/spool — start or stop spool
+/// Body: {"action": "start", "filename": "console.log"} or {"action": "stop"}
+async fn spool_action(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    match action {
+        "start" => {
+            let filename = payload.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+            if filename.is_empty() {
+                return Json(err_response("filename is required for start action", "INVALID_INPUT"));
+            }
+            if filename.len() > 255 {
+                return Json(err_response("Filename too long (max 255 chars)", "INVALID_INPUT"));
+            }
+            match crate::spool::SPOOL.start(filename) {
+                Ok(()) => {
+                    tracing::info!(filename = %filename, "API: spool started");
+                    Json(ok_response(
+                        format!("Spooling output to '{}'", filename),
+                        Some(serde_json::json!({ "active": true, "file": filename })),
+                    ))
+                }
+                Err(e) => Json(err_response(format!("Failed to start spool: {}", e), "SPOOL_ERROR")),
+            }
+        }
+        "stop" => {
+            if let Some(name) = crate::spool::SPOOL.stop() {
+                tracing::info!(file = %name, "API: spool stopped");
+                Json(ok_response(
+                    format!("Spool stopped. Output saved to '{}'", name),
+                    Some(serde_json::json!({ "active": false, "file": name })),
+                ))
+            } else {
+                Json(ok_response("Spool was not active", Some(serde_json::json!({ "active": false }))))
+            }
+        }
+        _ => Json(err_response("action must be 'start' or 'stop'", "INVALID_INPUT")),
+    }
+}
+
 // ─── Loot API ──────────────────────────────────────────────────────
 
 /// GET /api/loot — list loot entries
@@ -668,7 +869,7 @@ async fn add_loot(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
 
 // ─── Jobs API ──────────────────────────────────────────────────────
 
-/// GET /api/jobs — list background jobs
+/// GET /api/jobs — list background jobs with limit metadata
 async fn list_jobs() -> Json<ApiResponse> {
     let jobs = crate::jobs::JOB_MANAGER.list();
     let job_data: Vec<serde_json::Value> = jobs.iter().map(|(id, module, target, started, status)| {
@@ -682,12 +883,51 @@ async fn list_jobs() -> Json<ApiResponse> {
     }).collect();
     Json(ok_response(
         format!("{} jobs", job_data.len()),
-        Some(serde_json::json!({ "jobs": job_data })),
+        Some(serde_json::json!({
+            "jobs": job_data,
+            "running_count": crate::jobs::JOB_MANAGER.running_count(),
+            "max_running": crate::jobs::JOB_MANAGER.get_max_running(),
+        })),
     ))
 }
 
+/// POST /api/jobs/limit — set the max concurrent running jobs (1-100)
+async fn set_job_limit(Json(payload): Json<serde_json::Value>) -> Json<ApiResponse> {
+    let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    if limit < 1 || limit > 100 {
+        return Json(err_response("Limit must be between 1 and 100", "INVALID_INPUT"));
+    }
+    crate::jobs::JOB_MANAGER.set_max_running(limit);
+    Json(ok_response(
+        format!("Job limit set to {}", limit),
+        Some(serde_json::json!({
+            "max_running": limit,
+            "running_count": crate::jobs::JOB_MANAGER.running_count(),
+        })),
+    ))
+}
+
+/// GET /api/jobs/{id} — get single job status
+async fn get_job(axum::extract::Path(id): axum::extract::Path<u32>) -> Json<ApiResponse> {
+    let jobs = crate::jobs::JOB_MANAGER.list();
+    if let Some((_, module, target, started, status)) = jobs.iter().find(|(jid, _, _, _, _)| *jid == id) {
+        Json(ok_response(
+            format!("Job {} status: {}", id, status),
+            Some(serde_json::json!({
+                "id": id,
+                "module": module,
+                "target": target,
+                "started": started,
+                "status": status,
+            })),
+        ))
+    } else {
+        Json(err_response(format!("Job {} not found", id), "NOT_FOUND"))
+    }
+}
+
 /// DELETE /api/jobs/{id} — kill a job
-async fn kill_job(axum::extract::Path(id): axum::extract::Path<u32>) -> Json<ApiResponse> {
+async fn kill_job_by_id(axum::extract::Path(id): axum::extract::Path<u32>) -> Json<ApiResponse> {
     if crate::jobs::JOB_MANAGER.kill(id) {
         Json(ok_response(format!("Job {} cancelled", id), None))
     } else {
@@ -846,6 +1086,17 @@ async fn run_module(
         )
             .into_response();
     }
+    // SSRF guard — block cloud metadata endpoints
+    if is_blocked_target(target_raw) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(err_response(
+                "Target is blocked (cloud metadata / internal endpoint)",
+                "BLOCKED_TARGET",
+            )),
+        )
+            .into_response();
+    }
     // Check module exists
     if !commands::discover_modules().contains(&module_name.to_string()) {
         return (
@@ -917,9 +1168,9 @@ async fn run_module(
         module_config.custom_prompts.entry("stop_on_success".into())
             .or_insert(if v { "y".into() } else { "n".into() });
     }
-    if let Some(v) = module_config.combo_mode {
+    if let Some(ref v) = module_config.combo_mode {
         module_config.custom_prompts.entry("combo_mode".into())
-            .or_insert(if v { "y".into() } else { "n".into() });
+            .or_insert(v.clone());
     }
     if let Some(ref v) = module_config.output_file {
         module_config.custom_prompts.entry("output_file".into())
@@ -943,6 +1194,36 @@ async fn run_module(
     }
 
     tracing::info!(module = %module_name, target = %target_raw, "API: dispatching module");
+
+    // Background job mode: spawn via JOB_MANAGER and return job_id immediately
+    if payload.background.unwrap_or(false) {
+        match crate::jobs::JOB_MANAGER.spawn(
+            module_name.to_string(), target_raw.to_string(), verbose,
+        ) {
+            Ok(job_id) => {
+                return (
+                    StatusCode::OK,
+                    Json(ok_response(
+                        format!("Job {} started: {} against {}", job_id, module_name, target_raw),
+                        Some(serde_json::json!({
+                            "job_id": job_id,
+                            "module": module_name,
+                            "target": target_raw,
+                            "status": "running",
+                            "running_jobs": crate::jobs::JOB_MANAGER.running_count(),
+                            "max_jobs": crate::jobs::JOB_MANAGER.get_max_running(),
+                        })),
+                    )),
+                ).into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(err_response(e, "JOB_LIMIT_REACHED")),
+                ).into_response();
+            }
+        }
+    }
 
     // Acquire concurrency permit to avoid resource exhaustion
     let _permit = match state.run_semaphore.acquire().await {
@@ -1108,18 +1389,44 @@ async fn get_result_file(
     let results_dir = crate::config::results_dir();
     let file_path = results_dir.join(&filename);
 
-    // Reject symlinks before canonicalizing — prevents following malicious symlinks
-    match file_path.symlink_metadata() {
-        Ok(sym_meta) => {
-            if sym_meta.file_type().is_symlink() {
+    // Canonicalize the results_dir once for the containment check.
+    let results_canonical = match results_dir.canonicalize() {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(err_response("Results directory not accessible", "INTERNAL_ERROR")),
+            )
+                .into_response();
+        }
+    };
+
+    // Open the file atomically with O_NOFOLLOW to prevent TOCTOU symlink swaps.
+    // All subsequent checks (path containment, regular-file) use the open fd's metadata,
+    // so no race window exists between validation and reading.
+    #[cfg(unix)]
+    let open_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&file_path)
+    };
+    #[cfg(not(unix))]
+    let open_result = std::fs::File::open(&file_path);
+
+    let file = match open_result {
+        Ok(f) => f,
+        Err(e) => {
+            // ELOOP (too many symlinks) means it was a symlink — O_NOFOLLOW rejected it
+            let is_symlink_err = e.raw_os_error() == Some(libc::ELOOP);
+            if is_symlink_err {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(err_response("Access denied: symlinks are not allowed", "SYMLINK_DENIED")),
                 )
                     .into_response();
             }
-        }
-        Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(err_response(
@@ -1129,20 +1436,37 @@ async fn get_result_file(
             )
                 .into_response();
         }
-    }
+    };
 
-    // Double-check the resolved path is still inside results_dir (canonicalize to prevent path escapes)
-    match file_path.canonicalize() {
-        Ok(canonical) => {
-            let results_canonical = results_dir.canonicalize().unwrap_or(results_dir.clone());
-            if !canonical.starts_with(&results_canonical) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(err_response("Access denied: path escapes results directory", "PATH_TRAVERSAL")),
-                )
-                    .into_response();
+    // Use /proc/self/fd/N to get the true canonical path of the *opened* file descriptor,
+    // preventing any further TOCTOU race on the pathname.
+    #[cfg(unix)]
+    let canonical = {
+        use std::os::unix::io::AsRawFd;
+        let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        match std::fs::read_link(&fd_path) {
+            Ok(p) => p,
+            Err(_) => {
+                // Fallback: canonicalize the path (still safe since we already hold the fd)
+                match file_path.canonicalize() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(err_response(
+                                format!("Result file '{}' not found", filename),
+                                "NOT_FOUND",
+                            )),
+                        )
+                            .into_response();
+                    }
+                }
             }
         }
+    };
+    #[cfg(not(unix))]
+    let canonical = match file_path.canonicalize() {
+        Ok(c) => c,
         Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1153,10 +1477,19 @@ async fn get_result_file(
             )
                 .into_response();
         }
+    };
+
+    // Path containment check on the fd-resolved path
+    if !canonical.starts_with(&results_canonical) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(err_response("Access denied: path escapes results directory", "PATH_TRAVERSAL")),
+        )
+            .into_response();
     }
 
-    // Verify it's a regular file (not a directory, device, etc.)
-    match file_path.metadata() {
+    // Verify it's a regular file via the open fd's metadata (no TOCTOU)
+    match file.metadata() {
         Ok(meta) if !meta.is_file() => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1177,13 +1510,19 @@ async fn get_result_file(
         _ => {}
     }
 
-    match std::fs::read_to_string(&file_path) {
-        Ok(content) => {
-            // Cap at 1MB to prevent memory exhaustion
-            let max_size = 1024 * 1024;
-            let content = if content.len() > max_size {
+    // Read from the already-open fd — no pathname re-resolution.
+    // Use take() to cap IO at 1MB+1 so we never buffer more than that.
+    let max_size: u64 = 1024 * 1024;
+    let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut content = String::new();
+    let mut limited = std::io::Read::take(&file, max_size + 1);
+    match std::io::Read::read_to_string(&mut limited, &mut content) {
+        Ok(bytes_read) => {
+            let size_bytes = if total_size > 0 { total_size as usize } else { bytes_read };
+            let content = if bytes_read as u64 > max_size {
+                content.truncate(max_size as usize);
                 format!("{}\n... (truncated at {} bytes, total: {} bytes)",
-                    &content[..max_size], max_size, content.len())
+                    content, max_size, total_size)
             } else {
                 content
             };
@@ -1195,7 +1534,7 @@ async fn get_result_file(
                     Some(serde_json::json!({
                         "filename": filename,
                         "content": content,
-                        "size_bytes": file_path.metadata().map(|m| m.len()).unwrap_or(0),
+                        "size_bytes": size_bytes,
                     })),
                 )),
             )
@@ -1223,7 +1562,17 @@ async fn honeypot_check(Json(payload): Json<HoneypotCheckRequest>) -> Response {
         )
             .into_response();
     }
-
+    // SSRF guard — block cloud metadata endpoints from port scanning
+    if is_blocked_target(target_raw) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(err_response(
+                "Target is blocked (cloud metadata / internal endpoint)",
+                "BLOCKED_TARGET",
+            )),
+        )
+            .into_response();
+    }
 
     let ip = match crate::utils::extract_ip_from_target(target_raw) {
         Some(ip) => ip,
@@ -1766,11 +2115,11 @@ async fn shell_command(
                     };
 
                     // SSRF guard — shell 'run' must also validate the resolved target
-                    if !validate_target(&target) {
+                    if !validate_target(&target) || is_blocked_target(&target) {
                         results.push(ShellResult {
                             command: trimmed.to_string(),
                             success: false,
-                            output: "Target is invalid or blocked (internal/private address)".to_string(),
+                            output: "Target is invalid or blocked (cloud metadata / internal endpoint)".to_string(),
                             duration_ms: None,
                         });
                         continue;
@@ -1780,15 +2129,26 @@ async fn shell_command(
 
                     if background {
                         // Background job: spawn via JOB_MANAGER
-                        let job_id = crate::jobs::JOB_MANAGER.spawn(
+                        match crate::jobs::JOB_MANAGER.spawn(
                             module_path.clone(), target.clone(), verbose,
-                        );
-                        results.push(ShellResult {
-                            command: trimmed.to_string(),
-                            success: true,
-                            output: format!("Job {} started: {} against {}", job_id, module_path, target),
-                            duration_ms: Some(start.elapsed().as_millis() as u64),
-                        });
+                        ) {
+                            Ok(job_id) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: true,
+                                    output: format!("Job {} started: {} against {}", job_id, module_path, target),
+                                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                                });
+                            }
+                            Err(e) => {
+                                results.push(ShellResult {
+                                    command: trimmed.to_string(),
+                                    success: false,
+                                    output: e,
+                                    duration_ms: None,
+                                });
+                            }
+                        }
                     } else {
                         // Foreground execution
                         let run_start = std::time::Instant::now();
@@ -1849,11 +2209,11 @@ async fn shell_command(
                 };
 
                 // SSRF guard — run_all must check the resolved target too
-                if !validate_target(&target) {
+                if !validate_target(&target) || is_blocked_target(&target) {
                     results.push(ShellResult {
                         command: trimmed.to_string(),
                         success: false,
-                        output: "Target is invalid or blocked (internal/private address)".to_string(),
+                        output: "Target is invalid or blocked (cloud metadata / internal endpoint)".to_string(),
                         duration_ms: None,
                     });
                     continue;
@@ -2455,7 +2815,7 @@ async fn shell_command(
                             duration_ms: None,
                         });
                     } else if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-                        crate::workspace::WORKSPACE.switch(name).await;
+                        crate::workspace::switch_all(name).await;
                         results.push(ShellResult {
                             command: trimmed.to_string(),
                             success: true,
@@ -2880,64 +3240,228 @@ pub async fn start_api_server(
     }
     println!("📢 Verbose: {}", verbose);
 
+    // --- Method-dispatch handlers for multi-method routes ---
+    // Since all PQ routes use any(), we dispatch by the restored X-PQ-Method.
+
+    async fn target_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "DELETE" => clear_target().await.into_response(),
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice::<SetTargetRequest>(&body) {
+                    Ok(payload) => set_target(Json(payload)).await,
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => get_target().await.into_response(),
+        }
+    }
+
+    async fn options_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "DELETE" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => delete_option(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => set_option(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => get_options().await.into_response(),
+        }
+    }
+
+    async fn creds_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "DELETE" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => delete_cred(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => add_cred(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => list_creds().await.into_response(),
+        }
+    }
+
+    async fn hosts_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "DELETE" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => delete_host(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => add_host(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => list_hosts().await.into_response(),
+        }
+    }
+
+    async fn services_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "DELETE" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => delete_service(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => add_service(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => list_services().await.into_response(),
+        }
+    }
+
+    async fn workspace_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => switch_workspace(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => get_workspace().await.into_response(),
+        }
+    }
+
+    async fn loot_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "DELETE" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => delete_loot(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => add_loot(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => list_loot().await.into_response(),
+        }
+    }
+
+    async fn job_dispatch(req: Request) -> Response {
+        let method = req.method().as_str().to_uppercase();
+        let id: u32 = req.uri().path()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        match method.as_str() {
+            "DELETE" => kill_job_by_id(axum::extract::Path(id)).await.into_response(),
+            _ => get_job(axum::extract::Path(id)).await.into_response(),
+        }
+    }
+
+    async fn spool_dispatch(req: Request) -> Response {
+        match req.method().as_str() {
+            "POST" | "PUT" => {
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                match serde_json::from_slice(&body) {
+                    Ok(payload) => spool_action(Json(payload)).await.into_response(),
+                    Err(_) => (StatusCode::BAD_REQUEST, Json(err_response("Invalid JSON body", "PARSE_ERROR"))).into_response(),
+                }
+            }
+            _ => get_spool().await.into_response(),
+        }
+    }
+
     // Protected routes (require API key)
+    // PQ transport: ALL requests arrive as POST (Node.js 22+ forbids body on GET/HEAD).
+    // The PQ middleware decrypts and restores the original method from X-PQ-Method header.
+    // Since axum matches routes by method BEFORE layers run, we register all routes with
+    // any() so the incoming POST is accepted. The PQ middleware restores the real method,
+    // but since any() matches all methods, the handler runs regardless.
     let protected = Router::new()
-        .route("/api/modules", get(list_modules))
-        .route("/api/modules/search", get(search_modules))
-        .route("/api/module/{*path}", get(get_module_info))
-        .route("/api/run", post(run_module))
-        .route("/api/run_all", post(run_all))
-        .route("/api/target", get(get_target))
-        .route("/api/target", post(set_target))
-        .route("/api/target", axum::routing::delete(clear_target))
-        .route("/api/honeypot-check", post(honeypot_check))
-        .route("/api/shell", post(shell_command))
-        .route("/api/results", get(list_results))
-        .route("/api/results/{filename}", get(get_result_file))
-        // Global options
-        .route("/api/options", get(get_options))
-        .route("/api/options", post(set_option))
-        .route("/api/options", axum::routing::delete(delete_option))
-        // Credential store
-        .route("/api/creds", get(list_creds))
-        .route("/api/creds", post(add_cred))
-        .route("/api/creds", axum::routing::delete(delete_cred))
-        .route("/api/creds/search", get(search_creds))
-        // Workspace / hosts / services
-        .route("/api/hosts", get(list_hosts))
-        .route("/api/hosts", post(add_host))
-        .route("/api/hosts", axum::routing::delete(delete_host))
-        .route("/api/hosts/notes", post(add_host_note))
-        .route("/api/services", get(list_services))
-        .route("/api/services", post(add_service))
-        .route("/api/services", axum::routing::delete(delete_service))
-        .route("/api/workspace", get(get_workspace))
-        .route("/api/workspace", post(switch_workspace))
-        // Loot
-        .route("/api/loot", get(list_loot))
-        .route("/api/loot", post(add_loot))
-        .route("/api/loot", axum::routing::delete(delete_loot))
-        .route("/api/loot/search", get(search_loot))
-        // Check (non-destructive vuln verification)
-        .route("/api/check", post(check_module))
-        // Jobs
-        .route("/api/jobs", get(list_jobs))
-        .route("/api/jobs/{id}", axum::routing::delete(kill_job))
-        // Export
-        .route("/api/export", get(export_data))
+        .route("/api/modules", axum::routing::any(list_modules))
+        .route("/api/modules/enriched", axum::routing::any(list_modules_enriched))
+        .route("/api/modules/search", axum::routing::any(search_modules))
+        .route("/api/module/{*path}", axum::routing::any(get_module_info))
+        .route("/api/run", axum::routing::any(run_module))
+        .route("/api/run_all", axum::routing::any(run_all))
+        .route("/api/target", axum::routing::any(target_dispatch))
+        .route("/api/honeypot-check", axum::routing::any(honeypot_check))
+        .route("/api/shell", axum::routing::any(shell_command))
+        .route("/api/results", axum::routing::any(list_results))
+        .route("/api/results/{filename}", axum::routing::any(get_result_file))
+        .route("/api/options", axum::routing::any(options_dispatch))
+        .route("/api/creds", axum::routing::any(creds_dispatch))
+        .route("/api/creds/search", axum::routing::any(search_creds))
+        .route("/api/creds/clear", axum::routing::any(clear_creds))
+        .route("/api/hosts", axum::routing::any(hosts_dispatch))
+        .route("/api/hosts/notes", axum::routing::any(add_host_note))
+        .route("/api/hosts/clear", axum::routing::any(clear_hosts))
+        .route("/api/services", axum::routing::any(services_dispatch))
+        .route("/api/workspace", axum::routing::any(workspace_dispatch))
+        .route("/api/loot", axum::routing::any(loot_dispatch))
+        .route("/api/loot/search", axum::routing::any(search_loot))
+        .route("/api/loot/clear", axum::routing::any(clear_loot))
+        .route("/api/spool", axum::routing::any(spool_dispatch))
+        .route("/api/check", axum::routing::any(check_module))
+        .route("/api/jobs", axum::routing::any(list_jobs))
+        .route("/api/jobs/limit", axum::routing::any(set_job_limit))
+        .route("/api/jobs/{id}", axum::routing::any(job_dispatch))
+        .route("/api/export", axum::routing::any(export_data))
         .layer(axum::middleware::from_fn(crate::pq_middleware::pq_middleware));
 
     // PQ shared state as Extension (accessible by middleware and handshake handler)
-    let pq_state = Arc::new(crate::pq_middleware::PqSharedState {
-        sessions: pq_sessions,
-        host_identity: Arc::new(host_identity),
-        authorized_keys: Arc::new(authorized_keys),
-    });
+    let pq_state = Arc::new(crate::pq_middleware::PqSharedState::new(
+        pq_sessions,
+        Arc::new(host_identity),
+        authorized_keys,
+        authorized_keys_path.to_path_buf(),
+    ));
+
+    // Fallback for /api/* paths that don't match any route — returns 404 instead of
+    // letting the PQ middleware reject with 401 (which would be misleading).
+    async fn api_fallback(uri: axum::http::Uri) -> Response {
+        (
+            StatusCode::NOT_FOUND,
+            Json(err_response(
+                format!("No route found for {}", uri.path()),
+                "NOT_FOUND",
+            )),
+        )
+            .into_response()
+    }
 
     // Public routes: health check + PQ handshake (must be unauthenticated)
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/pq/handshake", post(crate::pq_middleware::handshake_handler))
+        // Catch-all for unmatched /api/* paths — must be before .merge(protected)
+        // so unmatched API paths get a clean 404 without requiring PQ auth
+        .fallback(api_fallback)
         .merge(protected)
         .layer(axum::Extension(pq_state))
         .layer(axum::middleware::from_fn_with_state(state.clone(), rate_limit_middleware))

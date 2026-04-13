@@ -126,6 +126,8 @@ Accept invalid certificates for offensive tooling convenience (e.g., `danger_acc
 
 ## Result Persistence
 
+> **Note:** Discovered credentials are stored per-workspace. When you switch workspaces (`workspace <name>`), the credential store is scoped to that workspace. This keeps engagement data isolated between different assessments.
+
 Offer to write `host -> user:pass` pairs to a local file (default `./results.txt`):
 
 ```rust

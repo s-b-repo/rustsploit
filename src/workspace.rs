@@ -361,6 +361,18 @@ impl Workspace {
 
 pub static WORKSPACE: Lazy<Workspace> = Lazy::new(Workspace::new);
 
+/// Mutex to coordinate workspace switching across all stores atomically.
+static SWITCH_MUTEX: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// Switch all stores (workspace, credentials, options) atomically.
+/// Prevents race conditions when concurrent requests switch workspaces.
+pub async fn switch_all(name: &str) {
+    let _lock = SWITCH_MUTEX.lock().await;
+    WORKSPACE.switch(name).await;
+    crate::cred_store::CRED_STORE.switch_workspace(name).await;
+    crate::global_options::GLOBAL_OPTIONS.switch_workspace(name).await;
+}
+
 /// Convenience functions for modules to auto-populate workspace data.
 pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
     WORKSPACE.add_host(ip, hostname, os_guess).await;
