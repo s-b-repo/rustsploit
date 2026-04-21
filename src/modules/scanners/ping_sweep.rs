@@ -114,6 +114,7 @@ impl PingMethod {
 
 /// Main entry point triggered via the dispatcher
 pub async fn run(initial_target: &str) -> Result<()> {
+    crate::utils::require_root("ping_sweep (raw ICMP socket)")?;
     let config = gather_configuration(initial_target).await?;
     execute_ping_sweep(&config).await
 }
@@ -350,8 +351,20 @@ fn methods_summary(methods: &[PingMethod]) -> String {
 }
 
 async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
+    const MAX_CIDR_HOSTS: usize = 1_048_576;
     let mut host_set: HashSet<IpAddr> = HashSet::new();
     for net in &config.targets {
+        let size: u128 = match net.size() {
+            ipnetwork::NetworkSize::V4(n) => n as u128,
+            ipnetwork::NetworkSize::V6(n) => n,
+        };
+        if size > MAX_CIDR_HOSTS as u128 {
+            crate::mprintln!(
+                "{}",
+                format!("[!] CIDR {} expands to {} hosts (max {}), skipping", net, size, MAX_CIDR_HOSTS).red()
+            );
+            continue;
+        }
         for host in net.iter() {
             host_set.insert(host);
         }
@@ -533,8 +546,9 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 fn save_hosts_to_file(hosts: &[String], file_path: &str) -> Result<()> {
     let mut file = File::create(file_path)
         .with_context(|| format!("Failed to create file '{}'", file_path))?;
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = crate::utils::set_secure_permissions(file_path, 0o600) {
+        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", file_path, e);
+    }
 
     for host in hosts {
         writeln!(file, "{}", host)
@@ -1004,6 +1018,12 @@ fn parse_ports(input: &str) -> Result<Vec<u16>> {
     let mut ports = Vec::new();
     for token in input.replace(',', " ").split_whitespace() {
         match token.parse::<u16>() {
+            Ok(0) => {
+                crate::mprintln!(
+                    "{}",
+                    "    Skipping port 0 (invalid)".yellow()
+                );
+            }
             Ok(port) => ports.push(port),
             Err(_) => {
                 crate::mprintln!(

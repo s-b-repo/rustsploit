@@ -4,17 +4,23 @@
 //! - If absent → reject with 401 (PQ is mandatory)
 //! - `POST /pq/handshake` → establish new PQ session
 
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Instant;
+
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{HeaderValue, Request, Response, StatusCode},
     middleware::Next,
 };
 use base64::Engine;
-use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::pq_channel::{
     decrypt_request, encrypt_response, process_handshake,
-    HandshakeRequest, HandshakeResponse, HostIdentity, ClientPublicIdentity, SessionStore,
+    ClientPublicIdentity, HandshakeRequest, HandshakeResponse, HostIdentity, SessionStore,
 };
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -24,13 +30,39 @@ pub struct PqSharedState {
     pub sessions: SessionStore,
     pub host_identity: Arc<HostIdentity>,
     pub authorized_keys: Arc<Vec<ClientPublicIdentity>>,
+    pub handshake_rate_limiter: HandshakeRateLimiter,
+}
+
+const MAX_PQ_SESSIONS: usize = 1000;
+const HANDSHAKE_RATE_WINDOW_SECS: u64 = 60;
+const HANDSHAKE_RATE_MAX_PER_IP: usize = 10;
+
+pub type HandshakeRateLimiter = Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>;
+
+pub fn new_handshake_rate_limiter() -> HandshakeRateLimiter {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 /// POST /pq/handshake — establish new PQ session
 pub async fn handshake_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     axum::Extension(pq): axum::Extension<Arc<PqSharedState>>,
     axum::Json(request): axum::Json<HandshakeRequest>,
 ) -> Result<axum::Json<HandshakeResponse>, (StatusCode, String)> {
+    let client_ip = addr.ip();
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(HANDSHAKE_RATE_WINDOW_SECS);
+    {
+        let mut limiter = pq.handshake_rate_limiter.lock().await;
+        let timestamps = limiter.entry(client_ip).or_default();
+        timestamps.retain(|t| now.duration_since(*t) < window);
+        if timestamps.len() >= HANDSHAKE_RATE_MAX_PER_IP {
+            tracing::debug!("PQ handshake rate-limited for {}: {}/{} in window", client_ip, timestamps.len(), HANDSHAKE_RATE_MAX_PER_IP);
+            return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
+        }
+        timestamps.push(now);
+    }
+
     let tenant_id = &request.client_name;
 
     let (response, session) = process_handshake(
@@ -39,9 +71,20 @@ pub async fn handshake_handler(
         &pq.authorized_keys,
         tenant_id,
     )
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Handshake failed: {e}")))?;
+    .map_err(|e| {
+        tracing::warn!("PQ handshake failed for tenant {}: {}", tenant_id, e);
+        (StatusCode::BAD_REQUEST, format!("Handshake failed: {e}"))
+    })?;
 
     let mut store = pq.sessions.write().await;
+    if store.len() >= MAX_PQ_SESSIONS {
+        if let Some(oldest_id) = store.iter()
+            .min_by_key(|(_, s)| s.last_activity)
+            .map(|(id, _)| *id)
+        {
+            store.remove(&oldest_id);
+        }
+    }
     store.insert(session.session_id, session);
 
     Ok(axum::Json(response))
@@ -56,6 +99,7 @@ pub async fn pq_middleware(
     let pq_header = match request.headers().get("X-PQ-Session") {
         Some(h) => h.clone(),
         None => {
+            tracing::debug!("PQ middleware rejected request missing X-PQ-Session header");
             // PQ is mandatory — reject unencrypted requests
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -109,8 +153,13 @@ pub async fn pq_middleware(
     let response = next.run(new_req).await;
 
     let (resp_parts, resp_body) = response.into_parts();
-    let resp_bytes = axum::body::to_bytes(resp_body, 10 * 1024 * 1024)
-        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let resp_bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(resp_body, 10 * 1024 * 1024),
+    )
+        .await
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let resp_aad = format!("{}|{epoch}|{session_id_b64}", resp_parts.status.as_u16());
 

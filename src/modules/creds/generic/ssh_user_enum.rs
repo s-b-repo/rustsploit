@@ -5,7 +5,7 @@
 //!
 //! For authorized penetration testing only.
 
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{cfg_prompt_default, cfg_prompt_required, cfg_prompt_yes_no};
 use anyhow::{anyhow, Result};
 use colored::*;
@@ -33,6 +33,7 @@ const DEFAULT_SAMPLES: usize = 3;
 const TIMING_THRESHOLD: f64 = 0.3; // 300ms difference threshold
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════════════╗".cyan()

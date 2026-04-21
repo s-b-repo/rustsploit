@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 /// Default ports to scan when the user accepts the default list.
@@ -200,6 +200,7 @@ pub async fn run(target: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════════════╗".cyan()
@@ -304,8 +305,9 @@ fn save_results_to_file(
     use std::io::Write;
     let mut f = std::fs::File::create(path)
         .with_context(|| format!("Failed to create output file: {}", path))?;
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = crate::utils::set_secure_permissions(path, 0o600) {
+        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", path, e);
+    }
 
     writeln!(f, "Service Version Scan Results for {}", target)?;
     writeln!(f, "Timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;

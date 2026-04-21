@@ -18,7 +18,7 @@ use socket2::{Socket, Domain, Type, Protocol};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScanMethod {
@@ -94,7 +94,9 @@ fn get_service_name(port: u16) -> &'static str {
 
 /// Interactive config prompt
 pub async fn prompt_settings() -> Result<ScanSettings> {
-    crate::mprintln!("{}", "\n=== Port Scanner Configuration ===".cyan().bold());
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!("{}", "\n=== Port Scanner Configuration ===".cyan().bold());
+    }
     
     // Port range selection
     let range_choice_str = cfg_prompt_default("port_range", "Port Range (1=All, 2=Common, 3=Top1000, 4=Custom)", "1").await?;
@@ -141,7 +143,7 @@ pub async fn prompt_settings() -> Result<ScanSettings> {
         // Use globally configured source port
         crate::utils::get_global_source_port().await
     } else if cfg_prompt_yes_no("enable_source_port", "Enable custom Source Port?", false).await? {
-        Some(cfg_prompt_int_range("source_port", "Source Port", 0, 0, 65535).await? as u16)
+        Some(cfg_prompt_int_range("source_port", "Source Port", 12345, 1, 65535).await? as u16)
     } else {
         None
     };
@@ -227,8 +229,9 @@ pub async fn run_with_settings(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let file = {
         let f = File::create(output_file)?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(output_file, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = crate::utils::set_secure_permissions(output_file, 0o600) {
+            crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", output_file, e);
+        }
         Arc::new(Mutex::new(BufWriter::new(f)))
     };
     
@@ -441,11 +444,14 @@ async fn scan_tcp(
         let _ = socket.bind(&bind_addr.into());
     }
 
-    // Connect (non-blocking)
+    // Connect (non-blocking). On Linux EINPROGRESS is the expected "in progress"
+    // signal; modern Rust maps it to ErrorKind::InProgress, which does NOT
+    // match WouldBlock — whitelist it explicitly.
     let connect_res = socket.connect(&addr.into());
     match connect_res {
         Ok(_) => {},
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {},
         Err(_) => return Some(("CLOSED".into(), "".into(), "".into())),
     }
 
@@ -466,7 +472,9 @@ async fn scan_tcp(
                                 let mut rng = rng();
                                 (0..len).map(|_| rng.random()).collect()
                             };
-                            let _ = stream.write_all(&payload).await;
+                            if stream.write_all(&payload).await.is_err() {
+                                // Probe write failed — proceed to banner grab anyway
+                            }
                         }
                     }
                     

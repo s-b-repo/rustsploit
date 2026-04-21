@@ -10,7 +10,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
     safe_read_to_string,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const METHODS: &[&str] = &[
     "GET",
@@ -151,6 +151,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 Ok(resp) => {
                     let status = resp.status();
                     let ok = status.is_success();
+                    drop(resp);
                     if ok {
                         total_success += 1;
                         if verbose {
@@ -228,6 +229,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
 }
 
 fn banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   HTTP Method Capability Scanner                             ║".cyan());
     crate::mprintln!("{}", "║   Checks support for common HTTP verbs (GET, POST, etc.)     ║".cyan());

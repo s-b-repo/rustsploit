@@ -3,7 +3,7 @@ use colored::*;
 use ssh2::Session;
 use std::{
     io::Write,
-    net::{IpAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, ToSocketAddrs},
     time::Duration,
 };
 use tokio::{
@@ -17,9 +17,10 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_port,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
 };
 
@@ -85,7 +86,7 @@ pub async fn run(target: &str) -> Result<()> {
                 // Try common defaults
                 let creds = [("root","root"),("admin","admin"),("root",""),("admin",""),("root","123456"),("admin","password")];
                 for (user, pass) in creds {
-                    if sess.userauth_password(user, pass).is_ok() {
+                    if sess.userauth_password(user, pass).is_ok() && sess.authenticated() {
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                         return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                     }
@@ -124,7 +125,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "ssh",
-            source_module: "creds/generic/ssh_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/ssh_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             let timeout_dur = timeout_duration;
@@ -187,7 +189,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|_| format!("{}:{}", target, port));
 
@@ -234,7 +236,11 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     let timeout_duration = Duration::from_secs(connection_timeout);
 
     let try_login = move |t: String, p: u16, user: String, pass: String| {
@@ -259,7 +265,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "ssh",
-        source_module: "creds/generic/ssh_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/ssh_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();
@@ -338,11 +345,14 @@ async fn try_ssh_login(
                 .or_else(|_| addr_owned.to_socket_addrs().and_then(|mut a|
                     a.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No addresses resolved"))))
                 .map_err(|e| anyhow!("Cannot resolve address {}: {}", addr_owned, e))?;
-            let tcp = TcpStream::connect_timeout(&socket_addr, timeout_duration)
+            let tcp = crate::utils::blocking_tcp_connect(&socket_addr, timeout_duration)
                 .map_err(|e| anyhow!("Connection error: {}", e))?;
+            tcp.set_read_timeout(Some(timeout_duration)).ok();
+            tcp.set_write_timeout(Some(timeout_duration)).ok();
 
             let mut sess = Session::new()
                 .map_err(|e| anyhow!("Failed to create SSH session: {}", e))?;
+            sess.set_timeout(timeout_duration.as_millis() as u32);
             sess.set_tcp_stream(tcp);
 
             sess.handshake()

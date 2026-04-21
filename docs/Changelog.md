@@ -4,15 +4,63 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
-## v0.4.8 (2026-04-03)
+## v0.4.8 (2026-04-19)
 
 ### Module Totals
 
-- **137 exploit modules** (24 with `check()`) — cameras, routers, network infrastructure, webapps, frameworks, SSH, DoS, crypto, FTP, IPMI, telnet, Bluetooth, VoIP, Windows, payload generators
-- **24 scanner modules**
-- **19 credential modules** — all with full mass scan support (random, CIDR, file, comma-separated targets)
+- **183 exploit modules** — cameras, routers, network infrastructure, webapps, frameworks, SSH, VNC, DoS, crypto, FTP, IPMI, telnet, Bluetooth, VoIP, Windows, payload generators, honeypot exploits (Cowrie, Dionaea, HoneyTrap, SNARE), WAF (SafeLine)
+- **27 scanner modules**
+- **29 credential modules** — all with full mass scan support (random, CIDR, file, comma-separated targets)
 - **1 plugin module**
-- **181 total modules**
+- **240 total modules**
+
+### New in April 2026
+
+#### 46 New Exploit Modules
+
+| Category | Modules |
+|----------|---------|
+| Cowrie (SSH honeypot) | `ansi_log_injection`, `llm_prompt_injection`, `ssrf_ipv6` |
+| Dionaea (honeypot) | `mqtt_underflow`, `mssql_dos`, `mysql_sqli`, `tftp_crash` |
+| HoneyTrap (honeypot) | `docker_panic`, `ftp_panic` |
+| SafeLine (WAF) | `cookie_attributes`, `nginx_injection`, `no_auth_probe`, `pre_auth_tfa`, `session_secret_entropy`, `unauth_writes` |
+| Snare (honeypot) | `cookie_dos`, `tanner_version_mitm` |
+| VNC | `rfb`, `libvnc_checkrect_overflow`, `libvnc_tight_filtergradient`, `libvnc_ultrazip`, `libvnc_websocket_overflow`, `libvnc_zrle_tile`, `tigervnc_rre_overflow`, `tigervnc_timing_oracle`, `tightvnc_decompression_bomb`, `tightvnc_des_hardcoded_key`, `tightvnc_ft_path_traversal`, `tightvnc_predictable_challenge`, `tightvnc_rect_overflow`, `x11vnc_dns_injection`, `x11vnc_env_injection`, `x11vnc_unixpw_inject` |
+| SSH | `asyncssh_beginauthpass`, `libssh2_rogue_server`, `paramiko_authnonepass`, `paramiko_unknown_method` |
+| Frameworks | `apache_camel/cve_2025_27636_camel_header_injection`, `php/cve_2025_51373_php_rce` |
+| Network Infra | `commvault/cve_2025_34028_commvault_rce`, `kubernetes/cve_2025_1974_ingress_nginx_rce` |
+| WebApps | `misp_rce_cve_2025_27364`, `nextjs_middleware_bypass_cve_2025_29927`, `vite_path_traversal_cve_2025_30208`, `zimbra_sqli_auth_bypass_cve_2025_25064` |
+
+#### 3 New Scanner Modules
+
+- `proxy_scanner` — HTTP CONNECT, SOCKS4/5, transparent proxy discovery
+- `reflect_scanner` — UDP amplification vulnerability scanner (DNS, NTP, SSDP, Memcached)
+- `vuln_checker` — Fingerprint-based vulnerability scanner across all exploit modules
+
+#### 10 New Credential Modules
+
+`couchdb_bruteforce`, `elasticsearch_bruteforce`, `http_basic_bruteforce`, `imap_bruteforce`, `memcached_bruteforce`, `mysql_bruteforce`, `postgres_bruteforce`, `proxy_bruteforce`, `redis_bruteforce`, `vnc_bruteforce`
+
+#### Infrastructure
+
+- **WebSocket transport** (`src/ws.rs`) — PQ-encrypted WebSocket endpoint at `/pq/ws` with 100-connection cap and heartbeat
+- **Root privilege helper** (`src/utils/privilege.rs`) — `require_root()` for raw-socket modules (DoS, ping sweep, ICMP)
+- **Unified HTTP client** (`src/utils/network.rs`) — `build_http_client()` and `build_http_client_with(HttpClientOpts)` replacing hand-rolled clients in 50+ modules
+- **TCP connect helpers** — `tcp_connect_addr()`, `tcp_connect_str()`, `blocking_tcp_connect()`, `udp_bind()` centralizing socket creation
+- **MCP hardening** — `isolate_protocol_stdout()` prevents module println! from corrupting JSON-RPC; `MAX_LINE_BYTES` (1 MiB) caps; binary-safe reads
+- **Spool hardening** — `O_NOFOLLOW` flag, parent symlink check, lock-first file creation, `write_line()` returns Result
+- **build.rs** — `check_available()` dispatch for capability queries without a target; optimized regex compilation
+
+#### Module Audit
+
+Systematic quality pass across all 183 exploit modules:
+- Replaced `std::thread::sleep` with async alternatives in SSH and scanner modules
+- Migrated raw `TcpStream::connect` to `tcp_connect_addr()` framework utility
+- Standardized 50+ modules from hand-rolled `reqwest::Client::builder` to `build_http_client()`
+- Added `require_root()` checks to all raw-socket modules (DoS, ping sweep, ICMP flood)
+- Added `zeroize` crate for sensitive data cleanup
+
+---
 
 ### Highlights
 

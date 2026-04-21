@@ -2,15 +2,16 @@
 //
 // Target normalization, IPv6/hostname validation, and IP extraction.
 
-use anyhow::{Result, anyhow, Context};
+use std::net::ToSocketAddrs;
+
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::net::ToSocketAddrs;
 use url::Url;
 
-use super::sanitize::MAX_TARGET_LENGTH;
 use super::prompt::{prompt_default, prompt_port, prompt_yes_no};
+use super::sanitize::MAX_TARGET_LENGTH;
 
 // ============================================================
 // TARGET NORMALIZATION

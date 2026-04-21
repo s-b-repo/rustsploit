@@ -21,7 +21,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
     cfg_prompt_int_range, cfg_prompt_existing_file, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SMTP_PORT: u16 = 25;
@@ -101,6 +101,7 @@ impl Statistics {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SMTP Username Enumeration Scanner                        ║".cyan());
     crate::mprintln!("{}", "║   Enumerates usernames using SMTP VRFY command             ║".cyan());

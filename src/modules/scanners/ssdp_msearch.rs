@@ -11,7 +11,7 @@ use tokio::time::{timeout as tokio_timeout, Duration};
 use crate::utils::{
     cfg_prompt_port, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_default,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 /// SSDP Search Target types
 #[derive(Clone, Debug)]
@@ -32,6 +32,7 @@ impl SearchTarget {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SSDP M-SEARCH Scanner                                      ║".cyan());
     crate::mprintln!("{}", "║   Discovers UPnP devices via SSDP protocol                   ║".cyan());
@@ -158,8 +159,9 @@ pub async fn run(target: &str) -> Result<()> {
     if save_results && !results.is_empty() {
         let filename = format!("ssdp_scan_{}.txt", target.replace([':', '.', '[', ']'], "_"));
         if let Ok(mut file) = File::create(&filename) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o600));
+            if let Err(e) = crate::utils::set_secure_permissions(&filename, 0o600) {
+                crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", filename, e);
+            }
             writeln!(file, "SSDP M-SEARCH Scan Results").ok();
             writeln!(file, "Target: {}:{}", target, port).ok();
             writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()).ok();

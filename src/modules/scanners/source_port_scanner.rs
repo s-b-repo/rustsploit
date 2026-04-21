@@ -15,7 +15,7 @@ use crate::utils::{
     cfg_prompt_port,
 };
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 /// Module metadata for `info` command.
 pub fn info() -> ModuleInfo {
@@ -101,7 +101,11 @@ pub async fn run(target: &str) -> Result<()> {
         }).await;
     }
 
-    print_banner();
+    if !crate::utils::is_batch_mode() {
+        if !crate::utils::is_batch_mode() {
+            print_banner();
+        }
+    }
 
     let settings = prompt_settings().await?;
 
@@ -237,8 +241,9 @@ pub async fn run(target: &str) -> Result<()> {
     // Save results
     if !settings.output_file.is_empty() {
         let file = File::create(&settings.output_file)?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&settings.output_file, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = crate::utils::set_secure_permissions(&settings.output_file, 0o600) {
+            crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", settings.output_file, e);
+        }
         let mut writer = BufWriter::new(file);
         writeln!(writer, "Source Port Scan Results")?;
         writeln!(writer, "Target: {}:{} ({})", ip_str, settings.dest_port, protocol_label)?;
@@ -263,11 +268,10 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    crate::mprintln!("{}", r#"
-╔══════════════════════════════════════════════════════════╗
-║              Source Port Scanner                          ║
-║  Discover which source ports bypass firewall rules       ║
-╚══════════════════════════════════════════════════════════╝"#.cyan());
+    if crate::utils::is_batch_mode() { return; }
+    crate::mprintln_block!(
+        format!("{}", r#" ╔══════════════════════════════════════════════════════════╗ ║              Source Port Scanner                          ║ ║  Discover which source ports bypass firewall rules       ║ ╚══════════════════════════════════════════════════════════╝"#.cyan())
+    );
 }
 
 async fn prompt_settings() -> Result<ScanSettings> {

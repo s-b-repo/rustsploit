@@ -2,8 +2,9 @@
 
 Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
-![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
-![Screenshot](https://github.com/s-b-repo/rustsploit/raw/main/testing.png)
+
+![Demo GIF](https://github.com/s-b-repo/rustsploit/raw/main/preview.gif)
+![Testing GIF](https://github.com/s-b-repo/rustsploit/raw/main/testing.gif)
 
 ---
 
@@ -16,7 +17,7 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 | [Getting Started](docs/Getting-Started.md) | Installation, build, quick-start, Docker deployment |
 | [Interactive Shell](docs/Interactive-Shell.md) | Shell walkthrough, command palette, chaining, shortcuts |
 | [CLI Reference](docs/CLI-Reference.md) | Command-line flags, non-shell usage, output formats |
-| [API Server](docs/API-Server.md) | REST API startup, endpoints, auth, rate limiting, hardening |
+| [API Server](docs/API-Server.md) | REST + WebSocket API, PQ encryption, endpoints, rate limiting |
 | [API Usage Examples](docs/API-Usage-Examples.md) | Practical curl workflows, request/response samples |
 | [Module Catalog](docs/Module-Catalog.md) | All modules by category — exploits, scanners, creds |
 | [Module Development](docs/Module-Development.md) | How to author new modules, lifecycle, dispatcher |
@@ -44,35 +45,38 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 -  **Background jobs:** Run modules asynchronously with `run -j`, manage with `jobs` commands
 -  **Export/reporting:** Export all engagement data to JSON, CSV, or human-readable summary reports
 -  **Console logging:** `spool` command captures all output to file for documentation
--  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, RDP, RTSP, SNMP, L2TP, MQTT, Fortinet — with IPv6 and TLS support
--  **Exploit coverage:** CVEs for GNU inetutils-telnetd, Apache Tomcat, TP-Link, Ivanti, Zabbix, OpenSSH, Jenkins, PAN-OS, Heartbleed, and more
--  **Scanners & utilities:** Port scanner, ping sweep, SSDP, HTTP title grabber, DNS recursion tester, directory bruteforcer, sequential fuzzer
--  **REST API server:** 30+ endpoints — authentication, rate limiting, IP tracking, full CRUD for credentials, hosts, services, loot, jobs
+-  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, IMAP, RDP, RTSP, SNMP, L2TP, MQTT, VNC, MySQL, PostgreSQL, Redis, CouchDB, Elasticsearch, Memcached, HTTP Basic, Proxy, Fortinet — with IPv6 and TLS support
+-  **Exploit coverage:** CVEs for VNC (LibVNC, TigerVNC, TightVNC, x11vnc), honeypots (Cowrie, Dionaea, HoneyTrap, SNARE), WAFs (SafeLine), Apache Camel, Kubernetes ingress-nginx, Commvault, MISP, Zimbra, Next.js, Vite, and 100+ more
+-  **Scanners & utilities:** Port scanner, ping sweep, SSDP, HTTP title grabber, DNS recursion tester, directory bruteforcer, sequential fuzzer, proxy scanner, reflect scanner, vulnerability checker
+-  **API server:** PQ-encrypted WebSocket transport — post-quantum cryptography, full CRUD for credentials, hosts, services, loot, jobs
+-  **MCP server:** 38-tool Model Context Protocol server for AI-assisted pentesting via stdio
 -  **Plugin system:** Third-party modules via `src/modules/plugins/` with build-time discovery and startup safety warnings
--  **Security hardened:** Input validation, path traversal protection, honeypot detection, memory-safe operations
+-  **Security hardened:** Input validation, path traversal protection, honeypot detection, root privilege checks, spool symlink protection, memory-safe operations
 -  **IPv4/IPv6 ready:** Both address families work out-of-the-box across all modules
 
 ---
 
 ## Quick Start
 
+**One command** (Debian/Ubuntu/Kali):
+
 ```bash
-# Install dependencies (Debian/Ubuntu/Kali)
-sudo apt update
-sudo apt install pkg-config libssl-dev rustc libdbus-1-dev freerdp2-x11
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# Clone & build
-git clone https://github.com/s-b-repo/rustsploit.git
-cd rustsploit
-cargo build
-
-# Run
-cargo run
+sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev libdbus-1-dev cmake && (command -v cargo > /dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env")) && git clone https://github.com/s-b-repo/rustsploit.git && cd rustsploit && cargo run
 ```
+
+<details>
+<summary>What each dependency does</summary>
+
+| Package | Required by | Why |
+|---------|------------|-----|
+| `build-essential` | Native crate compilation | gcc, make, libc headers |
+| `pkg-config` | `native-tls`, `ssh2` | Finds system libraries at build time |
+| `libssl-dev` | `native-tls`, `ssh2` | OpenSSL headers for TLS and SSH |
+| `libdbus-1-dev` | `btleplug` | D-Bus IPC for Bluetooth scanning |
+| `cmake` | `ssh2` (libssh2-sys) | Builds libssh2 from source |
+
+
+</details>
 
 For other distros (Arch, Gentoo, Fedora), Docker deployment, and one-liner installs, see **[Getting Started](docs/Getting-Started.md)**.
 

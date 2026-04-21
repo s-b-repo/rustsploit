@@ -5,8 +5,9 @@ use tokio::time::Duration;
 
 use crate::native::rdp as rdp_native;
 
-use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+use crate::utils::{
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -89,6 +90,7 @@ impl RdpSecurityLevel {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -229,6 +231,7 @@ pub async fn run(target: &str) -> Result<()> {
                 let addr = format_socket_address(&ip.to_string(), port);
                 let timeout_duration = Duration::from_secs(timeout_secs);
 
+                let mut consecutive_errors = 0u32;
                 for user in users.iter() {
                     for pass in passes.iter() {
                         match try_rdp_login(&addr, user, pass, timeout_duration, security_level)
@@ -246,17 +249,25 @@ pub async fn run(target: &str) -> Result<()> {
                                 );
                                 return Some(line);
                             }
+                            Ok(false) => {
+                                consecutive_errors = 0; // Auth failure = server responsive
+                            }
                             Err(e) => {
+                                consecutive_errors += 1;
                                 let err = e.to_string().to_lowercase();
                                 if err.contains("refused")
                                     || err.contains("timeout")
                                     || err.contains("reset")
                                     || err.contains("not found")
                                 {
-                                    return None;
+                                    return None; // Host unreachable, skip
+                                }
+                                // Backoff on consecutive errors to avoid hammering
+                                if consecutive_errors >= 3 {
+                                    let delay = crate::utils::backoff_delay(500, consecutive_errors.min(5), 8);
+                                    tokio::time::sleep(delay).await;
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -298,12 +309,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every password with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     // Determine streaming vs. memory-loaded mode for large wordlists
     let use_streaming = should_use_streaming(&passwords_file_path)?;
@@ -362,7 +368,11 @@ pub async fn run(target: &str) -> Result<()> {
     }
     crate::mprintln!("[*] Loaded {} passwords", passwords.len());
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     crate::mprintln!("{}", format!("[*] Total attempts: {}", combos.len()).cyan());
 
     // Free original vecs since combos now owns the data
@@ -381,7 +391,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries: 2,
         service_name: "rdp",
-        source_module: "creds/generic/rdp_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/rdp_credcheck",
     };
 
     // Build the try_login closure capturing security_level, domain, and verbose
@@ -443,7 +454,8 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
         verbose,
         output_file,
         service_name: "rdp",
-        source_module: "creds/generic/rdp_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/rdp_credcheck",
         skip_tcp_check: false,
     };
 

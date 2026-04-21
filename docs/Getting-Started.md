@@ -1,6 +1,6 @@
 # Getting Started
 
-Rustsploit is a modular offensive tooling framework for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. It ships an interactive shell, a CLI runner, a REST API server, and an ever-growing library of exploits, scanners, and credential modules.
+Rustsploit is a modular offensive tooling framework for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. It ships an interactive shell, a CLI runner, a WebSocket API server with post-quantum encryption, and an ever-growing library of exploits, scanners, and credential modules.
 
 ---
 
@@ -10,23 +10,22 @@ Rustsploit is a modular offensive tooling framework for embedded targets, writte
 
 **Debian / Ubuntu / Kali:**
 ```bash
-sudo apt update
-sudo apt install pkg-config libssl-dev rustc libdbus-1-dev 
+sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev libdbus-1-dev cmake
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S pkgconf openssl freerdp rustc
+sudo pacman -S base-devel pkgconf openssl dbus cmake
 ```
 
 **Gentoo:**
 ```bash
-sudo emerge dev-libs/openssl dev-util/pkgconf net-misc/freerdp
+sudo emerge dev-libs/openssl dev-util/pkgconf sys-apps/dbus dev-build/cmake
 ```
 
 **Fedora / RHEL:**
 ```bash
-sudo dnf install pkgconf-pkg-config openssl-devel freerdp rustc
+sudo dnf install gcc make pkgconf-pkg-config openssl-devel dbus-devel cmake
 ```
 
 ### Rust & Cargo
@@ -36,7 +35,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
 
-> The minimum supported Rust version tracks stable. Run `rustup update` to stay current.
+> Rust 1.85+ is required (edition 2024). Run `rustup update` to stay current.
 
 ---
 

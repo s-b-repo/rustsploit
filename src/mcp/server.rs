@@ -1,11 +1,35 @@
 use anyhow::Context;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::types::{
-    InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
-    ResourcesCapability, ToolsCapability,
+    InitializeResult, JsonRpcRequest, JsonRpcResponse, ResourcesCapability, ServerCapabilities,
+    ServerInfo, ToolsCapability,
 };
+
+fn isolate_protocol_stdout() -> anyhow::Result<tokio::fs::File> {
+    use std::os::fd::FromRawFd;
+    unsafe {
+        let saved_fd = libc::dup(1);
+        if saved_fd < 0 {
+            anyhow::bail!("dup(1) failed: errno {}", *libc::__errno_location());
+        }
+        let null_path = b"/dev/null\0";
+        let null_fd = libc::open(null_path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
+        if null_fd < 0 {
+            libc::close(saved_fd);
+            anyhow::bail!("open(/dev/null) failed: errno {}", *libc::__errno_location());
+        }
+        if libc::dup2(null_fd, 1) < 0 {
+            libc::close(null_fd);
+            libc::close(saved_fd);
+            anyhow::bail!("dup2(null, 1) failed: errno {}", *libc::__errno_location());
+        }
+        libc::close(null_fd);
+        let std_file = std::fs::File::from_raw_fd(saved_fd);
+        Ok(tokio::fs::File::from_std(std_file))
+    }
+}
 
 /// Run the MCP server over newline-delimited JSON on stdio.
 ///
@@ -13,25 +37,56 @@ use super::types::{
 /// * **stdout** — writes one JSON-RPC 2.0 response per line.
 /// * **stderr** — diagnostic logging (stdout is the protocol channel).
 pub async fn run_mcp_server() -> anyhow::Result<()> {
+    let mut protocol_out = isolate_protocol_stdout()
+        .context("Cannot isolate protocol stdout — aborting to prevent JSON-RPC corruption")?;
+
     let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
+
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
 
     eprintln!("[MCP] RustSploit MCP server started (stdio transport)");
+    eprintln!("[MCP] Protocol stdout isolated — module output is captured via OUTPUT_BUFFER only");
 
     loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
+        line_buf.clear();
+        let n = (&mut reader)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line_buf)
             .await
             .context("failed to read from stdin")?;
         if n == 0 {
-            // EOF — client closed the pipe.
             eprintln!("[MCP] stdin closed, shutting down");
             break;
         }
+        if line_buf.len() > MAX_LINE_BYTES {
+            eprintln!(
+                "[MCP] line exceeded {} bytes without newline — rejecting and closing",
+                MAX_LINE_BYTES
+            );
+            let resp = JsonRpcResponse::error(
+                None,
+                -32600,
+                format!("Request exceeds {} byte line limit", MAX_LINE_BYTES),
+            );
+            write_response(&mut protocol_out, &resp).await?;
+            break;
+        }
 
+        let line = match std::str::from_utf8(&line_buf) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[MCP] non-UTF-8 input on stdin: {}", e);
+                let resp = JsonRpcResponse::error(
+                    None,
+                    -32700,
+                    format!("Parse error: input is not valid UTF-8: {}", e),
+                );
+                write_response(&mut protocol_out, &resp).await?;
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -42,7 +97,7 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
             Err(e) => {
                 eprintln!("[MCP] parse error: {}", e);
                 let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e));
-                write_response(&mut stdout, &resp).await?;
+                write_response(&mut protocol_out, &resp).await?;
                 continue;
             }
         };
@@ -51,23 +106,22 @@ pub async fn run_mcp_server() -> anyhow::Result<()> {
 
         let response = handle_request(request).await;
         if let Some(resp) = response {
-            write_response(&mut stdout, &resp).await?;
+            write_response(&mut protocol_out, &resp).await?;
         }
     }
 
     Ok(())
 }
 
-/// Serialize a response as a single JSON line on stdout.
-/// Combines serialization + newline into one write to minimize syscalls.
+/// Serialize a response as a single JSON line on the protocol channel.
 async fn write_response(
-    stdout: &mut tokio::io::Stdout,
+    out: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     resp: &JsonRpcResponse,
 ) -> anyhow::Result<()> {
     let mut json = serde_json::to_vec(resp).context("failed to serialize response")?;
     json.push(b'\n');
-    stdout.write_all(&json).await.context("failed to write response")?;
-    stdout.flush().await.context("failed to flush stdout")?;
+    out.write_all(&json).await.context("failed to write response")?;
+    out.flush().await.context("failed to flush protocol channel")?;
     Ok(())
 }
 
@@ -75,7 +129,7 @@ async fn write_response(
 async fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(req.id)),
-        "initialized" => {
+        "initialized" | "notifications/initialized" => {
             // Notification — no response.
             eprintln!("[MCP] Client initialized");
             None
@@ -84,11 +138,15 @@ async fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
         "tools/call" => Some(handle_tools_call(req.id, req.params).await),
         "resources/list" => Some(handle_resources_list(req.id)),
         "resources/read" => Some(handle_resources_read(req.id, req.params).await),
+        other if other.starts_with("notifications/") => {
+            eprintln!("[MCP] Ignoring notification: {}", other);
+            None
+        }
         other => Some(JsonRpcResponse::error(
             req.id,
             -32601,
             format!("Method not found: {}", other),
-        )),
+        ))
     }
 }
 
@@ -151,8 +209,11 @@ async fn handle_resources_read(id: Option<Value>, params: Option<Value>) -> Json
     };
 
     let result = super::resources::read_resource(&uri).await;
+    // The MCP spec (2024-11-05) requires `resources/read` to return
+    // `{ contents: [ { uri, mimeType, text } ] }` — a list, not a bare content
+    // object. Claude's client rejects the bare shape silently.
     match serde_json::to_value(&result) {
-        Ok(v) => JsonRpcResponse::success(id, v),
+        Ok(v) => JsonRpcResponse::success(id, serde_json::json!({ "contents": [v] })),
         Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),
     }
 }

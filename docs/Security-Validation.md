@@ -121,6 +121,42 @@ The API server (`api.rs`) implements:
 - **Auto-cleanup** — old entries purged at 100,000 entries
 - **IP tracking + key rotation** — suspicious activity triggers auto-rotation in hardening mode
 - **Secure defaults** — by default, considers `127.0.0.1` as the intended private bind
+- **WebSocket limits** — max 100 concurrent connections, 1 MiB frame cap, 30s heartbeat
+
+---
+
+## MCP Server Security
+
+The MCP server (`mcp/server.rs`) implements:
+
+- **`isolate_protocol_stdout()`** — redirects fd 1 to /dev/null so module `println!` cannot corrupt the JSON-RPC stream
+- **`MAX_LINE_BYTES`** — 1 MiB cap on incoming lines to prevent memory exhaustion
+- **Binary-safe reads** — uses `read_until()` instead of `read_line()` for no UTF-8 requirement
+- **Non-UTF-8 error handling** — returns proper JSON-RPC error responses for malformed input
+
+---
+
+## Spool Security
+
+The spool system (`spool.rs`) implements:
+
+- **`O_NOFOLLOW`** — prevents TOCTOU race conditions on symlinked spool files
+- **Parent symlink check** — rejects spool paths with symlinked parent directories
+- **Lock-first pattern** — acquires write lock before creating files to prevent orphaned files
+- **`write_line()` returns `Result`** — callers handle write failures instead of silently dropping output
+
+---
+
+## Privilege Checks
+
+Modules requiring raw sockets call `require_root()` at startup:
+
+```rust
+use crate::utils::privilege::require_root;
+require_root("ICMP raw socket")?;
+```
+
+Returns a descriptive error with the current euid instead of a cryptic "permission denied" from the socket layer. Used by DoS modules, ping sweep, and raw packet scanners.
 
 ---
 

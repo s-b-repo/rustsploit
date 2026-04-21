@@ -171,7 +171,7 @@ impl BruteforceStats {
                 rate
             );
         }
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
     }
 
     pub async fn print_final(&self) {
@@ -257,13 +257,17 @@ pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr 
     loop {
         attempts += 1;
         if attempts > 100_000 {
-            // Fallback: return a random non-excluded IP from common ranges
-            return IpAddr::V4(std::net::Ipv4Addr::new(
+            // Fallback: generate from common public ranges and re-check exclusions
+            let fallback = IpAddr::V4(std::net::Ipv4Addr::new(
                 rng.random_range(1..224),
                 rng.random_range(0..256) as u8,
                 rng.random_range(0..256) as u8,
                 rng.random_range(1..255) as u8,
             ));
+            if !exclusions.iter().any(|net| net.contains(fallback)) {
+                return fallback;
+            }
+            continue; // Fallback was excluded too — keep trying
         }
 
         let octets: [u8; 4] = rng.random();
@@ -289,29 +293,53 @@ pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr 
     }
 }
 
-pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
-    let needle = format!("checked: {}", ip.to_string());
-    match tokio::fs::read_to_string(state_file).await {
-        Ok(contents) => contents.lines().any(|line| line.contains(&needle)),
-        Err(_) => false,
-    }
-}
+/// In-memory dedup set for mass scan IP tracking.
+/// Avoids the TOCTOU race of file-based is_ip_checked + mark_ip_checked.
+static CHECKED_IPS: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
-pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
+/// Atomically check AND mark an IP in a single lock acquisition.
+/// Returns `true` if the IP was already checked (caller should skip it).
+/// On first call, loads persisted state from file (cold start recovery).
+/// Persists the new entry to file for restart durability.
+pub async fn check_and_mark_ip(ip: &impl ToString, state_file: &str) -> bool {
     if state_file.contains("..") {
         crate::meprintln!("[!] Invalid state file path: {}", state_file);
-        return;
+        return false;
     }
-    let data = format!("checked: {}\n", ip.to_string());
+    let ip_str = ip.to_string();
+    {
+        let mut set = CHECKED_IPS.lock().await;
+
+        // Cold start: load persisted state from file on first access
+        if set.is_empty() {
+            if let Ok(contents) = tokio::fs::read_to_string(state_file).await {
+                for line in contents.lines() {
+                    if let Some(checked_ip) = line.strip_prefix("checked: ") {
+                        set.insert(checked_ip.to_string());
+                    }
+                }
+            }
+        }
+
+        if !set.insert(ip_str.clone()) {
+            // Already present — skip this IP
+            return true;
+        }
+    }
+    // Persist outside the lock to minimize hold time
+    let data = format!("checked: {}\n", ip_str);
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
         .open(state_file)
         .await
     {
-        let _ = file.write_all(data.as_bytes()).await;
+        if let Err(e) = file.write_all(data.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
     }
+    false
 }
+
 
 pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
     let mut exclusion_subnets = Vec::new();
@@ -425,7 +453,7 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
                 }
             }
             Err(e) => {
@@ -499,11 +527,12 @@ where
 
             tokio::spawn(async move {
                 let ip = generate_random_public_ip(&exc);
-                if !is_ip_checked(&ip, state_file).await {
-                    mark_ip_checked(&ip, state_file).await;
+                if !check_and_mark_ip(&ip, state_file).await {
                     if let Some(line) = probe(ip, port).await {
                         sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
+                        if let Err(e) = tx.send(line).await {
+                            crate::meprintln!("[!] Channel send error: {}", e);
+                        }
                     }
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -531,11 +560,12 @@ where
             let probe = probe.clone();
 
             tokio::spawn(async move {
-                if !is_ip_checked(&ip_addr, state_file).await {
-                    mark_ip_checked(&ip_addr, state_file).await;
+                if !check_and_mark_ip(&ip_addr, state_file).await {
                     if let Some(line) = probe(ip_addr, port).await {
                         sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
+                        if let Err(e) = tx.send(line).await {
+                            crate::meprintln!("[!] Channel send error: {}", e);
+                        }
                     }
                 }
                 sc.fetch_add(1, Ordering::Relaxed);
@@ -545,7 +575,7 @@ where
 
         // Wait for all tasks to finish
         for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+            if let Err(e) = semaphore.acquire().await { crate::meprintln!("[!] Semaphore error: {}", e); }
         }
     } else {
         // File mode
@@ -580,11 +610,12 @@ where
 
             tokio::spawn(async move {
                 if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    if !is_ip_checked(&ip, state_file).await {
-                        mark_ip_checked(&ip, state_file).await;
+                    if !check_and_mark_ip(&ip, state_file).await {
                         if let Some(line) = probe(ip, port).await {
                             sf.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(line).await;
+                            if let Err(e) = tx.send(line).await {
+                                crate::meprintln!("[!] Channel send error: {}", e);
+                            }
                         }
                     }
                 }
@@ -595,7 +626,7 @@ where
 
         // Wait for all tasks to finish
         for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+            if let Err(e) = semaphore.acquire().await { crate::meprintln!("[!] Semaphore error: {}", e); }
         }
     }
 
@@ -629,6 +660,17 @@ pub enum LoginResult {
     Error { message: String, retryable: bool },
 }
 
+/// Credential combination strategy.
+#[derive(Clone, Copy, Debug)]
+pub enum ComboMode {
+    /// Pair user\[i\] with pass\[i\], cycling the shorter list.
+    Linear,
+    /// Full cross product: every user × every password.
+    Combo,
+    /// Password spray: for each password, try all users (avoids account lockout).
+    Spray,
+}
+
 /// Common configuration for the bruteforce engine.
 #[derive(Clone)]
 pub struct BruteforceConfig {
@@ -638,6 +680,8 @@ pub struct BruteforceConfig {
     pub stop_on_success: bool,
     pub verbose: bool,
     pub delay_ms: u64,
+    /// Random jitter added to delay_ms (0..jitter_ms) for IDS evasion.
+    pub jitter_ms: u64,
     pub max_retries: usize,
     pub service_name: &'static str,
     pub source_module: &'static str,
@@ -682,7 +726,7 @@ impl BruteforceResult {
             Ok(mut file) => {
                 use std::io::Write;
                 for (host, user, pass) in &self.found {
-                    let _ = writeln!(file, "{}:{}:{}", host, user, pass);
+                    if let Err(e) = writeln!(file, "{}:{}:{}", host, user, pass) { crate::meprintln!("[!] Write error: {}", e); }
                 }
                 crate::mprintln!("[+] Results saved to '{}'", file_path.display());
             }
@@ -694,33 +738,69 @@ impl BruteforceResult {
     }
 }
 
-/// Generate credential pairs from username and password lists.
-/// In combo mode, produces the full cross product (user × pass).
-/// In linear mode, pairs user\[i\] with pass\[i\], cycling the shorter list.
-pub fn generate_combos(
+/// Generate credential pairs with full combo mode control.
+/// - Linear: pairs user\[i\] with pass\[i\], cycling the shorter list.
+/// - Combo: full cross product (user × pass).
+/// - Spray: for each password, try all users (lockout-safe ordering).
+pub fn generate_combos_mode(
     usernames: &[String],
     passwords: &[String],
-    combo_mode: bool,
+    mode: ComboMode,
 ) -> Vec<(String, String)> {
     if usernames.is_empty() || passwords.is_empty() {
         return Vec::new();
     }
-    let mut combos = Vec::new();
-    if combo_mode {
-        for u in usernames {
+    match mode {
+        ComboMode::Combo => {
+            let mut combos = Vec::with_capacity(usernames.len() * passwords.len());
+            for u in usernames {
+                for p in passwords {
+                    combos.push((u.clone(), p.clone()));
+                }
+            }
+            combos
+        }
+        ComboMode::Spray => {
+            let mut combos = Vec::with_capacity(usernames.len() * passwords.len());
             for p in passwords {
+                for u in usernames {
+                    combos.push((u.clone(), p.clone()));
+                }
+            }
+            combos
+        }
+        ComboMode::Linear => {
+            let max_len = std::cmp::max(usernames.len(), passwords.len());
+            let mut combos = Vec::with_capacity(max_len);
+            for i in 0..max_len {
+                let u = &usernames[i % usernames.len()];
+                let p = &passwords[i % passwords.len()];
                 combos.push((u.clone(), p.clone()));
             }
-        }
-    } else {
-        let max_len = std::cmp::max(usernames.len(), passwords.len());
-        for i in 0..max_len {
-            let u = &usernames[i % usernames.len()];
-            let p = &passwords[i % passwords.len()];
-            combos.push((u.clone(), p.clone()));
+            combos
         }
     }
-    combos
+}
+
+/// Load user:pass credential pairs from a file (one pair per line, colon-separated).
+pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
+    let lines = crate::utils::load_lines(path)?;
+    let mut combos = Vec::new();
+    for line in lines {
+        if let Some((user, pass)) = line.split_once(':') {
+            combos.push((user.to_string(), pass.to_string()));
+        }
+    }
+    Ok(combos)
+}
+
+/// Parse combo mode from user input string.
+pub fn parse_combo_mode(input: &str) -> ComboMode {
+    match input.trim().to_lowercase().as_str() {
+        "combo" | "cross" => ComboMode::Combo,
+        "spray" | "password_spray" => ComboMode::Spray,
+        _ => ComboMode::Linear,
+    }
 }
 
 /// Run the generic bruteforce engine against a single target.
@@ -793,6 +873,7 @@ where
         let stop_on_success = config.stop_on_success;
         let max_retries = config.max_retries;
         let delay_ms = config.delay_ms;
+        let jitter_ms = config.jitter_ms;
 
         tasks.push(tokio::spawn(async move {
             if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
@@ -811,11 +892,14 @@ where
                 match result {
                     LoginResult::Success => {
                         crate::mprintln!("\r{}", format!("[+] {} -> {}:{}", display, user, pass).green().bold());
-                        let _ = crate::cred_store::store_credential(
-                            &target, port, service, &user, &pass,
-                            crate::cred_store::CredType::Password,
-                            source,
-                        ).await;
+                        {
+                            let id = crate::cred_store::store_credential(
+                                &target, port, service, &user, &pass,
+                                crate::cred_store::CredType::Password,
+                                source,
+                            ).await;
+                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                        }
                         found_c.lock().await.push((display.clone(), user.clone(), pass.clone()));
                         stats_c.record_success();
                         if stop_on_success {
@@ -857,8 +941,11 @@ where
                 }
             }
 
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            if delay_ms > 0 || jitter_ms > 0 {
+                let jitter = if jitter_ms > 0 {
+                    rand::rng().random_range(0..=jitter_ms)
+                } else { 0 };
+                tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
             }
         }));
 
@@ -874,7 +961,7 @@ where
     }
 
     stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    if let Err(e) = progress_handle.await { crate::meprintln!("[!] Progress task error: {}", e); }
     stats.print_final().await;
 
     let found_creds = found.lock().await.clone();
@@ -897,6 +984,8 @@ pub struct SubnetScanConfig {
     pub verbose: bool,
     pub output_file: String,
     pub service_name: &'static str,
+    /// Random jitter added to delay between attempts (0..jitter_ms).
+    pub jitter_ms: u64,
     pub source_module: &'static str,
     /// Skip the TCP port pre-check before attempting credentials.
     /// Set to `true` for UDP-based protocols (SNMP, L2TP) where a TCP
@@ -980,7 +1069,7 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await { crate::meprintln!("[!] Write error: {}", e); }
                 }
             }
             Err(e) => {
@@ -1003,15 +1092,13 @@ where
         let try_login = try_login.clone();
         let verbose = config.verbose;
         let skip_tcp = config.skip_tcp_check;
+        let jitter_ms = config.jitter_ms;
 
         tokio::spawn(async move {
             // Quick TCP port check (skipped for UDP protocols)
             if !skip_tcp {
                 let sa = SocketAddr::new(ip, port);
-                if tokio::time::timeout(
-                    Duration::from_millis(3000),
-                    tokio::net::TcpStream::connect(&sa),
-                )
+                if crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
                 .await
                 .is_err()
                 {
@@ -1029,17 +1116,22 @@ where
                         LoginResult::Success => {
                             let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
                             crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                            let _ = crate::cred_store::store_credential(
-                                &ip.to_string(),
-                                port,
-                                service,
-                                user,
-                                pass,
-                                crate::cred_store::CredType::Password,
-                                source,
-                            )
-                            .await;
-                            let _ = tx.send(format!("{}\n", msg)).await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    &ip.to_string(),
+                                    port,
+                                    service,
+                                    user,
+                                    pass,
+                                    crate::cred_store::CredType::Password,
+                                    source,
+                                )
+                                .await;
+                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
+                            if let Err(e) = tx.send(format!("{}\n", msg)).await {
+                                crate::meprintln!("[!] Channel send error: {}", e);
+                            }
                             sf.fetch_add(1, Ordering::Relaxed);
                             break 'outer;
                         }
@@ -1061,6 +1153,11 @@ where
                             }
                         }
                     }
+                    // Apply jitter between attempts if configured
+                    if jitter_ms > 0 {
+                        let jitter = rand::rng().random_range(0..=jitter_ms);
+                        tokio::time::sleep(Duration::from_millis(jitter)).await;
+                    }
                 }
             }
             sc.fetch_add(1, Ordering::Relaxed);
@@ -1070,12 +1167,12 @@ where
 
     // Wait for all tasks
     for _ in 0..config.concurrency {
-        let _ = semaphore.acquire().await.context("Semaphore")?;
+        let _permit = semaphore.acquire().await.context("Semaphore")?;
     }
 
     // Shut down writer task
     drop(tx);
-    let _ = writer_handle.await;
+    if let Err(e) = writer_handle.await { crate::meprintln!("[!] Task error: {}", e); }
 
     progress_stop.store(true, Ordering::Relaxed);
     crate::mprintln!(

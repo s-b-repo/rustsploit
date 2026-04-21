@@ -1,12 +1,10 @@
 # API Usage Examples
 
-Practical workflows for interacting with the Rustsploit REST API.
+Practical workflows for interacting with the Rustsploit WebSocket API.
 
 > Start the server first: `cargo run -- --api`
 >
-> **Note:** Direct `curl` usage requires completing a PQ handshake first (programmatic clients only). For interactive use, connect via ArcticAlopex GUI which handles the PQ session automatically. The `curl` examples below show the plaintext request/response format — in practice, all traffic is PQ-encrypted.
->
-> The `Authorization: Bearer` headers shown below are **no longer used** — authentication is via PQ identity keys established during the handshake. The examples retain the header for reference only.
+> **Note:** All API endpoints (except `/health`) require a PQ WebSocket session. The examples below show the JSON message format sent over the WebSocket connection — not direct HTTP requests. Authentication is via PQ identity keys established during the handshake. The `Authorization: Bearer` headers shown are **legacy placeholders** retained for readability — they are not used.
 
 ---
 
@@ -40,7 +38,7 @@ curl -H "Authorization: Bearer my-secret-key" \
     "scanners/dir_brute",
     "creds/generic/ssh_bruteforce"
   ],
-  "count": 181,
+  "count": 240,
   "request_id": "abc123",
   "timestamp": "2026-03-17T14:01:00Z",
   "duration_ms": 2
@@ -54,18 +52,6 @@ curl -H "Authorization: Bearer my-secret-key" \
 ```bash
 curl -H "Authorization: Bearer my-secret-key" \
      http://localhost:8080/api/module/exploits/sample_exploit
-```
-
----
-
-## Validate Parameters (Dry Run)
-
-```bash
-curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     -H "Content-Type: application/json" \
-     -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
-     http://localhost:8080/api/validate
 ```
 
 ---
@@ -195,60 +181,6 @@ curl -X POST \
      }' \
      http://localhost:8080/api/run
 ```
-
----
-
-## Check Server Status & Statistics
-
-```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/status
-```
-
-**Response:**
-```json
-{
-  "uptime_seconds": 3600,
-  "requests_total": 142,
-  "auth_failures": 3,
-  "tracked_ips": 2,
-  "hardening_enabled": true,
-  "ip_limit": 5,
-  "request_id": "def456",
-  "timestamp": "2026-03-17T15:00:00Z",
-  "duration_ms": 1
-}
-```
-
----
-
-## View Tracked IPs
-
-```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/ips
-```
-
----
-
-## View Auth Failure Stats
-
-```bash
-curl -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/auth-failures
-```
-
----
-
-## Manually Rotate API Key
-
-```bash
-curl -X POST \
-     -H "Authorization: Bearer my-secret-key" \
-     http://localhost:8080/api/rotate-key
-```
-
-The response includes the **new key** — store it immediately as the old key is invalidated.
 
 ---
 

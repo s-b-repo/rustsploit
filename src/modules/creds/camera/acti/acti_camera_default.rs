@@ -6,11 +6,12 @@ use telnet::{Telnet, Event};
 use std::{net::TcpStream, time::Duration};
 use tokio::{join, task};
 use crate::utils::url_encode;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   ACTi Camera Default Credentials Checker                 ║".cyan());
     crate::mprintln!("{}", "║   Multi-Protocol Scanner (FTP/SSH/Telnet/HTTP)            ║".cyan());

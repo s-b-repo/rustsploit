@@ -7,6 +7,7 @@
 // API mode:   macros write to a task-local OutputBuffer.
 
 use std::sync::{Arc, Mutex};
+
 use serde::Serialize;
 
 // ============================================================
@@ -26,39 +27,55 @@ impl OutputBuffer {
         Self::default()
     }
 
-    /// Max lines per buffer to prevent unbounded memory growth from long-running modules.
     const MAX_BUFFER_LINES: usize = 100_000;
 
+    /// Warn once when a buffer hits capacity.
+    fn warn_truncated(label: &str) {
+        static STDOUT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static STDERR_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let flag = match label {
+            "stdout" => &STDOUT_WARNED,
+            _ => &STDERR_WARNED,
+        };
+        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[!] Output buffer ({}) reached {} lines — further output truncated", label, Self::MAX_BUFFER_LINES);
+        }
+    }
+
     pub fn push_stdout(&self, text: String) {
-        if let Ok(mut guard) = self.stdout.lock() {
-            if guard.len() < Self::MAX_BUFFER_LINES {
-                guard.push(text);
-            }
+        let mut guard = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() < Self::MAX_BUFFER_LINES {
+            guard.push(text);
+        } else {
+            Self::warn_truncated("stdout");
         }
     }
 
     pub fn push_stderr(&self, text: String) {
-        if let Ok(mut guard) = self.stderr.lock() {
-            if guard.len() < Self::MAX_BUFFER_LINES {
-                guard.push(text);
-            }
+        let mut guard = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() < Self::MAX_BUFFER_LINES {
+            guard.push(text);
+        } else {
+            Self::warn_truncated("stderr");
         }
     }
 
-    /// Drain all captured stdout into a single String.
     pub fn drain_stdout(&self) -> String {
         let mut guard = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
-        let joined = guard.join("");
-        guard.clear();
-        joined
+        let mut result = String::new();
+        for line in guard.drain(..) {
+            result.push_str(&line);
+        }
+        result
     }
 
-    /// Drain all captured stderr into a single String.
     pub fn drain_stderr(&self) -> String {
         let mut guard = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-        let joined = guard.join("");
-        guard.clear();
-        joined
+        let mut result = String::new();
+        for line in guard.drain(..) {
+            result.push_str(&line);
+        }
+        result
     }
 }
 
@@ -90,6 +107,15 @@ macro_rules! meprintln {
     }};
 }
 
+/// Write multiple lines atomically — concurrent tasks cannot interleave.
+/// Usage: `mprintln_block!("line1", "line2", "line3");`
+#[macro_export]
+macro_rules! mprintln_block {
+    ($($line:expr),+ $(,)?) => {{
+        $crate::output::_mprint_block(&[$(& $line.to_string()),+])
+    }};
+}
+
 /// Write text without newline to the buffer (API) or stdout (shell).
 #[macro_export]
 macro_rules! mprint {
@@ -110,6 +136,18 @@ macro_rules! meprint {
 // INTERNAL ROUTING FUNCTIONS (called by macros)
 // ============================================================
 
+/// Global stdout lock for atomic multi-line output in shell mode.
+/// Prevents concurrent tasks from interleaving lines within a block.
+static STDOUT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+static SPOOL_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn handle_spool_error(e: std::io::Error) {
+    if !SPOOL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[!] Spool write failed (further errors suppressed): {}", e);
+    }
+}
+
 /// Route a line to buffer (stdout channel) or real stdout + spool.
 pub fn _mprint_line(text: &str) {
     let buffered = OUTPUT_BUFFER.try_with(|buf| {
@@ -117,7 +155,9 @@ pub fn _mprint_line(text: &str) {
     });
     if buffered.is_err() {
         println!("{}", text);
-        crate::spool::SPOOL.write_line(text);
+        if let Err(e) = crate::spool::SPOOL.write_line(text) {
+            handle_spool_error(e);
+        }
     }
 }
 
@@ -128,11 +168,13 @@ pub fn _mprint_newline() {
     });
     if buffered.is_err() {
         println!();
-        crate::spool::SPOOL.write_line("");
+        if let Err(e) = crate::spool::SPOOL.write_line("") {
+            handle_spool_error(e);
+        }
     }
 }
 
-/// Route raw text (no newline) to buffer or stdout.
+/// Route raw text (no newline) to buffer or stdout + spool.
 pub fn _mprint_raw(text: &str) {
     let buffered = OUTPUT_BUFFER.try_with(|buf| {
         buf.push_stdout(text.to_string());
@@ -141,6 +183,29 @@ pub fn _mprint_raw(text: &str) {
         use std::io::Write;
         print!("{}", text);
         let _ = std::io::stdout().flush();
+        if let Err(e) = crate::spool::SPOOL.write_line(text) {
+            handle_spool_error(e);
+        }
+    }
+}
+
+/// Write multiple lines atomically so concurrent tasks cannot interleave.
+/// Each element is printed as a separate line. In API/buffer mode, lines are
+/// pushed individually (the buffer is already per-task).
+pub fn _mprint_block(lines: &[&str]) {
+    let buffered = OUTPUT_BUFFER.try_with(|buf| {
+        for line in lines {
+            buf.push_stdout(format!("{}\n", line));
+        }
+    });
+    if buffered.is_err() {
+        let _guard = STDOUT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        for line in lines {
+            println!("{}", line);
+            if let Err(e) = crate::spool::SPOOL.write_line(line) {
+                handle_spool_error(e);
+            }
+        }
     }
 }
 
@@ -226,17 +291,19 @@ pub struct OutputAccumulator {
 }
 
 impl OutputAccumulator {
+    const MAX_FINDINGS: usize = 10_000;
+
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn add_finding(&self, finding: Finding) {
-        if let Ok(mut guard) = self.inner.lock() {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.findings.len() < Self::MAX_FINDINGS {
             guard.findings.push(finding);
         }
     }
 
-    /// Take the accumulated output, leaving an empty ModuleOutput behind.
     pub fn take(&self) -> ModuleOutput {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)

@@ -4,7 +4,7 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 > **Module categories:** `exploits/`, `scanners/`, `creds/`, `plugins/` -- all auto-discovered at build time. Adding a new subdirectory under `src/modules/` automatically creates a new category.
 
-**Totals:** 137 exploit modules (24 with `check()`), 24 scanners, 19 credential modules, 1 plugin.
+**Totals:** 183 exploit modules, 27 scanners, 29 credential modules, 1 plugin.
 
 ---
 
@@ -27,12 +27,29 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/cameras/reolink/reolink_rce_cve_2019_11001` | Reolink camera authenticated OS command injection via TestEmail (CVE-2019-11001) |
 | `exploits/cameras/uniview/uniview_nvr_pwd_disclosure` | Uniview NVR remote credential extraction and decoding |
 
+### Cowrie (SSH Honeypot)
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/cowrie/ansi_log_injection` | Injects ANSI/OSC escape sequences into cowrie session logs via unsanitized crontab arguments for terminal-level code execution on replay |
+| `exploits/cowrie/llm_prompt_injection` | Exploits cowrie LLM mode where attacker commands are concatenated into the system prompt, coercing the LLM to echo real configuration data |
+| `exploits/cowrie/ssrf_ipv6` | Bypasses cowrie SSRF blocklist via IPv6 addresses (fc00::/7, fe80::/10, ::ffff:0:0/96) and DNS-rebinding TOCTOU |
+
 ### Crypto
 
 | Module Path | Description |
 |-------------|-------------|
 | `exploits/crypto/geth_dos_cve_2026_22862` | Go-Ethereum ECIES panic DoS via malformed encrypted messages (CVE-2026-22862) |
 | `exploits/crypto/heartbleed` | OpenSSL Heartbleed memory leak exploitation (CVE-2014-0160) |
+
+### Dionaea (Honeypot)
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/dionaea/mqtt_underflow` | Malformed MQTT PUBLISH with TopicLength exceeding MessageLength triggers parser desync/UnicodeDecodeError in dionaea |
+| `exploits/dionaea/mssql_dos` | Crafted TDS7 LOGIN7 packet with misaligned password slice triggers unhandled UnicodeDecodeError in dionaea MSSQL handler |
+| `exploits/dionaea/mysql_sqli` | MySQL COM_FIELD_LIST with SQLite injection in table name leaks dionaea internal DB schema |
+| `exploits/dionaea/tftp_crash` | Malformed TFTP RRQ without trailing NUL causes struct.error in dionaea options parser |
 
 ### DoS / Stress Testing
 
@@ -50,12 +67,14 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/dos/ssdp_amplification` | Spoofed SSDP M-SEARCH requests for ~30x amplification |
 | `exploits/dos/syn_ack_flood` | SYN packets to reflectors with spoofed victim source IP for SYN-ACK reflection |
 | `exploits/dos/tcp_connection_flood` | High-concurrency TCP connection flood with optional RST close and HTTP payload |
+| `exploits/dos/telnet_iac_flood` | Telnet IAC negotiation flood exploiting unbounded SB/SE parsing and rapid WILL/DO option cycling |
 | `exploits/dos/udp_flood` | High-speed UDP flood with random, null, and pattern payload modes |
 
 ### Frameworks
 
 | Module Path | Description |
 |-------------|-------------|
+| `exploits/frameworks/apache_camel/cve_2025_27636_camel_header_injection` | Apache Camel < 4.10.2 HTTP header injection via Simple expression language for OS command execution (CVE-2025-27636) |
 | `exploits/frameworks/apache_tomcat/catkiller_cve_2025_31650` | Apache Tomcat memory leak via invalid HTTP/2 priority headers (CVE-2025-31650) |
 | `exploits/frameworks/apache_tomcat/cve_2025_24813_apache_tomcat_rce` | Apache Tomcat deserialization RCE (CVE-2025-24813) |
 | `exploits/frameworks/apache_tomcat/cve_2025_24813_tomcat_put_rce` | Apache Tomcat unauthenticated RCE via partial PUT and Java deserialization (CVE-2025-24813) |
@@ -67,6 +86,7 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/frameworks/mongo/mongobleed` | MongoDB zlib decompression heap memory disclosure (CVE-2025-14847) |
 | `exploits/frameworks/nginx/nginx_pwner` | Nginx misconfiguration scanner: alias traversal, CRLF injection, PHP detection, and more |
 | `exploits/frameworks/php/cve_2024_4577` | PHP CGI argument injection on Windows XAMPP for RCE (CVE-2024-4577) |
+| `exploits/frameworks/php/cve_2025_51373_php_rce` | PHP CGI on Windows soft hyphen code-page conversion allows argument injection for auto_prepend_file RCE (CVE-2025-51373) |
 | `exploits/frameworks/wsus/cve_2025_59287_wsus_rce` | Unauthenticated RCE in Windows Server Update Services (CVE-2025-59287) |
 
 ### FTP
@@ -76,11 +96,24 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/ftp/ftp_bounce_test` | FTP bounce attack test via PORT commands to third-party hosts |
 | `exploits/ftp/pachev_ftp_path_traversal_1_0` | Directory traversal in Pachev FTP Server 1.0 to read files outside FTP root |
 
+### HoneyTrap (Honeypot)
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/honeytrap/docker_panic` | POST /v1.40/images/create without fromImage causes nil map panic in HoneyTrap Docker emulation — daemon exit |
+| `exploits/honeytrap/ftp_panic` | Malformed FTP PORT command with insufficient fields causes slice out-of-range panic in HoneyTrap — daemon exit |
+
 ### IPMI
 
 | Module Path | Description |
 |-------------|-------------|
 | `exploits/ipmi/ipmi_enum_exploit` | IPMI enumeration with cipher 0 bypass, default credential brute force, and RAKP hash dumping |
+
+### Network Infrastructure -- Commvault
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/network_infra/commvault/cve_2025_34028_commvault_rce` | Commvault Command Center < 11.38.0 unauthenticated path traversal file upload to RCE (CVE-2025-34028) |
 
 ### Network Infrastructure -- Citrix
 
@@ -113,6 +146,12 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | Module Path | Description |
 |-------------|-------------|
 | `exploits/network_infra/hpe/cve_2025_37164_hpe_oneview_rce` | Unauthenticated RCE via REST API command injection in HPE OneView (CVE-2025-37164) |
+
+### Network Infrastructure -- Kubernetes
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/network_infra/kubernetes/cve_2025_1974_ingress_nginx_rce` | ingress-nginx admission webhook config injection via annotations for arbitrary NGINX config, file read, and RCE (CVE-2025-1974) |
 
 ### Network Infrastructure -- Ivanti
 
@@ -241,14 +280,42 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 |-------------|-------------|
 | `exploits/routers/zyxel/zyxel_cpe_ci_cve_2024_40890` | Zyxel legacy CPE unauthenticated HTTP command injection (CVE-2024-40890) |
 
+### Sample
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/sample_exploit` | Template exploit module demonstrating info(), check(), and run() with cfg_prompt integration |
+
+### SafeLine (WAF)
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/safeline/cookie_attributes` | SafeLine session cookie lacks HttpOnly, Secure, and SameSite attributes enabling XSS session theft and CSRF |
+| `exploits/safeline/nginx_injection` | SafeLine tcontrollerd inserts Ports field verbatim into nginx config via fmt.Sprintf for arbitrary directive injection |
+| `exploits/safeline/no_auth_probe` | Detects SafeLine NO_AUTH env bypass where `len(noAuth) >= 0` (always true) disables auth middleware |
+| `exploits/safeline/pre_auth_tfa` | Fresh SafeLine install unauthenticated TFA secret rotation via /api/OTPUrl for full account takeover |
+| `exploits/safeline/session_secret_entropy` | SafeLine JWT signing secret generated with math/rand seeded by time.Now().UnixNano() — as low as 39 bits effective entropy |
+| `exploits/safeline/unauth_writes` | SafeLine publicRouters expose unauthenticated POST to /api/Behaviour and /api/FalsePositives for analytics pollution and request amplification |
+
+### Snare (Honeypot)
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/snare/cookie_dos` | HTTP Cookie header without '=' separator causes IndexError crash in snare tanner_handler.py worker |
+| `exploits/snare/tanner_version_mitm` | Rogue HTTP server on port 8090 returns forged version response to snare's unauthenticated GET /version check |
+
 ### SSH
 
 | Module Path | Description |
 |-------------|-------------|
+| `exploits/ssh/asyncssh_beginauthpass` | AsyncSSH server begin_auth() returning False causes USERAUTH_SUCCESS bypass for unauthenticated session access |
 | `exploits/ssh/erlang_otp_ssh_rce_cve_2025_32433` | Erlang/OTP SSH server unauthenticated RCE (CVE-2025-32433) |
+| `exploits/ssh/libssh2_rogue_server` | Rogue SSH server capturing credentials from libssh2 clients that accept USERAUTH_SUCCESS without verifying KEX state |
 | `exploits/ssh/libssh_auth_bypass_cve_2018_10933` | libSSH server authentication bypass (CVE-2018-10933) |
 | `exploits/ssh/openssh_regresshion_cve_2024_6387` | OpenSSH sshd signal handler race condition for unauthenticated RCE (CVE-2024-6387) |
 | `exploits/ssh/opensshserver_9_8p1race_condition` | OpenSSH 9.8p1 race condition for heap-based RCE |
+| `exploits/ssh/paramiko_authnonepass` | Paramiko SSH server check_auth_none() returning AUTH_SUCCESSFUL allows unauthenticated session access |
+| `exploits/ssh/paramiko_unknown_method` | Paramiko SSH server unrecognized auth method fallthrough to check_auth_none() allows authentication bypass |
 | `exploits/ssh/sshpwn_auth_passwd` | OpenSSH auth2-passwd.c password length DoS, change info leak, timing enumeration |
 | `exploits/ssh/sshpwn_pam` | OpenSSH auth-pam.c environment injection, memory leak DoS, username validation bypass |
 | `exploits/ssh/sshpwn_scp_attacks` | OpenSSH SCP path traversal, command injection, and brace expansion DoS |
@@ -260,6 +327,27 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | Module Path | Description |
 |-------------|-------------|
 | `exploits/telnet/telnet_auth_bypass_cve_2026_24061` | Telnet authentication bypass on vulnerable devices (CVE-2026-24061) |
+
+### VNC
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/vnc/libvnc_checkrect_overflow` | LibVNCClient signed 32-bit bounds check integer overflow for heap overflow RCE |
+| `exploits/vnc/libvnc_tight_filtergradient` | LibVNCClient Tight decoder unclamped numRows out-of-bounds write past allocated buffer |
+| `exploits/vnc/libvnc_ultrazip` | LibVNCClient Ultra encoding unbounded cache rect loop for heap overflow (CVE-2018-20750) |
+| `exploits/vnc/libvnc_websocket_overflow` | LibVNCServer WebSocket unbounded 64-bit payloadLen for heap overflow |
+| `exploits/vnc/libvnc_zrle_tile` | LibVNCClient ZRLE decoder truncated RLE tile buffer over-read |
+| `exploits/vnc/rfb` | Shared RFB protocol helpers for VNC exploit modules |
+| `exploits/vnc/tigervnc_rre_overflow` | TigerVNC RRE decoder unbounded numSubrects loop for heap over-read |
+| `exploits/vnc/tigervnc_timing_oracle` | TigerVNC VNC auth DES response timing side-channel for bit-by-bit key recovery |
+| `exploits/vnc/tightvnc_decompression_bomb` | TightVNC FileUploadData uncapped uncompressedSize for heap exhaustion DoS |
+| `exploits/vnc/tightvnc_des_hardcoded_key` | TightVNC hardcoded 8-byte DES key for offline Windows registry password decryption |
+| `exploits/vnc/tightvnc_ft_path_traversal` | TightVNC file-transfer handler directory traversal for arbitrary file read/write |
+| `exploits/vnc/tightvnc_predictable_challenge` | TightVNC srand(time(0)) predictable 16-byte RFB challenge for replay attacks |
+| `exploits/vnc/tightvnc_rect_overflow` | TightVNC signed int32 multiplication overflow in Rect::area() for heap buffer overflow RCE |
+| `exploits/vnc/x11vnc_dns_injection` | x11vnc reverse-DNS hostname passed unsanitized to system() for shell injection via crafted PTR record |
+| `exploits/vnc/x11vnc_env_injection` | x11vnc RFB_CLIENT_IP environment variable injection into hook scripts |
+| `exploits/vnc/x11vnc_unixpw_inject` | x11vnc -unixpw mode newline injection in plaintext username to confuse PAM flow |
 
 ### VoIP
 
@@ -278,8 +366,10 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/webapps/flowise/cve_2025_59528_flowise_rce` | Flowise < 3.0.5 unauthenticated API RCE (CVE-2025-59528) |
 | `exploits/webapps/langflow_rce_cve_2025_3248` | Langflow unauthenticated RCE via Python exec() in code validation (CVE-2025-3248) |
 | `exploits/webapps/laravel_livewire_rce_cve_2025_47949` | Laravel Livewire RCE via unsafe deserialization (CVE-2025-47949) |
+| `exploits/webapps/misp_rce_cve_2025_27364` | MISP < 2.5.3 authenticated file upload to PHP webshell RCE via /events/upload_sample (CVE-2025-27364) |
 | `exploits/webapps/mcpjam/cve_2026_23744_mcpjam_rce` | MCPJam Inspector <= 1.4.2 unauthenticated RCE (CVE-2026-23744) |
 | `exploits/webapps/n8n/n8n_rce_cve_2025_68613` | n8n workflow automation RCE via expression injection (CVE-2025-68613) |
+| `exploits/webapps/nextjs_middleware_bypass_cve_2025_29927` | Next.js < 15.2.3 middleware bypass via unauthenticated x-middleware-subrequest header (CVE-2025-29927) |
 | `exploits/webapps/react/react2shell` | React Server Components / Next.js RCE via RSC Flight protocol deserialization |
 | `exploits/webapps/roundcube/roundcube_postauth_rce` | Roundcube webmail post-auth RCE via deserialization in file upload |
 | `exploits/webapps/sap_netweaver_rce_cve_2025_31324` | SAP NetWeaver Visual Composer unauthenticated file upload to RCE (CVE-2025-31324) |
@@ -288,12 +378,14 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/webapps/solarwinds/cve_2025_40551_solarwinds_whd_rce` | SolarWinds Web Help Desk unauthenticated Java deserialization RCE (CVE-2025-40551) |
 | `exploits/webapps/spotube/spotube` | Spotube API path traversal via WebSocket and denial of service |
 | `exploits/webapps/termix/termix_xss_cve_2026_22804` | Termix File Manager stored XSS via SVG upload in Electron context (CVE-2026-22804) |
+| `exploits/webapps/vite_path_traversal_cve_2025_30208` | Vite dev server < 6.2.3 /@fs/ path traversal via ?import&raw query parameter bypass (CVE-2025-30208) |
 | `exploits/webapps/wordpress/vitepos_file_upload_cve_2025_13156` | Vitepos for WooCommerce authenticated arbitrary PHP file upload (CVE-2025-13156) |
 | `exploits/webapps/wordpress/wp_bricks_rce_cve_2024_25600` | Bricks Builder for WordPress unauthenticated RCE via render_element (CVE-2024-25600) |
 | `exploits/webapps/wordpress/wp_litespeed_rce_cve_2024_28000` | LiteSpeed Cache weak hash brute force for WordPress admin escalation (CVE-2024-28000) |
 | `exploits/webapps/wordpress/wp_royal_elementor_rce_cve_2024_32suspended` | Royal Elementor Addons unauthenticated PHP webshell upload |
 | `exploits/webapps/xwiki/cve_2025_24893_xwiki_rce` | XWiki SolrSearch unauthenticated RCE via Groovy template injection (CVE-2025-24893) |
 | `exploits/webapps/zabbix/zabbix_7_0_0_sql_injection` | Zabbix 7.0.0 time-based SQL injection in API endpoints |
+| `exploits/webapps/zimbra_sqli_auth_bypass_cve_2025_25064` | Zimbra ZCS < 10.0.12 unauthenticated SQL injection via /service/home~ for email metadata extraction (CVE-2025-25064) |
 
 ### Windows
 
@@ -317,7 +409,9 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `scanners/nbns_scanner` | NBNS name queries to UDP 137 for Windows host discovery |
 | `scanners/ping_sweep` | Host discovery via ICMP echo, TCP connect, SYN, and ACK probes with CIDR support |
 | `scanners/port_scanner` | TCP/UDP port scanner with service detection, banner grabbing, and configurable ranges |
+| `scanners/proxy_scanner` | HTTP CONNECT, SOCKS4, SOCKS5, and transparent proxy discovery with authentication detection |
 | `scanners/redis_scanner` | Redis instance discovery and unauthenticated access detection |
+| `scanners/reflect_scanner` | UDP amplification vulnerability scanner for DNS, NTP monlist, SSDP, and Memcached reflectors |
 | `scanners/sample_scanner` | Demonstration scanner checking HTTP/HTTPS reachability and response codes |
 | `scanners/sequential_fuzzer` | Character-based HTTP fuzzer with 10+ encodings, custom charsets, and concurrent requests |
 | `scanners/service_scanner` | Service port banner grabbing and version identification |
@@ -330,6 +424,7 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `scanners/stalkroute_full_traceroute` | Advanced traceroute with ICMP/TCP/UDP probes, OS fingerprint spoofing, and decoy packets |
 | `scanners/subdomain_scanner` | Subdomain brute-force enumeration via DNS resolution |
 | `scanners/vnc_scanner` | VNC protocol version and security type enumeration |
+| `scanners/vuln_checker` | Fingerprint-based vulnerability scanner with detection signatures across all exploit modules |
 | `scanners/waf_detector` | Web Application Firewall and CDN provider detection via HTTP response analysis |
 
 ---
@@ -340,23 +435,33 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 | Module Path | Description |
 |-------------|-------------|
-| `creds/generic/ssh_bruteforce` | SSH password brute force with default credential testing, combo mode, and subnet scanning |
-| `creds/generic/rdp_bruteforce` | RDP auth brute force with NLA, TLS, Standard RDP, and Negotiate security levels |
-| `creds/generic/ftp_bruteforce` | FTP/FTPS brute force with combo mode, concurrent connections, and subnet scanning |
-| `creds/generic/telnet_bruteforce` | Telnet brute force with full IAC negotiation, multiple attack modes, and subnet scanning |
-| `creds/generic/smtp_bruteforce` | SMTP auth brute force supporting PLAIN and LOGIN mechanisms with combo mode |
-| `creds/generic/pop3_bruteforce` | POP3/POP3S brute force with SSL/TLS support, retry logic, and subnet scanning |
-| `creds/generic/mqtt_bruteforce` | MQTT 3.1.1 auth testing with TLS/SSL, anonymous detection, and multiple attack modes |
-| `creds/generic/snmp_bruteforce` | SNMPv1/v2c community string brute force with read/write detection and subnet scanning |
-| `creds/generic/rtsp_bruteforce` | RTSP auth brute force for IP cameras with path bruting and custom headers |
-| `creds/generic/l2tp_bruteforce` | L2TP/IPsec VPN CHAP auth brute force against L2TP concentrators |
+| `creds/generic/couchdb_bruteforce` | CouchDB session cookie and HTTP Basic auth brute force with default credential testing and subnet scanning |
+| `creds/generic/elasticsearch_bruteforce` | Elasticsearch HTTP Basic auth brute force against cluster root and security API with subnet scanning |
+| `creds/generic/enablebruteforce` | Raises file descriptor limits (ulimit) for high-concurrency brute-force operations |
 | `creds/generic/fortinet_bruteforce` | Fortinet FortiGate SSL VPN web auth brute force with certificate pinning and realm support |
 | `creds/generic/ftp_anonymous` | FTP anonymous access check with FTPS, IPv4/IPv6, and mass scanning support |
-| `creds/generic/telnet_hose` | Mass internet Telnet default credential scanner with 500 workers and disk-based state |
-| `creds/generic/ssh_user_enum` | SSH username enumeration via timing-based side-channel attack (CVE-2018-15473 inspired) |
-| `creds/generic/ssh_spray` | SSH password spray across multiple targets with lockout-aware delays |
-| `creds/generic/enablebruteforce` | Raises file descriptor limits (ulimit) for high-concurrency brute-force operations |
+| `creds/generic/ftp_bruteforce` | FTP/FTPS brute force with combo mode, concurrent connections, and subnet scanning |
+| `creds/generic/http_basic_bruteforce` | HTTP Basic Authentication brute force with HTTPS support, default credentials, and subnet scanning |
+| `creds/generic/imap_bruteforce` | IMAP/IMAPS LOGIN command brute force over raw TCP with TLS support and subnet scanning |
+| `creds/generic/l2tp_bruteforce` | L2TP/IPsec VPN CHAP auth brute force against L2TP concentrators |
+| `creds/generic/memcached_bruteforce` | Memcached open instance detection and SASL PLAIN auth brute force over binary protocol |
+| `creds/generic/mqtt_bruteforce` | MQTT 3.1.1 auth testing with TLS/SSL, anonymous detection, and multiple attack modes |
+| `creds/generic/mysql_bruteforce` | MySQL native password wire protocol brute force with HandshakeV10 parsing and subnet scanning |
+| `creds/generic/pop3_bruteforce` | POP3/POP3S brute force with SSL/TLS support, retry logic, and subnet scanning |
+| `creds/generic/postgres_bruteforce` | PostgreSQL protocol v3 brute force supporting cleartext and MD5 auth with subnet scanning |
+| `creds/generic/proxy_bruteforce` | HTTP CONNECT, SOCKS5, and HTTP forward proxy authentication brute force |
+| `creds/generic/rdp_bruteforce` | RDP auth brute force with NLA, TLS, Standard RDP, and Negotiate security levels |
+| `creds/generic/redis_bruteforce` | Redis AUTH brute force supporting legacy and ACL mode with server info gathering on success |
+| `creds/generic/rtsp_bruteforce` | RTSP auth brute force for IP cameras with path bruting and custom headers |
 | `creds/generic/sample_cred_check` | Sample module testing HTTP Basic Auth with default admin:admin credentials |
+| `creds/generic/smtp_bruteforce` | SMTP auth brute force supporting PLAIN and LOGIN mechanisms with combo mode |
+| `creds/generic/snmp_bruteforce` | SNMPv1/v2c community string brute force with read/write detection and subnet scanning |
+| `creds/generic/ssh_bruteforce` | SSH password brute force with default credential testing, combo mode, and subnet scanning |
+| `creds/generic/ssh_spray` | SSH password spray across multiple targets with lockout-aware delays |
+| `creds/generic/ssh_user_enum` | SSH username enumeration via timing-based side-channel attack (CVE-2018-15473 inspired) |
+| `creds/generic/telnet_bruteforce` | Telnet brute force with full IAC negotiation, multiple attack modes, and subnet scanning |
+| `creds/generic/telnet_hose` | Mass internet Telnet default credential scanner with 500 workers and disk-based state |
+| `creds/generic/vnc_bruteforce` | VNC DES challenge-response brute force with bit-reversed key derivation and subnet scanning |
 
 ### Camera
 

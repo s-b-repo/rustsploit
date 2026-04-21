@@ -5,6 +5,8 @@ Rustsploit provides several utility modules that every module developer should k
 | Module | Import Path | Purpose |
 |--------|-------------|---------|
 | **Core Utils** | `crate::utils` | Target normalization, file loading, config-aware prompts, input validation |
+| **Network Utils** | `crate::utils::network` | HTTP client builders, TCP/UDP connect helpers, honeypot check |
+| **Privilege Utils** | `crate::utils::privilege` | Root privilege check for raw-socket modules |
 | **Creds Utils** | `crate::modules::creds::utils` | Bruteforce statistics, subnet helpers, IP exclusion, scan state tracking |
 | **Config** | `crate::config` | Global target state, module config, API prompt keys, results directory |
 | **Global Options** | `crate::global_options` | Persistent `setg` options — checked by `cfg_prompt_*` after custom_prompts |
@@ -616,6 +618,120 @@ std::fs::write(&out_path, results)?;
 | `MAX_COMMAND_LENGTH` | 8192 | Maximum command/input length |
 | `MAX_PATH_LENGTH` | 4096 | Maximum file path length |
 | `MAX_HOSTNAME_LENGTH` | 253 | Maximum hostname length (config.rs) |
+
+---
+
+## `crate::utils::network` — Network Utilities
+
+Import path:
+
+```rust
+use crate::utils::network::{
+    build_http_client, build_http_client_with, HttpClientOpts,
+    tcp_connect_addr, tcp_connect_str, tcp_connect, tcp_port_open,
+    blocking_tcp_connect, udp_bind, quick_honeypot_check,
+};
+```
+
+---
+
+### `build_http_client(timeout) → Result<Client>`
+
+Creates a standard `reqwest::Client` with sensible defaults (danger-accept invalid certs, no redirect limit). Use this instead of hand-rolling `reqwest::Client::builder()`.
+
+```rust
+use crate::utils::network::build_http_client;
+
+let client = build_http_client(Duration::from_secs(10))?;
+let resp = client.get(&url).send().await?;
+```
+
+---
+
+### `build_http_client_with(timeout, opts) → Result<Client>`
+
+Extended HTTP client builder with additional options.
+
+```rust
+use crate::utils::network::{build_http_client_with, HttpClientOpts};
+
+let client = build_http_client_with(Duration::from_secs(10), HttpClientOpts {
+    cookie_store: true,
+    follow_redirects: true,
+    user_agent: Some("Mozilla/5.0".to_string()),
+    ..HttpClientOpts::default()
+})?;
+```
+
+#### `HttpClientOpts` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cookie_store` | `bool` | `false` | Enable cookie jar |
+| `follow_redirects` | `bool` | `false` | Follow HTTP redirects |
+| `user_agent` | `Option<String>` | `None` | Custom User-Agent header |
+| `default_headers` | `Option<HeaderMap>` | `None` | Default headers for all requests |
+
+---
+
+### `tcp_connect_addr(addr, timeout) → io::Result<TcpStream>`
+
+Async TCP connection to a `SocketAddr` with timeout and optional source port binding. Preferred over raw `TcpStream::connect` — respects global source port setting.
+
+```rust
+use crate::utils::network::tcp_connect_addr;
+
+let stream = tcp_connect_addr(addr, Duration::from_secs(5)).await?;
+```
+
+---
+
+### `tcp_connect_str(addr_str, timeout) → io::Result<TcpStream>`
+
+Async TCP connection from a `"host:port"` string. Resolves DNS and connects.
+
+---
+
+### `tcp_port_open(ip, port, timeout) → bool`
+
+Quick async check if a TCP port is open.
+
+---
+
+### `blocking_tcp_connect(addr, timeout) → io::Result<TcpStream>`
+
+Synchronous TCP connection for use in `spawn_blocking` contexts.
+
+---
+
+### `udp_bind(target_ip) → io::Result<UdpSocket>`
+
+Binds a UDP socket to the appropriate address family (IPv4 or IPv6) for the target.
+
+---
+
+### `quick_honeypot_check(ip) → bool`
+
+Fast honeypot detection — probes common ports and returns `true` if 11+ respond (likely honeypot).
+
+---
+
+## `crate::utils::privilege` — Privilege Checks
+
+### `require_root(context) → Result<()>`
+
+Call at the top of `run()` in modules that need raw sockets (ICMP, SYN scan, packet crafting). Returns a clean error message if the current euid is not root.
+
+```rust
+use crate::utils::privilege::require_root;
+
+pub async fn run(target: &str) -> Result<()> {
+    require_root("ICMP raw socket")?;
+    // ... raw socket operations ...
+}
+```
+
+Used by: DoS modules (icmp_flood, syn_ack_flood, null_syn_exhaustion, dns_amplification, etc.), ping_sweep scanner.
 
 ---
 

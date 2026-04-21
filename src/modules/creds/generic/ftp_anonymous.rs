@@ -5,7 +5,7 @@ use suppaftp::async_native_tls::TlsConnector;
 use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
 use tokio::time::{timeout, Duration};
 
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::cfg_prompt_yes_no;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -22,6 +22,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()

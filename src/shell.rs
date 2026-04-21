@@ -1,10 +1,7 @@
-use crate::commands;
-use crate::utils;
-use crate::config;
+use std::io::{self, Write};
+
 use anyhow::{Context, Result};
 use colored::*;
-use std::io::{self, Write};
-use url::Url;
 use ipnetwork::IpNetwork;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -12,6 +9,11 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Config, Editor, Helper};
+use url::Url;
+
+use crate::commands;
+use crate::config;
+use crate::utils;
 
 const MAX_INPUT_LENGTH: usize = 4096;
 const MAX_COMMAND_CHAIN_LENGTH: usize = 10;
@@ -19,14 +21,11 @@ const MAX_URL_LENGTH: usize = 2048;
 
 const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
 
-/// IPv6 prefix threshold for size calculations (prefixes > this use u64 formula, otherwise u64::MAX)
-const IPV6_PREFIX_THRESHOLD: u8 = 64;
-
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
     "help", "modules", "find", "use", "set target", "set subnet",
     "set port", "set source_port",
-    "show_target", "clear_target", "run", "run_all", "back", "exit", "quit",
+    "show_target", "clear_target", "run", "back", "exit", "quit",
     "info", "check", "setg", "unsetg", "show options",
     "creds", "creds add", "creds search", "creds delete", "creds clear",
     "spool", "spool off", "resource", "makerc",
@@ -147,7 +146,9 @@ fn history_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".rustsploit");
     use std::os::unix::fs::DirBuilderExt;
-    let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir);
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) {
+        eprintln!("[!] Failed to create rustsploit config directory {}: {}", dir.display(), e);
+    }
     dir.join("history.txt")
 }
 
@@ -306,7 +307,9 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
 
             let should_break = execute_single_command(&mut ctx, cmd_input).await;
             // Spool the command
-            crate::spool::SPOOL.write_line(&format!("rsf> {}", cmd_input));
+            if let Err(e) = crate::spool::SPOOL.write_line(&format!("rsf> {}", cmd_input)) {
+                eprintln!("[!] Spool write error: {}", e);
+            }
             if should_break {
                 break 'main_loop;
             }
@@ -377,7 +380,13 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     config::GLOBAL_CONFIG.clear_target();
                     println!("{}", "Cleared target.".green());
                 }
-                "help" => render_help(),
+                "help" => {
+                    if rest.is_empty() {
+                        render_help();
+                    } else {
+                        render_help_topic(&rest);
+                    }
+                }
                 "modules" => utils::list_all_modules(),
                 "find" => {
                     if rest.is_empty() {
@@ -622,8 +631,18 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         if key.is_empty() || value.is_empty() {
                             println!("{}", "Usage: setg <key> <value>".yellow());
                         } else {
-                            crate::global_options::GLOBAL_OPTIONS.set(key, value).await;
-                            println!("{}", format!("{} => {}", key.green(), value).to_string());
+                            match (
+                                crate::utils::sanitize::sanitize_string_input(key),
+                                crate::utils::sanitize::sanitize_string_input(value),
+                            ) {
+                                (Ok(skey), Ok(sval)) => {
+                                    crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                    println!("{}", format!("{} => {}", skey.green(), sval));
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    println!("{}", format!("[!] Invalid input: {}", e).red());
+                                }
+                            }
                         }
                     } else {
                         println!("{}", "Usage: setg <key> <value>".yellow());
@@ -654,7 +673,13 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         // Interactive cred add
                         let host = match utils::prompt_required("Host").await { Ok(v) => v, Err(_) => return false };
                         let port_str = match utils::prompt_default("Port", "0").await { Ok(v) => v, Err(_) => return false };
-                        let port: u16 = port_str.parse().unwrap_or(0);
+                        let port: u16 = match port_str.parse() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                println!("{}", format!("[!] Invalid port '{}' (must be 0-65535)", port_str).red());
+                                return false;
+                            }
+                        };
                         let service = match utils::prompt_default("Service", "unknown").await { Ok(v) => v, Err(_) => return false };
                         let username = match utils::prompt_required("Username").await { Ok(v) => v, Err(_) => return false };
                         let secret = match utils::prompt_required("Password/Hash/Key").await { Ok(v) => v, Err(_) => return false };
@@ -665,8 +690,10 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                             "token" => crate::cred_store::CredType::Token,
                             _ => crate::cred_store::CredType::Password,
                         };
-                        let id = crate::cred_store::CRED_STORE.add(&host, port, &service, &username, &secret, cred_type, "manual").await;
-                        println!("{}", format!("[+] Credential stored (ID: {})", id).green());
+                        match crate::cred_store::CRED_STORE.add(&host, port, &service, &username, &secret, cred_type, "manual").await {
+                            Some(id) => println!("{}", format!("[+] Credential stored (ID: {})", id).green()),
+                            None => println!("{}", "[!] Failed to store credential (validation failure)".red()),
+                        }
                     } else if let Some(query) = rest.strip_prefix("search ") {
                         let results = crate::cred_store::CRED_STORE.search(query.trim()).await;
                         crate::cred_store::CRED_STORE.display_results(&results);
@@ -697,9 +724,14 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                             println!("{}", "Spool was not active.".dimmed());
                         }
                     } else {
-                        match crate::spool::SPOOL.start(&rest) {
-                            Ok(()) => println!("{}", format!("[+] Spooling output to '{}'", rest).green()),
-                            Err(e) => println!("{}", format!("[!] Failed to start spool: {}", e).red()),
+                        match crate::utils::sanitize::validate_safe_file_path(&rest) {
+                            Ok(safe_path) => {
+                                match crate::spool::SPOOL.start(&safe_path) {
+                                    Ok(()) => println!("{}", format!("[+] Spooling output to '{}'", safe_path).green()),
+                                    Err(e) => println!("{}", format!("[!] Failed to start spool: {}", e).red()),
+                                }
+                            }
+                            Err(e) => println!("{}", format!("[!] Invalid spool path: {}", e).red()),
                         }
                     }
                 }
@@ -721,15 +753,20 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     if rest.is_empty() {
                         println!("{}", "Usage: makerc <output_file>".yellow());
                     } else {
-                        let hist_path = history_path();
-                        match std::fs::read_to_string(&hist_path) {
-                            Ok(contents) => {
-                                match std::fs::write(&rest, &contents) {
-                                    Ok(_) => println!("{}", format!("[+] Command history saved to '{}'", rest).green()),
-                                    Err(e) => println!("{}", format!("[!] Failed to write: {}", e).red()),
+                        match crate::utils::sanitize::validate_safe_file_path(&rest) {
+                            Ok(safe_path) => {
+                                let hist_path = history_path();
+                                match std::fs::read_to_string(&hist_path) {
+                                    Ok(contents) => {
+                                        match std::fs::write(&safe_path, &contents) {
+                                            Ok(_) => println!("{}", format!("[+] Command history saved to '{}'", safe_path).green()),
+                                            Err(e) => println!("{}", format!("[!] Failed to write: {}", e).red()),
+                                        }
+                                    }
+                                    Err(e) => println!("{}", format!("[!] Failed to read history: {}", e).red()),
                                 }
                             }
-                            Err(e) => println!("{}", format!("[!] Failed to read history: {}", e).red()),
+                            Err(e) => println!("{}", format!("[!] Invalid output path: {}", e).red()),
                         }
                     }
                 }
@@ -744,6 +781,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         let ip = ip.trim();
                         if ip.is_empty() {
                             println!("{}", "Usage: hosts add <ip>".yellow());
+                        } else if let Err(e) = sanitize_target(ip) {
+                            println!("{}", format!("[!] Invalid host: {}", e).red());
                         } else {
                             crate::workspace::WORKSPACE.add_host(ip, None, None).await;
                             println!("{}", format!("[+] Host '{}' added to workspace.", ip).green());
@@ -769,8 +808,18 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         crate::workspace::WORKSPACE.display_services().await;
                     } else if rest == "add" {
                         let host = match utils::prompt_required("Host IP").await { Ok(v) => v, Err(_) => return false };
+                        if let Err(e) = sanitize_target(&host) {
+                            println!("{}", format!("[!] Invalid host: {}", e).red());
+                            return false;
+                        }
                         let port_str = match utils::prompt_required("Port").await { Ok(v) => v, Err(_) => return false };
-                        let port: u16 = port_str.parse().unwrap_or(0);
+                        let port: u16 = match port_str.parse() {
+                            Ok(p) if p > 0 => p,
+                            _ => {
+                                println!("{}", "[!] Invalid port. Must be 1-65535.".yellow());
+                                return false;
+                            }
+                        };
                         let proto = match utils::prompt_default("Protocol", "tcp").await { Ok(v) => v, Err(_) => return false };
                         let svc = match utils::prompt_required("Service name").await { Ok(v) => v, Err(_) => return false };
                         let ver = match utils::prompt_default("Version", "").await { Ok(v) => v, Err(_) => return false };
@@ -829,7 +878,9 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         println!();
                     } else {
                         let name = rest.trim();
-                        if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                        if name.is_empty() || name.len() > 64 {
+                            println!("{}", "Workspace name must be 1-64 characters.".red());
+                        } else if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
                             crate::workspace::WORKSPACE.switch(name).await;
                             println!("{}", format!("[+] Switched to workspace '{}'", name).green());
                         } else {
@@ -886,8 +937,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 "export" => {
                     if let Some((fmt, path)) = rest.split_once(char::is_whitespace) {
                         let path = path.trim();
-                        if path.is_empty() || path.contains("..") {
-                            println!("{}", "Invalid file path.".red());
+                        if let Err(e) = crate::export::validate_export_path(path) {
+                            println!("{}", format!("[!] {}", e).red());
                         } else {
                             match fmt.trim() {
                                 "json" => {
@@ -1007,16 +1058,22 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
 
                         if let Some(ref t) = target {
                             if background {
-                                // Run as background job
-                                let job_id = crate::jobs::JOB_MANAGER.spawn(
+                                match crate::jobs::JOB_MANAGER.spawn(
                                     module_path.clone(),
                                     t.clone(),
                                     ctx.verbose,
-                                );
-                                println!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
+                                    None,
+                                ) {
+                                    Ok((job_id, _progress)) => {
+                                        println!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("{}", format!("[!] Failed to start job: {}", e).red());
+                                    }
+                                }
                             } else {
                                 // Normal foreground execution
-                                let is_mass_scan = crate::modules::creds::utils::is_mass_scan_target(t);
+                                let is_mass_scan = crate::utils::is_mass_scan_target(t);
 
                                 // Honeypot detection — enabled by default, disable with: setg honeypot_detection n
                                 let honeypot_on = crate::global_options::GLOBAL_OPTIONS
@@ -1059,71 +1116,6 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         println!("{}", "No module selected. Use 'use <module>' first.".yellow());
                     }
                 }
-                "run_all" => {
-                    if let Some(ref module_path) = ctx.current_module {
-                        if !config::GLOBAL_CONFIG.has_target() {
-                            println!("{}", "No global target set. Use 'set target <ip/subnet>' first.".yellow());
-                        } else if !config::GLOBAL_CONFIG.is_subnet() {
-                            println!("{}", "Global target is not a subnet. Use 'run' for single targets.".yellow());
-                        } else {
-                            match config::GLOBAL_CONFIG.get_target_subnet() {
-                                Some(subnet) => {
-                                    let total_size = match subnet {
-                                        IpNetwork::V4(net) => 2u64.pow(32 - net.prefix() as u32),
-                                        IpNetwork::V6(net) => {
-                                             let prefix = net.prefix();
-                                             if prefix > IPV6_PREFIX_THRESHOLD { 2u64.pow(128 - prefix as u32) } else { u64::MAX }
-                                        }
-                                    };
-
-                                    println!("{}", format!("[*] Running module '{}' against subnet {}", module_path, subnet).cyan().bold());
-                                    if total_size > 1000000 {
-                                         println!("{}", format!("[!] Warning: Subnet is very large (~{} IPs). This will take a long time.", total_size).yellow());
-                                    }
-
-                                    let mut success_count = 0;
-                                    let mut fail_count = 0;
-                                    let mut idx = 0u64;
-
-                                    let hp_on = crate::global_options::GLOBAL_OPTIONS
-                                        .try_get("honeypot_detection")
-                                        .map(|v| !matches!(v.to_lowercase().as_str(), "n"|"no"|"false"|"0"|"off"|"disabled"))
-                                        .unwrap_or(true);
-
-                                    for ip in subnet.iter() {
-                                        idx += 1;
-                                        let ip_str = ip.to_string();
-                                        println!("\n{}", format!("[{}/{}] Running against: {}", idx, total_size, ip_str).yellow());
-
-                                        if hp_on && crate::utils::network::quick_honeypot_check(&ip_str).await {
-                                            println!("{}", format!("[!] {} — honeypot detected, skipping", ip_str).red());
-                                            fail_count += 1;
-                                            continue;
-                                        }
-
-                                        match commands::run_module(module_path, &ip_str, ctx.verbose).await {
-                                            Ok(_) => success_count += 1,
-                                            Err(e) => {
-                                                eprintln!("[!] Module failed: {:?}", e);
-                                                fail_count += 1;
-                                            }
-                                        }
-                                    }
-
-                                    println!("\n{}", "=== Run All Summary ===".cyan().bold());
-                                    println!("{}", format!("Total IPs: {}", total_size).green());
-                                    println!("{}", format!("Successful: {}", success_count).green());
-                                    println!("{}", format!("Failed: {}", fail_count).red());
-                                }
-                                None => {
-                                     println!("{}", "[!] Error retrieving subnet configuration.".red());
-                                }
-                            }
-                        }
-                    } else {
-                        println!("{}", "No module selected. Use 'use <module>' first.".yellow());
-                    }
-                }
                 _ => {
                     println!("{}", format!("Unknown command: '{}'. Type 'help' or '?' for usage.", cmd_input).red());
                 }
@@ -1148,7 +1140,14 @@ fn execute_resource_file_inner<'a>(ctx: &'a mut ShellContext, path: &'a str, dep
             println!("{}", format!("[!] Resource script nesting too deep (max {}). Aborting to prevent infinite recursion.", MAX_RESOURCE_DEPTH).red());
             return;
         }
-        match std::fs::read_to_string(path) {
+        let safe_path = match crate::utils::sanitize::validate_safe_file_path(path) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("{}", format!("[!] Invalid resource file path: {}", e).red());
+                return;
+            }
+        };
+        match std::fs::read_to_string(&safe_path) {
             Ok(contents) => {
                 let mut count = 0;
                 for line in contents.lines() {
@@ -1187,8 +1186,7 @@ pub fn resolve_command(cmd: &str) -> String {
         "subnet" | "sn" => "set_subnet",
         "show_target" | "showtarget" | "st" => "show_target",
         "clear_target" | "cleartarget" | "ct" => "clear_target",
-        "run" | "go" | "exec" => "run",
-        "run_all" | "runall" | "ra" => "run_all",
+        "run" | "go" | "exec" | "ra" => "run",
         "back" | "b" | "clear" | "reset" => "back",
         "exit" | "quit" | "q" => "exit",
 
@@ -1278,9 +1276,8 @@ fn render_help() {
     // --- Execution ---
     println!("  {}", "Execution".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "run".green(), "go".dimmed(), "Execute the selected module");
+    println!("    {:<20} {:<24} {}", "run".green(), "go, ra".dimmed(), "Execute the selected module");
     println!("    {:<20} {:<24} {}", "run -j".green(), "".dimmed(), "Run module as background job");
-    println!("    {:<20} {:<24} {}", "run_all".green(), "ra".dimmed(), "Run module against all IPs in subnet");
     println!("    {:<20} {:<24} {}", "check".green(), "ch".dimmed(), "Non-destructive vulnerability check");
     println!();
 
@@ -1334,6 +1331,10 @@ fn render_help() {
     println!("{}", "┌──────────────────────────────────────────────────────────────────────────┐".dimmed());
     println!("{}", "│  Tips                                                                    │".dimmed());
     println!("{}",  "├──────────────────────────────────────────────────────────────────────────┤".dimmed());
+    println!("  {} Type {} for a man-style page with examples (e.g. {}).",
+        ">>".dimmed(),
+        "help <command>".cyan().bold(),
+        "help run".cyan());
     println!("  {} Chain commands with {}: {}",
         ">>".dimmed(),
         "&".cyan().bold(),
@@ -1347,6 +1348,463 @@ fn render_help() {
         MAX_COMMAND_CHAIN_LENGTH);
     println!("{}", "└──────────────────────────────────────────────────────────────────────────┘".dimmed());
     println!();
+    println!("  {} {}", "Topics:".bold(), "use info run check set setg target mass-scan jobs creds hosts services loot workspace resource spool export".dimmed());
+    println!();
+}
+
+/// man-style manual page for a single topic.
+fn render_help_topic(topic: &str) {
+    let key = topic.trim().to_lowercase();
+    let key = key.as_str();
+
+    let canonical: &str = match key {
+        "?" | "help" | "h" => "help",
+        "u" => "use",
+        "i" => "info",
+        "ls" | "list" | "m" => "modules",
+        "f" | "f1" | "search" => "find",
+        "t" | "target" | "set_target" | "settarget" => "target",
+        "sn" => "subnet",
+        "st" | "show_target" => "show_target",
+        "ct" | "clear_target" => "clear_target",
+        "go" | "exec" => "run",
+        "ra" => "run",
+        "ch" => "check",
+        "sg" => "setg",
+        "ug" => "unsetg",
+        "so" | "show_options" | "showoptions" => "show_options",
+        "svcs" => "services",
+        "ws" => "workspace",
+        "rc" => "resource",
+        "j" => "jobs",
+        "b" | "clear" | "reset" => "back",
+        "mass" | "massscan" | "mass_scan" => "mass-scan",
+        other => other,
+    };
+
+    match canonical {
+        "use" => man_page(
+            "use",
+            "Select a module to work with.",
+            &["use <category>/<path>", "use <short_name>   # fuzzy-match on final segment"],
+            "Loads the named module into the shell. The prompt changes to show the selected module. \
+             Subsequent `run`, `check`, and `info` commands target it. Use `back` to deselect.",
+            &[
+                ("use scanners/proxy_scanner",           "Load the open-proxy scanner"),
+                ("use proxy_scanner",                    "Same thing — short-name fuzzy match"),
+                ("u exploits/dos/slowloris",             "Alias `u` works identically"),
+            ],
+            &["info", "modules", "find", "back", "run"],
+        ),
+        "info" => man_page(
+            "info",
+            "Print module metadata: description, CVE references, author, rank, disclosure date.",
+            &["info [<path>]"],
+            "With no argument, shows info for the currently-selected module. With a path, shows info \
+             for that module without selecting it.",
+            &[
+                ("info",                                  "Info for the current module"),
+                ("info exploits/dos/slowloris",           "Look up a module without loading it"),
+                ("i scanners/reflect_scanner",           "Alias `i`"),
+            ],
+            &["use", "modules", "find"],
+        ),
+        "modules" => man_page(
+            "modules",
+            "List every available module, grouped by category.",
+            &["modules"],
+            "Walks the full module registry and prints each one under its category heading \
+             (scanners, exploits, creds, plugins).",
+            &[
+                ("modules",                               "List everything"),
+                ("ls",                                    "Alias"),
+            ],
+            &["find", "use", "info"],
+        ),
+        "find" => man_page(
+            "find",
+            "Search the module registry by keyword.",
+            &["find <keyword>"],
+            "Case-insensitive substring match against module path, name, and description.",
+            &[
+                ("find ssh",                              "Everything mentioning ssh"),
+                ("f cve-2024",                            "CVE search"),
+                ("search proxy",                          "Alias `search`"),
+            ],
+            &["modules", "use"],
+        ),
+        "target" => man_page(
+            "target",
+            "Set the global scan target. Accepts a single IP, a hostname, a CIDR subnet, a comma-separated list, a file of targets, or a mass-scan keyword.",
+            &[
+                "set target <value>",
+                "t <value>                  # alias",
+                "target <value>             # alias",
+            ],
+            "The target persists across modules. Use `show_target` to view, `clear_target` to reset. \
+             Special values trigger mass-scan mode: `random` / `0.0.0.0` / `0.0.0.0/0` scan random \
+             public IPs; a CIDR scans the subnet; a file path reads one target per line.",
+            &[
+                ("t 10.0.0.5",                            "Single host"),
+                ("t example.com",                         "Hostname (resolved before probing)"),
+                ("t 10.0.0.0/24",                         "CIDR — fans out across the subnet"),
+                ("t 10.0.0.1,10.0.0.2,10.0.0.3",          "Comma-separated list"),
+                ("t targets.txt",                         "One target per line from a file"),
+                ("t 0.0.0.0/0",                           "Internet-wide random-IP mass scan"),
+                ("t random",                              "Same as 0.0.0.0/0"),
+            ],
+            &["show_target", "clear_target", "subnet", "mass-scan", "run"],
+        ),
+        "subnet" => man_page(
+            "subnet",
+            "Shortcut to set the target to a CIDR subnet.",
+            &["set subnet <CIDR>", "sn <CIDR>"],
+            "Equivalent to `set target <CIDR>` but validates that the argument parses as a CIDR network.",
+            &[
+                ("sn 192.168.1.0/24",                     "Scan a /24"),
+                ("set subnet 2001:db8::/48",              "IPv6 subnet"),
+            ],
+            &["target", "mass-scan", "run"],
+        ),
+        "show_target" => man_page(
+            "show_target",
+            "Print the current target and port settings.",
+            &["show_target", "st"],
+            "Shows what `run` will use. Also displays the global `port` and `source_port` values if set.",
+            &[("st", "Quick check")],
+            &["target", "clear_target"],
+        ),
+        "clear_target" => man_page(
+            "clear_target",
+            "Forget the current target.",
+            &["clear_target", "ct"],
+            "After clearing, `run` will require an explicit target or a module-specific prompt.",
+            &[("ct", "Reset")],
+            &["target"],
+        ),
+        "run" => man_page(
+            "run",
+            "Execute the selected module against the current target.",
+            &[
+                "run",
+                "run -j                     # run as background job",
+                "go                         # alias",
+            ],
+            "The framework dispatches the target to the module's `run()`. CIDR / file / random \
+             targets are automatically fanned out across `concurrency` workers. Every task runs under \
+             a shared prompt cache (you answer each prompt once) and a per-task `module_timeout` \
+             (default 60s) so a hung host cannot stall the scan.",
+            &[
+                ("run",                                    "Run foreground"),
+                ("run -j",                                 "Run as background job; see `jobs`"),
+                ("setg concurrency 200 & run",             "Raise parallelism for the next run"),
+                ("setg module_timeout 30 & run",           "Cap per-host time at 30s"),
+            ],
+            &["check", "mass-scan", "jobs", "setg"],
+        ),
+        "check" => man_page(
+            "check",
+            "Run a non-destructive vulnerability check for the selected module.",
+            &["check", "ch"],
+            "Only modules that define a `check()` entry point support this. Output categorizes each \
+             target as Vulnerable, NotVulnerable, Unknown, or Error. Safe for production networks.",
+            &[
+                ("use exploits/frameworks/wsus/cve_2025_59287_wsus_rce & t 10.0.0.5 & ch", "Confirm before exploiting"),
+            ],
+            &["run", "info"],
+        ),
+        "setg" => man_page(
+            "setg",
+            "Set a global option (persists across modules and across shell sessions).",
+            &["setg <key> <value>", "sg <key> <value>"],
+            "Values are stored in ~/.rustsploit/global_options.json. They are consulted by every \
+             module prompt (cfg_prompt_*) after per-run `custom_prompts` but before interactive stdin. \
+             Useful keys: `concurrency`, `max_random_hosts`, `module_timeout`, `honeypot_detection`, \
+             `source_port`, `port`, `ports`, `wordlist`, `timeout`.",
+            &[
+                ("setg concurrency 200",                  "Run 200 tasks in parallel"),
+                ("setg max_random_hosts 100000",          "Scan up to 100k random IPs"),
+                ("setg module_timeout 30",                "Per-task timeout (seconds)"),
+                ("setg honeypot_detection n",             "Disable the pre-scan honeypot check"),
+                ("setg source_port 53",                   "Bind TCP connections to port 53"),
+                ("setg wordlist /usr/share/wordlists/rockyou.txt", "Default wordlist for brute-force modules"),
+            ],
+            &["unsetg", "show_options", "mass-scan"],
+        ),
+        "unsetg" => man_page(
+            "unsetg",
+            "Remove a global option.",
+            &["unsetg <key>", "ug <key>"],
+            "Deletes the key from ~/.rustsploit/global_options.json.",
+            &[("ug concurrency", "Revert to default concurrency (50)")],
+            &["setg", "show_options"],
+        ),
+        "show_options" => man_page(
+            "show_options",
+            "Display every global option currently set.",
+            &["show options", "show_options", "so"],
+            "Prints key/value pairs from ~/.rustsploit/global_options.json.",
+            &[("so", "Quick look")],
+            &["setg", "unsetg"],
+        ),
+        "mass-scan" => man_page(
+            "mass-scan",
+            "How mass-scan mode works and how to tune it.",
+            &[
+                "set target 0.0.0.0/0       # internet-wide random IPs",
+                "set target random          # same",
+                "set target 10.0.0.0/16     # full subnet",
+                "set target targets.txt     # one IP or host per line",
+            ],
+            "When the target is `random`, `0.0.0.0[/0]`, a CIDR, or a readable file path, the \
+             framework enters batch mode: it enables a shared prompt cache (first task prompts, the \
+             rest read the cached answer), suppresses banners / per-host verbose output, and fans \
+             the module out across `concurrency` async tasks. Each task runs under a per-IP \
+             `module_timeout` — a slow or hung host cannot starve the scan. Honeypot IPs are skipped \
+             unless disabled. Hit lines (`[+] host:port ...`) still print; noise does not.",
+            &[
+                ("setg concurrency 200 & t 0.0.0.0/0 & use scanners/proxy_scanner & run", "Mass-scan proxies with 200 workers"),
+                ("setg max_random_hosts 50000 & t random & use scanners/reflect_scanner & run", "Sample 50k random public IPs for UDP amplifiers"),
+                ("t 10.0.0.0/16 & use scanners/ssh_scanner & ra", "Full /16 subnet sweep"),
+                ("setg module_timeout 20 & t targets.txt & use creds/generic/ssh_bruteforce & run", "File-based list with aggressive 20s per-host timeout"),
+                ("setg honeypot_detection n",             "Skip the pre-scan honeypot probe (faster, noisier)"),
+            ],
+            &["target", "setg", "run", "jobs"],
+        ),
+        "jobs" => man_page(
+            "jobs",
+            "Manage background module runs (started with `run -j`).",
+            &[
+                "jobs",
+                "jobs -k <id>",
+                "jobs clean",
+            ],
+            "Lists running/completed jobs with their id, module, target, and status. `-k <id>` \
+             terminates a running job. `clean` drops finished ones from the table.",
+            &[
+                ("t 10.0.0.0/24 & use scanners/ping_sweep & run -j", "Kick off a background subnet sweep"),
+                ("j",                                     "List jobs"),
+                ("jobs -k 3",                             "Kill job 3"),
+                ("jobs clean",                            "Tidy up"),
+            ],
+            &["run"],
+        ),
+        "creds" => man_page(
+            "creds",
+            "Manage captured credentials in the workspace.",
+            &[
+                "creds",
+                "creds add",
+                "creds search <query>",
+            ],
+            "Credentials collected by brute-force and auth-bypass modules land here automatically. \
+             Data lives in the active workspace (see `workspace`).",
+            &[
+                ("creds",                                 "List everything"),
+                ("creds add",                             "Add one interactively"),
+                ("creds search admin",                    "Find creds whose user/pass/service matches"),
+            ],
+            &["workspace", "export"],
+        ),
+        "hosts" => man_page(
+            "hosts",
+            "Manage tracked hosts in the workspace.",
+            &["hosts", "hosts add <ip>"],
+            "Automatically populated by scanner modules; you can also add entries manually.",
+            &[
+                ("hosts",                                 "List hosts"),
+                ("hosts add 10.0.0.5",                    "Track a host manually"),
+            ],
+            &["services", "notes", "workspace"],
+        ),
+        "services" => man_page(
+            "services",
+            "List services (ip, port, proto, banner) tracked in the workspace.",
+            &["services", "svcs"],
+            "Populated by port/service scanners. Filterable by column in interactive tables.",
+            &[("svcs", "List services")],
+            &["hosts", "workspace"],
+        ),
+        "notes" => man_page(
+            "notes",
+            "Attach a free-text note to a host.",
+            &["notes <ip> <text>"],
+            "Notes show up alongside the host in `hosts` and in JSON/CSV exports.",
+            &[("notes 10.0.0.5 owned via cve-2024-12345", "Record the finding")],
+            &["hosts", "export"],
+        ),
+        "loot" => man_page(
+            "loot",
+            "List collected loot (file contents dumped from exploits).",
+            &["loot"],
+            "Loot is populated by modules that extract data (LFI, file-read, exfil). Each entry \
+             records source IP, path, mime type, and captured bytes.",
+            &[("loot", "Browse")],
+            &["export"],
+        ),
+        "workspace" => man_page(
+            "workspace",
+            "Show or switch the active workspace.",
+            &["workspace", "workspace <name>", "ws"],
+            "Each workspace has its own hosts/services/creds/loot store under ~/.rustsploit/workspaces.",
+            &[
+                ("ws",                                    "Show current"),
+                ("workspace acme",                        "Switch to workspace 'acme' (created if absent)"),
+            ],
+            &["creds", "hosts", "export"],
+        ),
+        "resource" => man_page(
+            "resource",
+            "Execute commands from a resource-script file (one command per line).",
+            &["resource <file>", "rc <file>"],
+            "Behaves as if you typed each line at the prompt. Lines starting with `#` are comments. \
+             Use `makerc` to capture history into a new file.",
+            &[
+                ("rc scans/proxy_sweep.rc",               "Replay a recorded session"),
+                ("makerc last_run.rc",                    "Save recent history"),
+            ],
+            &["makerc", "spool"],
+        ),
+        "makerc" => man_page(
+            "makerc",
+            "Save command history into a resource-script file.",
+            &["makerc <file>"],
+            "Pairs with `resource` to replay sessions.",
+            &[("makerc recon.rc", "Snapshot current session")],
+            &["resource"],
+        ),
+        "spool" => man_page(
+            "spool",
+            "Log all console output to a file.",
+            &["spool <file>", "spool off"],
+            "Writes a tee of everything the shell prints until you run `spool off`.",
+            &[
+                ("spool session.log",                     "Start spooling"),
+                ("spool off",                             "Stop"),
+            ],
+            &["export"],
+        ),
+        "export" => man_page(
+            "export",
+            "Export the current workspace (hosts, services, creds, loot, notes) to a file.",
+            &[
+                "export json <file>",
+                "export csv <file>",
+                "export summary <file>",
+            ],
+            "`json` is machine-readable; `csv` is per-table; `summary` is a human report.",
+            &[
+                ("export json report.json",               "Full machine-readable dump"),
+                ("export csv findings.csv",               "Flat CSV for spreadsheets"),
+                ("export summary report.md",              "Human-readable markdown report"),
+            ],
+            &["creds", "hosts", "services", "loot", "workspace"],
+        ),
+        "back" => man_page(
+            "back",
+            "Deselect the current module (and optionally clear the target).",
+            &["back", "b", "clear", "reset"],
+            "Returns to the top-level prompt. The last-used target is preserved unless you use \
+             `clear_target`.",
+            &[("b", "Drop back to the root prompt")],
+            &["use", "clear_target"],
+        ),
+        "exit" => man_page(
+            "exit",
+            "Leave the rsf shell.",
+            &["exit", "quit", "q"],
+            "Active background jobs are cancelled; workspace data is persisted.",
+            &[("q", "Fastest way out")],
+            &[],
+        ),
+        "help" => man_page(
+            "help",
+            "Show command help. With no argument prints the full command list; with a topic prints a man-style page with examples.",
+            &["help", "help <topic>", "? <topic>"],
+            "Topics mirror command names and their aliases, plus the meta-topic `mass-scan`.",
+            &[
+                ("help",                                   "Full command reference"),
+                ("help run",                               "Man page for `run`"),
+                ("help mass-scan",                         "How mass-scan mode works"),
+                ("? setg",                                 "Alias"),
+            ],
+            &["mass-scan", "setg", "run"],
+        ),
+        _ => {
+            println!();
+            println!("{}", format!("No help topic '{}'.", topic).yellow());
+            println!();
+            println!("{} {}",
+                "Available topics:".bold(),
+                "use info modules find target subnet show_target clear_target run check setg unsetg show_options mass-scan jobs creds hosts services notes loot workspace resource makerc spool export back exit help".dimmed());
+            println!();
+        }
+    }
+}
+
+/// Format a man-style manual page: NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / SEE ALSO.
+fn man_page(
+    name: &str,
+    tagline: &str,
+    synopsis: &[&str],
+    description: &str,
+    examples: &[(&str, &str)],
+    see_also: &[&str],
+) {
+    println!();
+    println!("{}", format!("{}(1)                                                        RustSploit Manual", name.to_uppercase()).dimmed());
+    println!();
+    println!("{}", "NAME".bold());
+    println!("    {} — {}", name.green().bold(), tagline);
+    println!();
+    println!("{}", "SYNOPSIS".bold());
+    for line in synopsis {
+        println!("    {}", line.cyan());
+    }
+    println!();
+    println!("{}", "DESCRIPTION".bold());
+    for line in wrap_paragraph(description, 74) {
+        println!("    {}", line);
+    }
+    println!();
+    if !examples.is_empty() {
+        println!("{}", "EXAMPLES".bold());
+        for (cmd, note) in examples {
+            println!("    {}", format!("rsf> {}", cmd).cyan().bold());
+            println!("        {}", note.dimmed());
+            println!();
+        }
+    }
+    if !see_also.is_empty() {
+        println!("{}", "SEE ALSO".bold());
+        let list = see_also.iter()
+            .map(|s| format!("help {}", s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("    {}", list.dimmed());
+        println!();
+    }
+}
+
+/// Wrap a paragraph to `width` columns on whitespace boundaries.
+fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.len() + 1 + word.len() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut line));
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 

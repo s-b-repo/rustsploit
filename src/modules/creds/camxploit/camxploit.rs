@@ -3,7 +3,7 @@ use colored::*;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use base64::prelude::*;
-use crate::modules::creds::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count, EXCLUDED_RANGES};
+use crate::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count, EXCLUDED_RANGES};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
@@ -169,7 +169,11 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
     }
     let target = target.trim().to_string();
-    print_banner();
+    if !crate::utils::is_batch_mode() {
+        if !crate::utils::is_batch_mode() {
+            print_banner();
+        }
+    }
 
     // Subnet handling — iterate over each IP in the CIDR
     if is_subnet_target(&target) {
@@ -231,11 +235,14 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    crate::mprintln!("{}", "\n╔══════════════════════════════════════════════════════════════╗".green().bold());
-    crate::mprintln!("{}", "║  💀 CamXploit Rust Port - Camera Exploitation Scanner      ║".green().bold());
-    crate::mprintln!("{}", "║  🔍 Discover open CCTV cameras & security flaws            ║".cyan().bold());
-    crate::mprintln!("{}", "║  ⚠️  For educational & security research purposes only!    ║".yellow().bold());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".green().bold());
+    if crate::utils::is_batch_mode() { return; }
+    crate::mprintln_block!(
+        format!("{}", "\n╔══════════════════════════════════════════════════════════════╗".green().bold()),
+        format!("{}", "║  💀 CamXploit Rust Port - Camera Exploitation Scanner      ║".green().bold()),
+        format!("{}", "║  🔍 Discover open CCTV cameras & security flaws            ║".cyan().bold()),
+        format!("{}", "║  ⚠️  For educational & security research purposes only!    ║".yellow().bold()),
+        format!("{}", "╚══════════════════════════════════════════════════════════════╝".green().bold())
+    );
 }
 
 fn create_client() -> Result<Client> {

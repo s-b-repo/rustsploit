@@ -19,7 +19,7 @@ cargo clippy
 cargo check
 ```
 
-A clean `cargo check` with **0 errors and 0 warnings** is required. The current codebase (all 181 modules) passes this check cleanly.
+A clean `cargo check` with **0 errors and 0 warnings** is required. The current codebase (all 240 modules) passes this check cleanly.
 
 ---
 
@@ -29,7 +29,7 @@ A clean `cargo check` with **0 errors and 0 warnings** is required. The current 
 cargo build
 ```
 
-`build.rs` regenerates the dispatchers (`exploit_dispatch.rs`, `scanner_dispatch.rs`, `creds_dispatch.rs`, `plugins_dispatch.rs`, `module_registry.rs`) into `OUT_DIR` during compilation. All 181 modules (137 exploits, 24 scanners, 19 creds, 1 plugin) are auto-discovered and dispatched by `build.rs`. If a new module fails to register, ensure `pub mod your_module;` is present in the sibling `mod.rs`.
+`build.rs` regenerates the dispatchers (`exploit_dispatch.rs`, `scanner_dispatch.rs`, `creds_dispatch.rs`, `plugins_dispatch.rs`, `module_registry.rs`) into `OUT_DIR` during compilation. All 240 modules (183 exploits, 27 scanners, 29 creds, 1 plugin) are auto-discovered and dispatched by `build.rs`. If a new module fails to register, ensure `pub mod your_module;` is present in the sibling `mod.rs`.
 
 ---
 
@@ -48,7 +48,7 @@ go                    # Runs the sample scanner against localhost
 
 ### CLI
 ```bash
-cargo run -- --command scanner --module sample_scanner --target 127.0.0.1
+cargo run -- -m scanners/sample_scanner -t 127.0.0.1
 cargo run -- --list-modules   # Verify your module is listed
 ```
 
@@ -57,8 +57,8 @@ cargo run -- --list-modules   # Verify your module is listed
 # Start the server
 cargo run -- --api
 
-# Check your module appears
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/modules | grep your_module
+# Verify server starts (module listing requires PQ WebSocket session)
+curl http://localhost:8080/health
 ```
 
 ---
@@ -127,18 +127,10 @@ export json /tmp/test.json      # Should create JSON file
 ```
 
 ```bash
-# API smoke test
+# API smoke test — verify server starts and health endpoint responds
 cargo run -- --api
-
-# New endpoints
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/options
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/creds
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/hosts
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/services
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/workspace
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/loot
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/jobs
-curl -H "Authorization: Bearer test-key" http://localhost:8080/api/export?format=json
+curl http://localhost:8080/health
+# All other endpoints require a PQ WebSocket session — see API-Server.md
 ```
 
 ---

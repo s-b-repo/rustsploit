@@ -9,10 +9,11 @@
 // never stall the tokio runtime (background jobs, API server, etc.
 // continue to make progress while the user is typing).
 
-use anyhow::{Result, anyhow, Context};
-use colored::*;
 use std::io::Write;
 use std::path::Path;
+
+use anyhow::{Context, Result, anyhow};
+use colored::*;
 
 use super::sanitize::{sanitize_string_input, validate_safe_file_path};
 
@@ -124,6 +125,58 @@ pub async fn prompt_wordlist(msg: &str) -> Result<String> {
 }
 
 // ============================================================
+// SHARED PROMPT CACHE (MASS SCAN / CIDR)
+// ============================================================
+
+/// Check the shared prompt cache (active in mass scan / CIDR / file modes).
+///
+/// When a prompt cache is active, the first task to request a given key will
+/// run `fallback` (typically the interactive prompt) while holding the cache
+/// lock, serializing access so only ONE prompt appears per key. All subsequent
+/// tasks receive the cached answer instantly.
+///
+/// Returns `None` if no prompt cache is active (single-target / normal mode).
+async fn cached_prompt<F, Fut>(key: &str, fallback: F) -> Option<Result<String>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    // Global batch cache — works even when task-locals don't propagate
+    if crate::context::is_batch_active() {
+        let cache = crate::context::batch_cache();
+        let mut guard = cache.lock().await;
+        let batch_gen = crate::context::batch_generation();
+        if crate::context::cache_generation() != batch_gen {
+            guard.clear();
+            crate::context::set_cache_generation(batch_gen);
+        }
+        if let Some(val) = guard.get(key) {
+            return Some(Ok(val.clone()));
+        }
+        let result = fallback().await;
+        if let Ok(ref val) = result {
+            crate::context::cache_insert(&mut guard, key.to_string(), val.clone());
+        }
+        return Some(result);
+    }
+
+    // Task-local prompt cache
+    let cache = crate::context::RUN_CONTEXT
+        .try_with(|ctx| ctx.prompt_cache.clone())
+        .ok()
+        .flatten()?;
+    let mut guard = cache.lock().await;
+    if let Some(val) = guard.get(key) {
+        return Some(Ok(val.clone()));
+    }
+    let result = fallback().await;
+    if let Ok(ref val) = result {
+        crate::context::cache_insert(&mut guard, key.to_string(), val.clone());
+    }
+    Some(result)
+}
+
+// ============================================================
 // CONFIG-AWARE PROMPT WRAPPERS
 // ============================================================
 
@@ -159,6 +212,13 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
     if config.api_mode {
         return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
     }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        prompt_required(&msg_owned).await
+    }).await {
+        return result;
+    }
     prompt_required(msg).await
 }
 
@@ -181,6 +241,14 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
     }
     if config.api_mode {
         return Ok(default.to_string());
+    }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    let default_owned = default.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        prompt_default(&msg_owned, &default_owned).await
+    }).await {
+        return result;
     }
     prompt_default(msg, default).await
 }
@@ -214,6 +282,14 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
     }
     if config.api_mode {
         return Ok(default_yes);
+    }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        let val = prompt_yes_no(&msg_owned, default_yes).await?;
+        Ok(if val { "y".to_string() } else { "n".to_string() })
+    }).await {
+        return result.map(|v| v == "y");
     }
     prompt_yes_no(msg, default_yes).await
 }
@@ -251,6 +327,15 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
     if config.api_mode {
         return Ok(default);
     }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        let val = prompt_port(&msg_owned, default).await?;
+        Ok(val.to_string())
+    }).await {
+        let val = result?;
+        return val.parse::<u16>().map_err(|_| anyhow!("Invalid cached port value for '{}'", key));
+    }
     prompt_port(msg, default).await
 }
 
@@ -280,6 +365,13 @@ pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
     }
     if config.api_mode {
         return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply a valid file path in the 'prompts' field.", key, msg));
+    }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        prompt_existing_file(&msg_owned).await
+    }).await {
+        return result;
     }
     prompt_existing_file(msg).await
 }
@@ -324,6 +416,15 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
     }
     if config.api_mode {
         return Ok(default);
+    }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        let val = prompt_int_range(&msg_owned, default, min, max).await?;
+        Ok(val.to_string())
+    }).await {
+        let val = result?;
+        return val.parse::<i64>().map_err(|_| anyhow!("Invalid cached int value for '{}'", key));
     }
     prompt_int_range(msg, default, min, max).await
 }
@@ -370,6 +471,13 @@ pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
     }
     if config.api_mode {
         return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    }
+    // Shared prompt cache: prompt once, reuse for all concurrent tasks
+    let msg_owned = msg.to_string();
+    if let Some(result) = cached_prompt(key, || async move {
+        prompt_wordlist(&msg_owned).await
+    }).await {
+        return result;
     }
     prompt_wordlist(msg).await
 }
