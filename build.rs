@@ -16,6 +16,9 @@ fn main() {
         return;
     }
 
+    // Check which features are enabled
+    let features = Features::detect();
+
     // Discover categories dynamically from subdirectories of src/modules/
     let mut categories: Vec<String> = Vec::new();
     let entries = match fs::read_dir(modules_root) {
@@ -31,6 +34,11 @@ fn main() {
         if path.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if !name.starts_with('.') {
+                    // Skip categories that are entirely disabled
+                    if features.should_skip_category(name) {
+                        println!("cargo:warning=Skipping category '{}' (feature disabled)", name);
+                        continue;
+                    }
                     categories.push(name.to_string());
                 }
             }
@@ -42,6 +50,9 @@ fn main() {
     for cat in &categories {
         println!("cargo:rerun-if-changed=src/modules/{}", cat);
     }
+    
+    // Also rerun if features change
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BLUETOOTH");
 
     // Compile regexes once, reuse across all categories.
     let run_re = Regex::new(r"pub\s+async\s+fn\s+run\s*\(\s*[^)]*:\s*&str\s*\)")
@@ -60,7 +71,7 @@ fn main() {
         let out_file = format!("{}_dispatch.rs", dispatch_name(cat));
         let display_name = capitalize(cat);
 
-        match generate_dispatch(&root, &out_file, &mod_prefix, &display_name, &run_re, &info_re, &check_re) {
+        match generate_dispatch(&root, &out_file, &mod_prefix, &display_name, &run_re, &info_re, &check_re, &features) {
             Ok(_module_count) => {
                 registry_entries.push(RegistryEntry {
                     category: cat.clone(),
@@ -78,6 +89,40 @@ fn main() {
     if let Err(e) = generate_registry(&registry_entries) {
         eprintln!("cargo:warning=Error generating module registry: {}", e);
         std::process::exit(1);
+    }
+}
+
+/// Feature detection and module filtering
+struct Features {
+    bluetooth: bool,
+}
+
+impl Features {
+    fn detect() -> Self {
+        Self {
+            bluetooth: env::var("CARGO_FEATURE_BLUETOOTH").is_ok(),
+        }
+    }
+    
+    /// Check if a category should be entirely skipped
+    fn should_skip_category(&self, category: &str) -> bool {
+        match category {
+            "bluetooth" => !self.bluetooth,
+            _ => false,
+        }
+    }
+    
+    /// Check if a module path should be skipped (for feature-gated submodules)
+    fn should_skip_module(&self, module_path: &str) -> bool {
+        // If bluetooth feature is disabled, skip any module under bluetooth/
+        if !self.bluetooth && module_path.starts_with("bluetooth/") {
+            return true;
+        }
+        
+        // Add more feature checks here as needed
+        // Example: if !self.some_feature && module_path.starts_with("some/path/")
+        
+        false
     }
 }
 
@@ -118,6 +163,7 @@ fn generate_dispatch(
     run_re: &Regex,
     info_re: &Regex,
     check_re: &Regex,
+    features: &Features,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR").map_err(|_| "OUT_DIR environment variable not set")?;
     let dest_path = Path::new(&out_dir).join(out_file);
@@ -127,7 +173,7 @@ fn generate_dispatch(
         return Err(format!("Module directory '{}' does not exist", root).into());
     }
 
-    let mappings = find_modules(root_path, run_re, info_re, check_re)?;
+    let mappings = find_modules(root_path, run_re, info_re, check_re, features)?;
 
     // Sort for deterministic output
     let mut sorted_mappings: Vec<_> = mappings.into_iter().collect();
@@ -411,6 +457,7 @@ fn find_modules(
     run_re: &Regex,
     info_re: &Regex,
     check_re: &Regex,
+    features: &Features,
 ) -> Result<HashSet<ModuleMapping>, Box<dyn std::error::Error>> {
     let mut mappings = HashSet::new();
 
@@ -422,6 +469,12 @@ fn find_modules(
 
             if let Ok(relative) = path.strip_prefix(root) {
                 let rel_str = relative.with_extension("").to_string_lossy().replace("\\", "/");
+                
+                // Skip modules that are feature-gated out
+                if features.should_skip_module(&rel_str) {
+                    println!("cargo:warning=Skipping module '{}' (feature disabled)", rel_str);
+                    continue;
+                }
 
                 let mut content = String::new();
                 if File::open(path).and_then(|mut f| f.read_to_string(&mut content)).is_ok() {
