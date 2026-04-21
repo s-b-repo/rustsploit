@@ -10,7 +10,7 @@ use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
 use crate::utils::{cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -43,6 +43,7 @@ const OID_SYS_NAME: &[u8] = &[0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x05, 0x00];
 const OID_SYS_LOCATION: &[u8] = &[0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x06, 0x00];
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SNMP Community String Scanner                              ║".cyan());
     crate::mprintln!("{}", "║   Tests SNMP v1/v2c communities via raw UDP packets          ║".cyan());

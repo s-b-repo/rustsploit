@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -32,6 +32,7 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   Redis Unauthenticated Access Scanner                       ║".cyan());
     crate::mprintln!("{}", "║   Detects open Redis instances and extracts server info       ║".cyan());
@@ -57,6 +58,10 @@ async fn redis_command(
 
     if n == 0 {
         return Err(anyhow!("Connection closed by Redis server"));
+    }
+
+    if n == buf.len() {
+        crate::mprintln!("{}", "[*] Redis response truncated at 8KB".dimmed());
     }
 
     Ok(String::from_utf8_lossy(&buf[..n]).to_string())

@@ -11,7 +11,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
     safe_read_to_string,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 pub async fn run(initial_target: &str) -> Result<()> {
     if crate::utils::get_global_source_port().await.is_some() {
@@ -194,18 +194,22 @@ impl TitleResult {
 }
 
 async fn fetch_title(client: &Client, url: &str, title_re: &Regex) -> Result<TitleResult> {
+    use futures_util::StreamExt;
+    const MAX_BODY: usize = 256 * 1024;
     let start = std::time::Instant::now();
     let response = client.get(url).send().await.context("Request failed")?;
     let status = response.status();
-    // Read at most 256KB to prevent OOM from malicious responses
-    let bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(anyhow!("Failed to read response body: {}", e));
+    let mut buffer = Vec::with_capacity(MAX_BODY);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read response stream")?;
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() >= MAX_BODY {
+            buffer.truncate(MAX_BODY);
+            break;
         }
-    };
-    let truncated = if bytes.len() > 256 * 1024 { &bytes[..256 * 1024] } else { &bytes };
-    let text = String::from_utf8_lossy(truncated).to_string();
+    }
+    let text = String::from_utf8_lossy(&buffer).to_string();
     let title = title_re
         .captures(&text)
         .and_then(|cap| cap.get(1))
@@ -352,6 +356,7 @@ fn write_report(path: &str, results: &[TitleResult]) -> Result<()> {
 }
 
 fn banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   HTTP Title Scanner                                         ║".cyan());
     crate::mprintln!("{}", "║   Enumerate page titles over HTTP/HTTPS endpoints            ║".cyan());

@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 use super::types::{Tool, ToolResult};
 
@@ -335,7 +336,7 @@ pub async fn call_tool(name: &str, args: Value) -> ToolResult {
         "check_module" => handle_check_module(&args).await,
 
         // ── Target tools ──────────────────────────────────────────
-        "set_target" => handle_set_target(&args),
+        "set_target" => handle_set_target(&args).await,
         "get_target" => handle_get_target(),
         "clear_target" => handle_clear_target(),
 
@@ -454,6 +455,9 @@ fn handle_search_modules(args: &Value) -> ToolResult {
 
 fn handle_module_info(args: &Value) -> ToolResult {
     let path = require_str!(args, "module_path");
+    if !crate::api::validate_module_name(path) {
+        return ToolResult::error("Invalid module name".into());
+    }
     match crate::commands::module_info(path) {
         Some(info) => ToolResult::json(&info),
         None => ToolResult::error(format!("No info available for module '{}'", path)),
@@ -463,6 +467,18 @@ fn handle_module_info(args: &Value) -> ToolResult {
 async fn handle_check_module(args: &Value) -> ToolResult {
     let path = require_str!(args, "module_path");
     let target = require_str!(args, "target");
+    if !crate::api::validate_module_name(path) {
+        return ToolResult::error("Invalid module name".into());
+    }
+    if !crate::api::validate_target(target) {
+        return ToolResult::error("Invalid target format".into());
+    }
+    if crate::api::is_blocked_target(target) {
+        return ToolResult::error("Target matches blocked address range".into());
+    }
+    if crate::api::is_blocked_target_resolved(target).await {
+        return ToolResult::error("Target resolves to a blocked metadata/link-local address".into());
+    }
     match crate::commands::check_module(path, target).await {
         Some(result) => ToolResult::json(&result),
         None => ToolResult::error(format!("Module '{}' does not support check", path)),
@@ -471,8 +487,17 @@ async fn handle_check_module(args: &Value) -> ToolResult {
 
 // ── Target tools ──────────────────────────────────────────────────────────
 
-fn handle_set_target(args: &Value) -> ToolResult {
+async fn handle_set_target(args: &Value) -> ToolResult {
     let target = require_str!(args, "target");
+    if !crate::api::validate_target(target) {
+        return ToolResult::error("Invalid target format".into());
+    }
+    if crate::api::is_blocked_target(target) {
+        return ToolResult::error("Target matches blocked address range".into());
+    }
+    if crate::api::is_blocked_target_resolved(target).await {
+        return ToolResult::error("Target resolves to blocked address".into());
+    }
     match crate::config::GLOBAL_CONFIG.set_target(target) {
         Ok(()) => ToolResult::text(format!("Target set to: {}", target)),
         Err(e) => ToolResult::error(format!("Failed to set target: {}", e)),
@@ -502,7 +527,19 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     let target = require_str!(args, "target").to_string();
     let verbose = bool_param(args, "verbose").unwrap_or(false);
 
-    // Validate module exists before executing
+    if !crate::api::validate_module_name(&module_path) {
+        return ToolResult::error("Invalid module name".into());
+    }
+    if !crate::api::validate_target(&target) {
+        return ToolResult::error("Invalid target format".into());
+    }
+    if crate::api::is_blocked_target(&target) {
+        return ToolResult::error("Target matches blocked address range".into());
+    }
+    if crate::api::is_blocked_target_resolved(&target).await {
+        return ToolResult::error("Target resolves to a blocked metadata/link-local address".into());
+    }
+
     if !crate::commands::discover_modules().contains(&module_path) {
         return ToolResult::error(format!("Module '{}' not found", module_path));
     }
@@ -584,8 +621,24 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
     let host = require_str!(args, "host");
     let username = require_str!(args, "username");
     let secret = require_str!(args, "secret");
-    let port = u16_param(args, "port").unwrap_or(0);
+    let port = match u16_param(args, "port") {
+        Some(0) => return ToolResult::error("Port must be between 1 and 65535".into()),
+        Some(p) => p,
+        None => return ToolResult::error("Missing required parameter: port".into()),
+    };
     let service = str_param(args, "service").unwrap_or("unknown");
+    if host.len() > 4096 || host.chars().any(|c| c.is_control()) {
+        return ToolResult::error("host too long (max 4096) or contains control characters".into());
+    }
+    if username.len() > 4096 || username.chars().any(|c| c.is_control()) {
+        return ToolResult::error("username too long (max 4096) or contains control characters".into());
+    }
+    if secret.len() > 4096 {
+        return ToolResult::error("secret too long (max 4096 chars)".into());
+    }
+    if service.len() > 4096 || service.chars().any(|c| c.is_control()) {
+        return ToolResult::error("service too long (max 4096) or contains control characters".into());
+    }
     let cred_type = match str_param(args, "cred_type").unwrap_or("password") {
         "hash" => crate::cred_store::CredType::Hash,
         "key" => crate::cred_store::CredType::Key,
@@ -593,14 +646,12 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
         _ => crate::cred_store::CredType::Password,
     };
 
-    let id = crate::cred_store::CRED_STORE
+    match crate::cred_store::CRED_STORE
         .add(host, port, service, username, secret, cred_type, "mcp")
-        .await;
-
-    if id.is_empty() {
-        ToolResult::error("Failed to add credential (validation error)".into())
-    } else {
-        ToolResult::json(&json!({ "id": id, "status": "added" }))
+        .await
+    {
+        Some(id) => ToolResult::json(&json!({ "id": id, "status": "added" })),
+        None => ToolResult::error("Failed to add credential (store limit reached or I/O error)".into()),
     }
 }
 
@@ -622,8 +673,21 @@ async fn handle_list_hosts() -> ToolResult {
 
 async fn handle_add_host(args: &Value) -> ToolResult {
     let ip = require_str!(args, "ip");
+    if ip.len() > 256 || ip.chars().any(|c| c.is_control()) {
+        return ToolResult::error("IP too long (max 256) or contains control characters".into());
+    }
     let hostname = str_param(args, "hostname");
+    if let Some(h) = hostname {
+        if h.len() > 256 || h.chars().any(|c| c.is_control()) {
+            return ToolResult::error("hostname too long (max 256) or contains control characters".into());
+        }
+    }
     let os_guess = str_param(args, "os_guess");
+    if let Some(o) = os_guess {
+        if o.len() > 256 || o.chars().any(|c| c.is_control()) {
+            return ToolResult::error("os_guess too long (max 256) or contains control characters".into());
+        }
+    }
     crate::workspace::WORKSPACE
         .add_host(ip, hostname, os_guess)
         .await;
@@ -647,11 +711,18 @@ async fn handle_list_services() -> ToolResult {
 async fn handle_add_service(args: &Value) -> ToolResult {
     let host = require_str!(args, "host");
     let port = match u16_param(args, "port") {
+        Some(0) => return ToolResult::error("Port must be between 1 and 65535".into()),
         Some(v) => v,
         None => return ToolResult::error("Missing required parameter: port".into()),
     };
+    if host.len() > 256 || host.chars().any(|c| c.is_control()) {
+        return ToolResult::error("host too long (max 256) or contains control characters".into());
+    }
     let service_name = require_str!(args, "service_name");
     let protocol = str_param(args, "protocol").unwrap_or("tcp");
+    if protocol.len() > 256 || protocol.chars().any(|c| c.is_control()) {
+        return ToolResult::error("protocol too long (max 256) or contains control characters".into());
+    }
     let version = str_param(args, "version");
     crate::workspace::WORKSPACE
         .add_service(host, port, protocol, service_name, version)
@@ -691,6 +762,17 @@ async fn handle_add_loot(args: &Value) -> ToolResult {
     let data = require_str!(args, "data");
     let description = str_param(args, "description").unwrap_or("");
 
+    if host.len() > 256 || loot_type.len() > 256 {
+        return ToolResult::error("host or loot_type too long (max 256)".into());
+    }
+    if description.len() > 4096 {
+        return ToolResult::error("description too long (max 4096)".into());
+    }
+    const MAX_LOOT_DATA: usize = 100 * 1024 * 1024;
+    if data.len() > MAX_LOOT_DATA {
+        return ToolResult::error(format!("data too large ({} bytes, max {} MB)", data.len(), MAX_LOOT_DATA / 1024 / 1024));
+    }
+
     match crate::loot::LOOT_STORE
         .add_text(host, loot_type, description, data, "mcp")
         .await
@@ -719,7 +801,9 @@ async fn handle_list_options() -> ToolResult {
 async fn handle_set_option(args: &Value) -> ToolResult {
     let key = require_str!(args, "key");
     let value = require_str!(args, "value");
-    crate::global_options::GLOBAL_OPTIONS.set(key, value).await;
+    if !crate::global_options::GLOBAL_OPTIONS.set(key, value).await {
+        return ToolResult::error(format!("Failed to set '{}': key/value too long or entry limit reached", key));
+    }
     ToolResult::text(format!("{} => {}", key, value))
 }
 
@@ -776,6 +860,11 @@ async fn handle_list_workspaces() -> ToolResult {
 
 async fn handle_switch_workspace(args: &Value) -> ToolResult {
     let name = require_str!(args, "name");
+    if name.is_empty() || name.len() > 64
+        || name.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return ToolResult::error("Workspace name must be 1-64 alphanumeric chars, dashes, or underscores".into());
+    }
     crate::workspace::WORKSPACE.switch(name).await;
     ToolResult::text(format!("Switched to workspace: {}", name))
 }

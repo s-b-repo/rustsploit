@@ -42,7 +42,8 @@ rustsploit/
 │   ├── main.rs               # Entry point — CLI or shell mode, input validation
 │   ├── cli.rs                # Clap-based CLI parser and dispatcher
 │   ├── shell.rs              # Interactive shell loop + UX helpers
-│   ├── api.rs                # REST API server — auth, rate limiting, hardening
+│   ├── api.rs                # REST + WebSocket API server — PQ encryption, rate limiting
+│   ├── ws.rs                 # PQ-encrypted WebSocket transport (/pq/ws)
 │   ├── config.rs             # Global config and target validation
 │   ├── module_info.rs        # ModuleInfo, CheckResult, ModuleRank types
 │   ├── global_options.rs     # Persistent global options (setg/unsetg)
@@ -52,19 +53,23 @@ rustsploit/
 │   ├── loot.rs               # Loot/evidence management
 │   ├── export.rs             # JSON/CSV/summary report export
 │   ├── jobs.rs               # Background job management
+│   ├── mcp/
+│   │   ├── mod.rs            # MCP server entry point (--mcp flag)
+│   │   ├── server.rs         # JSON-RPC stdio transport with binary-safe reads
+│   │   └── tools.rs          # 38 MCP tool implementations
 │   ├── commands/
 │   │   ├── mod.rs            # Module discovery, fuzzy matching, multi-target dispatch
 │   │   ├── exploit.rs
 │   │   ├── scanner.rs
 │   │   └── creds.rs
 │   ├── modules/
-│   │   ├── exploits/         # Exploit modules (137 modules, 24 with check)
-│   │   ├── scanners/         # Scanner modules (24 modules)
-│   │   ├── creds/            # Credential modules (19 modules)
+│   │   ├── exploits/         # Exploit modules (183 modules, 21 categories)
+│   │   ├── scanners/         # Scanner modules (27 modules)
+│   │   ├── creds/            # Credential modules (29 modules)
 │   │   └── plugins/          # Plugin modules (1 module)
 │   ├── native/               # Native integrations
 │   │   ├── mod.rs
-│   │   ├── rdp.rs            # xfreerdp/rdesktop wrapper
+│   │   ├── rdp.rs            # Native RDP auth (X.224, TLS, CredSSP/NTLM)
 │   │   ├── payload_engine.rs # Payload encoding/generation
 │   │   ├── url_encoding.rs   # URL encoding utilities
 │   │   └── async_tls.rs      # Async TLS helpers
@@ -73,7 +78,8 @@ rustsploit/
 │       ├── prompt.rs         # Config-aware prompts (cfg_prompt_*)
 │       ├── sanitize.rs       # Input validation, length limits
 │       ├── target.rs         # Target normalization (IPv4/IPv6/CIDR/hostname)
-│       ├── network.rs        # Network utilities
+│       ├── network.rs        # HTTP client builders, TCP/UDP connect helpers
+│       ├── privilege.rs      # Root privilege check (require_root)
 │       └── modules.rs        # Module discovery helpers
 ├── docs/                     # This wiki
 ├── lists/                    # Wordlists and data files

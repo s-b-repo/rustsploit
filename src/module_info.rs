@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use colored::*;
+use serde::{Deserialize, Serialize};
 
 /// Module metadata — returned by optional `pub fn info() -> ModuleInfo` in modules.
 #[derive(Debug, Clone, Serialize, Deserialize)]

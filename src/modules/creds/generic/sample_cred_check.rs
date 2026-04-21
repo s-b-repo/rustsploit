@@ -1,7 +1,7 @@
 use anyhow::{Result, Context};
 use colored::*;
 use std::time::Duration;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -17,6 +17,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   Sample Default Credential Checker                       ║".cyan());
     crate::mprintln!("{}", "║   HTTP Basic Auth Test Module                             ║".cyan());

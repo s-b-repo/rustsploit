@@ -13,10 +13,10 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+use crate::utils::{
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -244,7 +244,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "mqtt",
-                source_module: "creds/generic/mqtt_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/mqtt_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -325,8 +326,7 @@ pub async fn run(target: &str) -> Result<()> {
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
 
     // Combo mode
-    let combo_mode =
-        cfg_prompt_yes_no("combo_mode", "Full combination mode (user x pass)?", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     // Load wordlists
     let usernames = load_lines(&username_wordlist)?;
@@ -354,16 +354,19 @@ pub async fn run(target: &str) -> Result<()> {
         match try_mqtt_auth(&addr, "", "", &client_id, use_tls).await {
             AttackResult::Success(_, _) => {
                 crate::mprintln!("{}", "[+] ANONYMOUS ACCESS ALLOWED!".green().bold());
-                let _ = crate::cred_store::store_credential(
-                    &normalized_target,
-                    port,
-                    "mqtt",
-                    "(anonymous)",
-                    "(no password)",
-                    crate::cred_store::CredType::Password,
-                    "creds/generic/mqtt_bruteforce",
-                )
-                .await;
+                {
+                    let id = crate::cred_store::store_credential(
+                        &normalized_target,
+                        port,
+                        "mqtt",
+                        "(anonymous)",
+                        "(no password)",
+                        crate::cred_store::CredType::Password,
+                        "creds/generic/mqtt_credcheck",
+                    )
+                    .await;
+                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
+                }
                 if stop_on_success {
                     crate::mprintln!(
                         "{}",
@@ -394,7 +397,11 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     // Generate credential combos
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     // Build the try_login closure capturing MQTT-specific config
     let try_login = move |_target: String, _port: u16, user: String, pass: String| {
@@ -426,7 +433,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries: 3,
             service_name: "mqtt",
-            source_module: "creds/generic/mqtt_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/mqtt_credcheck",
         },
         combos,
         try_login,
@@ -502,6 +510,7 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -533,15 +542,9 @@ async fn try_mqtt_auth(
     use_tls: bool,
 ) -> AttackResult {
     // Connect with timeout
-    let stream = match tokio::time::timeout(
-        Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return AttackResult::ConnectionError(e.to_string()),
-        Err(_) => return AttackResult::ConnectionError("Connection timeout".to_string()),
+    let stream = match crate::utils::network::tcp_connect(addr, Duration::from_millis(MQTT_CONNECT_TIMEOUT_MS)).await {
+        Ok(s) => s,
+        Err(e) => return AttackResult::ConnectionError(e.to_string()),
     };
 
     if use_tls {
@@ -647,7 +650,7 @@ where
 
     // Send DISCONNECT on success
     if return_code == MqttReturnCode::Accepted {
-        let _ = stream.write_all(&[MQTT_PACKET_DISCONNECT, 0x00]).await;
+        if let Err(e) = stream.write_all(&[MQTT_PACKET_DISCONNECT, 0x00]).await { crate::meprintln!("[!] Write error: {}", e); }
         return Ok(true);
     }
 
@@ -655,7 +658,12 @@ where
         return Ok(false);
     }
 
-    Err(anyhow!("MQTT error: {}", return_code.description()))
+    // ServerUnavailable (0x03) is transient — return Ok(false) so engine retries
+    // UnacceptableProtocol (0x01) and IdentifierRejected (0x02) are config errors — not retryable
+    match return_code {
+        MqttReturnCode::ServerUnavailable => Ok(false),
+        _ => Err(anyhow!("MQTT error: {}", return_code.description())),
+    }
 }
 
 fn build_connect_packet(username: &str, password: &str, client_id: &str) -> Result<Vec<u8>> {

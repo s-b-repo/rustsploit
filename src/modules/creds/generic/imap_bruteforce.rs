@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use crate::utils::{
     load_lines, get_filename_in_current_dir,
-    cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
+    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
     backoff_delay,
 };
@@ -247,7 +248,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "imap",
-            source_module: "creds/generic/imap_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/imap_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
@@ -310,7 +312,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}:{}", target, port).cyan());
 
@@ -355,7 +357,11 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     let try_login = move |t: String, p: u16, user: String, pass: String| {
         async move {
@@ -386,7 +392,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "imap",
-        source_module: "creds/generic/imap_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/imap_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();
@@ -493,7 +500,7 @@ fn attempt_imap_login(
 
         let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
-        let _ = stream.set_nodelay(true);
+        if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
         stream.set_read_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
 
@@ -522,7 +529,7 @@ fn attempt_imap_login(
 
         if response.contains("A001 OK") {
             // Clean logout
-            let _ = stream.write_all(b"A002 LOGOUT\r\n");
+            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") { crate::meprintln!("[!] IMAP LOGOUT write error: {}", e); }
             return Ok(true);
         }
         if response.contains("A001 NO") || response.contains("A001 BAD") {
@@ -545,7 +552,7 @@ fn attempt_imap_login(
 
         let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
-        let _ = stream.set_nodelay(true);
+        if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
         stream.set_read_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
         stream.set_write_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
 
@@ -569,7 +576,7 @@ fn attempt_imap_login(
 
         if response.contains("A001 OK") {
             // Clean logout
-            let _ = stream.write_all(b"A002 LOGOUT\r\n");
+            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") { crate::meprintln!("[!] IMAP LOGOUT write error: {}", e); }
             return Ok(true);
         }
         if response.contains("A001 NO") || response.contains("A001 BAD") {

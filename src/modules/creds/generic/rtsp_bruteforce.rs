@@ -9,12 +9,12 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     time::timeout,
 };
 
-use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+use crate::utils::{
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -36,6 +36,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -184,12 +185,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every pass with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let advanced_mode = cfg_prompt_yes_no(
         "advanced_mode",
@@ -292,7 +288,11 @@ pub async fn run(target: &str) -> Result<()> {
         }
     };
 
-    let combos = generate_combos(&users, &pass_lines, combo_mode);
+    let mut combos = generate_combos_mode(&users, &pass_lines, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     crate::mprintln!(
         "{}",
         format!(
@@ -364,7 +364,8 @@ pub async fn run(target: &str) -> Result<()> {
                 delay_ms: 10,
                 max_retries: 2,
                 service_name: "rtsp",
-                source_module: "creds/generic/rtsp_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/rtsp_credcheck",
             },
             combos.clone(),
             try_login,
@@ -421,7 +422,7 @@ pub async fn run(target: &str) -> Result<()> {
                 opts.mode(0o600);
                 if let Ok(mut file) = opts.open(&filename) {
                     for (host, user, pass, path) in &all_found {
-                        let _ = writeln!(file, "{} -> {}:{} [path={}]", host, user, pass, path);
+                        if let Err(e) = writeln!(file, "{} -> {}:{} [path={}]", host, user, pass, path) { crate::meprintln!("[!] Write error: {}", e); }
                     }
                     crate::mprintln!("[+] Results saved to '{}'", filename.display());
                 }
@@ -484,7 +485,8 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
                 verbose,
                 output_file: output_file.clone(),
                 service_name: "rtsp",
-                source_module: "creds/generic/rtsp_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/rtsp_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -508,9 +510,11 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
                         Ok(false) => LoginResult::AuthFailed,
                         Err(e) => {
                             let msg = e.to_string().to_lowercase();
-                            let retryable = !msg.contains("refused")
-                                && !msg.contains("timeout")
-                                && !msg.contains("reset");
+                            // Connection errors are retryable; auth errors are not
+                            let retryable = msg.contains("refused")
+                                || msg.contains("timeout")
+                                || msg.contains("reset")
+                                || msg.contains("connection");
                             LoginResult::Error {
                                 message: e.to_string(),
                                 retryable,
@@ -577,26 +581,14 @@ async fn try_rtsp_login(
 
     // Try each candidate address
     for sa in addrs {
-        match timeout(
-            Duration::from_millis(CONNECT_TIMEOUT_MS),
-            TcpStream::connect(*sa),
-        )
-        .await
-        {
-            Ok(Ok(s)) => {
+        match crate::utils::network::tcp_connect_addr(*sa, Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+            Ok(s) => {
                 stream = Some(s);
                 connected_sa = Some(*sa);
                 break;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 last_err = Some(e);
-                continue;
-            }
-            Err(_) => {
-                last_err = Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connect timeout",
-                ));
                 continue;
             }
         }

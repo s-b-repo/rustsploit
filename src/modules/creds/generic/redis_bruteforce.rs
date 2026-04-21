@@ -5,12 +5,13 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::utils::{
-    load_lines, get_filename_in_current_dir, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
+    load_lines, get_filename_in_current_dir, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos, run_bruteforce, run_subnet_bruteforce,
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    run_bruteforce, run_subnet_bruteforce,
     is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
 };
 
@@ -184,11 +185,14 @@ pub async fn run(target: &str) -> Result<()> {
                     Ok(Ok(true)) => {
                         // PING succeeded without auth — Redis has no auth
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let _ = crate::cred_store::store_credential(
-                            &target_str, port, "redis", "", "(no auth)",
-                            crate::cred_store::CredType::Password,
-                            "creds/generic/redis_bruteforce",
-                        ).await;
+                        {
+                            let id = crate::cred_store::store_credential(
+                                &target_str, port, "redis", "", "(no auth)",
+                                crate::cred_store::CredType::Password,
+                                "creds/generic/redis_credcheck",
+                            ).await;
+                            if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
+                        }
                         return Some(format!("[{}] {}:{}:(no auth)\n", ts, ip, port));
                     }
                     Ok(Ok(false)) => {
@@ -208,11 +212,14 @@ pub async fn run(target: &str) -> Result<()> {
                         match res {
                             Ok(Ok(true)) => {
                                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = crate::cred_store::store_credential(
-                                    &target_str, port, "redis", user, pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/redis_bruteforce",
-                                ).await;
+                                {
+                                    let id = crate::cred_store::store_credential(
+                                        &target_str, port, "redis", user, pass,
+                                        crate::cred_store::CredType::Password,
+                                        "creds/generic/redis_credcheck",
+                                    ).await;
+                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
+                                }
                                 return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                             }
                             Ok(Ok(false)) => continue,
@@ -229,11 +236,14 @@ pub async fn run(target: &str) -> Result<()> {
                         match res {
                             Ok(Ok(true)) => {
                                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = crate::cred_store::store_credential(
-                                    &target_str, port, "redis", "", pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/redis_bruteforce",
-                                ).await;
+                                {
+                                    let id = crate::cred_store::store_credential(
+                                        &target_str, port, "redis", "", pass,
+                                        crate::cred_store::CredType::Password,
+                                        "creds/generic/redis_credcheck",
+                                    ).await;
+                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
+                                }
                                 return Some(format!("[{}] {}:{}::{}\n", ts, ip, port, pass));
                             }
                             Ok(Ok(false)) => continue,
@@ -278,7 +288,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "redis",
-            source_module: "creds/generic/redis_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/redis_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
@@ -344,7 +355,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no("combo_mode", "Combination mode? (try every pass with every user)", false).await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}:{}", target, port).cyan());
 
@@ -408,7 +419,11 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
 
     let try_login = move |t: String, p: u16, user: String, pass: String| {
         async move {
@@ -439,7 +454,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "redis",
-        source_module: "creds/generic/redis_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/redis_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();
@@ -523,11 +539,11 @@ fn redis_ping(target: &str, port: u16, timeout_secs: u64) -> std::result::Result
 
     let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
         .map_err(|e| RedisError::from_anyhow(e.into()))?;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
     stream.set_read_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
     stream.set_write_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
 
-    stream.write_all(b"PING\r\n")
+    stream.write_all(&resp_cmd(&[b"PING"]))
         .map_err(|e| RedisError::from_anyhow(e.into()))?;
 
     let mut buffer = [0u8; 1024];
@@ -547,9 +563,19 @@ fn redis_ping(target: &str, port: u16, timeout_secs: u64) -> std::result::Result
     }
 }
 
-/// Attempt Redis AUTH login.
-/// In ACL mode: sends `AUTH username password\r\n`
-/// In legacy mode: sends `AUTH password\r\n`
+/// Build a RESP (REdis Serialization Protocol) array command.
+/// Length-prefixed format prevents injection even if args contain \r\n.
+fn resp_cmd(args: &[&[u8]]) -> Vec<u8> {
+    let mut cmd = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        cmd.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        cmd.extend_from_slice(arg);
+        cmd.extend_from_slice(b"\r\n");
+    }
+    cmd
+}
+
+/// Attempt Redis AUTH login using safe RESP protocol framing.
 /// Returns Ok(true) on +OK, Ok(false) on -ERR, Err on connection issues.
 /// On success, also sends INFO server to gather version info.
 fn attempt_redis_login(
@@ -573,18 +599,18 @@ fn attempt_redis_login(
 
     let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
         .map_err(|e| RedisError::from_anyhow(e.into()))?;
-    let _ = stream.set_nodelay(true);
+    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
     stream.set_read_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
     stream.set_write_timeout(Some(timeout)).map_err(|e| RedisError::from_anyhow(e.into()))?;
 
-    // Build AUTH command
+    // Build AUTH command using RESP array format (injection-safe)
     let auth_cmd = if acl_mode {
-        format!("AUTH {} {}\r\n", user, pass)
+        resp_cmd(&[b"AUTH", user.as_bytes(), pass.as_bytes()])
     } else {
-        format!("AUTH {}\r\n", pass)
+        resp_cmd(&[b"AUTH", pass.as_bytes()])
     };
 
-    stream.write_all(auth_cmd.as_bytes())
+    stream.write_all(&auth_cmd)
         .map_err(|e| RedisError::from_anyhow(e.into()))?;
 
     let mut buffer = [0u8; 2048];
@@ -594,7 +620,7 @@ fn attempt_redis_login(
 
     if response.contains("+OK") {
         // Auth succeeded — gather server info
-        if stream.write_all(b"INFO server\r\n").is_ok() {
+        if stream.write_all(&resp_cmd(&[b"INFO", b"server"])).is_ok() {
             let mut info_buf = [0u8; 4096];
             if let Ok(info_n) = stream.read(&mut info_buf) {
                 let info_response = String::from_utf8_lossy(&info_buf[..info_n]);
@@ -611,7 +637,7 @@ fn attempt_redis_login(
             }
         }
         // Clean disconnect
-        let _ = stream.write_all(b"QUIT\r\n");
+        if let Err(e) = stream.write_all(&resp_cmd(&[b"QUIT"])) { crate::meprintln!("[!] Redis QUIT write error: {}", e); }
         return Ok(true);
     }
 
@@ -619,9 +645,9 @@ fn attempt_redis_login(
         return Ok(false);
     }
 
-    // If no auth required, also treat as success for empty password
+    // Server requires no password — treat empty-password probe as success
     if response.contains("-NOAUTH") && pass.is_empty() {
-        return Ok(false);
+        return Ok(true);
     }
 
     Err(RedisError {

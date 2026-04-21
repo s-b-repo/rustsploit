@@ -4,17 +4,19 @@
 // Discovery uses the build-time generated registry (via commands::discover_modules)
 // for reliable operation regardless of CWD.
 
-use anyhow::{Result, Context, bail};
-use colored::*;
-use rand::prelude::IndexedRandom;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// Maximum file size for wordlist/text file loading (100 MB)
-const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+use anyhow::{Context, Result, bail};
+use colored::*;
+use rand::prelude::IndexedRandom;
 
 use super::sanitize::MAX_MODULE_PATH_LENGTH;
+
+/// Maximum file size for general text file loading (100 MB).
+/// Wordlists bypass this via `load_lines_uncapped`.
+const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Checks if a module path exists in the build-time registry.
 pub fn module_exists(module_path: &str) -> bool {
@@ -56,9 +58,21 @@ pub fn list_all_modules() {
     crate::mprintln!();
     for (category, paths) in grouped {
         crate::mprintln!("{}:", category.blue().bold());
+        let mut last_subcategory = String::new();
         for path in paths {
+            let parts: Vec<&str> = path.split('/').collect();
+            let subcategory = if parts.len() >= 3 {
+                parts[..2].join("/")
+            } else {
+                category.clone()
+            };
+            if !last_subcategory.is_empty() && subcategory != last_subcategory {
+                crate::mprintln!();
+            }
+            last_subcategory = subcategory;
             crate::mprintln!("  - {}", path.color(get_random_color()));
         }
+        crate::mprintln!();
     }
     crate::mprintln!("\n{}", format!("Total: {} modules", modules.len()).dimmed());
 }
@@ -92,7 +106,18 @@ pub fn find_modules(keyword: &str) {
     }
     for (category, paths) in grouped {
         crate::mprintln!("\n{}:", category.blue().bold());
+        let mut last_subcategory = String::new();
         for path in paths {
+            let parts: Vec<&str> = path.split('/').collect();
+            let subcategory = if parts.len() >= 3 {
+                parts[..2].join("/")
+            } else {
+                category.clone()
+            };
+            if !last_subcategory.is_empty() && subcategory != last_subcategory {
+                crate::mprintln!();
+            }
+            last_subcategory = subcategory;
             crate::mprintln!("  - {}", path.color(get_random_color()));
         }
     }
@@ -118,6 +143,66 @@ pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
         .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
         .filter(|line| !line.is_empty())
         .collect())
+}
+
+/// Load lines from a wordlist of any size.
+/// Files <= 250 MB are loaded into memory. Larger files are streamed in
+/// batches of `batch_size` lines, calling `on_batch` for each chunk.
+/// Returns the total number of lines processed.
+pub fn load_lines_batched<P, F>(
+    path: P,
+    batch_size: usize,
+    mut on_batch: F,
+) -> Result<usize>
+where
+    P: AsRef<Path>,
+    F: FnMut(Vec<String>),
+{
+    let file = fs::File::open(path.as_ref())
+        .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let mut total = 0usize;
+    let mut batch = Vec::with_capacity(batch_size);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l.trim().to_string(),
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        batch.push(line);
+        if batch.len() >= batch_size {
+            total += batch.len();
+            on_batch(std::mem::replace(&mut batch, Vec::with_capacity(batch_size)));
+        }
+    }
+    if !batch.is_empty() {
+        total += batch.len();
+        on_batch(batch);
+    }
+    Ok(total)
+}
+
+/// Streaming threshold: files larger than this use batched loading.
+pub const STREAMING_THRESHOLD: u64 = 250 * 1024 * 1024;
+
+/// Load lines from a file without the 100 MB cap.
+/// For wordlists that may be very large.
+pub fn load_lines_uncapped<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
+    let file = fs::File::open(path.as_ref())
+        .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    Ok(reader
+        .lines()
+        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+/// Check file size for streaming decisions.
+pub fn file_size<P: AsRef<Path>>(path: P) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Read a text file to string with a size limit to prevent OOM.

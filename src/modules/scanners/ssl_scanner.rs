@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port,
     cfg_prompt_yes_no,
@@ -103,7 +103,7 @@ impl ServerCertVerifier for CertCaptureVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -639,6 +639,7 @@ async fn scan_target(
 // ============================================================
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔══════════════════════════════════════════════════════════════╗".cyan()

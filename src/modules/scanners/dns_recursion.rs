@@ -4,9 +4,9 @@ use colored::*;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use tokio::time::{timeout, Duration};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_port,
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::op::ResponseCode;
@@ -24,6 +24,7 @@ struct TargetSpec {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   DNS Recursion & Amplification Scanner                      ║".cyan());
     crate::mprintln!("{}", "║   Detects open resolvers that may be abused for DoS attacks  ║".cyan());
@@ -75,6 +76,8 @@ pub async fn run(initial_target: &str) -> Result<()> {
         cfg_prompt_default("record_type", "Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY").await?;
     let record_type = parse_record_type(&record_input)?;
 
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 5, 1, 60).await? as u64;
+
     crate::mprintln!(
         "[*] Prepared {} query for {} across {} target(s)",
         record_type,
@@ -107,7 +110,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
         match resolve_target(&spec.host, port).await {
             Ok((socket_addr, resolved_display)) => {
                 crate::mprintln!("{}", format!("[*] Target resolver: {}", resolved_display).cyan());
-                match query_target(socket_addr, &resolved_display, &name, record_type, &mut vulnerable_count).await {
+                match query_target(socket_addr, &resolved_display, &name, record_type, timeout_secs, &mut vulnerable_count).await {
                     Ok(()) => any_success = true,
                     Err(err) => {
                         crate::meprintln!(
@@ -159,22 +162,23 @@ async fn query_target(
     display_target: &str,
     name: &Name,
     record_type: RecordType,
+    timeout_secs: u64,
     vulnerable_count: &mut usize,
 ) -> Result<()> {
     crate::mprintln!(
-        "[*] Sending {} query (timeout 5s) to {}",
-        record_type, display_target
+        "[*] Sending {} query (timeout {}s) to {}",
+        record_type, timeout_secs, display_target
     );
 
     let stream = UdpClientStream::builder(socket_addr, TokioRuntimeProvider::new())
         .build();
-    
+
     let (mut client, bg) =
         Client::connect(stream).await.context("Failed to initiate DNS client")?;
     tokio::spawn(bg);
 
     let response: DnsResponse = timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(timeout_secs),
         client.query(name.clone(), DNSClass::IN, record_type),
     )
     .await

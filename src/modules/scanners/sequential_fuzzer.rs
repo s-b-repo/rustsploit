@@ -13,7 +13,7 @@ use crate::utils::{
     cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, normalize_target, cfg_prompt_existing_file,
     safe_read_to_string, url_encode,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use base64::{Engine as _, engine::general_purpose};
 use rand::seq::IndexedRandom;
 
@@ -158,7 +158,11 @@ pub async fn run(target: &str) -> Result<()> {
         }).await;
     }
 
-    print_banner();
+    if !crate::utils::is_batch_mode() {
+        if !crate::utils::is_batch_mode() {
+            print_banner();
+        }
+    }
 
     // Menu
     crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
@@ -189,10 +193,13 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan());
-    crate::mprintln!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red());
-    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() { return; }
+    crate::mprintln_block!(
+        format!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan()),
+        format!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan()),
+        format!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red()),
+        format!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan())
+    );
 }
 
 // --- Setup ---

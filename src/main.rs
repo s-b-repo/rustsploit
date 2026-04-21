@@ -1,31 +1,34 @@
+use std::net::SocketAddr;
+use std::process;
+
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use colored::*;
-use std::net::SocketAddr;
-use std::process;
 use tracing_subscriber::EnvFilter;
 
-mod cli;
-mod shell;
-mod commands;
-mod modules;
-mod utils;
 mod api;
+mod cli;
+mod commands;
 mod config;
 mod context;
+mod modules;
 mod native;
-pub mod output;
-pub mod module_info;
-pub mod global_options;
+mod shell;
+mod utils;
+
 pub mod cred_store;
-pub mod spool;
-pub mod workspace;
-pub mod loot;
 pub mod export;
+pub mod global_options;
 pub mod jobs;
+pub mod loot;
 pub mod mcp;
+pub mod module_info;
+pub mod output;
 pub mod pq_channel;
 pub mod pq_middleware;
+pub mod spool;
+pub mod workspace;
+pub mod ws;
 
 
 /// Maximum length for interface/bind address

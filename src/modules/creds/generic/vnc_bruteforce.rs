@@ -20,10 +20,10 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+use crate::utils::{
+    generate_combos_mode, ComboMode,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -179,7 +179,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "vnc",
-                source_module: "creds/generic/vnc_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/vnc_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, _user: String, pass: String| async move {
@@ -279,7 +280,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // VNC is password-only: use a single dummy username for the combos framework
     let usernames = vec!["vnc".to_string()];
-    let combos = generate_combos(&usernames, &passwords, false);
+    let combos = generate_combos_mode(&usernames, &passwords, ComboMode::Linear);
 
     crate::mprintln!(
         "\n{}",
@@ -324,7 +325,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 100, // VNC servers often rate-limit; small delay helps
             max_retries,
             service_name: "vnc",
-            source_module: "creds/generic/vnc_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/vnc_credcheck",
         },
         combos,
         try_login,
@@ -517,15 +519,9 @@ fn parse_rfb_version(version_str: &[u8]) -> Result<(u16, u16)> {
 /// Attempt VNC authentication against a target address.
 async fn try_vnc_auth(addr: &str, password: &str) -> VncResult {
     // TCP connect with timeout
-    let mut stream = match tokio::time::timeout(
-        Duration::from_millis(CONNECT_TIMEOUT_MS),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return VncResult::ConnectionError(format!("Connect failed: {}", e)),
-        Err(_) => return VncResult::ConnectionError("Connection timeout".to_string()),
+    let mut stream = match crate::utils::network::tcp_connect(addr, Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+        Ok(s) => s,
+        Err(e) => return VncResult::ConnectionError(format!("Connect failed: {}", e)),
     };
 
     // Step 1: Read server version string (12 bytes)
@@ -758,11 +754,15 @@ async fn try_vnc_auth(addr: &str, password: &str) -> VncResult {
                     let reason_len = u32::from_be_bytes(len_buf) as usize;
                     if reason_len > 0 && reason_len < 4096 {
                         let mut reason = vec![0u8; reason_len];
-                        let _ = tokio::time::timeout(
+                        match tokio::time::timeout(
                             Duration::from_millis(READ_TIMEOUT_MS),
                             stream.read_exact(&mut reason),
                         )
-                        .await;
+                        .await {
+                            Err(_) => crate::meprintln!("[!] VNC reason read timed out"),
+                            Ok(Err(e)) => crate::meprintln!("[!] VNC reason read error: {}", e),
+                            Ok(Ok(_)) => {}
+                        }
                     }
                 }
             }

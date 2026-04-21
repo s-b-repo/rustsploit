@@ -1,6 +1,6 @@
 # API Server
 
-Rustsploit includes a built-in REST API server (`src/api.rs`) with post-quantum encrypted transport and SSH-style identity key authentication. No TLS. No API keys.
+Rustsploit includes a built-in API server (`src/api.rs`, `src/ws.rs`) with post-quantum encrypted WebSocket transport and SSH-style identity key authentication. No TLS. No API keys.
 
 ---
 
@@ -78,6 +78,7 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/pq/handshake` | Establish PQ-encrypted session (mutual auth) |
+| `GET` | `/pq/ws` | Upgrade to PQ-encrypted WebSocket transport |
 
 ### Protected (26 endpoints — require active PQ session)
 
@@ -168,7 +169,26 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 
 > All responses include `request_id`, `timestamp`, and `duration_ms` fields for observability.
 
-> **Total: 27 endpoints** (1 public + 26 protected) across 9 resource categories.
+> **Total: 28 endpoints** (2 public + 26 protected) across 9 resource categories, plus WebSocket transport.
+
+### WebSocket Transport
+
+`GET /pq/ws` upgrades the connection to a PQ-encrypted WebSocket. After the initial `/pq/handshake`, clients can switch to WebSocket for persistent bidirectional communication.
+
+**Features:**
+- PQ-encrypted frames using ChaCha20-Poly1305 (same security as REST)
+- Max 100 concurrent WebSocket connections
+- 30-second heartbeat interval
+- 1 MiB max frame size
+- Sub-session key derivation from the PQ handshake session
+
+**Headers required:**
+- `X-PQ-Session-Id` — session ID from `/pq/handshake`
+- Standard WebSocket upgrade headers
+
+WebSocket messages use the same JSON request/response format as REST endpoints. The WebSocket transport is ideal for long-running operations, real-time job monitoring, and persistent client connections.
+
+---
 
 ### Shell Command Endpoint
 

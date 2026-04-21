@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
-use serde::{Serialize, Deserialize};
+
 use colored::*;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Type of credential stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,11 +61,16 @@ impl CredStore {
                     Err(e) => {
                         eprintln!("[!] Warning: creds.json is corrupted ({}). Starting fresh.", e);
                         let backup = file_path.with_extension("json.bak");
-                        let _ = std::fs::copy(&file_path, &backup);
+                        if let Err(e) = std::fs::copy(&file_path, &backup) {
+                            eprintln!("[!] Failed to backup corrupted creds.json: {}", e);
+                        }
                         Vec::new()
                     }
                 },
-                Err(_) => Vec::new(),
+                Err(e) => {
+                    eprintln!("[!] Failed to read creds.json: {}", e);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -79,7 +85,7 @@ impl CredStore {
     /// Maximum length for credential fields to prevent memory abuse.
     const MAX_FIELD_LEN: usize = 4096;
 
-    /// Add a credential. Returns the generated ID (empty string on validation failure).
+    /// Add a credential. Returns `Some(id)` on success, `None` on validation failure.
     pub async fn add(
         &self,
         host: &str,
@@ -89,13 +95,13 @@ impl CredStore {
         secret: &str,
         cred_type: CredType,
         source_module: &str,
-    ) -> String {
+    ) -> Option<String> {
         // Input validation
         if host.is_empty() || host.len() > Self::MAX_FIELD_LEN {
-            return String::new();
+            return None;
         }
         if secret.len() > Self::MAX_FIELD_LEN || username.len() > Self::MAX_FIELD_LEN {
-            return String::new();
+            return None;
         }
         let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let entry = CredEntry {
@@ -116,7 +122,7 @@ impl CredStore {
             entries.clone()
         };
         self.save_locked(&snapshot).await;
-        id
+        Some(id)
     }
 
     /// List all credentials.
@@ -163,15 +169,42 @@ impl CredStore {
 
     async fn save_locked(&self, entries: &[CredEntry]) {
         if let Some(parent) = self.file_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                eprintln!("[!] Failed to create creds directory: {}", e);
+                return;
+            }
         }
         let tmp = self.file_path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(entries) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, &self.file_path).await;
-                use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600)).await;
+        let json = match serde_json::to_string_pretty(entries) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[!] Failed to serialize credentials: {}", e);
+                return;
             }
+        };
+        {
+            let file = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[!] Failed to write temp creds file: {}", e);
+                    return;
+                }
+            };
+            let mut file = file;
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await {
+                eprintln!("[!] Failed to write temp creds file: {}", e);
+                return;
+            }
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
+            eprintln!("[!] Failed to rename creds file: {}", e);
         }
     }
 
@@ -229,6 +262,6 @@ pub async fn store_credential(
     secret: &str,
     cred_type: CredType,
     source_module: &str,
-) -> String {
+) -> Option<String> {
     CRED_STORE.add(host, port, service, username, secret, cred_type, source_module).await
 }

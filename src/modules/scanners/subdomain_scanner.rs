@@ -45,6 +45,7 @@ const DEFAULT_SUBDOMAINS: &[&str] = &[
 ];
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   DNS Subdomain Enumerator                                   ║".cyan());
     crate::mprintln!("{}", "║   Brute-force subdomain discovery via DNS resolution         ║".cyan());
@@ -135,15 +136,27 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("{}", format!("[*] Loaded {} subdomains to test", subdomains.len()).cyan());
     crate::mprintln!("{}", format!("[*] Concurrency: {}, Timeout: {}s", concurrency, timeout_secs).dimmed());
 
-    // Wildcard detection: test a random non-existent subdomain
-    let wildcard_test = format!("xz9q7k2m4p{}.{}", rand::random::<u32>(), domain);
-    let wildcard_ips = resolve_subdomain(&wildcard_test, timeout_dur).await;
-    let wildcard_filter: Option<Vec<String>> = if let Some(ref ips) = wildcard_ips {
+    // Wildcard detection: test multiple random non-existent subdomains to reduce false negatives
+    let mut wildcard_hits: Vec<Vec<String>> = Vec::new();
+    for i in 0..3u32 {
+        let probe = format!("xz9q7k{}r{}.{}", rand::random::<u32>(), i, domain);
+        if let Some(ips) = resolve_subdomain(&probe, timeout_dur).await {
+            wildcard_hits.push(ips);
+        }
+    }
+    let wildcard_filter: Option<Vec<String>> = if wildcard_hits.len() >= 2 {
+        let ips = &wildcard_hits[0];
         crate::mprintln!("{}", format!(
-            "[!] WILDCARD DNS DETECTED — *.{} resolves to {}. Filtering results.",
-            domain, ips.join(", ")
+            "[!] WILDCARD DNS DETECTED — *.{} resolves to {} ({}/3 probes matched). Filtering results.",
+            domain, ips.join(", "), wildcard_hits.len()
         ).yellow().bold());
         Some(ips.clone())
+    } else if wildcard_hits.len() == 1 {
+        crate::mprintln!("{}", format!(
+            "[?] Possible wildcard DNS — 1/3 probes resolved for *.{}. Not filtering (may be flaky).",
+            domain
+        ).yellow());
+        None
     } else {
         crate::mprintln!("{}", "[+] No wildcard DNS detected".green());
         None

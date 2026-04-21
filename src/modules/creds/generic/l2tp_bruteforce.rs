@@ -2,8 +2,9 @@ use anyhow::{anyhow, Result};
 use colored::*;
 use std::{io::Write, net::UdpSocket, time::Duration};
 
-use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+use crate::utils::{
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -43,6 +44,7 @@ const CHAP_SUCCESS: u8 = 3;
 const CHAP_FAILURE: u8 = 4;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -424,12 +426,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every password with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let normalized = normalize_target(target)?;
 
@@ -467,7 +464,11 @@ pub async fn run(target: &str) -> Result<()> {
         ),
     }
 
-    let combos = generate_combos(&users, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&users, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     let timeout_duration = Duration::from_millis(timeout_ms);
 
     crate::mprintln!(
@@ -508,7 +509,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries: 2,
             service_name: "l2tp",
-            source_module: "creds/generic/l2tp_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/l2tp_credcheck",
         },
         combos,
         try_login,
@@ -634,7 +636,8 @@ async fn run_l2tp_subnet_scan(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "l2tp",
-            source_module: "creds/generic/l2tp_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/l2tp_credcheck",
             skip_tcp_check: true, // L2TP is UDP — no TCP pre-check
         },
         move |ip: std::net::IpAddr, port: u16, user: String, pass: String| {
@@ -773,7 +776,7 @@ fn try_l2tp_login_sync(
                         offset = 2;
                     }
 
-                    if pkt.payload.len() > offset + 4 {
+                    if pkt.payload.len() > offset + 6 {
                         let protocol =
                             u16::from_be_bytes([pkt.payload[offset], pkt.payload[offset + 1]]);
                         if protocol == PPP_CHAP {
@@ -806,7 +809,8 @@ fn try_l2tp_login_sync(
     for _ in 0..5 {
         match session.recv_packet(timeout) {
             Ok(pkt) => {
-                if !pkt.is_control && pkt.payload.len() > 4 {
+                if !pkt.is_control && !pkt.payload.is_empty() {
+                    if pkt.payload.len() < 3 { continue; }
                     let mut offset = 0;
                     if pkt.payload[0] == 0xFF && pkt.payload[1] == 0x03 {
                         offset = 2;

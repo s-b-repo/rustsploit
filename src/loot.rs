@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
-use serde::{Serialize, Deserialize};
+
 use colored::*;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Metadata for a stored loot item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +32,9 @@ impl LootStore {
 
         let loot_dir = base.join("loot");
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) {
+            eprintln!("[!] Failed to create loot directory {}: {}", loot_dir.display(), e);
+        }
 
         let index_path = base.join("loot_index.json");
         let entries = if index_path.exists() {
@@ -41,11 +44,16 @@ impl LootStore {
                     Err(e) => {
                         eprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
                         let backup = index_path.with_extension("json.bak");
-                        let _ = std::fs::copy(&index_path, &backup);
+                        if let Err(e) = std::fs::copy(&index_path, &backup) {
+                            eprintln!("[!] Failed to backup corrupted loot index: {}", e);
+                        }
                         Vec::new()
                     }
                 },
-                Err(_) => Vec::new(),
+                Err(e) => {
+                    eprintln!("[!] Failed to read loot_index.json: {}", e);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -104,11 +112,27 @@ impl LootStore {
             return None;
         }
 
-        if tokio::fs::write(&file_path, data).await.is_err() {
-            return None;
+        {
+            let file = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[!] Failed to create loot file: {}", e);
+                    return None;
+                }
+            };
+            let mut file = file;
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, data).await {
+                eprintln!("[!] Failed to write loot data: {}", e);
+                return None;
+            }
         }
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).await;
 
         let entry = LootEntry {
             id: id.clone(),
@@ -174,7 +198,9 @@ impl LootStore {
         };
         if let Some(fname) = filename {
             if let Some(path) = self.file_path(&fname) {
-                let _ = tokio::fs::remove_file(&path).await;
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
+                }
             }
         }
         removed
@@ -191,7 +217,9 @@ impl LootStore {
         self.save_locked(&[]).await;
         for fname in filenames {
             if let Some(path) = self.file_path(&fname) {
-                let _ = tokio::fs::remove_file(&path).await;
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
+                }
             }
         }
     }
@@ -216,12 +244,34 @@ impl LootStore {
 
     async fn save_locked(&self, entries: &[LootEntry]) {
         let tmp = self.index_path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(entries) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, &self.index_path).await;
-                use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::set_permissions(&self.index_path, std::fs::Permissions::from_mode(0o600)).await;
+        let json = match serde_json::to_string_pretty(entries) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[!] Failed to serialize loot index: {}", e);
+                return;
             }
+        };
+        let file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[!] Failed to write loot index: {}", e);
+                return;
+            }
+        };
+        let mut file = file;
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await {
+            eprintln!("[!] Failed to write loot index data: {}", e);
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &self.index_path).await {
+            eprintln!("[!] Failed to rename loot index: {}", e);
         }
     }
 

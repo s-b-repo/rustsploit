@@ -1,6 +1,7 @@
-use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use anyhow::{anyhow, Result};
 use ipnetwork::IpNetwork;
 use regex::Regex;
 
@@ -73,6 +74,12 @@ impl GlobalConfig {
             let canonical = path.canonicalize()
                 .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", trimmed, e))?;
             let canonical_str = canonical.to_string_lossy().to_string();
+            if canonical_str.len() > MAX_TARGET_LENGTH {
+                return Err(anyhow!(
+                    "Canonical path too long (max {} characters)",
+                    MAX_TARGET_LENGTH
+                ));
+            }
             let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
             *target_guard = Some(TargetConfig::Single(canonical_str));
             return Ok(());
@@ -196,15 +203,6 @@ impl GlobalConfig {
     /// Check if global target is a subnet
     pub fn is_subnet(&self) -> bool {
         self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)) | Some(TargetConfig::Multi(_)))).unwrap_or(false)
-    }
-
-    /// Get the target subnet if set
-    pub fn get_target_subnet(&self) -> Option<IpNetwork> {
-        let guard = self.target.read().ok()?;
-        match guard.as_ref() {
-            Some(TargetConfig::Subnet(net)) => Some(*net),
-            _ => None,
-        }
     }
 
     /// Get the size of the target (number of IPs)
@@ -338,21 +336,7 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 /// `check_http`, `check_https`
 #[derive(Clone, Debug)]
 pub struct ModuleConfig {
-    pub port: Option<u16>,
-    pub username_wordlist: Option<String>,
-    pub password_wordlist: Option<String>,
-    pub concurrency: Option<usize>,
-    pub stop_on_success: Option<bool>,
-    pub save_results: Option<bool>,
-    pub output_file: Option<String>,
-    pub verbose: Option<bool>,
-    pub combo_mode: Option<bool>,
-    /// Generic key→value prompt overrides.
-    /// When set, `cfg_prompt_*` functions in utils.rs return these values
-    /// instead of prompting stdin. Keys match prompt names like "port", "mode", etc.
     pub custom_prompts: HashMap<String, String>,
-    /// When true, cfg_prompt_* will return an error instead of falling back
-    /// to stdin. This prevents the API server from blocking on interactive prompts.
     pub api_mode: bool,
 }
 
@@ -365,15 +349,6 @@ impl ModuleConfig {
 impl Default for ModuleConfig {
     fn default() -> Self {
         Self {
-            port: None,
-            username_wordlist: None,
-            password_wordlist: None,
-            concurrency: None,
-            stop_on_success: None,
-            save_results: None,
-            output_file: None,
-            verbose: None,
-            combo_mode: None,
             custom_prompts: HashMap::new(),
             api_mode: false,
         }
@@ -409,8 +384,6 @@ pub fn get_run_target() -> Option<String> {
         .flatten()
 }
 
-/// Get the results directory (~/.rustsploit/results/) — creates it if needed.
-/// Module output files are stored here when running via API.
 pub fn results_dir() -> std::path::PathBuf {
     let dir = home::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -418,7 +391,9 @@ pub fn results_dir() -> std::path::PathBuf {
         .join("results");
     if !dir.exists() {
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) {
+            eprintln!("[!] Failed to create results directory {}: {}", dir.display(), e);
+        }
     }
     dir
 }

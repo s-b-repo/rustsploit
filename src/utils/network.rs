@@ -2,10 +2,12 @@
 //
 // Network utility functions: honeypot detection, TCP connection with source port, etc.
 
-use colored::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
+
+use colored::*;
 use tokio::net::TcpStream;
+
 use super::target::extract_ip_from_target;
 
 /// Get the globally configured source port (from `setg source_port` or `set source_port`).
@@ -111,11 +113,75 @@ pub async fn tcp_connect_with_source(
     }
 }
 
+/// Create a TCP connection to a resolved `SocketAddr` with optional source port binding.
+/// Skips DNS resolution — use this when you already have an IP address.
+#[inline]
+pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
+    let src_port = get_global_source_port().await;
+
+    if let Some(port) = src_port {
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+
+        let bind_addr = if addr.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        };
+        socket.bind(&bind_addr.into())?;
+
+        let _connect = socket.connect(&addr.into());
+        let std_stream: std::net::TcpStream = socket.into();
+        let stream = TcpStream::from_std(std_stream)?;
+
+        tokio::time::timeout(timeout, stream.writable()).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"))??;
+
+        if let Some(err) = stream.take_error()? {
+            return Err(err);
+        }
+
+        Ok(stream)
+    } else {
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out")),
+        }
+    }
+}
+
 /// Quick TCP port open check with global source port support.
-/// Used by mass-scan probes as a drop-in replacement for raw TcpStream::connect.
+/// Uses zero-alloc SocketAddr path — no format!() or DNS resolution.
+#[inline]
 pub async fn tcp_port_open(ip: std::net::IpAddr, port: u16, timeout: Duration) -> bool {
-    let addr = format!("{}:{}", ip, port);
-    tcp_connect(&addr, timeout).await.is_ok()
+    tcp_connect_addr(SocketAddr::new(ip, port), timeout).await.is_ok()
+}
+
+/// Convenience wrapper: resolve a "host:port" string (or bare IP+port) via
+/// `ToSocketAddrs` and then delegate to [`tcp_connect_addr`]. Exploit modules
+/// that accept hostnames from user input should prefer this over raw
+/// `TcpStream::connect(&str)` so they still get source-port binding and
+/// consistent EINPROGRESS handling.
+pub async fn tcp_connect_str(addr_str: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    use tokio::net::lookup_host;
+    let first = lookup_host(addr_str)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!("DNS resolve '{}': {}", addr_str, e)))?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!("no address resolved for '{}'", addr_str)))?;
+    tcp_connect_addr(first, timeout).await
 }
 
 /// Blocking TCP connection with automatic global source port binding.
@@ -205,9 +271,50 @@ pub fn blocking_udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<std::net:
 
 
 
-/// Build a standard reqwest HTTP client with common defaults.
-/// Prints a one-time info notice if source_port is set (reqwest doesn't support it).
+/// Optional knobs for [`build_http_client_with`]. Use `HttpClientOpts::default()`
+/// for the plain "accept invalid certs, no cookies, no redirects" client.
+#[derive(Default, Clone)]
+pub struct HttpClientOpts {
+    /// Enable persistent cookie jar across requests on the same client.
+    pub cookie_store: bool,
+    /// Follow HTTP 3xx redirects (reqwest default is 10-hop; we default to OFF
+    /// so exploit modules see the raw response they asked for).
+    pub follow_redirects: bool,
+    /// Override the default User-Agent header.
+    pub user_agent: Option<String>,
+    /// Default headers applied to every request from this client.
+    pub default_headers: Option<reqwest::header::HeaderMap>,
+    /// Disable TLS cert verification (default: true, matching historical
+    /// build_http_client behaviour). Set to false if you want strict TLS.
+    pub accept_invalid_certs: bool,
+}
+
+impl HttpClientOpts {
+    /// Convenience: HttpClientOpts with `accept_invalid_certs: true` (the
+    /// historical build_http_client default).
+    pub fn permissive() -> Self {
+        Self {
+            accept_invalid_certs: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// Build a standard reqwest HTTP client with common defaults (permissive TLS,
+/// no cookies, no redirects). Prints a one-time info notice if source_port is
+/// set (reqwest doesn't support it).
 pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    build_http_client_with(timeout, HttpClientOpts::permissive())
+}
+
+/// Build a reqwest HTTP client with extended options. Every exploit module
+/// should go through this function (or the simpler [`build_http_client`])
+/// instead of rolling its own `reqwest::Client::builder()` so that source-port
+/// warnings, TLS defaults, and redirect policy stay centralised.
+pub fn build_http_client_with(
+    timeout: Duration,
+    opts: HttpClientOpts,
+) -> Result<reqwest::Client, reqwest::Error> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if get_global_source_port_sync().is_some()
         && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -217,10 +324,58 @@ pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::
             "[*] Note: source_port is set but HTTP (reqwest) does not support source port binding. TCP/UDP/SSH modules will use the configured source port.".yellow()
         );
     }
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout)
-        .build()
+        .danger_accept_invalid_certs(opts.accept_invalid_certs);
+
+    if opts.cookie_store {
+        builder = builder.cookie_store(true);
+    }
+
+    builder = if opts.follow_redirects {
+        builder.redirect(reqwest::redirect::Policy::limited(10))
+    } else {
+        builder.redirect(reqwest::redirect::Policy::none())
+    };
+
+    if let Some(ua) = opts.user_agent {
+        builder = builder.user_agent(ua);
+    }
+
+    if let Some(headers) = opts.default_headers {
+        builder = builder.default_headers(headers);
+    }
+
+    builder.build()
+}
+
+/// Pre-check a random IP before dispatching a module in mass-scan mode.
+/// Returns `true` if the IP should be scanned, `false` if it should be skipped.
+///
+/// Checks performed (in order, fastest to slowest):
+/// 1. **Port pre-check** — if `service_port` is Some, verifies TCP port is open (3s timeout).
+///    Skips 90%+ of random IPs that don't run the target service.
+/// 2. **Honeypot detection** — if `honeypot_check` is true, checks for 11+ open ports.
+///
+/// Designed to be called from the framework mass-scan loop in `commands/mod.rs`.
+pub async fn mass_scan_precheck(
+    ip: std::net::IpAddr,
+    service_port: Option<u16>,
+    honeypot_check: bool,
+) -> bool {
+    if let Some(port) = service_port {
+        if !tcp_port_open(ip, port, Duration::from_secs(3)).await {
+            return false;
+        }
+    }
+    if honeypot_check {
+        let ip_str = ip.to_string();
+        if quick_honeypot_check(&ip_str).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// Fast parallel honeypot check for a single IP. Returns true if likely honeypot.

@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
-use serde::{Serialize, Deserialize};
+
 use colored::*;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// A tracked host discovered during an engagement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +51,9 @@ impl Workspace {
             .join(".rustsploit")
             .join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir);
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) {
+            eprintln!("[!] Failed to create workspaces directory {}: {}", base_dir.display(), e);
+        }
 
         let data = Self::load_sync(&base_dir, "default");
         Self {
@@ -74,11 +77,16 @@ impl Workspace {
                     Err(e) => {
                         eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        let _ = std::fs::copy(&path, &backup);
+                        if let Err(e) = std::fs::copy(&path, &backup) {
+                            eprintln!("[!] Failed to backup corrupted workspace '{}': {}", name, e);
+                        }
                         WorkspaceData::default()
                     }
                 },
-                Err(_) => WorkspaceData::default(),
+                Err(e) => {
+                    eprintln!("[!] Failed to read workspace '{}': {}", name, e);
+                    WorkspaceData::default()
+                }
             }
         } else {
             WorkspaceData::default()
@@ -98,7 +106,9 @@ impl Workspace {
                     Err(e) => {
                         eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        let _ = tokio::fs::copy(&path, &backup).await;
+                        if let Err(e) = tokio::fs::copy(&path, &backup).await {
+                            eprintln!("[!] Failed to backup corrupted workspace '{}': {}", name, e);
+                        }
                         WorkspaceData::default()
                     }
                 },
@@ -124,14 +134,22 @@ impl Workspace {
         // Clone data to release lock before file I/O
         let data_snapshot = self.data.read().await.clone();
         let tmp = path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(&data_snapshot) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
+        match serde_json::to_string_pretty(&data_snapshot) {
+            Ok(json) => {
+                if let Err(e) = tokio::fs::write(&tmp, &json).await {
+                    eprintln!("[!] Failed to write workspace tmp file: {}", e);
+                    return;
+                }
                 if let Err(e) = tokio::fs::rename(&tmp, &path).await {
                     eprintln!("[!] Failed to save workspace: {}", e);
                 } else {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+                    if let Err(e) = crate::utils::set_secure_permissions_async(&path, 0o600).await {
+                        eprintln!("[!] Workspace {} saved but chmod 0o600 failed: {} — file may be world-readable", path.display(), e);
+                    }
                 }
+            }
+            Err(e) => {
+                eprintln!("[!] Failed to serialize workspace data: {}", e);
             }
         }
     }
@@ -152,7 +170,8 @@ impl Workspace {
         let mut names = Vec::new();
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(entries) => entries,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[!] Failed to read workspaces directory {}: {}", self.base_dir.display(), e);
                 names.push("default".to_string());
                 return names;
             }

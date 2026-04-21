@@ -2,8 +2,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use once_cell::sync::Lazy;
+
 use colored::*;
+use once_cell::sync::Lazy;
 
 /// Global spool state for console logging.
 pub struct SpoolState {
@@ -42,23 +43,31 @@ impl SpoolState {
     }
 
     fn start_at_path(&self, resolved: &Path, display_name: &str) -> Result<(), String> {
-        // Reject symlinks
-        if resolved.is_symlink() {
-            return Err("Symlinks not allowed for spool files".to_string());
-        }
-        match File::create(resolved) {
+        let mut guard = self.file.write().map_err(|_| "Failed to acquire spool lock".to_string())?;
+
+        use std::fs::OpenOptions;
+        #[cfg(unix)]
+        let open_result = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(resolved)
+        };
+        #[cfg(not(unix))]
+        let open_result = OpenOptions::new().write(true).create(true).truncate(true).open(resolved);
+        match open_result {
             Ok(f) => {
-                if let Ok(mut guard) = self.file.write() {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let mut file = f;
-                    let _ = writeln!(file, "# RustSploit Console Log - Started {}", ts);
-                    let _ = writeln!(file, "# ==========================================");
-                    let _ = writeln!(file);
-                    let _ = file.flush();
-                    *guard = Some((file, display_name.to_string()));
-                    return Ok(());
-                }
-                Err("Failed to acquire spool lock".to_string())
+                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                let mut file = f;
+                if let Err(e) = writeln!(file, "# RustSploit Console Log - Started {}", ts) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = writeln!(file, "# ==========================================") { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = writeln!(file) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
+                *guard = Some((file, display_name.to_string()));
+                Ok(())
             }
             Err(e) => Err(format!("Failed to create spool file: {}", e)),
         }
@@ -69,9 +78,9 @@ impl SpoolState {
         if let Ok(mut guard) = self.file.write() {
             if let Some((mut file, name)) = guard.take() {
                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                let _ = writeln!(file);
-                let _ = writeln!(file, "# Spool ended {}", ts);
-                let _ = file.flush();
+                if let Err(e) = writeln!(file) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = writeln!(file, "# Spool ended {}", ts) { eprintln!("[!] Spool write error: {}", e); }
+                if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
                 return Some(name);
             }
         }
@@ -88,23 +97,46 @@ impl SpoolState {
         self.file.read().ok()?.as_ref().map(|(_, name)| name.clone())
     }
 
-    /// Write a line to the spool file (if active).
-    pub fn write_line(&self, msg: &str) {
+    /// Write a line to the spool file (if active). Flushes after write (BUG 11 fix).
+    /// Returns `Err` on write/flush failure so callers can react.
+    pub fn write_line(&self, msg: &str) -> Result<(), std::io::Error> {
         if let Ok(mut guard) = self.file.write() {
             if let Some((ref mut file, _)) = *guard {
-                if let Err(e) = writeln!(file, "{}", msg) {
-                    eprintln!("[!] Spool write error: {}", e);
-                }
+                writeln!(file, "{}", msg)?;
+                file.flush()?;
             }
         }
+        Ok(())
     }
 }
 
 fn resolve_spool_path(path: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(path);
     if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            return Err(format!("Parent directory '{}' does not exist", parent.display()));
+        if !parent.as_os_str().is_empty() {
+            if !parent.exists() {
+                return Err(format!("Parent directory '{}' does not exist", parent.display()));
+            }
+            // Bug #96: O_NOFOLLOW on the target file is not enough — if the
+            // parent directory is itself a symlink (e.g. `./logs` → /tmp/evil),
+            // the spool file gets written inside the symlink target. Reject
+            // symlinked parents so spool files stay in the intended CWD subtree.
+            match std::fs::symlink_metadata(parent) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(format!(
+                        "Parent directory '{}' is a symlink — refusing to spool through it",
+                        parent.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to stat parent directory '{}': {}",
+                        parent.display(),
+                        e
+                    ));
+                }
+            }
         }
     }
     Ok(p)
@@ -115,7 +147,9 @@ pub static SPOOL: Lazy<SpoolState> = Lazy::new(SpoolState::new);
 /// Write a message to both stdout and the spool file.
 pub fn sprintln(msg: &str) {
     println!("{}", msg);
-    SPOOL.write_line(msg);
+    if let Err(e) = SPOOL.write_line(msg) {
+        eprintln!("[!] Spool write error: {}", e);
+    }
 }
 
 /// Display spool status.

@@ -3,8 +3,9 @@ use colored::*;
 use reqwest::ClientBuilder;
 use std::{io::Write, net::IpAddr, sync::Arc, time::Duration};
 
-use crate::modules::creds::utils::{
-    generate_combos, is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
+use crate::utils::{
+    generate_combos_mode, parse_combo_mode, load_credential_file,
+    is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
 };
 use crate::utils::{
@@ -42,6 +43,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -120,16 +122,19 @@ pub async fn run(target: &str) -> Result<()> {
                             if let Ok(b) = r.text().await {
                                 if b.contains("\"ok\":true") || b.contains("\"ok\": true") {
                                     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                    let _ = crate::cred_store::store_credential(
-                                        &ip.to_string(),
-                                        port,
-                                        "couchdb",
-                                        user,
-                                        pass,
-                                        crate::cred_store::CredType::Password,
-                                        "creds/generic/couchdb_bruteforce",
-                                    )
-                                    .await;
+                                    {
+                                        let id = crate::cred_store::store_credential(
+                                            &ip.to_string(),
+                                            port,
+                                            "couchdb",
+                                            user,
+                                            pass,
+                                            crate::cred_store::CredType::Password,
+                                            "creds/generic/couchdb_credcheck",
+                                        )
+                                        .await;
+                                        if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
+                                    }
                                     return Some(format!(
                                         "[{}] {}:{}:{}:{}\n",
                                         ts, ip, port, user, pass
@@ -207,7 +212,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "couchdb",
-                source_module: "creds/generic/couchdb_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/couchdb_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -286,12 +292,7 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_mode = cfg_prompt_yes_no(
-        "combo_mode",
-        "Combination mode? (try every pass with every user)",
-        false,
-    )
-    .await?;
+    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
     let normalized = normalize_target(target)?;
     let connect_addr = format!("{}:{}", normalized, port);
@@ -355,7 +356,11 @@ pub async fn run(target: &str) -> Result<()> {
         return Err(anyhow!("No passwords available"));
     }
 
-    let combos = generate_combos(&usernames, &passwords, combo_mode);
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
+        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
     let timeout_duration = Duration::from_secs(connection_timeout);
 
     let try_login = move |t: String, p: u16, user: String, pass: String| {
@@ -383,7 +388,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "couchdb",
-            source_module: "creds/generic/couchdb_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/couchdb_credcheck",
         },
         combos,
         try_login,

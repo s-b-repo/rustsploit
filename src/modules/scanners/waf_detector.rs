@@ -11,7 +11,7 @@ use colored::*;
 use std::time::Duration;
 use std::collections::HashMap;
 use crate::utils::{cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -34,6 +34,7 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   WAF / CDN Detection Scanner                                ║".cyan());
     crate::mprintln!("{}", "║   Fingerprint web application firewalls and CDN providers    ║".cyan());

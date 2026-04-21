@@ -16,6 +16,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   System Ulimit Configuration Utility                     ║".cyan());
     crate::mprintln!("{}", "║   Raises file descriptor limits for brute forcing         ║".cyan());
