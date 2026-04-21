@@ -9,7 +9,7 @@ use pnet_packet::Packet;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashSet,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufRead, BufReader, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio::{process::Command, sync::Semaphore, task, time::Duration};
+use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Duration};
 
 use rand::RngExt;
 use std::io::Read;
@@ -114,6 +114,7 @@ impl PingMethod {
 
 /// Main entry point triggered via the dispatcher
 pub async fn run(initial_target: &str) -> Result<()> {
+    crate::utils::require_root("ping_sweep (raw ICMP socket)")?;
     let config = gather_configuration(initial_target).await?;
     execute_ping_sweep(&config).await
 }
@@ -350,8 +351,20 @@ fn methods_summary(methods: &[PingMethod]) -> String {
 }
 
 async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
+    const MAX_CIDR_HOSTS: usize = 1_048_576;
     let mut host_set: HashSet<IpAddr> = HashSet::new();
     for net in &config.targets {
+        let size: u128 = match net.size() {
+            ipnetwork::NetworkSize::V4(n) => n as u128,
+            ipnetwork::NetworkSize::V6(n) => n,
+        };
+        if size > MAX_CIDR_HOSTS as u128 {
+            crate::mprintln!(
+                "{}",
+                format!("[!] CIDR {} expands to {} hosts (max {}), skipping", net, size, MAX_CIDR_HOSTS).red()
+            );
+            continue;
+        }
         for host in net.iter() {
             host_set.insert(host);
         }
@@ -446,7 +459,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     )
                     .dimmed()
                 );
-                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
 
             if !successes.is_empty() {
@@ -477,12 +490,12 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     }
 
     for task in tasks {
-        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = task.await;
     }
     
     // Clear progress line
     crate::mprint!("\r{}\r", " ".repeat(80));
-    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     let up_hosts = success_counter.load(Ordering::Relaxed);
     crate::mprintln!(
@@ -531,11 +544,10 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
 }
 
 fn save_hosts_to_file(hosts: &[String], file_path: &str) -> Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(file_path)
+    let mut file = File::create(file_path)
         .with_context(|| format!("Failed to create file '{}'", file_path))?;
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600)) {
-        crate::meprintln!("[!] Permission error on {}: {}", file_path, e);
+    if let Err(e) = crate::utils::set_secure_permissions(file_path, 0o600) {
+        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", file_path, e);
     }
 
     for host in hosts {
@@ -607,11 +619,12 @@ async fn tcp_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<
         
         tasks.push(tokio::spawn(async move {
             let socket = SocketAddr::new(ip, port);
-            match crate::utils::network::tcp_connect_addr(socket, timeout).await {
-                Ok(_stream) => {
+            match tokio::time::timeout(timeout, TcpStream::connect(socket)).await {
+                Ok(Ok(_stream)) => {
                     // Connection successful - drop stream immediately
                     Some(format!("TCP/{}", port))
                 }
+                Ok(Err(_)) => None,
                 Err(_) => None,
             }
         }));
@@ -987,7 +1000,8 @@ fn get_local_ipv4() -> Option<Ipv4Addr> {
     }
     
     // Fallback to UDP connection trick if pnet fails
-    if let Ok(socket) = crate::utils::network::blocking_udp_bind(None) {
+    use std::net::UdpSocket;
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
             if let Ok(local_addr) = socket.local_addr() {
                 if let IpAddr::V4(ipv4) = local_addr.ip() {
@@ -1004,6 +1018,12 @@ fn parse_ports(input: &str) -> Result<Vec<u16>> {
     let mut ports = Vec::new();
     for token in input.replace(',', " ").split_whitespace() {
         match token.parse::<u16>() {
+            Ok(0) => {
+                crate::mprintln!(
+                    "{}",
+                    "    Skipping port 0 (invalid)".yellow()
+                );
+            }
             Ok(port) => ports.push(port),
             Err(_) => {
                 crate::mprintln!(

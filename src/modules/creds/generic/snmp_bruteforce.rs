@@ -7,8 +7,7 @@ use std::{
     time::Duration,
 };
 
-
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, ComboMode,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -156,9 +155,9 @@ pub async fn run(target: &str) -> Result<()> {
         stop_on_success,
         verbose,
         delay_ms: 10,
+        jitter_ms: 50,
         max_retries: 2,
         service_name: "snmp",
-        jitter_ms: 0,
         source_module: "creds/generic/snmp_bruteforce",
     };
 
@@ -180,19 +179,16 @@ pub async fn run(target: &str) -> Result<()> {
                 match try_snmp_community(&addr, &community, snmp_version, timeout).await {
                     Ok(true) => {
                         // Store with CredType::Key for SNMP semantics
-                        {
-                            let id = crate::cred_store::store_credential(
-                                &target,
-                                port,
-                                "snmp",
-                                "",
-                                &community,
-                                crate::cred_store::CredType::Key,
-                                "creds/generic/snmp_bruteforce",
-                            )
-                            .await;
-                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-                        }
+                        let _ = crate::cred_store::store_credential(
+                            &target,
+                            port,
+                            "snmp",
+                            "",
+                            &community,
+                            crate::cred_store::CredType::Key,
+                            "creds/generic/snmp_bruteforce",
+                        )
+                        .await;
                         LoginResult::Success
                     }
                     Ok(false) => LoginResult::AuthFailed,
@@ -226,7 +222,7 @@ pub async fn run(target: &str) -> Result<()> {
         {
             for (host, _user, community) in &result.found {
                 crate::mprintln!("     {} -> community: '{}'", host, community);
-                if let Err(e) = writeln!(file, "{} -> community: '{}'", host, community) { crate::meprintln!("[!] Write error: {}", e); }
+                let _ = writeln!(file, "{} -> community: '{}'", host, community);
             }
             crate::mprintln!("[+] Results saved to '{}'", output_file);
         }
@@ -246,19 +242,16 @@ async fn try_snmp_community(
         .parse()
         .map_err(|e| anyhow!("Invalid address '{}': {}", normalized_addr, e))?;
 
-    // Async UDP socket
     let socket = crate::utils::udp_bind(None).await
         .map_err(|e| anyhow!("Failed to bind UDP socket: {}", e))?;
 
     let message = build_snmp_get_request(community, version);
 
-    // Send SNMP GET request
     socket
         .send_to(&message, &addr)
         .await
         .map_err(|e| anyhow!("Failed to send SNMP request: {}", e))?;
 
-    // Receive response with timeout
     let mut buf = vec![0u8; 4096];
     match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
         Ok(Ok((size, _))) => {
@@ -579,7 +572,7 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "snmp",
-            jitter_ms: 0,
+            jitter_ms: 50,
             source_module: "creds/generic/snmp_bruteforce",
             skip_tcp_check: true, // SNMP is UDP — no TCP pre-check
         },
@@ -590,19 +583,16 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
                 match try_snmp_community(&addr, &community, snmp_version, timeout).await {
                     Ok(true) => {
                         // Store with CredType::Key for SNMP semantics
-                        {
-                            let id = crate::cred_store::store_credential(
-                                &ip.to_string(),
-                                port,
-                                "snmp",
-                                "",
-                                &community,
-                                crate::cred_store::CredType::Key,
-                                "creds/generic/snmp_bruteforce",
-                            )
-                            .await;
-                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-                        }
+                        let _ = crate::cred_store::store_credential(
+                            &ip.to_string(),
+                            port,
+                            "snmp",
+                            "",
+                            &community,
+                            crate::cred_store::CredType::Key,
+                            "creds/generic/snmp_bruteforce",
+                        )
+                        .await;
                         LoginResult::Success
                     }
                     Ok(false) => LoginResult::AuthFailed,

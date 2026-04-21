@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use crate::modules::creds::utils::{run_mass_scan, MassScanConfig};
+use crate::utils::{run_mass_scan, MassScanConfig};
 use crate::utils::{cfg_prompt_output_file, cfg_prompt_yes_no};
 
 use colored::*;
@@ -112,7 +112,7 @@ pub async fn run(target: &str) -> Result<()> {
             cfg_prompt_output_file(
                 "results_file",
                 "Results output file",
-                "telnet_hose_creds.txt",
+                "telnet_sweep_creds.txt",
             )
             .await?,
         )
@@ -129,8 +129,8 @@ pub async fn run(target: &str) -> Result<()> {
         MassScanConfig {
             protocol_name: "Telnet-Hose",
             default_port: 23,
-            state_file: "telnet_hose_state.log",
-            default_output: "telnet_hose_results.txt",
+            state_file: "telnet_sweep_state.log",
+            default_output: "telnet_sweep_results.txt",
             default_concurrency: 500,
         },
         move |ip, port| {
@@ -195,10 +195,10 @@ pub async fn run(target: &str) -> Result<()> {
                                     user,
                                     pass,
                                     crate::cred_store::CredType::Password,
-                                    "creds/generic/telnet_hose",
+                                    "creds/generic/telnet_sweep",
                                 )
                                 .await;
-                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                             }
 
                             // Save to dedicated results file if requested

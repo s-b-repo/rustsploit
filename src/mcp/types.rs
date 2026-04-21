@@ -8,17 +8,11 @@ use serde_json::Value;
 /// Incoming JSON-RPC 2.0 request (or notification when `id` is `None`).
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
-    #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,
     /// `None` means this is a notification (no response expected).
     pub id: Option<Value>,
     pub method: String,
-    #[serde(default)]
     pub params: Option<Value>,
-}
-
-fn default_jsonrpc() -> String {
-    "2.0".to_string()
 }
 
 /// Outgoing JSON-RPC 2.0 response.

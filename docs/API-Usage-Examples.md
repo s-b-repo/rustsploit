@@ -1,12 +1,10 @@
 # API Usage Examples
 
-Practical workflows for interacting with the Rustsploit REST API.
+Practical workflows for interacting with the Rustsploit WebSocket API.
 
 > Start the server first: `cargo run -- --api`
 >
-> **Important:** All API traffic is PQ-encrypted (ML-KEM-768 + X25519 + ChaCha20-Poly1305). Direct `curl` cannot be used — you must complete a PQ handshake at `POST /pq/handshake` first. For interactive use, connect via the **ArcticAlopex GUI** (`http://localhost:3000`) which handles PQ sessions automatically.
->
-> The examples below show the **plaintext request/response format** for reference. In practice, request bodies are encrypted and wrapped in the PQ envelope. See `docs/API-Server.md` for the full PQ handshake protocol.
+> **Note:** All API endpoints (except `/health`) require a PQ WebSocket session. The examples below show the JSON message format sent over the WebSocket connection — not direct HTTP requests. Authentication is via PQ identity keys established during the handshake. The `Authorization: Bearer` headers shown are **legacy placeholders** retained for readability — they are not used.
 
 ---
 
@@ -26,7 +24,8 @@ curl http://localhost:8080/health
 ## List Available Modules
 
 ```bash
-curl      http://localhost:8080/api/modules
+curl -H "Authorization: Bearer my-secret-key" \
+     http://localhost:8080/api/modules
 ```
 
 **Response (truncated):**
@@ -39,7 +38,7 @@ curl      http://localhost:8080/api/modules
     "scanners/dir_brute",
     "creds/generic/ssh_bruteforce"
   ],
-  "count": 190,
+  "count": 240,
   "request_id": "abc123",
   "timestamp": "2026-03-17T14:01:00Z",
   "duration_ms": 2
@@ -51,18 +50,8 @@ curl      http://localhost:8080/api/modules
 ## Get Module Details
 
 ```bash
-curl      http://localhost:8080/api/module/exploits/sample_exploit
-```
-
----
-
-## Validate Parameters (Dry Run)
-
-```bash
-curl -X POST \
-          -H "Content-Type: application/json" \
-     -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
-     http://localhost:8080/api/validate
+curl -H "Authorization: Bearer my-secret-key" \
+     http://localhost:8080/api/module/exploits/sample_exploit
 ```
 
 ---
@@ -71,7 +60,8 @@ curl -X POST \
 
 ```bash
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
      http://localhost:8080/api/run
 ```
@@ -86,7 +76,8 @@ waiting on stdin.
 
 ```bash
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{"module": "exploits/heartbleed", "target": "10.10.10.10"}' \
      http://localhost:8080/api/run
 ```
@@ -96,7 +87,8 @@ curl -X POST \
 ```bash
 # TP-Link Archer RCE — supply credentials and command via API
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/routers/tplink/tplink_archer_rce_cve_2024_53375",
        "target": "192.168.1.1",
@@ -112,7 +104,8 @@ curl -X POST \
 ```bash
 # Zabbix SQL Injection — pre-select payload mode and credentials
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/webapps/zabbix/zabbix_7_0_0_sql_injection",
        "target": "10.10.10.10",
@@ -128,7 +121,8 @@ curl -X POST \
 ```bash
 # HTTP/2 Rapid Reset DoS test
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/frameworks/http2/cve_2023_44487_http2_rapid_reset",
        "target": "10.10.10.10",
@@ -150,7 +144,8 @@ curl -X POST \
 
 ```bash
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{
        "module": "creds/generic/ssh_bruteforce",
        "target": "10.10.10.10",
@@ -173,7 +168,8 @@ curl -X POST \
 
 ```bash
 curl -X POST \
-          -H "Content-Type: application/json" \
+     -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{
        "module": "exploits/mongo/mongobleed",
        "target": "10.10.10.10:27017",
@@ -188,59 +184,7 @@ curl -X POST \
 
 ---
 
-## Check Server Status & Statistics
-
-```bash
-curl      http://localhost:8080/api/status
-```
-
-**Response:**
-```json
-{
-  "uptime_seconds": 3600,
-  "requests_total": 142,
-  "auth_failures": 3,
-  "tracked_ips": 2,
-  "hardening_enabled": true,
-  "ip_limit": 5,
-  "request_id": "def456",
-  "timestamp": "2026-03-17T15:00:00Z",
-  "duration_ms": 1
-}
-```
-
----
-
-## View Tracked IPs
-
-```bash
-curl      http://localhost:8080/api/ips
-```
-
----
-
-## View Auth Failure Stats
-
-```bash
-curl      http://localhost:8080/api/auth-failures
-```
-
----
-
-## Manually Rotate API Key
-
-```bash
-curl -X POST \
-          http://localhost:8080/api/rotate-key
-```
-
-The response includes the **new key** — store it immediately as the old key is invalidated.
-
----
-
 ## Global Options
-
-> **Note:** Global options are scoped to the current workspace. Switching workspaces loads that workspace's own set of options.
 
 ```bash
 # Set global options
@@ -257,8 +201,6 @@ curl http://localhost:8080/api/options \
 ---
 
 ## Credential Store
-
-> **Note:** Credentials are scoped to the current workspace. Switching workspaces loads that workspace's own credential store.
 
 ```bash
 # Add a credential
@@ -493,7 +435,8 @@ curl http://localhost:8080/health
 curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/modules
 
 # 4. Port scan
-curl -X POST      -H "Content-Type: application/json" \
+curl -X POST -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
      -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}' \
      http://localhost:8080/api/run
 
@@ -503,56 +446,3 @@ curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/status
 # 6. View IPs
 curl -H "Authorization: Bearer my-secret-key" http://localhost:8080/api/ips
 ```
-
----
-
-## Multi-Target Examples
-
-The API supports multiple target formats: single IP, CIDR subnets, comma-separated lists, and hostname resolution.
-
-```bash
-# Single IP
-curl -X POST http://localhost:8080/api/run \
-  -H "Authorization: Bearer my-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"module": "scanners/port_scanner", "target": "192.168.1.1"}'
-
-# CIDR subnet
-curl -X POST http://localhost:8080/api/run \
-  -H "Authorization: Bearer my-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"module": "scanners/port_scanner", "target": "192.168.1.0/24"}'
-
-# Comma-separated list
-curl -X POST http://localhost:8080/api/run \
-  -H "Authorization: Bearer my-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"module": "scanners/port_scanner", "target": "10.0.0.1,10.0.0.2,10.0.0.3"}'
-
-# Hostname (resolved via DNS)
-curl -X POST http://localhost:8080/api/run \
-  -H "Authorization: Bearer my-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"module": "exploits/heartbleed", "target": "vulnerable.example.com"}'
-```
-
----
-
-## MCP Integration
-
-The MCP (Model Context Protocol) server runs over stdio with JSON-RPC 2.0 transport. It is designed for integration with Claude Desktop and other MCP-compatible clients.
-
-```bash
-# Start the MCP server
-cargo run -- --mcp
-```
-
-MCP tools can be invoked by any MCP-compatible client. Example tool calls (JSON-RPC 2.0 format):
-
-```json
-{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_modules", "arguments": {"category": "exploits"}}}
-{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run_module", "arguments": {"module_path": "scanners/port_scanner", "target": "192.168.1.1"}}}
-{"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "rustsploit:///status"}}
-```
-
-See [MCP Integration](MCP-Integration.md) for the full tool and resource reference.

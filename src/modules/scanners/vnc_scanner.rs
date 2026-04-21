@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -32,6 +32,7 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   VNC Security Scanner                                       ║".cyan());
     crate::mprintln!("{}", "║   Enumerate VNC versions and security types                  ║".cyan());
@@ -67,8 +68,9 @@ async fn scan_vnc(
 ) -> Result<VncResult> {
     let addr = format!("{}:{}", target, port);
 
-    let mut stream = crate::utils::network::tcp_connect(&addr, timeout_dur)
+    let mut stream = timeout(timeout_dur, tokio::net::TcpStream::connect(&addr))
         .await
+        .context("Connection timed out")?
         .context("Failed to connect to VNC server")?;
 
     // Step 1: Read server RFB version string (12 bytes: "RFB XXX.YYY\n")
@@ -283,15 +285,8 @@ pub async fn run(target: &str) -> Result<()> {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            f.write_all(content.as_bytes())
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-        }
+        std::fs::write(&output_path, content)
+            .with_context(|| format!("Failed to write results to {}", output_path))?;
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

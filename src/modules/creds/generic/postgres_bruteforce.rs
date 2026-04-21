@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -165,8 +165,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "postgresql",
-                jitter_ms: 0,
-                source_module: "creds/generic/postgres_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/postgres_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -350,8 +350,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "postgresql",
-            jitter_ms: 0,
-            source_module: "creds/generic/postgres_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/postgres_credcheck",
         },
         combos,
         try_login,

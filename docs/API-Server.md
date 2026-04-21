@@ -1,6 +1,6 @@
 # API Server
 
-Rustsploit includes a built-in REST API server (`src/api.rs`) with post-quantum encrypted transport and SSH-style identity key authentication. No TLS. No API keys.
+Rustsploit includes a built-in API server (`src/api.rs`, `src/ws.rs`) with post-quantum encrypted WebSocket transport and SSH-style identity key authentication. No TLS. No API keys.
 
 ---
 
@@ -78,6 +78,7 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/pq/handshake` | Establish PQ-encrypted session (mutual auth) |
+| `GET` | `/pq/ws` | Upgrade to PQ-encrypted WebSocket transport |
 
 ### Protected (26 endpoints — require active PQ session)
 
@@ -117,42 +118,21 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 | `GET` | `/api/results` | List saved result files |
 | `GET` | `/api/results/{filename}` | Download a result file |
 
-**Global Options** (per-workspace)
-
-Options set via `setg` are now scoped to the current workspace. Each workspace stores its own options at `~/.rustsploit/workspaces/{name}_options.json`. Switching workspaces loads the target workspace's options automatically.
+**Global Options**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/options` | List all global options (`setg` values) for the current workspace |
-| `POST` | `/api/options` | Set a global option in the current workspace |
-| `DELETE` | `/api/options` | Delete a global option from the current workspace |
+| `GET` | `/api/options` | List all global options (`setg` values) |
+| `POST` | `/api/options` | Set a global option |
+| `DELETE` | `/api/options` | Delete a global option |
 
-**Credential Store** (per-workspace, per-user)
-
-Credentials are scoped to the current workspace and owned by individual users. Non-admin users only see credentials they added. Owners and admins can view all credentials by passing `?show_all=1`. The ArcticAlopex GUI tracks credential ownership via the `credential_owners` table.
+**Credential Store**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/creds` | List user's own credentials (or `?show_all=1` for admins) |
-| `POST` | `/api/creds` | Add a credential (automatically assigned to current user) |
-| `DELETE` | `/api/creds` | Delete a credential by ID (must own it, unless admin) |
-
-**User Preferences** (per-user, ArcticAlopex)
-
-Each user has their own key-value preferences via the Account Settings page.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/preferences` | List all preferences for current user |
-| `POST` | `/api/preferences` | Set a preference `{ key, value }` |
-| `DELETE` | `/api/preferences?key=` | Remove a preference |
-
-**Audit/Activity Log Export**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/audit?export=csv\|json` | Download audit log as CSV or JSON file |
-| `GET` | `/api/activity?export=csv\|json` | Download activity feed as CSV or JSON file |
+| `GET` | `/api/creds` | List stored credentials |
+| `POST` | `/api/creds` | Add a credential manually |
+| `DELETE` | `/api/creds` | Delete a credential by ID |
 
 **Workspace / Hosts / Services**
 
@@ -163,7 +143,7 @@ Each user has their own key-value preferences via the Account Settings page.
 | `GET` | `/api/services` | List discovered services |
 | `POST` | `/api/services` | Add a service (host, port, protocol, name) |
 | `GET` | `/api/workspace` | Get current workspace name/data |
-| `POST` | `/api/workspace` | Switch to a different workspace (also switches credentials and options to the target workspace) |
+| `POST` | `/api/workspace` | Switch to a different workspace |
 
 **Loot**
 
@@ -185,21 +165,30 @@ Each user has their own key-value preferences via the Account Settings page.
 |--------|------|-------------|
 | `GET` | `/api/export?format=<json\|csv\|summary>` | Export engagement data |
 
-**Check (Non-Destructive Vulnerability Verification)**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/check` | Run a module's `check()` function without exploitation |
-
-**Subnet Execution**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/run_all` | Execute a module against all IPs in a CIDR subnet (concurrent) |
+> **Note:** The `check` command (non-destructive vulnerability check) is available via `POST /api/shell` with `{"command": "check"}` when a module and target are set. There is no dedicated `/api/check` endpoint.
 
 > All responses include `request_id`, `timestamp`, and `duration_ms` fields for observability.
 
-> **Total: 29 endpoints** (1 public + 28 protected) across 10 resource categories.
+> **Total: 28 endpoints** (2 public + 26 protected) across 9 resource categories, plus WebSocket transport.
+
+### WebSocket Transport
+
+`GET /pq/ws` upgrades the connection to a PQ-encrypted WebSocket. After the initial `/pq/handshake`, clients can switch to WebSocket for persistent bidirectional communication.
+
+**Features:**
+- PQ-encrypted frames using ChaCha20-Poly1305 (same security as REST)
+- Max 100 concurrent WebSocket connections
+- 30-second heartbeat interval
+- 1 MiB max frame size
+- Sub-session key derivation from the PQ handshake session
+
+**Headers required:**
+- `X-PQ-Session-Id` — session ID from `/pq/handshake`
+- Standard WebSocket upgrade headers
+
+WebSocket messages use the same JSON request/response format as REST endpoints. The WebSocket transport is ideal for long-running operations, real-time job monitoring, and persistent client connections.
+
+---
 
 ### Shell Command Endpoint
 
@@ -327,7 +316,6 @@ pre-fill interactive prompts so modules run non-interactively via the API.
 | Key | Type | Used By | Description |
 |-----|------|---------|-------------|
 | `port` | u16 | Most modules | Target service port |
-| `source_port` | u16 | Scanners/exploits | Source port for outbound connections |
 | `target` | string | Some modules | Override target when empty |
 | `command` | string | RCE exploits | Command to execute |
 | `username` | string | Auth exploits/creds | Username or login |
@@ -398,16 +386,3 @@ pre-fill interactive prompts so modules run non-interactively via the API.
   }
 }
 ```
-
----
-
-### MCP Protocol
-
-Rustsploit also exposes an MCP (Model Context Protocol) server via JSON-RPC 2.0 over stdio, enabling integration with Claude Desktop and other MCP-compatible tools. The MCP server provides 30 tools and 7 resources covering module execution, credential management, workspace tracking, loot storage, global options, background jobs, and data export.
-
-Start the MCP server with:
-```bash
-cargo run -- --mcp
-```
-
-See [MCP Integration](MCP-Integration.md) for full details on tools, resources, and configuration.

@@ -1,10 +1,20 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
-use serde::Serialize;
+use std::sync::RwLock;
+
 use colored::*;
-use tokio::sync::watch;
+use serde::Serialize;
+use tokio::sync::{broadcast, watch};
+
+#[derive(Clone, Debug, Serialize)]
+pub enum JobEvent {
+    Started { id: u32, module: String, target: String },
+    Completed { id: u32 },
+    Failed { id: u32, error: String },
+    Cancelled { id: u32 },
+}
 
 /// Status of a background job.
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +36,57 @@ impl std::fmt::Display for JobStatus {
     }
 }
 
+/// Thread-safe output + progress tracker shared between the job task and API readers.
+pub struct JobProgress {
+    output: RwLock<std::collections::VecDeque<String>>,
+    total_lines_pushed: AtomicU64,
+    pub success_count: AtomicU64,
+    pub fail_count: AtomicU64,
+    pub total_targets: AtomicU64,
+    pub last_activity: RwLock<chrono::DateTime<chrono::Local>>,
+}
+
+const MAX_OUTPUT_LINES: usize = 5000;
+
+impl JobProgress {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            output: RwLock::new(std::collections::VecDeque::with_capacity(MAX_OUTPUT_LINES)),
+            total_lines_pushed: AtomicU64::new(0),
+            success_count: AtomicU64::new(0),
+            fail_count: AtomicU64::new(0),
+            total_targets: AtomicU64::new(0),
+            last_activity: RwLock::new(chrono::Local::now()),
+        })
+    }
+
+    pub fn push_line(&self, line: String) {
+        if let Ok(mut buf) = self.output.write() {
+            if buf.len() >= MAX_OUTPUT_LINES {
+                buf.pop_front();
+            }
+            buf.push_back(line);
+        }
+        self.total_lines_pushed.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut ts) = self.last_activity.write() {
+            *ts = chrono::Local::now();
+        }
+    }
+
+    pub fn get_output(&self, from: usize) -> Vec<String> {
+        self.output.read().unwrap_or_else(|e| e.into_inner())
+            .iter().skip(from).cloned().collect()
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.output.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn completed(&self) -> u64 {
+        self.success_count.load(Ordering::Relaxed) + self.fail_count.load(Ordering::Relaxed)
+    }
+}
+
 /// A background job entry.
 pub struct Job {
     pub id: u32,
@@ -33,34 +94,41 @@ pub struct Job {
     pub target: String,
     pub started_at: chrono::DateTime<chrono::Local>,
     pub status: JobStatus,
+    pub progress: Arc<JobProgress>,
+    finished_at: Option<std::time::Instant>,
     cancel_tx: watch::Sender<bool>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Maximum number of tracked jobs (BUG 7 fix).
 const MAX_JOBS: usize = 1000;
-
-/// Default limit on concurrent running jobs (can be overridden via API).
+const FINISHED_JOB_RETENTION_SECS: u64 = 300;
 const DEFAULT_MAX_RUNNING: usize = 5;
 
 /// Manages background jobs.
 pub struct JobManager {
     jobs: RwLock<HashMap<u32, Job>>,
     next_id: AtomicU32,
-    /// Configurable limit on concurrent running jobs. Default: 5.
     max_running: AtomicU32,
+    event_tx: broadcast::Sender<JobEvent>,
 }
 
 impl JobManager {
     fn new() -> Self {
+        use rand::RngExt;
+        let start = rand::rng().random_range(1..(1u32 << 24));
+        let (event_tx, _) = broadcast::channel(256);
         Self {
             jobs: RwLock::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
+            next_id: AtomicU32::new(start),
             max_running: AtomicU32::new(DEFAULT_MAX_RUNNING as u32),
+            event_tx,
         }
     }
 
-    /// Get the number of currently running jobs.
+    pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
+        self.event_tx.subscribe()
+    }
+
     pub fn running_count(&self) -> usize {
         self.jobs.read().map(|jobs| {
             jobs.values().filter(|j| {
@@ -69,26 +137,27 @@ impl JobManager {
         }).unwrap_or(0)
     }
 
-    /// Get the current max running jobs limit.
     pub fn get_max_running(&self) -> u32 {
         self.max_running.load(Ordering::Relaxed)
     }
 
-    /// Set the max running jobs limit (1-100).
     pub fn set_max_running(&self, limit: u32) {
         let clamped = limit.clamp(1, 100);
         self.max_running.store(clamped, Ordering::Relaxed);
     }
 
-    /// Spawn a module as a background job. Returns Ok(job_id) or Err if limit reached.
     pub fn spawn(
         &self,
         module: String,
         target: String,
         verbose: bool,
-    ) -> Result<u32, String> {
-        // Check running job limit before spawning
-        let running = self.running_count();
+        config: Option<crate::config::ModuleConfig>,
+    ) -> Result<(u32, Arc<JobProgress>), String> {
+        let mut jobs = self.jobs.write().map_err(|_| "Job lock poisoned".to_string())?;
+
+        let running = jobs.values().filter(|j| {
+            j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+        }).count();
         let max = self.max_running.load(Ordering::Relaxed) as usize;
         if running >= max {
             return Err(format!(
@@ -96,93 +165,166 @@ impl JobManager {
                 running, max
             ));
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
 
+        let mut id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        while jobs.contains_key(&id) {
+            id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if jobs.len() >= MAX_JOBS {
+            let now = std::time::Instant::now();
+            jobs.retain(|_, j| {
+                match j.finished_at {
+                    None => true,
+                    Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
+                }
+            });
+            if jobs.len() >= MAX_JOBS {
+                let mut finished: Vec<(u32, std::time::Instant)> = jobs.iter()
+                    .filter_map(|(jid, j)| j.finished_at.map(|t| (*jid, t)))
+                    .collect();
+                finished.sort_by_key(|(_, t)| *t);
+                for (oldest_id, _) in finished.into_iter().take(jobs.len() - MAX_JOBS + 1) {
+                    jobs.remove(&oldest_id);
+                }
+            }
+        }
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let progress = JobProgress::new();
+        let prog_clone = progress.clone();
         let mod_clone = module.clone();
         let tgt_clone = target.clone();
+        let evt_module = module.clone();
+        let evt_target = target.clone();
+        let event_tx = self.event_tx.clone();
 
         let handle = tokio::spawn(async move {
             let mut rx = cancel_rx;
+            prog_clone.push_line(format!("[*] Starting {} against {}", mod_clone, tgt_clone));
+            let run_fut = {
+                let m = mod_clone.clone();
+                let t = tgt_clone.clone();
+                async move {
+                    if let Some(cfg) = config {
+                        let (result, _ctx) = crate::context::run_with_context_target(
+                            cfg,
+                            t.clone(),
+                            || async move { crate::commands::run_module(&m, &t, verbose).await },
+                        ).await;
+                        result
+                    } else {
+                        crate::commands::run_module(&m, &t, verbose).await
+                    }
+                }
+            };
             tokio::select! {
-                result = crate::commands::run_module(&mod_clone, &tgt_clone, verbose) => {
+                result = run_fut => {
                     match result {
                         Ok(_) => {
+                            prog_clone.push_line(format!("[+] Completed: {} against {}", mod_clone, tgt_clone));
                             crate::mprintln!("\n{}", format!("[*] Job completed: {} against {}", mod_clone, tgt_clone).green());
+                            if let Err(e) = event_tx.send(JobEvent::Completed { id }) {
+                                tracing::debug!("No WS subscribers for job event: {}", e);
+                            }
                         }
                         Err(e) => {
-                            crate::meprintln!("\n{}", format!("[!] Job failed: {} - {}", mod_clone, e).red());
+                            let msg = e.to_string();
+                            prog_clone.push_line(format!("[-] Failed: {} - {}", mod_clone, msg));
+                            crate::meprintln!("\n{}", format!("[!] Job failed: {} - {}", mod_clone, msg).red());
+                            if let Err(e) = event_tx.send(JobEvent::Failed { id, error: msg }) {
+                                tracing::debug!("No WS subscribers for job event: {}", e);
+                            }
                         }
                     }
                 }
                 _ = async { while rx.changed().await.is_ok() { if *rx.borrow() { break; } } } => {
+                    prog_clone.push_line(format!("[!] Cancelled: {}", mod_clone));
                     crate::mprintln!("\n{}", format!("[*] Job cancelled: {}", mod_clone).yellow());
+                    if let Err(e) = event_tx.send(JobEvent::Cancelled { id }) {
+                        tracing::debug!("No WS subscribers for job event: {}", e);
+                    }
                 }
             }
         });
 
-        let job = Job {
+        jobs.insert(id, Job {
             id,
             module,
             target,
             started_at: chrono::Local::now(),
             status: JobStatus::Running,
+            progress: progress.clone(),
+            finished_at: None,
             cancel_tx,
             handle: Some(handle),
-        };
+        });
+        drop(jobs);
 
-        if let Ok(mut jobs) = self.jobs.write() {
-            // Evict finished jobs if at capacity (BUG 7 fix)
-            if jobs.len() >= MAX_JOBS {
-                jobs.retain(|_, j| {
-                    j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
-                });
-            }
-            jobs.insert(id, job);
+        if let Err(e) = self.event_tx.send(JobEvent::Started {
+            id,
+            module: evt_module,
+            target: evt_target,
+        }) {
+            tracing::debug!("No WS subscribers for job started event: {}", e);
         }
 
-        Ok(id)
+        Ok((id, progress))
     }
 
-    /// Kill a background job.
     pub fn kill(&self, id: u32) -> bool {
-        if let Ok(mut jobs) = self.jobs.write() {
-            if let Some(job) = jobs.get_mut(&id) {
-                if let Err(e) = job.cancel_tx.send(true) { crate::meprintln!("[!] Job cancel signal error: {}", e); }
-                if let Some(handle) = job.handle.take() {
-                    handle.abort();
-                }
-                job.status = JobStatus::Cancelled;
-                return true;
+        let handle_and_tx = {
+            let mut jobs = match self.jobs.write() {
+                Ok(j) => j,
+                Err(_) => return false,
+            };
+            let job = match jobs.get_mut(&id) {
+                Some(j) => j,
+                None => return false,
+            };
+            if let Err(e) = job.cancel_tx.send(true) {
+                crate::meprintln!("[!] Job cancel signal error: {}", e);
             }
-        }
-        false
-    }
-
-    /// List all jobs. Updates status for finished jobs and auto-cleans old ones.
-    pub fn list(&self) -> Vec<(u32, String, String, String, String)> {
-        // Use a single write lock to both update statuses and collect results
-        let mut result = Vec::new();
-        if let Ok(mut jobs) = self.jobs.write() {
-            // Update status for finished jobs (BUG 6 fix)
-            for job in jobs.values_mut() {
-                if let Some(ref handle) = job.handle {
-                    if handle.is_finished() {
-                        if matches!(job.status, JobStatus::Running) {
-                            job.status = JobStatus::Completed;
-                        }
-                    }
-                }
+            job.status = JobStatus::Cancelled;
+            if job.finished_at.is_none() {
+                job.finished_at = Some(std::time::Instant::now());
             }
-            // Auto-cleanup finished jobs (inline, avoids separate cleanup() lock)
-            jobs.retain(|_, job| {
-                if let Some(ref handle) = job.handle {
-                    !handle.is_finished()
-                } else {
-                    false
+            job.handle.take()
+        };
+        if let Some(handle) = handle_and_tx {
+            let abort_handle = handle.abort_handle();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if !handle.is_finished() {
+                    abort_handle.abort();
                 }
             });
-            // Collect results
+        }
+        true
+    }
+
+    pub fn list(&self) -> Vec<(u32, String, String, String, String)> {
+        let mut result = Vec::new();
+        if let Ok(mut jobs) = self.jobs.write() {
+            let now = std::time::Instant::now();
+            for job in jobs.values_mut() {
+                if let Some(ref handle) = job.handle {
+                    if handle.is_finished() && matches!(job.status, JobStatus::Running) {
+                        job.status = JobStatus::Completed;
+                    }
+                }
+                let terminal = matches!(
+                    job.status,
+                    JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
+                ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+                if terminal && job.finished_at.is_none() {
+                    job.finished_at = Some(now);
+                }
+            }
+            jobs.retain(|_, job| match job.finished_at {
+                None => true,
+                Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
+            });
             let mut ids: Vec<_> = jobs.keys().collect();
             ids.sort();
             for &id in &ids {
@@ -200,20 +342,55 @@ impl JobManager {
         result
     }
 
-    /// Clean up finished jobs.
+    pub fn get_detail(&self, id: u32) -> Option<(String, String, String, String, Arc<JobProgress>)> {
+        if let Ok(mut jobs) = self.jobs.write() {
+            if let Some(job) = jobs.get_mut(&id) {
+                if let Some(ref handle) = job.handle {
+                    if handle.is_finished() && matches!(job.status, JobStatus::Running) {
+                        job.status = JobStatus::Completed;
+                    }
+                }
+                let terminal = matches!(
+                    job.status,
+                    JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
+                ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+                if terminal && job.finished_at.is_none() {
+                    job.finished_at = Some(std::time::Instant::now());
+                }
+                return Some((
+                    job.module.clone(),
+                    job.target.clone(),
+                    job.started_at.format("%H:%M:%S").to_string(),
+                    format!("{}", job.status),
+                    job.progress.clone(),
+                ));
+            }
+        }
+        None
+    }
+
+    pub fn get_progress(&self, id: u32) -> Option<Arc<JobProgress>> {
+        self.jobs.read().ok().and_then(|jobs| {
+            jobs.get(&id).map(|j| j.progress.clone())
+        })
+    }
+
     pub fn cleanup(&self) {
         if let Ok(mut jobs) = self.jobs.write() {
-            jobs.retain(|_, job| {
-                if let Some(ref handle) = job.handle {
-                    !handle.is_finished()
-                } else {
-                    false
+            let now = std::time::Instant::now();
+            for job in jobs.values_mut() {
+                let finished = job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(true);
+                if finished && job.finished_at.is_none() {
+                    job.finished_at = Some(now);
                 }
+            }
+            jobs.retain(|_, job| match job.finished_at {
+                None => true,
+                Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
             });
         }
     }
 
-    /// Display jobs table.
     pub fn display(&self) {
         let jobs = self.list();
         if jobs.is_empty() {

@@ -11,7 +11,7 @@ use colored::*;
 use std::time::Duration;
 use std::collections::HashMap;
 use crate::utils::{cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -34,6 +34,7 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   WAF / CDN Detection Scanner                                ║".cyan());
     crate::mprintln!("{}", "║   Fingerprint web application firewalls and CDN providers    ║".cyan());
@@ -406,15 +407,8 @@ pub async fn run(target: &str) -> Result<()> {
             }
             content.push('\n');
         }
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            f.write_all(content.as_bytes())
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-        }
+        std::fs::write(&output_path, content)
+            .with_context(|| format!("Failed to write results to {}", output_path))?;
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

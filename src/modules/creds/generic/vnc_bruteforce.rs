@@ -21,7 +21,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, ComboMode,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -179,8 +179,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "vnc",
-                jitter_ms: 0,
-                source_module: "creds/generic/vnc_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/vnc_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, _user: String, pass: String| async move {
@@ -325,8 +325,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 100, // VNC servers often rate-limit; small delay helps
             max_retries,
             service_name: "vnc",
-            jitter_ms: 0,
-            source_module: "creds/generic/vnc_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/vnc_credcheck",
         },
         combos,
         try_login,

@@ -122,14 +122,19 @@ impl McpClient {
 
     /// Shut down the MCP server subprocess gracefully.
     pub async fn close(mut self) -> Result<()> {
-        // Drop stdin to signal EOF to the child process
         drop(self.stdin);
-        // Wait for the child to exit (with a timeout to avoid indefinite hangs)
-        if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            eprintln!("[!] Process wait timeout: {}", e);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => {
+                eprintln!("[!] MCP server wait error: {}", e);
+            }
+            Err(_) => {
+                eprintln!("[!] MCP server did not exit within 5s, killing");
+            }
         }
-        // If it didn't exit, kill it
-        if let Err(e) = self.child.kill().await { eprintln!("[!] Process kill error: {}", e); }
+        if let Err(e) = self.child.kill().await {
+            eprintln!("[!] Failed to kill MCP server: {}", e);
+        }
         Ok(())
     }
 

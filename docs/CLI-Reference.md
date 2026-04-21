@@ -36,7 +36,8 @@ An optional positional argument (`exploit`, `scanner`, `creds`) can be used to s
 | `--list-modules` | | Print all available modules and exit |
 | `--verbose` | `-v` | Enable detailed logging |
 | `--output-format` | | Control output: `text` (default) or `json` |
-| `--api` | | Start the PQ-encrypted REST API server |
+| `--api` | | Start the PQ-encrypted REST + WebSocket API server |
+| `--mcp` | | Start as MCP (Model Context Protocol) server on stdio |
 | `--interface <addr:port>` | | Bind address for API server (default: `127.0.0.1:8080`) |
 | `--pq-host-key <path>` | | PQ host key file (default: `~/.rustsploit/pq_host_key`) |
 | `--pq-authorized-keys <path>` | | Authorized client keys file (default: `~/.rustsploit/pq_authorized_keys`) |

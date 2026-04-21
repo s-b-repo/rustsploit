@@ -27,7 +27,7 @@ use tokio::{
 use ipnetwork::IpNetwork;
 
 use crate::utils::{cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_required};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
@@ -46,6 +46,7 @@ const DEFAULT_THREADS: usize = 20;
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SSH Password Spray                                              ║".cyan());
     crate::mprintln!("{}", "║   Spray single password across multiple targets/users             ║".cyan());
@@ -312,9 +313,9 @@ pub async fn password_spray(
                                 let id = crate::cred_store::store_credential(
                                     &host, port, "ssh", &user, &password,
                                     crate::cred_store::CredType::Password,
-                                    "creds/generic/ssh_spray",
+                                    "creds/generic/ssh_sweep",
                                 ).await;
-                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                             }
                             // Signal stop if stop_on_success is enabled
                             if stop_on_success {
@@ -408,8 +409,8 @@ pub async fn run(target: &str) -> Result<()> {
         return run_mass_scan(target, MassScanConfig {
             protocol_name: "SSH Spray",
             default_port: 22,
-            state_file: "ssh_spray_mass_state.log",
-            default_output: "ssh_spray_mass_results.txt",
+            state_file: "ssh_sweep_mass_state.log",
+            default_output: "ssh_sweep_mass_results.txt",
             default_concurrency: 200,
         }, move |ip: std::net::IpAddr, port: u16| {
             let users = users.clone();
@@ -541,12 +542,12 @@ pub async fn run(target: &str) -> Result<()> {
     
     // Save results?
     if !results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
-        let raw = cfg_prompt_default("output_file", "Output file", "ssh_spray_results.txt").await?;
+        let raw = cfg_prompt_default("output_file", "Output file", "ssh_sweep_results.txt").await?;
         // Force basename only — no directory traversal
         let output_path = std::path::Path::new(&raw)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "ssh_spray_results.txt".to_string());
+            .unwrap_or_else(|| "ssh_sweep_results.txt".to_string());
         if output_path.is_empty() || output_path.starts_with('.') {
             crate::mprintln!("{}", "[-] Invalid output filename".red());
         } else if let Err(e) = save_results(&results, &output_path) {

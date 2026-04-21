@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::native::payload_engine::{self as payload_mutator, PayloadCategory, MutatorConfig};
 use serde_json::json;
 
@@ -152,10 +152,12 @@ pub async fn run(target: &str) -> Result<()> {
     }
     if cfg_prompt_yes_no("enable_extended_methods", "Enable Extended HTTP methods (PUT, PATCH, HEAD, OPTIONS, CONNECT, TRACE, DEBUG)?", false).await? {
         methods.extend(vec![
-            Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
-            Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE, 
-            match Method::from_bytes(b"DEBUG") { Ok(m) => m, Err(_) => Method::GET }, // Method parsing is generally safe for ASCII
+            Method::PUT, Method::PATCH, Method::HEAD, Method::OPTIONS, Method::CONNECT, Method::TRACE,
         ]);
+        match Method::from_bytes(b"DEBUG") {
+            Ok(m) => methods.push(m),
+            Err(e) => crate::mprintln!("{}", format!("[!] Failed to register DEBUG method: {}", e).yellow()),
+        }
     }
 
     crate::mprintln!("1. Baseline (Standard Requests)");
@@ -691,9 +693,8 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
                                 Err(_) => bytes::Bytes::new(),
                             };
                             if let Ok(mut f) = File::create(&body_file) {
-                                use std::os::unix::fs::PermissionsExt;
-                                if let Err(e) = std::fs::set_permissions(&body_file, std::fs::Permissions::from_mode(0o600)) {
-                                    crate::meprintln!("[!] Permission error on {}: {}", body_file.display(), e);
+                                if let Err(e) = crate::utils::set_secure_permissions(&body_file, 0o600) {
+                                    crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", body_file.display(), e);
                                 }
                                 if let Err(e) = f.write_all(&body) {
                                     crate::meprintln!("[!] Failed to write body: {}", e);

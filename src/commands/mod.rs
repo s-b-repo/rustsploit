@@ -1,7 +1,7 @@
-pub mod exploit;
-pub mod scanner;
 pub mod creds;
+pub mod exploit;
 pub mod plugins;
+pub mod scanner;
 
 // Auto-generated registry of all module categories (from build.rs)
 mod registry {
@@ -12,10 +12,9 @@ use anyhow::{Result, Context};
 use crate::cli::Cli;
 use crate::config;
 use crate::utils::normalize_target;
-use crate::modules::creds::utils::{
+use crate::utils::{
     is_subnet_target, parse_subnet, subnet_host_count,
-    is_mass_scan_target, generate_random_public_ip, parse_exclusions,
-    check_and_mark_ip, EXCLUDED_RANGES,
+    is_mass_scan_target, generate_random_public_ip, parse_exclusions, EXCLUDED_RANGES,
 };
 
 /// CLI dispatcher
@@ -204,7 +203,11 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
     };
 
     // --- Random / Internet-wide mass scan (target == "random" or "0.0.0.0") ---
+    // Framework manages the loop: generates random public IPs, does a TCP port
+    // pre-check (if port is known via setg), enters batch mode so interactive
+    // prompts are asked once and cached for all subsequent hosts.
     if is_random {
+        let batch_guard = crate::context::enter_batch_mode();
         crate::mprintln!("{}", format!(
             "[*] Random mass scan — running '{}/{}' against random public IPs (Ctrl+C to stop)",
             category, module_name
@@ -218,22 +221,40 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             .try_get("max_random_hosts")
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
+        let module_timeout_secs: u64 = crate::global_options::GLOBAL_OPTIONS
+            .try_get("module_timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let precheck_port: Option<u16> = crate::global_options::GLOBAL_OPTIONS
+            .try_get("port")
+            .and_then(|v| v.parse().ok());
+
+        crate::mprintln!("{}", format!(
+            "[*] Will scan up to {} random hosts with concurrency {} (setg max_random_hosts / concurrency to change){}",
+            max_hosts, concurrency,
+            if let Some(p) = precheck_port { format!(" | port pre-check: {}", p) } else { String::new() }
+        ).cyan());
+
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let success_count = Arc::new(AtomicUsize::new(0));
         let fail_count = Arc::new(AtomicUsize::new(0));
         let checked = Arc::new(AtomicUsize::new(0));
         let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
 
-        let subnet_filter: Arc<Option<ipnetwork::IpNetwork>> = Arc::new(None);
-
         let category = category.to_string();
         let module_name = module_name.to_string();
-        let state_file = format!("{}_{}_mass_state.log", category, module_name)
-            .replace('/', "_");
 
-        crate::mprintln!("{}", format!("[*] Will scan up to {} random hosts with concurrency {} (setg max_random_hosts / concurrency to change)", max_hosts, concurrency).cyan());
+        let prompt_cache = crate::context::new_prompt_cache();
+        let parent_config = crate::config::get_module_config();
+        let mut seen = std::collections::HashSet::<std::net::IpAddr>::new();
 
         for _ in 0..max_hosts {
+            let ip = generate_random_public_ip(&exclusions);
+            if !seen.insert(ip) {
+                continue;
+            }
+            let ip_str = ip.to_string();
+
             let permit = semaphore.clone().acquire_owned().await
                 .context("Semaphore closed")?;
             let sc = success_count.clone();
@@ -241,65 +262,62 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let tc = checked.clone();
             let cat = category.clone();
             let mname = module_name.clone();
-            let exc = exclusions.clone();
-            let sf = state_file.clone();
-            let subnet = subnet_filter.clone();
+            let pc = prompt_cache.clone();
+            let cfg = parent_config.clone();
 
             tokio::spawn(async move {
-                // Generate IP: random within subnet, or random public
-                let ip = if let Some(ref net) = *subnet {
-                    generate_random_ip_in_network(net)
-                } else {
-                    generate_random_public_ip(&exc)
-                };
-                let ip_str = ip.to_string();
-
-                if check_and_mark_ip(&ip, &sf).await {
-                    tc.fetch_add(1, Ordering::Relaxed);
-                    drop(permit);
-                    return;
-                }
-
-                // Quick honeypot check before running module
-                if honeypot_enabled && crate::utils::network::quick_honeypot_check(&ip_str).await {
-                    crate::meprintln!("[!] Skipping {} — honeypot detected", ip_str);
+                // Combined port pre-check + honeypot detection via native network lib
+                if !crate::utils::network::mass_scan_precheck(ip, precheck_port, honeypot_enabled).await {
                     fc.fetch_add(1, Ordering::Relaxed);
                     drop(permit);
                     return;
                 }
 
                 let idx = tc.fetch_add(1, Ordering::Relaxed) + 1;
-                if idx % 100 == 0 || idx == 1 {
+                if idx % 50 == 0 || idx == 1 {
                     crate::mprintln!("[*] Progress: {} hosts scanned | {} ok | {} err",
                         idx,
                         sc.load(Ordering::Relaxed),
                         fc.load(Ordering::Relaxed));
                 }
-                match registry::dispatch_by_category(&cat, &mname, &ip_str).await {
-                    Ok(_) => { sc.fetch_add(1, Ordering::Relaxed); }
-                    Err(e) => {
-                        fc.fetch_add(1, Ordering::Relaxed);
+                let ctx = std::sync::Arc::new(crate::context::RunContext::with_prompt_cache(
+                    cfg, pc, ip_str.clone(),
+                ));
+                let dispatch_result = crate::context::RUN_CONTEXT.scope(ctx, async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(module_timeout_secs),
+                        registry::dispatch_by_category(&cat, &mname, &ip_str),
+                    ).await
+                }).await;
+                match dispatch_result {
+                    Ok(Ok(_)) => { sc.fetch_add(1, Ordering::Relaxed); }
+                    Ok(Err(e)) => {
                         tracing::debug!("Mass scan {} failed: {:?}", ip_str, e);
+                        fc.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        fc.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 drop(permit);
             });
         }
 
-        // Wait for all tasks: acquire all permits back
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
+            crate::meprintln!("[!] Drain barrier failed: {}", e);
         }
 
-        let sc = success_count.load(Ordering::Relaxed);
-        let fc = fail_count.load(Ordering::Relaxed);
-        print_scan_summary("Mass Scan", checked.load(Ordering::Relaxed), sc, fc);
-        auto_log_result(&category, &module_name, "random", sc > 0, &format!("mass_scan ok={} err={}", sc, fc));
+        drop(batch_guard);
+        print_scan_summary("Random Mass Scan",
+            checked.load(Ordering::Relaxed),
+            success_count.load(Ordering::Relaxed),
+            fail_count.load(Ordering::Relaxed));
         return Ok(());
     }
 
     // --- File-based target list ---
     if is_file {
+        let batch_guard = crate::context::enter_batch_mode();
         let content = crate::utils::safe_read_to_string_async(target, None).await
             .with_context(|| format!("Failed to read target file '{}'", target))?;
         let targets: Vec<String> = content.lines()
@@ -313,7 +331,14 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             count, target, category, module_name
         ).cyan().bold());
 
-        let concurrency = 50usize;
+        let concurrency: usize = crate::global_options::GLOBAL_OPTIONS
+            .try_get("concurrency")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let module_timeout_secs: u64 = crate::global_options::GLOBAL_OPTIONS
+            .try_get("module_timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let success_count = Arc::new(AtomicUsize::new(0));
         let fail_count = Arc::new(AtomicUsize::new(0));
@@ -321,6 +346,10 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
 
         let category = category.to_string();
         let module_name = module_name.to_string();
+
+        // Shared prompt cache: all concurrent tasks share one set of prompt answers
+        let prompt_cache = crate::context::new_prompt_cache();
+        let parent_config = crate::config::get_module_config();
 
         for ip_str in targets {
             let permit = semaphore.clone().acquire_owned().await
@@ -330,6 +359,8 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let tc = total.clone();
             let cat = category.clone();
             let mname = module_name.clone();
+            let pc = prompt_cache.clone();
+            let cfg = parent_config.clone();
 
             tokio::spawn(async move {
                 // Quick honeypot check before running module
@@ -344,26 +375,39 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
                 if idx % 50 == 0 || idx == 1 {
                     crate::mprintln!("[*] Progress: {}/{} hosts processed...", idx, count);
                 }
-                match registry::dispatch_by_category(&cat, &mname, &ip_str).await {
-                    Ok(_) => { sc.fetch_add(1, Ordering::Relaxed); }
-                    Err(e) => {
+                let ctx = std::sync::Arc::new(crate::context::RunContext::with_prompt_cache(
+                    cfg, pc, ip_str.clone(),
+                ));
+                let dispatch_result = crate::context::RUN_CONTEXT.scope(ctx, async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(module_timeout_secs),
+                        registry::dispatch_by_category(&cat, &mname, &ip_str),
+                    ).await
+                }).await;
+                match dispatch_result {
+                    Ok(Ok(_)) => { sc.fetch_add(1, Ordering::Relaxed); }
+                    Ok(Err(e)) => {
                         crate::meprintln!("[!] {} failed: {:?}", ip_str, e);
                         fc.fetch_add(1, Ordering::Relaxed);
                     }
+                    Err(_) => {
+                        fc.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!("File target {} timed out after {}s", ip_str, module_timeout_secs);
+                    }
                 }
-                drop(permit);
             });
         }
 
-        // Wait for all tasks
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+        // Drain barrier: wait until all in-flight tasks release their permits.
+        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
+            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
         }
 
-        let sc = success_count.load(Ordering::Relaxed);
-        let fc = fail_count.load(Ordering::Relaxed);
-        print_scan_summary("File Target Scan", total.load(Ordering::Relaxed), sc, fc);
-        auto_log_result(&category, &module_name, target, sc > 0, &format!("file_scan ok={} err={}", sc, fc));
+        drop(batch_guard);
+        print_scan_summary("File Target Scan",
+            total.load(Ordering::Relaxed),
+            success_count.load(Ordering::Relaxed),
+            fail_count.load(Ordering::Relaxed));
         return Ok(());
     }
 
@@ -382,11 +426,17 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             return Ok(());
         }
 
+        let batch_guard = crate::context::enter_batch_mode();
+
         // Concurrency from global options, default 50
         let concurrency: usize = crate::global_options::GLOBAL_OPTIONS
             .try_get("concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(50);
+        let module_timeout_secs: u64 = crate::global_options::GLOBAL_OPTIONS
+            .try_get("module_timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
 
         // Warn for very large subnets but don't block
         if host_count > 1_000_000 {
@@ -409,6 +459,10 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
         let category = category.to_string();
         let module_name = module_name.to_string();
 
+        // Shared prompt cache: all concurrent tasks share one set of prompt answers
+        let prompt_cache = crate::context::new_prompt_cache();
+        let parent_config = crate::config::get_module_config();
+
         // Adaptive progress interval: every 50 for small, 1000 for medium, 10000 for huge
         let progress_interval = if host_count > 10_000_000 {
             10_000
@@ -430,6 +484,8 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let cat = category.clone();
             let mname = module_name.clone();
             let ip_str = ip.to_string();
+            let pc = prompt_cache.clone();
+            let cfg = parent_config.clone();
 
             tokio::spawn(async move {
                 if honeypot_enabled && crate::utils::network::quick_honeypot_check(&ip_str).await {
@@ -447,26 +503,40 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
                         sc.load(Ordering::Relaxed),
                         fc.load(Ordering::Relaxed));
                 }
-                match registry::dispatch_by_category(&cat, &mname, &ip_str).await {
-                    Ok(_) => { sc.fetch_add(1, Ordering::Relaxed); }
-                    Err(e) => {
+                let ctx = std::sync::Arc::new(crate::context::RunContext::with_prompt_cache(
+                    cfg, pc, ip_str.clone(),
+                ));
+                let dispatch_result = crate::context::RUN_CONTEXT.scope(ctx, async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(module_timeout_secs),
+                        registry::dispatch_by_category(&cat, &mname, &ip_str),
+                    ).await
+                }).await;
+                match dispatch_result {
+                    Ok(Ok(_)) => { sc.fetch_add(1, Ordering::Relaxed); }
+                    Ok(Err(e)) => {
                         crate::meprintln!("[!] {} failed: {:?}", ip_str, e);
                         fc.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        fc.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!("Subnet {} timed out after {}s", ip_str, module_timeout_secs);
                     }
                 }
                 drop(permit);
             });
         }
 
-        // Wait for all tasks
-        for _ in 0..concurrency {
-            let _ = semaphore.acquire().await;
+        // Drain barrier: wait until all in-flight tasks release their permits.
+        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
+            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
         }
 
-        let sc = success_count.load(Ordering::Relaxed);
-        let fc = fail_count.load(Ordering::Relaxed);
-        print_scan_summary("Subnet Scan", host_count as usize, sc, fc);
-        auto_log_result(&category, &module_name, target, sc > 0, &format!("subnet_scan ok={} err={}", sc, fc));
+        drop(batch_guard);
+        print_scan_summary("Subnet Scan",
+            host_count as usize,
+            success_count.load(Ordering::Relaxed),
+            fail_count.load(Ordering::Relaxed));
         return Ok(());
     }
 
@@ -478,51 +548,13 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
         ).red().bold());
         return Ok(());
     }
-    let result = registry::dispatch_by_category(category, module_name, target).await;
-    auto_log_result(category, module_name, target, result.is_ok(), "");
-    result?;
+    registry::dispatch_by_category(category, module_name, target).await?;
     Ok(())
 }
 
 /// Generate a random IP address within a given network range.
 /// Works for both IPv4 and IPv6 subnets of any size, including private ranges.
-fn generate_random_ip_in_network(net: &ipnetwork::IpNetwork) -> std::net::IpAddr {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    match net {
-        ipnetwork::IpNetwork::V4(v4net) => {
-            let base: u32 = v4net.network().into();
-            let prefix = v4net.prefix() as u32;
-            if prefix >= 32 {
-                return std::net::IpAddr::V4(v4net.network());
-            }
-            let host_bits = 32 - prefix;
-            // Mask for randomizable host portion
-            let host_mask: u32 = (1u64.checked_shl(host_bits).unwrap_or(0) - 1) as u32;
-            let net_mask: u32 = !host_mask;
-            let random_host: u32 = rng.random::<u32>() & host_mask;
-            let ip = (base & net_mask) | random_host;
-            std::net::IpAddr::V4(std::net::Ipv4Addr::from(ip))
-        }
-        ipnetwork::IpNetwork::V6(v6net) => {
-            let base: u128 = v6net.network().into();
-            let prefix = v6net.prefix() as u32;
-            if prefix >= 128 {
-                return std::net::IpAddr::V6(v6net.network());
-            }
-            let host_bits = 128 - prefix;
-            let host_mask: u128 = if host_bits >= 128 {
-                u128::MAX
-            } else {
-                (1u128 << host_bits) - 1
-            };
-            let net_mask: u128 = !host_mask;
-            let random_host: u128 = (rng.random::<u128>()) & host_mask;
-            let ip = (base & net_mask) | random_host;
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip))
-        }
-    }
-}
+
 
 fn print_scan_summary(label: &str, total: usize, success: usize, failed: usize) {
     use colored::Colorize;
@@ -530,36 +562,6 @@ fn print_scan_summary(label: &str, total: usize, success: usize, failed: usize) 
     crate::mprintln!("  Total:      {}", total);
     crate::mprintln!("  {}", format!("Successful: {}", success).green());
     crate::mprintln!("  {}", format!("Failed:     {}", failed).red());
-}
-
-/// Auto-save a module execution log entry to ~/.rustsploit/results/ in append mode.
-/// Called after every module dispatch so all modules (exploit, scanner, creds) get
-/// persistent output regardless of whether the module itself saves to file.
-fn auto_log_result(category: &str, module_name: &str, target: &str, success: bool, detail: &str) {
-    // Check if auto_save_results is enabled (default: on)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.try_get("auto_save_results") {
-        if matches!(val.to_lowercase().as_str(), "n" | "no" | "false" | "0" | "off" | "disabled") {
-            return;
-        }
-    }
-    let results_dir = crate::config::results_dir();
-    // Sanitize module name for filename
-    let safe_name: String = module_name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
-    let filename = format!("{}_{}.txt", category, safe_name);
-    let path = results_dir.join(&filename);
-    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let status = if success { "SUCCESS" } else { "COMPLETED" };
-    let line = if detail.is_empty() {
-        format!("[{}] {} {}/{} target={}\n", timestamp, status, category, module_name, target)
-    } else {
-        format!("[{}] {} {}/{} target={} {}\n", timestamp, status, category, module_name, target, detail)
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        if let Err(e) = file.write_all(line.as_bytes()) { crate::meprintln!("[!] Write error: {}", e); }
-    }
 }
 
 /// Helper to aggregate all available modules from generated registry
@@ -572,12 +574,17 @@ pub fn plugin_count() -> usize {
     discover_modules().iter().filter(|m| m.starts_with("plugins/")).count()
 }
 
-/// All known categories (auto-generated from src/modules/ subdirectories)
 pub fn categories() -> &'static [&'static str] {
     registry::CATEGORIES
 }
 
-/// Get module info metadata if the module provides it.
+pub fn has_check(module_path: &str) -> bool {
+    let mut parts = module_path.splitn(2, '/');
+    let category = match parts.next() { Some(c) => c, None => return false };
+    let module_name = match parts.next() { Some(m) => m, None => return false };
+    registry::check_available_by_category(category, module_name)
+}
+
 pub fn module_info(module_path: &str) -> Option<crate::module_info::ModuleInfo> {
     let mut parts = module_path.splitn(2, '/');
     let category = parts.next()?;
@@ -591,18 +598,4 @@ pub async fn check_module(module_path: &str, target: &str) -> Option<crate::modu
     let category = parts.next()?;
     let module_name = parts.next()?;
     registry::check_by_category(category, module_name, target).await
-}
-
-/// Check if a module has a check() function without needing a target.
-pub fn has_check(module_path: &str) -> bool {
-    let mut parts = module_path.splitn(2, '/');
-    let category = match parts.next() {
-        Some(c) => c,
-        None => return false,
-    };
-    let module_name = match parts.next() {
-        Some(m) => m,
-        None => return false,
-    };
-    registry::check_available_by_category(category, module_name)
 }

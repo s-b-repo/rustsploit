@@ -17,7 +17,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_port,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
     generate_combos_mode, parse_combo_mode, load_credential_file,
     run_bruteforce, run_subnet_bruteforce,
@@ -125,8 +125,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "ssh",
-            jitter_ms: 0,
-            source_module: "creds/generic/ssh_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/ssh_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             let timeout_dur = timeout_duration;
@@ -265,8 +265,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "ssh",
-        jitter_ms: 0,
-        source_module: "creds/generic/ssh_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/ssh_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();
@@ -347,9 +347,12 @@ async fn try_ssh_login(
                 .map_err(|e| anyhow!("Cannot resolve address {}: {}", addr_owned, e))?;
             let tcp = crate::utils::blocking_tcp_connect(&socket_addr, timeout_duration)
                 .map_err(|e| anyhow!("Connection error: {}", e))?;
+            tcp.set_read_timeout(Some(timeout_duration)).ok();
+            tcp.set_write_timeout(Some(timeout_duration)).ok();
 
             let mut sess = Session::new()
                 .map_err(|e| anyhow!("Failed to create SSH session: {}", e))?;
+            sess.set_timeout(timeout_duration.as_millis() as u32);
             sess.set_tcp_stream(tcp);
 
             sess.handshake()

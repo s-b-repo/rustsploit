@@ -3,12 +3,13 @@ use colored::*;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use base64::prelude::*;
-use crate::modules::creds::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count, EXCLUDED_RANGES};
+use crate::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count, EXCLUDED_RANGES};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
@@ -168,7 +169,11 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
     }
     let target = target.trim().to_string();
-    print_banner();
+    if !crate::utils::is_batch_mode() {
+        if !crate::utils::is_batch_mode() {
+            print_banner();
+        }
+    }
 
     // Subnet handling — iterate over each IP in the CIDR
     if is_subnet_target(&target) {
@@ -230,11 +235,14 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    crate::mprintln!("{}", "\n╔══════════════════════════════════════════════════════════════╗".green().bold());
-    crate::mprintln!("{}", "║  💀 CamXploit Rust Port - Camera Exploitation Scanner      ║".green().bold());
-    crate::mprintln!("{}", "║  🔍 Discover open CCTV cameras & security flaws            ║".cyan().bold());
-    crate::mprintln!("{}", "║  ⚠️  For educational & security research purposes only!    ║".yellow().bold());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".green().bold());
+    if crate::utils::is_batch_mode() { return; }
+    crate::mprintln_block!(
+        format!("{}", "\n╔══════════════════════════════════════════════════════════════╗".green().bold()),
+        format!("{}", "║  💀 CamXploit Rust Port - Camera Exploitation Scanner      ║".green().bold()),
+        format!("{}", "║  🔍 Discover open CCTV cameras & security flaws            ║".cyan().bold()),
+        format!("{}", "║  ⚠️  For educational & security research purposes only!    ║".yellow().bold()),
+        format!("{}", "╚══════════════════════════════════════════════════════════════╝".green().bold())
+    );
 }
 
 fn create_client() -> Result<Client> {
@@ -303,7 +311,7 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
             let addr = format!("{}:{}", t, port);
             
             // Basic TCP Connect
-            if crate::utils::network::tcp_connect(&addr, Duration::from_secs(PORT_SCAN_TIMEOUT)).await.is_ok() {
+            if timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), TcpStream::connect(&addr)).await.is_ok() {
                 // If open, probe for RTSP
                 let is_rtsp = probe_rtsp(&t, port).await;
                 return Some((port, is_rtsp));
@@ -334,7 +342,7 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
 async fn probe_rtsp(target: &str, port: u16) -> bool {
     // Sends a minimal RTSP OPTIONS request
     let addr = format!("{}:{}", target, port);
-    if let Ok(mut stream) = crate::utils::network::tcp_connect(&addr, Duration::from_secs(PORT_SCAN_TIMEOUT)).await {
+    if let Ok(Ok(mut stream)) = timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), TcpStream::connect(&addr)).await {
         let request = format!(
             "OPTIONS rtsp://{}:{}/ RTSP/1.0\r\nCSeq: 1\r\n\r\n",
             target, port
@@ -414,7 +422,7 @@ async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> b
     }
 
     for task in tasks {
-        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = task.await;
     }
 
     let result = *found.lock().await;
@@ -520,14 +528,11 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                         target,
                         port
                     );
-                    {
-                        let id = crate::cred_store::store_credential(
-                            target, port, "rtsp", user, pass,
-                            crate::cred_store::CredType::Password,
-                            "creds/camxploit/camxploit",
-                        ).await;
-                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-                    }
+                    let _ = crate::cred_store::store_credential(
+                        target, port, "rtsp", user, pass,
+                        crate::cred_store::CredType::Password,
+                        "creds/camxploit/camxploit",
+                    ).await;
                 }
             }
         }
@@ -559,14 +564,11 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                                 if pass.is_empty() { "<empty>" } else { pass },
                                 url
                             );
-                            {
-                                let id = crate::cred_store::store_credential(
-                                    target, port, "http", user, pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/camxploit/camxploit",
-                                ).await;
-                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-                            }
+                            let _ = crate::cred_store::store_credential(
+                                target, port, "http", user, pass,
+                                crate::cred_store::CredType::Password,
+                                "creds/camxploit/camxploit",
+                            ).await;
                         }
                     }
                 }
@@ -583,14 +585,11 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                                 if pass.is_empty() { "<empty>" } else { pass },
                                 url
                             );
-                            {
-                                let id = crate::cred_store::store_credential(
-                                    target, port, "http", user, pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/camxploit/camxploit",
-                                ).await;
-                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-                            }
+                            let _ = crate::cred_store::store_credential(
+                                target, port, "http", user, pass,
+                                crate::cred_store::CredType::Password,
+                                "creds/camxploit/camxploit",
+                            ).await;
                         }
                     }
                 }
@@ -601,7 +600,7 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
 
 async fn test_rtsp_auth(target: &str, port: u16, user: &str, pass: &str) -> bool {
     let addr = format!("{}:{}", target, port);
-    if let Ok(mut stream) = crate::utils::network::tcp_connect(&addr, Duration::from_secs(2)).await {
+    if let Ok(Ok(mut stream)) = timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
         let auth_str = BASE64_STANDARD.encode(format!("{}:{}", user, pass));
         let request = format!(
             "OPTIONS rtsp://{}:{}/ RTSP/1.0\r\nAuthorization: Basic {}\r\nCSeq: 1\r\n\r\n",
@@ -858,11 +857,11 @@ async fn run_mass_scan() -> Result<()> {
                     .open(outfile.as_str())
                 {
                     use std::io::Write;
-                    if let Err(e) = writeln!(
+                    let _ = writeln!(
                         file,
                         "CAMERA: {} | ports: {:?} | rtsp: {:?}",
                         target, open_ports, rtsp_ports
-                    ) { crate::meprintln!("[!] Write error: {}", e); }
+                    );
                 }
             }
 

@@ -8,7 +8,7 @@ use crate::utils::{
     load_lines, get_filename_in_current_dir, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
     generate_combos_mode, parse_combo_mode, load_credential_file,
     run_bruteforce, run_subnet_bruteforce,
@@ -189,9 +189,9 @@ pub async fn run(target: &str) -> Result<()> {
                             let id = crate::cred_store::store_credential(
                                 &target_str, port, "redis", "", "(no auth)",
                                 crate::cred_store::CredType::Password,
-                                "creds/generic/redis_bruteforce",
+                                "creds/generic/redis_credcheck",
                             ).await;
-                            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                            if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                         }
                         return Some(format!("[{}] {}:{}:(no auth)\n", ts, ip, port));
                     }
@@ -216,9 +216,9 @@ pub async fn run(target: &str) -> Result<()> {
                                     let id = crate::cred_store::store_credential(
                                         &target_str, port, "redis", user, pass,
                                         crate::cred_store::CredType::Password,
-                                        "creds/generic/redis_bruteforce",
+                                        "creds/generic/redis_credcheck",
                                     ).await;
-                                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                                 }
                                 return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                             }
@@ -240,9 +240,9 @@ pub async fn run(target: &str) -> Result<()> {
                                     let id = crate::cred_store::store_credential(
                                         &target_str, port, "redis", "", pass,
                                         crate::cred_store::CredType::Password,
-                                        "creds/generic/redis_bruteforce",
+                                        "creds/generic/redis_credcheck",
                                     ).await;
-                                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                                 }
                                 return Some(format!("[{}] {}:{}::{}\n", ts, ip, port, pass));
                             }
@@ -288,8 +288,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "redis",
-            jitter_ms: 0,
-            source_module: "creds/generic/redis_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/redis_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
@@ -454,8 +454,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "redis",
-        jitter_ms: 0,
-        source_module: "creds/generic/redis_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/redis_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();
@@ -645,9 +645,9 @@ fn attempt_redis_login(
         return Ok(false);
     }
 
-    // If no auth required, also treat as success for empty password
+    // Server requires no password — treat empty-password probe as success
     if response.contains("-NOAUTH") && pass.is_empty() {
-        return Ok(false);
+        return Ok(true);
     }
 
     Err(RedisError {

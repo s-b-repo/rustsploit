@@ -5,7 +5,7 @@ use tokio::time::Duration;
 
 use crate::native::rdp as rdp_native;
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -90,6 +90,7 @@ impl RdpSecurityLevel {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -263,7 +264,7 @@ pub async fn run(target: &str) -> Result<()> {
                                 }
                                 // Backoff on consecutive errors to avoid hammering
                                 if consecutive_errors >= 3 {
-                                    let delay = crate::modules::creds::utils::backoff_delay(500, consecutive_errors.min(5), 8);
+                                    let delay = crate::utils::backoff_delay(500, consecutive_errors.min(5), 8);
                                     tokio::time::sleep(delay).await;
                                 }
                             }
@@ -390,8 +391,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries: 2,
         service_name: "rdp",
-        jitter_ms: 0,
-        source_module: "creds/generic/rdp_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/rdp_credcheck",
     };
 
     // Build the try_login closure capturing security_level, domain, and verbose
@@ -453,8 +454,8 @@ async fn run_subnet_scan(target: &str) -> Result<()> {
         verbose,
         output_file,
         service_name: "rdp",
-        jitter_ms: 0,
-        source_module: "creds/generic/rdp_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/rdp_credcheck",
         skip_tcp_check: false,
     };
 

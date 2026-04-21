@@ -7,7 +7,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
 use crate::utils::target::extract_ip_from_target;
-use crate::modules::creds::utils::{
+use crate::utils::{
     is_mass_scan_target, is_subnet_target, parse_subnet, subnet_host_count,
     run_mass_scan, MassScanConfig,
 };
@@ -54,7 +54,7 @@ async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
     }
 
     for task in tasks {
-        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = task.await;
     }
 
     let count = open_count.load(Ordering::Relaxed);
@@ -130,7 +130,7 @@ async fn scan_targets(
     }
 
     for task in tasks {
-        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = task.await;
     }
 
     let mut out = results.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -167,10 +167,9 @@ fn save_results(
     output_file: &str,
 ) -> Result<()> {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(output_file)?;
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(output_file, std::fs::Permissions::from_mode(0o600)) {
-        crate::meprintln!("[!] Permission error on {}: {}", output_file, e);
+    let mut file = std::fs::File::create(output_file)?;
+    if let Err(e) = crate::utils::set_secure_permissions(output_file, 0o600) {
+        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", output_file, e);
     }
     writeln!(file, "Honeypot Detection Results")?;
     writeln!(file, "=========================")?;
@@ -233,9 +232,12 @@ pub async fn run(target: &str) -> Result<()> {
         }).await;
     }
 
-    crate::mprintln!();
-    crate::mprintln!("{}", "=== Honeypot Detection Scanner ===".cyan().bold());
-    crate::mprintln!();
+    // Only print the header if we're NOT running inside a batch/mass scan context
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!();
+        crate::mprintln!("{}", "=== Honeypot Detection Scanner ===".cyan().bold());
+        crate::mprintln!();
+    }
 
     // Prompts
     let target_input = cfg_prompt_default("target", "Target (IP/CIDR/file)", target).await?;

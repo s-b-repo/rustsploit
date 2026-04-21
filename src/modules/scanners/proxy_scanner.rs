@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 use crate::utils::cfg_prompt_default;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_PORTS: &str = "8080,3128,1080,8888,9050,80,3129,8118";
 const CONNECT_HOST: &str = "httpbin.org";
@@ -132,6 +132,7 @@ async fn probe_port(ip: IpAddr, port: u16, dur: Duration) -> Vec<ProxyHit> {
 // ============================================================================
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "+=================================================================+".cyan());
     crate::mprintln!("{}", "|              Open Proxy Scanner                                 |".cyan());
     crate::mprintln!("{}", "|   HTTP CONNECT | SOCKS4 | SOCKS5 | HTTP Forward                |".cyan());
@@ -175,19 +176,24 @@ pub async fn run(target: &str) -> Result<()> {
     let ports = parse_ports(&ports_input);
     let timeout_ms: u64 = cfg_prompt_default("timeout", "Timeout (ms)", "5000").await?.parse().unwrap_or(5000);
     let dur = Duration::from_millis(timeout_ms);
+    let verbose = !crate::utils::is_batch_mode();
 
-    crate::mprintln!("[*] Target: {}", target.yellow());
-    crate::mprintln!("[*] Ports: {:?}", ports);
-    crate::mprintln!("[*] Timeout: {}ms", timeout_ms);
-    crate::mprintln!();
+    if verbose {
+        crate::mprintln!("[*] Target: {}", target.yellow());
+        crate::mprintln!("[*] Ports: {:?}", ports);
+        crate::mprintln!("[*] Timeout: {}ms", timeout_ms);
+        crate::mprintln!();
+    }
 
     let ip: IpAddr = resolve_target(target)?;
     let mut found = Vec::new();
 
     for &port in &ports {
-        crate::mprintln!("[*] Probing {}:{}...", ip, port);
+        if verbose {
+            crate::mprintln!("[*] Probing {}:{}...", ip, port);
+        }
         let hits = probe_port(ip, port, dur).await;
-        if hits.is_empty() {
+        if hits.is_empty() && verbose {
             crate::mprintln!("  {}", format!("[-] {}:{} — no proxy detected", ip, port).dimmed());
         }
         for h in &hits {
@@ -196,20 +202,21 @@ pub async fn run(target: &str) -> Result<()> {
         found.extend(hits);
     }
 
-    crate::mprintln!();
-    if found.is_empty() {
-        crate::mprintln!("{}", "[-] No open proxies found.".yellow());
-    } else {
-        crate::mprintln!("{}", format!("[+] {} proxy(ies) found:", found.len()).green().bold());
+    if verbose {
         crate::mprintln!();
-        crate::mprintln!("  {:<8} {:<25} {}", "Port".bold(), "Type".bold(), "Detail".bold());
-        crate::mprintln!("  {}", "-".repeat(60).dimmed());
-        for h in &found {
-            crate::mprintln!("  {:<8} {:<25} {}", h.port, h.kind.green(), h.detail);
+        if found.is_empty() {
+            crate::mprintln!("{}", "[-] No open proxies found.".yellow());
+        } else {
+            crate::mprintln!("{}", format!("[+] {} proxy(ies) found:", found.len()).green().bold());
+            crate::mprintln!();
+            crate::mprintln!("  {:<8} {:<25} {}", "Port".bold(), "Type".bold(), "Detail".bold());
+            crate::mprintln!("  {}", "-".repeat(60).dimmed());
+            for h in &found {
+                crate::mprintln!("  {:<8} {:<25} {}", h.port, h.kind.green(), h.detail);
+            }
         }
+        crate::mprintln!();
     }
-
-    crate::mprintln!();
     Ok(())
 }
 

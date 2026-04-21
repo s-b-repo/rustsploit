@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use tokio::sync::RwLock;
-use std::sync::LazyLock as Lazy;
-use serde::{Serialize, Deserialize};
+
 use colored::*;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Metadata for a stored loot item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,7 +32,9 @@ impl LootStore {
 
         let loot_dir = base.join("loot");
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) {
+            eprintln!("[!] Failed to create loot directory {}: {}", loot_dir.display(), e);
+        }
 
         let index_path = base.join("loot_index.json");
         let entries = if index_path.exists() {
@@ -39,13 +42,18 @@ impl LootStore {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        crate::meprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
+                        eprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
                         let backup = index_path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&index_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&index_path, &backup) {
+                            eprintln!("[!] Failed to backup corrupted loot index: {}", e);
+                        }
                         Vec::new()
                     }
                 },
-                Err(_) => Vec::new(),
+                Err(e) => {
+                    eprintln!("[!] Failed to read loot_index.json: {}", e);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -72,18 +80,15 @@ impl LootStore {
     ) -> Option<String> {
         // Validate size
         if data.len() > Self::MAX_LOOT_SIZE {
-            crate::meprintln!("[!] Loot too large: {} bytes (max {} MB)", data.len(), Self::MAX_LOOT_SIZE / 1024 / 1024);
+            eprintln!("[!] Loot too large: {} bytes (max {} MB)", data.len(), Self::MAX_LOOT_SIZE / 1024 / 1024);
             return None;
         }
-        // Validate inputs (BUG 29 fix: also validate description and source_module)
+        // Validate inputs
         if host.is_empty() || host.len() > 256 {
             return None;
         }
-        if description.len() > 4096 || source_module.len() > 4096 || loot_type.len() > 256 {
-            return None;
-        }
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let ext = match loot_type {
             "config" => "conf",
             "password_file" => "txt",
@@ -103,16 +108,30 @@ impl LootStore {
 
         // Verify the resolved path is within loot_dir (prevent traversal)
         if !file_path.starts_with(&self.loot_dir) {
-            crate::meprintln!("[!] Loot path escapes loot directory");
+            eprintln!("[!] Loot path escapes loot directory");
             return None;
         }
 
-        if tokio::fs::write(&file_path, data).await.is_err() {
-            return None;
-        }
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tokio::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).await {
-            crate::meprintln!("[!] Permission error on {}: {}", file_path.display(), e);
+        {
+            let file = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[!] Failed to create loot file: {}", e);
+                    return None;
+                }
+            };
+            let mut file = file;
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, data).await {
+                eprintln!("[!] Failed to write loot data: {}", e);
+                return None;
+            }
         }
 
         let entry = LootEntry {
@@ -130,14 +149,7 @@ impl LootStore {
             entries.push(entry);
             entries.clone()
         };
-        if !self.save_locked(&snapshot).await {
-            // Rollback: remove from in-memory index and clean up the file
-            let mut entries = self.entries.write().await;
-            entries.retain(|e| e.id != id);
-            let _ = tokio::fs::remove_file(&file_path).await;
-            crate::meprintln!("[!] Loot add rolled back — index save failed");
-            return None;
-        }
+        self.save_locked(&snapshot).await;
         Some(id)
     }
 
@@ -178,9 +190,7 @@ impl LootStore {
             if entries.len() < before {
                 let snapshot = entries.clone();
                 drop(entries);
-                if !self.save_locked(&snapshot).await {
-                    crate::meprintln!("[!] Warning: loot delete index save failed — in-memory state may diverge");
-                }
+                self.save_locked(&snapshot).await;
                 (true, fname)
             } else {
                 (false, None)
@@ -188,7 +198,9 @@ impl LootStore {
         };
         if let Some(fname) = filename {
             if let Some(path) = self.file_path(&fname) {
-                if let Err(e) = tokio::fs::remove_file(&path).await { crate::meprintln!("[!] File remove error: {}", e); }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
+                }
             }
         }
         removed
@@ -202,12 +214,12 @@ impl LootStore {
             entries.clear();
             names
         };
-        if !self.save_locked(&[]).await {
-            crate::meprintln!("[!] Warning: loot clear index save failed");
-        }
+        self.save_locked(&[]).await;
         for fname in filenames {
             if let Some(path) = self.file_path(&fname) {
-                if let Err(e) = tokio::fs::remove_file(&path).await { crate::meprintln!("[!] File remove error: {}", e); }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
+                }
             }
         }
     }
@@ -230,53 +242,62 @@ impl LootStore {
         &self.loot_dir
     }
 
-    async fn save_locked(&self, entries: &[LootEntry]) -> bool {
+    async fn save_locked(&self, entries: &[LootEntry]) {
         let tmp = self.index_path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(entries) {
             Ok(j) => j,
             Err(e) => {
-                crate::meprintln!("[!] Failed to serialize loot index: {}", e);
-                return false;
+                eprintln!("[!] Failed to serialize loot index: {}", e);
+                return;
             }
         };
-        if let Err(e) = tokio::fs::write(&tmp, &json).await {
-            crate::meprintln!("[!] Failed to write loot index tmp: {}", e);
-            return false;
+        let file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[!] Failed to write loot index: {}", e);
+                return;
+            }
+        };
+        let mut file = file;
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await {
+            eprintln!("[!] Failed to write loot index data: {}", e);
+            return;
         }
         if let Err(e) = tokio::fs::rename(&tmp, &self.index_path).await {
-            crate::meprintln!("[!] File rename error: {}", e);
-            return false;
+            eprintln!("[!] Failed to rename loot index: {}", e);
         }
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tokio::fs::set_permissions(&self.index_path, std::fs::Permissions::from_mode(0o600)).await {
-            crate::meprintln!("[!] Permission error on {}: {}", self.index_path.display(), e);
-        }
-        true
     }
 
     /// Display loot table.
     pub async fn display(&self) {
         let entries = self.list().await;
         if entries.is_empty() {
-            crate::mprintln!("{}", "No loot stored.".dimmed());
+            println!("{}", "No loot stored.".dimmed());
             return;
         }
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("Loot ({} items):", entries.len()).bold().underline());
-        crate::mprintln!();
-        crate::mprintln!("  {:<10} {:<18} {:<15} {:<30} {}",
+        println!();
+        println!("{}", format!("Loot ({} items):", entries.len()).bold().underline());
+        println!();
+        println!("  {:<10} {:<18} {:<15} {:<30} {}",
             "ID".bold(), "Host".bold(), "Type".bold(), "Description".bold(), "Module".bold());
-        crate::mprintln!("  {}", "-".repeat(90).dimmed());
+        println!("  {}", "-".repeat(90).dimmed());
         for e in &entries {
             let desc = if e.description.len() > 28 {
                 format!("{}...", &e.description[..25])
             } else {
                 e.description.clone()
             };
-            crate::mprintln!("  {:<10} {:<18} {:<15} {:<30} {}",
+            println!("  {:<10} {:<18} {:<15} {:<30} {}",
                 e.id.yellow(), e.host.green(), e.loot_type, desc, e.source_module);
         }
-        crate::mprintln!();
+        println!();
     }
 }
 

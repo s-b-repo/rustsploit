@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use colored::*;
 use std::{
-    fs::OpenOptions,
+    fs::File,
     io::{Write, BufWriter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
@@ -15,7 +15,7 @@ use crate::utils::{
     cfg_prompt_port,
 };
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 /// Module metadata for `info` command.
 pub fn info() -> ModuleInfo {
@@ -72,10 +72,10 @@ pub async fn run(target: &str) -> Result<()> {
                     };
                     let domain = if ip.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
                     if let Ok(sock) = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP)) {
-                        if let Err(e) = sock.set_reuse_address(true) { crate::meprintln!("[!] Socket option error: {}", e); }
-                        if let Err(e) = sock.set_nonblocking(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+                        let _ = sock.set_reuse_address(true);
+                        let _ = sock.set_nonblocking(true);
                         if sock.bind(&bind.into()).is_ok() {
-                            let _connect = sock.connect(&dest.into());
+                            let _ = sock.connect(&dest.into());
                             let std_stream: std::net::TcpStream = sock.into();
                             if let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) {
                                 if let Ok(Ok(())) = tokio::time::timeout(
@@ -101,7 +101,11 @@ pub async fn run(target: &str) -> Result<()> {
         }).await;
     }
 
-    print_banner();
+    if !crate::utils::is_batch_mode() {
+        if !crate::utils::is_batch_mode() {
+            print_banner();
+        }
+    }
 
     let settings = prompt_settings().await?;
 
@@ -201,7 +205,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     for task in tasks {
-        if let Err(e) = task.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = task.await;
     }
 
     let elapsed = start_time.elapsed();
@@ -236,10 +240,9 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Save results
     if !settings.output_file.is_empty() {
-        let file = OpenOptions::new().create(true).append(true).open(&settings.output_file)?;
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&settings.output_file, std::fs::Permissions::from_mode(0o600)) {
-            crate::meprintln!("[!] Permission error on {}: {}", settings.output_file, e);
+        let file = File::create(&settings.output_file)?;
+        if let Err(e) = crate::utils::set_secure_permissions(&settings.output_file, 0o600) {
+            crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", settings.output_file, e);
         }
         let mut writer = BufWriter::new(file);
         writeln!(writer, "Source Port Scan Results")?;
@@ -265,11 +268,10 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    crate::mprintln!("{}", r#"
-╔══════════════════════════════════════════════════════════╗
-║              Source Port Scanner                          ║
-║  Discover which source ports bypass firewall rules       ║
-╚══════════════════════════════════════════════════════════╝"#.cyan());
+    if crate::utils::is_batch_mode() { return; }
+    crate::mprintln_block!(
+        format!("{}", r#" ╔══════════════════════════════════════════════════════════╗ ║              Source Port Scanner                          ║ ║  Discover which source ports bypass firewall rules       ║ ╚══════════════════════════════════════════════════════════╝"#.cyan())
+    );
 }
 
 async fn prompt_settings() -> Result<ScanSettings> {
@@ -336,9 +338,9 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
         Err(e) => return ProbeResult::Error(e.to_string()),
     };
 
-    if let Err(e) = socket.set_reuse_address(true) { crate::meprintln!("[!] Socket option error: {}", e); }
-    if let Err(e) = socket.set_nonblocking(true) { crate::meprintln!("[!] Socket option error: {}", e); }
-    if let Err(e) = socket.set_tcp_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+    let _ = socket.set_reuse_address(true);
+    let _ = socket.set_nonblocking(true);
+    let _ = socket.set_tcp_nodelay(true);
 
     // Bind to the specific source port
     let bind_addr = if ip.is_ipv4() {
@@ -524,7 +526,7 @@ impl ProgressTracker {
             "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
             self.current, self.total, pct, rate, eta
         ).cyan());
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
 
         if self.current == self.total {
             crate::mprintln!();

@@ -11,7 +11,7 @@
 use anyhow::Result;
 use colored::*;
 use crate::utils::cfg_prompt_default;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 pub async fn run(target: &str) -> Result<()> {
     if is_mass_scan_target(target) {
@@ -24,8 +24,11 @@ pub async fn run(target: &str) -> Result<()> {
         }, move |ip, port| {
             async move {
                 let addr = format!("{}:{}", ip, port);
-                match crate::utils::network::tcp_connect(&addr, std::time::Duration::from_secs(3)).await {
-                    Ok(_) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::net::TcpStream::connect(&addr),
+                ).await {
+                    Ok(Ok(_)) => {
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                         Some(format!("[{}] {}:{} open\n", ts, ip, port))
                     }

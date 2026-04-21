@@ -1,45 +1,36 @@
-## v0.5.0 — Security & Isolation Hardening
+## April 2026 — Module Expansion & Infrastructure Hardening
 
-### Security Fixes (ArcticAlopex Frontend)
-- **API key hashing**: Replaced SHA256 with Argon2id via existing `hashApiKey()` function
-- **Permission checks**: Added ACL checks to 6 admin endpoints (GET/POST /api/users, GET/POST /api/roles, GET /api/audit, GET /api/activity) that previously only checked session existence
-- **Module restrictions**: Loaded `role_module_restrictions` from DB and passed to ACL `resolve()` engine (was always passing empty array)
-- **Export permission mismatch**: Fixed `export.data` → `export.json` permission name inconsistency
-- **PQ-aware health check**: Health worker now tests both plain HTTP and PQ-encrypted paths, reports healthy/degraded/unreachable
-- **Default-deny unmapped endpoints**: pathToPermission() now returns a sentinel for unmapped RSF endpoints instead of null (owner-only fallback)
-- **WebSocket error handling**: Separated JSON parse errors from session failures in WS message handler
-- **Credential redaction**: Recursive redaction across 15+ secret field names with nested object support
-- **TOTP encryption**: Secrets now encrypted with AES-256-GCM via MASTER_KEY before DB storage
-- **Per-account login lockout**: Added per-account rate limiting (10 attempts → 30 min lock) alongside existing IP-based limiter
+**Module totals: 182 exploits, 27 scanners, 29 creds, 1 plugin = 239 total**
 
-### Per-Workspace Isolation
-- **Credentials**: Each workspace now has its own credential store at `~/.rustsploit/workspaces/{name}_creds.json` (previously global `creds.json`)
-- **Options**: Each workspace now has its own options at `~/.rustsploit/workspaces/{name}_options.json` (previously global `global_options.json`)
-- **Auto-migration**: Legacy global files are automatically migrated to the default workspace on first run
-- **Workspace switch**: `workspace <name>` now switches credentials and options alongside hosts/services
+### 45 New Exploit Modules
 
-### Persistent File Logging
-- Added daily rolling log files at `~/.rustsploit/logs/rustsploit.YYYY-MM-DD.log`
-- Both console (stderr) and file logging run simultaneously via `tracing-appender`
-- Log files include timestamps, log levels, and target module information
+6 new categories: Cowrie (3), Dionaea (4), HoneyTrap (2), SafeLine (6), Snare (2), VNC (16). Plus 12 modules in existing categories: SSH (4), Frameworks (2), Network Infra (2), WebApps (4).
 
-### Per-User Isolation (ArcticAlopex GUI)
-- **Credential ownership**: Each user now has their own credential store. Non-admin users only see credentials they added. Owners/admins can toggle "Show All" to view all tenant credentials.
-- **User preferences**: New per-user key-value preferences API (`/api/preferences`) with theme, default target, concurrency, auto-refresh, and other settings. Managed via Account Settings page.
-- **Credential ownership enforcement**: Non-admin users can only delete their own credentials (403 for others' creds).
-- **New DB tables**: `credential_owners` (maps RSF cred IDs to users), `user_preferences` (per-user key-value settings).
+### 3 New Scanner Modules
 
-### Audit & Activity Log Export
-- Audit and Activity pages now have CSV and JSON export buttons
-- Export API: `GET /api/audit?export=csv|json` and `GET /api/activity?export=csv|json`
-- Exports up to 10,000 entries with `Content-Disposition: attachment` for file download
-- Respects current search/filter when exporting
+`proxy_scanner`, `reflect_scanner`, `vuln_checker`
 
-### Dashboard & UI Fixes
-- Fixed Instance Health showing "unreachable" despite backend being up (was checking `data.healthy` instead of `data.success`)
-- Dashboard now checks health endpoint directly + uses stored DB status
-- Fixed activity feed auto-refresh glitching (unstable callback deps causing interval reset every 5 seconds)
-- Fixed audit page loading flash on refresh (skeleton only shows on initial load)
+### 10 New Credential Modules
+
+`couchdb_bruteforce`, `elasticsearch_bruteforce`, `http_basic_bruteforce`, `imap_bruteforce`, `memcached_bruteforce`, `mysql_bruteforce`, `postgres_bruteforce`, `proxy_bruteforce`, `redis_bruteforce`, `vnc_bruteforce`
+
+### Infrastructure
+
+- WebSocket transport (`/pq/ws`) with PQ encryption, 100-connection cap, heartbeat
+- `require_root()` privilege helper for raw-socket modules
+- `build_http_client()` / `build_http_client_with()` standardized across 50+ modules
+- `tcp_connect_addr()`, `tcp_connect_str()` TCP helpers replacing raw TcpStream::connect
+- MCP server hardening: stdout isolation, 1 MiB line cap, binary-safe reads
+- Spool hardening: O_NOFOLLOW, parent symlink check, lock-first pattern
+- build.rs: `check_available()` dispatch, optimized regex compilation
+- `zeroize` crate for sensitive data cleanup
+
+### Module Audit
+
+- Replaced blocking `std::thread::sleep` with async alternatives
+- Migrated raw `TcpStream::connect` to framework `tcp_connect_addr()`
+- Standardized `reqwest::Client::builder` to `build_http_client()`
+- Added `require_root()` to all raw-socket modules
 
 ---
 
@@ -16907,1364 +16898,1790 @@ Built a complete separate web application (75 files, ~10K lines) in `arcticalope
 
 ● The GUI backend's key is registered. Now you need to restart the API server first (so it picks up the new key), then the backend, then the frontend. Run these in 3 terminals:                                                            
                                                                                                                                                                                                                                             
-  Terminal 1 — API server (restart to load the new authorized key):                                                                                                                                                                         
-  cd ~/Pictures/Jenkins/rustsploit-thekiaboys && ./target/debug/rustsploit --api                                                                                                                                                            
-                                                                                                                                                                                                                                            
-  Terminal 2 — GUI Backend:                                                                                                                                                                                                                 
-  cd ~/Pictures/Jenkins/rustsploit-thekiaboys/rustsploit\ gui/backend && npm run dev                                                                                                                                                        
-                                                                                                                                                                                                                                            
-  Terminal 3 — Frontend:                                                                                                                                                                                                                    
-  cd ~/Pictures/Jenkins/rustsploit-thekiaboys/rustsploit\ gui/frontend && npm run dev                                                                                                                                                       
-                                                                                                                                                                                                                                            
-  The API server should now show Authorized clients: 1 with the gui-backend key, and the GUI backend should show a successful PQ connection instead of the API key error. No more plaintext — everything goes through the PQ-encrypted      
-  channel.  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  the necromoonix fixes
-  
-    api.rs (3 fixes):                                                                                                                                                                                                                         
-  - Rate limiter panic — lock().unwrap() replaced with poison-recovery via into_inner(). Added entry pruning when map exceeds 10K entries to prevent memory exhaustion.                                                                     
-  - Shell metacharacter check incomplete — Added (, ), {, } to the blocked characters to prevent subshell/brace injection.                                                                                                                  
-                                                                       
-  mcp/tools.rs (2 fixes):                                                                                                                                                                                                                   
-  - u16/u32 silent truncation — n as u16 replaced with u16::try_from(n).ok() so values >65535 return None instead of silently wrapping (e.g., port 70000 was becoming 4464).
-  - SSRF target filter bypass — prompts.remove("target") was case-sensitive. Now removes all case variations ("Target", "TARGET", etc.) to prevent prompt injection bypass.                                                                 
-                                                                                                                                                                                                                                            
-  config.rs (1 fix):                                                                                                                                                                                                                        
-  - Multi-target file path traversal — File paths in comma-separated target lists were stored raw without canonicalization. Now canonicalized (resolves .., symlinks) consistent with single-target handling. 
-  
-  
-  
-  
-  Bug Audit: 10 Framework Feature Modules
+Audit & Improve All 181 Exploit Modules
 
      Context
 
-     Comprehensive security and correctness audit of the 10 Metasploit-parity framework features added to Rustsploit. Each module was read in full, cross-referenced with shell.rs and api.rs integration points. Findings are organized by
-     file, prioritized by severity.
-
-     ---
-     1. src/export.rs — Export / Reporting
-
-     BUG 1: Path traversal — absolute paths accepted (CRITICAL)
-
-     - Line 202-209: validate_export_path() only blocks .. and \0. Absolute paths like /etc/cron.d/backdoor pass validation.
-     - Fix: Add if path.starts_with('/') || path.starts_with('\\') rejection. Restrict to basename-only (no / or \\).
-
-     BUG 2: Shell handler bypasses validate_export_path() (HIGH)
-
-     - shell.rs export handler: Only checks path.contains("..") inline, never calls validate_export_path(). The two validations are inconsistent.
-     - Fix: Call validate_export_path() from shell handler instead of inline check.
-
-     BUG 3: Plaintext credentials in export (MEDIUM)
-
-     - Lines 77-82: CSV export includes secret field in plaintext. Summary report (line 156) omits it, but JSON (line 36) and CSV include it.
-     - Fix: Redact or mask secret in CSV export. Add --include-secrets flag.
-
-     BUG 4: Non-atomic file writes (LOW)
-
-     - Lines 38, 96, 176: Uses std::fs::write() directly, not atomic tmp+rename like workspace/cred_store.
-     - Fix: Use tmp file + rename pattern for consistency.
-
-     ---
-     2. src/jobs.rs — Background Jobs
-
-     BUG 5: Deadlock — list() calls cleanup() which acquires write lock (CRITICAL)
-
-     - Line 121: list() calls self.cleanup() which acquires a write lock via self.jobs.write(). Then list() itself tries to acquire a read lock at line 123 via self.jobs.read(). Since cleanup() already released the write lock before
-     list() reads, this is NOT actually a deadlock with std::sync::RwLock (non-reentrant). However, cleanup() runs on every list() call — if another thread holds a read lock, cleanup()'s write lock blocks ALL readers.
-     - Actual issue: Performance — write lock contention on every list operation.
-     - Fix: Only run cleanup if job count exceeds threshold, or use a separate cleanup timer.
-
-     BUG 6: Job status never updated after completion (HIGH)
-
-     - Lines 129-137: list() checks handle.is_finished() and returns "Completed" string, but job.status field is never updated from Running to Completed/Failed. The status field diverges from reality — kill() sets it to Cancelled, but
-     normal completion doesn't.
-     - Impact: After cleanup removes finished jobs, the status field was never correct. If cleanup is delayed, jobs shows "Running" for already-finished jobs unless handle is checked.
-     - Fix: Spawn a watcher task that updates job.status when handle completes. Or update status in the list() method before returning.
-
-     BUG 7: Unbounded job history (MEDIUM)
-
-     - Lines 96-98: cleanup() only runs when list() is called. Between calls, finished jobs accumulate without limit.
-     - Fix: Add max job count (e.g., 1000). Old finished jobs evicted automatically.
-
-     BUG 8: Job output not captured (MEDIUM)
-
-     - Lines 72-77: Output goes directly to stdout/stderr. No way to retrieve job results later via jobs command or API.
-     - Fix: Capture output via the existing mprintln! system and store in Job struct.
-
-     BUG 9: AtomicU32 ID wraps to 0 (LOW)
-
-     - Line 61: fetch_add(1, Ordering::Relaxed) wraps at u32::MAX. Collision with existing jobs.
-     - Fix: Use u64, or check for collision before insert.
-
-     ---
-     3. src/spool.rs — Console Logging
-
-     BUG 10: TOCTOU race — symlink check before File::create (HIGH)
-
-     - Lines 46-49: resolved.is_symlink() checked, then File::create(resolved) called. An attacker can swap the file for a symlink between check and create.
-     - Fix: Use OpenOptions::new().write(true).create(true).truncate(true) with O_NOFOLLOW via .custom_flags(libc::O_NOFOLLOW) on Unix, or create file first then check fd.
-
-     BUG 11: write_line() never flushes (MEDIUM)
-
-     - Lines 92-99: writeln!() without flush(). Data buffered in memory, lost on crash.
-     - Fix: Call file.flush() after each writeln, or at minimum periodically.
-
-     BUG 12: File created before lock acquired (MEDIUM)
-
-     - Lines 49-61: File::create() happens at line 49, but the write lock is acquired at line 51. If lock acquisition fails (poisoned), file is created but orphaned.
-     - Fix: Acquire lock first, then create file.
-
-     BUG 13: resolve_spool_path doesn't canonicalize (LOW)
-
-     - Lines 103-110: Only checks parent existence. Doesn't canonicalize to verify path stays within CWD.
-     - Fix: Use std::fs::canonicalize() and verify result starts with std::env::current_dir().
-
-     ---
-     4. src/global_options.rs — Global Options
-
-     BUG 14: Lost update race between concurrent set/unset (HIGH)
-
-     - Lines 46-53, 56-67: Two concurrent set() calls each: acquire write lock, modify HashMap, clone, release lock, save snapshot. The second save can overwrite the first's changes.
-     - Example: Thread A sets "port"="8080", Thread B sets "timeout"="30". If B's save runs after A's save, "port" is lost.
-     - Fix: Acquire a file-level Mutex around the save operation, or re-read-before-save.
-
-     BUG 15: Silent save failures — data in memory but not on disk (HIGH)
-
-     - Lines 86-98: let _ = ignores errors from create_dir_all, rename, and set_permissions. If disk is full or permissions denied, in-memory state diverges from disk. On restart, changes are lost.
-     - Fix: Return Result from save_locked(), log errors at minimum.
-
-     BUG 16: No key/value length validation (MEDIUM)
-
-     - Lines 46, 56: No bounds on key or value length, or total number of options.
-     - Fix: Add MAX_KEY_LEN=256, MAX_VALUE_LEN=4096, MAX_OPTIONS=1000.
-
-     BUG 17: try_get() masks lock contention as "key not found" (LOW)
-
-     - Line 76-78: Returns None both when key doesn't exist AND when write lock is held. Callers like honeypot_detection (shell.rs) use .unwrap_or(true), silently defaulting.
-     - Fix: Document behavior or return Result<Option<String>, TryLockError>.
-
-     ---
-     5. src/cred_store.rs — Credential Store
-
-     BUG 18: UUID truncation — 16-char ID collision risk (MEDIUM)
-
-     - Line 100: Uuid::new_v4().simple().to_string()[..16] gives 64-bit ID space. Birthday paradox collision at ~2^32 entries. No collision detection.
-     - Fix: Use full 32-char UUID, or at minimum detect collision before insert.
-
-     BUG 19: service and source_module fields not length-validated (MEDIUM)
-
-     - Lines 87-99: host, secret, and username are validated against MAX_FIELD_LEN, but service and source_module are unchecked. Can be arbitrarily long.
-     - Fix: Add service.len() > MAX_FIELD_LEN and source_module.len() > MAX_FIELD_LEN checks.
-
-     BUG 20: Silent save failures — same pattern as global_options (HIGH)
-
-     - Lines 164-176: All file I/O errors silently ignored with let _ =.
-     - Fix: Same as BUG 15.
-
-     BUG 21: Port 0 accepted (LOW)
-
-     - Line 83-100: No validation that port > 0.
-     - Fix: Add if port == 0 { return String::new(); }.
-
-     BUG 22: Secret display reveals 16-18 char secrets unmasked (LOW)
-
-     - Line 196: if e.secret.len() > 18 — secrets of length 16-18 are shown in full.
-     - Fix: Use if e.secret.len() > 8 and show first 5 chars + "...".
-
-     ---
-     6. src/workspace.rs — Host & Service Tracking
-
-     BUG 23: Non-atomic name/data update during load (HIGH)
-
-     - Lines 115-116: name and data are updated with separate write locks. Between them, a reader can see new name with old data.
-     - Fix: Use a single RwLock wrapping both name and data, or update data first then name.
-
-     BUG 24: Workspace switch corrupts on load failure (MEDIUM)
-
-     - Lines 145-147: save() then load(). If load fails (corrupt JSON), data defaults to empty but name is already changed. Old workspace data saved correctly but new workspace is empty.
-     - Impact: Acceptable as designed (starts fresh), but could warn user more clearly.
-
-     BUG 25: Unbounded notes per host (MEDIUM)
-
-     - Line 15, 211: notes: Vec<String> has no size limit. Repeated notes <ip> <text> grows unbounded.
-     - Fix: Cap at e.g. 10,000 notes per host.
-
-     BUG 26: No workspace name validation in API (MEDIUM)
-
-     - api.rs switch_workspace handler: No alphanumeric validation. Shell validates but API doesn't, allowing names with /, .., etc.
-     - Fix: Add same validation as shell.rs: name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-').
-
-     BUG 27: No workspace name length check (LOW)
-
-     - shell.rs line 831-837: Validates character set but not length. Names can be thousands of chars.
-     - Fix: Add name.len() <= 64 check.
-
-     ---
-     7. src/loot.rs — Loot Management
-
-     BUG 28: UUID truncation same as cred_store (MEDIUM)
-
-     - Line 83: Same 16-char UUID truncation as cred_store.
-     - Fix: Use full UUID.
-
-     BUG 29: description field has no length validation (MEDIUM)
-
-     - Lines 65-72: description and source_module have no bounds checks. Can be arbitrarily long.
-     - Fix: Add length validation (e.g., 4096 max).
-
-     BUG 30: Loot file deleted after lock release — TOCTOU (LOW)
-
-     - Lines 160-180: Index updated and saved, lock released, then file deleted. Between save and delete, another operation could reference the now-deleted file.
-     - Impact: Minor — file_path() would return a valid path but file wouldn't exist.
-
-     ---
-     8. src/module_info.rs — Module Metadata
-
-     Status: CLEAN
-
-     No bugs found. Simple data structs with Display implementation.
-
-     ---
-     9. build.rs — Info/Check Detection
-
-     BUG 31: Regex can match inside comments/strings (LOW)
-
-     - Lines ~360-362: info_re and check_re scan entire file content including comments and string literals. A comment like // pub fn info() -> ModuleInfo would trigger a false match.
-     - Fix: Strip comments before matching, or anchor regex to line start.
-
-     ---
-     10. shell.rs — Integration Issues
-
-     BUG 32: makerc path traversal (HIGH)
-
-     - Shell handler: makerc writes history to user-provided path with zero validation. makerc /etc/cron.d/evil works.
-     - Fix: Validate path same as spool (reject absolute, reject .., basename-only).
-
-     BUG 33: resource script path not validated (HIGH)
-
-     - Shell handler: resource ../../../tmp/evil.rc reads and executes arbitrary files.
-     - Fix: Validate path or restrict to ~/.rustsploit/ directory.
-
-     BUG 34: Port 0 accepted in services add and creds add (MEDIUM)
-
-     - Shell handler lines ~773, ~657: port_str.parse().unwrap_or(0) accepts port 0.
-     - Fix: Validate port > 0 && port <= 65535.
-
-     ---
-     11. api.rs — Integration Issues
-
-     BUG 35: Workspace name not validated in API (see BUG 26)
-
-     BUG 36: Hosts add — no IP format validation (MEDIUM)
-
-     - API handler: Accepts any string as IP, including empty after trim, URLs, etc.
-     - Fix: Validate IP format with ip.parse::<std::net::IpAddr>() or hostname regex.
-
-     ---
-     Summary by Severity
-
-     ┌──────────┬───────┬─────────────────────────────────────────────────────────────┐
-     │ Severity │ Count │                           Bug IDs                           │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ CRITICAL │ 1     │ 1                                                           │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ HIGH     │ 8     │ 2, 5(perf), 6, 10, 14, 15, 20, 32, 33                       │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ MEDIUM   │ 16    │ 3, 7, 8, 11, 12, 16, 18, 19, 23, 24, 25, 26, 28, 29, 34, 36 │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ LOW      │ 8     │ 4, 9, 13, 17, 21, 22, 27, 30, 31                            │
-     └──────────┴───────┴─────────────────────────────────────────────────────────────┘
-
-     Fix Priority
-
-     Batch 1 — Security (do first):
-     - BUG 1: export.rs absolute path traversal
-     - BUG 2: shell export handler bypass
-     - BUG 32: makerc path traversal
-     - BUG 33: resource path validation
-     - BUG 10: spool TOCTOU symlink race
-     - BUG 26: API workspace name validation
-
-     Batch 2 — Data Integrity:
-     - BUG 14: global_options lost update race
-     - BUG 15, 20: Silent save failures (global_options + cred_store)
-     - BUG 6: Job status never updated
-     - BUG 23: workspace non-atomic name/data update
-
-     Batch 3 — Input Validation:
-     - BUG 16: global_options key/value length
-     - BUG 19: cred_store service/source_module length
-     - BUG 29: loot description length
-     - BUG 34: Port 0 accepted
-     - BUG 36: API hosts IP validation
-
-     Batch 4 — Quality / Polish:
-     - BUG 11: spool flush
-     - BUG 7: unbounded job history
-     - BUG 8: job output capture
-     - BUG 18, 28: UUID truncation
-     - BUG 25: unbounded notes
-     - BUG 22: secret display threshold
-
-     Verification
-
-     After fixes:
-     1. cargo check — zero errors, zero warnings
-     2. cargo build — full build succeeds
-     3. Manual tests:
-       - export json /etc/passwd — should be rejected
-       - makerc /tmp/evil — should be rejected
-       - resource ../../etc/shadow — should be rejected
-       - spool with symlink target — should be rejected
-       - Workspace switch via API with ../ name — should be rejected
-       - setg with 10MB value — should be rejected
-       - creds add with port 0 — should be rejected or warned
-       - jobs after spawning + waiting — should show correct status
-
-     Files to Modify
-
-     ┌───────────────────────┬────────────────────┐
-     │         File          │        Bugs        │
-     ├───────────────────────┼────────────────────┤
-     │ src/export.rs         │ 1, 3, 4            │
-     ├───────────────────────┼────────────────────┤
-     │ src/jobs.rs           │ 5, 6, 7, 8, 9      │
-     ├───────────────────────┼────────────────────┤
-     │ src/spool.rs          │ 10, 11, 12, 13     │
-     ├───────────────────────┼────────────────────┤
-     │ src/global_options.rs │ 14, 15, 16, 17     │
-     ├───────────────────────┼────────────────────┤
-     │ src/cred_store.rs     │ 18, 19, 20, 21, 22 │
-     ├───────────────────────┼────────────────────┤
-     │ src/workspace.rs      │ 23, 24, 25, 27     │
-     ├───────────────────────┼────────────────────┤
-     │ src/loot.rs           │ 28, 29, 30         │
-     ├───────────────────────┼────────────────────┤
-     │ src/shell.rs          │ 2, 32, 33, 34      │
-     ├───────────────────────┼────────────────────┤
-     │ src/api.rs            │ 26, 35, 36         │
-     ├───────────────────────┼────────────────────┤
-     │ build.rs              │ 31                 │
-     └───────────────────────┴────────────────────┘
-
-  1. is_blocked_target() — now blocks cloud metadata SSRF endpoints instead of returning false for everything. Blocks 169.254.169.254 (AWS/Azure), metadata.google.internal (GCP), 100.100.100.200 (Alibaba), and IPv6 equivalents. Loopback
-   and RFC-1918 intentionally allowed since this is a pentesting framework that needs internal scanning — but cloud metadata is never a legitimate scan target from inside a compromised host.   
+     The repo has 181 exploit modules under src/modules/exploits/. A verified grep-based audit surfaces several
+     systemic issues that break MCP/API/CLI compatibility, waste runtime, and leave the module set inconsistent:
+
+     - 14 blocking std::thread::sleep calls in async code (5 files) — freeze the tokio runtime.
+     - 23 files hand-roll TcpStream::connect instead of the framework's battle-tested
+     crate::utils::network::tcp_connect_addr (src/utils/network.rs:117).
+     - 50 files hand-roll reqwest::Client::builder instead of crate::utils::network::build_http_client
+     (src/utils/network.rs:257) — duplicated TLS/cookie/timeout config, inconsistent source-port handling.
+     - ~114 / 181 modules lack a standalone pub async fn check() — the framework expects a cheap vulnerability probe
+      separate from run() (used by check_module MCP tool; currently returns "does not support check" for most).
+     - ~73 modules hardcode port/path consts rather than using cfg_prompt_* — works for CLI-interactive only; breaks
+      silent MCP/API callers who want overrides.
+     - ~39 CVE-named modules have references: vec![] — links missing even though CVE ID is in the filename.
+     - Batch harness (/tmp/fire_all_modules.py → /tmp/fire_results.tsv, running in background) shows ~90% of modules
+      hit the 5 s per-module timeout when fired at a generic nc listener — they don't bail early when the target
+     clearly isn't speaking their protocol.
+
+     Fixing these raises MCP-run success rate, cuts timeout waste, eliminates duplicated networking logic, and makes
+      each exploit uniformly discoverable/probeable. The work splits cleanly into mechanical bulk fixes (quick wins)
+      and per-module feature work (bounded scope).
+
+     Critical Files & Utilities to Reuse
+
+     - src/utils/network.rs:117 — tcp_connect_addr(addr, timeout) (async, honours global source-port, handles
+     EINPROGRESS correctly)
+     - src/utils/network.rs:257 — build_http_client(timeout) (reqwest client with standard TLS + source-port
+     warning)
+     - src/utils/mod.rs — normalize_target, cfg_prompt_default, cfg_prompt_port, cfg_prompt_existing_file,
+     cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file
+     - src/modules/creds/utils.rs — is_mass_scan_target, is_subnet_target, run_mass_scan, MassScanConfig,
+     load_credential_file, generate_combos_mode
+     - src/module_info.rs — ModuleInfo, ModuleRank, CheckResult
+
+     Phased Execution
+
+     Phase A — Mechanical bulk (~1 session)
+
+     A1. Replace std::thread::sleep with tokio::time::sleep(...).await in 5 files / 14 sites:
+     ssh/sshpwn_auth_passwd.rs, ssh/sshpwn_pam.rs, cowrie/llm_prompt_injection.rs, cowrie/ansi_log_injection.rs,
+     dos/null_syn_exhaustion.rs. Where the sleep sits inside an ssh2 blocking session (ssh2 crate is sync), keep the
+      sync sleep but wrap the surrounding block in tokio::task::spawn_blocking.
+
+     A2. Fill empty references: vec![] for the ~39 CVE-named modules. Default pair:
+     https://nvd.nist.gov/vuln/detail/CVE-{year}-{id} +
+     https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-{year}-{id}. Extract CVE from filename.
+
+     A3. Root-check preamble for raw-socket modules. Add a shared helper crate::utils::require_root("icmp raw
+     socket") at the top of every run() in the flood/amplification family (dos/icmp_flood, dos/syn_ack_flood,
+     dos/null_syn_exhaustion, dos/dns_amplification, dos/ntp_amplification, dos/ssdp_amplification,
+     dos/memcached_amplification, scanners/ping_sweep, scanners/stalkroute_full_traceroute). Returns a clean
+     anyhow::Error if geteuid() != 0 — no panic, no socket-bind crash. Helper lives in src/utils/privilege.rs (new
+     file, ~12 LOC using libc::geteuid()).
+
+     Gate: cargo build --release clean, cargo clippy -- -W clippy::all no new warnings.
+
+     Phase B — Utility-reuse migrations (~2 sessions)
+
+     B1. Migrate 23 raw TcpStream::connect sites → tcp_connect_addr. Transformation:
+
+     // before
+     let stream = tokio::time::timeout(
+         Duration::from_secs(t),
+         TcpStream::connect(&addr),
+     ).await??;
+     // after
+     use crate::utils::network::tcp_connect_addr;
+     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+     let stream = tcp_connect_addr(addr, Duration::from_secs(t)).await?;
+
+     File list (from grep): dionaea/{mysql_sqli, mssql_dos, mqtt_underflow}, honeytrap/{ftp_panic, docker_panic},
+     snare/cookie_dos, ssh/{openssh_regresshion_cve_2024_6387, opensshserver_9_8p1race_condition,
+     erlang_otp_ssh_rce_cve_2025_32433}, dos/{slowloris, rudy}, crypto/geth_dos_cve_2026_22862,
+     frameworks/http2/cve_2023_44487, frameworks/exim/exim_etrn_sqli_cve_2025_26794,
+     network_infra/trend_micro/cve_2025_692{58,59,60}, network_infra/fortinet/fortisiem_rce_cve_2025_64155,
+     webapps/dify/cve_2025_56157, tplink/{tapo_c200_vulns, tplink_vigi_c385_rce, tplink_wr740n_dos},
+     netgear/netgear_r6700v3_rce_cve_2022_27646.
+
+     B2. Extend build_http_client + migrate all 50 sites.
+     First, extend the helper (src/utils/network.rs:257) with an opts struct so every HTTP-using module can migrate
+     cleanly:
+
+     #[derive(Default)]
+     pub struct HttpClientOpts {
+         pub cookie_store: bool,
+         pub follow_redirects: bool,      // default false → manual policy
+         pub user_agent: Option<String>,
+         pub default_headers: Option<reqwest::header::HeaderMap>,
+     }
+     pub fn build_http_client_with(timeout: Duration, opts: HttpClientOpts) -> Result<reqwest::Client,
+     reqwest::Error> { ... }
+     // existing build_http_client(timeout) stays as a thin wrapper over build_http_client_with(timeout,
+     Default::default()).
+
+     Then migrate all 50 modules — no diverging callers left in exploit code.
+
+     Gate: cargo build --release; re-run fire_all_modules.py, store diff vs Phase-A baseline. Timeout bucket should
+     shrink.
+
+     Phase C — Empirical bug triage (~1 session, after batch finishes)
+
+     Once /tmp/fire_results.tsv is complete, bucket by status:
+     1. PANIC / unwrap()-in-net — fix all; replace with ? + anyhow::Context.
+     2. IMMEDIATE_ERROR (<500 ms) — usually a hardcoded const or missing prompt default; fix inline.
+     3. TIMEOUT_NO_READ — add protocol sniff + early-exit after first read:
+
+     let mut probe = [0u8; 8];
+     match tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut probe)).await {
+         Ok(Ok(0)) | Ok(Err(_)) | Err(_) =>
+             return Ok(CheckResult::NotVulnerable("no banner".into())),
+         Ok(Ok(n)) if !looks_like_protocol(&probe[..n]) =>
+             return Ok(CheckResult::NotVulnerable("wrong protocol".into())),
+         _ => {}
+     }
+
+     Gate: PANIC bucket = 0, TIMEOUT bucket ≥50 % reduction.
+
+     Phase D — Feature additions (~2 sessions)
+
+     D1. Add pub async fn check() to the 114 missing modules. Priority = ~70 CVE-named ones. Template: reuse the
+     first TCP/HTTP probe from run(), return CheckResult::{Vulnerable|NotVulnerable|Unknown} without the payload.
+     For DoS floods where "check == exploit," omit with an inline comment.
+
+     D2. Replace hardcoded consts with cfg_prompt_* in ~73 modules. Keep current values as prompt defaults ⇒ zero
+     behavior change for existing callers; opens API/MCP overridability.
+
+     Gate: mcp__rustsploit__check_module returns a real result for every newly-checked module; list_options reflects
+      new knobs.
+
+     Phase E — Deep per-module audit of ALL 181 modules (rolling, multi-session)
+
+     User scope decision: full coverage. No deferral. Split into rolling session batches of ~20 modules each (≈9-10
+     sessions). Checklist tracked in src/modules/exploits/AUDIT.md (created once, updated per session) so progress
+     survives session boundaries.
+
+     Per-module checklist (applied uniformly):
+     1. Payload correctness vs. upstream CVE PoC / advisory (link in doc-comment).
+     2. Auth fallbacks where applicable (retry on 401/403 with alt credentials).
+     3. Exponential backoff around retryable transient errors.
+     4. Loot capture via crate::db::add_loot (shell output, extracted creds, files).
+     5. Host/service registration via crate::db::add_host + add_service on successful fingerprint.
+     6. Error context via anyhow::Context — every ? with human-readable .context(...).
+     7. Doc block at top: CVE, vendor, affected versions, payload summary, references.
+     8. ModuleRank honest w.r.t. reliability observed during testing.
+     9. check() present (Phase D1 adds one if missing).
+     10. cfg_prompt_* for every user-configurable knob (Phase D2 migrates consts).
+
+     Session batching order (priority first):
+     - E1 (session 1): highest-profile CVEs in network_infra/ (fortinet, ivanti, citrix, palo_alto, sonicwall) — 30
+     modules.
+     - E2: webapps RCE modules (craftcms, flowise, n8n, xwiki, roundcube, sharepoint, wordpress, sap, misp, mcpjam,
+     dify, langflow) — 25 modules.
+     - E3: frameworks (apache_tomcat, apache_camel, jenkins, nginx, php, wsus, http2) — 15 modules.
+     - E4: ssh module family (libssh_auth_bypass, asyncssh, paramiko, erlang_otp, sshpwn_*, libssh2_rogue_server,
+     openssh_regresshion, opensshserver_9_8p1race) — 15 modules.
+     - E5: router CVEs (tplink, ruijie, netgear, dlink, zte, zyxel, tenda, ubiquiti) — 25 modules.
+     - E6: vnc modules (13) + telnet (1) + voip (1) + cameras (6) — 21 modules.
+     - E7: dos modules (12 flood/amplification) — apply root-check + verify they behave cleanly.
+     - E8: honeytrap / snare / cowrie / dionaea / safeline — 15 modules.
+     - E9: crypto / ftp / ipmi / windows / bluetooth / payloadgens — 12 modules.
+     - E10: remaining + catch-all review.
+
+     Completion gate for each session: audit notes + diff committed, cargo build --release green, MCP smoke re-run.
+
+     Verification (cross-phase)
+
+     1. cargo build --release must stay green after every phase.
+     2. cargo clippy --all-targets -- -W clippy::all — no new warnings in touched files.
+     3. python3 /tmp/fire_all_modules.py smoke run between phases; /tmp/fire_results.tsv compared against the
+     pre-phase snapshot for regressions.
+     4. MCP smoke: mcp__rustsploit__list_modules, module_info on every touched module, check_module on all Phase-D1
+     additions, run_module on 3 representative modules (ssh, HTTP RCE, DoS).
+     5. CLI smoke: run the shell (cargo run -- -s), use <module>, check, verify prompts are satisfied via set <opt>
+     and no io::stdin blocks.
+
+     Decisions Locked
+
+     - Phase E scope → all 181 modules, batched across rolling sessions (E1–E10, ~20 modules each), checklist
+     tracked in src/modules/exploits/AUDIT.md.
+     - build_http_client extension → new HttpClientOpts struct + build_http_client_with(timeout, opts); existing
+     build_http_client(timeout) stays as wrapper. All 50 exploit modules migrate; no diverging callers.
+     - Raw-socket modules → shared crate::utils::require_root(&str) helper (new src/utils/privilege.rs); every
+     flood/amplification/raw-sniff module gates at top of run() returning anyhow::Error, no crash.
+
+  
+    Completed                                                                                                         
+  - ✅ Phase A1: thread::sleep → tokio::time::sleep (2 files — other sites were already correct inside
+  spawn_blocking/native threads)                                                                      
+  - ✅ Phase A2: Populated all 39 empty references: vec![] with category-appropriate refs
+  - ✅ Phase A3: New require_root() helper in src/utils/privilege.rs wired into 9 raw-socket modules                
+  - ✅ Phase B2a: HttpClientOpts + build_http_client_with() added to src/utils/network.rs; old build_http_client()
+  now wraps it   
+  
+  
+                                                                                                                     
+  ┌─────────────────────────────────────┬───────────┬──────────────────────────────────────────────────────────┐    
+  │                Phase                │  Status   │                          Impact                          │    
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤    
+  │ A1 — thread::sleep → tokio::sleep   │ ✅ done   │ 2 SSH modules (14 sites)                                 │    
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤    
+  │ A2 — Populate empty references      │ ✅ done   │ All 39 modules                                           │
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤    
+  │ A3 — require_root helper            │ ✅ done   │ New src/utils/privilege.rs + 9 raw-socket modules        │    
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤
+  │ B2a — Extend build_http_client      │ ✅ done   │ HttpClientOpts + build_http_client_with                  │    
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤    
+  │ B1 — TcpStream::connect migration   │ ✅        │ ~14 sites / 10 files migrated; complex patterns deferred │    
+  │                                     │ partial   │  to E                                                    │    
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤
+  │ B2b — reqwest migration             │ ✅ done   │ 47 sites / 41 files unified                              │
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤
+  │ C — Empirical batch triage          │ ⏳        │ Needs fresh /tmp/fire_results.tsv                        │
+  │                                     │ pending   │                                                          │    
+][
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤
+  │ D2 — cfg_prompt_* for hardcoded     │ ⏳        │ 73 modules                                               │    
+  │ consts                              │ pending   │                                                          │
+  ├─────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────┤    
+  │ E — Deep audit all 181 modules      │ ⏳        │ rolling E1–E10                                           │
+  │                                     │ pending   │                                                          │    
+  └─────────────────────────────────────┴───────────┴──────────────────────────────────────────────────────────┘
+                                                                                                                 
+  MCP Server Protocol Safety (src/mcp/server.rs):                                                                   
+  - Added isolate_protocol_stdout() — redirects fd 1 to /dev/null so stray println! from modules can't corrupt the  
+  JSON-RPC stream                                                                                                   
+  - Added MAX_LINE_BYTES (1 MiB) cap to prevent memory exhaustion from malicious input              
+  - Switched to byte-level read_until for binary safety (vs read_line which requires valid UTF-8)                   
+  - Explicit non-UTF-8 error handling with proper JSON-RPC error response                                           
+  - Made write_response accept dyn AsyncWrite for flexibility                                                       
+  - Fixed MCP spec compliance: resources/read now wraps response in { "contents": [...] }                           
+                                                                                                                    
+  Spool Security (src/spool.rs):                                                                                    
+  - Added O_NOFOLLOW flag to prevent TOCTOU race condition on symlinks                                              
+  - Lock-first pattern: acquires the write lock before creating the file to prevent orphaned files                  
+  - Parent directory symlink check (Bug #96): blocks spool through symlinked parent dirs            
+  - write_line() now returns Result<(), std::io::Error> with flush after every write (Bug #11)                      
+  - Proper error logging in start_at_path() and stop()                                              
+                                                                                                                    
+  Output Error Handling (src/output.rs):                                                                            
+  - Added SPOOL_WARNED pattern for spool write error suppression (logs once, then suppresses)                       
+  - _mprint_line and _mprint_newline now properly handle write_line Result                                          
+                                                                                                                    
+  Shell (src/shell.rs):                                                                                             
+  - Proper error handling for spool write_line call                                                                 
+                                                                                                                    
+  Build System (build.rs):                                                                                          
+  - Regex caching: compiles 3 regexes once in main() and reuses across all category dispatchers                     
+  - Fast pre-filter: content.contains("fn run") skip before regex matching                                          
+  - Added check_available() function generation per category                                                        
+  - Added check_available_by_category() in unified registry                                                         
+                                                                                                                    
+  API SSRF Protection (src/api.rs):                                                                                 
+  - Restored comprehensive SSRF blocking: cloud metadata endpoints, link-local ranges, IPv6 metadata, wildcard DNS  
+  services                                                                                                          
+  - Added is_blocked_ip() function for IP-level blocking                                                            
+  - Made is_blocked_target() pub(crate) for MCP tools access                                                        
+  - Added () and {} to shell metacharacter checks           
+                                                                                                                    
+  MCP Tools Input Validation (src/mcp/tools.rs):                                                                    
+  - Added SSRF checks to handle_run_module and handle_check_module                                                  
+  - Added field length limits (4096 chars) and control character validation to handle_add_cred                      
+  - Added IP/hostname validation (256 chars) to handle_add_host                                                     
+  - Added port range validation (port 0 blocked) and field validation to handle_add_service  
+
+  
+  
+  Warnings fixed (10 → 0):
+  - Removed unused extract_ip_from_target re-export from utils/mod.rs
+  - Wired categories() and has_check() into commands/mod.rs, called from ws.rs rpc_list_modules_enriched — this uses the generated CATEGORIES, check_available_by_category, and all 4 per-dispatch check_available functions
+  - Removed 9 unused ModuleConfig fields (port, username_wordlist, password_wordlist, concurrency, stop_on_success, save_results, output_file, verbose, combo_mode) — only custom_prompts and api_mode were ever read
+  - Wired results_dir() from config.rs into ws.rs instead of hardcoded "results" path
+
+  Slop audit result: Only 4 .expect() calls in the entire codebase, all on infallible operations (hardcoded regex, fixed-size byte slice, in-memory zlib). No .unwrap() calls on fallible paths.
+
+  
+    Completed fixes:
+  - P0 (SSRF): Fixes #1-3 — async DNS resolution checks in ws.rs and mcp/tools.rs
+  - P1 (Race/Validation): Fix #4 (port truncation), #5 (WS connection limit TOCTOU), #6 (job spawn TOCTOU), #7
+  (session expiry/cleanup), #8 (file permission TOCTOU)
+  - P2 (Hardening): Fix #9 (health info disclosure), #10 (secret zeroization — Zeroizing<Vec<u8>> on all chain keys,
+   root keys, IKM), #11 (subscription limit), #12 (serialization error propagation), #13 (per-IP handshake rate
+  limiting — 10/min/IP with 429 response), #14 (job ID collision check)
+  - P3 (Low): Fix #15 (cred_type validation), #16 (removed is_locked() stub)
+
+First task to need a prompt (e.g., "Port Range") locks the shared cache, prompts the user once, caches the answer
+All other tasks find the cached answer instantly — zero stdin reads
+Single-target mode is completely unaffected (no cache active)
+Files changed
+File	Change
+
+context.rs
+Added PromptCache type + prompt_cache field on RunContext
+
+prompt.rs
+Added cached_prompt() helper, updated all 7 cfg_prompt_* functions
+
+commands/mod.rs
+Wrapped all 3 concurrent dispatch paths (mass scan, file, CIDR) with shared cache via RUN_CONTEXT.scope()
+You can test it with cargo run and try a mass scan target like 0.0.0.0/0 — each prompt should now appear exactly once.
+  Fixed (7 changes across 8 files):                                                                                 
+                                                               
+  1. TOCTOU file permissions (cred_store.rs, loot.rs, global_options.rs, pq_channel.rs): Files now created with     
+  0o600 atomically via OpenOptions::mode() instead of write-then-chmod.
+  2. Path traversal (creds/utils.rs): mark_ip_checked and is_ip_checked now reject absolute paths, paths with       
+  separators, and null bytes - not just ...                                                                         
+  3. SSH timeout hardening (ssh_bruteforce.rs): Added set_read_timeout, set_write_timeout, and sess.set_timeout() so
+   handshake/auth can't hang a blocking thread forever.                                                             
+  4. Combo overflow protection (creds/utils.rs): Vec::with_capacity now caps pre-allocation at 10M entries to avoid
+  OOM on huge cross products; Vec still grows organically beyond that.                                              
+  5. Atomic ordering (creds/utils.rs): print_progress and print_final now use Ordering::Acquire instead of Relaxed
+  for consistent stats.                                                                                             
+  6. Streaming wordlist support (utils/modules.rs, creds/utils.rs): Added load_lines_uncapped, load_lines_batched,
+  file_size, STREAMING_THRESHOLD (250 MB), and run_bruteforce_streaming - processes huge wordlists in 500K-line     
+  batches without materializing the full cross product.  
+
+  
+    11 files updated:
+
+  1. docs/Module-Catalog.md — Added 57 new module entries (45 exploits, 3 scanners, 10 creds), 6 new category
+  sections (Cowrie, Dionaea, HoneyTrap, SafeLine, Snare, VNC), updated totals to 239
+  2. docs/Changelog.md — New April 2026 section with all changes, updated module totals
+  3. README.md — Updated counts, highlights (credential protocols, exploit categories, MCP server, WebSocket),
+  scanner list
+  4. docs/Home.md — Updated module counts in wiki index (239 total)
+  5. docs/Module-Development.md — Added mcp/, ws.rs, privilege.rs to layout tree, updated module counts
+  6. docs/Utilities-Helpers.md — Added network utils and privilege check sections with full API docs
+  7. docs/API-Server.md — Added WebSocket endpoint /pq/ws, transport documentation, updated endpoint count
+  8. docs/CLI-Reference.md — Added --mcp flag
+  9. docs/Security-Validation.md — Added MCP, spool, privilege check security patterns
+  10. bugs.txt — Cleaned up debug logs, replaced with resolved bug list
+  11. changelogs/changelog-latest.md — Prepended full session changelog
+
+    Mass scan prompt spam fix (context.rs, utils/mod.rs, utils/prompt.rs, commands/mod.rs):                           
+  - Added a global BATCH_ACTIVE flag and BATCH_CACHE that don't rely on tokio::task_local propagation into spawned  
+  tasks                                                                                                             
+  - is_batch_mode() now checks the global flag first, falling back to the task-local                                
+  - cached_prompt() now uses the global batch cache when active, ensuring only one prompt per key even across       
+  tokio::spawn boundaries                                                                                           
+  - All three concurrent dispatch paths (random, file, CIDR) set set_batch_mode(true) before spawning and           
+  set_batch_mode(false) after completion                                                                            
+                                                                                                                    
+  hex.rs (src/native/hex.rs):                               
+  - Added decode() function — accepts upper/lowercase hex, returns Vec<u8>                                          
+  - Added DecodeError enum with OddLength and InvalidChar variants, implementing Display and Error                  
+  - No test code — production functions only     
+  v
+  
+  New module: src/modules/exploits/dos/telnet_iac_flood.rs
+
+  Four attack modes that exploit the unbounded IAC parsing bug:
+
+  1. WILL/DO Storm — Rapid-fire WILL/DO/WONT/DONT for 14 options, forcing the target to generate and process response packets for each
+  2. Subnegotiation Bomb — Sends IAC SB frames without IAC SE terminators, plus 4000+ byte payloads that force parsers to scan the entire buffer looking for a terminator that never comes
+  3. NOP Interleave — 1000+ IAC NOP commands interleaved with WILL/DO, forcing per-byte state machine transitions
+  4. Combined — All three plus rapid option toggling (WILL→WONT→DO→DONT cycles)
+
+  Fea
+  
+    Fixed (7 changes across 8 files):
+
+  1. TOCTOU file permissions (cred_store.rs, loot.rs, global_options.rs, pq_channel.rs): Files now created with 0o600 atomically via OpenOptions::mode() instead of write-then-chmod.
+  2. Path traversal (creds/utils.rs): mark_ip_checked and is_ip_checked now reject absolute paths, paths with separators, and null bytes - not just ...
+  3. SSH timeout hardening (ssh_bruteforce.rs): Added set_read_timeout, set_write_timeout, and sess.set_timeout() so handshake/auth can't hang a blocking thread forever.
+  4. Combo overflow protection (creds/utils.rs): Vec::with_capacity now caps pre-allocation at 10M entries to avoid OOM on huge cross products; Vec still grows organically beyond that.
+  5. Atomic ordering (creds/utils.rs): print_progress and print_final now use Ordering::Acquire instead of Relaxed for consistent stats.
+  6. Streaming wordlist support (utils/modules.rs, creds/utils.rs): Added load_lines_uncapped, load_lines_batched, file_size, STREAMING_THRESHOLD (250 MB), and run_bruteforce_streaming - processes huge wordlists in 500K-line batches
+  without materializing the full cross product.
+
+                                                                                                                                                                                                                                            
+  telnet_auth_bypass_cve_2026_24061.rs (line 207):                                                                                                                                                                                          
+  - while i < data.len() - 1 → while i + 1 < data.len() — eliminates the usize underflow when data is empty (would wrap to usize::MAX)                                                                                                      
+  - Added sb_data.len() < MAX_SB_DATA (4096 cap) — prevents unbounded memory growth from a malicious server sending endless SB data without SE                                                                                              
+                                                                                                                                                                                                                                            
+  telnet_bruteforce.rs (line 1097):                                                                                                                                                                                                         
+  - Added sb_limit = (i + 4096).min(data.len()) — caps the SB scan at 4096 bytes past the SB start, so a malicious server sending SB without SE can't force the parser to process the entire buffer repeatedly
+                                                                                                                                                                                                                
+ Bug 1 — set_batch_mode(true) leaks on early ? return (file path, line 319-320)                                    
+                                                                                                                    
+  crate::context::set_batch_mode(true);          // line 318                                                        
+  let content = ...safe_read_to_string_async(target, None).await                                                    
+      .with_context(|| ...)?;                     // line 320 — early return!                                       
+                                                                                                                    
+  If the file read fails, ? returns Err and set_batch_mode(false) on line 390 is never reached. Every subsequent    
+  single-target run will think it's in batch mode — headers suppressed, prompts cached from a stale previous run.   
+  Same issue in the random path at line 243 (semaphore.acquire_owned().await?).                                     
+                                                            
+  Bug 2 — try_lock() silently skips cache clear (context.rs line 35)                                                
+  
+  if let Ok(mut guard) = BATCH_CACHE.try_lock() {                                                                   
+      guard.clear();                                                                                                
+  }
+                                                                                                                    
+  try_lock() on a tokio::sync::Mutex fails if another task still holds it (e.g. a prompt awaiting stdin from a      
+  previous run that was Ctrl+C'd). The cache retains stale answers from the prior scan — a different module's
+  prompts could silently get wrong defaults.                                                                        
+                                                            
+  Bug 3 — Global state conflicts with concurrent API dispatches                                                     
+  
+  BATCH_ACTIVE is a single global bool. If the WebSocket API dispatches two modules concurrently (one mass scan, one
+   single-target), the single-target run sees is_batch_active() == true and suppresses its headers/caches its
+  prompts incorrectly. The CLI is single-threaded so this won't bite today, but the API path uses RUN_CONTEXT       
+  precisely to avoid global state.     
+
+  
+   all improvements made to telnet_bruteforce.rs:    
+                                                                                                                    
+  Security hardening:                                                                                               
+  - MAX_IAC_ROUNDS (64) — caps total IAC negotiation responses per drain call, prevents infinite WILL/DO cycling    
+  from malicious servers                                                                                            
+  - MAX_DRAIN_BYTES (64KB) — caps total bytes read per drain call, prevents memory exhaustion                       
+  - IAC response batching — concatenates all responses into a single write_all instead of N separate writes,        
+  reducing syscalls                                                                                                 
+                                                                                                                    
+  Protocol improvements:                                                                                            
+  - TERMINAL_SPEED subnegotiation — responds with 38400,38400 instead of refusing                                   
+  - NEW_ENVIRON/ENVIRON subnegotiation — sends empty environment response instead of refusing                       
+  - Accepted TERMINAL_SPEED and ENVIRON in negotiate_do() (enables WILL before server sends SB)
+  - No-auth device detection — if banner shows a shell prompt with no login prompt, attempts verification           
+  immediately                                                                                                       
+                                                                                                                    
+  Effectiveness improvements:                                                                                       
+  - Banner fingerprinting (DeviceType enum with 15 device types) — detects Dahua, Xiongmai, HiSilicon, ZTE, Huawei, 
+  MikroTik, Ubiquiti, Cisco, D-Link, TP-Link, Netgear, BusyBox, Raspberry Pi, Dell iDRAC, HP printers               
+  - Device-specific credential prioritization — tries known device-specific defaults before generic credentials in
+  mass scan mode                                                                                                    
+  - ~40 additional default credentials (95+ total) — Ubiquiti, Raspberry Pi, Dell iDRAC, HP printers, Zyxel, Alpine 
+  Linux, Synology NAS, Cisco small business, Aerohive, Symbol/Zebra, etc.                                          
+  - Connection pre-check — verifies at least one port is reachable before loading wordlists (single target mode)    
+                                                            
+  Accuracy improvements:                                                                                            
+  - Multi-probe shell verification — tries echo _RS_VERIFIED_, then id (checks for uid=), then structural prompt
+  analysis                                                                                                          
+  - 6 more false-positive rejection patterns in looks_like_shell_prompt()
+  - 7 more failure indicators (Japanese, Korean, additional English patterns)                                       
+  - 5 more success indicators (EdgeOS, RouterOS, IoT menu patterns)                                                 
+  - 6 more login prompt patterns (Japanese, NVR/router/switch/modem-specific)                                       
+                                                                                                                    
+  Code quality:                                                                                                     
+  - collect_chunk_result() helper — deduplicates 3 copies of the streaming chunk result processing pattern          
+  - grab_banner() function — clean banner-only connection for fingerprinting     
+  
+  
+  
+    Critical - Unbounded network reads:                                                                               
+  - vnc/tightvnc_ft_path_traversal.rs - Added 16MB cap on FT message size and 64MB cap on total download with
+  per-chunk validation                                                                                              
+  
+  Critical - Integer overflow:                                                                                      
+  - ssh/libssh2_rogue_server.rs - Fixed off + 4 + len overflow using saturating_add()
+                                                                                                                    
+  High - Unbounded SSH channel reads:
+  - ssh/sshpwn_session.rs - Truncate stdout/stderr to 10MB + added 500MB file upload size check                     
+  - ssh/sshpwn_scp_attacks.rs - Truncate stdout/stderr to 10MB
+  - ssh/sshpwn_pam.rs - Truncate env output to 10MB                                                                 
+  - ssh/asyncssh_beginauthpass.rs - Truncate output to 10MB
+  - ssh/paramiko_authnonepass.rs - Truncate output to 10MB
+  - ssh/paramiko_unknown_method.rs - Truncate output to 10MB
+  - ssh/sshpwn_sftp_attacks.rs - Cap SFTP read to 10MB via Read::take()
+
+  High - Decompression bomb:
+  - mongo/mongobleed.rs - Cap zlib decompression to 64MB via Read::take()
+
+  Medium - File read without size check:
+  - payloadgens/payload_encoder.rs - Added 100MB file size check before encoding
+                                                                                                                    
+  Low - Capacity overflow prevention:
+  - native/hex.rs - saturating_mul(2) on capacity                                                                   
+  - native/payload_engine.rs - saturating_mul on 3 capacity calculations                                            
+  - utils/sanitize.rs - saturating_mul(2) on 2 shell escape capacities                                              
+                                                                                                                    
+  Bonus - Edition compatibility:                                                                                    
+  - context.rs - Renamed gen parameter (reserved keyword in Rust 2024)    
+  
+  
+    1. Batch mode leak on early ? return — fixed with RAII BatchGuard that calls set_batch_mode(false) on drop, even  
+  on error returns or panics                                                                                        
+  2. try_lock() silently skipping cache clear — replaced with a lock-free generation counter. enter_batch_mode()    
+  bumps the generation; cached_prompt() lazily clears stale entries when it sees a generation mismatch while already
+   holding the lock
+  3. blocking_lock() in async context — eliminated entirely, now lock-free                                          
+  4. gen reserved keyword — renamed to batch_gen (Rust 2024 edition)                                                
+                                                                                                                    
+  Bug 3 (global state vs concurrent API) remains by design — the global batch mode is a CLI-only fallback. API      
+  requests use RUN_CONTEXT task-local with per-request custom_prompts, which short-circuits before cached_prompt is 
+  ever reached. No functional conflict.  
+Security & Bug Audit: RustSploit                                                                                   
+                                                        
+ Context
+
+ Full security and bug audit of the RustSploit penetration testing framework. The codebase has strong Rust
+ fundamentals (memory safety, type system) and solid crypto (post-quantum ML-KEM + X25519). The issues below are
+ real, actionable findings organized by severity.
+
+ ---
+ CRITICAL / HIGH Severity
+
+ 1. TOCTOU Race in File Permission Setting
+
+ Files: src/cred_store.rs:165-191, src/loot.rs:108-112, src/global_options.rs:88-114, src/pq_channel.rs:68-89
+
+ Bug: Files are created world-readable, then permissions set to 0o600 in a separate call. Between write() and
+ set_permissions(), a local attacker can read credentials or private keys.
+
+ Fix: Use OpenOptionsExt::mode(0o600) to set permissions atomically at creation:
+ use std::os::unix::fs::OpenOptionsExt;
+ tokio::fs::OpenOptions::new()
+     .write(true).create(true).truncate(true)
+     .mode(0o600)
+     .open(&tmp).await?
+ All 4 files follow the same pattern - fix should be a shared utility.
+
+ ---
+ 2. Path Traversal in State File Handling
+
+ File: src/modules/creds/utils.rs:300-314 (mark_ip_checked())
+
+ Bug: Validates state_file by checking for .. substring, but does not block:
+ - Absolute paths (/etc/passwd passes)
+ - Symlink traversal
+ - Double encoding
+
+ Fix: Canonicalize the path and verify it's within an allowed directory.
+
+ ---
+ 3. Credential Plaintext Logging
+
+ Files: All bruteforce modules (ssh, mysql, http_basic, ftp, rdp, redis, etc.)
+
+ Bug: Found credentials are printed to stdout including the password in cleartext:
+ crate::mprintln!("\r{}", format!("[+] {} -> {}:{}", display, user, pass).green().bold());
+ Also stored in result files without zeroization.
+
+ Fix:
+ - Mask passwords in output (show first/last char or hash)
+ - Use zeroize crate for credential strings after use
+ - Warn users about terminal history exposure
+
+ ---
+ 4. DNS Resolution Without Timeout
+
+ File: src/modules/creds/generic/ssh_bruteforce.rs:344-346
+
+ Bug: to_socket_addrs() is a blocking DNS call with no timeout. A malicious or slow DNS server hangs the bruteforce
+  indefinitely.
+
+ Fix: Wrap DNS resolution in tokio::time::timeout(Duration::from_secs(5), ...).
+
+ ---
+ 5. Blocking Operations in Async Context
+
+ File: src/modules/creds/generic/ssh_bruteforce.rs:343-362
+
+ Bug: Inside spawn_blocking, sess.handshake() can hang indefinitely. The outer timeout wraps the JoinHandle, not
+ the inner blocking operation, so a hung handshake ties up a tokio blocking thread permanently.
+
+ Fix: Set TCP-level timeouts on the socket before passing to libssh2, or use a signal mechanism to abort the
+ blocking task.
+
+ ---
+ 6. Combo Generation Integer Overflow
+
+ File: src/modules/creds/utils.rs:647-658
+
+ Bug: Vec::with_capacity(usernames.len() * passwords.len()) can overflow on large wordlists (1M x 1M = 1 trillion
+ entries), causing OOM or panic.
+
+ Fix: Use checked_mul() and enforce a maximum combination count.
+
+ ---
+ MEDIUM Severity
+
+ 7. No Per-Second Rate Limiting in Mass Scan
+
+ File: src/modules/creds/utils.rs:381-615
+
+ Bug: Concurrency semaphore limits parallel tasks, but with fast probes and high concurrency (e.g., 1000), this
+ produces 100k+ packets/sec - effectively a DoS. No delay between retries either.
+
+ Fix: Add configurable requests_per_second throttle and retry delay.
+
+ ---
+ 8. Inconsistent Input Validation in MCP Tools
+
+ File: src/mcp/tools.rs (lines 595-612, 648-662, 691-698)
+
+ Bug: Different handlers have different length limits (host: 4096, IP: 256). IP field doesn't validate format. No
+ shared validation constants.
+
+ Fix: Create shared validation constants and utility functions.
+
+ ---
+ 9. Config Lock Poisoning Unrecoverable
+
+ File: src/config.rs (lines 63, 77, 115, 133, 184, 194, 199)
+
+ Bug: RwLock poison errors are caught but never recovered. A single panic in a locked section makes the entire
+ config system permanently broken.
+
+ Fix: Either use parking_lot::RwLock (which doesn't poison) or add recovery logic.
+
+ ---
+ 10. Race Condition in Progress Stats
+
+ File: src/modules/creds/utils.rs:128-175
+
+ Bug: Uses Ordering::Relaxed for all atomic loads in print_progress(). Stats can be inconsistent (e.g., showing
+ more successes than total attempts).
+
+ Fix: Use Ordering::Acquire for consistency.
+
+ ---
+ 11. Telnet IAC Parser Infinite Loop Risk
+
+ File: src/modules/creds/generic/telnet_bruteforce.rs
+
+ Bug: IAC negotiation has no limits on SB (subnegotiation) frame size or iteration count. A malicious server can
+ send endless IAC sequences.
+
+ Fix: Add max frame size and iteration limits.
+
+ ---
+ 12. Transitive Dependency Vulnerabilities
+
+ File: Cargo.toml:135-136
+
+ Bug: paste (RUSTSEC-2024-0436, unmaintained) and lru (RUSTSEC-2026-0002, unsound) via ratatui 0.29. No upstream
+ fix yet.
+
+ Fix: Monitor for ratatui update; consider alternative TUI library if unresolved.
+
+ ---
+ LOW Severity
+
+ 13. Unsafe errno Access Without Validation
+
+ File: src/mcp/server.rs:12-31
+
+ Direct *libc::__errno_location() dereference. Consider using errno crate.
+
+ 14. Session Cleanup - No Fallback
+
+ File: src/api.rs:223-242
+
+ Cleanup task runs every 300s. If it panics, no fallback exists. Already has max session limit elsewhere, so impact
+  is low.
+
+ 15. File Export Path Assumes CWD Safety
+
+ File: src/export.rs:214-228
+
+ Validates filename but writes to CWD. In API mode, CWD should be operator-controlled. Document this assumption.
+
+ 16. Redis "No Auth" False Positive
+
+ File: src/modules/creds/generic/redis_bruteforce.rs:178-196
+
+ PING succeeding without auth doesn't mean Redis is fully unauthenticated. Should test with INFO or SELECT.
+
+ 17. Partial File Write on Error
+
+ File: src/modules/creds/generic/ssh_bruteforce.rs:288-327
+
+ If writeln! fails partway through writing results, the file is left in partial state. Use temp file + atomic
+ rename.
+
+ 18. Regex Compiled in Loop
+
+ File: src/modules/exploits/crypto/heartbleed.rs:325-407
+
+ Regex patterns compiled per iteration. Pre-compile at module load time for performance.
+
+ ---
+ Already Implemented (Previous Rounds)
+
+ Items 1 (TOCTOU), 2 (path traversal), 4 (DNS timeout), 5 (blocking ops), 6 (combo overflow), 10 (atomic ordering)
+ — all fixed. Streaming wordlist support added. Edge case hardening applied across SSH/VNC/MongoDB/payload modules.
+
+ ---
+ Phase 3: Scanner Module Fixes
+
+ Context
+
+ Scanner modules audit revealed ~15 actionable bugs across 10+ scanner files. No shared scanner utility exists —
+ each module independently implements buffer handling and timeout logic, causing inconsistency and gaps.
+
+ Fix Order (by severity)
+
+ S1. CIDR /0 Expansion OOM — src/modules/scanners/ping_sweep.rs:354-366
+
+ Bug: host_set collects all IPs from CIDR with no limit. A /0 network = 4 billion IPs → OOM.
+ Fix: Before iterating, check net.size(). If > 1M hosts, warn and require confirmation. Use .take(limit) as safety
+ net.
+ const MAX_CIDR_HOSTS: usize = 1_048_576; // 1M = /12 IPv4
+ for net in &config.targets {
+     let size = match net.size() {
+         ipnetwork::NetworkSize::V4(n) => n as u128,
+         ipnetwork::NetworkSize::V6(n) => n,
+     };
+     if size > MAX_CIDR_HOSTS as u128 {
+         crate::mprintln!("CIDR {} has {} hosts (max {}), skipping", net, size, MAX_CIDR_HOSTS);
+         continue;
+     }
+     for host in net.iter() { host_set.insert(host); }
+ }
+
+ S2. Duplicate HTTP Methods — src/modules/scanners/api_endpoint_scanner.rs:155-158
+
+ Bug: Extended methods list has exact duplicate line, adding PUT/PATCH/HEAD/OPTIONS/CONNECT/TRACE twice.
+ Fix: Remove duplicate line 157. Trivial one-line fix.
+
+ S3. Hardcoded DNS Timeout — src/modules/scanners/dns_recursion.rs:176-181
+
+ Bug: Uses Duration::from_secs(5) instead of user-configured timeout_secs. Display message also hardcoded.
+ Fix: Replace 5 with timeout_secs in both the timeout call and the print statement.
+
+ S4. Unbounded HTTP Response Body — src/modules/scanners/http_title_scanner.rs:196-207
+
+ Bug: Comment says "at most 256KB" but response.bytes().await downloads full body before truncation.
+ Fix: Use bytes_stream() with early termination at 256KB:
+ use futures_util::StreamExt;
+ let mut buffer = Vec::with_capacity(256 * 1024);
+ let mut stream = response.bytes_stream();
+ while let Some(chunk) = stream.next().await {
+     let chunk = chunk.context("Stream read error")?;
+     buffer.extend_from_slice(&chunk);
+     if buffer.len() >= 256 * 1024 { buffer.truncate(256 * 1024); break; }
+ }
+
+ S5. Response Not Consumed — src/modules/scanners/http_method_scanner.rs:139-174
+
+ Bug: Response object created but body never consumed/dropped explicitly. Reqwest buffers body in memory.
+ Fix: Drop response explicitly after extracting status, or read a small portion:
+ let status = resp.status();
+ drop(resp); // release connection and buffered body
+
+ S6. Port 0 Acceptance — src/modules/scanners/port_scanner.rs:146 and ping_sweep.rs:1004-1020
+
+ Bug: Source port allows 0 in port_scanner. Port parsing in ping_sweep accepts port 0.
+ Fix: In parse_ports(), skip port 0 with warning. In port_scanner, validate source port > 0.
+
+ S7. Semaphore Acquisition Pattern — src/modules/scanners/port_scanner.rs:258-259
+
+ Bug: Semaphore acquired before spawning task. If acquire fails, loop exits leaving orphan tasks.
+ Fix: Move semaphore acquisition inside spawned task.
+
+ S8. Wildcard DNS Detection — src/modules/scanners/subdomain_scanner.rs:139-150
+
+ Bug: Tests only ONE random subdomain for wildcard. False negatives from slow DNS or collisions.
+ Fix: Test 3 random subdomains. Mark wildcard only if at least 2 resolve to same IP.
+
+ S9. Inconsistent Banner Buffers — src/modules/scanners/service_scanner.rs (multiple)
+
+ Bug: Banner buffers range from 512B to 8192B across probes with no consistency.
+ Fix: Define const MAX_BANNER: usize = 4096; and use it across all probes. Not a security issue (single .read() is
+ bounded by buffer size) but inconsistent behavior.
+
+ S10. Path Traversal in Output Files — src/modules/scanners/sequential_fuzzer.rs:368-371
+
+ Bug: Output directory built from timestamp (safe) but template-derived file names could escape.
+ Fix: Sanitize output filenames — strip directory separators, .., null bytes.
+
+ S11. Redis Scanner Silent Truncation — src/modules/scanners/redis_scanner.rs:52-63
+
+ Bug: Fixed 8KB buffer for Redis responses. Large INFO responses silently truncated.
+ Fix: Accept truncation (this is a scanner, not a data extractor) but log when truncation occurs.
+
+ S12. SSH Scanner Blocking Connect — src/modules/scanners/ssh_scanner.rs:140
+
+ Bug: blocking_tcp_connect is called with timeout but inside spawn_blocking. If the underlying OS doesn't honor the
+  timeout, the thread hangs.
+ Fix: Set TcpStream::connect_timeout() explicitly and add read/write timeouts on the stream.
+
+ ---
+ Verification Plan
+
+ 1. cargo build — must compile cleanly
+ 2. cargo clippy — no new warnings
+ 3. Test CIDR expansion: verify /8 and larger produce warnings, /24 works normally
+ 4. Test api_endpoint_scanner: verify no duplicate methods in scan output
+ 5. Test dns_recursion: verify custom timeout applies
+ 6. Test port parsing: verify port 0 rejected with message
+ 7. General: cargo test passes
+
+ ---
+ Implementation Notes
+
+ - Files to modify: 10 scanner module files
+ - No new dependencies required — futures_util::StreamExt already available via reqwest
+ - No shared utility file needed — fixes are localized per-module
+ - Estimated changes: ~150 lines across all files
+ 
    
-  2. IPv6 validation — replaced 50-line hand-rolled parser with std::net::Ipv6Addr::from_str() which handles all edge cases correctly (IPv4-mapped, compressed, full format). Added zone ID fallback for link-local addresses               
-  (fe80::1%eth0). The old code had bugs: overlapping :: detection, unvalidated IPv6 prefixes in IPv4-mapped addresses, and segment count edge cases.   
-  
-  3. split_command — removed the dishonest Option wrapper. Changed from fn split_command() -> Option<(String, String)> (always returned Some) to fn split_command() -> (String, String). Updated the call site from a match Some/None to a  
-  direct destructure with an if cmd.is_empty() guard. Removed the dead None => arm that duplicated the _ => error message.       
-  
-  4. Resource scripts — added absolute path warning. When executing a script from outside ~/.rustsploit/, the user now sees a warning. This doesn't block execution (startup.rc needs absolute paths) but makes it visible when scripts from
-   unexpected locations are run.   
-
-   
-s21 doc files total across the project. Updated 17, created 1 new.                                                                                                                                                                         
-                                                                                                                                                                                                                                            
-  New file created:                                                                                                                                                                                                                         
-  - docs/MCP-Integration.md (218 lines) — Full MCP server docs: 30 tools table, 7 resources, architecture, security properties, Claude Desktop setup, generic client setup                                                                  
-                                                                                                                                                                                                                                            
-  Core docs updated (5 files):
-  - README.md — Added 7 new highlight bullets (MCP, payload mutation, native RDP, mass scan engine, streaming wordlists, source port binding)                                                                                               
-  - docs/Home.md — Module counts 181->190, 19->28 creds, added MCP-Integration.md to index table                                                                                                                                            
-  - docs/Changelog.md — Module counts updated, added 17 new highlight items covering all major features                                                                                                                                     
-  - docs/Future-Features.md — 5 features moved to "Recently Completed" (MCP, mutation engine, native RDP, mass scan, source port), removed completed planned item, renumbered                                                               
-  - docs/Credits.md — Added 7 new dependency credits (ratatui, crossterm, btleplug, rlimit, tracing, num_cpus, gag)                                                                                                                         
-                                                                                                                                                                                                                                            
-  Technical docs updated (5 files):                                                                                                                                                                                                         
-  - docs/Module-Catalog.md — 181->190 total, 19->28 creds, added 9 missing credential modules                                                                                                                                               
-  - docs/Module-Development.md — 19->28 creds, added MCP Tool Development and Payload Mutation Engine sections                                                                                                                              
-  - docs/Credential-Modules-Guide.md — Added Mass Scan Engine, ETA/Backoff/Lockout Detection, Streaming Wordlists sections                                                                                                                
-  - docs/Exploit-Modules-Guide.md — Added Payload Mutation Engine (9 strategies) and WPair BLE Module sections                                                                                                                              
-  - docs/Utilities-Helpers.md — Added output.rs and payload_engine.rs to utility table                                                                                                                                                      
-                                                                                                                                                                                                                                            
-  Ops docs updated (7 files):                                                                                                                                                                                                               
-  - docs/API-Server.md — Added source_port prompt key, MCP Protocol section                                                                                                                                                                 
-  - docs/API-Usage-Examples.md — 181->190, added Multi-Target Examples and MCP Integration sections                                                                                                                                         
-  - docs/Security-Validation.md — Added Cloud Metadata SSRF Protection and MCP Input Validation sections                                                                                                                                  
-  - docs/Testing-QA.md — 181->190, 19->28 creds, added MCP Integration Tests and Native RDP Tests sections                                                                                                                                  
-  - docs/Getting-Started.md — Added MCP Integration setup section with Claude Desktop config                                                                                                                                                
-  - docs/Contributing.md — Added MCP tools and payload mutation to module placement table                                                                                                                                                   
-  - docs/Interactive-Shell.md — (updated by agent, module counts)       
-
-  
-    Highest-impact gaps to fix:
-
-  1. API: Missing DELETE endpoints for hosts, services, loot, bulk clears
-  2. API: No /api/check endpoint — safe vuln scanning not REST-exposed
-  3. API: No query filters on creds/loot list endpoints
-  4. API: No CSV/summary export via REST (only JSON)
-  5. MCP: Missing tools — add_note, delete_host, delete_service, delete_loot, clear_creds, clear_loot, clear_hosts, spool on/off, honeypot_check
-  6. MCP: Missing input validation — workspace names, module names, port ranges, target format
-  7. MCP: No result file access — API has /api/results but MCP doesn't
-
-  
-                                                         
-  API Gaps Fixed (8 new endpoints):                                                                                                                                                                                                         
-                                                                                   
-  ┌──────────────────────┬────────┬─────────────────────────────────────────────────────────────────┐                                                                                                                                       
-  │     New Endpoint     │ Method │                             Purpose                             │
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                       
-  │ /api/hosts           │ DELETE │ Delete a host by IP (+ its services)                            │
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                       
-  │ /api/services        │ DELETE │ Delete a service by host+port                                   │
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤
-  │ /api/hosts/notes     │ POST   │ Add a note to a tracked host                                    │
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤
-  │ /api/loot            │ DELETE │ Delete a loot entry by ID                                       │                                                                                                                                       
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                       
-  │ /api/creds/search?q= │ GET    │ Search credentials by host/service/username                     │                                                                                                                                       
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                       
-  │ /api/loot/search?q=  │ GET    │ Search loot by host/type/description                            │
-  ├──────────────────────┼────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                       
-  │ /api/check           │ POST   │ Non-destructive vulnerability check (module's check() function) │                                                                                                                                       
-  └──────────────────────┴────────┴─────────────────────────────────────────────────────────────────┘                                                                                                                                       
-                                                                                                                                                                                                                                            
-  Total API endpoints: 27 -> 34 (was missing DELETE for hosts/services/loot, search for creds/loot, check endpoint, and notes)                                                                                                              
-                                                            
-  MCP Gaps Fixed (5 new tools + 1 validation fix):                                                                                                                                                                                          
-                                                            
-  ┌─────────────────────────────┬───────────────────────────────────────────────────┐                                                                                                                                                       
-  │          New Tool           │                      Purpose                      │
-  ├─────────────────────────────┼───────────────────────────────────────────────────┤
-  │ add_note                    │ Add annotation to a tracked host                  │
-  ├─────────────────────────────┼───────────────────────────────────────────────────┤
-  │ clear_creds                 │ Bulk clear all stored credentials                 │
-  ├─────────────────────────────┼───────────────────────────────────────────────────┤                                                                                                                                                       
-  │ clear_loot                  │ Bulk clear all loot entries and files             │
-  ├─────────────────────────────┼───────────────────────────────────────────────────┤                                                                                                                                                       
-  │ clear_hosts                 │ Bulk clear all hosts and services from workspace  │
-  ├─────────────────────────────┼───────────────────────────────────────────────────┤                                                                                                                                                       
-  │ + workspace name validation │ Reject names >64 chars or with invalid characters │
-  └─────────────────────────────┴───────────────────────────────────────────────────┘                                                                                                                                                       
-                                                            
-  Total MCP tools: 30 -> 34                                                                                                                                                                                                                 
-  
- Summary by Severity
-
-     ┌──────────┬───────┬─────────────────────────────────────────────────────────────┐
-     │ Severity │ Count │                           Bug IDs                           │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ CRITICAL │ 1     │ 1                                                           │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ HIGH     │ 8     │ 2, 5(perf), 6, 10, 14, 15, 20, 32, 33                       │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ MEDIUM   │ 16    │ 3, 7, 8, 11, 12, 16, 18, 19, 23, 24, 25, 26, 28, 29, 34, 36 │
-     ├──────────┼───────┼─────────────────────────────────────────────────────────────┤
-     │ LOW      │ 8     │ 4, 9, 13, 17, 21, 22, 27, 30, 31                            │
-     └──────────┴───────┴─────────────────────────────────────────────────────────────┘
-
-     Fix Priority
-
-     Batch 1 — Security (do first):
-     - BUG 1: export.rs absolute path traversal
-     - BUG 2: shell export handler bypass
-     - BUG 32: makerc path traversal
-     - BUG 33: resource path validation
-     - BUG 10: spool TOCTOU symlink race
-     - BUG 26: API workspace name validation
-
-     Batch 2 — Data Integrity:
-     - BUG 14: global_options lost update race
-     - BUG 15, 20: Silent save failures (global_options + cred_store)
-     - BUG 6: Job status never updated
-     - BUG 23: workspace non-atomic name/data update
-
-     Batch 3 — Input Validation:
-     - BUG 16: global_options key/value length
-     - BUG 19: cred_store service/source_module length
-     - BUG 29: loot description length
-     - BUG 34: Port 0 accepted
-     - BUG 36: API hosts IP validation
-
-     Batch 4 — Quality / Polish:
-     - BUG 11: spool flush
-     - BUG 7: unbounded job history
-     - BUG 8: job output capture
-     - BUG 18, 28: UUID truncation
-     - BUG 25: unbounded notes
-     - BUG 22: secret display threshold
-
-     Verification
-
-     After fixes:
-     1. cargo check — zero errors, zero warnings
-
-     
-     All 5 "intentionally not fixed" gaps are now fixed:                                                                                                                                                                                       
-                                                                                                                                                                                                                                            
-  1. Honeypot Check — Now Universal                                                                                                                                                                                                         
-                                                                                                                                                                                                                                            
-  - Shell: Already worked (via run command with honeypot_detection global option)                                                                                                                                                           
-  - API: Already at POST /api/honeypot-check
-  - MCP: Added honeypot_check tool calling quick_honeypot_check() from utils/network.rs                                                                                                                                                     
-                                                                                                                                                                                                                                            
-  2. run_all — Dedicated API Endpoint + MCP Tool                                                                                                                                                                                            
-                                                                                                                                                                                                                                            
-  - Shell: Already worked (run_all command)                                                                                                                                                                                                 
-  - API: Added POST /api/run_all accepting {module, target, verbose} — validates CIDR, caps at 100K IPs, iterates with per-IP results
-  - MCP: Added run_all tool with same logic                                                                                                                                                                                                 
-  
-  3. Spool — MCP Tools Added                                                                                                                                                                                                                
-                                                            
-  - Shell: Already worked (spool <file>, spool off)                                                                                                                                                                                         
-  - API: Already worked via /api/shell command
-  - MCP: Added 3 tools: spool_start, spool_stop, spool_status                                                                                                                                                                               
-                                                                                                                                                                                                                                            
-  4. Export CSV/Summary — String Variants + API/MCP Support                                                                                                                                                                                 
-                                                                                                                                                                                                                                            
-  - export.rs: Added export_csv_string(), export_summary_string() returning Result<String>                                                                                                                                                  
-  - API: /api/export?format=csv and ?format=summary now return content in JSON response (was JSON-only)
-  - MCP: Added export_csv and export_summary tools                                                                                                                                                                                          
-                                                                                                                                                                                                                                            
-  5. Resource Scripts — Safe MCP Equivalent                                                                                                                                                                                                 
-                                                                                                                                                                                                                                            
-  - File-based resource stays shell-only (security)                                                                                                                                                                                         
-  - MCP: Added execute_commands tool accepting {commands: ["use module", "set target x", "run"]} — same workflow power, no file access risk, max 100 commands per call
-                                                                                                                                                                                                                                            
-  Total new additions:                                      
-  - API: 2 new endpoints (/api/run_all, /api/export extended with csv/summary)                                                                                                                                                              
-  - MCP: 9 new tools (honeypot_check, run_all, spool_start/stop/status, export_csv, export_summary, execute_commands)                                                                                                                       
-  - export.rs: 3 new string-returning functions                                                                      
-                                                                                                        
-  Key changes in the uncapped implementations:                                                                                                                                                                                              
-  - Arc<Semaphore> bounds concurrency (default 50, configurable via concurrency param, max 500)
-  - tokio::spawn per IP with permit — lazy iteration, never allocates all IPs in memory                                                                                                                                                     
-  - Semaphore drain at the end waits for all tasks to finish                           
-  - Response returns summary counts only (success, failed, host_count), not per-IP results — prevents OOM on /8 subnets                                                                                                                     
-  - concurrency parameter added to both API and MCP for user control       
-  
-  
-    Critical/High bugs fixed (7):                                                    
-                                                                                                                                                                                                                                            
-  ┌────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────┐
-  │           Module           │                                                      Bug                                                      │                     Fix                      │                                             
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
-  │ ssh_bruteforce.rs:88       │ Mass scan userauth_password().is_ok() without authenticated() — reports false successes                       │ Added && sess.authenticated() check          │                                             
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤
-  │ l2tp_bruteforce.rs:776     │ CHAP challenge parsing accesses payload[offset+6] with only len > offset+4 guard — OOB panic on short packets │ Changed guard to len > offset + 6            │                                             
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                             
-  │ l2tp_bruteforce.rs:811     │ CHAP success/failure parsing accesses payload[0]/[1] without length check — panic on empty payloads           │ Added if pkt.payload.len() < 3 { continue; } │                                             
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                             
-  │ smtp_bruteforce.rs:238     │ EHLO response capped at 10 lines — fails on servers with >10 AUTH capabilities                                │ Increased to 100                             │                                             
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                             
-  │ smtp_bruteforce.rs:260,289 │ QUIT not flushed — may not send before socket close                                                           │ Added writer.flush() after each QUIT         │                                             
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                             
-  │ fortinet_bruteforce.rs:502 │ Success indicators case-sensitive — "Success"/"PORTAL" not detected                                           │ Added response_body.to_lowercase()           │
-  ├────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────┤                                             
-  │ telnet_bruteforce.rs:719   │ Port parsing allows duplicates ("23,23,23" attacks same port 3x)                                              │ Added HashSet dedup in parse_ports()         │
-  └────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────┘                                             
-                                                            
-  Shared infrastructure bugs fixed (2):                                                                                                                                                                                                     
-                                                            
-  ┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────┐   
-  │          File          │                                              Bug                                              │                                                    Fix                                                     │
-  ├────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-  │ creds/utils.rs:292-314 │ State file TOCTOU race — is_ip_checked + mark_ip_checked not atomic, two tasks can probe same │ Replaced with in-memory HashSet<String> behind tokio::Mutex for atomic check-and-mark, file used only for  │
-  │                        │  IP                                                                                           │ persistence                                                                                                │
-  ├────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ creds/utils.rs:259-267 │ generate_random_public_ip fallback bypasses exclusion list — returns unchecked IP after 100K  │ Fallback now re-checks against exclusions before returning                                                 │
-  │                        │ attempts                                                                                      │                                                                                                            │   
-  └────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  
-  
-    5 bruteforce module fixes:                                                                                                                                                                                                                
-                                                                                                                                                                                                                                            
-  ┌────────────────────┬──────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐   
-  │       Module       │                                Issue                                 │                                                                   Fix                                                                   │
-  ├────────────────────┼──────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ rtsp_bruteforce.rs │ Retryable logic inverted — "refused"/"timeout" marked as NOT         │ Fixed: connection errors (refused, timeout, reset, connection) now marked retryable: true                                               │   
-  │                    │ retryable when they should be                                        │                                                                                                                                         │   
-  ├────────────────────┼──────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ mqtt_bruteforce.rs │ ServerUnavailable (0x03) returned as Err() causing engine confusion  │ Fixed: returns Ok(false) so engine retries naturally; config errors (0x01, 0x02) still return Err                                       │   
-  ├────────────────────┼──────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ rdp_bruteforce.rs  │ No backoff in mass scan — hammers host on consecutive errors         │ Fixed: tracks consecutive errors, applies backoff_delay(500ms, attempt, 8x max) after 3+ consecutive errors                             │   
-  ├────────────────────┼──────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-  │ pop3_bruteforce.rs │ 74 lines of duplicated SSL/plain auth code                           │ Refactored: extracted pop3_authenticate() helper taking impl Read + Write, shared by SSL and plain paths. Connection setup stays        │   
-  │                    │                                                                      │ separate (SSL needs TlsConnector), auth logic unified                                                                                   │
-  ├────────────────────┼──────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤   
-  │ snmp_bruteforce.rs │ spawn_blocking for UDP I/O — unnecessary thread pool overhead        │ Replaced with native async tokio::net::UdpSocket via crate::utils::udp_bind() + tokio::time::timeout for recv. Removed spawn_blocking   │
-  │                    │                                                                      │ import                                                                                                                                  │   
-  └────────────────────┴──────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                                                                                                                                                                                                                            
-  Additional fixes:                                                                                                                                                                                                                         
-  
-  ┌──────────────────────┬───────────────────────────────────────────────────────────────┬──────────────────────────────────────┐                                                                                                           
-  │        Module        │                             Issue                             │                 Fix                  │
-  ├──────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────┤
-  │ telnet_bruteforce.rs │ Port list allows duplicates ("23,23,23" attacks same port 3x) │ Added HashSet dedup in parse_ports() │
-  └──────────────────────┴───────────────────────────────────────────────────────────────┴──────────────────────────────────────┘
-Audit findings:                                                                                                                                                                                                                           
-  - 118 out of 137 exploit modules (86%) had NO file output — only printed to stdout                                                                                                                                                        
-  - 23 out of 24 scanners saved to file but mostly in truncate mode (overwriting previous results)                                                                                                                                          
-  - All 11 bruteforce modules properly saved in append mode via the shared mass scan engine                                                                                                                                                 
-  - 1 scanner (dns_recursion) had no file output at all                                                                                                                                                                                     
-                                                                                                                                                                                                                                            
-  Fix applied — Framework-level auto-logging:                                                                                                                                                                                               
-                                                                                                                                                                                                                                            
-  Added auto_log_result() to src/commands/mod.rs that automatically logs every module execution to ~/.rustsploit/results/{category}_{module}.txt in append mode. This covers:                                                               
-                                                            
-  - Single target dispatch — logged after dispatch_by_category() returns                                                                                                                                                                    
-  - CIDR subnet scan — logged after scan summary with success/fail counts
-  - Random mass scan — logged after scan summary with success/fail counts                                                                                                                                                                   
-  - File-based target scan — logged after scan summary with success/fail counts                                                                                                                                                             
-                                                                                                                                                                                                                                            
-  Log format:                                                                                                                                                                                                                               
-  [2026-04-07 12:34:56] SUCCESS exploits/ssh/erlang_otp_ssh_rce target=192.168.1.1
-  [2026-04-07 12:35:10] COMPLETED scanners/port_scanner target=10.0.0.0/24 subnet_scan ok=254 err=2
-  [2026-04-07 12:36:00] SUCCESS exploits/crypto/heartbleed target=random mass_scan ok=5 err=1203                                                                                                                                            
-                                                                                                                                                                                                                                            
-  Key design decisions:                                                                                                                                                                                                                     
-  - Append mode (OpenOptions::new().append(true)) — never overwrites previous results                                                                                                                                                       
-  - Per-module files — exploits_heartbleed.txt, scanners_port_scanner.txt, etc.                                                                                                                                                             
-  - Controllable — users can disable via setg auto_save_results off                                                                                                                                                                         
-  - Zero module changes — all 190 modules get persistent output for free                                                                                                                                                                    
-  - Results accessible via API — /api/results endpoint already serves files from ~/.rustsploit/results/                                                                                                                                     
-                                                                                                           
-
-  ┌────────────────────────┬─────────────────────────────────────────────────────┐                                                                                                                                                          
-  │         Module         │                       Change                        │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ nbns_scanner.rs        │ std::fs::write() -> OpenOptions::new().append(true) │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤
-  │ redis_scanner.rs       │ std::fs::write() -> OpenOptions::new().append(true) │                                                                                                                                                          
-  ├────────────────────────┼─────────────────────────────────────────────────────┤
-  │ waf_detector.rs        │ std::fs::write() -> OpenOptions::new().append(true) │                                                                                                                                                          
-  ├────────────────────────┼─────────────────────────────────────────────────────┤
-  │ vnc_scanner.rs         │ std::fs::write() -> OpenOptions::new().append(true) │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ snmp_scanner.rs        │ std::fs::write() -> OpenOptions::new().append(true) │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ subdomain_scanner.rs   │ std::fs::write() -> OpenOptions::new().append(true) │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ ssl_scanner.rs         │ std::fs::write() -> OpenOptions::new().append(true) │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ http_title_scanner.rs  │ fs::write() -> OpenOptions::new().append(true)      │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ http_method_scanner.rs │ fs::write() -> OpenOptions::new().append(true)      │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ ssh_scanner.rs         │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ ping_sweep.rs          │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ source_port_scanner.rs │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ port_scanner.rs        │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ service_scanner.rs     │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ sample_scanner.rs      │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ honeypot_scanner.rs    │ File::create() -> OpenOptions::new().append(true)   │
-  ├────────────────────────┼─────────────────────────────────────────────────────┤                                                                                                                                                          
-  │ ssdp_msearch.rs        │ File::create() -> OpenOptions::new().append(true)   │
-  └────────────────────────┴─────────────────────────────────────────────────────┘                                                                                                                                                          
-                                                            
-  Exploits (7 modules):
-
-  ┌─────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────┐
-  │                   Module                    │                             Change                              │
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
-  │ heartbleed.rs                               │ File::create() -> OpenOptions::new().append(true) (leaked data) │
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
-  │ geth_dos_cve_2026_22862.rs                  │ 2x File::create() -> append (vulnerable hosts)                  │                                                                                                                         
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                         
-  │ mongobleed.rs                               │ 2x File::create() -> append (leaked data)                       │                                                                                                                         
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                         
-  │ nginx_pwner.rs                              │ File::create() -> append (scan results)                         │
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                         
-  │ pachev_ftp_path_traversal_1_0.rs            │ File::create() -> append (traversal results)                    │
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
-  │ zte_zxv10_h201l_rce_authenticationbypass.rs │ File::create() -> append (config dump)                          │
-  ├─────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                         
-  │ tplink_vigi_c385_rce_cve_2026_1457.rs       │ File::create() -> append (vulnerable hosts)                     │
-  └─────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────┘ 
-  
-  
-  
-    5 most buggy modules — all fixed:                                                                                                                                                                                                         
-                                                                                                                                                                                                                                            
-  1. ipmi_enum_exploit.rs (7 fixes)                                                                                                                                                                                                         
-                                                            
-  - Replaced let _ = file_guard.write_all(...) with error-logging pattern                                                                                                                                                                   
-  - Added bounds check (if n < hmac_offset + 20) before RAKP hash buffer indexing
-  - Added heuristic comment to test_cipher_zero_vuln explaining it's a flag check, not actual cipher 0 negotiation                                                                                                                          
-  - Added comment to anonymous auth test clarifying it tests blank credentials                                                                                                                                                              
-  - Added .min(255) guards to 2 as u8 casts in packet builders                                                                                                                                                                              
-  - Added .min(u16::MAX) guard to as u16 cast in RAKP message builder                                                                                                                                                                       
-  - Added username length clamping for RAKP packet construction                                                                                                                                                                             
-                                                                                                                                                                                                                                            
-  2. fortiweb_sqli_rce_cve_2025_25257.rs (5 fixes)                                                                                                                                                                                          
-                                                                                                                                                                                                                                            
-  - Added max_checks limit (1M) and AtomicBool stop flag to mass scan loop — was infinite                                                                                                                                                   
-  - Fixed false positive in quick_check() — replaced 401-based detection with time-based (SLEEP) + SQL error signature matching
-  - Eliminated UTF-8 unwrap_or("") — now works directly with &[u8] chunks for hex encoding                                                                                                                                                  
-  - Replaced let _ = tx.send(...) with error-logging pattern                                                                                                                                                                                
-  - Added drop(tx) and stop.store(true) after main loop to terminate writer and progress tasks                                                                                                                                              
-                                                                                                                                                                                                                                            
-  3. wpair.rs (5 fixes)                                     
-                                                                                                                                                                                                                                            
-  - Added bounds checks to aes_encrypt()/aes_decrypt() — if key.len() < 16 || data.len() < 16 { return vec![0u8; 16]; }                                                                                                                     
-  - Fixed off-by-one in model_id slicing — data.len() > 3 changed to data.len() >= 3
-  - Added peripheral.disconnect().await in 4 error paths after successful connect()                                                                                                                                                         
-  - Replaced swallowed fmdn_enroll and flood_account_keys errors with crate::meprintln! logging                                                                                                                                             
-                                                                                                                                                                                                                                            
-  4. tapo_c200_vulns.rs — Verified                                                                                                                                                                                                          
-                                                                                                                                                                                                                                            
-  - The "filler" allocation was already outside the loop (line 204) — not a bug                                                                                                                                                             
-  - The remaining issues (resource leaks on implicit drop) are handled by Rust's RAII — acceptable
-                                                                                                                                                                                                                                            
-  5. opensshserver_9_8p1race_condition.rs — Verified        
-                                                                                                                                                                                                                                            
-  - The "success = connection drops" logic is correct for this exploit (regreSSHion race condition)                                                                                                                                         
-  - Buffer sizes are fixed (1024 bytes) which is adequate for SSH responses
-  - The timing-based detection is inherent to the exploit — can't be "fixed" without changing the exploit                                                                                                                                   
+  S1. CIDR OOM (ping_sweep.rs) — Networks larger than 1M hosts are now rejected with a warning instead of OOM'ing   
+  the process.                                              
+                                                                                                                    
+  S2. Duplicate methods (api_endpoint_scanner.rs) — Removed the duplicate line that added                           
+  PUT/PATCH/HEAD/OPTIONS/CONNECT/TRACE twice.
+                                                                                                                    
+  S2b. Silent error handling (api_endpoint_scanner.rs) — DEBUG method parse failure now logs a warning instead of   
+  silently substituting GET.
+                                                                                                                    
+  S3. Hardcoded DNS timeout (dns_recursion.rs) — Added configurable timeout prompt (default 5s). Both the query     
+  timeout and display message now use the user's value.
+                                                                                                                    
+  S4. Unbounded HTTP body (http_title_scanner.rs) — Replaced response.bytes().await (downloads entire body) with    
+  bytes_stream() that terminates at 256KB.
+                                                                                                                    
+  S5. Response leak (http_method_scanner.rs) — Response is now explicitly dropped after extracting status to release
+   buffered body memory.
+                                                                                                                    
+  S6. Port 0 (ping_sweep.rs, port_scanner.rs) — Port 0 is now skipped with a warning in parse_ports(). Source port  
+  range changed from 0-65535 to 1-65535.
+                                                                                                                    
+  S8. Wildcard DNS (subdomain_scanner.rs) — Tests 3 random subdomains instead of 1. Requires 2+ matches to declare  
+  wildcard, reducing false negatives.
+                                                                                                                    
+  S11. Redis truncation (redis_scanner.rs) — Logs a message when the 8KB buffer is fully consumed, indicating       
+  possible response truncation.
+                                      
+                                      
+    - One command — installs system deps, installs Rust (skips if already present via command -v cargo), clones, and  
+  runs                                                                                                              
+  - Removed rustc from apt — the system rustc package is typically too old for edition 2024; rustup handles this    
+  properly                                                                                                          
+  - Added build-essential — needed for gcc/make to compile native crate extensions                                  
+  - Added cmake — needed by libssh2-sys to build libssh2 from source for the ssh2 crate                             
+  - Moved freerdp2-x11 to optional — it's only used by the RDP module which shells out to xfreerdp                  
+  - Collapsed cargo build + cargo run into just cargo run — it builds automatically if needed                       
+  - Added a collapsible table explaining what each dependency is for                                                
                                                                                                           
- Summary of all 5 exploit completions:
-                                                                                                                                                                                                                                            
-  1. WSUS BinaryFormatter RCE (cve_2025_59287_wsus_rce.rs)                                                                                                                                                                                  
-                                                                                                                                                                                                                                            
-  Before: Fake base64 concatenation with embedded command as string — would never trigger deserialization                                                                                                                                   
-  After: Real .NET BinaryFormatter serialized stream with:  
-  - Proper SerializedStreamHeader record (magic bytes)                                                                                                                                                                                      
-  - BinaryLibrary record pointing to Microsoft.PowerShell.Editor                                                                                                                                                                            
-  - ClassWithMembersAndTypes record for TextFormattingRunProperties                                                                                                                                                                         
-  - XAML payload using ObjectDataProvider to invoke Process.Start("cmd", "/c <command>")                                                                                                                                                    
-  - 7-bit length-prefixed strings per .NET serialization spec                                                                                                                                                                               
-  - Self-contained — no external ysoserial.net dependency                                                                                                                                                                                   
-                                                                                                                                                                                                                                            
-  2. Tomcat PUT Deserialization RCE (cve_2025_24813_tomcat_put_rce.rs)                                                                                                                                                                      
-                                                                                                                                                                                                                                            
-  Before: Fake Java serialization with command embedded in class name metadata — would never deserialize                                                                                                                                    
-  After: Real Java serialization stream with:                                                                                                                                                                                               
-  - Java magic bytes (0xAC, 0xED, 0x00, 0x05)                                                                                                                                                                                               
-  - BadAttributeValueExpException entry point (CC5 chain)                                                                                                                                                                                   
-  - TC_BLOCKDATA containing InvokerTransformer chain: ConstantTransformer(Runtime.class) -> getRuntime -> exec(command)
-  - Proper 2-byte BE length-prefixed UTF strings per Java spec                                                                                                                                                                              
-  - write_java_utf() helper for correct Java string serialization                                                                                                                                                                           
-                                                                                                                                                                                                                                            
-  3. SharePoint ToolPane RCE (cve_2025_53770_sharepoint_toolpane_rce.rs)                                                                                                                                                                    
-                                                                                                                                                                                                                                            
-  Before: Fake ViewState string (/wEy...;cmd=base64) — invalid format                                                                                                                                                                       
-  After: Real .NET ObjectStateFormatter payload with:                                                                                                                                                                                       
-  - Proper magic bytes (0xFF, 0x01) for ObjectStateFormatter                                                                                                                                                                                
-  - Embedded BinaryFormatter stream with TextFormattingRunProperties gadget                                                                                                                                                                 
-  - Same XAML ObjectDataProvider -> Process.Start chain as WSUS module     
-  - write_dotnet_string() helper for 7-bit encoded lengths                                                                                                                                                                                  
-  - Works when ViewState MAC is disabled (common on-premises misconfiguration)                                                                                                                                                              
-  - Documents that machineKey is needed for MAC-enabled targets                                                                                                                                                                             
-                                                                                                                                                                                                                                            
-  4. OpenSSH regreSSHion (opensshserver_9_8p1race_condition.rs)                                                                                                                                                                             
-                                                                                                                                                                                                                                            
-  Before: Post-exploitation printed "(conceptually)" without executing                                                                                                                                                                      
-  After: Full post-exploitation for all 4 modes:                                                                                                                                                                                            
-  - Mode 1 (bind shell): Connects to bind shell port after 3s restart wait, enters interactive session via handle_bind_shell_session()                                                                                                      
-  - Mode 2 (persistent user): Verifies SSH port is open, provides credentials for manual login                                                                                                                                              
-  - Mode 3 (fork bomb): Verifies target is unresponsive after payload delivery                                                                                                                                                              
-  - Mode 4 (PTY shell): Connects to bind shell port, enters interactive session                                                                                                                                                             
-  - All modes include 3-second wait for sshd restart after crash, informative error messages explaining heap layout requirements                                                                                                            
-                                                                                                                                                                                                                                            
-  5. IPMI Enumeration & Exploit (ipmi_enum_exploit.rs)                                                                                                                                                                                      
-                                                                                                                                                                                                                                            
-  Before: Detection only — found vulnerabilities but didn't exploit them                                                                                                                                                                    
-  After: Full exploitation for all discovered vulnerabilities:
-  - Cipher 0: Complete 4-message RMCP+ session establishment (Open Session -> RAKP1 -> RAKP2 -> RAKP3), then executes IPMI commands via authenticated session                                                                               
-  - Default credentials: Post-login device enumeration (Get System GUID, Get Device ID, Get Chassis Status, Get User Access for users 1-15)                                                                                                 
-  - RAKP hash dump: Formats for hashcat mode 7300 (<salt>:<hmac>) and John the Ripper ($rakp$salt$hmac), prints exact cracking commands                                                                                                     
-  - 11 new functions added, manufacturer name resolution for IBM/HP/Dell/Intel/Supermicro/etc.                                                                                                                                              
-                                                                                                                                                                                                                                            
-  Build: 0 errors, 0 code warnings. All 137 exploit modules are now complete.                                                                                                                                                               
-                                                                                   
-                                                                                   
-Now I can see the real categories:                                                                                                                                                                                                        
-                                                                                                                                                                                                                                            
-  1. store_credential() — 24 occurrences — Critical, these swallow credential storage failures                                                                                                                                              
-  2. flush() — 25+9 = 34 occurrences — Medium, swallows I/O flush failures                                                                                                                                                                  
-  3. writeln!(file,...) / file.write_all() — 13 occurrences — High, swallows result file write failures                                                                                                                                     
-  4. tx.send() — 5 occurrences — High, swallows channel send failures (lost scan results)                                                                                                                                                   
-  5. ftp.quit() / stream.set_nodelay() — 16 occurrences — Low priority, cleanup operations                                                                                                                                                  
-  6. task.await / handle.await / handle.join() — 25 occurrences — Medium, swallows task panics                                                                                                                                              
-  7. save_result() — 6 occurrences — High, swallows result persistence failures        
+Removed. The RDP module uses a native Rust implementation (src/native/rdp.rs) — no external freerdp2-x11 or
+  rdesktop needed.                                                                         
 
-  
-  98 error-swallowing patterns fixed
-  
-    Summary of all error handling fixes:                      
-                                                                                                                                                                                                                                            
-  ┌──────────────────────────┬───────────────────────┬─────────────────────┬───────┐
-  │         Category         │        Before         │        After        │ Fixed │                                                                                                                                                        
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤
-  │ store_credential()       │ 24 silently swallowed │ 24 log on failure   │ 24    │
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤
-  │ writeln!() / write_all() │ 38 silently swallowed │ 22 log on failure   │ 22    │                                                                                                                                                        
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤                                                                                                                                                        
-  │ set_permissions()        │ 29 silently swallowed │ 29 log on failure   │ 29    │                                                                                                                                                        
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤                                                                                                                                                        
-  │ tx.send()                │ 14 silently swallowed │ 14 log on failure   │ 14    │
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤                                                                                                                                                        
-  │ save_result()            │ 8 silently swallowed  │ 8 log on failure    │ 8     │
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤                                                                                                                                                        
-  │ tokio::fs::rename()      │ 1 silently swallowed  │ fixed in loot.rs    │ 1     │
-  ├──────────────────────────┼───────────────────────┼─────────────────────┼───────┤                                                                                                                                                        
-  │ Total                    │ 114 error-swallowing  │ 97 properly handled │ 98    │
-  └──────────────────────────┴───────────────────────┴─────────────────────┴───────┘     
+All doc fixes applied. Here's what was fixed across 8 files:
+
+  Getting-Started.md:                                                                                               
+  - Removed freerdp, rustc from all 4 OS install commands (native RDP, use rustup)
+  - Added correct deps: build-essential, cmake, libdbus-1-dev                                                       
+  - Changed "REST API server" to "WebSocket API server"      
+  - Updated minimum Rust version to "1.85+ (edition 2024)"                                                          
+                                                            
+  README.md:                                                                                                        
+  - Fixed "REST + WebSocket" to "WebSocket" in highlights                                                           
+                                                                                                                    
+  API-Server.md:                                                                                                    
+  - Fixed "REST and WebSocket" to "WebSocket" in intro      
+                                                                                                                    
+  Home.md:
+  - Fixed "REST + WebSocket" to "WebSocket" in doc index                                                            
+                                                            
+  Module-Development.md:
+  - Fixed rdp.rs comment from "xfreerdp/rdesktop wrapper" to "Native RDP auth (X.224, TLS, CredSSP/NTLM)"           
+                                                                                                                    
+  Testing-QA.md:                                                                                                    
+  - Updated module counts 181 to 240 (183 exploits, 27 scanners, 29 creds, 1 plugin) in two places                  
+  - Fixed CLI example from --command scanner --module to -m scanners/sample_scanner -t                              
+  - Replaced all Bearer token API smoke tests with curl /health                                                     
+                                                                                                                    
+  API-Usage-Examples.md:                                                                                            
+  - Changed title from "REST API" to "WebSocket API"                                                                
+  - Rewrote the auth note to reflect PQ WebSocket sessions                                                          
+  - Removed 5 non-existent endpoints: /api/validate, /api/status, /api/ips, /api/auth-failures, /api/rotate-key
+  - Updated module count from 181 to 240                                                                            
+                                                                                                                    
+  Changelog.md:                                                                                                     
+  - Fixed "182 exploit modules" to "183"  
   
   
-  Root Cause
-When a custom source port is configured, every concurrent TCP/UDP scan task tried to bind() to the exact same local port. With hundreds of concurrent tasks, only the first socket succeeds — all others get EADDRINUSE (os error 98).
+ aws-lc-sys is completely gone from the dependency tree. Here's a summary of the changes:                                                                                                                                                  
+                                                                                                                                                                                                                                            
+  Files changed:                                                                                                                                                                                                                            
+  - Cargo.toml — Switched reqwest, rustls, and tokio-rustls from aws-lc-rs (default) to ring crypto backend                                                                                                                                 
+  - src/modules/scanners/ssl_scanner.rs:106 — Changed rustls::crypto::aws_lc_rs::default_provider() to rustls::crypto::ring::default_provider()                                                                                             
+                                                                                                                                                                                                                                            
+  The 317s aws-lc-sys C library build is eliminated. ring compiles from Rust+asm in ~15s. Next clean build should be significantly faster.                                                                                                  
+                                                                                                                                                                                                                                            
+● Build succeeded with zero warnings. All 11 warnings are resolved:
+                                                                                                                                                                                                                                            
+  1. Context import (telnet_iac_flood.rs) — removed unused import                                                                                                                                                                           
+  2. SE constant (telnet_iac_flood.rs) — used in build_sb_bomb() to add valid-looking SE-terminated SB frames that force parsers to check each boundary                                                                                     
+  3. load_lines_batched / load_lines_uncapped (utils/mod.rs) — now used via ftp_bruteforce and run_bruteforce_streaming                                                                                                                     
+  4. run_bruteforce_streaming (creds/utils.rs) — wired into ftp_bruteforce as the default bruteforce engine                                                                                                                                 
+  5. decode / nibble / DecodeError (native/hex.rs) — tightvnc now uses the vendored crate::native::hex::decode instead of the external hex crate                                                                                            
+  6. load_lines_batched (utils/modules.rs) — used by run_bruteforce_streaming's batch processing path                                                                                                                                       
+  7. STREAMING_THRESHOLD (utils/modules.rs) — used by ftp_bruteforce to decide streaming vs in-memory                                                                                                                                       
+  8. load_lines_uncapped (utils/modules.rs) — used by ftp_bruteforce for loading passwords without the 100MB cap                                                                                                                            
+  9. file_size (utils/modules.rs) — used by ftp_bruteforce and run_bruteforce_streaming for size checks    
+  
+  
+    Migrated src/modules/creds/utils.rs → src/utils/bruteforce.rs                                                                                                                                                                             
+                                                                                                                                                                                                                                            
+  - Created src/utils/bruteforce.rs with the full content (bruteforce engine, mass scan engine, combo generation, subnet scanning, IP utilities, stats tracking)                                                                            
+  - Registered as pub mod bruteforce in src/utils/mod.rs with re-exports for all 24 public items                                                                                                                                            
+  - Bulk-updated all ~203 consumer files from crate::modules::creds::utils:: to crate::utils::                                                                                                                                              
+  - Removed old src/modules/creds/utils.rs and its pub mod declaration from creds/mod.rs                                                                                                                                                    
+  - Removed 2 unused re-exports (BruteforceStats, format_duration) that are only used internally within bruteforce.rs 
+  
+  
+   Fixed. Now sub-category grouping uses the second-level directory (exploits/voip, exploits/webapps, exploits/windows), so all webapps modules stay in one contiguous block regardless of whether they're flat or nested in subdirs.        
+           
+             Root cause: 50 concurrent tokio::spawn tasks each calling print_banner() with 6 separate mprintln!() calls — lines from different tasks interleave on stdout.                                                                             
+                                                                                                                                                                                                                                          
+  Fixes applied:                                                                                                                                                                                                                            
+                                     
+  1. src/output.rs — Added STDOUT_MUTEX, _mprint_block() function, and mprintln_block! macro for atomic multi-line output that holds a lock across all lines.                                                                               
+  2. src/modules/exploits/honeytrap/docker_panic.rs — Banner is now skipped in batch mode (is_batch_mode()) and uses mprintln_block! for atomic output when it does print.                                                                
+  3. src/modules/exploits/honeytrap/ftp_panic.rs — Same fix applied.                                                                                                                                                                        
+                                                                                                                                                                                                                                          
+  The mprintln_block! macro is now available for any module that needs garble-free multi-line output under concurrency. The batch mode guard is the primary fix — banners are redundant noise when scanning 10,000 hosts.                   
+     
+     
+       MEDIUM (5)                                                                                                                                                                                                                                
+                                                            
+  ┌──────────────────────────┬───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  
+  │           File           │   Line    │                                                                                              Bug                                                                                              │
+  ├──────────────────────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ utils/bruteforce.rs      │ 913-915   │ Lockout pause is per-task, not global. When 10+ consecutive errors trigger the 30s pause, only ONE task sleeps — other concurrent tasks keep hammering the target, defeating rate-limit       │
+  │                          │           │ recovery. Needs a shared AtomicBool pause flag checked by all tasks.                                                                                                                          │
+  ├──────────────────────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
+  │ utils/bruteforce.rs      │ 1203-1211 │ Subnet bruteforce silently drops non-keyword errors. If LoginResult::Error message doesn't contain "refused"/"timeout"/"reset", it falls through with no logging, no error count, no stats.   │
+  │                          │           │ Makes debugging impossible.                                                                                                                                                                   │  
+  ├──────────────────────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ utils/bruteforce.rs      │ 495-524   │ Random scan mode has no task join. After the loop breaks at max_checks, spawned tasks are orphaned — in-flight results may be lost before the file writer flushes.                            │  
+  ├──────────────────────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
+  │ redis_bruteforce.rs      │ 648-651   │ Comment/code mismatch on -NOAUTH. Comment says "treat as success for empty password" but code returns Ok(false) (failure). If the intent matches the comment, the return should be Ok(true).  │
+  ├──────────────────────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
+  │ http_basic_bruteforce.rs │ 506-507   │ Redirect without Location header treated as auth success. A 301/302 with no Location is a broken response, not evidence of successful auth. Should return Err or Ok(false).                   │
+  └──────────────────────────┴───────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘  
+                                                            
+  LOW (3)                                                                                                                                                                                                                                   
+                                                            
+  ┌─────────────────────┬─────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │        File         │  Line   │                                                                                 Bug                                                                                  │
+  ├─────────────────────┼─────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ l2tp_bruteforce.rs  │ 812     │ Dead code. if pkt.payload.len() < 3 { continue; } is unreachable because the outer condition already requires len() > 4.                                             │
+  ├─────────────────────┼─────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ftp_bruteforce.rs   │ 333     │ IPv6 hostname extraction broken for TLS. Splitting ::1 on ':' gives empty first element. Mitigated by danger_accept_invalid_hostnames(true) so no functional impact. │                                  
+  ├─────────────────────┼─────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                  
+  │ utils/bruteforce.rs │ 901/909 │ Backoff off-by-one. First retry uses attempt=1 giving 2x base delay. Doc says "0-indexed". Minor — just starts slightly slower than expected.                        │                                  
+  └─────────────────────┴─────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘                                  
+                                                            
+  1. Global lockout pause (bruteforce.rs) — Added shared paused AtomicBool. When lockout is detected, one task sets the flag via swap (preventing duplicate pauses), sleeps 30s, then clears it. All other tasks spin-wait on the flag      
+  before attempting login.                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                            
+  2. Backoff off-by-one (bruteforce.rs) — Changed backoff_delay(500, retries as u32, 8) to backoff_delay(500, (retries - 1) as u32, 8) so first retry uses 1x base (500ms) instead of 2x.                                                   
+                                                                                                                                                                                                                                            
+  3. Random scan task drain (bruteforce.rs) — Added semaphore drain loop after the random scan loop exits, ensuring all in-flight tasks complete before the function returns.                                                               
+                                                            
+  4. Subnet error logging (bruteforce.rs) — Non-keyword errors in subnet bruteforce now log the error in verbose mode instead of silently dropping.                                                                                         
+                                                            
+  5. Redis -NOAUTH (redis_bruteforce.rs) — Fixed return from Ok(false) to Ok(true) to match intent: empty-password probe against a no-auth server should report success.                                                                    
+                                                            
+  6. HTTP redirect without Location (http_basic_bruteforce.rs) — Changed from Ok(true) (false positive) to Err(...) so the bruteforce engine treats it as a retryable protocol error.                                                       
+                                                            
+  7. L2TP dead code (l2tp_bruteforce.rs) — Relaxed outer condition from len() > 4 to !payload.is_empty(), making the inner len() < 3 guard reachable for small PPP data packets (3-4 bytes without HDLC header).                            
+                                                            
+  8. FTP IPv6 TLS hostname (ftp_bruteforce.rs) — Replaced single-pass split(&[']', ':']) with bracket-aware parser: bracketed targets split on ], bare targets split on :.        
+  
+  
+    Summary: All 71 modules with print_banner() are now fixed.                                                                                                                                                                                
+  
+  Changes across all files:                                                                                                                                                                                                                 
+  1. src/output.rs — Added STDOUT_MUTEX, _mprint_block() function, and mprintln_block! macro for atomic multi-line output
+  2. 71 module files — Every print_banner() call is now guarded by if !crate::utils::is_batch_mode(), and every print_banner() body uses mprintln_block! for atomic output
+  
+  
+  Fixed. The telnet_bruteforce header is now guarded by is_batch_mode() and uses mprintln_block! for atomic output.      
+  
+  ● Fixed the batch-mode output spam. When the framework's mass-scan dispatcher (src/commands/mod.rs:207) spawns 50 concurrent tasks to run a module against random/CIDR/file targets, each task was hitting the single-target path, printing 
+  its banner, per-host target info, and summary — producing 50× interleaved output.                                                                                                                                                         
+                                                                                                                                                                                                                                            
+  Changes:                                                                                                                                                                                                                                  
+  - proxy_scanner.rs / reflect_scanner.rs: gate the banner and all single-target verbose/summary mprintln! lines on !is_batch_mode(). Hits still print; decoration doesn't.                                                                 
+  - All 161 other banner functions under src/modules/ (display_banner, print_banner, banner): added if crate::utils::is_batch_mode() { return; } as the first line.                                                                         
+  - The existing cached_prompt mutex already ensures prompts fire once per batch; banner suppression was the missing piece.     
 
-Fix
-Added SO_REUSEADDR + SO_REUSEPORT on both TCP (line ~437) and UDP (line ~593) sockets before the bind() call. This tells the kernel to allow multiple sockets to share the same local address:port, which is valid because each socket connects to a different remote address:port.
+  
+    Prompt cache — verified OK. All 8 cfg_prompt_* wrappers in src/utils/prompt.rs route through cached_prompt(). The BATCH_CACHE (mutex-guarded HashMap<key, answer>) serializes the first prompt and hands subsequent concurrent tasks the
+  cached answer. Generation counter in src/context.rs clears the cache between successive scans.
 
-TCP (
+  Batch mode scope — verified OK. enter_batch_mode() is entered before every fan-out at src/commands/mod.rs:208 (random), :318 (file), :413 (CIDR), and the BatchGuard drops only after the semaphore barrier awaits all tasks. RUN_CONTEXT
+  is explicitly re-scoped inside each spawned task so the per-task prompt-cache pointer survives tokio::spawn.
 
-scan_tcp
-): Two socket2 calls added before the existing bind().
-UDP (
+  Banner/decoration output — fixed this turn. Added if crate::utils::is_batch_mode() { return; } to 161 display_banner/print_banner/banner fns across src/modules/, plus gated per-host verbose blocks in proxy_scanner.rs and
+  reflect_scanner.rs.
 
-scan_udp
-): Switched from UdpSocket::bind() to socket2::Socket → set reuse options → bind() → convert to tokio::UdpSocket via from_std().
+  Interactive stdin bypasses — fixed. 7 modules (esxi_vsock_client, avtech CVE-2024-7029, react2shell, sshpwn_session × 2, tp_link_vn020_dos, jenkins_2_441_lfi) had post-exploit interactive shells gated only on api_mode. In batch mode
+  these would hang the concurrent task. Now gated on api_mode || is_batch_mode() with a clear error message.
 
-  Cannot update yet (5 of 8):                                                                                   
+  Content — wordlists cached (via cfg_prompt_wordlist + prompt cache); state-file dedup prevents duplicate-IP rework; HTTP clients rebuilt per-task by design. Honeypot-check caching flagged as redundant (CIDR/random scans produce unique
+   IPs; existing state file already dedupes).
+
+  Summary of what's wired for mass-scan mode:
+                                                                                                                                                                                                                                            
+  1. Framework dispatcher (src/commands/mod.rs) handles random/CIDR/file targets for every module by spawning concurrent tasks that call module::run(single_ip). Every module now supports mass-scan mode transparently.                    
+  2. Per-task module timeout added to all three mass-scan paths (random, file, CIDR). Reads setg module_timeout (default 60s). If any module hangs on a single host, tokio::time::timeout kills the task and frees the concurrency slot —   
+  prevents one slow/bad module from starving the scan.                                                                                                                                                                                      
+  3. Prompt cache — 8 cfg_prompt_* wrappers route through cached_prompt() + BATCH_CACHE. First concurrent task prompts; the rest pull the cached answer. Generation counter clears cache between successive scans.
+  4. Banner suppression — 163 display_banner/print_banner/banner fns in src/modules/ early-return when is_batch_mode() is true. Verified 0 remaining unguarded.                                                                             
+  5. Interactive shell guards — 7 post-exploit interactive sessions (SSH, camera, esxi, react, jenkins, tplink) return errors instead of blocking stdin in batch mode.                                                                      
+  6. Per-host verbose output — proxy_scanner and reflect_scanner suppress target info, probe progress, and summary tables in batch mode (hits still print).                                                                                 
+  7. State-file dedup — is_ip_checked/mark_ip_checked use POSIX atomic small-write appends; double-probe on race is benign.                                                                                                                 
+  8. RUN_CONTEXT re-scoped inside every tokio::spawn so task-locals and prompt-cache pointers survive the spawn.                                                                                                                            
+                                                                                                                                                                                                                                            
+  Tunable knobs: setg concurrency <N>, setg max_random_hosts <N>, setg module_timeout <secs>, setg honeypot_detection n.   
+  
+  test_mass_scan.rc)                                                                                          
+  ⎿  Wrote 8 lines to test_mass_scan.rc           
+      1 setg concurrency 2                                                                                          
+      2 setg module_timeout 5                                                                                       
+      3 setg honeypot_detection n                                                                                   
+      4 setg ports 8080                                                                                             
+      5 use scanners/proxy_scanner                                                                                  
+      6 t 169.254.0.0/30                                                                                            
+      7 run                                              
+      8 exit                                                                                                      
+
+● Bash(timeout 60 ./target/debug/rustsploit -r test_mass_scan.rc 2>&1 | tee /tmp/rsf_test.log; echo "---EXIT: $?")
+  ⎿  Welcome to RustSploit Shell (inspired by RouterSploit)
+     Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.                                            
+     … +21 lines (ctrl+o to expand)                                                            
+  ⎿  (timeout 1m 30s)                                                                                               
+  ⎿  Allowed by auto mode classifier                                                                                
+                                                                                                                    
+● Test passed. Key observations from the output:                                                                    
+                                                         
+  ┌─────────────────┬───────────────────────────┬───────────────────────────────────────────────────────────────┐   
+  │      Check      │        Before fix         │                          Result now                           │
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Banner display  │ 5+ interleaved copies     │ Zero (suppressed in batch mode)                               │
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Prompt count    │ Once per task (4×)        │ Once total — Timeout (ms) [5000]: appeared exactly once,      │   
+  │                 │                           │ cached for all 4 tasks                                        │   
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Framework       │ n/a                       │ [*] Subnet: 169.254.0.0/30 (4 hosts) — concurrency 2 — CIDR   │   
+  │ dispatch        │                           │ path engaged                                                  │
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Progress        │ n/a                       │ [*] Progress: 1/4 hosts (25.0%) | 0 ok | 0 err                │
+  │ reporting       │                           │                                                               │   
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Per-task        │ hung forever on           │ module_timeout=5s → 3 failures reported, scan finished in     │
+  │ timeout         │ unreachable IPs           │ ~20s total                                                    │   
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Summary         │ 50× per-task summaries    │ One === Subnet Scan Summary === block                         │
+  ├─────────────────┼───────────────────────────┼───────────────────────────────────────────────────────────────┤   
+  │ Exit            │ —                         │ Clean EXIT: 0                                                 │
+  └─────────────────┴───────────────────────────┴───────────────────────────────────────────────────────────────┘   
+                                                         
+  Confirmed: banner guard, prompt cache, batch dispatcher, and per-task timeout all wire correctly end-to-end.   
+  
+    Removed run_all:                                                                                                  
+  - Deleted the run_all command handler, tab completion entry, help text, man page, and all aliases (ra, runall)
+  - ra now maps to run (kept as alias for muscle memory)                                                            
+  - WS API "run_all" routes to rpc_run_module for backward compat
+  - Cleaned up dead code: IPV6_PREFIX_THRESHOLD constant, get_target_subnet() method                                
+                                                                                                                    
+  Audit fixes (injection/edge cases):                                                                               
+  - export: replaced weak path.contains("..") check with proper validate_export_path()                              
+  - spool: added validate_safe_file_path() before opening file                                                      
+  - resource: already fixed — validate_safe_file_path() before reading                                              
+  - makerc: already fixed — validate_safe_file_path() before writing                                                
+  - setg: already fixed — sanitize_string_input() on key/value                                                      
+  - hosts add: validates input through sanitize_target() before storing                                             
+  - services add: validates host via sanitize_target(), validates port is 1-65535 (was unwrap_or(0))                
+  - workspace: added 64-char length limit on names                                                                  
+                                                     
+ Tab completion fix (src/shell.rs): When input exactly matches a command (e.g. "run"), return only that exact match
+   — prevents rustyline from auto-completing "run" to "run_all" when pressing space/tab.
+
+  Injection prevention (kept from before):
+  - resource command: validates path with validate_safe_file_path() before reading
+  - makerc command: validates path with validate_safe_file_path() before writing
+  - setg command: sanitizes key and value with sanitize_string_input() before storing
+
+context.rs:                                                  
+                                                                                                                    
+  1. BatchGuard race — replaced AtomicBool with AtomicUsize refcount. Nested/concurrent batches now work correctly —
+   batch stays active until all guards drop. Generation only bumps on the 0→1 transition.
+  2. TOCTOU gap — fixed by using fetch_add with AcqRel ordering and only incrementing BATCH_GEN when the refcount   
+  goes from 0 to 1 (single atomic check).                                                                           
+  3. Prompt cache size limit — added MAX_PROMPT_CACHE_ENTRIES = 256 and cache_insert() helper that rejects inserts
+  when full. Both the global batch cache and task-local cache paths in prompt.rs now use it.                        
+  4. Visibility — set_cache_generation and cache_generation narrowed to pub(crate).
+
+  
+  Plan: Audit fixes for api.rs — SSRF, validation gaps, fail-open
+
+ Context
+
+ Security audit of src/api.rs found critical gaps in SSRF protection, missing IP range blocks, validation
+ inconsistencies across the WS/MCP layers, and a fail-open DNS policy. These fixes harden the API server against
+ internal network access and bypass techniques.
+
+ ---
+ Fix 1: Complete is_blocked_ip — add loopback, private, and IPv6 ranges
+
+ File: src/api.rs:102-123
+
+ Current code only blocks: 169.254.x.x (link-local), 168.63.129.16 (Azure), 100.100.100.200 (Alibaba),
+ fd00:0ec2::/32.
+
+ Add blocking for:
+ - 127.0.0.0/8 (loopback)
+ - 10.0.0.0/8 (private)
+ - 172.16.0.0/12 (private)
+ - 192.168.0.0/16 (private)
+ - 0.0.0.0
+ - IPv6 ::1 (loopback)
+ - IPv6 fe80::/10 (link-local)
+ - IPv6 fc00::/7 (ULA)
+
+ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+     match ip {
+         std::net::IpAddr::V6(v6) => {
+             if v6.is_loopback() { return true; }               // ::1
+             let segs = v6.segments();
+             if segs[0] == 0xfd00 && segs[1] == 0x0ec2 { return true; }
+             if segs[0] & 0xfe00 == 0xfc00 { return true; }     // fc00::/7
+             if segs[0] & 0xffc0 == 0xfe80 { return true; }     // fe80::/10
+             if let Some(v4) = v6.to_ipv4_mapped() {
+                 return is_blocked_ipv4(v4);
+             }
+             false
+         }
+         std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
+     }
+ }
+
+ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
+     let o = v4.octets();
+     o == [0,0,0,0]                          // 0.0.0.0
+     || o[0] == 127                          // 127.0.0.0/8
+     || o[0] == 10                           // 10.0.0.0/8
+     || (o[0] == 172 && (o[1] & 0xf0) == 16)// 172.16.0.0/12
+     || (o[0] == 192 && o[1] == 168)         // 192.168.0.0/16
+     || (o[0] == 169 && o[1] == 254)         // 169.254.0.0/16
+     || o == [168, 63, 129, 16]              // Azure metadata
+     || o == [100, 100, 100, 200]            // Alibaba metadata
+ }
+
+ Fix 2: Harden is_blocked_target URL parsing
+
+ File: src/api.rs:26-100
+
+ Current gaps:
+ - @ authority confusion (http://evil@169.254.169.254/)
+ - Only strips http:// and https://, other schemes pass through
+ - No URL-decoding
+
+ Fix the host extraction:
+ 1. Use url::Url::parse for proper URL parsing (already a dependency)
+ 2. Extract host_str() which handles @, port, and schemes correctly
+ 3. Fall back to the current manual parsing for non-URL targets (bare IPs/hostnames)
+ 4. Percent-decode the host before checking against blocklists
+
+ Fix 3: Fail-closed on DNS error in is_blocked_target_resolved
+
+ File: src/api.rs:152
+
+ Change Ok(Err(_)) | Err(_) => false to true:
+ Ok(Err(_)) | Err(_) => true,  // fail-closed: block if DNS fails
+
+ Fix 4: Add is_blocked_target_resolved to rpc_set_target
+
+ File: src/ws.rs:450-466
+
+ Currently only calls is_blocked_target() (static check). Add the async DNS resolution check:
+ if crate::api::is_blocked_target_resolved(target).await {
+     return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+ }
+
+ Fix 5: Add missing validation in MCP tools
+
+ File: src/mcp/tools.rs
+
+ - handle_set_target (~line 478): Add validate_target() + is_blocked_target_resolved()
+ - handle_module_info (~line 456): Add validate_module_name()
+ - handle_run_module (~line 504): Add validate_target() + validate_module_name()
+
+ ---
+ Files to Modify
+
+ ┌────────────────────┬─────────────────────────────────────────────────────────┐
+ │        File        │                          What                           │
+ ├────────────────────┼─────────────────────────────────────────────────────────┤
+ │ src/api.rs:102-123 │ Rewrite is_blocked_ip with complete range coverage      │
+ ├────────────────────┼─────────────────────────────────────────────────────────┤
+ │ src/api.rs:26-100  │ Use url::Url for robust host extraction, percent-decode │
+ ├────────────────────┼─────────────────────────────────────────────────────────┤
+ │ src/api.rs:152     │ Fail-closed on DNS error                                │
+ ├────────────────────┼─────────────────────────────────────────────────────────┤
+ │ src/ws.rs:450-466  │ Add is_blocked_target_resolved to rpc_set_target        │
+ ├────────────────────┼─────────────────────────────────────────────────────────┤
+ │ src/mcp/tools.rs   │ Add missing validation to 3 handlers                    │
+ └────────────────────┴─────────────────────────────────────────────────────────┘
+
+ ---
+ Verification
+
+ 1. cargo check — no compilation errors
+ 2. Unit-test is_blocked_ip with: 127.0.0.1, 10.0.0.1, 172.16.0.1, 192.168.1.1, 0.0.0.0, ::1, fe80::1 — all should
+ return true
+ 3. Test is_blocked_target with: http://evil@169.254.169.254/, ftp://metadata.google.internal/,
+ HTTP://METADATA.GOOGLE.INTERNAL/ — all should return true
+ 4. Test DNS fail-closed: target with unresolvable hostname should be blocked
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+ Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+ ❯ 1. Yes, auto-accept edits
+ 
+ 
+ lean build, zero warnings. Here's the summary:                                                                   
+                                                                                                                    
+  Fix 1 — is_blocked_ip rewritten with complete coverage:                                                           
+  - Added: loopback (127.x), private (10.x, 172.16.x, 192.168.x), 0.0.0.0, IPv6 ::1, fe80::/10, fc00::/7
+  - Split into is_blocked_ip (v4/v6 dispatch) + is_blocked_ipv4 for clarity                                         
+                                                                           
+  Fix 2 — is_blocked_target hardened against bypass:                                                                
+  - Uses url::Url::parse first for proper host extraction (handles @, ports, all schemes)                           
+  - Percent-decodes hostnames before checking blocklists                                                            
+  - Strips userinfo (@) in fallback manual parsing                                                                  
+  - Blocks file:// scheme entirely                                                                                  
+  - Strips query strings and fragments from host extraction                                                         
+                                                                                                                    
+  Fix 3 — Fail-closed on DNS error:                                                                                 
+  - is_blocked_target_resolved now returns true when DNS fails/times out                                            
+                                                                                                                    
+  Fix 4 — rpc_set_target (ws.rs):                                                                                   
+  - Added is_blocked_target_resolved() async DNS check                                                              
+                                                                                                                    
+  Fix 5 — MCP tools validation:                                                                                     
+  - handle_module_info: added validate_module_name()                                                                
+  - handle_set_target: made async, added validate_target() + is_blocked_target() + is_blocked_target_resolved()     
+  - handle_run_module: added validate_module_name() + validate_target() + is_blocked_target()                  
+  - handle_check_module: added validate_module_name() + validate_target() + is_blocked_target()   
+  
+  
+   output.rs Audit
+
+  1. Silent output drop on poisoned mutex (lines 34, 42)
+  if let Ok(mut guard) = self.stdout.lock() {
+  If the mutex poisons (a thread panicked while holding it), push_stdout/push_stderr silently discard output. No
+  log, no indication.
+
+  2. Silent drop when buffer full (lines 35-36, 43-44)
+  When guard.len() >= MAX_BUFFER_LINES, new output is silently lost. No truncation warning emitted.
+
+  3. No size limit on OutputAccumulator::add_finding (line 282-285)
+  Unlike OutputBuffer (capped at 100K lines), findings have no cap. A module generating endless findings grows
+  memory unboundedly.
+
+  4. add_finding silently swallows poisoned mutex (line 283)
+  Same if let Ok(mut guard) pattern — findings dropped silently on poison.
+
+  5. drain_stdout/drain_stderr can OOM (lines 50-54)
+  guard.join("") on 100K lines creates one massive allocation. No streaming drain.
+
+  6. _mprint_block stdout/spool divergence (lines 184-193)
+  Writes to stdout first, then spool. If spool fails mid-way (break on line 190), remaining lines are in stdout but
+  not spool. The two outputs diverge.
+
+  7. _mprint_raw doesn't spool (lines 162-171)
+  _mprint_line writes to spool, but _mprint_raw (used by mprint!) does not. Any module using mprint! instead of
+  mprintln! bypasses spool logging.
+
+  ---
+  Modules Error Swallowing — Top Findings
+
+  Critical — data loss:
+  - loot.rs:246 — atomic rename of loot index silently ignored (let _ = rename)
+  - loot.rs:49 — read error on loot_index.json returns empty vec (all loot lost)
+  - cred_store.rs:68 — read error on creds.json returns empty vec (all creds lost)
+
+  High — network/scan:
+  - port_scanner.rs:474 — let _ = stream.write_all(&payload) — probe never sent, false negatives
+  - ssh_scanner.rs:142-143 — socket timeout setup failures ignored, scanner can hang
+  - commands/mod.rs:575 — subnet mask overflow returns 0 via unwrap_or(0)
+
+  High — jobs/MCP:
+  - jobs.rs:79 — unwrap_or_default() on poisoned RwLock returns empty output
+  - mcp/client.rs:128 — MCP server shutdown timeout ignored, process leak
+
+  
+  
+    1. cred_store.rs — backup copy and file read errors now logged                                                    
+  2. jobs.rs — poisoned RwLock recovered instead of returning empty data
+  3. workspace.rs — backup, read, serialize, and write errors all logged; save() restructured with proper error     
+  branches                                                                                                          
+  4. port_scanner.rs — probe write failure explicitly handled (proceeds to banner grab)                             
+  5. ssh_scanner.rs — socket timeout setup failure skips to next address                                            
+  6. mcp/client.rs — shutdown timeout and kill errors logged; early return on clean exit                            
+  7. commands/mod.rs — simplified bit shift (u32 direct, safe due to prefix>=32 guard)  
+
+  
+    Finding 1 — Error swallowing: backup copy on line 30                                                              
+  src/global_options.rs:30 — let _ = std::fs::copy(&file_path, &backup); silently drops backup failure when         
+  corrupted JSON is detected.                                                                                       
+                                                                                                                    
+  Finding 2 — Error swallowing: file read error on line 34                                                          
+  src/global_options.rs:34 — Err(_) => HashMap::new() silently loses all global options on a read error without
+  telling the user.                                                                                                 
+                                                        
+  Finding 3 — set() always returns true (dead code in WS layer)                                                     
+  src/global_options.rs:47-55 — set() unconditionally returns true. The WS handler at ws.rs:615 checks if 
+  !...set(...).await which can never be false. That error path is dead code.                                        
+                                                        
+  Finding 4 — No size limit on the options map                                                                      
+  The shell setg sanitizes via sanitize_string_input and the WS rpc_set_option caps key to 256 chars and value to
+  4096 chars, but GlobalOptions::set() itself has no limits. The MCP handle_set_option at mcp/tools.rs:792-796 calls
+   set() with zero validation — no key length check, no value length check, no sanitization. An MCP client can stuff
+   arbitrary-length keys/values and create unlimited entries.                                                       
+                                                        
+  Finding 5 — try_get silently returns None on write-contention                                                     
+  src/global_options.rs:78-80 — When another task holds the write lock, try_get returns None as if the option
+  doesn't exist. Callers like commands/mod.rs:214-225 fall back to defaults (concurrency=50, timeout=60s) when the  
+  lock is briefly held during a save — user's configured values are silently ignored during those moments.
+                                                                                                                    
+  Finding 6 — File target path ignores concurrency global option                                                    
+  src/commands/mod.rs:343 — hardcodes let concurrency = 50usize; instead of reading from global options like the
+  random-scan and CIDR paths do.
+  
+                                                                                                                      
+  1. Error swallowing (line 30) — backup copy failure now logged                                                    
+  2. Error swallowing (line 34) — file read error now logged
+  3. set() always true — now validates key length (1-256), value length (max 4096), and entry cap (1024); returns   
+  false on rejection, making the WS error path live                                                                 
+  4. MCP no validation — handle_set_option now checks set() return and reports errors                               
+  5. try_get write-contention — now retries up to 50ms instead of silently returning None on a briefly-held write   
+  lock                                                                                                              
+  6. File target hardcoded concurrency — now reads concurrency from global options like the other scan paths        
+                                                                                                                
+  
+All 4 bugs fixed:                                                                                    
+                                                                                                                    
+  1. shell.rs:674 — creds add now reports invalid port input with a clear error instead of silently storing port 0  
+  2. ws.rs:274, 285 — subscribe/unsubscribe now reject out-of-range job IDs with an INVALID_JOB_ID error
+  3. config.rs:74-82 — canonical path length now re-checked against MAX_TARGET_LENGTH after resolution              
+  4. pq_middleware.rs:151 — response body read wrapped in 30s timeout, returns GATEWAY_TIMEOUT on stuck handlers 
+
+  
+    - Bug A: ws.rs:539-568 — rpc_run_module stores prompts as dead prompt_{k} keys in GLOBAL_OPTIONS instead of using 
+  ModuleConfig.custom_prompts like MCP does. Also pollutes GLOBAL_OPTIONS persistently with per-run settings        
+  (concurrency, wordlists, etc.) that leak across runs.                                                             
+  - Bug B: mcp/tools.rs:852 — handle_switch_workspace missing name validation that WS enforces.                     
+  - Bug C: mcp/tools.rs:761 — handle_add_loot missing length validation that WS enforces.                           
    
-  ┌───────────────────────────────┬──────────────────────────────────────────────────────────────────────┐      
-  │             Crate             │                                Reason                                │
-  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
-  │ cipher 0.4 → 0.5              │ aes 0.8 requires cipher ^0.4 — no compatible aes release exists yet  │
-  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
-  │ kem 0.3.0-pre.0 → 0.3.0       │ ml-kem 0.2.3 pins =0.3.0-pre.0 exactly                               │      
-  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤      
-  │ rand_core 0.6 → 0.10          │ x25519-dalek 2.0 requires rand_core ^0.6 API (OsRng removed in 0.10) │      
-  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤      
-  │ generic-array 0.14.7 → 0.14.9 │ Transitive dep — will update when parent crates allow it             │
-  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤      
-  │ matchit 0.8.4 → 0.8.6         │ Transitive dep (from axum) — controlled by axum's version constraint │
-  └───────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
-  
-    Removed 5 dependencies:                                                                                       
-                                                                                                                
-  ┌────────────────────┬──────────────────────────────────────────────────────┐                                 
-  │       Crate        │                        Reason                        │                                 
-  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
-  │ aes-gcm            │ Not imported anywhere                                │                                 
-  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
-  │ subtle             │ Not imported anywhere                                │                                 
-  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
-  │ hyper + hyper-util │ Only transitive (axum pulls them in)                 │                                 
-  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
-  │ futures-util       │ Replaced with futures re-exports (2 files changed)   │
-  ├────────────────────┼──────────────────────────────────────────────────────┤                                 
-  │ once_cell          │ Replaced with std::sync::LazyLock (10 files changed) │                               
-  └────────────────────┴──────────────────────────────────────────────────────┘                                 
-                                                                                                              
-  Kept (justified):                                                                                             
-                                                                                                              
-  ┌────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
-  │               Crate                │                               Reason                               │
-  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-  │ crossbeam-channel                  │ Needed for MPMC (multi-consumer) pattern in smtp_user_enum         │
-  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-  │ http                               │ Used directly by h2's API (http::Request::builder())               │   
-  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤   
-  │ All three hash crates              │ Different algorithms, different use sites                          │   
-  │ (sha1/sha2/md5)                    │                                                                    │   
-  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤ 
-  │ All three TLS crates               │ Different purposes (async TLS, cert inspection, native-tls for     │   
-  │                                    │ suppaftp)                                                          │ 
-  ├────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤   
-  │ data-encoding / base64 / hex       │ Different encoding formats (base32, base64, hex)                   │ 
-  └────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘ 
-  
-  ● All done. Here's a summary of every performance improvement:                                                  
-                                                                                                                
-  Build/Compile Performance                                                                                     
-                                                             
-  ┌───────────────────────────────────────────────────────┬────────────┬──────────────────────────────────┐     
-  │                        Change                         │    File    │              Impact              │
-  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
-  │ Trimmed tokio "full" → 10 specific features           │ Cargo.toml │ Fewer tokio modules compiled     │
-  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
-  │ Trimmed socket2 "all" → defaults                      │ Cargo.toml │ Fewer platform features compiled │     
-  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
-  │ Compile 3 regexes once in main(), not 4× per category │ build.rs   │ 4× fewer regex compilations      │     
-  ├───────────────────────────────────────────────────────┼────────────┼──────────────────────────────────┤     
-  │ Fast contains("fn run") pre-filter before regex       │ build.rs   │ Skips regex on non-module files  │     
-  └───────────────────────────────────────────────────────┴────────────┴──────────────────────────────────┘     
-                                                                                                                
-  Connection Creation Speed                                                                                     
-                                                                                                                
-  ┌───────────────────────────────────────────┬──────────────┬──────────────────────────────────────────────┐   
-  │                  Change                   │     File     │                    Impact                    │   
-  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤   
-  │ Cached reqwest::Client pool keyed by      │ network.rs   │ 72+ modules share connection pools, TLS      │   
-  │ timeout                                   │              │ session reuse                                │   
-  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤   
-  │ Cached TLS connector in LazyLock          │ async_tls.rs │ Built once instead of per-call               │
-  │ singleton                                 │              │                                              │   
-  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤ 
-  │ tcp_connect_addr(SocketAddr) — zero-alloc │ network.rs   │ Skips format!() + DNS for resolved IPs       │   
-  │  path                                     │              │                                              │   
-  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤
-  │ tcp_port_open() uses SocketAddr directly  │ network.rs   │ Eliminates 65K String allocs per full-port   │   
-  │                                           │              │ scan                                         │ 
-  ├───────────────────────────────────────────┼──────────────┼──────────────────────────────────────────────┤   
-  │ Honeypot check pre-parses IP once         │ network.rs   │ Eliminates 30 format!()+DNS per honeypot     │   
-  │                                           │              │ check                                        │
-  └───────────────────────────────────────────┴──────────────┴──────────────────────────────────────────────┘   
-                                                                                                              
-  Runtime Hot-Path Performance                                                                                  
-  
-  ┌─────────────────────────────────────────────┬─────────────────────────┬────────────────────────────────┐    
-  │                   Change                    │          File           │             Impact             │  
-  ├─────────────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤  
-  │ detect_service_from_banner() returns        │ port_scanner.rs         │ No String alloc for known      │  
-  │ &'static str                                │                         │ services                       │  
-  ├─────────────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤    
-  │ #[inline] on tcp_port_open,                 │ network.rs,             │ Better inlining in dev profile │    
-  │ get_service_name, etc.                      │ port_scanner.rs         │                                │    
-  ├─────────────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤    
-  │ check_and_mark_ip() — single lock           │ creds/utils.rs          │ Half the lock contention in    │  
-  │ acquisition                                 │                         │ mass scans                     │    
-  └─────────────────────────────────────────────┴─────────────────────────┴────────────────────────────────┘
+  Fix A: WS rpc_run_module — use per-run custom_prompts                                                             
+                                                         
 
- All 190 modules detected, MCP fully functional. Here's the final audit summary:                               
+                                                         
+                                                         
+● Fix B: MCP handle_switch_workspace validation
+
+● Fix C: MCP handle_add_loot length validation
+
+  A. ws.rs rpc_run_module — refactored to build a per-run ModuleConfig.custom_prompts map (matching MCP's pattern)  
+  and call run_with_context_target. This fixes three bugs at once:
+  - Dead prompt_{k} keys are gone — prompts now flow through custom_prompts which the cfg_prompt_* chain actually   
+  reads                                                                                                             
+  - No more persistent GLOBAL_OPTIONS pollution — concurrency/port/etc. are scoped to the request instead of leaking
+   across every subsequent run                                                                                      
+  - target prompt injection guarded (stripped like MCP already does)                                                
+  - Response now includes captured stdout/stderr from the per-task buffer
+                                                                                                                    
+  B. MCP handle_switch_workspace — now rejects invalid names with same 1-64 alphanumeric+dash+underscore rule as WS.
+                                                                                                                    
+  C. MCP handle_add_loot — now enforces same length caps as WS (host/loot_type ≤256, description ≤4096, data        
+  ≤100MB).                                                                                                          
+            
+            
+ A. ws.rs rpc_run_module — 4 gaps                                                                                  
+                                                                                                                    
+  A1. combo_mode not validated for shell metacharacters (ws.rs:568-570)                                             
+  The validation block at lines 515-526 checks username_wordlist, password_wordlist, output_file, and prompts.* for 
+  shell metacharacters — but combo_mode is a string param that's folded straight into custom_prompts with no check. 
+  A client can inject ; rm -rf / via combo_mode.         
+                                                                                                                    
+  A2. Background job path silently drops all per-run config (ws.rs:531-537)                                         
+  if background {
+      match crate::jobs::JOB_MANAGER.spawn(module.to_string(), target.to_string(), verbose) { ... }                 
+  }                                                                                                
+  When background=true, the entire prompts/port/wordlists/concurrency/stop_on_success/output_file/combo_mode object 
+  is ignored. The user sends a fully-configured background run and gets a stripped-down module execution with
+  defaults. This is a major wiring gap — only foreground runs get the new custom_prompts treatment.                 
+                                                         
+  A3. No module existence check (ws.rs:494)                                                                         
+  MCP checks discover_modules().contains(&module_path) at mcp/tools.rs:543 before spawning. WS doesn't — a typo'd
+  module name goes through validation, enters run_module, and fails deep inside dispatch with a worse error.        
+   
+  A4. Port not range-validated (ws.rs:550)                                                                          
+  if let Some(port) = params.get("port").and_then(|v| v.as_u64()) {
+      custom_prompts.entry("port".into()).or_insert_with(|| port.to_string());                                      
+  }                                                                           
+  A port of 99999999 is accepted as a u64 and stringified. cfg_prompt_port will reject it downstream, but the early 
+  rejection MCP has (via u16_param) is cleaner. Minor.
+                                                                                                                    
+  B. MCP handle_switch_workspace — 1 minor gap           
+                                                                                                                    
+  B1. is_alphanumeric() accepts Unicode letters                                                                     
+  char::is_alphanumeric() returns true for CJK characters, Cyrillic, etc. A workspace named 工作 or админ passes
+  validation and becomes a filename. Not exploitable, but inconsistent with the "alphanumeric+dash+underscore" spec 
+  a user would expect. WS has the exact same behavior — would need to tighten both if we care (change to
+  is_ascii_alphanumeric()).                                                                                         
+                                                         
+  C. MCP handle_add_loot — 1 minor gap
+
+  C1. Empty host rejected with misleading error                                                                     
+  MCP only checks host.len() > 256, not host.is_empty(). Empty host passes MCP validation, then loot.rs::add()
+  rejects it at line 87 and returns None, surfacing as the generic "Failed to store loot (validation or I/O error)".
+   WS has the same gap but returns the same vague error. Low-impact — error is just unhelpful.
+                                                                                                                    
+  ---                                                    
+  Priority: A1 and A2 are real wiring bugs (silent data loss / injection). A3 is a UX regression. B1, A4, C1 are
+  minor.                                                                                                            
+   
+  Want me to fix A1, A2, A3?            
+  
+  
+    A1 — combo_mode shell metacharacter check: Added to the validation block alongside wordlists and output_file      
+  (ws.rs:522-525).
+                                                                                                                    
+  A2 — Background jobs now receive per-run config:                                                                  
+  - jobs::spawn now takes Option<ModuleConfig>; when Some, the spawned future runs inside run_with_context_target
+  with that config.                                                                                                 
+  - rpc_run_module builds custom_prompts before branching on background, then passes the ModuleConfig to both paths.
+  - Shell's spawn call updated to pass None (preserves existing shell semantics).                                   
+                                                                                                                    
+  A3 — Module existence check: Added discover_modules().contains(&module) at ws.rs:502-504, matching MCP's pattern. 
+  Unknown modules now fail fast with a clear MODULE_NOT_FOUND error instead of deep in dispatch.                    
+                                                                                                                    
+Fixed (5 real bugs):                                                                                              
+  1. shell.rs:149 — silent rustsploit dir creation now logs failure
+  2. workspace.rs:54 — silent workspaces dir creation now logs                                                      
+  3. workspace.rs:170 — silent read_dir failure in list_workspaces now logs (still returns ["default"] fallback so
+  API doesn't break)                                                                                                
+  4. config.rs:394 — silent results dir creation now logs                                                           
+  5. bruteforce.rs:998 — .unwrap() on Option replaced with explicit fallback to non-streaming path; panic no longer 
+  possible if the streaming-threshold logic ever changes 
+  
+  
+  - 3 sites in commands/mod.rs (Mass Scan / File Target Scan / Subnet Scan) — for _ in 0..concurrency { let _ =     
+  sem.acquire().await } → if let Err(e) = sem.acquire_many(concurrency as u32).await { meprintln!("[!] Drain barrier
+   failed...: {}", e) }                                                                                             
+  - 3 sites in utils/bruteforce.rs (file/cidr/random scan loops) — same refactor
+  - 1 site in utils/bruteforce.rs:1237 (run_bruteforce) — kept ? propagation but bound the permit with let _drain to
+   silence the unused_must_use warning                                                                              
+                                                                                                                    
+  Benefits: single syscall instead of N loop iterations, clearer intent (labeled "drain barrier"), and a diagnostic 
+  message if the semaphore ever gets closed unexpectedly (which would indicate a real bug elsewhere).
+
+    Plan:                                                                     
+  1. Remove crossterm + ratatui imports                                     
+  2. Remove App struct + impl (uses TableState, Color)                      
+  3. Remove draw_ui function (~260 lines of ratatui drawing)                
+  4. Replace the TUI event loop in run() (~315 lines) with a rustyline REPL 
+  5. Update Color references in helpers (rssi_color, DeviceStatus::color,   
+  execute_exploit's log channel) — map ratatui colors to colored::Color     
+  (DarkGray→BrightBlack, LightRed→BrightRed, etc.)                          
+  6. REPL commands: scan, list, select <n>, test, exploit, fmdn, write 
+  [count], audio connect, listen, record, talk, stop, quit/exit, help       
+  7. State (selected device, audio process, device list) kept in a plain    
+  struct; rustyline handles input, helpers log directly via mprintln!   
+                                                                            
+  Side effects:                                             
+  - Lose the live-updating device table (ratatui's strength)                
+  - Gain: no raw-mode side-effects, plays nicely in embedded/API usage,     
+  users can scroll history                                                  
+  - ratatui + crossterm deps may be removable from Cargo.toml if no other   
+  module uses them — want me to check? 
+  
+  
+  wpair.rs audit — verified findings
+
+  Critical
+
+  C1. aes_encrypt / aes_decrypt will panic on short buffers — wpair.rs:965-978
+  &key[0..16] and &data[0..16] index-slice without bounds checks. All current
+  callers pass 16-byte buffers so it's safe today, but aes_decrypt is called on
+   peripheral-returned data at 1112 after only a len() >= 16 caller-side check
+  — any future refactor that drops that check turns untrusted BLE data into an
+  in-process panic.
+
+  High
+
+  H1. Stale selected index after re-scan — wpair.rs:2271-2282 (cmd_scan)
+  After scan, if a device was previously selected, the code only resets
+  selected when count == 0 or when selected.is_none(). If the user had select 3
+   and re-scans, selected stays at 3 — now pointing at a different peripheral
+  in the new results. Silent re-binding.
+
+  H2. Passkey-confirmation write failure silently ignored — wpair.rs:1593-1595
+  let _ = peripheral.write(passkey_char, &encrypted_pk,
+  WriteType::WithoutResponse).await;
+  The exploit then reports success and attempts bonding — but if this write
+  failed, the confirmation never reached the device. User sees a false-positive
+   "EXPLOIT COMPLETE" in the log.
+
+  H3. flood_account_keys has no pacing — wpair.rs:1816-1843
+  Tight for i in 0..count { peripheral.write(...).await } loop with no sleep.
+  Real Fast Pair devices rate-limit GATT writes; later writes in the flood are
+  likely to fail and we stop at the first error (break on Err). Adding a short
+  configurable delay (e.g. 50-100ms) would materially increase success rate.
+
+  H4. Four of six KBP strategies use a half-zero shared secret — wpair.rs:1033,
+   1041, 1070, 1080
+  Legacy, RawKbp, ExtendedResponse, ActionRequest copy a [u8; 8] salt into
+  shared_secret[0..8] and leave [8..16] as zero — so the AES-128 key used for
+  the subsequent account-key encryption has only 64 bits of entropy.
+  RawWithSeeker and Retroactive correctly fill all 16 bytes. Verify against the
+   Fast Pair spec; if the expected salt for these strategies really is 8 bytes,
+   this is correct — but the current code has no unit-test or doc link
+  documenting that.
+
+  Medium
+
+  M1. peripheral.disconnect() return discarded — seven sites (1239, 1258, 1670,
+   1722, 1752, 1852 in wpair's BT helpers)
+  Per your "no silent let _" directive, these should at least be logged (even
+  at tracing::debug). Disconnect failures here indicate BLE state inconsistency
+   that could affect the next operation.
+
+  M2. No bonding cleanup after exploit — wpair.rs:1512-1545, 1615-1657
+  bluetoothctl pair <addr> creates a persistent bond on the local Kali system.
+  There's no corresponding remove <addr> after the exploit run, so each target
+  leaves a stale bonded entry that accumulates and may later auto-reconnect.
+
+  M3. Discovered bond addresses / keys not stored in cred_store —
+  wpair.rs:1421-1435, 1537-1540
+  BONDING SUCCESSFUL! and BR/EDR address obtained are logged only to the REPL.
+  Unlike every other cred-discovering module (SSH, SMTP, MQTT, etc.), wpair
+  doesn't call store_credential/store_loot, so findings vanish at exit.
+
+  Low / missing features
+
+  L1. No direct-target mode — run(_target: &str) ignores the target argument;
+  you must scan then select. The standard pattern in other modules is to accept
+   a MAC directly. Add: set target AA:BB:CC:DD:EE:FF → skip scan, build a
+  FastPairDevice from address + light discovery.
+
+  L2. No output-file option — the API-mode handler (run_api_mode) prints to
+  stdout; there's no output_file cfg_prompt like every other scanner.
+  Bruteforce / batch runs can't persist findings easily.
+
+  L3. No authorization / scope check — cfg_prompt_yes_no("authorized", "Confirm
+   authorized test", false) gate is missing. Bluetooth exploitation typically
+  requires explicit consent confirmation per the project's pattern in other RCE
+   modules.
+
+  L4. aes_encrypt / aes_decrypt have no unit tests — a known-answer test
+  against a Fast Pair spec example vector would catch any future regression in
+  key derivation.
+
+  L5. REPL has no tab-completion — shell.rs has rich completion via
+  RsfCompleter; wpair's rustyline editor is created with default config. Easy
+  win: add a WpairCompleter for the 16 command keywords and device indices.
+
+  L6. render_device_table is one-shot — it only redraws on list. A watch or
+  auto-refresh option (re-render every N seconds while idle) would be closer to
+   the spirit of "live updating" you asked for. The spinner covers active ops
+  but not passive monitoring.
+
+                                           
+● All Err(_) patterns are timeout-elapsed errors where the message already
+  describes what happened ("Connection timed out after {N}ms"). The tokio
+  Elapsed error's display is just "deadline has elapsed" — adding it would be  
+  less informative than what's already there.                                  
+                                                                               
+  Final summary:                                                               
+                                                            
+  - let _ =: 0 remaining (was 7 — all converted to if let Err(e) = ... with    
+  tracing::debug for disconnects and log_msg for bluetoothctl)
+  - if let Ok(...): 2 remaining — both String::from_utf8 on raw BLE bytes;     
+  failure means non-UTF8 device name, which is normal and already handled by   
+  the outer read-success path
+  - Err(_) =>: 6 remaining — all timeout-to-descriptive-message conversions    
+  where the error detail (Elapsed) is less useful than the contextual message  
+  already produced
+  - Poisoned mutex locks: 0 remaining — all converted to unwrap_or_else(|e|    
+  e.into_inner())                                                              
+  - Build: clean, zero warnings
+                                
+                                
+                                I found several bugs in this module. Let me analyze them:
+                                                                               
+  1. Silent error swallowing - the error handler only checks for EPERM, ALL other send errors (ENETUNREACH, ENOBUFS,
+   EINVAL, etc.) are silently dropped                                                                               
+  2. No pre-flight test - 1000 workers spawn with no validation that sending works
+  3. No actual sendmmsg - despite advertising it, uses individual send_to calls                                     
+  4. Each worker creates its own socket - 1000 sockets can exhaust file descriptors, and errors are only logged for 
+  worker 0                                                                                                          
+  5. Default 8MB stack per thread - 1000 threads = 8GB virtual memory                                               
+                                                                                                                    
+  Let me check one more thing before writing the fix.                                                               
+  
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)                                                            
+                                                                       
+● Now let me write the fixed module. The key changes are: shared socket pool via raw fds, actual sendmmsg batching,
+  pre-flight test, comprehensive error reporting, and smaller thread stacks.
+                                                                                                                    
+● Write(src/modules/exploits/dos/null_syn_exhaustion.rs)                                                            
+                                                          
+                                                          
+ Fix memcached_amplification.rs                                                                                 
+                                                                                                                    
+●                                                                                                                   
+                                                                                                                    
+                                                                                                                    
+  - Shared socket pool via raw fds (no per-worker socket creation)                                                  
+  - Pre-flight test before spawning workers                                                                      
+                                                                                                                 
+                                                                                                                    
+                                                                                                                    
+  - Graceful spawn failure handling                                                                                 
+                                                                                                                 
+  Files being fixed:                                                                                             
+                                                                                                                 
+  1. dns_amplification.rs                                                                                           
+  2. memcached_amplification.rs                                                                                  
+                                                                                                                 
+  4. ssdp_amplification.rs                                                                                          
+                                                                                                                 
+  6. icmp_flood.rs                                                                                                  
+  7. udp_flood.rs                                                                                                
+                                                                                                                 
+                                                                                                                    
+✻ Baked for 4m 49s · 7 local agents still running                                                                   
+                                                                                                                 
+※ recap: Fixing silent error swallowing and per-worker socket bugs across all 7 raw-socket DoS modules. Waiting for 
+  7 parallel agents to finish writing the fixed files, then I'll run cargo check to verify everything compiles.  
+  (disable recaps in /config)                                                                                    
+                                                                                                                  
+  /btw with all these fixes applied how much resources are used and max possible like the improvemtn scale Fixes ap…
+                                                                                                                 
+    ├────────────────────┼─────────────────────────────────────────┼────────┤                                     
+    │ Sockets opened     │ 1000 (hits default ulimit 1024)         │ max 32 │                                     
+    ├────────────────────┼─────────────────────────────────────────┼────────┤                                    
+    │ FD exhaustion risk │ High — workers past ~1020 silently fail │ None   │                                    
+    └────────────────────┴─────────────────────────────────────────┴────────┘                                     
+                                                                                                                   
+    Syscall Overhead                                                                                              
+                                                                                                                 
+    ┌────────────────────────────┬─────────────────────────────┬─────────────────────────────┬──────────────────┐  
+    │                            │           Before            │            After            │   Improvement    │
+    ├────────────────────────────┼─────────────────────────────┼─────────────────────────────┼──────────────────┤ 
+    │ Syscalls per 32 packets    │ 32 × sendto()               │ 1 × sendmmsg()              │ 32x fewer        │   
+    │                            │                             │                             │ syscalls         │  
+    ├────────────────────────────┼─────────────────────────────┼─────────────────────────────┼──────────────────┤ 
+    │ Kernel lock acquisitions   │ 32 (one per sendto, on one  │ 1 (one sendmmsg, on one of  │ 32x fewer        │   
+    │ per 32 packets             │ of 1000 sockets)            │ 32 sockets)                 │                  │  
+    ├────────────────────────────┼─────────────────────────────┼─────────────────────────────┼──────────────────┤   
+    │ Context switches           │ Extreme — 1000 threads      │ Moderate — threads do more  │ Significant      │   
+    │                            │ competing                   │ work per wakeup             │ reduction        │   
+    └────────────────────────────┴─────────────────────────────┴─────────────────────────────┴──────────────────┘   
+                                                                                                                    
+    Throughput Estimate                                                                                             
+                                                                                                                    
+    The real bottleneck is kernel socket lock contention and syscall overhead:                                      
+                                                                                                                    
+    - Before: 1000 threads × 1000 individual sendto calls each hitting separate socket locks = massive contention,  
+    many threads starved. Effective throughput likely near zero due to silent errors from fd exhaustion + the       
+    surviving threads fighting each other.                                                                          
+    - After: 1000 threads across 32 sockets, each doing sendmmsg(32 packets) = ~31 threads per socket lock, each    
+    submitting 32 packets atomically.                                                                               
+                                                                                                                    
+
+       - Fix error handler: count all errors, log first in verbose, stop on EPERM/EACCES, backoff on ENOBUFS, break after 500 consecutive
+       - Track local_errs, consecutive_errs, error_logged
+       - Flush to global_errors
+
+       4. Rewrite worker_thread_standard:
+       - Add global_errors: Arc<AtomicU64> param
+       - Fix socket creation to log for ALL workers, not just worker_id == 0
+       - Fix error handler: count all errors, log first in verbose mode for worker 0
+       - Track and flush local_errs
+
+       5. Rewrite execute_attack:
+       - For spoofed mode: create shared socket pool using create_raw_socket, extract fds, pre-flight test
+       - For standard mode: just add error counter
+       - errors_total: Arc<AtomicU64>
+       - thread::Builder::new().stack_size(128 * 1024)
+       - Handle spawn failures
+       - Pass fd (spoofed) or nothing extra (standard) plus errors to workers
+       - Show errors in stats and summary
+       - drop(sockets) at end if spoofed
+
+       Keep PacketBuilder, FastRng, gen_ipv4_public, gather_config, display_banner, run, info UNCHANGED.
+
+       Write the complete fixed file.
+
+                                                                                                                                                                                                            10:15 AM claude-opus-4-6
+● All 7 agents are running in parallel, each fixing one DoS module. They're applying the same fix pattern from the null_syn_exhaustion fix:
+
+  - Shared socket pool via raw fds (no per-worker socket creation)
+  - Pre-flight test before spawning workers
+  - Comprehensive error logging (all errors, not just EPERM)
+  - Error counter in stats display and final summary
+  - 128KB thread stacks via thread::Builder
+  - Graceful spawn failure handling
+
+  Files being fixed:
+  1. dns_amplification.rs
+  2. memcached_amplification.rs
+  3. ntp_amplification.rs
+  4. ssdp_amplification.rs
+  5. syn_ack_flood.rs
+  6. icmp_flood.rs
+  7. udp_flood.rs
+
+  I'll run cargo check once all agents complete to verify everything compiles.
+
+
+  
+  8 modules fixed total:                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                          
+  ┌────────────────────────────┬─────────────────────────────────────────────────────────────────┐                                                                                                                                          
+  │           Module           │                           Bugs Fixed                            │
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ null_syn_exhaustion.rs     │ Silent errors, per-worker sockets, fake sendmmsg, no pre-flight │                                                                                                                                        
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ dns_amplification.rs       │ Silent errors, per-worker sockets, no pre-flight                │                                                                                                                                          
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ memcached_amplification.rs │ Silent errors, per-worker sockets, no pre-flight                │                                                                                                                                          
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ ntp_amplification.rs       │ Silent errors, per-worker sockets, no pre-flight                │                                                                                                                                        
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ ssdp_amplification.rs      │ Silent errors, per-worker sockets, no pre-flight                │
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ syn_ack_flood.rs           │ Silent errors, per-worker sockets, no pre-flight                │                                                                                                                                        
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ icmp_flood.rs              │ Silent errors, per-worker sockets (spoofed), no pre-flight      │
+  ├────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                                                                                          
+  │ udp_flood.rs               │ Silent errors, per-worker sockets (spoofed), no pre-flight      │                                                                                                                                        
+  └────────────────────────────┴─────────────────────────────────────────────────────────────────┘                                                                                                                                          
+  
+  Fixes applied consistently:                                                                                                                                                                                                               
+  - Shared socket pool via AsRawFd + libc::sendto — no more fd exhaustion with many workers                                                                                                                                               
+  - Pre-flight test — sends one packet before spawning workers; aborts immediately with a descriptive error if it fails                                                                                                                     
+  - Comprehensive error handling — all errno values logged (not just EPERM), with ENOBUFS backoff and consecutive-error circuit breaker
+  - Error counter in live stats display and final summary                                                                                                                                                                                   
+  - 128KB thread stacks via thread::Builder — 64x less memory than default                                                                                                                                                                  
+  - Graceful spawn failure handling — logs failures, continues with available workers                                                                                                                                                       
+                                                                                       
+● Found 11 modules with duplicate mass scan implementations. The key duplication is EXCLUDED_RANGES (copied 10 times) and inline random-IP loops instead of using the shared run_mass_scan(). Let me clean this up systematically.
+
+  First, let me check what the duplicate EXCLUDED_RANGES look like vs the canonical one:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● 10 duplicates. Now let me check how each module imports utilities — do they already import from crate::utils?
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● They import generate_random_public_ip but define their own EXCLUDED_RANGES and parse_exclusions. Let me check if they also duplicate parse_exclusions:
+
+  Searched for 3 patterns (ctrl+o to expand)
+
+● Good — they don't duplicate parse_exclusions, only EXCLUDED_RANGES. Let me check how they use the constant:
+
+  Read 1 file (ctrl+o to expand)
+
+● The module's EXCLUDED_RANGES is a subset of the canonical one in bruteforce.rs. Let me verify the canonical one is a superset:
+
+  Read 1 file (ctrl+o to expand)
+
+● The canonical EXCLUDED_RANGES is a strict superset (includes Cloudflare + Google ranges). Now let me verify EXCLUDED_RANGES is already re-exported from utils/mod.rs:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good — already exported. Now I need to replace all 10 duplicate const EXCLUDED_RANGES definitions with use crate::utils::EXCLUDED_RANGES;. Let me do them all:
+
+● Agent(Replace duplicate EXCLUDED_RANGES in all 10 modules)
+  ⎿  Done (13 tool uses · 30.0k tokens · 1m 8s)                                           
+  (ctrl+o to expand)                                                                      
                                                                                           
-  Source port compliance: 100%                                                                                  
-                                                                                                                
-  ┌────────────────────────────────┬────────────────┬──────────────────────────────────────────────────────┐    
-  │            Category            │     Before     │                        After                         │    
-  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤    
-  │ Raw TcpStream::connect in      │ 59 instances   │ 0 — all use                                          │ 
-  │ modules                        │ across 44      │ tcp_connect/tcp_connect_addr/blocking_tcp_connect    │ 
-  │                                │ files          │                                                      │    
-  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤ 
-  │ Raw                            │ 3 instances    │ 0 — all use blocking_udp_bind                        │    
-  │ UdpSocket::bind("0.0.0.0:0")   │ across 3 files │                                                      │ 
-  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤    
-  │ Only in network.rs (framework  │ 4 instances    │ 4 instances (correct — this IS the implementation)   │    
-  │ utility)                       │                │                                                      │
-  ├────────────────────────────────┼────────────────┼──────────────────────────────────────────────────────┤    
-  │ Build warnings                 │ 31 unused      │ 0 — cleaned by cargo fix                             │
-  │                                │ imports        │                                                      │    
-  └────────────────────────────────┴────────────────┴──────────────────────────────────────────────────────┘
-  Phase 1: Critical Bug Fixes                                                                                   
-                                                                                   
-  ┌───────────────────┬──────────────────────────┬──────────────────────────────────────────────────────────┐   
-  │        Fix        │           File           │                          Impact                          │
-  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤   
-  │ Redis command     │                          │ format!("AUTH {} {}") → RESP array format                │   
-  │ injection         │ redis_bruteforce.rs      │ (length-prefixed, injection-proof). Added resp_cmd()     │
-  │                   │                          │ helper. Applied to AUTH, PING, INFO, QUIT.               │   
-  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤
-  │ SMTP 2s timeout   │ smtp_bruteforce.rs       │ Hardcoded 2000ms → configurable DEFAULT_TIMEOUT_MS =     │   
-  │                   │                          │ 10_000 (10s). Threaded through all closures.             │   
-  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤   
-  │ FTP 421           │                          │ ConnectionLimitExceeded returns Err(anyhow!(...))        │   
-  │ misclassified     │ ftp_bruteforce.rs        │ instead of Ok(false) → engine retries with backoff       │   
-  │                   │                          │ instead of skipping credential.                          │   
-  ├───────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤   
-  │ HTTP redirect     │ http_basic_bruteforce.rs │ Checks Location header for login/auth/signin/sso paths → │   
-  │ false positives   │                          │  classifies as AuthFailed instead of Success.            │   
-  └───────────────────┴──────────────────────────┴──────────────────────────────────────────────────────────┘   
-                                                                                                                
-  Phase 2: Consistency & Quality                            
-
-  ┌───────────────────┬──────────────────────────┬─────────────────────────────────────────────────────────┐    
-  │    Improvement    │          Files           │                         Detail                          │ 
-  ├───────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤    
-  │ FTP               │ ftp_bruteforce.rs        │ Added delay_ms and max_retries prompts (was hardcoded 0 │ 
-  │ user-configurable │                          │  and 3). Fixed _verbose → active TLS fallback logging.  │ 
-  ├───────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤    
-  │                   │                          │ Build reqwest::Client once with Arc, share across all   │ 
-  │ HTTP client reuse │ http_basic_bruteforce.rs │ attempts. Enables keep-alive connection pooling. Added  │    
-  │                   │                          │ redirect(Policy::none()).                               │ 
-  ├───────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤    
-  │                   │ utils.rs + all 20        │ New jitter_ms: u64 in BruteforceConfig and              │
-  │ jitter_ms field   │ modules                  │ SubnetScanConfig. Engine adds random 0..jitter_ms to    │    
-  │                   │                          │ each delay for IDS evasion. All modules default to 0.   │
-  └───────────────────┴──────────────────────────┴─────────────────────────────────────────────────────────┘    
-                                                            
-  Phase 3: New Features (Core Engine)                                                                           
-  
-  ┌─────────────────┬──────────┬────────────────────────────────────────────────────────────────────────────┐   
-  │     Feature     │   File   │                                   Detail                                   │
-  ├─────────────────┼──────────┼────────────────────────────────────────────────────────────────────────────┤
-  │ Password spray  │          │ ComboMode::Spray iterates one password across all users before next        │
-  │ mode            │ utils.rs │ password — critical for AD lockout avoidance. generate_combos_mode()       │
-  │                 │          │ function.                                                                  │   
-  ├─────────────────┼──────────┼────────────────────────────────────────────────────────────────────────────┤
-  │ Credential file │ utils.rs │ load_credential_file(path) loads user:pass pairs from file. Modules can    │   
-  │  support        │          │ extend combos from credential files.                                       │
-  ├─────────────────┼──────────┼────────────────────────────────────────────────────────────────────────────┤   
-  │ Combo mode      │ utils.rs │ parse_combo_mode("spray") parses user input to ComboMode enum.             │
-  │ parser          │          │                                                                            │   
-  └─────────────────┴──────────┴────────────────────────────────────────────────────────────────────────────┘
-● Final results — zero warnings, zero dead code, zero bypasses:                                                                                                                                                                             
+● The agent planned but didn't execute. Let me do the edits myself, starting with reading each file's EXCLUDED_RANGES block and imports.
+                                                                             
+  Read 4 files (ctrl+o to expand)    
                                                                                                                                                                                                                                             
-  ┌────────────────────────────────────────┬───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
-  │                 Check                  │          Before           │                                  After                                  │                                                                                          
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ Compiler warnings                      │ 4 (dead code)             │ 0                                                                       │
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ ComboMode::Spray                       │ Never constructed         │ Wired into all 20 bruteforce modules                                    │
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ load_credential_file()                 │ Never called              │ Wired into all 18 modules with combo prompts                            │
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ parse_combo_mode()                     │ Never called              │ Used by all 18 modules                                                  │
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ SubnetScanConfig.jitter_ms             │ Never read                │ Used in run_subnet_bruteforce() inner loop                              │                                                                                          
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ generate_combos() (old wrapper)        │ Dead code after migration │ Removed                                                                 │                                                                                          
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ Raw println!/eprintln! bypassing spool │ 500+ instances            │ 0 in target files — all converted to crate::mprintln!/crate::meprintln! │                                                                                          
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ MCP modules                            │ 190                       │ 190                                                                     │
-  ├────────────────────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤                                                                                          
-  │ Build errors                           │ 0                         │ 0                                                                       │
-  └────────────────────────────────────────┴───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘   
-  
-  New: src/native/dos_utils.rs — Unified DoS Spoofing Infrastructure                                                                                                                                                                        
+● Good. All follow the same pattern. Let me now read the remaining 6 files' imports and EXCLUDED_RANGES blocks:
                                                                                                                                                                                                                                             
-  ┌──────────────────────────┬────────────────────────────────────────────────────────────────────────────────────┐
-  │        Component         │                                      Purpose                                       │                                                                                                                         
-  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
-  │ FastRng                  │ XorShift128+ PRNG with thread-seeded init, gen_ipv4_public(), gen_ephemeral_port() │                                                                                                                         
-  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤
-  │ checksum_16() / sum_16() │ RFC 1071 Internet checksum for IP/TCP/UDP/ICMP headers                             │                                                                                                                         
-  ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                         
-  │ is_spoof_enabled()       │ Reads setg spoof_ip true global option                                             │                                                                                                                         
-  └──────────────────────────┴────────────────────────────────────────────────────────────────────────────────────┘                                                                                                                         
+  Read 6 files (ctrl+o to expand)                                                                                                                                                                                                           
                                                                                                                                                                                                                                             
-  Updated 8 Raw-Packet DoS Modules                                                                                                                                                                                                          
-                                                                                                                                                                                                                                            
-  Each module had its duplicated FastRng, checksum, and gen_ipv4_public code removed and replaced with imports from crate::native::dos_utils.                                                                                               
-                                                                                                                                                                                                                                            
-  ┌─────────────────────────┬────────────────────────────────────────────────────────────┬───────────────────────────────────┐                                                                                                              
-  │         Module          │                     Local Code Removed                     │         Spoof Integration         │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ null_syn_exhaustion     │ ~55 lines FastRng + checksum methods                       │ Global spoof_ip as prompt default │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤
-  │ syn_ack_flood           │ ~38 lines FastRng + checksum methods                       │ Always spoofs (reflection attack) │                                                                                                              
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ udp_flood               │ ~52 lines FastRng + standalone gen_ipv4_public + checksums │ Global spoof_ip as prompt default │                                                                                                              
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ icmp_flood              │ ~48 lines FastRng + standalone gen_ipv4_public + checksums │ Global spoof_ip as prompt default │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ dns_amplification       │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ ntp_amplification       │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ ssdp_amplification      │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────┼───────────────────────────────────┤                                                                                                              
-  │ memcached_amplification │ ~36 lines FastRng + checksum methods                       │ Always spoofs (amplification)     │
-  └─────────────────────────┴────────────────────────────────────────────────────────────┴───────────────────────────────────┘                                                                                                              
-  
-  Usage                                                                                                                                                                                                                                     
-                                                            
-  rsf> setg spoof_ip true     # Enable spoofing globally
-  rsf> use exploits/dos/udp_flood                                                                                                                                                                                                           
-  rsf> run 10.0.0.1           # Spoof prompt defaults to "yes"
-                                                                                                                                                                                                                                            
-  The 5 TCP/HTTP-based DoS modules (slowloris, rudy, http_flood, connection_exhaustion, tcp_connection_flood) are unaffected — they require valid TCP handshakes and cannot spoof.                                                          
-                                                                                                                                                                                           
-
-
-## Session: 2026-04-07 — Performance, Source Port, Bruteforce, Spool, DoS
-
-### Dependency Cleanup
-- Removed 5 redundant crates: aes-gcm (unused), subtle (unused), hyper + hyper-util (transitive only), futures-util (consolidated into futures)
-- Migrated once_cell::sync::Lazy to std::sync::LazyLock across 10 files
-- Updated sha1 0.10 to 0.11, sha2 0.10 to 0.11, hkdf 0.12 to 0.13
-
-### Compile Performance
-- Tokio: replaced "full" feature with 10 specific features (rt-multi-thread, macros, net, time, io-util, io-std, fs, process, sync, signal)
-- socket2: removed "all" feature flag
-- build.rs: compile 3 regexes once in main() instead of 4x per category; added content.contains("fn run") pre-filter before regex
-
-### Connection Speed
-- Cached reqwest::Client pool keyed by timeout in build_http_client() — 72+ modules share connection pools
-- Cached TLS connector singleton in make_dangerous_tls_connector() via LazyLock
-- Added tcp_connect_addr(SocketAddr, Duration) — zero-allocation path skipping DNS/string parsing
-- tcp_port_open() now uses SocketAddr directly — eliminates 65K String allocs per full port scan
-- Honeypot check pre-parses IP once, uses tcp_connect_addr per port
-- Added #[inline] to hot-path functions
-
-### Source Port Enforcement
-- Fixed 63 raw TcpStream::connect calls across 44 module files to use tcp_connect/tcp_connect_addr/blocking_tcp_connect
-- Fixed 3 raw UdpSocket::bind("0.0.0.0:0") calls to use blocking_udp_bind
-- All 190 modules now respect `setg source_port` for firewall bypass testing
-- Removed 31 unused TcpStream imports via cargo fix
-
-### Bruteforce Engine Improvements
-- Redis: switched from inline AUTH format to RESP array format (injection-proof)
-- SMTP: timeout changed from hardcoded 2000ms to configurable DEFAULT_TIMEOUT_MS (10s)
-- FTP: ConnectionLimitExceeded (421) now returns retryable Error instead of AuthFailed
-- FTP: delay_ms and max_retries now user-configurable (was hardcoded 0 and 3)
-- FTP: _verbose parameter activated for TLS fallback logging
-- HTTP Basic: redirect responses checked for login/auth/signin/sso in Location header
-- HTTP Basic: reqwest::Client built once with Arc, shared across attempts (connection pooling)
-- Added ComboMode enum: Linear, Combo, Spray (password spray for AD lockout avoidance)
-- Added generate_combos_mode() replacing generate_combos() across all 20 modules
-- Added load_credential_file() for user:pass file loading
-- Added parse_combo_mode() for user input parsing
-- Added jitter_ms field to BruteforceConfig and SubnetScanConfig
-- jitter_ms wired into both run_bruteforce() and run_subnet_bruteforce() inner loops
-- Merged is_ip_checked + mark_ip_checked into single-lock check_and_mark_ip()
-
-### Spool Compliance
-- Converted 500+ raw println!/eprintln! calls to crate::mprintln!/crate::meprintln!
-- Affected files: shell.rs, config.rs, export.rs, global_options.rs, jobs.rs, workspace.rs, module_info.rs, loot.rs, cred_store.rs, and all module files
-- Excluded: spool.rs (is the system), main.rs (pre-init), api.rs (headless), mcp/ (JSON-RPC)
-
-### Zero Warnings
-- Eliminated all 4 compiler warnings (ComboMode::Spray, load_credential_file, parse_combo_mode, SubnetScanConfig.jitter_ms)
-- Removed dead generate_combos() wrapper after all callers migrated
-- All code compiles with zero warnings
-
-### DoS Spoofing Infrastructure
-- Created src/native/dos_utils.rs with shared FastRng, checksum_16, sum_16, is_spoof_enabled
-- Updated 8 raw-packet DoS modules to use shared utilities (~300 lines of duplicated code removed)
-- Added global setg spoof_ip true support for null_syn_exhaustion, udp_flood, icmp_flood
-- Amplification modules (DNS, NTP, SSDP, Memcached) always spoof (required for reflection)
-
-All 7 documentation files updated. Here's the summary:                                                                                                                                                                                  
-                                                                                                                                                                                                                                            
-  ┌──────────────────────────────────┬──────────────────────────────────────────────────────────────────────────┐                                                                                                                           
-  │             Doc File             │                                 Changes                                  │                                                                                                                           
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ docs/Changelog.md                │ Added session section with 8 highlights, fixed MCP tool count (30 -> 42) │                                                                                                                           
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ docs/Credential-Modules-Guide.md │ Added Combo Modes (spray), credential files, jitter, protocol safety     │                                                                                                                           
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ docs/Module-Development.md       │ Added mandatory framework rules (source port, spool, DoS utils)          │                                                                                                                           
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ docs/Utilities-Helpers.md        │ Added dos_utils, tcp_connect_addr, cached build_http_client              │
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ docs/Exploit-Modules-Guide.md    │ Added DoS spoofing infrastructure section                                │
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ docs/MCP-Integration.md          │ Updated tool count from 30 to 42                                         │
-  ├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                                                                                                                           
-  │ changelogs/changelog-latest.md   │ Appended 59-line session summary                                         │
-  └──────────────────────────────────┴──────────────────────────────────────────────────────────────────────────┘      
-  New: src/modules/scanners/amplification_scanner.rs
-
-  Scans for 4 amplification protocols in one module:
-
-  ┌───────────┬───────┬─────────────────────────────────────┬──────────────────────┬────────────────────────────────────────────────┐
-  │ Protocol  │ Port  │                Probe                │ Amplification Factor │              Vulnerability Check               │
-  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
-  │ DNS       │ 53    │ ANY query for google.com (33 bytes) │ ~28-54x              │ Response with NOERROR/SERVFAIL = open resolver │
-  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
-  │ NTP       │ 123   │ MON_GETLIST_1 (8 bytes)             │ ~556x                │ Mode 6/7 response = monlist enabled            │
-  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
-  │ SSDP      │ 1900  │ M-SEARCH ssdp:all (107 bytes)       │ ~30x                 │ HTTP/1.1 response = UPnP exposed               │
-  ├───────────┼───────┼─────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
-  │ Memcached │ 11211 │ UDP stats (15 bytes)                │ ~51,000x             │ Response with STAT = UDP exposed               │
-  └───────────┴───────┴─────────────────────────────────────┴──────────────────────┴────────────────────────────────────────────────┘
-
-  Features:
-  - Single-target mode with table output, risk rating, and remediation recommendations
-  - Mass scan mode via run_mass_scan() (random, CIDR, file targets)
-  - Protocol selection: dns,ntp,ssdp,memcached,all
-  - Configurable timeout (default 3000ms)
-  - Verbose mode with probe/response size details
-  - Color-coded amplification factors (>100x red, >10x yellow)
-  - Risk assessment: CRITICAL (>500x), HIGH (>50x), MEDIUM (>10x), LOW
-  - Uses crate::utils::udp_bind() for source port compliance
-
-  Usage:
-  use scanners/amplification_scanner
-  set target 8.8.8.8          # single target
-  run
-
-  set target 192.168.1.0/24   # subnet scan
-  run
-
-  set target random            # mass internet scan
-  run
-
-✻ Churned for 6m 20s
-  Here's the summary of everything created:                                                                                                                                                                                                 
-   
-  New Modules (4)                                                                                                                                                                                                                           
-                                                                                                                                                                                                                                            
-  ┌────────────────────────────────┬────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  
-  │             Module             │    Type    │                                                                                      Description                                                                                       │  
-  ├────────────────────────────────┼────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
-  │ scanners/proxy_scanner         │ Scanner    │ Detects open HTTP CONNECT, SOCKS4, SOCKS5, and HTTP Forward proxies. Identifies auth-required vs open. Multi-port scanning (8080, 3128, 1080, 8888, 9050, etc). Mass scan support.     │  
-  ├────────────────────────────────┼────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
-  │ creds/generic/proxy_bruteforce │ Credential │ Bruteforces proxy authentication: HTTP CONNECT (Basic auth), SOCKS5 (RFC 1929 user/pass), HTTP Forward (Basic auth). Full bruteforce engine integration (spray, combo, linear,         │  
-  │                                │            │ credential files, jitter, retry).                                                                                                                                                      │  
-  ├────────────────────────────────┼────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤  
-  │ scanners/banner_grabber        │ Scanner    │ Grabs service banners from open ports with protocol-specific probes (HTTP HEAD, RTSP OPTIONS). Auto-identifies SSH, FTP, SMTP, HTTP, MySQL, Redis, VNC, etc. Mass scan support.        │  
-  ├────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────                                                                                                                                                                                                                 
-
-  ┌──────────────────────┬──────────────────────────────────────────┬─────────────────────────────────┐                                                                                                                                     
-  │         Type         │            Scanner Detection             │         Bruteforce Auth         │
-  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
-  │ HTTP CONNECT (Basic) │ Sends CONNECT, checks 200/407            │ Basic auth header               │                                                                                                                                   
-  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
-  │ SOCKS5 (no auth)     │ Greeting [05,02,00,02], checks method 00 │ -                               │                                                                                                                                     
-  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
-  │ SOCKS5 (user/pass)   │ Greeting, checks method 02               │ RFC 1929 auth packet            │                                                                                                                                     
-  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
-  │ SOCKS4               │ Connect packet, checks 5A response       │ - (SOCKS4 has no auth standard) │                                                                                                                                   
-  ├──────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤                                                                                                                                     
-  │ HTTP Forward         │ Full GET, checks 200 + body              │ Basic auth header               │                                                                                                                                   
-  └──────────────────────┴──────────────────────────────────────────┴─────────────────────────────────┘    
-  
-  
-    │ 1D  │ api.rs                            │ Rewrote is_blocked_target() with IP parsing — catches ::ffff:169.254.169.254, Azure wireserver 168.63.129.16, full 169.254.0.0/16 range │
-  ├─────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                     
-  │ 1E  │ api.rs                            │ Added is_blocked_target() to honeypot_check()                                                                                           │
-  ├─────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                     
-  │ 1F  │ api.rs                            │ Added is_blocked_target() to shell run_all command  
-  Phase 2 — High Severity                                                                                                                                                                                                                   
-                                         
-  ┌─────┬──────────────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
-  │ Fix │         File         │                                        Issue                                        │
-  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
-  │ 2A  │ api.rs, mcp/tools.rs │ Reject CIDR prefixes < /16 (IPv4) and < /48 (IPv6) — prevents /0 DoS                │
-  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
-  │ 2B  │ api.rs               │ File read uses Read::take() to cap at 1MB at IO level — prevents OOM on large files │                                                                                                                      
-  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                      
-  │ 2C  │ api.rs               │ add_cred rejects port=0 and empty secret                                            │                                                                                                                      
-  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                      
-  │ 2D  │ loot.rs              │ save_locked returns bool; add() rolls back on failure                               │
-  ├─────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                      
-  │ 2E  │ cred_store.rs        │ Same persistence-integrity fix for credential store                                 │
-  └─────┴──────────────────────┴─────────────────────────────────────────────────────────────────────────────────────┘          
-  
-    Phase 3 — Swallowed Errors (12 locations)                                                                                                                                                                                                 
-                                         
-  All .catch(() => {}) / catch { /* ignore */ } replaced with toast.error() or console.error(). Most critical: permission save on roles page now shows error + keeps dirty state on failure.                                                
-  
-  Phase 4 — Crypto                                                                                                                                                                                                                          
-                                         
-  ┌─────┬──────────────────┬──────────────────────────────────────────────────────────────────┐
-  │ Fix │       File       │                              Issue                               │
-  ├─────┼──────────────────┼──────────────────────────────────────────────────────────────────┤
-  │ 4A  │ pq_channel.rs    │ Nonces derived from `[epoch                                      │
-  ├─────┼──────────────────┼──────────────────────────────────────────────────────────────────┤
-  │ 4B  │ pq_middleware.rs │ Epoch monotonicity check prevents replay of older-epoch messages │                                                                                                                                             
-  └─────┴──────────────────┴──────────────────────────────────────────────────────────────────┘                                                                                                                                             
-                                                                        Security Fixes (10 items):                                                                
-  1. API key hashing: SHA256 → Argon2id                                                                                                                                                                                                     
-  2. ACL checks added to 6 unprotected admin endpoints                             
-  3. Module restrictions wired into ACL engine                                                                                                                                                                                              
-  4. Export permission name mismatch fixed                                         
-  5. PQ-aware health check (healthy/degraded/unreachable)                                                                                                                                                                                   
-  6. Default-deny for unmapped RSF endpoints                                       
-  7. WebSocket error handling separated                                                                                                                                                                                                     
-  8. Recursive credential redaction (15+ secret field names)                                                                                                                                                                                
-  9. TOTP secrets encrypted at rest (AES-256-GCM)                                                                                                                                                                                           
-  10. Per-account login lockout (10 attempts → 30 min)                                                                                                                                                                                      
-                                                                                                                                                                                                                                            
-  Per-Workspace Isolation:                                                                                                                                                                                                                  
-  - Credentials: ~/.rustsploit/workspaces/{name}_creds.json (was global creds.json)                                                                                                                                                         
-  - Options: ~/.rustsploit/workspaces/{name}_options.json (was global global_options.json)                                                                                                                                                  
-  - Auto-migration from legacy files on first run                                         
-  - Workspace switch now switches creds + options alongside hosts/services                                                                                                                                                                  
-                                                                          
-  Persistent File Logging:                                                                                                                                                                                                                  
-  - Daily rolling logs at ~/.rustsploit/logs/rustsploit.YYYY-MM-DD.log                                                                                                                                                                      
-  - Dual output: console (stderr) + file via tracing-appender                                                                                                                                                                               
-                                                                                                                                                                                                                                            
-  UI Fixes (4 items):                                                                                                                                                                                                                       
-  - Dashboard health: data.healthy → data.success + direct health endpoint check                                                                                                                                                            
-  - Activity feed: stabilized auto-refresh interval                                                                                                                                                                                         
-  - Audit page: skeleton only on initial load                                                                                                                                                                                               
-                                                                                                                                                                                                                                            
-  Docs Updated (12 files):                                  
-  changelog-latest.md, Changelog.md, Security-Validation.md, API-Server.md, Utilities-Helpers.md, Interactive-Shell.md, Getting-Started.md, MCP-Integration.md, API-Usage-Examples.md, Credential-Modules-Guide.md, Module-Development.md                                 
-  Rust API (src/api.rs) — 4 new REST endpoints                                                                      
-   
-  ┌──────────────────┬──────────┬───────────────────────────────┬──────────────────────────────────┐                
-  │     Endpoint     │  Method  │            Purpose            │             Replaces             │
-  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤                
-  │ /api/creds/clear │ POST     │ Clear all credentials         │ shell: "creds clear"             │
-  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤
-  │ /api/hosts/clear │ POST     │ Clear all hosts & services    │ shell: "hosts clear"             │                
-  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤
-  │ /api/loot/clear  │ POST     │ Clear all loot entries        │ shell: "loot clear"              │                
-  ├──────────────────┼──────────┼───────────────────────────────┼──────────────────────────────────┤                
-  │ /api/spool       │ GET/POST │ Get status / start/stop spool │ shell: "spool status/off/<file>" │
-  └──────────────────┴──────────┴───────────────────────────────┴──────────────────────────────────┘  
-
-     Phase D (Rust):
-     cd /home/kali/Pictures/rustsploit/rustsploit
-     cargo build --release
-     # MCP execute_commands: if option (a) was taken, confirm the tool is gone from the schema.
-     # Wordlist per-line cap: create a wordlist with one 10MB line, run a bruteforce module, confirm tracing::warn fires and the line is skipped.
-     # Spool parent symlink: create `ln -s /tmp /home/kali/Pictures/rustsploit/rustsploit/test-logs`, try to spool into test-logs/out.txt, expect explicit error.
+● Now I have all 10 files. Let me do all the edits in parallel — remove the const block and add EXCLUDED_RANGES to imports:     

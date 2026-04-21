@@ -20,21 +20,6 @@ The following Metasploit-inspired features have been implemented:
 - **Background Jobs** (`run -j`/`jobs`) — Async module execution
 - **Export/Reporting** (`export`) — JSON, CSV, and summary reports
 
-### MCP Integration
-Model Context Protocol server with 30 tools and 7 resources for programmatic access from Claude Desktop and other MCP-compatible clients. Supports module execution, target management, credential/host/loot tracking, and data export via JSON-RPC 2.0 over stdio.
-
-### Payload Mutation Engine
-Dynamic payload mutation with 9 WAF bypass strategies (URL encode, double URL, case toggle, comment injection, whitespace swap, concat/split, null byte, unicode homoglyph, boundary wrap) in `src/native/payload_engine.rs`.
-
-### Native RDP Authentication
-Pure Rust TCP+TLS+CredSSP/NTLM brute force — no xfreerdp or rdesktop dependency. 10-50x faster than CLI process spawning.
-
-### Mass Scan Engine Unification
-Shared `run_mass_scan()` engine with `MassScanConfig` replaced ~900 lines of duplicated mass scan code across 13 credential modules. Single source of truth for exclusion ranges, state tracking, and progress reporting.
-
-### Source Port Binding
-Framework-level `set source_port` command for firewall bypass testing. Applied to TCP, UDP, and SSH connections via `tcp_connect()`, `udp_bind()`, and `blocking_tcp_connect()` helpers.
-
 ---
 
 ## Planned Features
@@ -44,22 +29,27 @@ Currently, modules are configured interactively or via API JSON payloads. We pla
 - **Goal:** Allow users to save their favorite scan parameters (wordlists, threads, timeouts) to a `.toml` or `.yaml` file and load them instantly.
 - **Usage Idea:** `run exploits/tomcat_rce --config profiles/aggressive.toml` or `set config profiles/aggressive.toml` in the shell.
 
-### 2. Session/Handler Management
+### 2. Dynamic Source Port Modification
+While we currently support advanced networking like IP spoofing in specific flood modules, we plan to bring dynamic source port control to the framework level.
+- **Goal:** Allow scanners and exploit modules to bind to specific source ports (e.g., source port 53) to bypass poorly configured firewalls that trust traffic originating from privileged ports.
+- **Implementation:** Extending the global configuration and socket helpers to accept an optional `bind_port` parameter.
+
+### 3. Session/Handler Management
 Add Metasploit-style session management with reverse/bind shell handlers.
 - **Goal:** Multi/handler listener, session listing/interaction, background sessions.
 - **Implementation:** Listener framework with TCP/HTTP handlers, session tracking with numeric IDs.
 
-### 3. Post-Exploitation Modules
+### 4. Post-Exploitation Modules
 Add a `post/` module category for post-exploitation tasks.
 - **Goal:** Privilege escalation checks, persistence mechanisms, credential extraction, lateral movement.
 - **Implementation:** New module category auto-discovered by build.rs.
 
-### 4. Network Pivoting
+### 5. Network Pivoting
 Route traffic through compromised hosts.
 - **Goal:** SOCKS proxy, port forwarding, autoroute through sessions.
 - **Implementation:** Requires session management (Feature 3) first.
 
-### 5. Nmap Integration
+### 6. Nmap Integration
 Import scan results directly into the workspace.
 - **Goal:** `db_import` command for Nmap XML, populate hosts/services automatically.
 - **Implementation:** Parse Nmap XML output and feed into workspace.

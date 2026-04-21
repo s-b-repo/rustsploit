@@ -2,8 +2,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::LazyLock as Lazy;
+
 use colored::*;
+use once_cell::sync::Lazy;
 
 /// Global spool state for console logging.
 pub struct SpoolState {
@@ -42,12 +43,8 @@ impl SpoolState {
     }
 
     fn start_at_path(&self, resolved: &Path, display_name: &str) -> Result<(), String> {
-        // Acquire lock FIRST (before creating file) to prevent orphaned files
         let mut guard = self.file.write().map_err(|_| "Failed to acquire spool lock".to_string())?;
 
-        // Open file with O_NOFOLLOW to atomically reject symlinks.
-        // This prevents the TOCTOU race where an attacker swaps the file
-        // with a symlink between the check and open().
         use std::fs::OpenOptions;
         #[cfg(unix)]
         let open_result = {
@@ -101,16 +98,15 @@ impl SpoolState {
     }
 
     /// Write a line to the spool file (if active). Flushes after write (BUG 11 fix).
-    pub fn write_line(&self, msg: &str) {
+    /// Returns `Err` on write/flush failure so callers can react.
+    pub fn write_line(&self, msg: &str) -> Result<(), std::io::Error> {
         if let Ok(mut guard) = self.file.write() {
             if let Some((ref mut file, _)) = *guard {
-                if let Err(e) = writeln!(file, "{}", msg) {
-                    eprintln!("[!] Spool write error: {}", e);
-                } else {
-                    if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
-                }
+                writeln!(file, "{}", msg)?;
+                file.flush()?;
             }
         }
+        Ok(())
     }
 }
 
@@ -151,7 +147,9 @@ pub static SPOOL: Lazy<SpoolState> = Lazy::new(SpoolState::new);
 /// Write a message to both stdout and the spool file.
 pub fn sprintln(msg: &str) {
     println!("{}", msg);
-    SPOOL.write_line(msg);
+    if let Err(e) = SPOOL.write_line(msg) {
+        eprintln!("[!] Spool write error: {}", e);
+    }
 }
 
 /// Display spool status.

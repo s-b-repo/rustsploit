@@ -6,7 +6,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -55,6 +55,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -131,10 +132,10 @@ pub async fn run(target: &str) -> Result<()> {
                             "(open)",
                             "(no auth)",
                             crate::cred_store::CredType::Password,
-                            "creds/generic/memcached_bruteforce",
+                            "creds/generic/memcached_credcheck",
                         )
                         .await;
-                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                        if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                     }
                     return Some(format!(
                         "[{}] {}:{} Memcached OPEN (no auth) - {}\n",
@@ -169,10 +170,10 @@ pub async fn run(target: &str) -> Result<()> {
                                         user,
                                         pass,
                                         crate::cred_store::CredType::Password,
-                                        "creds/generic/memcached_bruteforce",
+                                        "creds/generic/memcached_credcheck",
                                     )
                                     .await;
-                                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                                 }
                                 return Some(format!(
                                     "[{}] {}:{}:{}:{}\n",
@@ -236,8 +237,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "memcached",
-                jitter_ms: 0,
-                source_module: "creds/generic/memcached_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/memcached_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -301,10 +302,10 @@ pub async fn run(target: &str) -> Result<()> {
                     "(open)",
                     "(no auth)",
                     crate::cred_store::CredType::Password,
-                    "creds/generic/memcached_bruteforce",
+                    "creds/generic/memcached_credcheck",
                 )
                 .await;
-                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
             }
 
             let continue_brute =
@@ -478,8 +479,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "memcached",
-            jitter_ms: 0,
-            source_module: "creds/generic/memcached_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/memcached_credcheck",
         },
         combos,
         try_login,

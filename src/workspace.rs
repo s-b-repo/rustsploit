@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use tokio::sync::RwLock;
-use std::sync::LazyLock as Lazy;
-use serde::{Serialize, Deserialize};
+
 use colored::*;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// A tracked host discovered during an engagement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +51,9 @@ impl Workspace {
             .join(".rustsploit")
             .join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) {
+            eprintln!("[!] Failed to create workspaces directory {}: {}", base_dir.display(), e);
+        }
 
         let data = Self::load_sync(&base_dir, "default");
         Self {
@@ -72,13 +75,18 @@ impl Workspace {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        crate::meprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
+                        eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(&path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&path, &backup) {
+                            eprintln!("[!] Failed to backup corrupted workspace '{}': {}", name, e);
+                        }
                         WorkspaceData::default()
                     }
                 },
-                Err(_) => WorkspaceData::default(),
+                Err(e) => {
+                    eprintln!("[!] Failed to read workspace '{}': {}", name, e);
+                    WorkspaceData::default()
+                }
             }
         } else {
             WorkspaceData::default()
@@ -96,25 +104,26 @@ impl Workspace {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        crate::meprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
+                        eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
                         let backup = path.with_extension("json.bak");
-                        if let Err(e) = tokio::fs::copy(&path, &backup).await { crate::meprintln!("[!] Copy error: {}", e); }
+                        if let Err(e) = tokio::fs::copy(&path, &backup).await {
+                            eprintln!("[!] Failed to backup corrupted workspace '{}': {}", name, e);
+                        }
                         WorkspaceData::default()
                     }
                 },
                 Err(e) => {
-                    crate::meprintln!("[!] Warning: Failed to read workspace '{}': {}. Starting empty.", name, e);
+                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Starting empty.", name, e);
                     WorkspaceData::default()
                 }
             }
         } else {
             WorkspaceData::default()
         };
-        // Update data FIRST, then name, to maintain consistency (BUG 23 fix).
-        // A reader between these two lines sees old name + new data,
-        // which is safer than new name + old data (stale workspace).
-        *self.data.write().await = data;
+        // Update name and data together to maintain consistency.
+        // Name is updated AFTER data is successfully loaded/defaulted.
         *self.name.write().await = name.to_string();
+        *self.data.write().await = data;
     }
 
     /// Save current workspace to disk.
@@ -125,16 +134,22 @@ impl Workspace {
         // Clone data to release lock before file I/O
         let data_snapshot = self.data.read().await.clone();
         let tmp = path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(&data_snapshot) {
-            if tokio::fs::write(&tmp, &json).await.is_ok() {
+        match serde_json::to_string_pretty(&data_snapshot) {
+            Ok(json) => {
+                if let Err(e) = tokio::fs::write(&tmp, &json).await {
+                    eprintln!("[!] Failed to write workspace tmp file: {}", e);
+                    return;
+                }
                 if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-                    crate::meprintln!("[!] Failed to save workspace: {}", e);
+                    eprintln!("[!] Failed to save workspace: {}", e);
                 } else {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
-                        crate::meprintln!("[!] Permission error on {}: {}", path.display(), e);
+                    if let Err(e) = crate::utils::set_secure_permissions_async(&path, 0o600).await {
+                        eprintln!("[!] Workspace {} saved but chmod 0o600 failed: {} — file may be world-readable", path.display(), e);
                     }
                 }
+            }
+            Err(e) => {
+                eprintln!("[!] Failed to serialize workspace data: {}", e);
             }
         }
     }
@@ -155,7 +170,8 @@ impl Workspace {
         let mut names = Vec::new();
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(entries) => entries,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[!] Failed to read workspaces directory {}: {}", self.base_dir.display(), e);
                 names.push("default".to_string());
                 return names;
             }
@@ -206,18 +222,11 @@ impl Workspace {
         self.save().await;
     }
 
-    /// Maximum notes per host to prevent unbounded growth (BUG 25 fix).
-    const MAX_NOTES_PER_HOST: usize = 10_000;
-
     /// Add a note to a host.
     pub async fn add_note(&self, ip: &str, note: &str) -> bool {
         let found = {
             let mut data = self.data.write().await;
             if let Some(host) = data.hosts.iter_mut().find(|h| h.ip == ip) {
-                if host.notes.len() >= Self::MAX_NOTES_PER_HOST {
-                    crate::meprintln!("[!] Maximum notes per host reached ({}).", Self::MAX_NOTES_PER_HOST);
-                    return false;
-                }
                 host.notes.push(note.to_string());
                 true
             } else {
@@ -315,63 +324,51 @@ impl Workspace {
     pub async fn display_hosts(&self) {
         let hosts = self.hosts().await;
         if hosts.is_empty() {
-            crate::mprintln!("{}", "No hosts tracked. Use 'hosts add <ip>' to add one.".dimmed());
+            println!("{}", "No hosts tracked. Use 'hosts add <ip>' to add one.".dimmed());
             return;
         }
         let name = self.current_name().await;
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("Hosts ({} total) - Workspace: {}", hosts.len(), name).bold().underline());
-        crate::mprintln!();
-        crate::mprintln!("  {:<18} {:<25} {:<15} {:<20} {}",
+        println!();
+        println!("{}", format!("Hosts ({} total) - Workspace: {}", hosts.len(), name).bold().underline());
+        println!();
+        println!("  {:<18} {:<25} {:<15} {:<20} {}",
             "IP".bold(), "Hostname".bold(), "OS".bold(), "Last Seen".bold(), "Notes".bold());
-        crate::mprintln!("  {}", "-".repeat(90).dimmed());
+        println!("  {}", "-".repeat(90).dimmed());
         for h in &hosts {
-            crate::mprintln!("  {:<18} {:<25} {:<15} {:<20} {}",
+            println!("  {:<18} {:<25} {:<15} {:<20} {}",
                 h.ip.green(),
                 h.hostname.as_deref().unwrap_or("-"),
                 h.os_guess.as_deref().unwrap_or("-"),
                 &h.last_seen,
                 h.notes.len());
         }
-        crate::mprintln!();
+        println!();
     }
 
     /// Display services table.
     pub async fn display_services(&self) {
         let services = self.services().await;
         if services.is_empty() {
-            crate::mprintln!("{}", "No services tracked. Use 'services add' to add one.".dimmed());
+            println!("{}", "No services tracked. Use 'services add' to add one.".dimmed());
             return;
         }
         let name = self.current_name().await;
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("Services ({} total) - Workspace: {}", services.len(), name).bold().underline());
-        crate::mprintln!();
-        crate::mprintln!("  {:<18} {:<8} {:<8} {:<15} {}",
+        println!();
+        println!("{}", format!("Services ({} total) - Workspace: {}", services.len(), name).bold().underline());
+        println!();
+        println!("  {:<18} {:<8} {:<8} {:<15} {}",
             "Host".bold(), "Port".bold(), "Proto".bold(), "Service".bold(), "Version".bold());
-        crate::mprintln!("  {}", "-".repeat(70).dimmed());
+        println!("  {}", "-".repeat(70).dimmed());
         for s in &services {
-            crate::mprintln!("  {:<18} {:<8} {:<8} {:<15} {}",
+            println!("  {:<18} {:<8} {:<8} {:<15} {}",
                 s.host.green(), s.port, s.protocol, s.service_name,
                 s.version.as_deref().unwrap_or("-"));
         }
-        crate::mprintln!();
+        println!();
     }
 }
 
 pub static WORKSPACE: Lazy<Workspace> = Lazy::new(Workspace::new);
-
-/// Mutex to coordinate workspace switching across all stores atomically.
-static SWITCH_MUTEX: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
-
-/// Switch all stores (workspace, credentials, options) atomically.
-/// Prevents race conditions when concurrent requests switch workspaces.
-pub async fn switch_all(name: &str) {
-    let _lock = SWITCH_MUTEX.lock().await;
-    WORKSPACE.switch(name).await;
-    crate::cred_store::CRED_STORE.switch_workspace(name).await;
-    crate::global_options::GLOBAL_OPTIONS.switch_workspace(name).await;
-}
 
 /// Convenience functions for modules to auto-populate workspace data.
 pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {

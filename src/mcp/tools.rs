@@ -1,6 +1,7 @@
-use std::sync::LazyLock as Lazy;
-use serde_json::{json, Value};
 use std::collections::HashMap;
+
+use once_cell::sync::Lazy;
+use serde_json::{json, Value};
 
 use super::types::{Tool, ToolResult};
 
@@ -318,100 +319,6 @@ fn build_tool_definitions() -> Vec<Tool> {
             description: "Export full engagement data (workspace, hosts, services, credentials, loot) as JSON".into(),
             input_schema: json!({ "type": "object", "properties": {} }),
         },
-        // ── Notes ────────────────────────────────────────────────────
-        Tool {
-            name: "add_note".into(),
-            description: "Add a note/annotation to a tracked host".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "ip": { "type": "string", "description": "Host IP address" },
-                    "note": { "type": "string", "description": "Note text (max 4096 chars)" }
-                },
-                "required": ["ip", "note"]
-            }),
-        },
-        // ── Bulk clear ───────────────────────────────────────────────
-        Tool {
-            name: "clear_creds".into(),
-            description: "Clear all stored credentials".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "clear_loot".into(),
-            description: "Clear all stored loot entries and files".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "clear_hosts".into(),
-            description: "Clear all hosts and services from the current workspace".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        // ── Honeypot check ───────────────────────────────────────────
-        Tool {
-            name: "honeypot_check".into(),
-            description: "Check if a target exhibits honeypot characteristics (scans common ports, flags if 11+ respond)".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string", "description": "Target IP or hostname" }
-                },
-                "required": ["target"]
-            }),
-        },
-        // ── Run all (subnet) ─────────────────────────────────────────
-        Tool {
-            name: "run_all".into(),
-            description: "Run a module against all IPs in a CIDR subnet".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "module": { "type": "string", "description": "Module path (e.g., exploits/ssh/weak_creds)" },
-                    "target": { "type": "string", "description": "CIDR subnet (e.g., 192.168.1.0/24)" },
-                    "verbose": { "type": "boolean", "description": "Enable verbose output", "default": false }
-                },
-                "required": ["module", "target"]
-            }),
-        },
-        // ── Spool ────────────────────────────────────────────────────
-        Tool {
-            name: "spool_start".into(),
-            description: "Start logging console output to a file".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "description": "Filename for the spool log (relative to CWD)" }
-                },
-                "required": ["filename"]
-            }),
-        },
-        Tool {
-            name: "spool_stop".into(),
-            description: "Stop logging console output".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "spool_status".into(),
-            description: "Check if spooling is active and get the current filename".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        // ── Export (CSV/Summary) ─────────────────────────────────────
-        Tool {
-            name: "export_csv".into(),
-            description: "Export engagement data as CSV string".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        Tool {
-            name: "export_summary".into(),
-            description: "Export a human-readable engagement summary report".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-        },
-        // Bug #94 — `execute_commands` was previously registered here as a
-        // silent-success stub that returned `{"status":"dispatched"}` without
-        // actually executing anything. LLM agents routing commands through it
-        // believed the commands had run. Removed from the tool registry until
-        // it's wired through to a real dispatch path (see handle_execute_commands
-        // below — kept around so the unused warning is explicit).
     ]
 }
 
@@ -429,7 +336,7 @@ pub async fn call_tool(name: &str, args: Value) -> ToolResult {
         "check_module" => handle_check_module(&args).await,
 
         // ── Target tools ──────────────────────────────────────────
-        "set_target" => handle_set_target(&args),
+        "set_target" => handle_set_target(&args).await,
         "get_target" => handle_get_target(),
         "clear_target" => handle_clear_target(),
 
@@ -472,39 +379,6 @@ pub async fn call_tool(name: &str, args: Value) -> ToolResult {
         // ── Export ────────────────────────────────────────────────
         "export_data" => handle_export_data().await,
 
-        // ── Notes ────────────────────────────────────────────────
-        "add_note" => handle_add_note(&args).await,
-
-        // ── Bulk clear operations ────────────────────────────────
-        "clear_creds" => handle_clear_creds().await,
-        "clear_loot" => handle_clear_loot().await,
-        "clear_hosts" => handle_clear_hosts().await,
-
-        // ── Honeypot check ───────────────────────────────────────
-        "honeypot_check" => handle_honeypot_check(&args).await,
-
-        // ── Run all (subnet) ─────────────────────────────────────
-        "run_all" => handle_run_all(&args).await,
-
-        // ── Spool ────────────────────────────────────────────────
-        "spool_start" => handle_spool_start(&args),
-        "spool_stop" => handle_spool_stop(),
-        "spool_status" => handle_spool_status(),
-
-        // ── Export CSV/Summary ───────────────────────────────────
-        "export_csv" => handle_export_csv().await,
-        "export_summary" => handle_export_summary().await,
-
-        // ── Execute commands (resource script equivalent) ────────
-        // execute_commands removed from the tool registry — bug #94. If a
-        // caller somehow still names it, return an explicit error instead of
-        // routing to the stub.
-        "execute_commands" => ToolResult::error(
-            "execute_commands is not available — the previous stub returned false success \
-             indications and has been removed. Use individual tools (set_target, run_module, \
-             get_jobs) instead.".to_string(),
-        ),
-
         _ => ToolResult::error(format!("Unknown tool: {}", name)),
     }
 }
@@ -528,11 +402,11 @@ fn str_param<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn u16_param(args: &Value, key: &str) -> Option<u16> {
-    args.get(key).and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok())
+    args.get(key).and_then(|v| v.as_u64()).map(|n| n as u16)
 }
 
 fn u32_param(args: &Value, key: &str) -> Option<u32> {
-    args.get(key).and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
+    args.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
 }
 
 fn bool_param(args: &Value, key: &str) -> Option<bool> {
@@ -581,6 +455,9 @@ fn handle_search_modules(args: &Value) -> ToolResult {
 
 fn handle_module_info(args: &Value) -> ToolResult {
     let path = require_str!(args, "module_path");
+    if !crate::api::validate_module_name(path) {
+        return ToolResult::error("Invalid module name".into());
+    }
     match crate::commands::module_info(path) {
         Some(info) => ToolResult::json(&info),
         None => ToolResult::error(format!("No info available for module '{}'", path)),
@@ -590,6 +467,18 @@ fn handle_module_info(args: &Value) -> ToolResult {
 async fn handle_check_module(args: &Value) -> ToolResult {
     let path = require_str!(args, "module_path");
     let target = require_str!(args, "target");
+    if !crate::api::validate_module_name(path) {
+        return ToolResult::error("Invalid module name".into());
+    }
+    if !crate::api::validate_target(target) {
+        return ToolResult::error("Invalid target format".into());
+    }
+    if crate::api::is_blocked_target(target) {
+        return ToolResult::error("Target matches blocked address range".into());
+    }
+    if crate::api::is_blocked_target_resolved(target).await {
+        return ToolResult::error("Target resolves to a blocked metadata/link-local address".into());
+    }
     match crate::commands::check_module(path, target).await {
         Some(result) => ToolResult::json(&result),
         None => ToolResult::error(format!("Module '{}' does not support check", path)),
@@ -598,8 +487,17 @@ async fn handle_check_module(args: &Value) -> ToolResult {
 
 // ── Target tools ──────────────────────────────────────────────────────────
 
-fn handle_set_target(args: &Value) -> ToolResult {
+async fn handle_set_target(args: &Value) -> ToolResult {
     let target = require_str!(args, "target");
+    if !crate::api::validate_target(target) {
+        return ToolResult::error("Invalid target format".into());
+    }
+    if crate::api::is_blocked_target(target) {
+        return ToolResult::error("Target matches blocked address range".into());
+    }
+    if crate::api::is_blocked_target_resolved(target).await {
+        return ToolResult::error("Target resolves to blocked address".into());
+    }
     match crate::config::GLOBAL_CONFIG.set_target(target) {
         Ok(()) => ToolResult::text(format!("Target set to: {}", target)),
         Err(e) => ToolResult::error(format!("Failed to set target: {}", e)),
@@ -629,7 +527,19 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     let target = require_str!(args, "target").to_string();
     let verbose = bool_param(args, "verbose").unwrap_or(false);
 
-    // Validate module exists before executing
+    if !crate::api::validate_module_name(&module_path) {
+        return ToolResult::error("Invalid module name".into());
+    }
+    if !crate::api::validate_target(&target) {
+        return ToolResult::error("Invalid target format".into());
+    }
+    if crate::api::is_blocked_target(&target) {
+        return ToolResult::error("Target matches blocked address range".into());
+    }
+    if crate::api::is_blocked_target_resolved(&target).await {
+        return ToolResult::error("Target resolves to a blocked metadata/link-local address".into());
+    }
+
     if !crate::commands::discover_modules().contains(&module_path) {
         return ToolResult::error(format!("Module '{}' not found", module_path));
     }
@@ -639,14 +549,8 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     if let Some(port) = u16_param(args, "port") {
         prompts.entry("port".into()).or_insert_with(|| port.to_string());
     }
-    // Strip "target" from prompts (case-insensitive) to prevent SSRF bypass via prompt injection
-    let target_keys: Vec<String> = prompts.keys()
-        .filter(|k| k.to_lowercase() == "target")
-        .cloned()
-        .collect();
-    for key in target_keys {
-        prompts.remove(&key);
-    }
+    // Strip "target" from prompts to prevent SSRF bypass via prompt injection
+    prompts.remove("target");
 
     let module_config = crate::config::ModuleConfig {
         api_mode: true,
@@ -717,8 +621,24 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
     let host = require_str!(args, "host");
     let username = require_str!(args, "username");
     let secret = require_str!(args, "secret");
-    let port = u16_param(args, "port").unwrap_or(0);
+    let port = match u16_param(args, "port") {
+        Some(0) => return ToolResult::error("Port must be between 1 and 65535".into()),
+        Some(p) => p,
+        None => return ToolResult::error("Missing required parameter: port".into()),
+    };
     let service = str_param(args, "service").unwrap_or("unknown");
+    if host.len() > 4096 || host.chars().any(|c| c.is_control()) {
+        return ToolResult::error("host too long (max 4096) or contains control characters".into());
+    }
+    if username.len() > 4096 || username.chars().any(|c| c.is_control()) {
+        return ToolResult::error("username too long (max 4096) or contains control characters".into());
+    }
+    if secret.len() > 4096 {
+        return ToolResult::error("secret too long (max 4096 chars)".into());
+    }
+    if service.len() > 4096 || service.chars().any(|c| c.is_control()) {
+        return ToolResult::error("service too long (max 4096) or contains control characters".into());
+    }
     let cred_type = match str_param(args, "cred_type").unwrap_or("password") {
         "hash" => crate::cred_store::CredType::Hash,
         "key" => crate::cred_store::CredType::Key,
@@ -726,14 +646,12 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
         _ => crate::cred_store::CredType::Password,
     };
 
-    let id = crate::cred_store::CRED_STORE
+    match crate::cred_store::CRED_STORE
         .add(host, port, service, username, secret, cred_type, "mcp")
-        .await;
-
-    if id.is_empty() {
-        ToolResult::error("Failed to add credential (validation error)".into())
-    } else {
-        ToolResult::json(&json!({ "id": id, "status": "added" }))
+        .await
+    {
+        Some(id) => ToolResult::json(&json!({ "id": id, "status": "added" })),
+        None => ToolResult::error("Failed to add credential (store limit reached or I/O error)".into()),
     }
 }
 
@@ -755,8 +673,21 @@ async fn handle_list_hosts() -> ToolResult {
 
 async fn handle_add_host(args: &Value) -> ToolResult {
     let ip = require_str!(args, "ip");
+    if ip.len() > 256 || ip.chars().any(|c| c.is_control()) {
+        return ToolResult::error("IP too long (max 256) or contains control characters".into());
+    }
     let hostname = str_param(args, "hostname");
+    if let Some(h) = hostname {
+        if h.len() > 256 || h.chars().any(|c| c.is_control()) {
+            return ToolResult::error("hostname too long (max 256) or contains control characters".into());
+        }
+    }
     let os_guess = str_param(args, "os_guess");
+    if let Some(o) = os_guess {
+        if o.len() > 256 || o.chars().any(|c| c.is_control()) {
+            return ToolResult::error("os_guess too long (max 256) or contains control characters".into());
+        }
+    }
     crate::workspace::WORKSPACE
         .add_host(ip, hostname, os_guess)
         .await;
@@ -780,11 +711,18 @@ async fn handle_list_services() -> ToolResult {
 async fn handle_add_service(args: &Value) -> ToolResult {
     let host = require_str!(args, "host");
     let port = match u16_param(args, "port") {
+        Some(0) => return ToolResult::error("Port must be between 1 and 65535".into()),
         Some(v) => v,
         None => return ToolResult::error("Missing required parameter: port".into()),
     };
+    if host.len() > 256 || host.chars().any(|c| c.is_control()) {
+        return ToolResult::error("host too long (max 256) or contains control characters".into());
+    }
     let service_name = require_str!(args, "service_name");
     let protocol = str_param(args, "protocol").unwrap_or("tcp");
+    if protocol.len() > 256 || protocol.chars().any(|c| c.is_control()) {
+        return ToolResult::error("protocol too long (max 256) or contains control characters".into());
+    }
     let version = str_param(args, "version");
     crate::workspace::WORKSPACE
         .add_service(host, port, protocol, service_name, version)
@@ -824,6 +762,17 @@ async fn handle_add_loot(args: &Value) -> ToolResult {
     let data = require_str!(args, "data");
     let description = str_param(args, "description").unwrap_or("");
 
+    if host.len() > 256 || loot_type.len() > 256 {
+        return ToolResult::error("host or loot_type too long (max 256)".into());
+    }
+    if description.len() > 4096 {
+        return ToolResult::error("description too long (max 4096)".into());
+    }
+    const MAX_LOOT_DATA: usize = 100 * 1024 * 1024;
+    if data.len() > MAX_LOOT_DATA {
+        return ToolResult::error(format!("data too large ({} bytes, max {} MB)", data.len(), MAX_LOOT_DATA / 1024 / 1024));
+    }
+
     match crate::loot::LOOT_STORE
         .add_text(host, loot_type, description, data, "mcp")
         .await
@@ -852,7 +801,9 @@ async fn handle_list_options() -> ToolResult {
 async fn handle_set_option(args: &Value) -> ToolResult {
     let key = require_str!(args, "key");
     let value = require_str!(args, "value");
-    crate::global_options::GLOBAL_OPTIONS.set(key, value).await;
+    if !crate::global_options::GLOBAL_OPTIONS.set(key, value).await {
+        return ToolResult::error(format!("Failed to set '{}': key/value too long or entry limit reached", key));
+    }
     ToolResult::text(format!("{} => {}", key, value))
 }
 
@@ -909,14 +860,12 @@ async fn handle_list_workspaces() -> ToolResult {
 
 async fn handle_switch_workspace(args: &Value) -> ToolResult {
     let name = require_str!(args, "name");
-    // Validate workspace name (same rules as shell and API)
-    if name.len() > 64 {
-        return ToolResult::error("Workspace name too long (max 64 chars)".to_string());
+    if name.is_empty() || name.len() > 64
+        || name.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    {
+        return ToolResult::error("Workspace name must be 1-64 alphanumeric chars, dashes, or underscores".into());
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-        return ToolResult::error("Workspace name must be alphanumeric, underscore, or hyphen only".to_string());
-    }
-    crate::workspace::switch_all(name).await;
+    crate::workspace::WORKSPACE.switch(name).await;
     ToolResult::text(format!("Switched to workspace: {}", name))
 }
 
@@ -937,170 +886,3 @@ async fn handle_export_data() -> ToolResult {
         "loot": loot,
     }))
 }
-
-// ── Notes ──────────────────────────────────────────────────────────────────
-
-async fn handle_add_note(args: &Value) -> ToolResult {
-    let ip = require_str!(args, "ip");
-    let note = require_str!(args, "note");
-    if note.len() > 4096 {
-        return ToolResult::error("Note too long (max 4096 chars)".to_string());
-    }
-    if crate::workspace::WORKSPACE.add_note(ip, note).await {
-        ToolResult::text(format!("Note added to host '{}'", ip))
-    } else {
-        ToolResult::error(format!("Host '{}' not found. Add it first with add_host.", ip))
-    }
-}
-
-// ── Bulk clear operations ──────────────────────────────────────────────────
-
-async fn handle_clear_creds() -> ToolResult {
-    crate::cred_store::CRED_STORE.clear().await;
-    ToolResult::text("All credentials cleared".to_string())
-}
-
-async fn handle_clear_loot() -> ToolResult {
-    crate::loot::LOOT_STORE.clear().await;
-    ToolResult::text("All loot cleared".to_string())
-}
-
-async fn handle_clear_hosts() -> ToolResult {
-    crate::workspace::WORKSPACE.clear_hosts().await;
-    ToolResult::text("All hosts and services cleared from current workspace".to_string())
-}
-
-// ── Honeypot check ─────────────────────────────────────────────────────────
-
-async fn handle_honeypot_check(args: &Value) -> ToolResult {
-    let target = require_str!(args, "target");
-    let normalized = match crate::utils::normalize_target(target) {
-        Ok(t) => t,
-        Err(e) => return ToolResult::error(format!("Invalid target: {}", e)),
-    };
-    let is_honeypot = crate::utils::network::quick_honeypot_check(&normalized).await;
-    ToolResult::json(&json!({
-        "target": normalized,
-        "is_honeypot": is_honeypot,
-        "recommendation": if is_honeypot { "Target may be a honeypot — 11+ common ports responded. Proceed with caution." } else { "No honeypot indicators detected." },
-    }))
-}
-
-// ── Run all (subnet) ───────────────────────────────────────────────────────
-
-async fn handle_run_all(args: &Value) -> ToolResult {
-    let module = require_str!(args, "module");
-    let target = require_str!(args, "target");
-    let verbose = bool_param(args, "verbose").unwrap_or(false);
-    let concurrency = u32_param(args, "concurrency").unwrap_or(50) as usize;
-    let concurrency = concurrency.clamp(1, 500);
-
-    let network: ipnetwork::IpNetwork = match target.parse() {
-        Ok(n) => n,
-        Err(_) => return ToolResult::error("target must be a valid CIDR subnet (e.g., 192.168.1.0/24)".to_string()),
-    };
-    // Reject excessively large subnets to prevent DoS
-    match &network {
-        ipnetwork::IpNetwork::V4(n) if n.prefix() < 16 => {
-            return ToolResult::error("IPv4 CIDR prefix must be /16 or more specific (max 65536 hosts)".to_string());
-        }
-        ipnetwork::IpNetwork::V6(n) if n.prefix() < 48 => {
-            return ToolResult::error("IPv6 CIDR prefix must be /48 or more specific".to_string());
-        }
-        _ => {}
-    }
-    let host_count = match network {
-        ipnetwork::IpNetwork::V4(n) => 2u64.saturating_pow(32 - n.prefix() as u32),
-        ipnetwork::IpNetwork::V6(n) => {
-            if n.prefix() >= 64 { 2u64.saturating_pow(128 - n.prefix() as u32) } else { u64::MAX }
-        }
-    };
-
-    // Semaphore-bounded concurrency — any CIDR size works
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let success = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let module_str = module.to_string();
-
-    for ip in network.iter() {
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break,
-        };
-        let sc = success.clone();
-        let fc = failed.clone();
-        let mod_name = module_str.clone();
-        let ip_str = ip.to_string();
-
-        tokio::spawn(async move {
-            match crate::commands::run_module(&mod_name, &ip_str, verbose).await {
-                Ok(_) => { sc.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                Err(_) => { fc.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-            }
-            drop(permit);
-        });
-    }
-
-    // Wait for all tasks
-    for _ in 0..concurrency {
-        if let Err(e) = semaphore.acquire().await { crate::meprintln!("[!] Semaphore error: {}", e); }
-    }
-
-    let s = success.load(std::sync::atomic::Ordering::Relaxed);
-    let f = failed.load(std::sync::atomic::Ordering::Relaxed);
-    ToolResult::json(&json!({
-        "module": module,
-        "target": target,
-        "host_count": host_count,
-        "concurrency": concurrency,
-        "success": s,
-        "failed": f,
-    }))
-}
-
-// ── Spool ──────────────────────────────────────────────────────────────────
-
-fn handle_spool_start(args: &Value) -> ToolResult {
-    let filename = require_str!(args, "filename");
-    match crate::spool::SPOOL.start(filename) {
-        Ok(()) => ToolResult::text(format!("Spool started: writing to '{}'", filename)),
-        Err(e) => ToolResult::error(format!("Failed to start spool: {}", e)),
-    }
-}
-
-fn handle_spool_stop() -> ToolResult {
-    match crate::spool::SPOOL.stop() {
-        Some(name) => ToolResult::text(format!("Spool stopped: '{}'", name)),
-        None => ToolResult::text("Spool was not active".to_string()),
-    }
-}
-
-fn handle_spool_status() -> ToolResult {
-    if let Some(name) = crate::spool::SPOOL.current_file() {
-        ToolResult::json(&json!({ "active": true, "filename": name }))
-    } else {
-        ToolResult::json(&json!({ "active": false }))
-    }
-}
-
-// ── Export CSV / Summary ───────────────────────────────────────────────────
-
-async fn handle_export_csv() -> ToolResult {
-    match crate::export::export_csv_string().await {
-        Ok(csv) => ToolResult::text(csv),
-        Err(e) => ToolResult::error(format!("CSV export failed: {}", e)),
-    }
-}
-
-async fn handle_export_summary() -> ToolResult {
-    match crate::export::export_summary_string().await {
-        Ok(summary) => ToolResult::text(summary),
-        Err(e) => ToolResult::error(format!("Summary export failed: {}", e)),
-    }
-}
-
-// Bug #94 — `handle_execute_commands` was a silent-success stub. It has
-// been deleted along with its registration in the tool list. If a future
-// contributor wants to re-introduce the feature, wire each command through
-// the real shell passthrough (same path as POST /api/shell) with ACL
-// re-gating via `gateShellCommand` and audit logging via `enqueueAudit`.

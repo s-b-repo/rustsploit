@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use tokio::sync::RwLock;
-use std::sync::LazyLock as Lazy;
-use serde::{Serialize, Deserialize};
+
 use colored::*;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 /// Type of credential stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,108 +40,52 @@ pub struct CredEntry {
     pub valid: bool,
 }
 
-/// Credential store backed by a per-workspace JSON file.
-/// Each workspace gets its own credential store at
-/// `~/.rustsploit/workspaces/{workspace}_creds.json`.
+/// Credential store backed by a JSON file.
 pub struct CredStore {
     entries: RwLock<Vec<CredEntry>>,
-    base_dir: PathBuf,
-    workspace: RwLock<String>,
+    file_path: PathBuf,
 }
 
 impl CredStore {
     fn new() -> Self {
-        let base_dir = home::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".rustsploit")
-            .join("workspaces");
-
-        let workspace = "default".to_string();
-        let file_path = base_dir.join(format!("{}_creds.json", workspace));
-
-        // Synchronous load at init time (called once from Lazy)
-        let entries = Self::load_from_file_sync(&file_path);
-
-        // Migrate legacy global creds.json into default workspace if it exists
-        let legacy_path = home::home_dir()
+        let file_path = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".rustsploit")
             .join("creds.json");
-        if legacy_path.exists() && entries.is_empty() {
-            let legacy = Self::load_from_file_sync(&legacy_path);
-            if !legacy.is_empty() {
-                crate::meprintln!("[*] Migrating {} credentials from legacy creds.json to workspace 'default'", legacy.len());
-                if let Ok(json) = serde_json::to_string_pretty(&legacy) {
-                    let _ = std::fs::create_dir_all(&base_dir);
-                    let _ = std::fs::write(&file_path, &json);
-                }
-                // Rename legacy file so migration only happens once
-                let _ = std::fs::rename(&legacy_path, legacy_path.with_extension("json.migrated"));
-                return Self {
-                    entries: RwLock::new(legacy),
-                    base_dir,
-                    workspace: RwLock::new(workspace),
-                };
-            }
-        }
 
-        Self {
-            entries: RwLock::new(entries),
-            base_dir,
-            workspace: RwLock::new(workspace),
-        }
-    }
-
-    fn load_from_file_sync(file_path: &PathBuf) -> Vec<CredEntry> {
-        if file_path.exists() {
-            match std::fs::read_to_string(file_path) {
+        // Synchronous load at init time (called once from Lazy)
+        let entries = if file_path.exists() {
+            match std::fs::read_to_string(&file_path) {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        crate::meprintln!("[!] Warning: {} is corrupted ({}). Starting fresh.", file_path.display(), e);
+                        eprintln!("[!] Warning: creds.json is corrupted ({}). Starting fresh.", e);
                         let backup = file_path.with_extension("json.bak");
-                        if let Err(e) = std::fs::copy(file_path, &backup) { crate::meprintln!("[!] Backup copy error: {}", e); }
+                        if let Err(e) = std::fs::copy(&file_path, &backup) {
+                            eprintln!("[!] Failed to backup corrupted creds.json: {}", e);
+                        }
                         Vec::new()
                     }
                 },
-                Err(_) => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn file_path_for(&self, workspace: &str) -> PathBuf {
-        self.base_dir.join(format!("{}_creds.json", workspace))
-    }
-
-    /// Switch to a different workspace's credential store.
-    /// Saves current, loads target workspace creds.
-    pub async fn switch_workspace(&self, name: &str) {
-        // Save current workspace creds
-        let snapshot = self.entries.read().await.clone();
-        let current = self.workspace.read().await.clone();
-        let current_path = self.file_path_for(&current);
-        self.save_to_path(&current_path, &snapshot).await;
-
-        // Load new workspace creds
-        let new_path = self.file_path_for(name);
-        let new_entries = if new_path.exists() {
-            match tokio::fs::read_to_string(&new_path).await {
-                Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-                Err(_) => Vec::new(),
+                Err(e) => {
+                    eprintln!("[!] Failed to read creds.json: {}", e);
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
         };
-        *self.entries.write().await = new_entries;
-        *self.workspace.write().await = name.to_string();
+
+        Self {
+            entries: RwLock::new(entries),
+            file_path,
+        }
     }
 
     /// Maximum length for credential fields to prevent memory abuse.
     const MAX_FIELD_LEN: usize = 4096;
 
-    /// Add a credential. Returns the generated ID (empty string on validation failure).
+    /// Add a credential. Returns `Some(id)` on success, `None` on validation failure.
     pub async fn add(
         &self,
         host: &str,
@@ -150,18 +95,15 @@ impl CredStore {
         secret: &str,
         cred_type: CredType,
         source_module: &str,
-    ) -> String {
-        // Input validation (BUG 19 fix: also validate service and source_module)
+    ) -> Option<String> {
+        // Input validation
         if host.is_empty() || host.len() > Self::MAX_FIELD_LEN {
-            return String::new();
+            return None;
         }
         if secret.len() > Self::MAX_FIELD_LEN || username.len() > Self::MAX_FIELD_LEN {
-            return String::new();
+            return None;
         }
-        if service.len() > Self::MAX_FIELD_LEN || source_module.len() > Self::MAX_FIELD_LEN {
-            return String::new();
-        }
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let entry = CredEntry {
             id: id.clone(),
             host: host.to_string(),
@@ -179,14 +121,8 @@ impl CredStore {
             entries.push(entry);
             entries.clone()
         };
-        if !self.save_locked(&snapshot).await {
-            // Rollback: remove from in-memory store since disk write failed
-            let mut entries = self.entries.write().await;
-            entries.retain(|e| e.id != id);
-            crate::meprintln!("[!] Credential add rolled back — save to disk failed");
-            return String::new();
-        }
-        id
+        self.save_locked(&snapshot).await;
+        Some(id)
     }
 
     /// List all credentials.
@@ -217,9 +153,7 @@ impl CredStore {
             }
         };
         if let Some(data) = snapshot {
-            if !self.save_locked(&data).await {
-                crate::meprintln!("[!] Warning: credential delete index save failed");
-            }
+            self.save_locked(&data).await;
             return true;
         }
         false
@@ -230,88 +164,90 @@ impl CredStore {
         {
             self.entries.write().await.clear();
         }
-        if !self.save_locked(&[]).await {
-            crate::meprintln!("[!] Warning: credential clear index save failed");
-        }
+        self.save_locked(&[]).await;
     }
 
-    /// Save to disk. Returns false if the write failed so callers can rollback.
-    async fn save_locked(&self, entries: &[CredEntry]) -> bool {
-        let workspace = self.workspace.read().await.clone();
-        let path = self.file_path_for(&workspace);
-        self.save_to_path(&path, entries).await
-    }
-
-    async fn save_to_path(&self, path: &PathBuf, entries: &[CredEntry]) -> bool {
-        if let Some(parent) = path.parent() {
+    async fn save_locked(&self, entries: &[CredEntry]) {
+        if let Some(parent) = self.file_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                crate::meprintln!("[!] Warning: Failed to create creds directory: {}", e);
-                return false;
+                eprintln!("[!] Failed to create creds directory: {}", e);
+                return;
             }
         }
-        let tmp = path.with_extension("json.tmp");
+        let tmp = self.file_path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(entries) {
             Ok(j) => j,
             Err(e) => {
-                crate::meprintln!("[!] Warning: Failed to serialize credentials: {}", e);
-                return false;
+                eprintln!("[!] Failed to serialize credentials: {}", e);
+                return;
             }
         };
-        if let Err(e) = tokio::fs::write(&tmp, &json).await {
-            crate::meprintln!("[!] Warning: Failed to write creds temp file: {}", e);
-            return false;
+        {
+            let file = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[!] Failed to write temp creds file: {}", e);
+                    return;
+                }
+            };
+            let mut file = file;
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await {
+                eprintln!("[!] Failed to write temp creds file: {}", e);
+                return;
+            }
         }
-        if let Err(e) = tokio::fs::rename(&tmp, path).await {
-            crate::meprintln!("[!] Warning: Failed to save credentials (rename): {}", e);
-            return false;
+        if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
+            eprintln!("[!] Failed to rename creds file: {}", e);
         }
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await {
-            crate::meprintln!("[!] Warning: Failed to set permissions on creds file: {}", e);
-        }
-        true
     }
 
     /// Display all credentials in a formatted table.
     pub async fn display(&self) {
         let entries = self.list().await;
         if entries.is_empty() {
-            crate::mprintln!("{}", "No credentials stored. Use 'creds add' to add one.".dimmed());
+            println!("{}", "No credentials stored. Use 'creds add' to add one.".dimmed());
             return;
         }
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("Credentials ({} total):", entries.len()).bold().underline());
-        crate::mprintln!();
-        crate::mprintln!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
+        println!();
+        println!("{}", format!("Credentials ({} total):", entries.len()).bold().underline());
+        println!();
+        println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
             "ID".bold(), "Host".bold(), "Port".bold(), "Service".bold(),
             "Username".bold(), "Secret".bold(), "Type".bold(), "Valid".bold());
-        crate::mprintln!("  {}", "-".repeat(100).dimmed());
+        println!("  {}", "-".repeat(100).dimmed());
         for e in &entries {
             let valid_str = if e.valid { "yes".green() } else { "no".red() };
-            crate::mprintln!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
+            println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
                 e.id, e.host, e.port, e.service, e.username,
-                if e.secret.len() > 8 { format!("{}...", &e.secret[..5]) } else { e.secret.clone() },
+                if e.secret.len() > 18 { format!("{}...", &e.secret[..15]) } else { e.secret.clone() },
                 e.cred_type, valid_str);
         }
-        crate::mprintln!();
+        println!();
     }
 
     /// Display search results.
     pub fn display_results(&self, results: &[CredEntry]) {
         if results.is_empty() {
-            crate::mprintln!("{}", "No matching credentials found.".dimmed());
+            println!("{}", "No matching credentials found.".dimmed());
             return;
         }
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("Found {} credential(s):", results.len()).bold());
-        crate::mprintln!();
+        println!();
+        println!("{}", format!("Found {} credential(s):", results.len()).bold());
+        println!();
         for e in results {
-            crate::mprintln!("  [{}] {}@{}:{} ({}) - {} [{}]",
+            println!("  [{}] {}@{}:{} ({}) - {} [{}]",
                 e.id.yellow(), e.username.green(), e.host, e.port,
                 e.service, e.cred_type,
                 if e.valid { "valid".green() } else { "invalid".red() });
         }
-        crate::mprintln!();
+        println!();
     }
 }
 
@@ -326,6 +262,6 @@ pub async fn store_credential(
     secret: &str,
     cred_type: CredType,
     source_module: &str,
-) -> String {
+) -> Option<String> {
     CRED_STORE.add(host, port, service, username, secret, cred_type, source_module).await
 }

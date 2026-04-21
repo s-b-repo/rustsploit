@@ -10,7 +10,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
     generate_combos_mode, parse_combo_mode, load_credential_file,
     run_bruteforce, run_subnet_bruteforce,
@@ -205,9 +205,9 @@ pub async fn run(target: &str) -> Result<()> {
                                     user,
                                     pass,
                                     crate::cred_store::CredType::Password,
-                                    "creds/generic/http_basic_bruteforce",
+                                    "creds/generic/http_basic_credcheck",
                                 ).await;
-                                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                             }
                             return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
                         }
@@ -251,8 +251,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "http-basic",
-            jitter_ms: 0,
-            source_module: "creds/generic/http_basic_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/http_basic_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             let url_path = url_path.clone();
@@ -405,8 +405,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "http-basic",
-        jitter_ms: 0,
-        source_module: "creds/generic/http_basic_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/http_basic_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();
@@ -504,7 +504,7 @@ async fn try_http_login(
                     Ok(true) // Redirect to non-login page = likely success
                 }
             } else {
-                Ok(true) // No location header = treat as success
+                Err(anyhow!("HTTP {} redirect with no Location header", status))
             }
         }
         _ => Err(anyhow!("HTTP {}", status)),

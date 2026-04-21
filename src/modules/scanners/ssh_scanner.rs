@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use colored::*;
 use std::{
     collections::HashSet,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, ToSocketAddrs},
     sync::{
@@ -26,7 +26,7 @@ use tokio::{
     time::sleep,
 };
 use ipnetwork::IpNetwork;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
@@ -37,6 +37,7 @@ const DEFAULT_THREADS: usize = 50;
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SSH Service Scanner                                             ║".cyan());
     crate::mprintln!("{}", "║   Scan networks for SSH services and grab banners                 ║".cyan());
@@ -94,9 +95,9 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
-
+    
     fn print_summary(&self) {
         crate::mprintln!();
         crate::mprintln!("{}", "=== Scan Summary ===".cyan().bold());
@@ -138,8 +139,11 @@ fn grab_ssh_banner(host: &str, port: u16, timeout_secs: u64) -> Option<String> {
     
     for addr in addrs {
         if let Ok(stream) = crate::utils::blocking_tcp_connect(&addr, timeout) {
-            if let Err(e) = stream.set_read_timeout(Some(timeout)) { crate::meprintln!("[!] Socket option error: {}", e); }
-            if let Err(e) = stream.set_write_timeout(Some(timeout)) { crate::meprintln!("[!] Socket option error: {}", e); }
+            if stream.set_read_timeout(Some(timeout)).is_err()
+                || stream.set_write_timeout(Some(timeout)).is_err()
+            {
+                continue;
+            }
             
             let mut stream = stream;
             let mut buffer = [0u8; 1024];
@@ -289,7 +293,7 @@ pub async fn scan_ssh(
                         banner: banner.clone(),
                     };
                     crate::mprintln!("\r{}", format!("[+] {}:{} - {}", host, port, banner).green());
-                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                     results.lock().await.push(result);
                 }
                 Ok(None) => {
@@ -307,12 +311,12 @@ pub async fn scan_ssh(
     
     // Wait for all tasks
     for handle in handles {
-        if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = handle.await;
     }
-
+    
     // Stop progress reporter
     stop.store(true, Ordering::Relaxed);
-    if let Err(e) = progress_handle.await { crate::meprintln!("[!] Progress task error: {}", e); }
+    let _ = progress_handle.await;
     
     // Print summary
     stats.print_summary();
@@ -323,10 +327,9 @@ pub async fn scan_ssh(
 
 /// Save results to file
 fn save_results(results: &[SshScanResult], path: &str) -> Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        crate::meprintln!("[!] Permission error on {}: {}", path, e);
+    let mut file = File::create(path)?;
+    if let Err(e) = crate::utils::set_secure_permissions(path, 0o600) {
+        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", path, e);
     }
 
     writeln!(file, "# SSH Scan Results")?;
