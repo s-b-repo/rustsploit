@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 /// Default ports to scan when the user accepts the default list.
@@ -200,6 +200,7 @@ pub async fn run(target: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════════════╗".cyan()
@@ -302,11 +303,10 @@ fn save_results_to_file(
     target: &str,
 ) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    let mut f = std::fs::File::create(path)
         .with_context(|| format!("Failed to create output file: {}", path))?;
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        crate::meprintln!("[!] Permission error on {}: {}", path, e);
+    if let Err(e) = crate::utils::set_secure_permissions(path, 0o600) {
+        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", path, e);
     }
 
     writeln!(f, "Service Version Scan Results for {}", target)?;
@@ -378,9 +378,12 @@ fn parse_port_list(input: &str) -> Result<Vec<u16>> {
 
 async fn mass_scan_probe(ip: &str, port: u16) -> Option<String> {
     let addr = format!("{}:{}", ip, port);
-    let mut stream = crate::utils::network::tcp_connect(&addr, Duration::from_secs(3))
+    let stream = timeout(Duration::from_secs(3), TcpStream::connect(&addr))
         .await
+        .ok()?
         .ok()?;
+
+    let mut stream = stream;
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         ip
@@ -414,8 +417,8 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
     let addr = format!("{}:{}", target, port);
     let dur = Duration::from_secs(timeout_secs);
 
-    let stream = match crate::utils::network::tcp_connect(&addr, dur).await {
-        Ok(s) => s,
+    let stream = match timeout(dur, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => s,
         _ => return None,
     };
 

@@ -268,7 +268,7 @@ async fn send_and_receive_one(
                 if ip_pkt.get_next_level_protocol() == IpNextHeaderProtocols::Icmp {
                     if let Some(icmp_pkt) = icmp::IcmpPacket::new(ip_pkt.payload()) {
                         let icmp_type = icmp_pkt.get_icmp_type();
-                        let _icmp_code = icmp_pkt.get_icmp_code();
+                        let _ = icmp_pkt.get_icmp_code();
                         let mut matched = false;
 
                         if icmp_type == IcmpTypes::TimeExceeded || icmp_type == IcmpTypes::DestinationUnreachable {
@@ -419,21 +419,7 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 }
 
 pub async fn run(target: &str) -> Result<()> {
-    let user_input = crate::utils::cfg_prompt_default("sudo_confirm", "Are you running this as sudo? (yes/no)", "no").await?;
-
-    if user_input.trim().to_lowercase() == "yes" {
-        let output = std::process::Command::new("id").arg("-u").output()
-            .context("Failed to run 'id -u'")?;
-        let uid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let uid: u32 = uid_str.parse().unwrap_or(1);
-        if uid != 0 {
-            bail!("Must be running as root (sudo)");
-        }
-    } else if user_input.trim().to_lowercase() == "no" {
-        bail!("Root privileges required. Run with sudo.");
-    } else {
-        bail!("Invalid input for sudo confirmation");
-    }
+    crate::utils::require_root("stalkroute_full_traceroute (raw ICMP/TCP/UDP probes)")?;
 
     crate::mprintln!("by suicidalteddy");
     crate::mprintln!("github.com/s-b-repo");

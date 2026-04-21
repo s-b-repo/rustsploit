@@ -137,7 +137,7 @@ rsf> show options
 rsf> unsetg port
 ```
 
-Global options are now per-workspace. They are saved to `~/.rustsploit/workspaces/{name}_options.json` (where `{name}` is the current workspace name) and loaded automatically when switching workspaces.
+Global options are saved to `~/.rustsploit/global_options.json` and loaded on startup.
 
 ### Common Global Options
 
@@ -215,6 +215,6 @@ Key details from `src/shell.rs`:
 - **`execute_single_command()`** — the command dispatcher, extracted as a standalone function for resource script support.
 - **`split_command` / `resolve_command`** — normalize shortcut aliases to canonical keys.
 - **`render_help()`** — prints the colorized command table.
-- **Selective persistence** — per-workspace options (`workspaces/{name}_options.json`), per-workspace credentials (`workspaces/{name}_creds.json`), workspace files, and loot are persisted across sessions in `~/.rustsploit/`. Transient shell state (selected module, current target, verbose flag) is reset on exit.
+- **Selective persistence** — `global_options.json`, `creds.json`, workspace files, and loot are persisted across sessions in `~/.rustsploit/`. Transient shell state (selected module, current target, verbose flag) is reset on exit.
 
 Tab completion and command history are powered by `rustyline`.

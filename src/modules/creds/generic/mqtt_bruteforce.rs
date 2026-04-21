@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -244,8 +244,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "mqtt",
-                jitter_ms: 0,
-                source_module: "creds/generic/mqtt_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/mqtt_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -362,10 +362,10 @@ pub async fn run(target: &str) -> Result<()> {
                         "(anonymous)",
                         "(no password)",
                         crate::cred_store::CredType::Password,
-                        "creds/generic/mqtt_bruteforce",
+                        "creds/generic/mqtt_credcheck",
                     )
                     .await;
-                    if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                 }
                 if stop_on_success {
                     crate::mprintln!(
@@ -433,8 +433,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries: 3,
             service_name: "mqtt",
-            jitter_ms: 0,
-            source_module: "creds/generic/mqtt_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/mqtt_credcheck",
         },
         combos,
         try_login,
@@ -510,6 +510,7 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()

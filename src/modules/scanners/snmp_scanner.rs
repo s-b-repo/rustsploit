@@ -10,7 +10,7 @@ use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
 use crate::utils::{cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -43,6 +43,7 @@ const OID_SYS_NAME: &[u8] = &[0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x05, 0x00];
 const OID_SYS_LOCATION: &[u8] = &[0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x06, 0x00];
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SNMP Community String Scanner                              ║".cyan());
     crate::mprintln!("{}", "║   Tests SNMP v1/v2c communities via raw UDP packets          ║".cyan());
@@ -288,7 +289,7 @@ pub async fn run(target: &str) -> Result<()> {
 
         for community in &communities {
             crate::mprint!("  [*] Testing '{}' ... ", community);
-            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
 
             match test_community(&socket, &addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
                 Ok(Some(sys_descr)) => {
@@ -339,15 +340,8 @@ pub async fn run(target: &str) -> Result<()> {
     if save_results && !valid_communities.is_empty() {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "snmp_scan_results.txt").await?;
         let content = valid_communities.join("\n");
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            f.write_all(format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content).as_bytes())
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-        }
+        std::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content))
+            .with_context(|| format!("Failed to write results to {}", output_path))?;
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

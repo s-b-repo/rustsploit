@@ -1,4 +1,4 @@
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -26,6 +26,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -147,8 +148,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "fortinet-vpn",
-                jitter_ms: 0,
-                source_module: "creds/generic/fortinet_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/fortinet_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -308,8 +309,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 100,
             max_retries: 2,
             service_name: "fortinet-vpn",
-            jitter_ms: 0,
-            source_module: "creds/generic/fortinet_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/fortinet_credcheck",
         },
         combos,
         try_login,

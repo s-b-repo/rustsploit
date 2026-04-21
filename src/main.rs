@@ -1,31 +1,34 @@
+use std::net::SocketAddr;
+use std::process;
+
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use colored::*;
-use std::net::SocketAddr;
-use std::process;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
 
-mod cli;
-mod shell;
-mod commands;
-mod modules;
-mod utils;
 mod api;
+mod cli;
+mod commands;
 mod config;
 mod context;
+mod modules;
 mod native;
-pub mod output;
-pub mod module_info;
-pub mod global_options;
+mod shell;
+mod utils;
+
 pub mod cred_store;
-pub mod spool;
-pub mod workspace;
-pub mod loot;
 pub mod export;
+pub mod global_options;
 pub mod jobs;
+pub mod loot;
 pub mod mcp;
+pub mod module_info;
+pub mod output;
 pub mod pq_channel;
 pub mod pq_middleware;
+pub mod spool;
+pub mod workspace;
+pub mod ws;
 
 
 /// Maximum length for interface/bind address
@@ -92,36 +95,15 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    // Initialize structured logging — console + file
+    // Initialize structured logging
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
         EnvFilter::new("warn")
     };
-
-    let log_dir = home::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".rustsploit")
-        .join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    // Daily rolling log file: rustsploit.YYYY-MM-DD.log
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "rustsploit.log");
-    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            fmt::layer()
-                .with_target(false)
-                .with_writer(std::io::stderr),
-        )
-        .with(
-            fmt::layer()
-                .with_target(true)
-                .with_ansi(false)
-                .with_writer(non_blocking),
-        )
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
         .init();
 
     let cli_args = cli::Cli::parse();

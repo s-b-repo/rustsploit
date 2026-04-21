@@ -21,7 +21,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
     cfg_prompt_int_range, cfg_prompt_existing_file, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SMTP_PORT: u16 = 25;
@@ -77,7 +77,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     fn print_final(&self) {
@@ -101,6 +101,7 @@ impl Statistics {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   SMTP Username Enumeration Scanner                        ║".cyan());
     crate::mprintln!("{}", "║   Enumerates usernames using SMTP VRFY command             ║".cyan());
@@ -377,12 +378,12 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         }
 
         for handle in handles {
-            if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
+            let _ = handle.await;
         }
 
         // Stop progress reporter
         stop_flag.store(true, Ordering::Relaxed);
-        if let Err(e) = progress_handle.join() { crate::meprintln!("[!] Thread join error: {:?}", e); }
+        let _ = progress_handle.join();
 
         // Final reporting including unknown responses
         return finalize_and_report(found, unknown, stats).await;
@@ -539,13 +540,13 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
     }
 
     for handle in handles {
-        if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = handle.await;
     }
-
+    
     // Stop progress reporter
     stop_flag.store(true, Ordering::Relaxed);
-    if let Err(e) = progress_handle.join() { crate::meprintln!("[!] Thread join error: {:?}", e); }
-
+    let _ = progress_handle.join();
+    
     // Final reporting including unknown responses
     finalize_and_report(found, unknown, stats).await
 }
@@ -560,7 +561,7 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
     
     let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(timeout_ms))
         .context("Connection timeout")?;
-    if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
+    let _ = stream.set_nodelay(true);
 
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;

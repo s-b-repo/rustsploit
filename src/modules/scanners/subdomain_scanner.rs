@@ -45,6 +45,7 @@ const DEFAULT_SUBDOMAINS: &[&str] = &[
 ];
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   DNS Subdomain Enumerator                                   ║".cyan());
     crate::mprintln!("{}", "║   Brute-force subdomain discovery via DNS resolution         ║".cyan());
@@ -135,15 +136,27 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("{}", format!("[*] Loaded {} subdomains to test", subdomains.len()).cyan());
     crate::mprintln!("{}", format!("[*] Concurrency: {}, Timeout: {}s", concurrency, timeout_secs).dimmed());
 
-    // Wildcard detection: test a random non-existent subdomain
-    let wildcard_test = format!("xz9q7k2m4p{}.{}", rand::random::<u32>(), domain);
-    let wildcard_ips = resolve_subdomain(&wildcard_test, timeout_dur).await;
-    let wildcard_filter: Option<Vec<String>> = if let Some(ref ips) = wildcard_ips {
+    // Wildcard detection: test multiple random non-existent subdomains to reduce false negatives
+    let mut wildcard_hits: Vec<Vec<String>> = Vec::new();
+    for i in 0..3u32 {
+        let probe = format!("xz9q7k{}r{}.{}", rand::random::<u32>(), i, domain);
+        if let Some(ips) = resolve_subdomain(&probe, timeout_dur).await {
+            wildcard_hits.push(ips);
+        }
+    }
+    let wildcard_filter: Option<Vec<String>> = if wildcard_hits.len() >= 2 {
+        let ips = &wildcard_hits[0];
         crate::mprintln!("{}", format!(
-            "[!] WILDCARD DNS DETECTED — *.{} resolves to {}. Filtering results.",
-            domain, ips.join(", ")
+            "[!] WILDCARD DNS DETECTED — *.{} resolves to {} ({}/3 probes matched). Filtering results.",
+            domain, ips.join(", "), wildcard_hits.len()
         ).yellow().bold());
         Some(ips.clone())
+    } else if wildcard_hits.len() == 1 {
+        crate::mprintln!("{}", format!(
+            "[?] Possible wildcard DNS — 1/3 probes resolved for *.{}. Not filtering (may be flaky).",
+            domain
+        ).yellow());
+        None
     } else {
         crate::mprintln!("{}", "[+] No wildcard DNS detected".green());
         None
@@ -197,7 +210,7 @@ pub async fn run(target: &str) -> Result<()> {
                     done, total,
                     found.load(Ordering::Relaxed).to_string().green()
                 );
-                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
         });
 
@@ -205,7 +218,7 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     for handle in handles {
-        if let Err(e) = handle.await { crate::meprintln!("[!] Task error: {}", e); }
+        let _ = handle.await;
     }
 
     crate::mprintln!(); // Clear progress line
@@ -239,15 +252,8 @@ pub async fn run(target: &str) -> Result<()> {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            f.write_all(format!("Subdomain Enumeration - {}\n\n{}", domain, content).as_bytes())
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-        }
+        std::fs::write(&output_path, format!("Subdomain Enumeration - {}\n\n{}", domain, content))
+            .with_context(|| format!("Failed to write results to {}", output_path))?;
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

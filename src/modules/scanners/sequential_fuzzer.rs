@@ -13,7 +13,7 @@ use crate::utils::{
     cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, normalize_target, cfg_prompt_existing_file,
     safe_read_to_string, url_encode,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use base64::{Engine as _, engine::general_purpose};
 use rand::seq::IndexedRandom;
 
@@ -158,7 +158,11 @@ pub async fn run(target: &str) -> Result<()> {
         }).await;
     }
 
-    print_banner();
+    if !crate::utils::is_batch_mode() {
+        if !crate::utils::is_batch_mode() {
+            print_banner();
+        }
+    }
 
     // Menu
     crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
@@ -189,10 +193,13 @@ pub async fn run(target: &str) -> Result<()> {
 }
 
 fn print_banner() {
-    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan());
-    crate::mprintln!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red());
-    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() { return; }
+    crate::mprintln_block!(
+        format!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan()),
+        format!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan()),
+        format!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red()),
+        format!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan())
+    );
 }
 
 // --- Setup ---
@@ -389,7 +396,7 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
                     let line = format!("[Size: {}] {}\n", res.size, res.path);
                     
                     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&file_path) {
-                        if let Err(e) = file.write_all(line.as_bytes()) { crate::meprintln!("[!] Write error: {}", e); }
+                        let _ = file.write_all(line.as_bytes());
                     }
 
                     // 2. Print Control (Real-time Output)
@@ -457,12 +464,10 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
     // We do this by attempting to acquire ALL permits.
     // This will block until all active tasks release their permits.
     crate::mprintln!("Generation done. Waiting for active tasks to complete...");
-    if let Err(e) = sem.acquire_many(config.concurrency as u32).await { crate::meprintln!("[!] Semaphore error: {}", e); }
+    let _ = sem.acquire_many(config.concurrency as u32).await;
     
     // Stop Writer
-    if let Err(e) = tx.send(WriterMessage::Stop).await {
-        crate::meprintln!("[!] Channel send error: {}", e);
-    }
+    let _ = tx.send(WriterMessage::Stop).await;
     let final_buffer = writer_handle.await?;
     
     crate::mprintln!("\n{}", "Scan Complete. Sorting results...".blue());
@@ -481,7 +486,7 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
         let mut content = String::new();
         for r in results {
             // Avoid unwrap on string write (very unlikely to fail on memory, but strictness requested)
-            if let Err(e) = writeln!(content, "[Size: {}] {}", r.size, r.path) { crate::meprintln!("[!] Write error: {}", e); }
+            let _ = writeln!(content, "[Size: {}] {}", r.size, r.path);
         }
         fs::write(&file_path, content)?;
         crate::mprintln!("Saved sorted results for status {} to {}", status, file_path.green());
@@ -555,9 +560,8 @@ async fn spawn_combinations_iterative(
                     status,
                     size,
                 };
-                if let Err(e) = tx.send(WriterMessage::Result(res)).await {
-                    crate::meprintln!("[!] Channel send error: {}", e);
-                }
+                // If receiver dropped, we just stop sending.
+                let _ = tx.send(WriterMessage::Result(res)).await;
             }
         });
         

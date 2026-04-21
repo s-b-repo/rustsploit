@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use colored::*;
+use serde::{Deserialize, Serialize};
 
 /// Module metadata — returned by optional `pub fn info() -> ModuleInfo` in modules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,36 +66,36 @@ impl std::fmt::Display for CheckResult {
 
 /// Pretty-print module info to the console.
 pub fn display_module_info(module_path: &str, info: &ModuleInfo) {
-    crate::mprintln!();
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║                       Module Information                      ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
-    crate::mprintln!();
-    crate::mprintln!("  {:<16} {}", "Path:".bold(), module_path);
-    crate::mprintln!("  {:<16} {}", "Name:".bold(), info.name);
-    crate::mprintln!("  {:<16} {}", "Rank:".bold(), format!("{}", info.rank).green());
+    println!();
+    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+    println!("{}", "║                       Module Information                      ║".cyan());
+    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    println!();
+    println!("  {:<16} {}", "Path:".bold(), module_path);
+    println!("  {:<16} {}", "Name:".bold(), info.name);
+    println!("  {:<16} {}", "Rank:".bold(), format!("{}", info.rank).green());
     if let Some(ref date) = info.disclosure_date {
-        crate::mprintln!("  {:<16} {}", "Disclosed:".bold(), date);
+        println!("  {:<16} {}", "Disclosed:".bold(), date);
     }
-    crate::mprintln!();
-    crate::mprintln!("  {}", "Description:".bold());
+    println!();
+    println!("  {}", "Description:".bold());
     for line in info.description.lines() {
-        crate::mprintln!("    {}", line);
+        println!("    {}", line);
     }
-    crate::mprintln!();
+    println!();
     if !info.authors.is_empty() {
-        crate::mprintln!("  {}", "Authors:".bold());
+        println!("  {}", "Authors:".bold());
         for author in &info.authors {
-            crate::mprintln!("    - {}", author);
+            println!("    - {}", author);
         }
-        crate::mprintln!();
+        println!();
     }
     if !info.references.is_empty() {
-        crate::mprintln!("  {}", "References:".bold());
+        println!("  {}", "References:".bold());
         for reference in &info.references {
-            crate::mprintln!("    - {}", reference);
+            println!("    - {}", reference);
         }
-        crate::mprintln!();
+        println!();
     }
 }
 

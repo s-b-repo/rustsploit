@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port,
     cfg_prompt_yes_no,
@@ -21,6 +21,7 @@ use crate::utils::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 const DEFAULT_PORT: u16 = 443;
@@ -102,7 +103,7 @@ impl ServerCertVerifier for CertCaptureVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -549,9 +550,13 @@ async fn scan_target(
 
     // TCP connect with timeout
     let addr = format!("{}:{}", host, port);
-    let tcp_stream = crate::utils::network::tcp_connect(&addr, Duration::from_secs(timeout_secs))
-        .await
-        .context("TCP connection failed")?;
+    let tcp_stream = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        TcpStream::connect(&addr),
+    )
+    .await
+    .context("TCP connection timed out")?
+    .context("TCP connection failed")?;
 
     // Build server name — for IP addresses, use the IP directly
     let server_name = ServerName::try_from(host.to_string())
@@ -634,6 +639,7 @@ async fn scan_target(
 // ============================================================
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔══════════════════════════════════════════════════════════════╗".cyan()
@@ -1031,15 +1037,8 @@ pub async fn run(target: &str) -> Result<()> {
             lines.push(String::new());
         }
 
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&output_path)
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            f.write_all(lines.join("\n").as_bytes())
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-        }
+        std::fs::write(&output_path, lines.join("\n"))
+            .with_context(|| format!("Failed to write results to {}", output_path))?;
         crate::mprintln!(
             "{}",
             format!("[+] Results saved to: {}", output_path).green()

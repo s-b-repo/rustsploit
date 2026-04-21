@@ -5,7 +5,7 @@
 //!
 //! For authorized penetration testing only.
 
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{cfg_prompt_default, cfg_prompt_required, cfg_prompt_yes_no};
 use anyhow::{anyhow, Result};
 use colored::*;
@@ -33,6 +33,7 @@ const DEFAULT_SAMPLES: usize = 3;
 const TIMING_THRESHOLD: f64 = 0.3; // 300ms difference threshold
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════════════╗".cyan()
@@ -98,8 +99,8 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         Err(_) => return None,
     };
 
-    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs))) { crate::meprintln!("[!] Socket option error: {}", e); }
-    if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs))) { crate::meprintln!("[!] Socket option error: {}", e); }
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)));
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs)));
 
     let mut sess = match Session::new() {
         Ok(s) => s,
@@ -117,7 +118,7 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         std::process::id(),
         start.elapsed().as_nanos()
     );
-    let _auth_result = sess.userauth_password(username, &invalid_password);
+    let _ = sess.userauth_password(username, &invalid_password);
 
     let elapsed = start.elapsed().as_secs_f64();
     Some(elapsed)
@@ -253,7 +254,7 @@ fn enumerate_users_blocking(
             usernames.len(),
             user
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { crate::meprintln!("[!] Flush error: {}", e); }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
 
         match sample_auth_timing(host, port, user, samples, timeout_secs) {
             Some(t) => {

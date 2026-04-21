@@ -49,13 +49,6 @@
 | `des` / `aes` / `cipher` | Cryptographic primitives |
 | `chrono` | Date/time handling |
 | `uuid` | Unique identifier generation |
-| `ratatui` | Terminal UI framework (WPair TUI) |
-| `crossterm` | Terminal backend for ratatui |
-| `btleplug` | Bluetooth Low Energy (WPair BLE) |
-| `rlimit` | Safe resource limit management |
-| `tracing` | Structured logging framework |
-| `num_cpus` | CPU core detection |
-| `gag` | Stdout capture (deprecated, replaced by mprintln!) |
 
 ---
 

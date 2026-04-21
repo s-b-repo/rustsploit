@@ -18,7 +18,7 @@ use crate::utils::{
     cfg_prompt_output_file, cfg_prompt_port, cfg_prompt_yes_no,
     load_lines, normalize_target,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     BruteforceConfig, LoginResult, SubnetScanConfig,
     run_bruteforce, run_subnet_bruteforce,
@@ -233,6 +233,7 @@ async fn try_proxy_auth(
 // ============================================================================
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "+=================================================================+".cyan());
     crate::mprintln!("{}", "|           Proxy Authentication Bruteforce                       |".cyan());
     crate::mprintln!("{}", "|   HTTP CONNECT (Basic) | SOCKS5 (RFC 1929) | HTTP Forward      |".cyan());
@@ -277,7 +278,7 @@ pub async fn run(target: &str) -> Result<()> {
                                 crate::cred_store::store_credential(
                                     &t, port, &format!("proxy-{}", proxy_type.name().to_lowercase()),
                                     user, pass, crate::cred_store::CredType::Password,
-                                    "creds/generic/proxy_bruteforce",
+                                    "creds/generic/proxy_credcheck",
                                 ).await;
                                 return Some(format!("{}\n", msg));
                             }
@@ -311,8 +312,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "proxy",
-            jitter_ms: 0,
-            source_module: "creds/generic/proxy_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/proxy_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
@@ -361,10 +362,10 @@ pub async fn run(target: &str) -> Result<()> {
             stop_on_success,
             verbose,
             delay_ms: 0,
-            jitter_ms: 0,
+            jitter_ms: 50,
             max_retries: 2,
             service_name: "proxy",
-            source_module: "creds/generic/proxy_bruteforce",
+            source_module: "creds/generic/proxy_credcheck",
         },
         combos,
         move |target: String, port: u16, user: String, pass: String| {

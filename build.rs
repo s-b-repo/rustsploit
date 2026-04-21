@@ -43,10 +43,13 @@ fn main() {
         println!("cargo:rerun-if-changed=src/modules/{}", cat);
     }
 
-    // Compile regexes once, reuse across all categories
-    let run_re = Regex::new(r"pub\s+async\s+fn\s+run\s*\(\s*[^)]*:\s*&str\s*\)").unwrap();
-    let info_re = Regex::new(r"pub\s+fn\s+info\s*\(\s*\)\s*->\s*(?:crate::)?(?:module_info::)?ModuleInfo").unwrap();
-    let check_re = Regex::new(r"pub\s+async\s+fn\s+check\s*\(\s*[^)]*:\s*&str\s*\)\s*->\s*(?:crate::)?(?:module_info::)?CheckResult").unwrap();
+    // Compile regexes once, reuse across all categories.
+    let run_re = Regex::new(r"pub\s+async\s+fn\s+run\s*\(\s*[^)]*:\s*&str\s*\)")
+        .expect("hardcoded regex must compile");
+    let info_re = Regex::new(r"pub\s+fn\s+info\s*\(\s*\)\s*->\s*(?:crate::)?(?:module_info::)?ModuleInfo")
+        .expect("hardcoded regex must compile");
+    let check_re = Regex::new(r"pub\s+async\s+fn\s+check\s*\(\s*[^)]*:\s*&str\s*\)\s*->\s*(?:crate::)?(?:module_info::)?CheckResult")
+        .expect("hardcoded regex must compile");
 
     // Generate a dispatcher for each category
     let mut registry_entries: Vec<RegistryEntry> = Vec::new();
@@ -399,9 +402,16 @@ fn generate_registry(entries: &[RegistryEntry]) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+type ModuleMapping = (String, String, ModuleCapabilities);
+
 /// Finds all valid modules recursively using WalkDir.
 /// Returns (module_key, module_path, capabilities) tuples.
-fn find_modules(root: &Path, run_re: &Regex, info_re: &Regex, check_re: &Regex) -> Result<HashSet<(String, String, ModuleCapabilities)>, Box<dyn std::error::Error>> {
+fn find_modules(
+    root: &Path,
+    run_re: &Regex,
+    info_re: &Regex,
+    check_re: &Regex,
+) -> Result<HashSet<ModuleMapping>, Box<dyn std::error::Error>> {
     let mut mappings = HashSet::new();
 
     for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
@@ -415,7 +425,6 @@ fn find_modules(root: &Path, run_re: &Regex, info_re: &Regex, check_re: &Regex) 
 
                 let mut content = String::new();
                 if File::open(path).and_then(|mut f| f.read_to_string(&mut content)).is_ok() {
-                    // Fast pre-filter: skip files that can't possibly match
                     if !content.contains("fn run") { continue; }
                     if run_re.is_match(&content) {
                         let caps = ModuleCapabilities {

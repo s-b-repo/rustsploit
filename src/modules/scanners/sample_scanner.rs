@@ -1,15 +1,16 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::Write;
 
 use std::time::{Duration, Instant};
 use crate::utils::{
     cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   HTTP Connectivity Scanner                               ║".cyan());
     crate::mprintln!("{}", "║   Checks HTTP/HTTPS reachability and response codes       ║".cyan());
@@ -165,10 +166,9 @@ pub async fn run(target: &str) -> Result<()> {
     // Save results
     if save_results && !results.is_empty() {
         let filename = cfg_prompt_output_file("output_file", "Output filename", "http_scan_results.txt").await?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&filename).context("Failed to create output file")?;
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&filename, std::fs::Permissions::from_mode(0o600)) {
-            crate::meprintln!("[!] Permission error on {}: {}", filename, e);
+        let mut file = File::create(&filename).context("Failed to create output file")?;
+        if let Err(e) = crate::utils::set_secure_permissions(&filename, 0o600) {
+            crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", filename, e);
         }
         writeln!(file, "HTTP Connectivity Scan Results")?;
         writeln!(file, "Target: {}", target)?;

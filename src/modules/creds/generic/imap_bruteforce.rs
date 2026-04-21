@@ -10,7 +10,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
+use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
     generate_combos_mode, parse_combo_mode, load_credential_file,
     run_bruteforce, run_subnet_bruteforce,
@@ -248,8 +248,8 @@ pub async fn run(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "imap",
-            jitter_ms: 0,
-            source_module: "creds/generic/imap_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/imap_credcheck",
             skip_tcp_check: false,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
@@ -392,8 +392,8 @@ pub async fn run(target: &str) -> Result<()> {
         delay_ms: 0,
         max_retries,
         service_name: "imap",
-        jitter_ms: 0,
-        source_module: "creds/generic/imap_bruteforce",
+        jitter_ms: 50,
+        source_module: "creds/generic/imap_credcheck",
     }, combos, try_login).await?;
 
     result.print_found();

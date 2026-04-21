@@ -25,38 +25,6 @@ Because it's generated at build time, there is **no manual registry drift** as l
 
 ---
 
-## Naming Convention
-
-### No Underscore Prefixes
-
-Do not use underscore prefixes on function names or variable names. All identifiers use standard Rust `snake_case` without leading underscores.
-
-```rust
-// CORRECT
-fn validate_input(data: &str) -> bool { ... }
-fn build_enriched_entry(path: &str) -> serde_json::Value { ... }
-pub async fn run(target: &str) -> Result<()> { ... }
-
-// WRONG — no leading underscores
-fn _validate_input(data: &str) -> bool { ... }
-let _unused = something();
-```
-
-### Variables Must Be Used
-
-All declared variables must be consumed. Do not use the `_` prefix on variables to suppress unused warnings. If a variable is unused, remove it or use it.
-
-```rust
-// WRONG — suppressing unused warning
-let _result = some_operation();
-
-// CORRECT — use the variable
-let result = some_operation();
-log::debug!("Result: {:?}", result);
-```
-
----
-
 ## Code Rules
 
 - **No dead code.** All code must be intentional and used. Do not leave unused functions, imports, or variables.
@@ -74,29 +42,34 @@ rustsploit/
 │   ├── main.rs               # Entry point — CLI or shell mode, input validation
 │   ├── cli.rs                # Clap-based CLI parser and dispatcher
 │   ├── shell.rs              # Interactive shell loop + UX helpers
-│   ├── api.rs                # REST API server — auth, rate limiting, hardening
+│   ├── api.rs                # REST + WebSocket API server — PQ encryption, rate limiting
+│   ├── ws.rs                 # PQ-encrypted WebSocket transport (/pq/ws)
 │   ├── config.rs             # Global config and target validation
 │   ├── module_info.rs        # ModuleInfo, CheckResult, ModuleRank types
-│   ├── global_options.rs     # Per-workspace options (setg/unsetg)
-│   ├── cred_store.rs         # Per-workspace credential store (JSON persistence)
+│   ├── global_options.rs     # Persistent global options (setg/unsetg)
+│   ├── cred_store.rs         # Credential store (JSON persistence)
 │   ├── spool.rs              # Console output logging
 │   ├── workspace.rs          # Host/service tracking + workspaces
 │   ├── loot.rs               # Loot/evidence management
 │   ├── export.rs             # JSON/CSV/summary report export
 │   ├── jobs.rs               # Background job management
+│   ├── mcp/
+│   │   ├── mod.rs            # MCP server entry point (--mcp flag)
+│   │   ├── server.rs         # JSON-RPC stdio transport with binary-safe reads
+│   │   └── tools.rs          # 38 MCP tool implementations
 │   ├── commands/
 │   │   ├── mod.rs            # Module discovery, fuzzy matching, multi-target dispatch
 │   │   ├── exploit.rs
 │   │   ├── scanner.rs
 │   │   └── creds.rs
 │   ├── modules/
-│   │   ├── exploits/         # Exploit modules (137 modules, 24 with check)
-│   │   ├── scanners/         # Scanner modules (24 modules)
-│   │   ├── creds/            # Credential modules (28 modules)
+│   │   ├── exploits/         # Exploit modules (183 modules, 21 categories)
+│   │   ├── scanners/         # Scanner modules (27 modules)
+│   │   ├── creds/            # Credential modules (29 modules)
 │   │   └── plugins/          # Plugin modules (1 module)
 │   ├── native/               # Native integrations
 │   │   ├── mod.rs
-│   │   ├── rdp.rs            # xfreerdp/rdesktop wrapper
+│   │   ├── rdp.rs            # Native RDP auth (X.224, TLS, CredSSP/NTLM)
 │   │   ├── payload_engine.rs # Payload encoding/generation
 │   │   ├── url_encoding.rs   # URL encoding utilities
 │   │   └── async_tls.rs      # Async TLS helpers
@@ -105,7 +78,8 @@ rustsploit/
 │       ├── prompt.rs         # Config-aware prompts (cfg_prompt_*)
 │       ├── sanitize.rs       # Input validation, length limits
 │       ├── target.rs         # Target normalization (IPv4/IPv6/CIDR/hostname)
-│       ├── network.rs        # Network utilities
+│       ├── network.rs        # HTTP client builders, TCP/UDP connect helpers
+│       ├── privilege.rs      # Root privilege check (require_root)
 │       └── modules.rs        # Module discovery helpers
 ├── docs/                     # This wiki
 ├── lists/                    # Wordlists and data files
@@ -181,8 +155,7 @@ The `check` shell command and `POST /api/check` endpoint run this without exploi
 Modules can auto-store discovered data:
 
 ```rust
-// Store a found credential (stored in the current workspace's credential store)
-// Credentials are isolated per workspace — switching workspaces switches the store.
+// Store a found credential
 crate::cred_store::store_credential(host, port, "ssh", username, password,
     crate::cred_store::CredType::Password, "creds/generic/ssh_bruteforce");
 
@@ -310,64 +283,3 @@ fn is_excluded_ip(ip: Ipv4Addr) -> bool { ... }
 The `EXCLUDED_RANGES` constant covers bogons, private, reserved, documentation CIDRs, and public DNS servers. Copy this pattern from an existing mass-scan module (e.g., `telnet_hose` or `hikvision_rce`).
 
 Honeypot detection is disabled in mass-scan mode to avoid interactive prompts.
-
----
-
-### MCP Tool Development
-
-Rustsploit exposes an MCP (Model Context Protocol) tool interface under `src/mcp/`. MCP tools allow AI agents to invoke framework functionality programmatically through a structured JSON-RPC protocol.
-
-**Adding an MCP tool:**
-
-1. Create a new handler in `src/mcp/` that implements the MCP tool interface.
-2. Define the tool's input schema (JSON Schema) and output format.
-3. Register the tool in the MCP tool registry so it appears in `tools/list` responses.
-4. Use the existing module dispatch system to route MCP tool calls to the appropriate exploit, scanner, or credential module.
-
-MCP tools follow the same security model as the REST API: input validation, sanitization, and rate limiting all apply. The MCP layer is a thin adapter over the existing shell command dispatch -- it does not bypass any framework security controls.
-
----
-
-### Payload Mutation Engine
-
-The payload mutation engine (`src/native/payload_engine.rs`) provides encoding, obfuscation, and transformation of payloads for AV/EDR evasion. Module authors can use it to dynamically encode payloads before delivery.
-
-**Supported encodings:**
-
-- XOR with configurable key
-- Base64 (standard and URL-safe)
-- Hex encoding
-- Zero-width Unicode steganography
-- Custom alphabet substitution
-
-**Usage in modules:**
-
-```rust
-use crate::native::payload_engine::{encode_payload, EncodingType};
-
-let encoded = encode_payload(raw_payload, EncodingType::Xor { key: 0x41 })?;
-```
-
-The engine is used by the `payload_encoder` and `narutto_dropper` exploit modules. When writing new exploit modules that deliver payloads, prefer using the mutation engine over hardcoded encoding to benefit from future encoding additions.
-
----
-
-## Mandatory Framework Rules
-
-### Network Connections
-- **TCP**: MUST use `crate::utils::network::tcp_connect()` or `tcp_connect_addr()` — never raw `TcpStream::connect`
-- **UDP**: MUST use `crate::utils::network::udp_bind()` or `blocking_udp_bind()` — never raw `UdpSocket::bind("0.0.0.0:0")`
-- **HTTP**: MUST use `crate::utils::build_http_client()` for reqwest clients (cached, connection pooling)
-- **TLS**: Use `crate::native::async_tls::make_dangerous_tls_connector()` (cached singleton)
-- **Blocking TCP**: Use `crate::utils::blocking_tcp_connect()` for SSH and other blocking protocols
-
-These utilities automatically respect `setg source_port` for firewall bypass testing.
-
-### Console Output
-- MUST use `crate::mprintln!()` / `crate::meprintln!()` — never raw `println!` / `eprintln!`
-- This ensures output is captured by the spool logging system when active
-
-### DoS Modules
-- Use `crate::native::dos_utils::FastRng` for packet randomization
-- Use `crate::native::dos_utils::checksum_16()` for IP/TCP/UDP checksums
-- Use `crate::native::dos_utils::is_spoof_enabled()` to check global `setg spoof_ip true`

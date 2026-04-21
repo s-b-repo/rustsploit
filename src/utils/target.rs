@@ -2,15 +2,16 @@
 //
 // Target normalization, IPv6/hostname validation, and IP extraction.
 
-use anyhow::{Result, anyhow, Context};
-use colored::*;
-use std::sync::LazyLock as Lazy;
-use regex::Regex;
 use std::net::ToSocketAddrs;
+
+use anyhow::{Context, Result, anyhow};
+use colored::*;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use url::Url;
 
-use super::sanitize::MAX_TARGET_LENGTH;
 use super::prompt::{prompt_default, prompt_port, prompt_yes_no};
+use super::sanitize::MAX_TARGET_LENGTH;
 
 // ============================================================
 // TARGET NORMALIZATION
@@ -212,24 +213,62 @@ pub fn normalize_target(raw: &str) -> Result<String> {
 // IPv6 / HOSTNAME VALIDATION
 // ============================================================
 
-/// Validate IPv6 address format using the standard library parser for correctness.
+/// Validate IPv6 address format (basic validation).
 fn is_valid_ipv6(addr: &str) -> bool {
     if addr.is_empty() {
         return false;
     }
-    // Use std::net::Ipv6Addr for authoritative validation — handles all edge cases
-    // including IPv4-mapped (::ffff:1.2.3.4), compressed (::1), and full addresses.
-    if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+    static IPV6_CHAR_RE: Lazy<Result<Regex, regex::Error>> =
+        Lazy::new(|| Regex::new(r"^[0-9a-fA-F:.]+$"));
+    let re = match &*IPV6_CHAR_RE {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+    if !re.is_match(addr) {
+        return false;
+    }
+    let double_colon_count = addr.matches("::").count();
+    if double_colon_count > 1 {
+        return false;
+    }
+    if addr == "::" || addr == "::1" {
         return true;
     }
-    // Fallback: allow zone ID suffixed addresses (e.g., fe80::1%eth0) which
-    // std::net doesn't accept but are valid for link-local scanning.
-    if let Some(base) = addr.split('%').next() {
-        if base.parse::<std::net::Ipv6Addr>().is_ok() {
-            return true;
+    // IPv4-mapped IPv6
+    if addr.contains('.') {
+        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+        if parts.len() == 2 {
+            let ipv4_part = parts[0];
+            let ipv4_parts: Vec<&str> = ipv4_part.split('.').collect();
+            if ipv4_parts.len() == 4 {
+                let is_valid_ipv4 = ipv4_parts.iter().all(|part| part.parse::<u8>().is_ok());
+                if is_valid_ipv4 {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    let segments: Vec<&str> = addr.split(':').collect();
+    if double_colon_count == 0 {
+        if segments.len() != 8 {
+            return false;
+        }
+    } else if segments.len() < 2 || segments.len() > 7 {
+        return false;
+    }
+    for segment in &segments {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment.len() > 4 {
+            return false;
+        }
+        if !segment.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
         }
     }
-    false
+    true
 }
 
 /// Validate hostname or IPv4 address format.

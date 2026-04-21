@@ -10,7 +10,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
     safe_read_to_string,
 };
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const METHODS: &[&str] = &[
     "GET",
@@ -151,6 +151,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 Ok(resp) => {
                     let status = resp.status();
                     let ok = status.is_success();
+                    drop(resp);
                     if ok {
                         total_success += 1;
                         if verbose {
@@ -228,6 +229,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
 }
 
 fn banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   HTTP Method Capability Scanner                             ║".cyan());
     crate::mprintln!("{}", "║   Checks support for common HTTP verbs (GET, POST, etc.)     ║".cyan());
@@ -344,16 +346,8 @@ fn write_report(path: &str, results: &[TargetResult]) -> Result<()> {
         lines.push(String::new());
     }
 
-    {
-        use std::io::Write;
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(path)
-            .with_context(|| format!("Failed to write report to {}", path))?;
-        writeln!(f, "\n--- Scan at {} ---", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-            .with_context(|| format!("Failed to write report to {}", path))?;
-        f.write_all(lines.join("\n").as_bytes())
-            .with_context(|| format!("Failed to write report to {}", path))?;
-    }
-    Ok(())
+    fs::write(path, lines.join("\n"))
+    .with_context(|| format!("Failed to write report to {}", path))
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {

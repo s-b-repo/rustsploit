@@ -2,8 +2,9 @@
 //
 // Input sanitization, validation, and shell escaping utilities.
 
-use anyhow::{Result, anyhow};
 use std::path::Path;
+
+use anyhow::{Result, anyhow};
 use url::Url;
 
 /// Maximum length for command inputs to prevent DoS
@@ -182,7 +183,7 @@ pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<Strin
 
 /// Escapes shell metacharacters in a command string.
 pub fn escape_shell_command(cmd: &str) -> String {
-    let mut escaped = String::with_capacity(cmd.len() * 2);
+    let mut escaped = String::with_capacity(cmd.len().saturating_mul(2));
     for ch in cmd.chars() {
         match ch {
             '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | '*' | '?' | '~' | '!' | '#' => {
@@ -204,7 +205,7 @@ pub fn escape_shell_command(cmd: &str) -> String {
 
 /// Escapes command for JavaScript/Node.js execSync context.
 pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
-    let mut escaped = String::with_capacity(cmd.len() * 2);
+    let mut escaped = String::with_capacity(cmd.len().saturating_mul(2));
     for ch in cmd.chars() {
         match ch {
             '\\' => escaped.push_str("\\\\"),

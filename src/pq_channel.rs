@@ -3,20 +3,22 @@
 //! SSH-style identity model with ML-KEM-768 + X25519 hybrid encryption.
 //! This is the SOLE transport security — no TLS, no API keys.
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
-use ml_kem::{EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use kem::Encapsulate;
+use ml_kem::{EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use sha2::{Sha256, Sha512};
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::RwLock;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 const PROTOCOL_VERSION: &str = "pqxdh-v2-identity";
 const HKDF_SALT_HANDSHAKE: &[u8] = b"ArcticAlopex-PQXDH-v2";
@@ -77,11 +79,15 @@ impl HostIdentity {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&data)?)?;
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut file = opts.open(&tmp)?;
+            std::io::Write::write_all(&mut file, serde_json::to_string_pretty(&data)?.as_bytes())?;
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -150,9 +156,9 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<ClientPublicIdent
 pub struct PqSession {
     pub session_id: [u8; 16],
     pub client_name: String,
-    pub root_key: Vec<u8>,
-    pub send_chain_key: Vec<u8>,
-    pub recv_chain_key: Vec<u8>,
+    pub root_key: Zeroizing<Vec<u8>>,
+    pub send_chain_key: Zeroizing<Vec<u8>>,
+    pub recv_chain_key: Zeroizing<Vec<u8>>,
     pub send_counter: u64,
     pub recv_counter: u64,
     pub my_x25519_secret: StaticSecret,
@@ -160,6 +166,7 @@ pub struct PqSession {
     pub their_x25519_public: PublicKey,
     pub rekey_after: u64,
     pub created_at: Instant,
+    pub last_activity: Instant,
     pub epoch: u64,
 }
 
@@ -242,13 +249,13 @@ pub fn process_handshake(
         .map_err(|_| anyhow::anyhow!("ML-KEM encapsulation failed"))?;
 
     // Combine 3 shared secrets
-    let mut ikm = Vec::with_capacity(96);
+    let mut ikm = Zeroizing::new(Vec::with_capacity(96));
     ikm.extend_from_slice(ss_eph.as_bytes());
     ikm.extend_from_slice(ss_id.as_bytes());
     ikm.extend_from_slice(ss_mlkem.as_ref());
 
     let hk = Hkdf::<Sha512>::new(Some(HKDF_SALT_HANDSHAKE), &ikm);
-    let mut root_key = vec![0u8; 64];
+    let mut root_key = Zeroizing::new(vec![0u8; 64]);
     hk.expand(instance_id.as_bytes(), &mut root_key)
         .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
 
@@ -284,6 +291,7 @@ pub fn process_handshake(
         their_x25519_public: PublicKey::from(client_eph_arr),
         rekey_after: DEFAULT_REKEY_AFTER,
         created_at: Instant::now(),
+        last_activity: Instant::now(),
         epoch: 0,
     };
 
@@ -308,32 +316,34 @@ pub fn process_handshake(
 // Double Ratchet
 // ---------------------------------------------------------------------------
 
-fn derive_chain_key(root_key: &[u8], label: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn derive_chain_key(root_key: &[u8], label: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let hk = Hkdf::<Sha256>::new(None, root_key);
-    let mut out = vec![0u8; 32];
+    let mut out = Zeroizing::new(vec![0u8; 32]);
     hk.expand(label, &mut out).map_err(|_| anyhow::anyhow!("HKDF chain key failed"))?;
     Ok(out)
 }
 
-fn ratchet_step(chain_key: &[u8], counter: u64) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+fn ratchet_step(chain_key: &[u8], counter: u64) -> anyhow::Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     let info = format!("msg:{counter}");
     let hk = Hkdf::<Sha256>::new(None, chain_key);
-    let mut derived = vec![0u8; 64];
+    let mut derived = Zeroizing::new(vec![0u8; 64]);
     hk.expand(info.as_bytes(), &mut derived)
         .map_err(|_| anyhow::anyhow!("HKDF ratchet step failed"))?;
-    Ok((derived[..32].to_vec(), derived[32..64].to_vec()))
+    let new_chain = Zeroizing::new(derived[..32].to_vec());
+    let msg_key = derived[32..64].to_vec();
+    Ok((new_chain, msg_key))
 }
 
 fn dh_ratchet(session: &mut PqSession, their_new_pub: PublicKey) -> anyhow::Result<()> {
     let new_secret = StaticSecret::random_from_rng(rand_core::OsRng);
     let new_public = PublicKey::from(&new_secret);
     let dh = new_secret.diffie_hellman(&their_new_pub);
-    let mut ikm = Vec::with_capacity(32 + session.root_key.len());
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 + session.root_key.len()));
     ikm.extend_from_slice(dh.as_bytes());
     ikm.extend_from_slice(&session.root_key);
     let info = format!("{}:{}", hex::encode(session.session_id), session.epoch);
     let hk = Hkdf::<Sha512>::new(Some(HKDF_SALT_RATCHET), &ikm);
-    let mut new_root = vec![0u8; 64];
+    let mut new_root = Zeroizing::new(vec![0u8; 64]);
     hk.expand(info.as_bytes(), &mut new_root).map_err(|_| anyhow::anyhow!("HKDF DH ratchet failed"))?;
     session.send_chain_key = derive_chain_key(&new_root, b"send")?;
     session.recv_chain_key = derive_chain_key(&new_root, b"recv")?;
@@ -361,6 +371,7 @@ pub fn decrypt_request(
     let (new_chain, msg_key) = ratchet_step(&session.recv_chain_key, session.recv_counter)?;
     session.recv_chain_key = new_chain;
     session.recv_counter += 1;
+    session.last_activity = Instant::now();
     let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     cipher.decrypt(Nonce::from_slice(nonce_bytes), Payload { msg: ciphertext, aad })
@@ -376,14 +387,80 @@ pub fn encrypt_response(
     let (new_chain, msg_key) = ratchet_step(&session.send_chain_key, session.send_counter)?;
     session.send_chain_key = new_chain;
     session.send_counter += 1;
+    session.last_activity = Instant::now();
     let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
-    // Derive deterministic nonce from epoch + counter to eliminate birthday collision risk.
-    // Format: [4 bytes: epoch LE][8 bytes: counter LE] — unique per message per session.
     let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[..4].copy_from_slice(&(session.epoch as u32).to_le_bytes());
-    nonce_bytes[4..].copy_from_slice(&(session.send_counter - 1).to_le_bytes());
+    { use rand::RngExt; rand::rng().fill(&mut nonce_bytes); }
     let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: plaintext, aad })
         .map_err(|e| anyhow::anyhow!("PQ encrypt failed: {e}"))?;
     Ok((ct, nonce_bytes, rekey_pub))
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket Sub-Session
+// ---------------------------------------------------------------------------
+
+pub struct WsSubSession {
+    pub session_id: [u8; 16],
+    pub send_chain_key: Zeroizing<Vec<u8>>,
+    pub recv_chain_key: Zeroizing<Vec<u8>>,
+    pub send_counter: u64,
+    pub recv_counter: u64,
+    pub epoch: u64,
+}
+
+pub fn derive_ws_subsession(session: &PqSession) -> anyhow::Result<WsSubSession> {
+    let hk = Hkdf::<Sha256>::new(Some(b"ArcticAlopex-ws-v1"), &session.root_key);
+    let mut ws_root = Zeroizing::new(vec![0u8; 64]);
+    hk.expand(b"ws-channel", &mut ws_root)
+        .map_err(|_| anyhow::anyhow!("HKDF WS sub-session derivation failed"))?;
+    let send_chain = derive_chain_key(&ws_root, b"ws-s2c")?;
+    let recv_chain = derive_chain_key(&ws_root, b"ws-c2s")?;
+    Ok(WsSubSession {
+        session_id: session.session_id,
+        send_chain_key: send_chain,
+        recv_chain_key: recv_chain,
+        send_counter: 0,
+        recv_counter: 0,
+        epoch: 0,
+    })
+}
+
+pub fn encrypt_ws_frame(sub: &mut WsSubSession, plaintext: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let (new_chain, msg_key) = ratchet_step(&sub.send_chain_key, sub.send_counter)?;
+    sub.send_chain_key = new_chain;
+    sub.send_counter += 1;
+    let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+    if sub.epoch > u32::MAX as u64 {
+        anyhow::bail!("WS sub-session epoch exhausted");
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[..4].copy_from_slice(&(sub.epoch as u32).to_le_bytes());
+    nonce_bytes[4..].copy_from_slice(&(sub.send_counter - 1).to_le_bytes());
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: plaintext, aad })
+        .map_err(|e| anyhow::anyhow!("WS encrypt failed: {e}"))?;
+    let mut frame = Vec::with_capacity(12 + ct.len());
+    frame.extend_from_slice(&nonce_bytes);
+    frame.extend_from_slice(&ct);
+    Ok(frame)
+}
+
+pub fn decrypt_ws_frame(sub: &mut WsSubSession, frame: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if frame.len() < 12 {
+        anyhow::bail!("WS frame too short (need at least 12 bytes for nonce)");
+    }
+    let nonce_bytes: [u8; 12] = frame[..12].try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid nonce slice"))?;
+    let ciphertext = &frame[12..];
+    let (candidate_chain, msg_key) = ratchet_step(&sub.recv_chain_key, sub.recv_counter)?;
+    let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: ciphertext, aad })
+        .map_err(|e| anyhow::anyhow!("WS decrypt failed: {e}"))?;
+    sub.recv_chain_key = candidate_chain;
+    sub.recv_counter += 1;
+    Ok(plaintext)
 }

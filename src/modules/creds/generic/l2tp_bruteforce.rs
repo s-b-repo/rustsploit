@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use colored::*;
 use std::{io::Write, net::UdpSocket, time::Duration};
 
-use crate::modules::creds::utils::{
+use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
     is_mass_scan_target, is_subnet_target, run_bruteforce, run_mass_scan,
     run_subnet_bruteforce, BruteforceConfig, LoginResult, MassScanConfig, SubnetScanConfig,
@@ -44,6 +44,7 @@ const CHAP_SUCCESS: u8 = 3;
 const CHAP_FAILURE: u8 = 4;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -508,8 +509,8 @@ pub async fn run(target: &str) -> Result<()> {
             delay_ms: 0,
             max_retries: 2,
             service_name: "l2tp",
-            jitter_ms: 0,
-            source_module: "creds/generic/l2tp_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/l2tp_credcheck",
         },
         combos,
         try_login,
@@ -635,8 +636,8 @@ async fn run_l2tp_subnet_scan(target: &str) -> Result<()> {
             verbose,
             output_file,
             service_name: "l2tp",
-            jitter_ms: 0,
-            source_module: "creds/generic/l2tp_bruteforce",
+            jitter_ms: 50,
+            source_module: "creds/generic/l2tp_credcheck",
             skip_tcp_check: true, // L2TP is UDP — no TCP pre-check
         },
         move |ip: std::net::IpAddr, port: u16, user: String, pass: String| {
@@ -808,7 +809,7 @@ fn try_l2tp_login_sync(
     for _ in 0..5 {
         match session.recv_packet(timeout) {
             Ok(pkt) => {
-                if !pkt.is_control && pkt.payload.len() > 4 {
+                if !pkt.is_control && !pkt.payload.is_empty() {
                     if pkt.payload.len() < 3 { continue; }
                     let mut offset = 0;
                     if pkt.payload[0] == 0xFF && pkt.payload[1] == 0x03 {

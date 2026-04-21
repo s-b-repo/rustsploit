@@ -3,14 +3,15 @@ use suppaftp::tokio::AsyncFtpStream;
 use colored::*;
 use ssh2::Session;
 use telnet::{Telnet, Event};
-use std::time::Duration;
+use std::{net::TcpStream, time::Duration};
 use tokio::{join, task};
 use crate::utils::url_encode;
-use crate::modules::creds::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 fn display_banner() {
+    if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   ACTi Camera Default Credentials Checker                 ║".cyan());
     crate::mprintln!("{}", "║   Multi-Protocol Scanner (FTP/SSH/Telnet/HTTP)            ║".cyan());
@@ -72,7 +73,7 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
                     crate::mprintln!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
-                    if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
+                    let _ = ftp.quit().await;
                     let result = Some((ServiceType::Ftp, username.to_string(), password.to_string()));
                     // Respect stop_on_success: if true, stop after first valid credential
                     if config.stop_on_success {
@@ -81,7 +82,7 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
                     // If false, continue checking but still return first found (for consistency)
                     return Ok(result);
                 }
-                if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
+                let _ = ftp.quit().await;
             }
             Err(_) => continue,
         }
@@ -105,7 +106,7 @@ pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String
             Ok(sa) => sa,
             Err(_) => continue,
         };
-        if let Ok(stream) = crate::utils::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+        if let Ok(stream) = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
             let mut session = Session::new().context("Failed to create SSH session")?;
             session.set_tcp_stream(stream);
             session.handshake().context("SSH handshake failed")?;
@@ -139,8 +140,8 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
         let port: u16 = parts[0].parse().unwrap_or(23);
 
         if let Ok(mut telnet) = Telnet::connect((host, port), 500) {
-            if let Err(e) = telnet.write(format!("{}\r\n", username).as_bytes()) { crate::meprintln!("[!] Telnet write error: {}", e); }
-            if let Err(e) = telnet.write(format!("{}\r\n", password).as_bytes()) { crate::meprintln!("[!] Telnet write error: {}", e); }
+            let _ = telnet.write(format!("{}\r\n", username).as_bytes());
+            let _ = telnet.write(format!("{}\r\n", password).as_bytes());
 
             // Give device time to respond
             std::thread::sleep(Duration::from_millis(500));
@@ -317,14 +318,11 @@ pub async fn run(target: &str) -> Result<()> {
                 "HTTP" => (80, "http"),
                 _ => (0, "unknown"),
             };
-            {
-                let id = crate::cred_store::store_credential(
-                    target, svc_port, svc_name, user, pass,
-                    crate::cred_store::CredType::Password,
-                    "creds/camera/acti/acti_camera_default",
-                ).await;
-                if id.is_empty() { crate::meprintln!("[!] Failed to store credential"); }
-            }
+            let _ = crate::cred_store::store_credential(
+                target, svc_port, svc_name, user, pass,
+                crate::cred_store::CredType::Password,
+                "creds/camera/acti/acti_camera_default",
+            ).await;
         }
     } else {
         crate::mprintln!();

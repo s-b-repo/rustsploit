@@ -106,81 +106,57 @@ loop {
 
 When reading files:
 1. Validate path does not contain `..`
-2. Open with `O_NOFOLLOW` to atomically reject symlinks (prevents TOCTOU)
-3. Resolve canonical path via `/proc/self/fd/N` on the open file descriptor
-4. Check file size before reading (ref: `MAX_FILE_SIZE`)
-5. Use `Read::take()` to cap memory usage at IO level
-
-When writing files (spool, export):
-1. Validate filename (no traversal, no absolute paths, no symlinks)
-2. Open with `O_NOFOLLOW` via `custom_flags(libc::O_NOFOLLOW)` on `OpenOptions`
-3. Write to temp file, then atomic rename
-
-### 8. SSRF Protection
-
-The `is_blocked_target()` function blocks cloud metadata and internal endpoints:
-- Parses target as `std::net::IpAddr` (handles IPv4, IPv6, mapped addresses)
-- Blocks: `169.254.0.0/16` (link-local), `168.63.129.16` (Azure), `100.100.100.200` (Alibaba), `fd00:ec2::*` (AWS IPv6)
-- Hostname check: `metadata.google.internal`
-- Applied to: `run_module`, `run_all` (per-IP), `check_module`, `honeypot_check`, shell `run`/`run_all`/`check`
-
-### 9. CIDR Size Limits
-
-`run_all` rejects subnets that would cause resource exhaustion:
-- IPv4: minimum /16 (65,536 hosts max)
-- IPv6: minimum /48
-
-### 10. SQL LIKE Escaping (ArcticAlopex)
-
-All `like()` queries escape user input with `escapeLike()`:
-```typescript
-function escapeLike(v: string): string {
-  return v.replace(/[%_\\]/g, (ch) => `\\${ch}`);
-}
-```
-
-### 11. ACL Shell Command Gating (ArcticAlopex)
-
-Shell commands are normalized before ACL matching:
-```typescript
-const cmd = command.trim().toLowerCase().replace(/\s+/g, " ");
-```
-This prevents whitespace-padding bypasses like `loot  delete`.
-
-**Per-account login lockout:** In addition to IP-based rate limiting, a per-account lockout is enforced: 10 failed login attempts trigger a 30-minute lock on the account.
-
-**Module restrictions enforcement:** The ACL `resolve()` engine now receives `role_module_restrictions` loaded from the database. Previously, an empty array was always passed, effectively bypassing module-level restrictions for all roles.
+2. Use `canonicalize()` to resolve the real path
+3. Check file size before reading (ref: `MAX_FILE_SIZE`)
+4. Skip symlinks for security
 
 ---
 
-## API Security (Rustsploit Backend)
+## API Security
 
 The API server (`api.rs`) implements:
 
-- **Post-quantum encryption** — ML-KEM-768 + X25519 hybrid, ChaCha20-Poly1305 AEAD, Double Ratchet forward secrecy
 - **`RequestBodyLimitLayer`** — prevents DoS via oversized payloads (1 MB max)
-- **SSRF protection** — `is_blocked_target()` with IP parsing on all execution endpoints
-- **CIDR limits** — rejects prefixes below /16 IPv4, /48 IPv6
-- **Shell metacharacter blocking** — `contains_shell_metacharacters()` on all shell commands
-- **Module name validation** — alphanumeric + `/` `_` `-` only, max 256 chars
-- **File read cap** — `Read::take(1MB)` prevents OOM on large result files
-- **Epoch monotonicity** — PQ session rejects replayed messages from older epochs
-- **Counter-based nonces** — deterministic nonces derived from `[epoch|counter]`, no birthday risk
+- **Rate limiting** — 3 failed auth attempts → 30 s block per IP
+- **Auto-cleanup** — old entries purged at 100,000 entries
+- **IP tracking + key rotation** — suspicious activity triggers auto-rotation in hardening mode
+- **Secure defaults** — by default, considers `127.0.0.1` as the intended private bind
+- **WebSocket limits** — max 100 concurrent connections, 1 MiB frame cap, 30s heartbeat
 
-## API Security (ArcticAlopex Frontend)
+---
 
-The frontend proxy (`rsf-proxy.ts`, `rsf/[...path]/route.ts`) implements:
+## MCP Server Security
 
-- **RBAC enforcement** — every RSF command re-gated against user's role permissions
-- **Per-tenant mutex** — serializes write operations to prevent race conditions
-- **Input validation** — module names and targets validated before shell command construction
-- **Error propagation** — RSF backend errors (401, 500) surfaced to UI instead of silent success
-- **Rate limiting** — per-user, Redis-backed, 30 module executions per minute
-- **Rate limiting (auth)** — per-IP with second-to-last XFF extraction, 50K entry hard cap, stale cleanup
-- **Session security** — HttpOnly, Secure, SameSite=Strict cookies, 8-hour TTL
-- **CSRF protection** — SameSite=Strict prevents cross-origin requests
-- **SQL injection** — Drizzle ORM parameterized queries + LIKE wildcard escaping
-- **TOTP 2FA** — Optional Argon2id + TOTP, secret never exposed in API responses. TOTP secrets are encrypted at rest with AES-256-GCM via MASTER_KEY before DB storage.
+The MCP server (`mcp/server.rs`) implements:
+
+- **`isolate_protocol_stdout()`** — redirects fd 1 to /dev/null so module `println!` cannot corrupt the JSON-RPC stream
+- **`MAX_LINE_BYTES`** — 1 MiB cap on incoming lines to prevent memory exhaustion
+- **Binary-safe reads** — uses `read_until()` instead of `read_line()` for no UTF-8 requirement
+- **Non-UTF-8 error handling** — returns proper JSON-RPC error responses for malformed input
+
+---
+
+## Spool Security
+
+The spool system (`spool.rs`) implements:
+
+- **`O_NOFOLLOW`** — prevents TOCTOU race conditions on symlinked spool files
+- **Parent symlink check** — rejects spool paths with symlinked parent directories
+- **Lock-first pattern** — acquires write lock before creating files to prevent orphaned files
+- **`write_line()` returns `Result`** — callers handle write failures instead of silently dropping output
+
+---
+
+## Privilege Checks
+
+Modules requiring raw sockets call `require_root()` at startup:
+
+```rust
+use crate::utils::privilege::require_root;
+require_root("ICMP raw socket")?;
+```
+
+Returns a descriptive error with the current euid instead of a cryptic "permission denied" from the socket layer. Used by DoS modules, ping sweep, and raw packet scanners.
 
 ---
 
@@ -231,40 +207,12 @@ All persistent data uses atomic write-to-temp-then-rename to prevent corruption:
 
 | File | Purpose | Sensitivity |
 |------|---------|-------------|
-| `~/.rustsploit/workspaces/{name}_options.json` | Per-workspace options | Low — user preferences |
-| `~/.rustsploit/workspaces/{name}_creds.json` | Per-workspace credential store | **High — contains passwords/hashes** |
+| `~/.rustsploit/global_options.json` | Global options (setg) | Low — user preferences |
+| `~/.rustsploit/creds.json` | Discovered credentials | **High — contains passwords/hashes** |
 | `~/.rustsploit/workspaces/<name>.json` | Hosts, services, notes | Medium — engagement data |
 | `~/.rustsploit/loot_index.json` | Loot metadata | Medium |
 | `~/.rustsploit/loot/` | Loot files | **High — may contain sensitive data** |
 | `~/.rustsploit/results/` | Module output files | Medium |
 | `~/.rustsploit/history.txt` | Shell command history | Medium |
-| `~/.rustsploit/logs/rustsploit.*.log` | Daily rolling log files | Low — operational logs |
 
 **Important:** The `creds.json` and `loot/` files may contain sensitive data. Protect `~/.rustsploit/` with appropriate file permissions (e.g., `chmod 700`).
-
----
-
-## Cloud Metadata SSRF Protection
-
-The API server (`api.rs`) blocks requests targeting cloud metadata endpoints to prevent SSRF attacks:
-
-| Blocked Target | Cloud Provider |
-|----------------|---------------|
-| `169.254.169.254` | AWS / GCP / Azure metadata |
-| `metadata.google.internal` | GCP metadata |
-| `100.100.100.200` | Alibaba Cloud metadata |
-
-These checks apply to all module execution requests (`POST /api/run`) and target-setting operations. Requests targeting these addresses are rejected before any module code executes.
-
----
-
-## MCP Input Validation
-
-The MCP server (`src/mcp/`) applies the same validation rules as the REST API:
-
-- **Tool parameters** are validated before dispatch. Missing required fields return a JSON-RPC error (`-32602 Invalid params`).
-- **Target injection prevention**: The `run_module` tool strips any `target` key from the `prompts` object to prevent prompt-injection SSRF bypass. The target is only accepted from the top-level `target` parameter.
-- **Module path validation**: Module paths are checked against the build-time discovered module list before execution.
-- **Credential redaction**: The `rustsploit:///credentials` resource redacts secrets (first 3 characters + `***`) to prevent accidental exposure through MCP resource reads.
-- **No file system access**: MCP tools do not expose direct file read/write operations. Export data is returned inline as JSON, not written to disk.
-- **Rate limiting**: MCP runs over stdio (single client), so no per-IP rate limiting is needed. Concurrency is bounded by the framework's semaphore (CPU count, min 4).

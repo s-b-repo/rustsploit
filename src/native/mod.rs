@@ -5,4 +5,3 @@ pub mod payload_engine;
 pub mod hex;
 pub mod url_encoding;
 pub mod async_tls;
-pub mod dos_utils;

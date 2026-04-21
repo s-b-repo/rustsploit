@@ -1,7 +1,8 @@
-use anyhow::{Result, Context};
-use serde::Serialize;
-use colored::*;
 use std::io::Write;
+
+use anyhow::{Context, Result};
+use colored::*;
+use serde::Serialize;
 
 /// Write data to a file, rejecting symlinks atomically with O_NOFOLLOW.
 fn safe_write(path: &str, data: &[u8]) -> Result<()> {
@@ -194,8 +195,6 @@ pub async fn export_summary(path: &str) -> Result<()> {
 
 fn csv_escape(s: &str) -> String {
     let mut val = s.to_string();
-    // Prevent CSV injection — prefix formula-triggering characters and always
-    // quote the result so parsers treat the prefix as literal text.
     let needs_formula_guard = val.starts_with('=')
         || val.starts_with('+')
         || val.starts_with('@')
@@ -219,11 +218,9 @@ pub fn validate_export_path(path: &str) -> Result<()> {
     if path.contains("..") || path.contains('\0') {
         return Err(anyhow::anyhow!("Path traversal not allowed in export path"));
     }
-    // Reject absolute paths and any directory separators — basename only
     if path.starts_with('/') || path.starts_with('\\') || path.contains('/') || path.contains('\\') {
         return Err(anyhow::anyhow!("Only filenames are allowed for export (no directory separators). Use a relative filename like 'report.json'."));
     }
-    // Reject hidden files
     if path.starts_with('.') {
         return Err(anyhow::anyhow!("Hidden files not allowed for export"));
     }

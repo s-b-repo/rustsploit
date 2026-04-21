@@ -1,6 +1,7 @@
-use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use anyhow::{anyhow, Result};
 use ipnetwork::IpNetwork;
 use regex::Regex;
 
@@ -73,6 +74,12 @@ impl GlobalConfig {
             let canonical = path.canonicalize()
                 .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", trimmed, e))?;
             let canonical_str = canonical.to_string_lossy().to_string();
+            if canonical_str.len() > MAX_TARGET_LENGTH {
+                return Err(anyhow!(
+                    "Canonical path too long (max {} characters)",
+                    MAX_TARGET_LENGTH
+                ));
+            }
             let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
             *target_guard = Some(TargetConfig::Single(canonical_str));
             return Ok(());
@@ -97,32 +104,22 @@ impl GlobalConfig {
                 // Single target after parsing — recurse without comma
                 return self.set_target(&targets[0]);
             }
-            // Validate each individual target, canonicalizing file paths
+            // Validate each individual target
             const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
-            let mut validated_targets = Vec::with_capacity(targets.len());
             for t in &targets {
                 // Allow mass scan keywords, CIDRs, file paths, and hostnames/IPs
                 if MASS_SCAN_KEYWORDS.contains(&t.as_str()) {
-                    validated_targets.push(t.clone());
                     continue;
                 }
-                let path = std::path::Path::new(t.as_str());
-                if path.exists() && path.is_file() {
-                    // Canonicalize file paths to prevent traversal
-                    let canonical = path.canonicalize()
-                        .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", t, e))?;
-                    validated_targets.push(canonical.to_string_lossy().to_string());
+                if std::path::Path::new(t.as_str()).is_file() {
                     continue;
                 }
-                if t.parse::<IpNetwork>().is_ok() {
-                    validated_targets.push(t.clone());
-                    continue;
+                if t.parse::<IpNetwork>().is_err() {
+                    Self::validate_hostname_or_ip(t)?;
                 }
-                Self::validate_hostname_or_ip(t)?;
-                validated_targets.push(t.clone());
             }
             let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
-            *target_guard = Some(TargetConfig::Multi(validated_targets));
+            *target_guard = Some(TargetConfig::Multi(targets));
             return Ok(());
         }
 
@@ -156,7 +153,7 @@ impl GlobalConfig {
         
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
-        static VALID_CHARS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        static VALID_CHARS: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
             Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("hardcoded regex must compile")
         });
         let valid_chars = &*VALID_CHARS;
@@ -206,15 +203,6 @@ impl GlobalConfig {
     /// Check if global target is a subnet
     pub fn is_subnet(&self) -> bool {
         self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)) | Some(TargetConfig::Multi(_)))).unwrap_or(false)
-    }
-
-    /// Get the target subnet if set
-    pub fn get_target_subnet(&self) -> Option<IpNetwork> {
-        let guard = self.target.read().ok()?;
-        match guard.as_ref() {
-            Some(TargetConfig::Subnet(net)) => Some(*net),
-            _ => None,
-        }
     }
 
     /// Get the size of the target (number of IPs)
@@ -270,86 +258,48 @@ impl GlobalConfig {
 }
 
 /// Global configuration instance
-use std::sync::LazyLock as Lazy;
+use once_cell::sync::Lazy;
 
 pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new());
 
-/// Module-level configuration for API-driven execution.
-/// Set by the API before running a module; modules read values via `cfg_prompt_*`
-/// instead of prompting the user interactively.
+/// Module-level configuration for API-driven execution
+/// This is set by the API before running a module and read by modules
+/// to get pre-configured values instead of prompting the user
 ///
 /// # Unified Prompt Keys
 ///
-/// Supply these in the JSON `"prompts"` object of an API `/api/run` request,
-/// or use the dedicated top-level fields (`port`, `concurrency`, etc.).
+/// These are the standardized `custom_prompts` keys used across all
+/// scanner modules (via `cfg_prompt_*` in utils.rs). Supply them in the
+/// JSON `"prompts"` object of an API `/api/run` request.
 ///
 /// ## Common Keys (used by many modules)
-/// | Key                 | Type   | Description                                      |
-/// |---------------------|--------|--------------------------------------------------|
-/// | `port`              | u16    | Target service port (dedicated field)             |
-/// | `timeout`           | int    | Connection/request timeout (seconds or ms)        |
-/// | `verbose`           | y/n    | Verbose output (dedicated field)                  |
-/// | `save_results`      | y/n    | Save results to file (dedicated field)            |
-/// | `output_file`       | string | Output filename for results (dedicated field)     |
-/// | `concurrency`       | int    | Concurrent threads/tasks (dedicated field)        |
-/// | `threads`           | int    | Alias for concurrency (some modules)              |
-/// | `username_wordlist` | path   | Path to username wordlist (dedicated field)       |
-/// | `password_wordlist` | path   | Path to password wordlist (dedicated field)       |
-/// | `stop_on_success`   | y/n    | Stop on first success (dedicated field)           |
-/// | `combo_mode`        | string | "linear"/"combo"/"spray" (dedicated field)        |
-/// | `mode`              | string | Operation mode selector (1, 2, 3, etc.)           |
-/// | `target_file`       | path   | Path to file containing targets                   |
-/// | `wordlist`          | path   | Path to wordlist file (scanners)                  |
-///
-/// ## Credential Module Keys (creds/generic/*)
-///
-/// All bruteforce modules share: `port`, `username_wordlist`, `password_wordlist`,
-/// `concurrency`, `timeout`, `verbose`, `save_results`, `output_file`, `combo_mode`,
-/// `stop_on_success`, `cred_file` (y/n), `cred_file_path`.
-///
-/// Module-specific additions:
-/// - **ssh_bruteforce**: `use_defaults`, `use_username_wordlist`, `use_password_wordlist`,
-///   `max_retries`, `retry_on_error`, `save_unknown_responses`
-/// - **ssh_spray**: `password` (R), `targets_file`, `username_file`, `usernames`,
-///   `ssh_port`, `additional_targets`, `load_targets_file`, `load_usernames_file`
-/// - **ssh_user_enum**: `username_file` (R), `ssh_port`, `additional_targets`
-/// - **mqtt_bruteforce**: `client_id`, `use_tls`
-/// - **ftp_bruteforce**: `delay_ms`, `max_retries`, `use_defaults`
-/// - **smtp_bruteforce**: `delay_ms`, `use_tls`
-/// - **snmp_bruteforce**: `community_wordlist`, `version` (snmpv1/v2c/v3)
-/// - **rdp_bruteforce**: `domain`
-/// - **rtsp_bruteforce**: `paths_file`, `headers_file`, `use_custom_headers`
-/// - **http_basic_bruteforce**: `url_path`, `use_tls`, `max_retries`,
-///   `use_defaults`, `use_username_wordlist`, `use_password_wordlist`
-/// - **pop3_bruteforce**: `use_tls`, `delay_ms`, `max_retries`
-/// - **imap_bruteforce**: `use_tls`, `max_retries`
-/// - **l2tp_bruteforce**: `ipsec_psk`, `use_ipsec`
-/// - **proxy_bruteforce**: `proxy_type`
-/// - **telnet_bruteforce**: `login_prompt`, `password_prompt`, `success_pattern`
-/// - **telnet_hose**: `command`, `delay_ms`
-/// - **camxploit**: (mass scan, uses creds/utils shared runner)
-/// - **fortinet_bruteforce**: `vpn_realm`
-/// - **redis_bruteforce**: `use_acl`, `max_retries`
-/// - **vnc_bruteforce**: (password-only, no username_wordlist)
-/// - **memcached_bruteforce**: `use_sasl`
+/// | Key               | Type   | Description                                    |
+/// |-------------------|--------|------------------------------------------------|
+/// | `port`            | u16    | Target service port                            |
+/// | `timeout`         | int    | Connection/request timeout (seconds or ms)     |
+/// | `verbose`         | y/n    | Verbose output                                 |
+/// | `save_results`    | y/n    | Save results to file                           |
+/// | `output_file`     | string | Output filename for results                    |
+/// | `concurrency`     | int    | Number of concurrent threads/tasks             |
+/// | `threads`         | int    | Alias for concurrency (some modules)           |
+/// | `wordlist`        | path   | Path to wordlist file                          |
+/// | `target_file`     | path   | Path to file containing targets                |
+/// | `additional_targets` | string | Comma-separated additional targets           |
+/// | `mode`            | string | Operation mode selector (1, 2, 3, etc.)        |
 ///
 /// ## Scanner-Specific Keys
 ///
 /// ### Port Scanner (`scanners/port_scanner`)
-/// `port_range`, `port_start`, `port_end`, `scan_method`, `show_only_open`,
-/// `ttl`, `source_port`, `data_length`
+/// `port_range`, `scan_method`, `show_only_open`, `ttl`, `source_port`, `data_length`
 ///
 /// ### SSH Scanner (`scanners/ssh_scanner`)
 /// `load_from_file`, `target_file`
-///
-/// ### Banner Grabber (`scanners/banner_grabber`)
-/// `port`, `target_file`, `additional_targets`
 ///
 /// ### DNS Recursion (`scanners/dns_recursion`)
 /// `domain`, `record_type`
 ///
 /// ### SMTP User Enum (`scanners/smtp_user_enum`)
-/// `threads`, `timeout_ms`, `save_valid`, `valid_output`, `save_unknown`, `unknown_output`
+/// `timeout_ms`, `save_valid`, `valid_output`, `save_unknown`, `unknown_output`
 ///
 /// ### Ping Sweep (`scanners/ping_sweep`)
 /// `add_manual_targets`, `manual_target`, `load_from_file`, `save_up_hosts`,
@@ -364,7 +314,7 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 ///
 /// ### Dir Brute (`scanners/dir_brute`)
 /// `scan_mode`, `delay_ms`, `random_agent`, `custom_cookies`, `cookies`,
-/// `use_https`, `base_path`, `template_name`, `template_file`, `sort_by`, `wordlist`
+/// `use_https`, `base_path`, `template_name`, `template_file`, `sort_by`
 ///
 /// ### Sequential Fuzzer (`scanners/sequential_fuzzer`)
 /// `min_length`, `max_length`, `charset`, `custom_charset`, `encoding`,
@@ -373,91 +323,20 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 /// ### API Endpoint Scanner (`scanners/api_endpoint_scanner`)
 /// `output_dir`, `use_spoofing`, `use_generic_payload`, `enable_delete`,
 /// `enable_extended_methods`, `modules`, `enum_mode`, `id_start`, `id_end`,
-/// `id_file`, `endpoint_source`, `base_path`, `endpoint_file`, `wordlist`,
-/// `mutation_depth`, `max_variants`, `max_total_payloads`, `traversal_max_depth`
+/// `id_file`, `endpoint_source`, `base_path`, `endpoint_file`
 ///
 /// ### IPMI Enum/Exploit (`scanners/ipmi_enum_exploit`)
 /// `cidr`, `target`, `test_cipher_zero`, `test_anonymous`, `test_default_creds`,
 /// `test_rakp_hash`, `continue_large_scan`, `destroy_confirm`
 ///
-/// ### Source Port Scanner (`scanners/source_port_scanner`)
-/// `dest_port`, `source_range`, `source_start`, `source_end`
-///
-/// ### NBNS Scanner (`scanners/nbns_scanner`)
-/// `retries`
-///
 /// ### SSDP MSearch (`scanners/ssdp_msearch`)
 /// `retries`, `search_target`
 ///
-/// ### Honeypot Scanner (`scanners/honeypot_scanner`)
-/// `port_timeout_ms`
-///
-/// ### Subdomain Scanner (`scanners/subdomain_scanner`)
-/// `domain` (R)
-///
-/// ### SSL Scanner (`scanners/ssl_scanner`)
-/// (uses standard `port`, `timeout`, `save_results`, `output_file`)
-///
-/// ### WAF Detector (`scanners/waf_detector`)
-/// `url_path`
-///
-/// ## Exploit-Specific Keys (selected, most use only `port` + `mode`)
-///
-/// ### Crypto
-/// - **heartbleed**: `port`
-/// - **geth_dos**: `targets_file`, `p2p_port`, `rpc_port`, `connections`, `duration`
-///
-/// ### DoS modules
-/// All share: `port`, `connections`/`threads`, `duration`
-/// - **syn_ack_flood**: `reflector_port`, `reflector`
-/// - **http_flood**: `path`, `method`
-/// - **slowloris**: `connections`
-/// - **rudy**: `path`, `content_type`
-///
-/// ### SSH exploits
-/// - **sshpwn_***: `port`, `username`, `password`/`key_path`
-/// - **erlang_otp_ssh_rce**: `port`, `command`
-/// - **openssh_regresshion**: `port`, `glibc_base`
-///
-/// ### Network Infrastructure
-/// - **forticloud_sso**: `port`, `shell_port`, `listener_ip`
-/// - **fortisiem_rce**: `lport`, `lhost`
-/// - **vcenter_backup_rce**: `mode`, `username`, `password`
-///
-/// ### Payload Generators
-/// - **batgen/lnkgen/polymorph_dropper/payload_encoder/narutto_dropper**:
-///   various `payload_url`, `output_path`, `encode_type`, `iterations`
-///
-/// ### Web Applications
-/// - **termix_xss**: `auth_port`, `file_port`, `ssh_port`
-/// - **spotube**: `mode`, `request_count`, `delay_ms`
-/// - **react2shell**: `mode`, `rhost`, `rport`
-///
-/// ### Cameras (mass-scan capable)
-/// - **hikvision_rce**: `output_file`
-/// - **acm_5611_rce**: `output_file`, `concurrency`
-/// - **abus_camera**: `output_file`
-///
-/// ### Sample modules
-/// - **sample_scanner**: `check_http`, `check_https`
-/// - **sample_exploit**: (minimal, target-only)
+/// ### Sample Scanner (`scanners/sample_scanner`)
+/// `check_http`, `check_https`
 #[derive(Clone, Debug)]
 pub struct ModuleConfig {
-    pub port: Option<u16>,
-    pub username_wordlist: Option<String>,
-    pub password_wordlist: Option<String>,
-    pub concurrency: Option<usize>,
-    pub stop_on_success: Option<bool>,
-    pub save_results: Option<bool>,
-    pub output_file: Option<String>,
-    pub verbose: Option<bool>,
-    pub combo_mode: Option<String>,
-    /// Generic key→value prompt overrides.
-    /// When set, `cfg_prompt_*` functions in utils.rs return these values
-    /// instead of prompting stdin. Keys match prompt names like "port", "mode", etc.
     pub custom_prompts: HashMap<String, String>,
-    /// When true, cfg_prompt_* will return an error instead of falling back
-    /// to stdin. This prevents the API server from blocking on interactive prompts.
     pub api_mode: bool,
 }
 
@@ -470,15 +349,6 @@ impl ModuleConfig {
 impl Default for ModuleConfig {
     fn default() -> Self {
         Self {
-            port: None,
-            username_wordlist: None,
-            password_wordlist: None,
-            concurrency: None,
-            stop_on_success: None,
-            save_results: None,
-            output_file: None,
-            verbose: None,
-            combo_mode: None,
             custom_prompts: HashMap::new(),
             api_mode: false,
         }
@@ -514,8 +384,6 @@ pub fn get_run_target() -> Option<String> {
         .flatten()
 }
 
-/// Get the results directory (~/.rustsploit/results/) — creates it if needed.
-/// Module output files are stored here when running via API.
 pub fn results_dir() -> std::path::PathBuf {
     let dir = home::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -523,7 +391,9 @@ pub fn results_dir() -> std::path::PathBuf {
         .join("results");
     if !dir.exists() {
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) { crate::meprintln!("[!] Directory creation error: {}", e); }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) {
+            eprintln!("[!] Failed to create results directory {}: {}", dir.display(), e);
+        }
     }
     dir
 }

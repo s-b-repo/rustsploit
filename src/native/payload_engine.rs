@@ -119,7 +119,7 @@ pub fn encode_url(text: &str) -> String {
 }
 
 pub fn encode_shell_escape(text: &str) -> String {
-    let mut result = String::with_capacity(text.len() * 2);
+    let mut result = String::with_capacity(text.len().saturating_mul(2));
     for c in text.chars() {
         match c {
             ' ' | '*' | '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | ',' | '?' | '~' | '!' | '#' => {
@@ -139,7 +139,7 @@ pub fn encode_shell_escape(text: &str) -> String {
 }
 
 pub fn encode_html(text: &str) -> String {
-    let mut result = String::with_capacity(text.len() * 5);
+    let mut result = String::with_capacity(text.len().saturating_mul(5));
     for c in text.chars() {
         match c {
             '&' => result.push_str("&amp;"),
@@ -187,7 +187,7 @@ pub fn encode_zero_width(data: &[u8]) -> String {
 }
 
 pub fn visualize_zero_width(text: &str) -> String {
-    let mut result = String::with_capacity(text.len() * 5);
+    let mut result = String::with_capacity(text.len().saturating_mul(5));
     for ch in text.chars() {
         match ch {
             '\u{200B}' => result.push_str("[000]"),
