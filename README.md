@@ -3,8 +3,9 @@
 Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
 
 
-![Demo GIF](https://github.com/s-b-repo/rustsploit/raw/main/preview.gif)
-![Testing GIF](https://github.com/s-b-repo/rustsploit/raw/main/testing.gif)
+![Rustsploit Interactive Shell Demo](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
+
+![Rustsploit Testing View](https://github.com/s-b-repo/rustsploit/raw/main/testing.png)
 
 ---
 
