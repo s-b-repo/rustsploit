@@ -7,23 +7,38 @@ use super::types::{
     ServerInfo, ToolsCapability,
 };
 
+// You can place this function in src/mcp/server.rs or a shared utility module
+fn errno() -> i32 {
+    unsafe {
+        #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+        { *libc::__error() }
+
+        #[cfg(target_os = "linux")]
+        { *libc::__errno_location() }
+
+        // Add fallbacks for other OSes if needed
+        #[cfg(not(any(target_os = "freebsd", target_os = "macos", target_os = "linux")))]
+        { 0 } // Or compile_error! to force checking for a new OS
+    }
+}
+
 fn isolate_protocol_stdout() -> anyhow::Result<tokio::fs::File> {
     use std::os::fd::FromRawFd;
     unsafe {
         let saved_fd = libc::dup(1);
         if saved_fd < 0 {
-            anyhow::bail!("dup(1) failed: errno {}", *libc::__errno_location());
+            anyhow::bail!("dup(1) failed: errno {}", errno());
         }
         let null_path = b"/dev/null\0";
         let null_fd = libc::open(null_path.as_ptr() as *const libc::c_char, libc::O_WRONLY);
         if null_fd < 0 {
             libc::close(saved_fd);
-            anyhow::bail!("open(/dev/null) failed: errno {}", *libc::__errno_location());
+            anyhow::bail!("open(/dev/null) failed: errno {}", errno());
         }
         if libc::dup2(null_fd, 1) < 0 {
             libc::close(null_fd);
             libc::close(saved_fd);
-            anyhow::bail!("dup2(null, 1) failed: errno {}", *libc::__errno_location());
+            anyhow::bail!("dup2(null, 1) failed: errno {}", errno());
         }
         libc::close(null_fd);
         let std_file = std::fs::File::from_raw_fd(saved_fd);
