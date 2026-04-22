@@ -64,16 +64,16 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 ```bash
 sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev libdbus-1-dev cmake && (command -v cargo > /dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env")) && git clone https://github.com/s-b-repo/rustsploit.git && cd rustsploit && cargo run
 ```
-# How to turn Bluetooth OFF (e.g. on FreeBSD without Bluetooth hardware):
+## How to turn Bluetooth OFF (e.g. on FreeBSD without Bluetooth hardware):
 
 ```
 cargo build --no-default-features
 ```
-# or
+## or
 ```
 cargo run --no-default-features
 ```
-# How to turn Bluetooth ON
+## How to turn Bluetooth ON
 ```
 cargo build --features bluetooth
 ```
