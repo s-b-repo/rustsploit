@@ -64,7 +64,7 @@ rlimit = "0.11"
 
 
 # Bluetooth
-btleplug = "0.12"
+btleplug = { version = "0.12", optional = true }
 
 # WPair migrated from ratatui+crossterm TUI to rustyline REPL — deps removed.
 
@@ -163,3 +163,7 @@ strip = true
 inherits = "release"
 lto = "thin"           # Faster than fat LTO
 codegen-units = 4      # Parallel codegen
+
+[features]
+default = ["bluetooth"]
+bluetooth = ["dep:btleplug"]
