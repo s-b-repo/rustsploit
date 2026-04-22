@@ -77,6 +77,10 @@ cargo run --no-default-features
 ```
 cargo build --features bluetooth
 ```
+## or
+```
+cargo run --features bluetooth
+```
 
 <details>
 <summary>What each dependency does</summary>
