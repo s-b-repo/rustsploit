@@ -113,8 +113,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Warn about privileged ports requiring root
     if settings.source_start < 1024 {
-        let is_root = unsafe { libc::geteuid() } == 0;
-        if !is_root {
+        if !crate::utils::is_root() {
             let priv_end = std::cmp::min(settings.source_end, 1023);
             crate::mprintln!("{}", format!(
                 "[!] Warning: Source ports {}-{} are privileged (< 1024). \
@@ -143,6 +142,7 @@ pub async fn run(target: &str) -> Result<()> {
     let mut tasks = Vec::with_capacity(total);
 
     for src_port in source_ports {
+        if crate::context::is_cancelled() { break; }
         let permit = semaphore.clone().acquire_owned().await?;
         let allowed = allowed_ports.clone();
         let prog = progress.clone();
@@ -154,6 +154,7 @@ pub async fn run(target: &str) -> Result<()> {
 
         let handle = tokio::spawn(async move {
             let _permit = permit;
+            if crate::context::is_cancelled() { return; }
 
             let result = if scan_udp {
                 probe_udp(ip, dest_port, src_port, timeout_secs).await
@@ -177,6 +178,12 @@ pub async fn run(target: &str) -> Result<()> {
                             proto, src_port, ip_str, dest_port, "ALLOWED".green().bold(), banner.trim().bright_black())
                     };
                     crate::mprintln!("{}", line);
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: ip_str.clone(),
+                        port: dest_port,
+                        service: format!("src-port-bypass:{}/{}", proto.to_lowercase(), src_port),
+                        version: if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
+                    });
                 }
                 ProbeResult::Denied => {
                     if verbose {

@@ -380,6 +380,16 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!();
         crate::mprintln!("{}", "[*] Note: Absence of detection does not mean no WAF is present.".yellow());
     } else {
+        // Surface every WAF detection to the structured event bus before
+        // printing the table, so subscribers see findings as they arrive.
+        for d in &detections {
+            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                host: target.to_string(),
+                port: 443,
+                service: format!("waf:{}", d.name),
+                version: Some(d.confidence.to_string()),
+            });
+        }
         crate::mprintln!("  Detected WAF/CDN(s):");
         crate::mprintln!();
 

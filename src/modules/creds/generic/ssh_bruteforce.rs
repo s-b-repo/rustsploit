@@ -77,7 +77,10 @@ pub async fn run(target: &str) -> Result<()> {
                     &addr.parse().ok()?, std::time::Duration::from_secs(5)
                 ) {
                     Ok(t) => t,
-                    Err(_) => return None,
+                    Err(e) => {
+                        tracing::trace!(target = %addr, "SSH TCP connect failed: {}", e);
+                        return None;
+                    }
                 };
                 let mut sess = ssh2::Session::new().ok()?;
                 sess.set_tcp_stream(tcp);

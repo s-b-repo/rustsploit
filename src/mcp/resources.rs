@@ -131,8 +131,12 @@ async fn read_credentials() -> ResourceContent {
     let redacted: Vec<serde_json::Value> = creds
         .iter()
         .map(|c| {
-            let redacted_secret = if c.secret.len() > 3 {
-                format!("{}***", &c.secret[..3])
+            // Take the first 3 chars (not bytes) — slicing at byte 3 in a
+            // multi-byte UTF-8 secret (emoji, CJK) panics with
+            // "byte index N is not a char boundary".
+            let redacted_secret = if c.secret.chars().count() > 3 {
+                let prefix: String = c.secret.chars().take(3).collect();
+                format!("{}***", prefix)
             } else {
                 "***".into()
             };

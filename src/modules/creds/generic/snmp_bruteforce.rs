@@ -99,7 +99,10 @@ pub async fn run(target: &str) -> Result<()> {
                             return Some(line);
                         }
                         Ok(false) => {}
-                        Err(_) => return None,
+                        Err(e) => {
+                            tracing::trace!(target = %addr, community, "SNMP try-community errored: {}", e);
+                            return None;
+                        }
                     }
                 }
                 None

@@ -327,7 +327,7 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose
 
     let connector = AsyncNativeTlsConnector::from(
         TlsConnector::new()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
             .danger_accept_invalid_hostnames(true),
     );
 

@@ -286,6 +286,7 @@ pub async fn run(target: &str) -> Result<()> {
         }, move |ip: IpAddr, _port: u16| {
             let protos = protocols.clone();
             async move {
+                if crate::context::is_cancelled() { return None; }
                 let results = probe_host(ip, &protos, 3000).await;
                 if results.is_empty() {
                     return None;
@@ -301,6 +302,12 @@ pub async fn run(target: &str) -> Result<()> {
                         "[+] {}:{} {} — {:.1}x amplification ({} bytes, {})",
                         ip, r.port, r.protocol, r.amplification, r.response_size, r.detail
                     ).green().bold());
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: ip.to_string(),
+                        port: r.port,
+                        service: format!("amplifier:{}", r.protocol),
+                        version: Some(format!("{:.1}x amp, {} bytes", r.amplification, r.response_size)),
+                    });
                 }
                 Some(lines.join("\n") + "\n")
             }

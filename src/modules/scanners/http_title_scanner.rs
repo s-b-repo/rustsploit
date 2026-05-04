@@ -86,7 +86,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
         .user_agent("RustSploit-HTTP-Title-Scanner/1.0")
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -104,9 +104,10 @@ pub async fn run(initial_target: &str) -> Result<()> {
     crate::mprintln!();
 
     for (idx, url) in normalized.iter().enumerate() {
+        if crate::context::is_cancelled() { break; }
         // Progress indicator
         if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
-            crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)", 
+            crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)",
                 idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
@@ -116,10 +117,22 @@ pub async fn run(initial_target: &str) -> Result<()> {
                 if let Some(title) = &result.title {
                     crate::mprintln!("\r{}", format!("[+] {} -> {}", url, title).green());
                     success_count += 1;
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: url.clone(),
+                        port: 0,
+                        service: "http".to_string(),
+                        version: Some(title.clone()),
+                    });
                 } else if let Some(status) = result.status {
                     if status.is_success() {
                         crate::mprintln!("\r{}", format!("[+] {} -> <no title> (status: {})", url, status).green());
                         success_count += 1;
+                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                            host: url.clone(),
+                            port: 0,
+                            service: "http".to_string(),
+                            version: Some(format!("status={}", status.as_u16())),
+                        });
                     } else {
                         crate::mprintln!("\r{}", format!("[~] {} -> <no title> (status: {})", url, status).yellow());
                     }

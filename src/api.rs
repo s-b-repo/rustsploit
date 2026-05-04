@@ -3,11 +3,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
-    response::Json,
-    routing::{get, post},
+    body::Bytes,
+    extract::Path as AxumPath,
+    http::{Method, StatusCode, Uri},
+    response::{IntoResponse, Json, Response},
+    routing::{any, get, post},
     Router,
 };
 use colored::*;
+use serde_json::{json, Value};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
@@ -24,6 +28,9 @@ pub(crate) fn validate_target(target: &str) -> bool {
 }
 
 pub(crate) fn is_blocked_target(target: &str) -> bool {
+    // Mass-scan keywords are deliberately allowed — this function exists for
+    // SSRF mitigation, not for restricting scan scope. Modules that opt in
+    // to mass-scan mode parse these keywords themselves.
     const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
     if MASS_SCAN_KEYWORDS.contains(&target) {
         return false;
@@ -132,12 +139,15 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 fn check_blocked_hostname(host: &str) -> bool {
-    const BLOCKED_HOST_SUFFIXES: &[&str] = &[
-        "metadata.google.internal",
-        "metadata.goog",
-        "metadata.internal",
-        "metadata.azure.com",
-        "metadata.oraclecloud.com",
+    // Each entry is `(exact, dotted_suffix)`. Pre-built so the per-call hot
+    // path is just two `eq`/`ends_with` checks per entry instead of a
+    // `format!(".{suffix}")` allocation each time.
+    const BLOCKED_HOST_SUFFIXES: &[(&str, &str)] = &[
+        ("metadata.google.internal", ".metadata.google.internal"),
+        ("metadata.goog", ".metadata.goog"),
+        ("metadata.internal", ".metadata.internal"),
+        ("metadata.azure.com", ".metadata.azure.com"),
+        ("metadata.oraclecloud.com", ".metadata.oraclecloud.com"),
     ];
     const BLOCKED_HOST_EXACT: &[&str] = &[
         "metadata",
@@ -151,8 +161,8 @@ fn check_blocked_hostname(host: &str) -> bool {
         ".local.gd",
     ];
 
-    for suffix in BLOCKED_HOST_SUFFIXES {
-        if host == *suffix || host.ends_with(&format!(".{}", suffix)) {
+    for (exact, dotted) in BLOCKED_HOST_SUFFIXES {
+        if host == *exact || host.ends_with(dotted) {
             return true;
         }
     }
@@ -199,13 +209,21 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
 }
 
 pub(crate) async fn is_blocked_target_resolved(target: &str) -> bool {
+    resolve_and_check(target).await.is_err()
+}
+
+/// Resolve a hostname and verify none of the returned IPs are blocked.
+/// Returns the resolved addresses on success, or an error if blocked / unresolvable.
+/// Callers should connect to the returned addresses directly (not re-resolve)
+/// to prevent DNS rebinding attacks.
+pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::SocketAddr>, String> {
     const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
     if MASS_SCAN_KEYWORDS.contains(&target) {
-        return false;
+        return Ok(vec![]);
     }
 
     if is_blocked_target(target) {
-        return true;
+        return Err("target blocked by SSRF filter".to_string());
     }
     let lower = target.to_lowercase();
     let host_part = lower
@@ -223,14 +241,22 @@ pub(crate) async fn is_blocked_target_resolved(target: &str) -> bool {
         tokio::net::lookup_host(&lookup_addr),
     ).await {
         Ok(Ok(addrs)) => {
-            for addr in addrs {
+            let resolved: Vec<std::net::SocketAddr> = addrs.collect();
+            for addr in &resolved {
                 if is_blocked_ip(addr.ip()) {
-                    return true;
+                    return Err(format!("resolved IP {} is blocked", addr.ip()));
                 }
             }
-            false
+            Ok(resolved)
         }
-        Ok(Err(_)) | Err(_) => true,
+        Ok(Err(e)) => {
+            tracing::debug!(target = lookup_addr, "SSRF resolve failed → blocking: {}", e);
+            Err(format!("DNS resolution failed: {}", e))
+        }
+        Err(_elapsed) => {
+            tracing::debug!(target = lookup_addr, "SSRF resolve timed out (5s) → blocking");
+            Err("DNS resolution timed out".to_string())
+        }
     }
 }
 
@@ -260,6 +286,392 @@ async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
+// ─── HTTP → JSON-RPC Adapter ────────────────────────────────────────
+//
+// Maps the REST surface (GET/POST/PUT/DELETE on `/api/<resource>[/<id>...]`)
+// onto the existing `crate::ws::dispatch_rpc` handlers so we keep one
+// canonical dispatch table for both transports.
+//
+// The middleware in `pq_middleware::pq_middleware` has already decrypted the
+// body, restored the original semantic HTTP method (from `X-PQ-Method`), and
+// scrubbed the PQ envelope headers by the time these handlers run.
+
+fn rpc_status(code: &str) -> StatusCode {
+    match code {
+        "INVALID_INPUT" | "INVALID_OUTPUT_FILE" | "INVALID_JOB_ID" | "PARSE_ERROR" => {
+            StatusCode::BAD_REQUEST
+        }
+        "NOT_FOUND" | "MODULE_NOT_FOUND" | "METHOD_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "SSRF_BLOCKED" | "SECURITY" => StatusCode::FORBIDDEN,
+        "JOB_LIMIT" | "STORE_ERROR" | "OPTION_ERROR" | "TARGET_ERROR" | "SUB_LIMIT" => {
+            StatusCode::CONFLICT
+        }
+        "RATE_LIMIT" => StatusCode::TOO_MANY_REQUESTS,
+        // Module / IO / serialization errors are runtime failures, not server
+        // bugs. Map them explicitly so callers don't see "500 unknown".
+        "MOD_ERROR"
+        | "CHECK_ERROR"
+        | "EXPORT_ERROR"
+        | "SPOOL_ERROR"
+        | "IO_ERROR"
+        | "SERIALIZE_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn ok(value: Value) -> Response {
+    Json(value).into_response()
+}
+
+fn err_resp(status: StatusCode, code: &str, message: &str) -> Response {
+    (status, Json(json!({ "error": message, "code": code }))).into_response()
+}
+
+fn parse_query(query: &str) -> std::collections::BTreeMap<String, String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// Run a single RPC call and turn its result into an HTTP response with a
+/// uniform `{ data: ... }` envelope on success and `{ error, code }` on
+/// failure. This is the single canonical shape every REST client sees.
+async fn invoke_rpc(method: &str, params: Value) -> Response {
+    match crate::ws::dispatch_rpc(method, &params).await {
+        Ok(data) => ok(json!({ "data": data })),
+        Err((code, msg)) => err_resp(rpc_status(&code), &code, &msg),
+    }
+}
+
+/// The single catch-all `/api/{*tail}` handler. Parses the path tail,
+/// method, query string, and JSON body into a `(rpc_method, params)` pair
+/// and forwards to `crate::ws::dispatch_rpc`.
+async fn api_dispatcher(
+    method: Method,
+    AxumPath(tail): AxumPath<String>,
+    uri: Uri,
+    axum::Extension(identity): axum::Extension<crate::pq_middleware::AuthenticatedIdentity>,
+    body: Bytes,
+) -> Response {
+    let path = format!("/{}", tail.trim_start_matches('/'));
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let head = segments.first().copied().unwrap_or("");
+    let sub = segments.get(1).copied();
+    let third = segments.get(2).copied();
+
+    let body_value: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "PARSE_ERROR",
+                    "Request body is not valid JSON",
+                );
+            }
+        }
+    };
+    let body_obj = body_value.as_object().cloned().unwrap_or_default();
+    let query = parse_query(uri.query().unwrap_or(""));
+
+    let mut params = serde_json::Map::new();
+
+    macro_rules! merge_query {
+        ($params:ident, $query:ident, [$($key:literal),* $(,)?]) => {
+            $(
+                if let Some(v) = $query.get($key) {
+                    $params.insert($key.to_string(), Value::String(v.clone()));
+                }
+            )*
+        };
+    }
+    macro_rules! merge_query_int {
+        ($params:ident, $query:ident, [$($key:literal),* $(,)?]) => {
+            $(
+                if let Some(v) = $query.get($key).and_then(|s| s.parse::<u64>().ok()) {
+                    $params.insert($key.to_string(), Value::Number(v.into()));
+                }
+            )*
+        };
+    }
+    macro_rules! body_into_params {
+        ($params:ident, $body:ident) => {
+            for (k, v) in $body.iter() {
+                $params.insert(k.clone(), v.clone());
+            }
+        };
+    }
+
+    let rpc_method: &str = match (method.as_str(), head, sub, third) {
+        // ── Health ──────────────────────────────────────────────────
+        ("GET", "health", None, _) => "health",
+
+        // ── Modules ─────────────────────────────────────────────────
+        ("GET", "modules", None, _) => "list_modules",
+        ("GET", "modules", Some("enriched"), _) => "list_modules_enriched",
+        ("GET", "modules", Some("search"), _) => {
+            merge_query!(params, query, ["q"]);
+            "search_modules"
+        }
+        ("GET", "module", Some(_), _) => {
+            // /api/module/<modulepath...> — everything after /module/ is the module path.
+            let module_path = &path["/module/".len()..];
+            params.insert("path".to_string(), Value::String(module_path.to_string()));
+            "module_info"
+        }
+
+        // ── Run / Check / Honeypot ──────────────────────────────────
+        ("POST", "run", None, _) => {
+            body_into_params!(params, body_obj);
+            "run_module"
+        }
+        ("POST", "run", Some("all"), _) => {
+            body_into_params!(params, body_obj);
+            "run_all"
+        }
+        ("POST", "run_all", None, _) => {
+            body_into_params!(params, body_obj);
+            "run_all"
+        }
+        ("POST", "check", None, _) => {
+            body_into_params!(params, body_obj);
+            "check_module"
+        }
+        ("POST", "honeypot-check", None, _) => {
+            body_into_params!(params, body_obj);
+            "honeypot_check"
+        }
+
+        // ── Target ──────────────────────────────────────────────────
+        ("GET", "target", None, _) => "get_target",
+        ("POST", "target", None, _) => {
+            body_into_params!(params, body_obj);
+            "set_target"
+        }
+        ("DELETE", "target", None, _) => "clear_target",
+
+        // ── Options ─────────────────────────────────────────────────
+        ("GET", "options", None, _) => "list_options",
+        ("POST", "options", None, _) => {
+            // set_option takes the multi-key body directly.
+            body_into_params!(params, body_obj);
+            "set_option"
+        }
+        ("DELETE", "options", None, _) => {
+            let tenant_name = identity.client_name.clone();
+            let mut deleted = Vec::new();
+            let mut errors = Vec::new();
+            for k in body_obj.keys() {
+                let single = json!({ "key": k });
+                let tn = tenant_name.clone();
+                let result = crate::tenant::CURRENT_TENANT
+                    .scope(tn, crate::ws::dispatch_rpc("delete_option", &single))
+                    .await;
+                match result {
+                    Ok(v) => deleted.push(v),
+                    Err((code, msg)) => errors.push(json!({"key": k, "code": code, "error": msg})),
+                }
+            }
+            return ok(json!({
+                "data": { "deleted": deleted, "errors": errors }
+            }));
+        }
+
+        // ── Credentials ─────────────────────────────────────────────
+        ("GET", "creds", None, _) => {
+            merge_query!(params, query, ["host", "service", "search"]);
+            merge_query_int!(params, query, ["limit", "offset"]);
+            if let Some(v) = query.get("reveal") {
+                if v == "1" || v.eq_ignore_ascii_case("true") {
+                    params.insert("reveal".to_string(), Value::Bool(true));
+                }
+            }
+            "list_creds"
+        }
+        ("GET", "creds", Some("search"), _) => {
+            merge_query!(params, query, ["q"]);
+            "search_creds"
+        }
+        ("POST", "creds", None, _) => {
+            body_into_params!(params, body_obj);
+            "add_cred"
+        }
+        ("DELETE", "creds", None, _) => {
+            body_into_params!(params, body_obj);
+            "delete_cred"
+        }
+        ("POST", "creds", Some("clear"), _) => "clear_creds",
+
+        // ── Hosts ───────────────────────────────────────────────────
+        ("GET", "hosts", None, _) => {
+            merge_query!(params, query, ["os", "search"]);
+            merge_query_int!(params, query, ["limit", "offset"]);
+            "list_hosts"
+        }
+        ("POST" | "PUT", "hosts", None, _) => {
+            body_into_params!(params, body_obj);
+            "add_host"
+        }
+        ("DELETE", "hosts", None, _) => {
+            body_into_params!(params, body_obj);
+            "delete_host"
+        }
+        ("POST", "hosts", Some("notes"), _) => {
+            body_into_params!(params, body_obj);
+            "add_host_note"
+        }
+        ("POST", "hosts", Some("clear"), _) => "clear_hosts",
+
+        // ── Services ────────────────────────────────────────────────
+        ("GET", "services", None, _) => {
+            merge_query!(params, query, ["host", "search"]);
+            merge_query_int!(params, query, ["port", "limit", "offset"]);
+            "list_services"
+        }
+        ("POST", "services", None, _) => {
+            body_into_params!(params, body_obj);
+            "add_service"
+        }
+        ("DELETE", "services", None, _) => {
+            body_into_params!(params, body_obj);
+            "delete_service"
+        }
+
+        // ── Loot ────────────────────────────────────────────────────
+        ("GET", "loot", None, _) => {
+            merge_query!(params, query, ["host", "loot_type", "search"]);
+            merge_query_int!(params, query, ["limit", "offset"]);
+            "list_loot"
+        }
+        ("GET", "loot", Some("search"), _) => {
+            merge_query!(params, query, ["q"]);
+            "search_loot"
+        }
+        ("POST", "loot", None, _) => {
+            body_into_params!(params, body_obj);
+            "add_loot"
+        }
+        ("DELETE", "loot", None, _) => {
+            body_into_params!(params, body_obj);
+            "delete_loot"
+        }
+        ("POST", "loot", Some("clear"), _) => "clear_loot",
+
+        // ── Workspace ───────────────────────────────────────────────
+        ("GET", "workspace", None, _) => "get_workspace",
+        ("POST", "workspace", None, _) => {
+            body_into_params!(params, body_obj);
+            "switch_workspace"
+        }
+        ("GET", "workspaces", None, _) => "list_workspaces",
+
+        // ── Jobs ────────────────────────────────────────────────────
+        ("GET", "jobs", None, _) => "list_jobs",
+        ("POST", "jobs", Some("limit"), _) => {
+            body_into_params!(params, body_obj);
+            "set_job_limit"
+        }
+        ("GET", "jobs", Some(id), _) => {
+            if let Ok(n) = id.parse::<u64>() {
+                params.insert("id".to_string(), Value::Number(n.into()));
+            } else {
+                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "job id must be numeric");
+            }
+            merge_query_int!(params, query, ["from"]);
+            "get_job"
+        }
+        ("DELETE", "jobs", Some(id), _) => {
+            if let Ok(n) = id.parse::<u64>() {
+                params.insert("id".to_string(), Value::Number(n.into()));
+            } else {
+                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "job id must be numeric");
+            }
+            "kill_job"
+        }
+        ("DELETE", "jobs", None, _) => {
+            // Body-style {id: N} — accept either a number or a numeric string.
+            if let Some(id_val) = body_obj.get("id") {
+                if let Some(n) = id_val.as_u64() {
+                    params.insert("id".to_string(), Value::Number(n.into()));
+                } else if let Some(s) = id_val.as_str().and_then(|s| s.parse::<u64>().ok()) {
+                    params.insert("id".to_string(), Value::Number(s.into()));
+                } else {
+                    return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "invalid job id");
+                }
+            } else {
+                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "job id is required");
+            }
+            "kill_job"
+        }
+
+        // ── Spool ───────────────────────────────────────────────────
+        ("GET", "spool", None, _) => "spool_status",
+        ("POST", "spool", None, _) => {
+            // Body shape: {action: "start"|"stop", filename?: ...}
+            let action = body_obj
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match action {
+                "start" => {
+                    if let Some(f) = body_obj.get("filename") {
+                        params.insert("filename".to_string(), f.clone());
+                    }
+                    "spool_start"
+                }
+                "stop" => "spool_stop",
+                _ => {
+                    return err_resp(
+                        StatusCode::BAD_REQUEST,
+                        "INVALID_INPUT",
+                        "action must be 'start' or 'stop'",
+                    );
+                }
+            }
+        }
+
+        // ── Results ─────────────────────────────────────────────────
+        ("GET", "results", None, _) => "list_results",
+        ("GET", "results", Some(name), _) => {
+            params.insert("filename".to_string(), Value::String(name.to_string()));
+            "get_result"
+        }
+
+        // ── Export ──────────────────────────────────────────────────
+        ("GET", "export", None, _) => {
+            merge_query!(params, query, ["format"]);
+            "export"
+        }
+
+        // ── Shell (intentionally not exposed via REST until ACL design lands) ─
+        ("POST", "shell", None, _) => {
+            return err_resp(
+                StatusCode::NOT_IMPLEMENTED,
+                "NOT_IMPLEMENTED",
+                "Shell-over-API is disabled; use individual RPC methods (set_target, run_module, …)",
+            );
+        }
+
+        // ── Default: nothing matched ────────────────────────────────
+        _ => {
+            return err_resp(
+                StatusCode::NOT_FOUND,
+                "ROUTE_NOT_FOUND",
+                &format!("No mapping for {} /api/{}", method, tail),
+            );
+        }
+    };
+
+    crate::tenant::CURRENT_TENANT
+        .scope(
+            identity.client_name,
+            invoke_rpc(rpc_method, Value::Object(params)),
+        )
+        .await
+}
+
 // ─── Server Entry Point ─────────────────────────────────────────────
 
 pub async fn start_api_server(
@@ -267,8 +679,13 @@ pub async fn start_api_server(
     _verbose: bool,
     host_key_path: &std::path::Path,
     authorized_keys_path: &std::path::Path,
+    passphrase: Option<&str>,
 ) -> Result<()> {
-    let host_identity = crate::pq_channel::HostIdentity::load_or_generate(host_key_path)
+    // We don't refuse any bind address. The bootstrap path is gated by a
+    // one-time enrollment token printed at startup (see /pq/register-key),
+    // not by the bind interface — the token is the sole authority that
+    // permits the very first authorized_keys entry.
+    let host_identity = crate::pq_channel::HostIdentity::load_or_generate(host_key_path, passphrase)
         .context("Failed to load/generate PQ host key")?;
 
     let authorized_keys = crate::pq_channel::load_authorized_keys(authorized_keys_path)
@@ -292,11 +709,21 @@ pub async fn start_api_server(
             crate::pq_channel::fingerprint(&key.x25519_public, &key.mlkem_ek));
     }
 
+    // Generate a one-time enrollment token. Operators bootstrap remote
+    // clients by POSTing their PQ public keys to /pq/register-key with this
+    // token. The token is printed at startup, held only in memory, and
+    // consumed on first successful registration. Subsequent key changes
+    // must use the established PQ session.
+    let enrollment_token = crate::pq_channel::generate_enrollment_token();
+    let enrollment_token_print = enrollment_token.clone();
+
     let pq_state = Arc::new(crate::pq_middleware::PqSharedState {
         sessions: pq_sessions,
         host_identity: Arc::new(host_identity),
-        authorized_keys: Arc::new(authorized_keys),
+        authorized_keys: tokio::sync::RwLock::new(authorized_keys),
+        authorized_keys_path: authorized_keys_path.to_path_buf(),
         handshake_rate_limiter: crate::pq_middleware::new_handshake_rate_limiter(),
+        enrollment_token: tokio::sync::Mutex::new(Some(enrollment_token)),
     });
 
     let cleanup_sessions = pq_state.sessions.clone();
@@ -305,14 +732,34 @@ pub async fn start_api_server(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
-            let mut store = cleanup_sessions.write().await;
-            let before = store.len();
-            store.retain(|_, s| s.last_activity.elapsed() < std::time::Duration::from_secs(3600));
-            let removed = before - store.len();
-            if removed > 0 {
-                tracing::info!("PQ session cleanup: removed {} idle sessions ({} remaining)", removed, store.len());
+            // Two-phase cleanup: first take a SHORT read lock to scan
+            // last_activity (locking each session's mutex non-blockingly),
+            // then take the write lock only to remove the doomed entries.
+            // This keeps the map readable during the bulk of the work.
+            let doomed: Vec<[u8; 16]> = {
+                let store = cleanup_sessions.read().await;
+                let mut out = Vec::new();
+                for (id, sess_arc) in store.iter() {
+                    if let Ok(sess) = sess_arc.try_lock() {
+                        if sess.last_activity.elapsed() >= std::time::Duration::from_secs(3600) {
+                            out.push(*id);
+                        }
+                    }
+                }
+                out
+            };
+            let removed_n = if !doomed.is_empty() {
+                let mut store = cleanup_sessions.write().await;
+                let mut n = 0usize;
+                for id in &doomed {
+                    if store.remove(id).is_some() { n += 1; }
+                }
+                n
+            } else { 0 };
+            if removed_n > 0 {
+                let remaining = cleanup_sessions.read().await.len();
+                tracing::info!("PQ session cleanup: removed {} idle sessions ({} remaining)", removed_n, remaining);
             }
-            drop(store);
 
             let mut limiter = cleanup_rate_limiter.lock().await;
             limiter.retain(|_, timestamps| {
@@ -322,10 +769,29 @@ pub async fn start_api_server(
         }
     });
 
+    // The PQ middleware MUST be the outermost wrapper for /api/* so it can
+    // see the encrypted body before any extractor tries to parse it. Mount
+    // it as a `route_layer` so it only runs on the /api/* surface and not
+    // on /health, /pq/handshake, /pq/ws which speak their own protocols.
+    let api_router: Router = Router::new()
+        // Specific routes BEFORE the catch-all so the dispatcher doesn't
+        // swallow them. Identity revocation lives behind the PQ middleware
+        // so the request is AEAD-authenticated by an existing client.
+        .route("/api/pq/revoke-key", post(crate::pq_middleware::revoke_key_handler))
+        .route("/api/{*tail}", any(api_dispatcher))
+        .route_layer(axum::middleware::from_fn(crate::pq_middleware::pq_middleware));
+
+    // Cap the JSON request body explicitly. Axum's default is 2 MiB, but we
+    // pin it here so a future caller can't disable it upstream by accident.
+    const MAX_REQUEST_BODY: usize = 2 * 1024 * 1024;
+
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/pq/handshake", post(crate::pq_middleware::handshake_handler))
+        .route("/pq/register-key", post(crate::pq_middleware::register_key_handler))
         .route("/pq/ws", get(crate::ws::ws_upgrade))
+        .merge(api_router)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .layer(axum::Extension(pq_state))
         .layer(
             ServiceBuilder::new()
@@ -334,7 +800,19 @@ pub async fn start_api_server(
 
     println!("Server running on http://{}", bind_address);
     println!("Transport: Post-Quantum encryption (ML-KEM-768 + X25519 + ChaCha20-Poly1305)");
-    println!("Endpoints: GET /health, POST /pq/handshake, GET /pq/ws");
+    println!(
+        "Endpoints: GET /health, POST /pq/handshake, POST /pq/register-key, GET /pq/ws, ALL /api/*"
+    );
+    println!();
+    println!("{}", "═══════════════════════════════════════════════════════════════".cyan());
+    println!("{} {}", "ENROLLMENT TOKEN (one-time, prints once):".yellow().bold(), enrollment_token_print.bright_white().bold());
+    println!("{}", "Bootstrap a client by POSTing its PQ public keys + this".dimmed());
+    println!("{}", "token to POST /pq/register-key:".dimmed());
+    println!("{}", "  { token, name, x25519_pub, mlkem_ek }".dimmed());
+    println!("{}", "After first successful registration the token is consumed; further".dimmed());
+    println!("{}", "key changes must go through the established PQ session.".dimmed());
+    println!("{}", "═══════════════════════════════════════════════════════════════".cyan());
+    println!();
 
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await

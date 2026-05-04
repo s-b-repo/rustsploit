@@ -4,12 +4,16 @@
 // Discovery uses the build-time generated registry (via commands::discover_modules)
 // for reliable operation regardless of CWD.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use colored::*;
+use once_cell::sync::Lazy;
 use rand::prelude::IndexedRandom;
 
 use super::sanitize::MAX_MODULE_PATH_LENGTH;
@@ -26,8 +30,7 @@ pub fn module_exists(module_path: &str) -> bool {
     if module_path.contains("..") || module_path.contains("//") {
         return false;
     }
-    let modules = crate::commands::discover_modules();
-    modules.iter().any(|m| m == module_path)
+    crate::commands::discover_modules_cached().iter().any(|m| m == module_path)
 }
 
 /// Helper to get a random color for module display.
@@ -123,6 +126,76 @@ pub fn find_modules(keyword: &str) {
     }
 }
 
+// ----- Wordlist cache -------------------------------------------------------
+//
+// Many scanners load the same wordlist (e.g. rockyou.txt) multiple times in
+// a session. Keying by canonical path + mtime + len lets us share a single
+// `Arc<Vec<String>>` across scanners while still invalidating if the file is
+// edited mid-session.
+
+#[derive(Clone)]
+struct CachedWordlist {
+    lines: Arc<Vec<String>>,
+    mtime: Option<SystemTime>,
+    len: u64,
+}
+
+static WORDLIST_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedWordlist>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Cap so a scan that opens many distinct wordlists in a session can't pin
+/// memory indefinitely. Oldest entry is evicted when the cap is hit; we don't
+/// bother with LRU since the workload is "a handful of recurring lists".
+const WORDLIST_CACHE_MAX_ENTRIES: usize = 16;
+
+/// Load lines from a file with a process-wide cache. Returns an `Arc<Vec>`
+/// shared with any earlier identical load. Cache is keyed by canonical path
+/// + (mtime, len) so an in-place edit is detected on the next call.
+///
+/// Use this from scanner / bruteforce module hot paths where the same
+/// wordlist is loaded repeatedly in a session. For one-shot loads
+/// (`load_lines` callers that already cache themselves), the cache adds no
+/// value — keep using `load_lines`.
+pub fn load_lines_cached<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<String>>> {
+    let path = path.as_ref();
+    // Canonicalize so `./list.txt` and `/abs/list.txt` share a cache slot.
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("Failed to canonicalize '{}'", path.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("Failed to stat '{}'", canonical.display()))?;
+    let mtime = metadata.modified().ok();
+    let len = metadata.len();
+
+    {
+        let cache = WORDLIST_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.get(&canonical) {
+            if cached.len == len && cached.mtime == mtime {
+                return Ok(cached.lines.clone());
+            }
+        }
+    }
+
+    // Cache miss — load fresh. Honour the same size cap as `load_lines`.
+    let lines = Arc::new(load_lines(&canonical)?);
+
+    let mut cache = WORDLIST_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= WORDLIST_CACHE_MAX_ENTRIES {
+        // Evict an arbitrary entry (HashMap iteration order is randomised).
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(
+        canonical,
+        CachedWordlist {
+            lines: lines.clone(),
+            mtime,
+            len,
+        },
+    );
+    Ok(lines)
+}
+
 /// Helper to load lines from a file.
 pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let metadata = fs::metadata(path.as_ref())
@@ -138,6 +211,12 @@ pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let file = fs::File::open(path.as_ref())
         .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
     let reader = BufReader::new(file);
+    // `line.ok()` deliberately drops UTF-8 decode errors. Wordlists
+    // routinely contain stray non-UTF-8 bytes (binary garbage in scraped
+    // dumps); the policy is "skip the line, keep going" rather than
+    // failing the whole load. If a caller needs strict validation it
+    // should use `load_lines_strict` (does not exist yet — add only if
+    // a real caller surfaces).
     Ok(reader
         .lines()
         .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
@@ -164,6 +243,7 @@ where
     let mut total = 0usize;
     let mut batch = Vec::with_capacity(batch_size);
     for line in reader.lines() {
+        // Skip non-UTF-8 lines silently; same policy as load_lines (above).
         let line = match line {
             Ok(l) => l.trim().to_string(),
             Err(_) => continue,
@@ -193,6 +273,7 @@ pub fn load_lines_uncapped<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
     let file = fs::File::open(path.as_ref())
         .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
     let reader = BufReader::with_capacity(256 * 1024, file);
+    // Same UTF-8-skip policy as load_lines.
     Ok(reader
         .lines()
         .filter_map(|line| line.ok().map(|s| s.trim().to_string()))

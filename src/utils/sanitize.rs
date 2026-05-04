@@ -2,7 +2,7 @@
 //
 // Input sanitization, validation, and shell escaping utilities.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{Result, anyhow};
 use url::Url;
@@ -49,13 +49,16 @@ pub fn validate_safe_file_path(path: &str) -> Result<String> {
     if trimmed.len() > MAX_PATH_LENGTH {
         return Err(anyhow!("File path too long (max {} chars)", MAX_PATH_LENGTH));
     }
-    if trimmed.contains("..") {
+    let p = Path::new(trimmed);
+    // Reject `..` as a path component (ParentDir), not as a substring.
+    // The substring check rejects legitimate filenames like `myapp..backup`.
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(anyhow!("Path traversal detected: '..' is not allowed in file paths"));
     }
-    if trimmed.contains("//") {
-        return Err(anyhow!("Invalid path: double slashes are not allowed"));
-    }
-    let p = Path::new(trimmed);
+    // Fast-fail TOCTOU check: a symlink visible at this point in time. The
+    // consumer is still responsible for opening with O_NOFOLLOW (or the
+    // platform equivalent) since the path could be replaced between this
+    // check and any subsequent open() call.
     if let Ok(m) = p.symlink_metadata() {
         if m.file_type().is_symlink() {
             return Err(anyhow!("Symlinks are not allowed: {}", trimmed));
@@ -119,11 +122,10 @@ pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
             trimmed.len()
         ));
     }
-    if trimmed.contains("..") {
+    // Reject `..` as a path component (ParentDir), not as a substring.
+    // Substring check would also reject legitimate filenames like `foo..bar`.
+    if Path::new(trimmed).components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(anyhow!("Path traversal detected: '..' not allowed"));
-    }
-    if trimmed.contains("//") {
-        return Err(anyhow!("Invalid path format: double slashes not allowed"));
     }
     if trimmed.chars().any(|c| c.is_control()) {
         return Err(anyhow!("File path cannot contain control characters"));

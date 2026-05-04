@@ -43,15 +43,16 @@ struct EngagementExport {
 /// Workspace data is snapshotted in a single read to avoid mixing data
 /// across concurrent workspace switches.
 async fn gather_data() -> EngagementExport {
-    let workspace_name = crate::workspace::WORKSPACE.current_name().await;
-    let workspace_data = crate::workspace::WORKSPACE.get_data().await;
+    let s = crate::tenant::resolve();
+    let workspace_name = s.workspace().current_name().await;
+    let workspace_data = s.workspace().get_data().await;
     EngagementExport {
         workspace: workspace_name,
         exported_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         hosts: workspace_data.hosts,
         services: workspace_data.services,
-        credentials: crate::cred_store::CRED_STORE.list().await,
-        loot: crate::loot::LOOT_STORE.list().await,
+        credentials: s.cred_store().list().await,
+        loot: s.loot_store().list().await,
     }
 }
 

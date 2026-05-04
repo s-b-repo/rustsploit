@@ -7,12 +7,14 @@ pub mod modules;
 pub mod network;
 pub mod privilege;
 pub mod prompt;
+pub mod safe_io;
 pub mod sanitize;
 pub mod target;
+pub mod wordlist;
 
 use colored::*;
 
-pub use privilege::{require_root, set_secure_permissions, set_secure_permissions_async};
+pub use privilege::{is_root, require_root, set_secure_permissions};
 
 // ============================================================
 // URL ENCODING HELPER (replaces unmaintained `urlencoding` crate)
@@ -86,11 +88,22 @@ pub use target::{
     prompt_domain_target,
 };
 
+// --- safe_io.rs ---
+#[allow(unused_imports)]
+pub use safe_io::{
+    read_async_capped,
+    read_http_body_capped,
+    DEFAULT_BODY_CAP,
+};
+
 // --- network.rs ---
 pub use network::blocking_tcp_connect;
 pub use network::blocking_udp_bind;
 pub use network::build_http_client;
 pub use network::get_global_source_port;
+pub use network::header_string;
+pub use network::http_get_status_body;
+pub use network::http_get_status_headers_body;
 pub use network::tcp_connect_str;
 pub use network::tcp_port_open;
 pub use network::udp_bind;
@@ -106,6 +119,7 @@ pub use modules::{
     list_all_modules,
     load_lines,
     load_lines_batched,
+    load_lines_cached,
     load_lines_uncapped,
     file_size,
     module_exists,

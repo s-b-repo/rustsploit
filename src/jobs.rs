@@ -4,9 +4,12 @@ use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
 
+use rand::RngExt;
+
 use colored::*;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize)]
 pub enum JobEvent {
@@ -47,6 +50,7 @@ pub struct JobProgress {
 }
 
 const MAX_OUTPUT_LINES: usize = 5000;
+const MAX_LINE_BYTES: usize = 10_240;
 
 impl JobProgress {
     pub fn new() -> Arc<Self> {
@@ -61,11 +65,19 @@ impl JobProgress {
     }
 
     pub fn push_line(&self, line: String) {
+        let capped = if line.len() > MAX_LINE_BYTES {
+            let mut t = line;
+            t.truncate(MAX_LINE_BYTES);
+            t.push_str(" [truncated]");
+            t
+        } else {
+            line
+        };
         if let Ok(mut buf) = self.output.write() {
             if buf.len() >= MAX_OUTPUT_LINES {
                 buf.pop_front();
             }
-            buf.push_back(line);
+            buf.push_back(capped);
         }
         self.total_lines_pushed.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut ts) = self.last_activity.write() {
@@ -96,7 +108,13 @@ pub struct Job {
     pub status: JobStatus,
     pub progress: Arc<JobProgress>,
     finished_at: Option<std::time::Instant>,
+    /// Lifecycle signal observed by the outer `tokio::select!` arm in `spawn`.
+    /// Triggered together with `cancel_token` from `kill`.
     cancel_tx: watch::Sender<bool>,
+    /// Cooperative-cancellation signal passed into the module's `RunContext`.
+    /// Module loops can poll `crate::context::is_cancelled()` to terminate
+    /// gracefully when `kill` is invoked.
+    cancel_token: CancellationToken,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -107,22 +125,30 @@ const DEFAULT_MAX_RUNNING: usize = 5;
 /// Manages background jobs.
 pub struct JobManager {
     jobs: RwLock<HashMap<u32, Job>>,
-    next_id: AtomicU32,
     max_running: AtomicU32,
     event_tx: broadcast::Sender<JobEvent>,
 }
 
 impl JobManager {
-    fn new() -> Self {
-        use rand::RngExt;
-        let start = rand::rng().random_range(1..(1u32 << 24));
+    pub(crate) fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             jobs: RwLock::new(HashMap::new()),
-            next_id: AtomicU32::new(start),
             max_running: AtomicU32::new(DEFAULT_MAX_RUNNING as u32),
             event_tx,
         }
+    }
+
+    /// P1-2: generate an unpredictable u32 job ID across the full 32-bit space
+    /// (skipping 0). Sequential IDs let one tenant guess another tenant's
+    /// `jobId` and subscribe to / kill it. With MAX_JOBS = 1000 the birthday
+    /// collision probability is ~1.2e-4 per spawn — the retry loop in `spawn`
+    /// covers the rare hit.
+    fn fresh_id() -> u32 {
+        let mut rng = rand::rng();
+        let mut id: u32 = rng.random();
+        if id == 0 { id = 1; }
+        id
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
@@ -166,9 +192,9 @@ impl JobManager {
             ));
         }
 
-        let mut id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut id = Self::fresh_id();
         while jobs.contains_key(&id) {
-            id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            id = Self::fresh_id();
         }
 
         if jobs.len() >= MAX_JOBS {
@@ -191,6 +217,8 @@ impl JobManager {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_token = CancellationToken::new();
+        let cancel_token_for_task = cancel_token.clone();
         let progress = JobProgress::new();
         let prog_clone = progress.clone();
         let mod_clone = module.clone();
@@ -202,24 +230,46 @@ impl JobManager {
         let handle = tokio::spawn(async move {
             let mut rx = cancel_rx;
             prog_clone.push_line(format!("[*] Starting {} against {}", mod_clone, tgt_clone));
+            // P2-A10 / P3-15: catch panics from inside the module so the job
+            // surfaces as Failed instead of staying "Running" forever after
+            // `tokio::spawn` swallows the panic. Requires `AssertUnwindSafe`
+            // because the inner future closes over arbitrary module state.
+            use futures::FutureExt;
+            use std::panic::AssertUnwindSafe;
             let run_fut = {
                 let m = mod_clone.clone();
                 let t = tgt_clone.clone();
-                async move {
+                let token = cancel_token_for_task;
+                AssertUnwindSafe(async move {
                     if let Some(cfg) = config {
-                        let (result, _ctx) = crate::context::run_with_context_target(
+                        let (result, _ctx) = crate::context::run_with_context_target_and_cancel(
                             cfg,
                             t.clone(),
+                            token,
                             || async move { crate::commands::run_module(&m, &t, verbose).await },
                         ).await;
                         result
                     } else {
                         crate::commands::run_module(&m, &t, verbose).await
                     }
-                }
+                })
+                .catch_unwind()
             };
             tokio::select! {
                 result = run_fut => {
+                    let result = match result {
+                        Ok(inner) => inner,
+                        Err(panic) => {
+                            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                                format!("module panicked: {}", s)
+                            } else if let Some(s) = panic.downcast_ref::<String>() {
+                                format!("module panicked: {}", s)
+                            } else {
+                                "module panicked (unknown payload)".to_string()
+                            };
+                            Err(anyhow::anyhow!(msg))
+                        }
+                    };
                     match result {
                         Ok(_) => {
                             prog_clone.push_line(format!("[+] Completed: {} against {}", mod_clone, tgt_clone));
@@ -257,6 +307,7 @@ impl JobManager {
             progress: progress.clone(),
             finished_at: None,
             cancel_tx,
+            cancel_token,
             handle: Some(handle),
         });
         drop(jobs);
@@ -276,7 +327,10 @@ impl JobManager {
         let handle_and_tx = {
             let mut jobs = match self.jobs.write() {
                 Ok(j) => j,
-                Err(_) => return false,
+                Err(e) => {
+                    tracing::warn!(job_id = id, "JobManager write lock poisoned during kill: {}", e);
+                    return false;
+                }
             };
             let job = match jobs.get_mut(&id) {
                 Some(j) => j,
@@ -285,6 +339,10 @@ impl JobManager {
             if let Err(e) = job.cancel_tx.send(true) {
                 crate::meprintln!("[!] Job cancel signal error: {}", e);
             }
+            // Trigger cooperative cancellation visible to module code via
+            // `crate::context::is_cancelled()`. Idempotent — safe to call
+            // even if the watch::Sender already fired.
+            job.cancel_token.cancel();
             job.status = JobStatus::Cancelled;
             if job.finished_at.is_none() {
                 job.finished_at = Some(std::time::Instant::now());
@@ -293,9 +351,13 @@ impl JobManager {
         };
         if let Some(handle) = handle_and_tx {
             let abort_handle = handle.abort_handle();
+            // Fire-and-forget cleanup: give the job 2s to honour the
+            // cooperative cancel before we hard-abort. We log via tracing
+            // so a panic in the cleanup task isn't silently swallowed.
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 if !handle.is_finished() {
+                    tracing::debug!("Job did not exit within 2s — hard-aborting");
                     abort_handle.abort();
                 }
             });

@@ -117,7 +117,7 @@ pub fn sum_16(data: &[u8], init: u32) -> u32 {
 /// Check if the global `spoof_ip` option is enabled (`setg spoof_ip true`).
 /// Returns false if not set or set to anything other than true/1/yes.
 pub fn is_spoof_enabled() -> bool {
-    crate::global_options::GLOBAL_OPTIONS.try_get("spoof_ip")
+    crate::tenant::resolve().global_options().try_get("spoof_ip")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false)
 }

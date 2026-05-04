@@ -26,6 +26,9 @@ fn display_banner() {
 
 /// Module entry point for raising ulimit
 pub async fn run(target: &str) -> Result<()> {
+    if crate::utils::is_mass_scan_target(target) {
+        anyhow::bail!("enablebruteforce does not support mass-scan targets — it raises the local process file-descriptor limit (ulimit), no remote interaction");
+    }
     // Target parameter is part of standard module interface
     // For ulimit operations, target is informational only
     if !target.is_empty() {

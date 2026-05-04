@@ -402,11 +402,13 @@ fn str_param<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn u16_param(args: &Value, key: &str) -> Option<u16> {
-    args.get(key).and_then(|v| v.as_u64()).map(|n| n as u16)
+    // try_from rejects out-of-range — `as u16` would silently wrap, e.g.
+    // {"port": 70000} → 4464, bypassing every downstream port check.
+    args.get(key).and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok())
 }
 
 fn u32_param(args: &Value, key: &str) -> Option<u32> {
-    args.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
+    args.get(key).and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
 }
 
 fn bool_param(args: &Value, key: &str) -> Option<bool> {

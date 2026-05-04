@@ -987,17 +987,17 @@ fn mutator_encode_url(payload: &str) -> Vec<String> {
 }
 
 fn mutator_encode_double_url(payload: &str) -> Vec<String> {
-    let double = payload
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_string()
-            } else {
-                let hex = format!("{:02X}", c as u8);
-                format!("%25{}", hex)
-            }
-        })
-        .collect::<String>();
+    let mut double = String::with_capacity(payload.len() * 5);
+    for c in payload.chars() {
+        if c.is_ascii_alphanumeric() {
+            double.push(c);
+        } else {
+            let pair = crate::native::hex::byte_to_upper(c as u8);
+            double.push_str("%25");
+            double.push(pair[0] as char);
+            double.push(pair[1] as char);
+        }
+    }
     vec![double]
 }
 

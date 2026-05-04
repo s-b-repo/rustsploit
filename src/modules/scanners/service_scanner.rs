@@ -151,12 +151,14 @@ pub async fn run(target: &str) -> Result<()> {
 
     let mut handles = Vec::with_capacity(ports.len());
     for port in &ports {
+        if crate::context::is_cancelled() { break; }
         let permit = semaphore.clone().acquire_owned().await?;
         let tgt = target_str.clone();
         let p = *port;
         let to = timeout_secs;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
+            if crate::context::is_cancelled() { return None; }
             probe_service(&tgt, p, to).await
         }));
     }
@@ -164,7 +166,18 @@ pub async fn run(target: &str) -> Result<()> {
     let mut results: Vec<ServiceResult> = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok(Some(r)) => results.push(r),
+            Ok(Some(r)) => {
+                // Surface every detected service on the structured event bus
+                // so API/MCP/WS subscribers see findings as they arrive, not
+                // only at the end via the printed table.
+                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                    host: target_str.clone(),
+                    port: r.port,
+                    service: r.service.clone(),
+                    version: if r.version.is_empty() { None } else { Some(r.version.clone()) },
+                });
+                results.push(r);
+            }
             Ok(None) => {}
             Err(_) => {}
         }
@@ -378,12 +391,9 @@ fn parse_port_list(input: &str) -> Result<Vec<u16>> {
 
 async fn mass_scan_probe(ip: &str, port: u16) -> Option<String> {
     let addr = format!("{}:{}", ip, port);
-    let stream = timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+    let mut stream = crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(3))
         .await
-        .ok()?
         .ok()?;
-
-    let mut stream = stream;
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         ip
@@ -417,9 +427,12 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
     let addr = format!("{}:{}", target, port);
     let dur = Duration::from_secs(timeout_secs);
 
-    let stream = match timeout(dur, TcpStream::connect(&addr)).await {
-        Ok(Ok(s)) => s,
-        _ => return None,
+    let stream = match crate::utils::network::tcp_connect_str(&addr, dur).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::trace!(target = %addr, port, "service probe connect failed: {}", e);
+            return None;
+        }
     };
 
     let result = match port {

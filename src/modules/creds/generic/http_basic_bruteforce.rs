@@ -10,6 +10,7 @@ use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
+use crate::utils::network::build_http_client;
 use crate::utils::{
     BruteforceConfig, LoginResult, SubnetScanConfig,
     generate_combos_mode, parse_combo_mode, load_credential_file,
@@ -164,13 +165,12 @@ pub async fn run(target: &str) -> Result<()> {
                 let base_url = format!("{}://{}:{}{}", scheme, ip, port, url_path);
 
                 // First check if endpoint requires Basic auth (401 response)
-                let client = match reqwest::Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                {
+                let client = match build_http_client(Duration::from_secs(5)) {
                     Ok(c) => c,
-                    Err(_) => return None,
+                    Err(e) => {
+                        tracing::trace!(ip = %ip, port, "HTTP basic-auth client build failed: {}", e);
+                        return None;
+                    }
                 };
 
                 match client.get(&base_url).send().await {
@@ -239,12 +239,12 @@ pub async fn run(target: &str) -> Result<()> {
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output result file", "http_basic_subnet_results.txt").await?;
 
-        let subnet_client = Arc::new(reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?);
+        // build_http_client already disables redirects (its default) and
+        // accepts invalid certs — same shape, one canonical builder.
+        let subnet_client = Arc::new(
+            build_http_client(Duration::from_secs(5))
+                .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?,
+        );
 
         return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
@@ -371,12 +371,10 @@ pub async fn run(target: &str) -> Result<()> {
         combos.extend(load_credential_file(&cred_path)?);
     }
 
-    let shared_client = Arc::new(reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(connection_timeout))
-        .build()
-        .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?);
+    let shared_client = Arc::new(
+        build_http_client(Duration::from_secs(connection_timeout))
+            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?,
+    );
 
     let try_login = move |_t: String, _p: u16, user: String, pass: String| {
         let url = base_url.clone();

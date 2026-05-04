@@ -86,6 +86,9 @@ async fn resolve_subdomain(fqdn: &str, timeout_dur: Duration) -> Option<Vec<Stri
 }
 
 pub async fn run(target: &str) -> Result<()> {
+    if crate::utils::is_mass_scan_target(target) {
+        anyhow::bail!("subdomain_scanner does not support mass-scan targets — it brute-forces DNS subdomains, target must be a registrable domain like example.com");
+    }
     display_banner();
 
     // Clean domain: strip protocol, paths, ports
@@ -115,25 +118,51 @@ pub async fn run(target: &str) -> Result<()> {
 
     let timeout_dur = Duration::from_secs(timeout_secs);
 
-    // Load wordlist
-    let subdomains: Vec<String> = if wordlist_choice == "built-in" || wordlist_choice.is_empty() {
-        DEFAULT_SUBDOMAINS.iter().map(|s| s.to_string()).collect()
+    // Decide between in-memory load and streaming-batched load.
+    // Wordlists <= STREAM_THRESHOLD load fully (cheap, simple); larger wordlists
+    // stream in BATCH_SIZE-line batches so memory usage stays bounded.
+    const STREAM_THRESHOLD: u64 = 10 * 1024 * 1024;
+    const BATCH_SIZE: usize = 100_000;
+
+    enum WordlistSource {
+        InMemory(Vec<String>),
+        Streaming { path: String, size: u64 },
+    }
+
+    let source = if wordlist_choice == "built-in" || wordlist_choice.is_empty() {
+        WordlistSource::InMemory(DEFAULT_SUBDOMAINS.iter().map(|s| s.to_string()).collect())
     } else {
-        // Cap wordlist at 10MB to prevent OOM
-        let meta = std::fs::metadata(&wordlist_choice)
+        let meta = tokio::fs::metadata(&wordlist_choice).await
             .with_context(|| format!("Cannot stat wordlist: {}", wordlist_choice))?;
-        if meta.len() > 10 * 1024 * 1024 {
-            return Err(anyhow!("Wordlist too large ({:.1}MB, max 10MB)", meta.len() as f64 / (1024.0 * 1024.0)));
+        if meta.len() > STREAM_THRESHOLD {
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[*] Large wordlist detected ({:.1} MB) — streaming in batches of {}",
+                    meta.len() as f64 / (1024.0 * 1024.0),
+                    BATCH_SIZE
+                ).cyan()
+            );
+            WordlistSource::Streaming { path: wordlist_choice.clone(), size: meta.len() }
+        } else {
+            let content = tokio::fs::read_to_string(&wordlist_choice).await
+                .with_context(|| format!("Failed to read wordlist: {}", wordlist_choice))?;
+            let v: Vec<String> = content.lines()
+                .map(|l| l.trim().to_lowercase())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            WordlistSource::InMemory(v)
         }
-        let content = std::fs::read_to_string(&wordlist_choice)
-            .with_context(|| format!("Failed to read wordlist: {}", wordlist_choice))?;
-        content.lines()
-            .map(|l| l.trim().to_lowercase())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
     };
 
-    crate::mprintln!("{}", format!("[*] Loaded {} subdomains to test", subdomains.len()).cyan());
+    match &source {
+        WordlistSource::InMemory(v) => {
+            crate::mprintln!("{}", format!("[*] Loaded {} subdomains to test", v.len()).cyan());
+        }
+        WordlistSource::Streaming { size, .. } => {
+            crate::mprintln!("{}", format!("[*] Streaming wordlist ({:.1} MB, total unknown until processed)", *size as f64 / (1024.0 * 1024.0)).cyan());
+        }
+    }
     crate::mprintln!("{}", format!("[*] Concurrency: {}, Timeout: {}s", concurrency, timeout_secs).dimmed());
 
     // Wildcard detection: test multiple random non-existent subdomains to reduce false negatives
@@ -169,62 +198,117 @@ pub async fn run(target: &str) -> Result<()> {
     let tested = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicU64::new(0));
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let total = subdomains.len() as u64;
+    let wf_outer = wildcard_filter.clone();
 
-    let mut handles = Vec::new();
+    // Process a single batch of subdomains: spawn per-name resolution tasks
+    // and await them all before returning. Memory peaks at one batch.
+    async fn scan_batch(
+        batch: Vec<String>,
+        domain: &str,
+        timeout_dur: Duration,
+        wildcard_filter: Option<Vec<String>>,
+        results: Arc<tokio::sync::Mutex<Vec<SubdomainResult>>>,
+        tested: Arc<AtomicU64>,
+        found: Arc<AtomicU64>,
+        semaphore: Arc<Semaphore>,
+    ) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for sub in batch {
+            // Acquire the permit BEFORE tokio::spawn so that a 100k-line batch
+            // doesn't materialize 100k task structs at once.
+            let permit = match Arc::clone(&semaphore).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let domain = domain.to_string();
+            let results = Arc::clone(&results);
+            let tested = Arc::clone(&tested);
+            let found = Arc::clone(&found);
+            let wf = wildcard_filter.clone();
 
-    let wf = wildcard_filter.clone();
-    for sub in subdomains {
-        let domain = domain.clone();
-        let results = Arc::clone(&results);
-        let tested = Arc::clone(&tested);
-        let found = Arc::clone(&found);
-        let semaphore = Arc::clone(&semaphore);
-        let wf = wf.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                if crate::context::is_cancelled() { return; }
+                let fqdn = format!("{}.{}", sub, domain);
 
-        let handle = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await;
-            let fqdn = format!("{}.{}", sub, domain);
-
-            if let Some(ips) = resolve_subdomain(&fqdn, timeout_dur).await {
-                // Filter out wildcard results
-                if let Some(ref wildcard_ips) = wf {
-                    if ips == *wildcard_ips {
-                        // Same IPs as wildcard — skip
-                        tested.fetch_add(1, Ordering::Relaxed);
-                        return;
+                if let Some(ips) = resolve_subdomain(&fqdn, timeout_dur).await {
+                    if let Some(ref wildcard_ips) = wf {
+                        if ips == *wildcard_ips {
+                            tested.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                     }
+                    crate::mprintln!("{}", format!("[+] {} -> {}", fqdn, ips.join(", ")).green());
+                    found.fetch_add(1, Ordering::Relaxed);
+                    crate::events::emit(crate::events::ModuleEvent::HostUp {
+                        host: fqdn.clone(),
+                    });
+                    results.lock().await.push(SubdomainResult { subdomain: fqdn, ips });
                 }
-                crate::mprintln!("{}", format!("[+] {} -> {}", fqdn, ips.join(", ")).green());
-                found.fetch_add(1, Ordering::Relaxed);
-                results.lock().await.push(SubdomainResult {
-                    subdomain: fqdn,
-                    ips,
-                });
-            }
 
-            let done = tested.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 50 == 0 || done == total {
-                crate::mprint!("\r{} {}/{} tested, {} found    ",
-                    "[Progress]".cyan(),
-                    done, total,
-                    found.load(Ordering::Relaxed).to_string().green()
-                );
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-        });
-
-        handles.push(handle);
+                let done = tested.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 50 == 0 {
+                    crate::mprint!("\r{} {} tested, {} found    ",
+                        "[Progress]".cyan(),
+                        done,
+                        found.load(Ordering::Relaxed).to_string().green()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }));
+        }
+        for h in handles { let _ = h.await; }
     }
 
-    for handle in handles {
-        let _ = handle.await;
+    match source {
+        WordlistSource::InMemory(batch) => {
+            scan_batch(
+                batch, &domain, timeout_dur, wf_outer.clone(),
+                Arc::clone(&results), Arc::clone(&tested), Arc::clone(&found), Arc::clone(&semaphore),
+            ).await;
+        }
+        WordlistSource::Streaming { path, size: _ } => {
+            // Read batches on a blocking thread, send to async side via channel.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
+            let read_path = path.clone();
+            let reader_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                crate::utils::load_lines_batched(&read_path, BATCH_SIZE, |raw_batch| {
+                    // normalize per-line (lowercase, drop comments) on the reader thread
+                    let cleaned: Vec<String> = raw_batch.into_iter()
+                        .map(|l| l.trim().to_lowercase())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .collect();
+                    if !cleaned.is_empty() {
+                        let _ = tx.blocking_send(cleaned);
+                    }
+                })
+            });
+
+            let mut batch_idx = 0usize;
+            while let Some(batch) = rx.recv().await {
+                batch_idx += 1;
+                crate::mprintln!("{}", format!("[*] Batch {}: {} entries", batch_idx, batch.len()).cyan());
+                scan_batch(
+                    batch, &domain, timeout_dur, wf_outer.clone(),
+                    Arc::clone(&results), Arc::clone(&tested), Arc::clone(&found), Arc::clone(&semaphore),
+                ).await;
+            }
+
+            match reader_handle.await {
+                Ok(Ok(total_lines)) => {
+                    crate::mprintln!("{}", format!("[*] Streamed {} total lines from wordlist", total_lines).dimmed());
+                }
+                Ok(Err(e)) => crate::meprintln!("[!] Wordlist read error: {}", e),
+                Err(e) => crate::meprintln!("[!] Wordlist reader task panicked: {}", e),
+            }
+        }
     }
 
     crate::mprintln!(); // Clear progress line
 
     let results = results.lock().await;
     let found_count = results.len();
+    let total = tested.load(Ordering::Relaxed);
 
     // Summary
     crate::mprintln!();

@@ -48,12 +48,17 @@ pub struct CredStore {
 
 impl CredStore {
     fn new() -> Self {
-        let file_path = home::home_dir()
+        let base = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".rustsploit")
-            .join("creds.json");
+            .join(".rustsploit");
+        Self::with_base_dir(base)
+    }
 
-        // Synchronous load at init time (called once from Lazy)
+    /// Create a credential store under a custom base directory.
+    pub(crate) fn with_base_dir(base: PathBuf) -> Self {
+        let file_path = base.join("creds.json");
+
+        // Synchronous load at init time
         let entries = if file_path.exists() {
             match std::fs::read_to_string(&file_path) {
                 Ok(contents) => match serde_json::from_str(&contents) {
@@ -68,7 +73,12 @@ impl CredStore {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Failed to read creds.json: {}", e);
+                    // Read errors here are typically EACCES/EIO — back up the
+                    // unreadable file so we don't silently overwrite a user's
+                    // creds with an empty store.
+                    eprintln!("[!] Failed to read creds.json: {}. Preserving original.", e);
+                    let backup = file_path.with_extension("json.unreadable");
+                    let _ = std::fs::rename(&file_path, &backup);
                     Vec::new()
                 }
             }
@@ -116,12 +126,16 @@ impl CredStore {
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             valid: true,
         };
-        let snapshot = {
+        // P1-1: hold the write lock across the disk save. Previous code
+        // released the lock before calling `save_locked`, letting two
+        // concurrent writers land disk writes in the wrong order — disk
+        // and in-memory state could diverge after restart.
+        {
             let mut entries = self.entries.write().await;
             entries.push(entry);
-            entries.clone()
-        };
-        self.save_locked(&snapshot).await;
+            let snapshot = entries.clone();
+            self.save_locked(&snapshot).await;
+        }
         Some(id)
     }
 
@@ -142,18 +156,15 @@ impl CredStore {
 
     /// Delete a credential by ID.
     pub async fn delete(&self, id: &str) -> bool {
-        let snapshot = {
-            let mut entries = self.entries.write().await;
-            let before = entries.len();
-            entries.retain(|e| e.id != id);
-            if entries.len() < before {
-                Some(entries.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(data) = snapshot {
-            self.save_locked(&data).await;
+        // P1-1: same lock-during-save fix as `add()`. Holding the write
+        // lock through the disk write keeps in-memory and on-disk state in
+        // agreement under concurrent ops.
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|e| e.id != id);
+        if entries.len() < before {
+            let snapshot = entries.clone();
+            self.save_locked(&snapshot).await;
             return true;
         }
         false
@@ -161,10 +172,9 @@ impl CredStore {
 
     /// Clear all credentials.
     pub async fn clear(&self) {
-        {
-            self.entries.write().await.clear();
-        }
-        self.save_locked(&[]).await;
+        let mut entries = self.entries.write().await;
+        entries.clear();
+        self.save_locked(&entries).await;
     }
 
     async fn save_locked(&self, entries: &[CredEntry]) {
@@ -183,14 +193,16 @@ impl CredStore {
             }
         };
         {
-            let file = match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .await
+            // P1-7: O_NOFOLLOW + create-with-mode atomically. A symlink raced
+            // into place between create and open would otherwise redirect the
+            // write to a privileged path with the credentials' contents.
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            #[cfg(unix)]
             {
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = match opts.open(&tmp).await {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[!] Failed to write temp creds file: {}", e);
@@ -254,6 +266,7 @@ impl CredStore {
 pub static CRED_STORE: Lazy<CredStore> = Lazy::new(CredStore::new);
 
 /// Convenience function for modules to store a discovered credential.
+/// Routes through the tenant registry when in a tenant context (API mode).
 pub async fn store_credential(
     host: &str,
     port: u16,
@@ -263,5 +276,6 @@ pub async fn store_credential(
     cred_type: CredType,
     source_module: &str,
 ) -> Option<String> {
-    CRED_STORE.add(host, port, service, username, secret, cred_type, source_module).await
+    let s = crate::tenant::resolve();
+    s.cred_store().add(host, port, service, username, secret, cred_type, source_module).await
 }

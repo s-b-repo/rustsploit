@@ -128,7 +128,10 @@ fn grab_ssh_banner(host: &str, port: u16, timeout_secs: u64) -> Option<String> {
     // Resolve and connect
     let addrs: Vec<SocketAddr> = match addr_str.to_socket_addrs() {
         Ok(a) => a.collect(),
-        Err(_) => return None,
+        Err(e) => {
+            tracing::trace!(target = %addr_str, "SSH scanner DNS resolve failed: {}", e);
+            return None;
+        }
     };
     
     if addrs.is_empty() {
@@ -270,20 +273,22 @@ pub async fn scan_ssh(
     
     // Scan tasks
     let mut handles = Vec::new();
-    
+
     for (host, port) in targets {
+        if crate::context::is_cancelled() { break; }
         let semaphore = Arc::clone(&semaphore);
         let results = Arc::clone(&results);
         let stats = Arc::clone(&stats);
-        
+
         let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
             let _permit = semaphore.acquire().await.context("Semaphore acquisition failed")?;
-            
+            if crate::context::is_cancelled() { return Ok(()); }
+
             let host_clone = host.clone();
             let result = spawn_blocking(move || {
                 grab_ssh_banner(&host_clone, port, timeout_secs)
             }).await;
-            
+
             match result {
                 Ok(Some(banner)) => {
                     stats.record_scan(true, false);
@@ -294,6 +299,12 @@ pub async fn scan_ssh(
                     };
                     crate::mprintln!("\r{}", format!("[+] {}:{} - {}", host, port, banner).green());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: host.clone(),
+                        port,
+                        service: "SSH".to_string(),
+                        version: Some(banner.clone()),
+                    });
                     results.lock().await.push(result);
                 }
                 Ok(None) => {

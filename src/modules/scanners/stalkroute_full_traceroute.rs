@@ -356,10 +356,15 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 
 
     for ttl_val in 1..=MAX_TTL {
+        if crate::context::is_cancelled() {
+            crate::mprintln!("{}", "[!] Cancelled — stopping traceroute".yellow());
+            break;
+        }
         let line_prefix = format!("[TTL={:2}] ", ttl_val).yellow().to_string();
         let mut ttl_responded = false;
 
         for _probe_idx in 0..PROBE_COUNT {
+            if crate::context::is_cancelled() { break; }
             // Scope RNG to avoid holding it across await
             let (icmp_probe_id, packet_bytes, protocol_used, os_sig_params) = {
                 let mut rng = rand::rng();
@@ -390,6 +395,12 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 ttl_responded = true;
                 let rtt_str = format!("{:.1}ms", res.rtt_ms);
 
+                // Surface every responding hop on the structured event bus so
+                // subscribers can build a topology view from the trace.
+                crate::events::emit(crate::events::ModuleEvent::HostUp {
+                    host: res.source_ip.to_string(),
+                });
+
                 crate::mprint!("{}{:<16} ", line_prefix, res.source_ip.to_string().bright_white());
                 crate::mprint!("{} ", res.icmp_info.description);
                 crate::mprintln!("({}) {}", res.probe_protocol_used.dimmed(), rtt_str);
@@ -419,6 +430,9 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 }
 
 pub async fn run(target: &str) -> Result<()> {
+    if crate::utils::is_mass_scan_target(target) {
+        anyhow::bail!("stalkroute_full_traceroute does not support `0.0.0.0`/random mass-scan targets — it traceroutes a single host, target must be a specific IP or hostname");
+    }
     crate::utils::require_root("stalkroute_full_traceroute (raw ICMP/TCP/UDP probes)")?;
 
     crate::mprintln!("by suicidalteddy");

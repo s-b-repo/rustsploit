@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines};
+use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines, load_lines_cached};
 use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::native::payload_engine::{self as payload_mutator, PayloadCategory, MutatorConfig};
 use serde_json::json;
@@ -429,15 +429,15 @@ fn parse_endpoint_file(path: &str) -> Result<Vec<Endpoint>> {
 async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str, wordlist_path: &str, concurrency: usize) -> Result<Vec<Endpoint>> {
     crate::mprintln!("{}", "\n[*] Starting Endpoint Enumeration...".cyan());
     
-    let lines = load_lines(wordlist_path)?;
+    let lines = load_lines_cached(wordlist_path)?;
     if lines.is_empty() {
         return Err(anyhow!("Wordlist is empty"));
     }
     let total = lines.len();
     crate::mprintln!("[*] Enumerating {} potential endpoints with concurrency {}", total, concurrency);
-    
-    let base_url = format!("{}{}", 
-        target_base.trim_end_matches('/'), 
+
+    let base_url = format!("{}{}",
+        target_base.trim_end_matches('/'),
         if base_path.starts_with('/') { base_path.to_string() } else { format!("/{}", base_path) }
     );
     // Ensure base_url ends with / for appending words
@@ -448,8 +448,9 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
     // Bug 6: Calculate base path prefix once outside loop
     let clean_base_path = if base_path.starts_with('/') { base_path.to_string() } else { format!("/{}", base_path) };
 
-    // Use a stream that returns Option<Endpoint> instead of locking a shared Vec
-    let stream = stream::iter(lines)
+    // Use a stream that returns Option<Endpoint> instead of locking a shared Vec.
+    // The stream consumes by value, so clone out of the cached `Arc<Vec<_>>`.
+    let stream = stream::iter(lines.iter().cloned().collect::<Vec<_>>())
         .map(|word| {
             let client = client.clone();
             let counter = Arc::clone(&counter);
@@ -678,12 +679,16 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
              Ok(resp) => {
                  let status = resp.status();
                  if status != reqwest::StatusCode::NOT_FOUND {
-                      // Log hit
-                      // Log hit with shared handle
                       // Log hit with shared handle
                       if let Err(e) = run_enum_logging_handle(&mut results_file_handle, &payload, &label, status, &target_url) {
                           crate::meprintln!("[!] Logging failed: {}", e);
                       }
+                      crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                          host: target_url.clone(),
+                          port: 0,
+                          service: format!("api-endpoint:{}", label),
+                          version: Some(format!("status={}", status.as_u16())),
+                      });
                       
                       // If 200, save body
                        if status.is_success() {

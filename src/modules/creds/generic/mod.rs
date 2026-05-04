@@ -5,6 +5,7 @@
     pub mod fortinet_bruteforce;
     pub mod ftp_anonymous;
     pub mod ftp_bruteforce;
+    pub mod h3c_oem_kvm_bruteforce;
     pub mod http_basic_bruteforce;
     pub mod imap_bruteforce;
     pub mod l2tp_bruteforce;

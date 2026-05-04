@@ -3,7 +3,7 @@ use suppaftp::tokio::AsyncFtpStream;
 use colored::*;
 use ssh2::Session;
 use telnet::{Telnet, Event};
-use std::{net::TcpStream, time::Duration};
+use std::time::Duration;
 use tokio::{join, task};
 use crate::utils::url_encode;
 use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
@@ -84,7 +84,10 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
                 }
                 let _ = ftp.quit().await;
             }
-            Err(_) => continue,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "FTP login attempt failed: {}", e);
+                continue;
+            }
         }
     }
 
@@ -104,9 +107,14 @@ pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String
         let address = normalize_target(&config.target, config.port);
         let socket_addr: std::net::SocketAddr = match address.parse() {
             Ok(sa) => sa,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(addr = %address, "SSH target parse failed: {}", e);
+                continue;
+            }
         };
-        if let Ok(stream) = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+        // libssh2 needs a blocking std stream — blocking_tcp_connect honors
+        // `setg src_port` which the raw connect_timeout silently skipped.
+        if let Ok(stream) = crate::utils::network::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
             let mut session = Session::new().context("Failed to create SSH session")?;
             session.set_tcp_stream(stream);
             session.handshake().context("SSH handshake failed")?;
@@ -197,7 +205,10 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
 
         let body = match res.text().await {
             Ok(t) => t,
-            Err(_) => String::new(),
+            Err(e) => {
+                tracing::debug!(target = %config.target, port = config.port, "HTTP form response body read failed: {}", e);
+                String::new()
+            }
         };
 
         if !body.contains(">Password<") {
@@ -242,7 +253,13 @@ pub async fn run(target: &str) -> Result<()> {
                     .await
                     .ok()?;
                 if resp.status().is_success() || resp.status().as_u16() == 301 || resp.status().as_u16() == 302 {
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = match resp.text().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
+                            String::new()
+                        }
+                    };
                     if !body.contains("401") && !body.to_lowercase().contains("unauthorized") {
                         let msg = format!("{}:{}:HTTP:{}:{}", ip, port, user, pass);
                         crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());

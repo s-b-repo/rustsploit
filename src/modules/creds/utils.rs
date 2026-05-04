@@ -503,7 +503,7 @@ where
             "{}",
             "[*] Mode: Random Internet Scan (Ctrl+C to stop)".yellow()
         );
-        let max_checks: usize = crate::global_options::GLOBAL_OPTIONS
+        let max_checks: usize = crate::tenant::resolve().global_options()
             .try_get("max_random_hosts")
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000_000);

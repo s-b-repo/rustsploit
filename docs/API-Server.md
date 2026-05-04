@@ -42,8 +42,8 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 ### How it works
 
 1. **Server** has a host key pair (ML-KEM-768 + X25519) stored at `~/.rustsploit/pq_host_key`
-2. **Client** has an identity key pair per tenant, stored encrypted in ArcticAlopex's database
-3. Client's public key must be listed in `~/.rustsploit/pq_authorized_keys`
+2. **Client** has its own identity key pair (ML-KEM-768 + X25519), persisted however the client sees fit (e.g. encrypted at rest in a database, in a keychain, or on disk)
+3. Client's public key must be listed in `~/.rustsploit/pq_authorized_keys` — populated via the one-time `POST /pq/register-key` flow at first contact, or by hand-editing the file
 4. On first connection, client and server perform a **mutual authentication handshake** at `POST /pq/handshake`
 5. Both sides prove key ownership via DH proof-of-possession
 6. Session keys are derived from 3 shared secrets: ephemeral X25519 DH + identity X25519 DH + ML-KEM-768

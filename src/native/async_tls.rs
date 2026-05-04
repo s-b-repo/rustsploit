@@ -5,13 +5,21 @@
 // were copy-pasted across mqtt_bruteforce, tapo_c200_vulns, fortisiem, etc.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::TlsConnector;
+
+/// Default upper bound on TLS handshake duration. Prevents a slow/malicious
+/// peer from hanging a worker indefinitely.
+#[allow(dead_code)]
+pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A `ServerCertVerifier` that accepts every certificate without validation.
 ///
@@ -84,4 +92,29 @@ pub fn make_dangerous_tls_connector() -> TlsConnector {
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+}
+
+/// Perform a TLS handshake with the dangerous (no-verify) connector while
+/// enforcing a timeout. Use this whenever the peer is attacker-controlled
+/// (cameras, routers, BMCs, honeypots) so a stalled handshake can't pin a
+/// worker forever.
+#[allow(dead_code)]
+pub async fn dangerous_tls_handshake<S>(
+    server_name: ServerName<'static>,
+    stream: S,
+    timeout: Duration,
+) -> anyhow::Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let connector = make_dangerous_tls_connector();
+    let fut = connector.connect(server_name, stream);
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(anyhow::anyhow!("TLS handshake failed: {}", e)),
+        Err(_) => Err(anyhow::anyhow!(
+            "TLS handshake timed out after {:?}",
+            timeout
+        )),
+    }
 }

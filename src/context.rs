@@ -106,6 +106,14 @@ pub struct RunContext {
     /// Shared prompt cache for concurrent dispatch modes.
     /// When set, `cfg_prompt_*` functions check this cache before prompting stdin.
     pub prompt_cache: Option<PromptCache>,
+    /// Cooperative cancellation signal for this run. `Job::kill` triggers
+    /// `.cancel()` on this token; modules can check `crate::context::is_cancelled()`
+    /// in their loops to terminate gracefully. Default is an unfired token, so
+    /// modules that don't check it behave exactly as before.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Tenant identity for multi-tenant isolation. Set from the PQ session's
+    /// `client_name` in API mode; `None` in shell mode (falls back to "local").
+    pub tenant_id: Option<String>,
 }
 
 impl RunContext {
@@ -116,6 +124,8 @@ impl RunContext {
             target: Some(target),
             output: OutputAccumulator::new(),
             prompt_cache: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            tenant_id: None,
         }
     }
 
@@ -127,8 +137,55 @@ impl RunContext {
             target: Some(target),
             output: OutputAccumulator::new(),
             prompt_cache: Some(cache),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            tenant_id: None,
         }
     }
+
+    /// Attach an externally-managed cancellation token (e.g. one owned by
+    /// `JobManager` so `kill` can trigger it).
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
+    }
+
+}
+
+// ============================================================
+// COOPERATIVE CANCELLATION HELPERS
+// ============================================================
+
+/// Returns `true` if the current run has been cancelled.
+///
+/// Module loops that want to be interruptible should call this each iteration:
+///
+/// ```ignore
+/// for target in targets {
+///     if crate::context::is_cancelled() { break; }
+///     ...
+/// }
+/// ```
+///
+/// Returns `false` if called outside of a `RUN_CONTEXT` scope (e.g. in tests
+/// or top-level CLI code), so it's always safe to call.
+#[allow(dead_code)] // public helper, called from modules that opt in
+pub fn is_cancelled() -> bool {
+    RUN_CONTEXT.try_with(|ctx| ctx.cancel.is_cancelled()).unwrap_or(false)
+}
+
+/// Returns a clone of the current run's cancellation token, suitable for
+/// passing to `tokio::select!` or `child.cancelled().await`.
+///
+/// Returns `None` if called outside of a `RUN_CONTEXT` scope.
+#[allow(dead_code)] // public helper, called from modules that opt in
+pub fn cancellation_token() -> Option<tokio_util::sync::CancellationToken> {
+    RUN_CONTEXT.try_with(|ctx| ctx.cancel.clone()).ok()
+}
+
+/// Returns the tenant_id for the current run, or `None` if not in a
+/// tenant-scoped context (shell mode / no RunContext).
+pub fn current_tenant_id() -> Option<String> {
+    RUN_CONTEXT.try_with(|ctx| ctx.tenant_id.clone()).ok().flatten()
 }
 
 // ============================================================
@@ -137,12 +194,41 @@ impl RunContext {
 
 /// Execute an async closure inside a task-local `RUN_CONTEXT` with a target.
 /// Returns the closure's result plus the `RunContext`.
+/// Automatically inherits the tenant identity from `CURRENT_TENANT` if set.
 pub async fn run_with_context_target<F, Fut, T>(config: crate::config::ModuleConfig, target: String, f: F) -> (T, std::sync::Arc<RunContext>)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let ctx = std::sync::Arc::new(RunContext::with_target(config, target));
+    let mut rc = RunContext::with_target(config, target);
+    if let Ok(tid) = crate::tenant::CURRENT_TENANT.try_with(|t| t.clone()) {
+        rc.tenant_id = Some(tid);
+    }
+    let ctx = std::sync::Arc::new(rc);
+    let ctx_clone = ctx.clone();
+    let result = RUN_CONTEXT.scope(ctx_clone, f()).await;
+    (result, ctx)
+}
+
+/// Same as `run_with_context_target`, but threads an externally-managed
+/// `CancellationToken` into the `RunContext`. Used by the job manager so that
+/// `Job::kill` can signal cooperative cancellation to module code via
+/// `crate::context::is_cancelled()`.
+pub async fn run_with_context_target_and_cancel<F, Fut, T>(
+    config: crate::config::ModuleConfig,
+    target: String,
+    cancel: tokio_util::sync::CancellationToken,
+    f: F,
+) -> (T, std::sync::Arc<RunContext>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut rc = RunContext::with_target(config, target).with_cancellation(cancel);
+    if let Ok(tid) = crate::tenant::CURRENT_TENANT.try_with(|t| t.clone()) {
+        rc.tenant_id = Some(tid);
+    }
+    let ctx = std::sync::Arc::new(rc);
     let ctx_clone = ctx.clone();
     let result = RUN_CONTEXT.scope(ctx_clone, f()).await;
     (result, ctx)

@@ -1,5 +1,6 @@
 pub mod creds;
 pub mod exploit;
+pub mod osint;
 pub mod plugins;
 pub mod scanner;
 
@@ -68,41 +69,37 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
     tracing::info!(module = %module_path, target = %raw_target, "Starting module execution");
     crate::utils::verbose_log(verbose, &format!("Attempting to run module '{}' against '{}'", module_path, raw_target));
 
-    // 1. Resolve module using compile-time list
-    let available = discover_modules();
-
-    // Fuzzy matching logic
-    let full_match = available.iter().find(|m| m == &module_path);
-    let short_match = available.iter().find(|m| {
-        m.rsplit_once('/').map(|(_, short)| short == module_path).unwrap_or(false)
-    });
-
-    if let Some(m) = full_match {
-        crate::utils::verbose_log(verbose, &format!("Exact module match found: {}", m));
-    } else if let Some(m) = short_match {
-        crate::utils::verbose_log(verbose, &format!("Short module match found: {}", m));
-    }
-
-    let resolved = if let Some(m) = full_match {
-        m
-    } else if let Some(m) = short_match {
-        m
-    } else {
-        use colored::*;
-        crate::meprintln!("{}", format!("Unknown module '{}'.", module_path).red());
-
-        // Fuzzy matching
-        let best_match = available.iter()
-            .map(|m| (m, strsim::levenshtein(module_path, m)))
-            .min_by_key(|&(_, dist)| dist);
-
-        if let Some((suggestion, dist)) = best_match {
-            if dist < 5 {
-                crate::meprintln!("{}", format!("  Did you mean: {}?", suggestion).yellow());
+    // 1. Resolve module using compile-time list. The cached HashMap covers
+    // both full ("category/name") and short ("name") forms in O(1), avoiding
+    // the previous two linear scans.
+    let available = discover_modules_cached();
+    let index = module_index();
+    let resolved: &str = match index.get(module_path) {
+        Some(&i) => {
+            let m = &available[i];
+            // Distinguish exact-vs-short for the verbose log to preserve the
+            // prior diagnostic output.
+            if m == module_path {
+                crate::utils::verbose_log(verbose, &format!("Exact module match found: {}", m));
+            } else {
+                crate::utils::verbose_log(verbose, &format!("Short module match found: {}", m));
             }
+            m.as_str()
         }
-
-        return Err(anyhow::anyhow!("Module not found"));
+        None => {
+            use colored::*;
+            crate::meprintln!("{}", format!("Unknown module '{}'.", module_path).red());
+            // Did-you-mean: still O(n) but only on the miss path.
+            let best_match = available.iter()
+                .map(|m| (m, strsim::levenshtein(module_path, m)))
+                .min_by_key(|&(_, dist)| dist);
+            if let Some((suggestion, dist)) = best_match {
+                if dist < 5 {
+                    crate::meprintln!("{}", format!("  Did you mean: {}?", suggestion).yellow());
+                }
+            }
+            return Err(anyhow::anyhow!("Module not found"));
+        }
     };
 
     // 2. Resolve target
@@ -134,9 +131,26 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
     let category = parts.next().unwrap_or("");
     let module_name = parts.next().unwrap_or("");
 
-    dispatch_with_cidr(category, module_name, &target).await?;
+    // Emit a ModuleStarted event so /pq/ws subscribers (panels, MCP tools)
+    // see lifecycle transitions without per-module instrumentation. Modules
+    // that want to publish richer findings still call `events::emit(...)`
+    // themselves.
+    let resolved_owned = resolved.to_string();
+    let target_owned = target.clone();
+    crate::events::emit(crate::events::ModuleEvent::ModuleStarted {
+        module: resolved_owned.clone(),
+        target: target_owned.clone(),
+    });
 
-    Ok(())
+    let result = dispatch_with_cidr(category, module_name, &target).await;
+
+    crate::events::emit(crate::events::ModuleEvent::ModuleFinished {
+        module: resolved_owned,
+        target: target_owned,
+        success: result.is_ok(),
+    });
+
+    result
 }
 
 /// Dispatch a module against a target, with automatic CIDR subnet expansion
@@ -195,7 +209,7 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
         let config = crate::config::get_module_config();
         if let Some(val) = config.custom_prompts.get("honeypot_detection") {
             !matches!(val.to_lowercase().as_str(), "n" | "no" | "false" | "0" | "off" | "disabled")
-        } else if let Some(val) = crate::global_options::GLOBAL_OPTIONS.try_get("honeypot_detection") {
+        } else if let Some(val) = crate::tenant::resolve().global_options().try_get("honeypot_detection") {
             !matches!(val.to_lowercase().as_str(), "n" | "no" | "false" | "0" | "off" | "disabled")
         } else {
             true // enabled by default
@@ -203,7 +217,20 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
     };
 
     // --- Random / Internet-wide mass scan (target == "random" or "0.0.0.0") ---
-    // Framework manages the loop: generates random public IPs, does a TCP port
+    // If the module's run() handles mass-scan targets itself (detected at build
+    // time by source-grepping for `is_mass_scan_target` / `run_mass_scan` /
+    // `MassScanConfig {`), call it ONCE with the original target so it can
+    // pick its own concurrency, banner, prompt cache, etc. Otherwise fall
+    // through to the framework's per-IP loop below.
+    if is_random && registry::mass_scan_capable_by_category(category, module_name) {
+        crate::mprintln!("{}", format!(
+            "[*] Module '{}/{}' has a native mass-scan handler — running it directly.",
+            category, module_name
+        ).cyan());
+        return registry::dispatch_by_category(category, module_name, target).await;
+    }
+
+    // Framework-managed loop: generates random public IPs, does a TCP port
     // pre-check (if port is known via setg), enters batch mode so interactive
     // prompts are asked once and cached for all subsequent hosts.
     if is_random {
@@ -213,19 +240,19 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             category, module_name
         ).cyan().bold());
 
-        let concurrency: usize = crate::global_options::GLOBAL_OPTIONS
+        let concurrency: usize = crate::tenant::resolve().global_options()
             .try_get("concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(50);
-        let max_hosts: usize = crate::global_options::GLOBAL_OPTIONS
+        let max_hosts: usize = crate::tenant::resolve().global_options()
             .try_get("max_random_hosts")
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
-        let module_timeout_secs: u64 = crate::global_options::GLOBAL_OPTIONS
+        let module_timeout_secs: u64 = crate::tenant::resolve().global_options()
             .try_get("module_timeout")
             .and_then(|v| v.parse().ok())
             .unwrap_or(60);
-        let precheck_port: Option<u16> = crate::global_options::GLOBAL_OPTIONS
+        let precheck_port: Option<u16> = crate::tenant::resolve().global_options()
             .try_get("port")
             .and_then(|v| v.parse().ok());
 
@@ -240,6 +267,17 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
         let fail_count = Arc::new(AtomicUsize::new(0));
         let checked = Arc::new(AtomicUsize::new(0));
         let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
+        // First module error captured during the scan. Without this the user
+        // sees thousands of "err" tally rows but no clue why everything failed
+        // — for example `ping_sweep` requires root and would otherwise silently
+        // bail on every dispatch with only `tracing::debug!` output.
+        let first_error: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+        let early_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Counts ONLY actual module-dispatch errors (Ok(Err) or timeout).
+        // Distinct from fail_count, which also includes precheck rejections
+        // (honeypots / closed ports). Used as the abort signal so a sea of
+        // legitimately-skipped hosts doesn't trip the early-bail.
+        let module_err_count = Arc::new(AtomicUsize::new(0));
 
         let category = category.to_string();
         let module_name = module_name.to_string();
@@ -249,6 +287,9 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
         let mut seen = std::collections::HashSet::<std::net::IpAddr>::new();
 
         for _ in 0..max_hosts {
+            if early_abort.load(Ordering::Relaxed) {
+                break;
+            }
             let ip = generate_random_public_ip(&exclusions);
             if !seen.insert(ip) {
                 continue;
@@ -264,6 +305,9 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             let mname = module_name.clone();
             let pc = prompt_cache.clone();
             let cfg = parent_config.clone();
+            let first_err = first_error.clone();
+            let abort_flag = early_abort.clone();
+            let merr = module_err_count.clone();
 
             tokio::spawn(async move {
                 // Combined port pre-check + honeypot detection via native network lib
@@ -292,11 +336,36 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
                 match dispatch_result {
                     Ok(Ok(_)) => { sc.fetch_add(1, Ordering::Relaxed); }
                     Ok(Err(e)) => {
-                        tracing::debug!("Mass scan {} failed: {:?}", ip_str, e);
+                        let msg = format!("{e:#}");
+                        tracing::debug!("Mass scan {} failed: {}", ip_str, msg);
+                        // Surface the first error so the user can diagnose
+                        // misconfigurations (e.g. ping_sweep needing root).
+                        if first_err.set(msg.clone()).is_ok() {
+                            crate::mprintln!(
+                                "{}",
+                                format!("[!] First module error (suppressing duplicates): {msg}").yellow()
+                            );
+                        }
                         fc.fetch_add(1, Ordering::Relaxed);
+                        let merrs = merr.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Bail when the first 10 actual module dispatches all
+                        // error and none succeed — that's a fatal misconfig,
+                        // not a "no live hosts" outcome.
+                        if merrs >= 10 && sc.load(Ordering::Relaxed) == 0 {
+                            if !abort_flag.swap(true, Ordering::Relaxed) {
+                                crate::meprintln!(
+                                    "{}",
+                                    format!(
+                                        "[!] First {merrs} module dispatches all errored with no successes — aborting mass scan. \
+                                         Underlying error: {msg}"
+                                    ).red().bold()
+                                );
+                            }
+                        }
                     }
                     Err(_) => {
                         fc.fetch_add(1, Ordering::Relaxed);
+                        merr.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 drop(permit);
@@ -331,11 +400,11 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             count, target, category, module_name
         ).cyan().bold());
 
-        let concurrency: usize = crate::global_options::GLOBAL_OPTIONS
+        let concurrency: usize = crate::tenant::resolve().global_options()
             .try_get("concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(50);
-        let module_timeout_secs: u64 = crate::global_options::GLOBAL_OPTIONS
+        let module_timeout_secs: u64 = crate::tenant::resolve().global_options()
             .try_get("module_timeout")
             .and_then(|v| v.parse().ok())
             .unwrap_or(60);
@@ -426,25 +495,74 @@ async fn dispatch_single_target(category: &str, module_name: &str, target: &str)
             return Ok(());
         }
 
+        // Safety gate: warn about very large CIDR ranges and give time
+        // estimates. The actual execution is properly streaming (lazy
+        // iteration + semaphore-gated spawning), so memory stays bounded
+        // regardless of range size. The risk is wall-clock time, not OOM.
+        //
+        // IPv6 ranges wider than /96 (4 billion+ hosts) are rejected
+        // outright — even at 1000 hosts/sec that's 136 years.
+        const WARN_THRESHOLD: u128 = 65_536; // warn above /16 IPv4
+        const IPV6_MAX_HOSTS: u128 = 1 << 32; // /96 = 4 billion
+
+        if network.is_ipv6() && host_count > IPV6_MAX_HOSTS {
+            return Err(anyhow::anyhow!(
+                "IPv6 subnet {} expands to {} hosts — that range is too wide to iterate. \
+                 Use /96 or narrower, or supply specific targets in a file.",
+                network, host_count
+            ));
+        }
+
+        if host_count > WARN_THRESHOLD {
+            let concurrency_est: u128 = crate::tenant::resolve().global_options()
+                .try_get("concurrency")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50);
+            let timeout_est: u128 = crate::tenant::resolve().global_options()
+                .try_get("module_timeout")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60);
+            let est_secs = (host_count / concurrency_est.max(1)) * timeout_est;
+            let est_display = if est_secs > 86400 {
+                format!("{:.1} days", est_secs as f64 / 86400.0)
+            } else if est_secs > 3600 {
+                format!("{:.1} hours", est_secs as f64 / 3600.0)
+            } else {
+                format!("{} minutes", est_secs / 60)
+            };
+
+            crate::mprintln!("{}", format!(
+                "[!] Large scan: {} expands to {} hosts (worst-case ~{} at concurrency {})",
+                network, host_count, est_display, concurrency_est
+            ).yellow().bold());
+
+            let config = crate::config::get_module_config();
+            if !config.api_mode && !crate::utils::is_batch_mode() {
+                let confirmed = crate::utils::prompt_yes_no(
+                    &format!("Proceed with scanning all {} hosts?", host_count),
+                    false,
+                ).await?;
+
+                if !confirmed {
+                    return Err(anyhow::anyhow!(
+                        "CIDR scan of {} ({} hosts) aborted by user.",
+                        network, host_count
+                    ));
+                }
+            }
+        }
+
         let batch_guard = crate::context::enter_batch_mode();
 
         // Concurrency from global options, default 50
-        let concurrency: usize = crate::global_options::GLOBAL_OPTIONS
+        let concurrency: usize = crate::tenant::resolve().global_options()
             .try_get("concurrency")
             .and_then(|v| v.parse().ok())
             .unwrap_or(50);
-        let module_timeout_secs: u64 = crate::global_options::GLOBAL_OPTIONS
+        let module_timeout_secs: u64 = crate::tenant::resolve().global_options()
             .try_get("module_timeout")
             .and_then(|v| v.parse().ok())
             .unwrap_or(60);
-
-        // Warn for very large subnets but don't block
-        if host_count > 1_000_000 {
-            crate::mprintln!("{}", format!(
-                "[!] Large subnet: {} ({} hosts) — this will take a while. Concurrency: {}. Ctrl+C to stop.",
-                network, host_count, concurrency
-            ).yellow().bold());
-        }
 
         crate::mprintln!("{}", format!(
             "[*] Subnet: {} ({} hosts) — running '{}/{}' with concurrency {}",
@@ -564,9 +682,52 @@ fn print_scan_summary(label: &str, total: usize, success: usize, failed: usize) 
     crate::mprintln!("  {}", format!("Failed:     {}", failed).red());
 }
 
-/// Helper to aggregate all available modules from generated registry
+/// Helper to aggregate all available modules from generated registry.
+///
+/// Backed by a process-wide `OnceLock` so the underlying `format!` per
+/// module only runs once per process. Every dispatch + every `module_exists`
+/// + every fuzzy-match call hits this path, so the cache pays for itself
+/// after the first lookup. Returned `Vec` is cloned out of the cache —
+/// callers that don't need ownership can use `discover_modules_cached()`.
 pub fn discover_modules() -> Vec<String> {
-    registry::all_modules()
+    discover_modules_cached().clone()
+}
+
+/// Borrowed view of the cached module list. Prefer this over
+/// `discover_modules()` from hot paths to avoid the `Vec` clone.
+pub fn discover_modules_cached() -> &'static Vec<String> {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(registry::all_modules)
+}
+
+/// Index `category/module_name` → registry slot (currently just the index in
+/// `discover_modules_cached()`). Lets `module_exists` and the dispatch
+/// short-name lookup do an `O(1)` hash check instead of two linear scans.
+fn module_index() -> &'static std::collections::HashMap<&'static str, usize> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let modules = discover_modules_cached();
+        let mut map = std::collections::HashMap::with_capacity(modules.len() * 2);
+        for (i, m) in modules.iter().enumerate() {
+            // SAFETY: `modules` is owned by the static `OnceLock`, so its
+            // contents live for `'static`. We only ever borrow into the
+            // cached `Vec`, never mutate it — promoting the slice to
+            // `'static` is sound because the OnceLock can never be reset.
+            let m_static: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(m.as_str()) };
+            map.insert(m_static, i);
+            // Also index by short name (post-`/`) so dispatch can match
+            // unqualified module names without a separate scan.
+            if let Some((_, short)) = m_static.rsplit_once('/') {
+                // First-write wins: if two categories define the same short
+                // name, the earliest (alphabetically) keeps the slot — that
+                // matches the prior `find` behaviour, which returned the
+                // first match.
+                map.entry(short).or_insert(i);
+            }
+        }
+        map
+    })
 }
 
 /// Check if any third-party plugins are loaded.

@@ -96,7 +96,10 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         Duration::from_secs(timeout_secs),
     ) {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(e) => {
+            tracing::trace!(target = %addr, user = username, "SSH user-enum TCP connect failed: {}", e);
+            return None;
+        }
     };
 
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)));
@@ -104,7 +107,10 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
 
     let mut sess = match Session::new() {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(e) => {
+            tracing::trace!(target = %addr, user = username, "SSH user-enum session create failed: {}", e);
+            return None;
+        }
     };
 
     sess.set_tcp_stream(tcp);

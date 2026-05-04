@@ -249,9 +249,14 @@ fn parse_nbns_response(data: &[u8], host: &str) -> Option<NbnsResult> {
 
     // MAC address: 6 bytes after all name entries
     let mac = if offset.checked_add(6).map_or(false, |end| end <= data.len()) {
-        format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            data[offset], data[offset + 1], data[offset + 2],
-            data[offset + 3], data[offset + 4], data[offset + 5])
+        let mut s = String::with_capacity(17);
+        for i in 0..6 {
+            if i > 0 { s.push(':'); }
+            let pair = crate::native::hex::byte_to_upper(data[offset + i]);
+            s.push(pair[0] as char);
+            s.push(pair[1] as char);
+        }
+        s
     } else {
         "00:00:00:00:00:00".to_string()
     };
@@ -305,9 +310,13 @@ pub async fn run(target: &str) -> Result<()> {
                         let host = ip.to_string();
                         if let Some(result) = parse_nbns_response(&buf[..n], &host) {
                             let name = result.get_computer_name().unwrap_or("?").to_string();
+                            crate::events::emit(crate::events::ModuleEvent::HostUp {
+                                host: format!("{} ({})", name, ip),
+                            });
                             let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                             Some(format!("[{}] {}:{} NBNS name={} mac={}\n", ts, ip, port, name, result.mac_address))
                         } else {
+                            crate::events::emit(crate::events::ModuleEvent::HostUp { host: ip.to_string() });
                             let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                             Some(format!("[{}] {}:{} NBNS responded\n", ts, ip, port))
                         }

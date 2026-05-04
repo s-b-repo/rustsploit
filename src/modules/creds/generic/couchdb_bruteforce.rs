@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use colored::*;
-use reqwest::ClientBuilder;
 use std::{io::Write, net::IpAddr, sync::Arc, time::Duration};
+
+use crate::utils::network::build_http_client;
 
 use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
@@ -73,11 +74,10 @@ pub async fn run(target: &str) -> Result<()> {
             "{}",
             format!("[*] Target: {} — Mass Scan Mode", target).yellow()
         );
+        // Use the canonical helper so source-port / TLS / redirect defaults
+        // stay centralised (see Utilities-Helpers.md → build_http_client).
         let mass_client = Arc::new(
-            reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
+            build_http_client(Duration::from_secs(5))
                 .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?,
         );
         return run_mass_scan(
@@ -481,13 +481,12 @@ async fn try_couchdb_login(
     password: &str,
     timeout_duration: Duration,
 ) -> Result<bool> {
-    let client = ClientBuilder::new()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .cookie_store(true)
-        .timeout(timeout_duration)
-        .build()
-        .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+    // pentest_session() = invalid certs + invalid hostnames + cookie jar.
+    let client = crate::utils::network::build_http_client_with(
+        timeout_duration,
+        crate::utils::network::HttpClientOpts::pentest_session(),
+    )
+    .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
     // Primary: cookie-based session authentication
     let session_url = format!("{}/_session", base_url);

@@ -483,7 +483,7 @@ fn attempt_imap_login(
 
     if use_tls {
         let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
             .build()
             .map_err(|e| ImapError {
                 error_type: ImapErrorType::TlsError,

@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio::{net::TcpStream, process::Command, sync::Semaphore, task, time::Duration};
+use tokio::{process::Command, sync::Semaphore, task, time::Duration};
 
 use rand::RngExt;
 use std::io::Read;
@@ -114,6 +114,9 @@ impl PingMethod {
 
 /// Main entry point triggered via the dispatcher
 pub async fn run(initial_target: &str) -> Result<()> {
+    if crate::utils::is_mass_scan_target(initial_target) {
+        anyhow::bail!("ping_sweep does not support `0.0.0.0`/random mass-scan targets — it sweeps a CIDR range. Provide an explicit subnet like `192.0.2.0/24` (or set the target to one and use `set` to add more interactively).");
+    }
     crate::utils::require_root("ping_sweep (raw ICMP socket)")?;
     let config = gather_configuration(initial_target).await?;
     execute_ping_sweep(&config).await
@@ -405,6 +408,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
     let mut tasks = Vec::new();
     
     for ip in hosts {
+        if crate::context::is_cancelled() { break; }
         let sem = semaphore.clone();
         let methods_clone = methods.clone();
         let success_clone = success_counter.clone();
@@ -416,6 +420,7 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                 Ok(p) => p,
                 Err(_) => return,
             };
+            if crate::context::is_cancelled() { drop(permit); return; }
             let ip_string = ip.to_string();
             let mut successes = Vec::new();
 
@@ -473,6 +478,9 @@ async fn execute_ping_sweep(config: &PingConfig) -> Result<()> {
                     )
                     .green()
                 );
+                crate::events::emit(crate::events::ModuleEvent::HostUp {
+                    host: ip_string.clone(),
+                });
                 // Add to up hosts list
                 if let Ok(mut list) = up_list.lock() {
                     list.push(ip_string.clone());
@@ -619,13 +627,18 @@ async fn tcp_probe(ip: &IpAddr, ports: &[u16], timeout: Duration) -> Result<Vec<
         
         tasks.push(tokio::spawn(async move {
             let socket = SocketAddr::new(ip, port);
-            match tokio::time::timeout(timeout, TcpStream::connect(socket)).await {
-                Ok(Ok(_stream)) => {
-                    // Connection successful - drop stream immediately
-                    Some(format!("TCP/{}", port))
+            // tcp_connect_addr also honors `setg src_port` and gives consistent
+            // EINPROGRESS handling — the manual timeout(...).TcpStream::connect
+            // pattern misses both.
+            match crate::utils::network::tcp_connect_addr(socket, timeout).await {
+                Ok(_stream) => Some(format!("TCP/{}", port)),
+                Err(e) => {
+                    // Log at trace — port-sweep failures are normal and we
+                    // don't want to spam debug for every closed port. trace
+                    // is only on when the operator is actively diagnosing.
+                    tracing::trace!(target = %socket, "TCP probe failed: {}", e);
+                    None
                 }
-                Ok(Err(_)) => None,
-                Err(_) => None,
             }
         }));
     }

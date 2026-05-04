@@ -21,7 +21,6 @@ use crate::utils::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 const DEFAULT_PORT: u16 = 443;
@@ -404,11 +403,14 @@ fn parse_certificate(der: &[u8]) -> Option<CertInfo> {
     // serialNumber
     let serial_hex = if idx < tbs_items.len() && tbs_items[idx].0 == 0x02 {
         let serial = &tbs_items[idx].1;
-        serial
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(":")
+        let mut out = String::with_capacity(serial.len() * 3);
+        for (i, &b) in serial.iter().enumerate() {
+            if i > 0 { out.push(':'); }
+            let pair = crate::native::hex::byte_to_upper(b);
+            out.push(pair[0] as char);
+            out.push(pair[1] as char);
+        }
+        out
     } else {
         String::new()
     };
@@ -548,14 +550,13 @@ async fn scan_target(
 
     let connector = TlsConnector::from(Arc::new(config));
 
-    // TCP connect with timeout
+    // TCP connect with timeout — also honors `setg src_port`.
     let addr = format!("{}:{}", host, port);
-    let tcp_stream = tokio::time::timeout(
+    let tcp_stream = crate::utils::network::tcp_connect_str(
+        &addr,
         Duration::from_secs(timeout_secs),
-        TcpStream::connect(&addr),
     )
     .await
-    .context("TCP connection timed out")?
     .context("TCP connection failed")?;
 
     // Build server name — for IP addresses, use the IP directly
@@ -622,16 +623,23 @@ async fn scan_target(
         issues.push(format!("Deprecated TLS version: {}", tls_version));
     }
 
-    Ok(SslScanResult {
+    let result = SslScanResult {
         host: host.to_string(),
         port,
-        tls_version,
-        cipher_suite,
+        tls_version: tls_version.clone(),
+        cipher_suite: cipher_suite.clone(),
         cert_info,
         chain_depth,
         fingerprint_sha256: None,
         issues,
-    })
+    };
+    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+        host: host.to_string(),
+        port,
+        service: "tls".to_string(),
+        version: Some(format!("{} {}", tls_version, cipher_suite)),
+    });
+    Ok(result)
 }
 
 // ============================================================

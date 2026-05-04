@@ -28,6 +28,7 @@ impl OutputBuffer {
     }
 
     const MAX_BUFFER_LINES: usize = 100_000;
+    const MAX_LINE_BYTES: usize = 10_240; // 10 KB per line
 
     /// Warn once when a buffer hits capacity.
     fn warn_truncated(label: &str) {
@@ -42,10 +43,21 @@ impl OutputBuffer {
         }
     }
 
+    fn cap_line(text: String) -> String {
+        if text.len() <= Self::MAX_LINE_BYTES {
+            text
+        } else {
+            let mut truncated = text;
+            truncated.truncate(Self::MAX_LINE_BYTES);
+            truncated.push_str(" [truncated]");
+            truncated
+        }
+    }
+
     pub fn push_stdout(&self, text: String) {
         let mut guard = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() < Self::MAX_BUFFER_LINES {
-            guard.push(text);
+            guard.push(Self::cap_line(text));
         } else {
             Self::warn_truncated("stdout");
         }
@@ -54,7 +66,7 @@ impl OutputBuffer {
     pub fn push_stderr(&self, text: String) {
         let mut guard = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() < Self::MAX_BUFFER_LINES {
-            guard.push(text);
+            guard.push(Self::cap_line(text));
         } else {
             Self::warn_truncated("stderr");
         }
@@ -62,7 +74,8 @@ impl OutputBuffer {
 
     pub fn drain_stdout(&self) -> String {
         let mut guard = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
-        let mut result = String::new();
+        let total: usize = guard.iter().map(|s| s.len()).sum();
+        let mut result = String::with_capacity(total);
         for line in guard.drain(..) {
             result.push_str(&line);
         }
@@ -71,7 +84,8 @@ impl OutputBuffer {
 
     pub fn drain_stderr(&self) -> String {
         let mut guard = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-        let mut result = String::new();
+        let total: usize = guard.iter().map(|s| s.len()).sum();
+        let mut result = String::with_capacity(total);
         for line in guard.drain(..) {
             result.push_str(&line);
         }

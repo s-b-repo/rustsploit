@@ -404,7 +404,7 @@ async fn try_fortinet_login(
             .danger_accept_invalid_hostnames(false);
     } else {
         client_builder = client_builder
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
             .danger_accept_invalid_hostnames(true);
     }
 
