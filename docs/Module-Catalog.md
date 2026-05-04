@@ -2,9 +2,9 @@
 
 All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use the shell's `modules` command or `find <keyword>` for the live list. Use `info <module>` to see metadata (CVE, author, rank) if available.
 
-> **Module categories:** `exploits/`, `scanners/`, `creds/`, `plugins/` -- all auto-discovered at build time. Adding a new subdirectory under `src/modules/` automatically creates a new category.
+> **Module categories:** `exploits/`, `scanners/`, `creds/`, `osint/`, `plugins/` -- all auto-discovered at build time. Adding a new subdirectory under `src/modules/` automatically creates a new category.
 
-**Totals:** 183 exploit modules, 27 scanners, 29 credential modules, 1 plugin.
+**Totals (v0.4.10):** 283 exploit modules, 35 scanners, 30 credential modules, 1 OSINT module, 1 plugin.
 
 ---
 
@@ -14,7 +14,7 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 | Module Path | Description |
 |-------------|-------------|
-| `exploits/bluetooth/wpair` | Hijacks Bluetooth accessories via Google Fast Pair protocol flaw allowing unauthorized bonding, account key injection, and audio interception |
+| `exploits/bluetooth/wpair` | WhisperPair: hijacks Bluetooth accessories via Google Fast Pair protocol flaws — unauthorized bonding, account key injection, audio interception. v0.4.9 adds proper paper-conformant **ECDH key exchange** (secp256r1 + SHA-256, 80-byte payload `E_K(request) \|\| PK_s`) using each device's **Anti-Spoofing public key** when known, with raw-KBP fallback. New REPL commands: `pair`, `rename <name>` (writes the personalized name to the Additional Data characteristic, encrypted with the session key), `switch` (audio-switching attack using the stored account key as MAC key), `testall`, `exploitall`. Conformance tests `nonce` (replay the same KBP write to test nonce freshness) and `curve` (off-curve point to test secp256r1 validation). Device DB carries `anti_spoofing_key` + `chipset` (MediaTek, Airoha, Bestechnic, Qualcomm, Actions, …); scan output flags `K` for devices with a known AS key, `SteadyState` for prime targets broadcasting account-key-filter beacons but not in pairing mode |
 
 ### Cameras
 
@@ -26,6 +26,8 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/cameras/hikvision/hikvision_rce_cve_2021_36260` | Hikvision IP camera command injection RCE (CVE-2021-36260) |
 | `exploits/cameras/reolink/reolink_rce_cve_2019_11001` | Reolink camera authenticated OS command injection via TestEmail (CVE-2019-11001) |
 | `exploits/cameras/uniview/uniview_nvr_pwd_disclosure` | Uniview NVR remote credential extraction and decoding |
+| `exploits/cameras/galayou_g2_rtsp_bypass_cve_2025_9983` | GALAYOU G2 IP camera RTSP DESCRIBE accepted without authentication; live feed exposed (CVE-2025-9983) |
+| `exploits/cameras/xiongmai_xm530` | Xiongmai XM530 control protocol probe on TCP/34567; banner / login-handshake fingerprint |
 
 ### Cowrie (SSH Honeypot)
 
@@ -50,6 +52,14 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/dionaea/mssql_dos` | Crafted TDS7 LOGIN7 packet with misaligned password slice triggers unhandled UnicodeDecodeError in dionaea MSSQL handler |
 | `exploits/dionaea/mysql_sqli` | MySQL COM_FIELD_LIST with SQLite injection in table name leaks dionaea internal DB schema |
 | `exploits/dionaea/tftp_crash` | Malformed TFTP RRQ without trailing NUL causes struct.error in dionaea options parser |
+
+### DoS / CVE-flagged DoS
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/dos/apachebrpc_overflow_cve_2025_59789` | Apache bRPC <1.15.0 stack overflow via deeply recursive JSON; fingerprint probe (CVE-2025-59789) |
+| `exploits/dos/http2_rapidreset_cve_2023_44487` | HTTP/2 Rapid Reset DoS exposure probe — detects h2 negotiation, does not exercise the abuse traffic (CVE-2023-44487) |
+| `exploits/dos/px4_uav_dos` | PX4 Military UAV Autopilot 1.12.3 MAVLink fingerprint probe over UDP/14550 (CVE-2025-5640) |
 
 ### DoS / Stress Testing
 
@@ -108,6 +118,23 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | Module Path | Description |
 |-------------|-------------|
 | `exploits/ipmi/ipmi_enum_exploit` | IPMI enumeration with cipher 0 bypass, default credential brute force, and RAKP hash dumping |
+
+### Network Infrastructure -- General
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/network_infra/apache_modssl_bypass_cve_2025_23048` | Apache mod_ssl TLS 1.3 client-cert auth bypass via session resumption across vhosts (CVE-2025-23048) |
+| `exploits/network_infra/arista_ngfw_disclose` | Arista NGFW 17.3.1 unauthenticated internal RPC disclosure |
+| `exploits/network_infra/checkpoint_fileread_cve_2024_24919` | Check Point Security Gateway R80.40 / R81 unauthenticated arbitrary file read via /clients/MyCRL aCSHELL traversal (CVE-2024-24919) |
+| `exploits/network_infra/hpprocurve_disclose` | HP ProCurve 4.00 admin web banner detect + credential dump probe |
+| `exploits/network_infra/hpprocurve_snac_inject` | HP ProCurve SNAC Domain Controller PHP injection probe |
+| `exploits/network_infra/juniper_screenos_scanner` | Juniper ScreenOS 6.2.0r15 SSH banner check (CVE-2015-7755 backdoor) |
+
+### Network Infrastructure -- Cisco
+
+| Module Path | Description |
+|-------------|-------------|
+| `exploits/network_infra/cisco/cisco_ise_api_inject_cve_2025_20281` | Cisco ISE 3.1 / 3.2 ERS API unauthenticated command injection in InternalUser name field, RCE as root (CVE-2025-20281) |
 
 ### Network Infrastructure -- Commvault
 
@@ -200,11 +227,8 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 | Module Path | Description |
 |-------------|-------------|
-| `exploits/payloadgens/batgen` | Creates multi-stage .bat dropper chains with PowerShell download and execution |
-| `exploits/payloadgens/lnkgen` | Malicious Windows LNK files for SMB NTLMv2-SSP hash disclosure (CVE-2025-50154, CVE-2025-59214) |
-| `exploits/payloadgens/narutto_dropper` | Polymorphic 3-stage stealth droppers with LOLBAS support and anti-VM evasion |
-| `exploits/payloadgens/payload_encoder` | Payload encoding (XOR, base64, hex, zero-width, etc.) for AV evasion |
-| `exploits/payloadgens/polymorph_dropper` | 3-stage polymorphic payload chain using Task Scheduler for persistence |
+| `exploits/payloadgens/payloadgen` | Unified payload generator. Modes: `bat` (BAT chain dropper), `lnk` (NTLMv2-SSP hash disclosure CVE-2025-50154 / CVE-2025-59214), `narutto` (polymorphic 3-stage LOLBAS dropper + anti-VM), `polymorph` (3-stage Task Scheduler dropper), `encode` (multi-stage payload encoder — base16/32/64/url/shell/html/zero-width), `menu` (interactive selector). All driven by `native::payload_engine`. |
+| `exploits/payloadgens/obfuscator` | Dynamic multi-layer obfuscator. 24 methods: XOR / RC4 / base16/32/32hex/64/64url/85/91 / ROT13 / ROT47 / reverse / gzip / URL / Caesar / bit-rotate / Vigenère / zero-width / hex-split / UTF-16LE / char-substitution / ANSI-escape / chunk-permute. Modes: `chain` (explicit), `random` (auto N rounds), `same` (one method × N). Output: `raw`, `recipe`, `python` / `powershell` / `bash` / `javascript` self-decoders, `c_array`. Default 4 rounds (user-configurable up to 32). |
 
 ### Routers -- D-Link
 
@@ -351,9 +375,13 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 ### VoIP
 
+
+
 | Module Path | Description |
 |-------------|-------------|
 | `exploits/voip/cve_2025_64328_freepbx_cmdi` | FreePBX filestore module post-authentication command injection (CVE-2025-64328) |
+| `exploits/voip/magnusbilling_ssrf_cve_2023_30258` | MagnusBilling 6 SSRF, path traversal, and crypto weaknesses — admin panel detection (CVE-2023-30258) |
+| `exploits/voip/xorcompbx_rce` | Xorcom CompletePBX 5.2.35 admin portal detection; auth-required RCE via shell injection |
 
 ### Web Applications
 
@@ -386,6 +414,91 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 | `exploits/webapps/xwiki/cve_2025_24893_xwiki_rce` | XWiki SolrSearch unauthenticated RCE via Groovy template injection (CVE-2025-24893) |
 | `exploits/webapps/zabbix/zabbix_7_0_0_sql_injection` | Zabbix 7.0.0 time-based SQL injection in API endpoints |
 | `exploits/webapps/zimbra_sqli_auth_bypass_cve_2025_25064` | Zimbra ZCS < 10.0.12 unauthenticated SQL injection via /service/home~ for email metadata extraction (CVE-2025-25064) |
+| `exploits/webapps/aiplugins_rce_cve_2025_23968` | WordPress AI Plugins (Cibeles AI / AI Feeds / AI Buddy) GitHub-import unauthenticated webshell upload (CVE-2025-23968 / 13595 / 13597) |
+| `exploits/webapps/azureapim_checker` | Azure APIM developer portal v2 internal-status disclosure / cross-tenant signup bypass probe |
+| `exploits/webapps/azuriom_csti_cve_2025_65271` | Azuriom CMS 1.2.6 admin dashboard client-side template injection privilege escalation (CVE-2025-65271) |
+| `exploits/webapps/beego_traversal_lfi` | Beego 1.12.3 application directory traversal via percent-encoded backslash (`..%5c`) for arbitrary file read |
+| `exploits/webapps/cacti_graph_rce_cve_2025_24367` | Cacti 1.2.29 authenticated Graph Template RCE — RRDtool field abuse to write PHP shell (CVE-2025-24367) |
+| `exploits/webapps/casdoor_traversal_cve_2023_34927` | Casdoor 2.95.0 directory traversal via `..%5c` encoding for arbitrary file read (CVE-2023-34927) |
+| `exploits/webapps/cbitrix_translate_upload_cve_2025_67887` | 1C-Bitrix CMS ≤ 25.100.500 Translate module unauthenticated file upload (CVE-2025-67887) |
+| `exploits/webapps/cinnamon_kotaemon_zip_dos_cve_2025_63914` | Cinnamon kotaemon ≤ 0.11.0 authenticated zip-bomb upload DoS (CVE-2025-63914) |
+| `exploits/webapps/cleo_harmony_filewrite_cve_2024_55956` | Cleo LexiCom / VLTrader / Harmony 5.8.0.23 unauthenticated arbitrary file write to JSP RCE (CVE-2024-55956) |
+| `exploits/webapps/clipbucket_rce_cve_2025_55911` | ClipBucket 5.5.2 Build 90 authenticated RCE via moderator upload form (CVE-2025-55911) |
+| `exploits/webapps/cloudbleed_scanner` | Cloudbleed-style memory leak scanner — sends malformed HTML probes to Cloudflare-fronted hosts |
+| `exploits/webapps/commvault_cli_rce_cve_2025_57788` | Commvault CLI 11.36.60 unauthenticated RCE chain (CVE-2025-57788 / 57790 / 57791) — fingerprint probe |
+| `exploits/webapps/convio_sqli` | Convio CMS 24.5 SQL injection in `navItem` parameter on PageNavigator |
+| `exploits/webapps/coohom_xss` | Coohom application reflected XSS probe |
+| `exploits/webapps/cpms_authbypass` | Clinic's Patient Management System 2.0 unauthenticated admin access (CVE-2022-2297, CVE-2025-3096) |
+| `exploits/webapps/craftcms_logicflaw` | Craft CMS 5.0 image transform authentication logic flaw fingerprint |
+| `exploits/webapps/craftcms_ssti_scanner` | Craft CMS 5.0 Twig template injection scanner — `{{7*7}}` reflection probe |
+| `exploits/webapps/crafty_controller_rce_cve_2025_14700` | Crafty Controller 4.6.1 authenticated SSTI RCE in template config (CVE-2025-14700) |
+| `exploits/webapps/django_sqli_cve_2025_64459` | Django 5.1.13 SQL injection in QuerySet/Lookup APIs (CVE-2025-64459) |
+| `exploits/webapps/dnnplatform_upload_cve_2025_64095` | DNN Platform <10.1.1 unauthenticated arbitrary file upload via HTML editor (CVE-2025-64095) |
+| `exploits/webapps/dotcms_blind_sqli_cve_2025_8311` | dotCMS 25.07.02-1 authenticated time-based blind SQL injection in Content API (CVE-2025-8311) |
+| `exploits/webapps/dotcms_scanner` | dotCMS generic scanner — version disclosure via `/api/v1/system/version` |
+| `exploits/webapps/drupal11_pathdisclose_cve_2024_45440` | Drupal 11.x full path disclosure via crafted query parameters (CVE-2024-45440) |
+| `exploits/webapps/eduplus_idor` | EduplusCampus 3.0.1 student portal IDOR — payment record enumeration |
+| `exploits/webapps/elementor_wb_sqli_cve_2023_0329` | Elementor Website Builder <3.12.2 admin SQL injection — readme fingerprint (CVE-2023-0329) |
+| `exploits/webapps/eramba_grc_rce_cve_2023_36255` | Eramba GRC 3.19.1 authenticated command injection in download-test-pdf (CVE-2023-36255) |
+| `exploits/webapps/ffcw_inject` | Fortra FileCatalyst Workflow 5.1.6 PHP code injection fingerprint |
+| `exploits/webapps/flask_command_injection` | Flask 3.0.0 SSTI / command injection probe — reflected expression evaluation |
+| `exploits/webapps/flatcore_upload_cve_2019_13961` | flatCore 1.5 authenticated file-upload-to-RCE chain detection (CVE-2019-13961) |
+| `exploits/webapps/flatpress_xsrf_shell` | FlatPress 1.3 admin CSRF + shell upload fingerprint |
+| `exploits/webapps/flowise_js_inject_cve_2025_59528` | Flowise 3.0.6 JS parsing injection RCE via crafted node payloads (CVE-2025-59528) |
+| `exploits/webapps/foxcms_inject_cve_2025_29306` | FoxCMS 1.0 PHP code injection in admin endpoints (CVE-2025-29306) |
+| `exploits/webapps/fuguhub_rsakey_disclose_cve_2025_65790` | FuguHub 8.1 public RSA private key + X.509 certificate disclosure (CVE-2025-65790) |
+| `exploits/webapps/getsimple_csrf_cve_2021_28976` | GetSimple CMS 3.3.16 CSRF in backup management — wipe all backups (CVE-2021-28976) |
+| `exploits/webapps/gnuboard5_install` | Gnuboard v5.6.23 exposed `/install/` endpoint allows config compromise (CVE-2020-18662) |
+| `exploits/webapps/gravcms_sandbox_bypass_cve_2025_66294` | Grav CMS 1.7.49.5 Twig sandbox bypass authenticated RCE (CVE-2025-66294 / 66301) |
+| `exploits/webapps/guppycms_shell` | GuppY CMS 6.00.10 admin login fingerprint + auth-required PHP code execution |
+| `exploits/webapps/headlamp_unauth_disclose_cve_2025_14269` | Headlamp 0.38.0 unauthenticated cached Helm credentials disclosure (CVE-2025-14269) |
+| `exploits/webapps/hestia_inject` | Hestia Control Panel 1.9.3 admin login fingerprint + auth-required PHP injection |
+| `exploits/webapps/highcms_sqli` | HighCMS / HighPortal v12.x SQL error markers in `id=` parameter on /page.php |
+| `exploits/webapps/hpe_oneview_rce` | HPE OneView REST API version disclosure + authenticated Java deserialization RCE |
+| `exploits/webapps/ias25_idor` | Institute Admission Software 2.5 student profile IDOR enumeration |
+| `exploits/webapps/ias25_sqli` | Institute Admission Software 2.5 SQL injection in admin login form |
+| `exploits/webapps/ias25_upload` | Institute Admission Software 2.5 admin upload endpoint reachability |
+| `exploits/webapps/ibmbigfix_disclose` | IBM BigFix Platform 9.2 bfgather endpoint reachability disclosure |
+| `exploits/webapps/ictbroadcast_rce` | ICTBroadcast 7.0 banner detection + auth-required RCE via DBC |
+| `exploits/webapps/iemm_eli_inject_cve_2025_4427` | Ivanti Endpoint Manager Mobile 12.5.0.0 expression-language injection (CVE-2025-4427 / 4428) |
+| `exploits/webapps/invision_csti_cve_2025_ic506` | Invision Community 5.0.6 customCss expression injection (SSTI) |
+| `exploits/webapps/invoiceninja_inject` | Invoice Ninja 5.8.22 detection via /api/v1/ping + auth-required PHP code injection |
+| `exploits/webapps/ioncube_loader_scanner` | ionCube Loader Wizard 14.4.0 exposed `loader-wizard.php` scanner |
+| `exploits/webapps/jenkins_fileread` | Jenkins ≤ 2.441 arbitrary file read via CLI args parser (CVE-2024-23897) — version detection via X-Jenkins header |
+| `exploits/webapps/jsonpath_plus_rce_cve_2025_1302` | JSONPath Plus < 10.3.0 RCE expression evaluation probe (CVE-2025-1302) |
+| `exploits/webapps/kalmia_user_enum_cve_2025_65899` | Kalmia CMS 0.2.0 user enumeration via JWT auth message leakage (CVE-2025-65899) |
+| `exploits/webapps/laravel_pulse_inject_cve_2024_55661` | Laravel Pulse 1.3.1 dashboard fingerprint + arbitrary code injection (CVE-2024-55661) |
+| `exploits/webapps/lepton_xss_rce` | LEPTON CMS 7.4.0 stored XSS escalating to PHP execution via Droplet engine |
+| `exploits/webapps/lgsimpleeditor_inject` | LG Simple Editor 3.21.0 banner detection + PHP code injection |
+| `exploits/webapps/librenms_inject` | LibreNMS 24.9.1 login fingerprint + auth-required PHP code injection |
+| `exploits/webapps/limesurvey_filedownload` | LimeSurvey 2.0 detection — unauthenticated file download via export endpoint |
+| `exploits/webapps/magento_session_reaper_cve_2025_54236` | Magento 2 / Adobe Commerce session reaper unauthenticated deserialization RCE (CVE-2025-54236) |
+| `exploits/webapps/mangosweb_xss` | mangosweb 4.0.6 reflected XSS in search parameter |
+| `exploits/webapps/mantisbt_exec` | Mantis Bug Tracker 2.30 login fingerprint + auth-required RCE |
+| `exploits/webapps/mobiledetect_xss` | Mobile_Detect 2.8.31 reflected XSS via User-Agent header |
+| `exploits/webapps/openrepeater_inject` | OpenRepeater 2.1 detection + auth-required command injection |
+| `exploits/webapps/opensisce_sqli` | openSIS Classic 8.0 detection + auth-bypass / SQLi via login form |
+| `exploits/webapps/phpipam_sqli` | phpIPAM 1.4 / 1.5.1 admin endpoint detection + SQL error probe |
+| `exploits/webapps/phpmyadmin_sqli` | phpMyAdmin 5.0.0 detection at common paths + auth-required SQLi |
+| `exploits/webapps/phpmyfaq_xss` | phpMyFAQ 3.1.7 / 2.9.8 detection + reflected XSS probes |
+| `exploits/webapps/pihole_redis_rce_cve_2024_34361` | Pi-hole 5.18.3 admin UI detection + authenticated SSRF + Redis abuse for RCE (CVE-2024-34361) |
+| `exploits/webapps/piwigo_sqli` | Piwigo 13.6.0 admin endpoint detection + SQLi probe |
+| `exploits/webapps/pluck_upload` | Pluck CMS 4.7.10 / 4.7.7-dev2 admin upload to PHP RCE |
+| `exploits/webapps/react_rsc_rce_cve_2025_55182` | React 19.2.0 server components RCE markers detection (CVE-2025-55182) |
+| `exploits/webapps/redash_rce_hash` | Redash detection + auth-required RCE / hash recovery PoC |
+| `exploits/webapps/rosariosis_xss` | RosarioSIS 6.7.2 login fingerprint + reflected XSS via search |
+| `exploits/webapps/sharepoint_toolpane_cve_2025_53770` | Microsoft SharePoint ToolPane.aspx auth bypass + ViewState deserialization (CVE-2025-53770 / 53771 / 49704 / 49706) |
+| `exploits/webapps/textpattern_xss` | Textpattern CMS 4.9.0 admin endpoint detection + auth stored XSS in /pref |
+| `exploits/webapps/varnish_styx_smuggling` | Varnish ↔ Styx HTTP Request Smuggling (TE.CL) edge fingerprint |
+| `exploits/webapps/visualstudio_debugger` | VS Code Remote Debugger (1.30 - 1.39) Node Inspector exposure (CVE-2019-1414) |
+| `exploits/webapps/wfentlm_disclose` | Windows File Explorer NTLMv2 hash disclosure — UNC trigger HTML payload generator |
+| `exploits/webapps/wp_storychief_rce_cve_2025_7441` | WordPress StoryChief 1.0.42 unauthenticated RCE via featured image (CVE-2025-7441) |
+| `exploits/webapps/wpcpi_upload` | WP for CPI 1.0.2 unauthenticated arbitrary file upload |
+| `exploits/webapps/wpgivewp_inject` | WordPress GiveWP 3.14.1 PHP object injection via donation form |
+| `exploits/webapps/wpomnipress_xss` | WP OmniPress 1.6.3 plugin readme detection + auth admin stored XSS |
+| `exploits/webapps/yourls_sqli_cve_2022_0088` | YOURLS 1.8.2 admin/upgrade.php SQL injection (CVE-2022-0088) |
+| `exploits/webapps/yourls_xsrf_idor` | YOURLS 1.8.2 admin/ajax.php CSRF / IDOR probe (CVE-2022-0088) |
+| `exploits/webapps/zimbra_postjournal_rce` | Zimbra Collaboration Suite postjournal helper unauthenticated RCE — SMTP banner fingerprint |
 
 ### Windows
 
@@ -477,8 +590,18 @@ All modules live under `src/modules/` and are auto-discovered by `build.rs`. Use
 
 ---
 
+## OSINT (Open-Source Intelligence)
+
+Reconnaissance modules that gather public information without sending traffic to the target itself — DNS records, certificate transparency logs, subdomain enumeration via public APIs, etc. Run these *before* scanners, when you only have a domain or organisation name. New category in v0.4.9.
+
+| Module Path | Description |
+|-------------|-------------|
+| `osint/cert_transparency` | Subdomain enumeration via crt.sh certificate transparency logs. Polls `is_cancelled()` in the parsing loop; persists deduplicated subdomains to the loot store; supports the standard CIDR / file / random target dispatcher even though the target is normally a domain |
+
+---
+
 ## Plugins
 
 | Module Path | Description |
 |-------------|-------------|
-| `plugins/sample_plugin` | Template plugin demonstrating the RustSploit plugin API with mass scan and cfg_prompt integration |
+| `plugins/sample_plugin` | Template plugin demonstrating the RustSploit plugin API with mass scan and cfg_prompt integration. Note: "plugins" are compile-time module templates, not loadable shared objects |

@@ -735,6 +735,127 @@ Used by: DoS modules (icmp_flood, syn_ack_flood, null_syn_exhaustion, dns_amplif
 
 ---
 
+## `crate::utils::wordlist` — Pinned Resolver + Streaming Reader (v0.4.9+)
+
+Two surfaces in one module: a **checksum-pinned downloader** for canonical lists, and a **streaming line reader** for files too large to slurp into memory.
+
+### `resolve(name) → Result<PathBuf>` (async)
+
+Returns a local path to a wordlist by name. If not already cached, downloads from the pinned catalogue into `~/.rustsploit/wordlists/` (mode `0700`), with size cap (`MAX_BYTES = 256 MiB`), atomic tmp-rename (no torn writes if interrupted), and SHA-256 verification on every fetch — including cached copies, so silent disk tampering is detected.
+
+```rust
+use crate::utils::wordlist;
+
+let pwlist = wordlist::resolve("rockyou_top10k").await?;
+let lines = crate::utils::load_lines(&pwlist)?;
+```
+
+Failure modes: unknown name (suggests close matches via Levenshtein), HTTP error, content-length over cap, mid-stream size overrun, checksum mismatch (file is deleted and the call fails loudly).
+
+### `catalogue() → Vec<&'static str>`
+
+Returns the names of every wordlist this build knows about. Useful for `--list-wordlists`-style introspection.
+
+The catalogue is **intentionally empty by default**. Entries get added by maintainers after fetching + hashing each upstream artefact:
+
+```bash
+curl -L <url> | sha256sum
+```
+
+There is no TODO placeholder — placeholder hashes that look real but aren't are an integrity hole, so the slot stays empty until verified. To request a wordlist be added, open a PR adding a `WordlistSpec { name, url, sha256, local_name }` tuple to `KNOWN_LISTS`.
+
+### `BatchedReader` — streaming reader
+
+`crate::utils::load_lines` reads a whole file into a `Vec<String>`, which is fine for ~10k entry lists but allocates ~14 GB for `rockyou.txt`-sized inputs. `BatchedReader` instead reads line-by-line through an async `BufReader`, materialising at most `batch_size` lines at a time. Memory use is bounded to `batch_size × average_line_length + 64 KiB` regardless of input size.
+
+```rust
+use crate::utils::wordlist::BatchedReader;
+
+let mut reader = BatchedReader::open("rockyou.txt").await?;
+while let Some(batch) = reader.next_batch().await? {
+    for password in &batch {
+        if crate::context::is_cancelled() { return Ok(()); }
+        // try password against target
+    }
+}
+```
+
+Lines are trimmed; empty / `#`-prefixed lines are skipped (matches `load_lines` semantics). The reader is `!Send` across `await` (holds a `BufReader<File>`) — keep it on a single task; for parallel work, send each `Vec<String>` batch to workers via a channel.
+
+Constructors:
+- `BatchedReader::open(path).await` — default batch size (`DEFAULT_BATCH_SIZE = 8192`).
+- `BatchedReader::open_with_batch_size(path, n).await` — explicit. `0` is treated as `1` to avoid pathological infinite loops.
+
+Convenience driver:
+- `for_each_batch(path, batch_size, |batch| async { ... }).await` — closure-style iteration, cleaner than the loop-and-call pattern when the body is a single `async` block.
+
+Heuristic helper:
+- `should_stream(path) -> bool` — returns true if the file size is `>= STREAMING_THRESHOLD` (16 MiB). Use it to pick the right reader without hard-coding a threshold:
+  ```rust
+  let lines: Vec<String> = if wordlist::should_stream(&path) {
+      // streaming path
+      let mut acc = Vec::new();
+      let mut r = BatchedReader::open(&path).await?;
+      while let Some(b) = r.next_batch().await? { acc.extend(b); }
+      acc
+  } else {
+      crate::utils::load_lines(&path)?
+  };
+  ```
+
+---
+
+## `crate::native::network` — Low-Level FFI Helpers (v0.4.9+)
+
+Single audited home for `unsafe` socket operations that previously lived duplicated across the DoS module tree. Three layers, pick the smallest one that fits the call site. Every `unsafe` block carries a `SAFETY:` comment.
+
+### Layer 1 — IPv4 fast path (used by all 8 DoS modules today)
+
+```rust
+use crate::native::network::{make_dst_sockaddr, send_one_raw};
+
+let dst = make_dst_sockaddr(target_ipv4);
+let n = send_one_raw(raw_fd, &packet, &dst)?;
+```
+
+- `make_dst_sockaddr(ip: Ipv4Addr) -> libc::sockaddr_in` — POD `sockaddr_in` with `sin_family = AF_INET` and `sin_addr` populated. `sin_port` and `sin_zero` are left zero (raw sockets carry the L4 port in the user-built packet, not the sockaddr).
+- `send_one_raw(fd, buf, &sockaddr_in) -> io::Result<usize>` — wrapper around `libc::sendto`; translates `errno` → `io::Error`; never panics.
+
+### Layer 2 — IPv6 fast path
+
+```rust
+use crate::native::network::{make_dst_sockaddr_v6, send_one_raw_v6};
+
+// scope_id matters for link-local (fe80::/10); pass 0 for global unicast.
+let dst = make_dst_sockaddr_v6(target_ipv6, 0);
+let n = send_one_raw_v6(raw_fd_v6, &packet, &dst)?;
+```
+
+- `make_dst_sockaddr_v6(ip: Ipv6Addr, scope_id: u32) -> libc::sockaddr_in6` — same shape as the IPv4 builder; `sin6_flowinfo` is left zero.
+- `send_one_raw_v6(fd, buf, &sockaddr_in6) -> io::Result<usize>` — IPv6 counterpart of `send_one_raw`. Caller is responsible for `fd` being an `AF_INET6` raw socket.
+
+### Layer 3 — Family-agnostic wrapper
+
+When a module accepts both IPv4 and IPv6 targets and you don't want to fork the call site:
+
+```rust
+use crate::native::network::{make_dst_sockaddr_any, send_one_raw_any};
+
+let dst = make_dst_sockaddr_any(target);   // target: std::net::IpAddr
+let n = send_one_raw_any(raw_fd, &packet, &dst)?;
+```
+
+- `enum DstAddr { V4(sockaddr_in), V6(sockaddr_in6) }` — carries the family and the right `socklen_t` so the caller doesn't have to remember IPv4 vs IPv6 sizes.
+- `make_dst_sockaddr_any(IpAddr) -> DstAddr` — convenience builder. For IPv6 link-local where `scope_id` matters, build the `sockaddr_in6` directly with `make_dst_sockaddr_v6` and wrap with `DstAddr::V6`.
+- `send_one_raw_any(fd, buf, &DstAddr) -> io::Result<usize>` — `sendto` with the correct `socklen_t` derived from the variant.
+- `DstAddr::as_ptr_len() -> (*const sockaddr, socklen_t)` — for callers building their own `sendmmsg(2)` arrays.
+
+### Audit footprint
+
+Project-wide `unsafe` count dropped from 22 → 15 in v0.4.9 by consolidating the IPv4 helpers. The IPv6 + Any helpers add 4 new `unsafe` sites all in this file, but every one carries a `SAFETY:` comment and the contract is identical to the IPv4 variants. Used today by the 8 DoS modules: `ssdp_amplification`, `syn_ack_flood`, `ntp_amplification`, `dns_amplification`, `udp_flood`, `icmp_flood`, `memcached_amplification`, `null_syn_exhaustion`.
+
+---
+
 ## Extending Utils
 
 Add new reusable helpers to `src/utils/` (the appropriate submodule: `prompt.rs`, `sanitize.rs`, `target.rs`, `network.rs`, or `modules.rs`), `creds/utils.rs`, or `config.rs` rather than copy-pasting into individual modules. Common candidates:

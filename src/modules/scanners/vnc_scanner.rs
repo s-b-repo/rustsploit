@@ -68,9 +68,8 @@ async fn scan_vnc(
 ) -> Result<VncResult> {
     let addr = format!("{}:{}", target, port);
 
-    let mut stream = timeout(timeout_dur, tokio::net::TcpStream::connect(&addr))
+    let mut stream = crate::utils::network::tcp_connect_str(&addr, timeout_dur)
         .await
-        .context("Connection timed out")?
         .context("Failed to connect to VNC server")?;
 
     // Step 1: Read server RFB version string (12 bytes: "RFB XXX.YYY\n")
@@ -238,6 +237,7 @@ pub async fn run(target: &str) -> Result<()> {
     let mut results = Vec::new();
 
     for p in &ports {
+        if crate::context::is_cancelled() { break; }
         let display_num = p - 5900;
         crate::mprintln!();
         crate::mprintln!("{}", format!("[*] Scanning {}:{} (display :{})", target, p, display_num).bold());
@@ -246,8 +246,20 @@ pub async fn run(target: &str) -> Result<()> {
             Ok(result) => {
                 if result.no_auth {
                     crate::mprintln!("{}", format!("[+] {} - NO AUTHENTICATION REQUIRED!", result).red().bold());
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: target.to_string(),
+                        port: *p,
+                        service: "vnc".to_string(),
+                        version: Some(format!("noauth display=:{}", display_num)),
+                    });
                 } else if !result.security_types.is_empty() {
                     crate::mprintln!("{}", format!("[+] {}", result).green());
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: target.to_string(),
+                        port: *p,
+                        service: "vnc".to_string(),
+                        version: Some(format!("display=:{}", display_num)),
+                    });
                 } else if let Some(ref err) = result.error_msg {
                     crate::mprintln!("{}", format!("[!] Server error: {}", err).yellow());
                 }

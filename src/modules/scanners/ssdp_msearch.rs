@@ -295,7 +295,13 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> 
                 crate::mprintln!("  {} Cache-Control: {}", "  |".dimmed(), cache.dimmed());
             }
         }
-        
+
+        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+            host: target_ip.to_string(),
+            port,
+            service: format!("ssdp:{}", st_value),
+            version: if server.is_empty() { None } else { Some(server.clone()) },
+        });
         Some(result_line)
     } else {
         crate::mprintln!(

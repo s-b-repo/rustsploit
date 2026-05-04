@@ -153,10 +153,15 @@ impl GlobalConfig {
         
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
-        static VALID_CHARS: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-            Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("hardcoded regex must compile")
-        });
-        let valid_chars = &*VALID_CHARS;
+        // Use OnceCell::get_or_try_init so a (theoretically impossible)
+        // regex compile failure surfaces as a clean error instead of a
+        // panic on first input. The literal pattern is hardcoded and has
+        // never failed to compile in test, but proper plumbing matters.
+        static VALID_CHARS: once_cell::sync::OnceCell<Regex> = once_cell::sync::OnceCell::new();
+        let valid_chars = VALID_CHARS.get_or_try_init(|| {
+            Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$")
+                .map_err(|e| anyhow!("internal error: VALID_CHARS regex failed to compile: {e}"))
+        })?;
         if !valid_chars.is_match(target) {
             return Err(anyhow!(
                 "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"

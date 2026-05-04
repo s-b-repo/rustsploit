@@ -248,7 +248,103 @@ Bubble up errors using `anyhow::Context` so the shell/CLI surface meaningful mes
 .with_context(|| format!("Failed to connect to {}", target))?
 ```
 
-Avoid `unwrap()` and `unwrap_or_default()` in critical paths.
+**No panics in module code.** As of v0.4.9 the entire `src/` tree is panic-free — `grep` finds zero `.unwrap()`, `.expect(`, `panic!(`, `unreachable!(`, `unimplemented!(`, or `todo!(`. Use `?` propagation, `_or(default)`, `_or_default()`, `_or_else(|| ...)`, or explicit `match { Err(e) => ... }`. The CI policy is to keep that grep returning empty.
+
+For length-checked slice conversions (a common source of historical `.expect()`), use `try_into().map_err(|_| anyhow!("descriptive context"))?` rather than `.expect("length was checked")` — even when the length truly was checked. Future readers shouldn't have to verify the invariant by hand.
+
+---
+
+## Cancellation
+
+Long-running modules MUST honor cancellation so `kill <job_id>` from the shell or `DELETE /api/jobs/<id>` from the API actually stops the work. The cancellation token is per-`RunContext` and is triggered automatically when a job is killed.
+
+```rust
+loop {
+    if crate::context::is_cancelled() {
+        crate::mprintln!("[!] Cancelled by user, stopping at host {}", current);
+        break;
+    }
+    // ... one iteration of work ...
+}
+```
+
+For `tokio::select!`-style code, use `crate::context::cancellation_token()` and `select!` against `tok.cancelled().await`:
+
+```rust
+let tok = crate::context::cancellation_token();
+tokio::select! {
+    res = real_work() => handle(res),
+    _ = tok.cancelled() => {
+        crate::mprintln!("[!] Cancelled");
+        return Ok(());
+    }
+}
+```
+
+The framework also emits `ModuleStarted` and `ModuleFinished` events automatically around every `run_module(...)` call, so subscribers always see lifecycle transitions.
+
+---
+
+## Structured Findings
+
+In addition to human-readable `mprintln!` output, modules may emit machine-readable findings on the `crate::events` channel. WebSocket subscribers (panels, MCP tooling, integrations) consume them without grepping stdout.
+
+```rust
+crate::events::emit(crate::events::ModuleEvent::CredentialFound {
+    host: target.to_string(),
+    port,
+    service: "ssh".into(),
+    username: user.into(),
+});
+```
+
+Available variants (all `#[non_exhaustive]` — adding more is non-breaking):
+
+- `ModuleStarted { module, target }` — auto-emitted by `commands::run_module`
+- `ModuleFinished { module, target, success }` — auto-emitted on return
+- `HostUp { host }`
+- `ServiceDetected { host, port, service, version: Option<String> }`
+- `CredentialFound { host, port, service, username }`
+- `LootStored { id, host, kind }`
+
+Emission is non-blocking and silently drops when there are no subscribers (the common CLI-only case).
+
+---
+
+## Batch Mode
+
+When the framework dispatches a mass-scan target (`0.0.0.0`, `random`, CIDR, file, comma-separated), it enters **batch mode** and fans out N concurrent module invocations against single IPs. **Modules MUST gate interactive UI behind `is_batch_mode()`** or risk N concurrent menu prints flooding the terminal:
+
+```rust
+use crate::context::is_batch_mode;
+
+pub async fn run(target: &str) -> Result<()> {
+    if !is_batch_mode() {
+        crate::mprintln!("=== My Module ===");
+        crate::mprintln!("[*] Loaded {} targets", n);
+    }
+
+    // For menus that pick a target type (Single / Subnet / File),
+    // short-circuit to "Single Target" — the framework already orchestrated targets.
+    let mode = if is_batch_mode() {
+        ModeChoice::SingleTarget
+    } else {
+        // print menu, read cfg_prompt_default("mode", ...), parse
+    };
+
+    // For REPL-style modules, break out after one action in batch mode:
+    let in_batch = is_batch_mode();
+    loop {
+        let cmd = cfg_prompt_default("cmd", "exec");
+        do_one_action(&cmd).await?;
+        if in_batch { break; }
+    }
+
+    Ok(())
+}
+```
+
+The cached `cfg_prompt_default(...)` returns the same value every call, so a REPL loop reading prompts spins forever in batch mode unless you `break;` after one iteration. This was the v0.4.9 root cause for ~22 modules across two sweeps — see the changelog entry.
 
 ---
 

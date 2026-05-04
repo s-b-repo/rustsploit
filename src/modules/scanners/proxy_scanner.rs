@@ -154,14 +154,22 @@ pub async fn run(target: &str) -> Result<()> {
         }, move |ip: IpAddr, _port: u16| {
             let ports = ports.clone();
             async move {
+                if crate::context::is_cancelled() { return None; }
                 let dur = Duration::from_secs(5);
                 let mut lines = Vec::new();
                 for &p in &ports {
+                    if crate::context::is_cancelled() { break; }
                     let hits = probe_port(ip, p, dur).await;
                     for h in hits {
                         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                         lines.push(format!("[{}] {}:{} {} ({})", ts, ip, h.port, h.kind, h.detail));
                         crate::mprintln!("\r{}", format!("[+] {}:{} {} — {}", ip, h.port, h.kind, h.detail).green().bold());
+                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                            host: ip.to_string(),
+                            port: h.port,
+                            service: format!("proxy:{}", h.kind),
+                            version: Some(h.detail.clone()),
+                        });
                     }
                 }
                 if lines.is_empty() { None } else { Some(lines.join("\n") + "\n") }
@@ -189,6 +197,7 @@ pub async fn run(target: &str) -> Result<()> {
     let mut found = Vec::new();
 
     for &port in &ports {
+        if crate::context::is_cancelled() { break; }
         if verbose {
             crate::mprintln!("[*] Probing {}:{}...", ip, port);
         }
@@ -198,6 +207,12 @@ pub async fn run(target: &str) -> Result<()> {
         }
         for h in &hits {
             crate::mprintln!("  {}", format!("[+] {}:{} — {} ({})", ip, h.port, h.kind, h.detail).green().bold());
+            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                host: ip.to_string(),
+                port: h.port,
+                service: format!("proxy:{}", h.kind),
+                version: Some(h.detail.clone()),
+            });
         }
         found.extend(hits);
     }

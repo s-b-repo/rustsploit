@@ -153,6 +153,12 @@ fn capitalize(s: &str) -> String {
 struct ModuleCapabilities {
     has_info: bool,
     has_check: bool,
+    /// Module's `run()` recognises mass-scan targets (`0.0.0.0`, `random`, etc.)
+    /// and runs its own optimised loop. Detected by source-grep for
+    /// `is_mass_scan_target(`, `run_mass_scan(`, or `MassScanConfig {` —
+    /// modules without these markers fall back to the framework's per-IP
+    /// dispatch loop in `commands::mod::dispatch_single_target`.
+    has_mass_scan: bool,
 }
 
 fn generate_dispatch(
@@ -343,6 +349,30 @@ fn generate_dispatch(
     }
 
     writeln!(file, "        _ => false,")?;
+    writeln!(file, "    }}\n}}\n")?;
+
+    // === Mass-scan capability (does the module's run() handle "0.0.0.0" itself?) ===
+    writeln!(file, "/// True when the module's `run()` recognises mass-scan targets")?;
+    writeln!(file, "/// (`0.0.0.0`, `random`, etc.) and runs its own loop. Used by the")?;
+    writeln!(file, "/// command dispatcher to decide whether to call the module once with")?;
+    writeln!(file, "/// the original mass-scan target, or fall back to the framework's")?;
+    writeln!(file, "/// per-IP dispatch loop.")?;
+    writeln!(file, "pub fn mass_scan_capable(module_name: &str) -> bool {{")?;
+    writeln!(file, "    match module_name {{")?;
+
+    let mut ms_shorts: HashSet<String> = HashSet::new();
+    for (key, _, caps) in &sorted_mappings {
+        if !caps.has_mass_scan { continue; }
+        let short_key = key.rsplit('/').next().unwrap_or(key);
+        if short_key == *key {
+            writeln!(file, r#"        "{k}" => true,"#, k = key)?;
+        } else if ms_shorts.insert(short_key.to_string()) {
+            writeln!(file, r#"        "{short}" | "{full}" => true,"#, short = short_key, full = key)?;
+        } else {
+            writeln!(file, r#"        "{full}" => true,"#, full = key)?;
+        }
+    }
+    writeln!(file, "        _ => false,")?;
     writeln!(file, "    }}\n}}")?;
 
     let count = sorted_mappings.len();
@@ -443,6 +473,21 @@ fn generate_registry(entries: &[RegistryEntry]) -> Result<(), Box<dyn std::error
     }
     writeln!(f, "        _ => false,")?;
     writeln!(f, "    }}")?;
+    writeln!(f, "}}\n")?;
+
+    // Mass-scan capability lookup
+    writeln!(f, "/// True if the module's `run()` handles mass-scan targets itself.")?;
+    writeln!(f, "pub fn mass_scan_capable_by_category(category: &str, module_name: &str) -> bool {{")?;
+    writeln!(f, "    match category {{")?;
+    for e in entries {
+        writeln!(
+            f,
+            "        \"{}\" => crate::commands::{}::mass_scan_capable(module_name),",
+            e.category, e.dispatch_name
+        )?;
+    }
+    writeln!(f, "        _ => false,")?;
+    writeln!(f, "    }}")?;
     writeln!(f, "}}")?;
 
     Ok(())
@@ -480,9 +525,13 @@ fn find_modules(
                 if File::open(path).and_then(|mut f| f.read_to_string(&mut content)).is_ok() {
                     if !content.contains("fn run") { continue; }
                     if run_re.is_match(&content) {
+                        let has_mass_scan = content.contains("is_mass_scan_target(")
+                            || content.contains("run_mass_scan(")
+                            || content.contains("MassScanConfig {");
                         let caps = ModuleCapabilities {
                             has_info: content.contains("fn info") && info_re.is_match(&content),
                             has_check: content.contains("fn check") && check_re.is_match(&content),
+                            has_mass_scan,
                         };
                         mappings.insert((rel_str.clone(), rel_str, caps));
                     }

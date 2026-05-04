@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use colored::*;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// A tracked host discovered during an engagement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,7 @@ pub struct Workspace {
     name: RwLock<String>,
     data: RwLock<WorkspaceData>,
     base_dir: PathBuf,
+    save_mutex: Mutex<()>,
 }
 
 impl Workspace {
@@ -46,10 +47,16 @@ impl Workspace {
     /// File I/O here uses std::fs since this runs during lazy initialization
     /// before the tokio runtime may be fully available for blocking.
     fn new() -> Self {
-        let base_dir = home::home_dir()
+        let base = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".rustsploit")
-            .join("workspaces");
+            .join(".rustsploit");
+        Self::with_base_dir(base)
+    }
+
+    /// Create a workspace rooted under a custom base directory.
+    /// Used by the tenant registry for per-tenant isolation.
+    pub(crate) fn with_base_dir(base: PathBuf) -> Self {
+        let base_dir = base.join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
         if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) {
             eprintln!("[!] Failed to create workspaces directory {}: {}", base_dir.display(), e);
@@ -60,6 +67,7 @@ impl Workspace {
             name: RwLock::new("default".to_string()),
             data: RwLock::new(data),
             base_dir,
+            save_mutex: Mutex::new(()),
         }
     }
 
@@ -84,7 +92,9 @@ impl Workspace {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Failed to read workspace '{}': {}", name, e);
+                    eprintln!("[!] Failed to read workspace '{}': {}. Preserving original.", name, e);
+                    let backup = path.with_extension("json.unreadable");
+                    let _ = std::fs::rename(&path, &backup);
                     WorkspaceData::default()
                 }
             }
@@ -113,7 +123,12 @@ impl Workspace {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Starting empty.", name, e);
+                    // Read errors (EACCES/EIO) leave the original file
+                    // intact. Move it aside so a subsequent successful
+                    // start doesn't silently overwrite the original.
+                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Preserving original.", name, e);
+                    let backup = path.with_extension("json.unreadable");
+                    let _ = tokio::fs::rename(&path, &backup).await;
                     WorkspaceData::default()
                 }
             }
@@ -127,30 +142,54 @@ impl Workspace {
     }
 
     /// Save current workspace to disk.
-    /// Clones data before releasing lock to avoid holding lock during I/O.
+    /// P1-1: serialize disk writes via `save_mutex` so concurrent mutators
+    /// cannot land their saves out of order. The snapshot is taken under
+    /// the read lock *while holding* the save mutex, guaranteeing the
+    /// on-disk file always matches a real in-memory state.
     async fn save(&self) {
+        let _save_guard = self.save_mutex.lock().await;
         let name = self.current_name().await;
         let path = self.file_path(&name);
-        // Clone data to release lock before file I/O
         let data_snapshot = self.data.read().await.clone();
         let tmp = path.with_extension("json.tmp");
-        match serde_json::to_string_pretty(&data_snapshot) {
-            Ok(json) => {
-                if let Err(e) = tokio::fs::write(&tmp, &json).await {
-                    eprintln!("[!] Failed to write workspace tmp file: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-                    eprintln!("[!] Failed to save workspace: {}", e);
-                } else {
-                    if let Err(e) = crate::utils::set_secure_permissions_async(&path, 0o600).await {
-                        eprintln!("[!] Workspace {} saved but chmod 0o600 failed: {} — file may be world-readable", path.display(), e);
-                    }
-                }
-            }
+        let json = match serde_json::to_string_pretty(&data_snapshot) {
+            Ok(j) => j,
             Err(e) => {
                 eprintln!("[!] Failed to serialize workspace data: {}", e);
+                return;
             }
+        };
+        // P1-7: open the temp file atomically with mode 0o600 + O_NOFOLLOW so
+        // (a) the file is never visible at world-readable mode (no
+        // truncate-then-chmod window), and (b) a symlink raced into place
+        // between create and write can't redirect the write to a privileged
+        // path.
+        use tokio::fs::OpenOptions;
+        use tokio::io::AsyncWriteExt;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        #[cfg(unix)]
+        {
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = match opts.open(&tmp).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[!] Failed to open workspace tmp file: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = file.write_all(json.as_bytes()).await {
+            eprintln!("[!] Failed to write workspace tmp file: {}", e);
+            return;
+        }
+        if let Err(e) = file.flush().await {
+            eprintln!("[!] Failed to flush workspace tmp file: {}", e);
+            return;
+        }
+        drop(file);
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            eprintln!("[!] Failed to save workspace: {}", e);
         }
     }
 
@@ -189,12 +228,26 @@ impl Workspace {
     }
 
     /// Add or update a host.
+    ///
+    /// `ip` may be a bare IPv4/IPv6 address or a hostname (the same shapes
+    /// that `extract_ip_from_target` produces). Anything that fails both an
+    /// IpAddr parse and the conservative hostname charset (alphanum + `.-_`)
+    /// is rejected so junk like `not_an_ip` cannot land in the tracked-host
+    /// list.
     pub async fn add_host(&self, ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
         // Input validation
         if ip.is_empty() || ip.len() > 256 {
             return;
         }
         if ip.chars().any(|c| c.is_control()) {
+            return;
+        }
+        let is_ip = ip.parse::<std::net::IpAddr>().is_ok();
+        let is_hostname = !is_ip
+            && ip.contains('.')
+            && ip.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+        if !is_ip && !is_hostname {
+            tracing::debug!(ip, "workspace add_host rejected: not a valid IP or hostname shape");
             return;
         }
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -371,10 +424,14 @@ impl Workspace {
 pub static WORKSPACE: Lazy<Workspace> = Lazy::new(Workspace::new);
 
 /// Convenience functions for modules to auto-populate workspace data.
+/// Routes through the tenant registry when in a tenant context (API mode),
+/// otherwise uses the global singleton (shell mode).
 pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
-    WORKSPACE.add_host(ip, hostname, os_guess).await;
+    let s = crate::tenant::resolve();
+    s.workspace().add_host(ip, hostname, os_guess).await;
 }
 
 pub async fn track_service(host: &str, port: u16, protocol: &str, service_name: &str, version: Option<&str>) {
-    WORKSPACE.add_service(host, port, protocol, service_name, version).await;
+    let s = crate::tenant::resolve();
+    s.workspace().add_service(host, port, protocol, service_name, version).await;
 }

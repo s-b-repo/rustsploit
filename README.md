@@ -22,6 +22,8 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 | [API Usage Examples](docs/API-Usage-Examples.md) | Practical curl workflows, request/response samples |
 | [Module Catalog](docs/Module-Catalog.md) | All modules by category — exploits, scanners, creds |
 | [Module Development](docs/Module-Development.md) | How to author new modules, lifecycle, dispatcher |
+| [Bad Patterns Catalogue](docs/BAD_PATTERNS.md) | 133-regex `grep` matrix every module must pass — banned `.unwrap`, swallow, panic, blocking-IO, lossy casts, crypto, injection, etc. Re-runnable via `scripts/audit-bad-patterns.sh` |
+| [Bad Patterns Audit Report](docs/audit-report.md) | Latest whole-tree snapshot — strict-mode result on the 100 authored modules (zero hits) and observational counts on the rest of the framework |
 | [Security & Validation](docs/Security-Validation.md) | Input validation, security patterns, honeypot detection |
 | [Credential Modules Guide](docs/Credential-Modules-Guide.md) | Best practices for brute-force / cred modules |
 | [Exploit Modules Guide](docs/Exploit-Modules-Guide.md) | Best practices for exploit modules |
@@ -107,6 +109,54 @@ For other distros (Arch, Gentoo, Fedora), Docker deployment, and one-liner insta
 - **Using the API?** → [API Server](docs/API-Server.md) + [API Usage Examples](docs/API-Usage-Examples.md)
 - **Running from CLI?** → [CLI Reference](docs/CLI-Reference.md)
 - **Full module list?** → [Module Catalog](docs/Module-Catalog.md)
+
+---
+
+## API server quick start
+
+The PQ-encrypted API is what external integrations and web panels talk to.
+Bind it to whichever interface you want — the bootstrap path is gated by a
+one-time enrollment token printed at startup, **not** by the bind address.
+
+```bash
+# Local-only (default, useful for development)
+cargo run --release -- --api
+
+# Reachable on a LAN
+cargo run --release -- --api --interface 192.0.2.10:8080
+
+# Reachable from anywhere (bind to all interfaces)
+cargo run --release -- --api --interface 0.0.0.0:8080
+```
+
+On startup the server prints something like:
+
+```
+═══════════════════════════════════════════════════════════════
+ENROLLMENT TOKEN (one-time, prints once): tWQ9sIz3kZGdHc4w7g8hPxJrAaPN1c0v
+Bootstrap a client by POSTing its PQ public keys + this
+token to POST /pq/register-key:
+  { token, name, x25519_pub, mlkem_ek }
+After first successful registration the token is consumed; further
+key changes must go through the established PQ session.
+═══════════════════════════════════════════════════════════════
+```
+
+Hand that token to whichever client you want to enroll. The client POSTs
+its X25519 + ML-KEM-768 public keys to `/pq/register-key` over the
+network — no shared filesystem required, client and server can be on
+different hosts. The token is consumed on first use; restart the server
+to issue a new one.
+
+Endpoints exposed by `--api`:
+
+| Path | Auth | Purpose |
+|------|------|---------|
+| `GET /health` | none | Liveness |
+| `POST /pq/handshake` | identity allowlist | PQXDH session establishment |
+| `POST /pq/register-key` | enrollment token (one-time) | Bootstrap a new client identity |
+| `GET /pq/ws` | PQ session | Bi-directional event/RPC channel |
+| `ALL /api/*` | PQ session | REST surface (auto-generated from JSON-RPC dispatcher) |
 
 ---
 

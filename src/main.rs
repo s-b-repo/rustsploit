@@ -17,6 +17,8 @@ mod shell;
 mod utils;
 
 pub mod cred_store;
+pub mod events;
+pub mod tenant;
 pub mod export;
 pub mod global_options;
 pub mod jobs;
@@ -110,6 +112,21 @@ async fn run() -> Result<()> {
 
     tracing::debug!("CLI arguments parsed successfully");
 
+    // P0-2: propagate the strict-TLS flag to the framework's HTTP-client
+    // builder so `permissive()` callers automatically pick up the operator's
+    // policy. Modules that *legitimately* need to talk to self-signed
+    // devices still opt in explicitly via `HttpClientOpts {
+    // accept_invalid_certs: true, .. }`. P1-9: same plumbing for the
+    // proxy-trust flag used by the handshake rate limiter.
+    utils::network::set_global_strict_tls(cli_args.strict_tls);
+    utils::network::set_global_trust_proxy(cli_args.trust_proxy);
+    if !cli_args.strict_tls {
+        tracing::warn!(
+            "TLS verification permissive by default for HTTPS exploit modules. \
+             Pass --strict-tls to flip the default to strict."
+        );
+    }
+
     // Handle list_modules flag
     if cli_args.list_modules {
         tracing::debug!("Listing all modules...");
@@ -131,6 +148,7 @@ async fn run() -> Result<()> {
             cli_args.verbose,
             &host_key_path,
             &auth_keys_path,
+            cli_args.pq_key_passphrase.as_deref(),
         )
         .await?;
         return Ok(());

@@ -280,7 +280,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     let connector = AsyncNativeTlsConnector::from(
         TlsConnector::new()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
             .danger_accept_invalid_hostnames(true),
     );
 

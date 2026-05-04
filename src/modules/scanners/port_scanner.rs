@@ -58,6 +58,18 @@ impl PortRange {
             PortRange::Top1000 => (1..=1000).collect(),
         }
     }
+
+    /// Cheap count without materializing the port list — use this for
+    /// progress reporting / pre-flight messages where the actual port values
+    /// aren't needed yet.
+    fn port_count(&self) -> usize {
+        match self {
+            PortRange::All => 65535,
+            PortRange::Custom { start, end } => (*end as usize).saturating_sub(*start as usize) + 1,
+            PortRange::Common => COMMON_PORTS.len(),
+            PortRange::Top1000 => 1000,
+        }
+    }
 }
 
 // Common ports list
@@ -120,8 +132,7 @@ pub async fn prompt_settings() -> Result<ScanSettings> {
         _ => PortRange::All,
     };
     
-    let ports = port_range.get_ports();
-    crate::mprintln!("{}", format!("[*] Selected {} ports to scan", ports.len()).green());
+    crate::mprintln!("{}", format!("[*] Selected {} ports to scan", port_range.port_count()).green());
     
     // Scan Method Selection
     let method_choice_str = cfg_prompt_default("scan_method", "Scan Method (1=TCP, 2=UDP, 3=Both)", "1").await?;
@@ -257,6 +268,8 @@ pub async fn run_with_settings(
     if scan_method == ScanMethod::TcpConnect || scan_method == ScanMethod::Both {
         crate::mprintln!("{}", "\n[*] Starting TCP scan...".yellow());
         for port in &ports {
+            // Honor cancellation before paying for another permit / spawn.
+            if crate::context::is_cancelled() { break; }
             let permit = semaphore.clone().acquire_owned().await?;
             let file = file.clone();
             let stats = stats.clone();
@@ -268,26 +281,34 @@ pub async fn run_with_settings(
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
+                if crate::context::is_cancelled() { return; }
                 let result = scan_tcp(&ip, port, timeout_secs, ttl, source_port, data_length).await;
-                
+
                 let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
                 let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
-                
+
                 if let Some((status, banner, service)) = result {
                     match status.as_str() {
                         "OPEN" => {
                             stats_guard.tcp_open += 1;
                             let service_name = if service.is_empty() { get_service_name(port) } else { &service };
                             let line = format!("[TCP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
-                            
+
                             let output_line = if !banner.is_empty() {
                                 format!("{} | Banner: {}", line, banner.trim().bright_black())
                             } else {
                                 line
                             };
-                            
+
                             let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
                             crate::mprintln!("{}", output_line);
+                            // Structured event for API/MCP/WS subscribers — no-op when none.
+                            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                                host: ip_str.clone(),
+                                port,
+                                service: service_name.to_string(),
+                                version: if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
+                            });
                         }
                         "CLOSED" => {
                             stats_guard.tcp_closed += 1;
@@ -319,6 +340,7 @@ pub async fn run_with_settings(
     if scan_method == ScanMethod::Udp || scan_method == ScanMethod::Both {
         crate::mprintln!("{}", "\n[*] Starting UDP scan...".yellow());
         for port in &ports {
+            if crate::context::is_cancelled() { break; }
             let permit = semaphore.clone().acquire_owned().await?;
             let file = file.clone();
             let stats = stats.clone();
@@ -329,6 +351,7 @@ pub async fn run_with_settings(
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
+                if crate::context::is_cancelled() { return; }
                 let result = scan_udp(&ip, port, timeout_secs, ttl, source_port, data_length).await;
                 
                 let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -340,9 +363,15 @@ pub async fn run_with_settings(
                             stats_guard.udp_open += 1;
                             let service_name = get_service_name(port);
                             let line = format!("[UDP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
-                            
+
                             let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
                             crate::mprintln!("{}", line);
+                            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                                host: ip_str.clone(),
+                                port,
+                                service: format!("{}/udp", service_name),
+                                version: None,
+                            });
                         }
                         "CLOSED" => stats_guard.udp_closed += 1,
                         "FILTERED" => stats_guard.udp_filtered += 1,

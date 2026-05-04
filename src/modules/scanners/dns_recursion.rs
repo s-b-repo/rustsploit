@@ -240,6 +240,12 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
             "    This resolver may be abused for reflection/amplification attacks (ANY/DNSSEC)."
                 .yellow()
         );
+        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+            host: display_target.to_string(),
+            port: 53,
+            service: "dns-open-resolver".to_string(),
+            version: Some(format!("RA=true rcode={:?}", rcode)),
+        });
         true
     } else if recursion_available && rcode == ResponseCode::Refused {
         crate::mprintln!(

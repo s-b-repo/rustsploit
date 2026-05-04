@@ -98,6 +98,7 @@ async fn scan_targets(
     let mut tasks = Vec::with_capacity(total);
 
     for ip_str in ips {
+        if crate::context::is_cancelled() { break; }
         let permit = semaphore.clone().acquire_owned().await;
         let permit = match permit {
             Ok(p) => p,
@@ -107,8 +108,20 @@ async fn scan_targets(
         let prog = progress.clone();
 
         tasks.push(tokio::spawn(async move {
+            if crate::context::is_cancelled() { drop(permit); return; }
             let (open_count, open_ports) = scan_ip_ports(&ip_str, timeout_ms).await;
             let (status, color) = classify(open_count);
+
+            // Emit any host that scored high enough to be flagged honeypot
+            // or suspicious so subscribers see findings as they arrive.
+            if open_count >= 8 {
+                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                    host: ip_str.clone(),
+                    port: 0,
+                    service: format!("honeypot:{}", status),
+                    version: Some(format!("{} open ports", open_count)),
+                });
+            }
 
             if let Ok(mut list) = res.lock() {
                 list.push((
@@ -201,7 +214,7 @@ async fn store_to_workspace(results: &[(String, usize, String, String, Vec<u16>)
         if *open_count >= 6 {
             crate::workspace::track_host(ip, None, None).await;
             let note = format!("Honeypot scan: {} ({}/{} ports open)", status, open_count, HONEYPOT_PORTS.len());
-            crate::workspace::WORKSPACE.add_note(ip, &note).await;
+            crate::tenant::resolve().workspace().add_note(ip, &note).await;
         }
     }
 }

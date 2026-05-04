@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use colored::*;
-use reqwest::ClientBuilder;
 use std::{io::Write, net::IpAddr, sync::Arc, time::Duration};
+
+use crate::utils::network::{build_http_client, build_http_client_with, HttpClientOpts};
 
 use crate::utils::{
     generate_combos_mode, parse_combo_mode, load_credential_file,
@@ -73,12 +74,11 @@ pub async fn run(target: &str) -> Result<()> {
             "{}",
             format!("[*] Target: {} — Mass Scan Mode", target).yellow()
         );
-        // Build client ONCE and share — avoids OOM from per-host client creation
+        // Build client ONCE and share — avoids OOM from per-host client creation.
+        // Canonical builder so source-port / TLS / redirect defaults stay
+        // centralised (see Utilities-Helpers.md → build_http_client).
         let mass_client = Arc::new(
-            reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
+            build_http_client(Duration::from_secs(5))
                 .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?,
         );
         return run_mass_scan(
@@ -477,12 +477,14 @@ async fn try_es_login(
     password: &str,
     timeout_duration: Duration,
 ) -> Result<bool> {
-    let client = ClientBuilder::new()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .timeout(timeout_duration)
-        .build()
-        .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+    let client = build_http_client_with(
+        timeout_duration,
+        HttpClientOpts {
+            accept_invalid_hostnames: !crate::utils::network::get_global_strict_tls(),
+            ..HttpClientOpts::permissive()
+        },
+    )
+    .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
     // Try the security authenticate endpoint first
     let auth_url = format!("{}/_security/_authenticate", base_url);

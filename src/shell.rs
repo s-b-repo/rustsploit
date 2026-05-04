@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -16,10 +17,49 @@ use crate::config;
 use crate::utils;
 
 const MAX_INPUT_LENGTH: usize = 4096;
-const MAX_COMMAND_CHAIN_LENGTH: usize = 10;
+/// Maximum number of `&` / `;` -separated commands in a single line.
+/// Sized for multi-stage chains like:
+///   `setg target 1.2.3.4 & use scanners/port_scanner & run & use exploits/... & run`
+const MAX_COMMAND_CHAIN_LENGTH: usize = 32;
+/// Characters that separate chained commands. `&` and `;` are equivalent.
+/// Note: `&` here is sequential (NOT the bash background operator); the
+/// shell does not support background commands.
+const CHAIN_SEPARATORS: &[char] = &['&', ';'];
 const MAX_URL_LENGTH: usize = 2048;
 
 const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
+
+// ─── Shell-active flag ──────────────────────────────────────────────────────
+/// True while the user is inside the interactive REPL shell (this file's
+/// `interactive_shell_inner`). False when invoked via `--api`, `--mcp`, or
+/// `-m <module> -t <target>` direct CLI mode.
+///
+/// Modules can call `crate::shell::is_interactive_shell()` to opt into
+/// extra interactive behaviour (e.g. wpair loops its action prompt so the
+/// operator can chain commands without re-entering the module).
+static IN_INTERACTIVE_SHELL: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard returned by `enter_interactive_shell()` — flips the flag back
+/// to `false` on drop so the marker stays correct even on `?` early returns.
+pub struct InteractiveShellGuard(());
+
+impl Drop for InteractiveShellGuard {
+    fn drop(&mut self) {
+        IN_INTERACTIVE_SHELL.store(false, Ordering::Release);
+    }
+}
+
+/// Mark the interactive shell as active. Returns a guard that clears the
+/// flag on drop.
+pub fn enter_interactive_shell() -> InteractiveShellGuard {
+    IN_INTERACTIVE_SHELL.store(true, Ordering::Release);
+    InteractiveShellGuard(())
+}
+
+/// True if the caller is running inside the interactive REPL shell.
+pub fn is_interactive_shell() -> bool {
+    IN_INTERACTIVE_SHELL.load(Ordering::Acquire)
+}
 
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
@@ -179,6 +219,11 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
 }
 
 async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> Result<()> {
+    // Mark this thread as being inside the interactive shell so modules can
+    // opt into shell-only UX (e.g. wpair loops its action prompt). Cleared
+    // automatically when the guard drops, including on `?` early returns.
+    let _shell_guard = enter_interactive_shell();
+
     println!("Welcome to RustSploit Shell (inspired by RouterSploit)");
     println!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
 
@@ -284,25 +329,47 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
             continue;
         }
 
-        // Support command chaining with & separator
-        let commands: Vec<&str> = trimmed
-        .split('&')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .take(MAX_COMMAND_CHAIN_LENGTH)
-        .collect();
+        // Support command chaining: `&` and `;` are equivalent sequential
+        // separators. Each command runs in order; failures don't abort the
+        // chain (modules emit their own error messages). Chain depth is
+        // capped at MAX_COMMAND_CHAIN_LENGTH to bound runaway lines.
+        let raw_segments: Vec<&str> = trimmed
+            .split(|c: char| CHAIN_SEPARATORS.contains(&c))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let truncated = raw_segments.len() > MAX_COMMAND_CHAIN_LENGTH;
+        let commands: Vec<&str> = raw_segments
+            .into_iter()
+            .take(MAX_COMMAND_CHAIN_LENGTH)
+            .collect();
 
-        if trimmed.split('&').count() > MAX_COMMAND_CHAIN_LENGTH {
+        if truncated {
             println!(
                 "{}",
-                format!("[!] Command chain exceeds maximum length of {}. Truncating.", MAX_COMMAND_CHAIN_LENGTH)
-                    .yellow()
+                format!(
+                    "[!] Command chain exceeds maximum length of {}. Truncating.",
+                    MAX_COMMAND_CHAIN_LENGTH
+                )
+                .yellow()
             );
         }
 
-        for cmd_input in commands {
+        let chain_len = commands.len();
+        let is_chain = chain_len > 1;
+        for (idx, cmd_input) in commands.iter().enumerate() {
             if cmd_input.is_empty() {
                 continue;
+            }
+
+            // For chains, surface a progress prefix so the operator can
+            // tell which segment is running and tie any error output back
+            // to its segment. Single-command lines stay quiet.
+            if is_chain {
+                println!(
+                    "{}",
+                    format!("[chain {}/{}] {}", idx + 1, chain_len, cmd_input).cyan()
+                );
             }
 
             let should_break = execute_single_command(&mut ctx, cmd_input).await;
@@ -1335,10 +1402,11 @@ fn render_help() {
         ">>".dimmed(),
         "help <command>".cyan().bold(),
         "help run".cyan());
-    println!("  {} Chain commands with {}: {}",
+    println!("  {} Chain commands with {} or {}: {}",
         ">>".dimmed(),
         "&".cyan().bold(),
-        format!("set target 10.0.0.1 & use scanners/smtp_user_enum & run").cyan());
+        ";".cyan().bold(),
+        format!("set target 10.0.0.1 & use scanners/smtp_user_enum & run ; use exploits/... & run").cyan());
     println!("  {} Use {} to set options that apply to all modules.",
         ">>".dimmed(), "setg".cyan().bold());
     println!("  {} Use {} to save engagement data.",

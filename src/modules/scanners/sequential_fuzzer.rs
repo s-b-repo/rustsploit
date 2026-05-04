@@ -159,17 +159,15 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
-            print_banner();
-        }
-    }
+        print_banner();
 
-    // Menu
-    crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
-    crate::mprintln!("1. Quick Attack (All ASCII, No Encoding)");
-    crate::mprintln!("2. Create Template (Wizard -> Save)");
-    crate::mprintln!("3. Load Template (Load -> Run)");
-    crate::mprintln!("4. Custom Attack (Wizard -> Run)");
+        // Menu
+        crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
+        crate::mprintln!("1. Quick Attack (All ASCII, No Encoding)");
+        crate::mprintln!("2. Create Template (Wizard -> Save)");
+        crate::mprintln!("3. Load Template (Load -> Run)");
+        crate::mprintln!("4. Custom Attack (Wizard -> Run)");
+    }
     
     let choice = cfg_prompt_default("mode", "Selection", "1").await?;
     
@@ -420,11 +418,17 @@ async fn execute_fuzz(config: SequentialFuzzerConfig) -> Result<()> {
                              format!("[{}]", status).white().to_string()
                          };
                          
-                         crate::mprintln!("{} Size: {} | {}", 
-                             status_display, 
-                             res.size.to_string().dimmed(), 
+                         crate::mprintln!("{} Size: {} | {}",
+                             status_display,
+                             res.size.to_string().dimmed(),
                              res.path
                          );
+                         crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                             host: res.path.clone(),
+                             port: 0,
+                             service: "fuzz-hit".to_string(),
+                             version: Some(format!("status={} size={}", res.status, res.size)),
+                         });
                     }
 
                     // 3. Buffer

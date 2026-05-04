@@ -297,6 +297,13 @@ pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
         return false;
     }
     let needle = format!("checked: {}", ip.to_string());
+    // Cap state-file size to keep a corrupted/runaway file from OOMing us.
+    const MAX_STATE_FILE: u64 = 256 * 1024 * 1024;
+    match tokio::fs::metadata(state_file).await {
+        Ok(meta) if meta.len() > MAX_STATE_FILE => return false,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
     match tokio::fs::read_to_string(state_file).await {
         Ok(contents) => contents.lines().any(|line| line.contains(&needle)),
         Err(_) => false,
@@ -419,16 +426,20 @@ where
     )
     .await?;
 
+    let concurrency = concurrency.max(1);
     let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let checked = Arc::new(AtomicUsize::new(0));
     let found = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Bounded channel → async file writer (append mode)
+    // Bounded channel → async file writer (append mode). The JoinHandle is
+    // held so we can await the writer's drain after the scan finishes —
+    // otherwise the last batch of buffered hits is lost when the function
+    // returns and the runtime tears down the writer task before it flushes.
     let (tx, mut rx) = mpsc::channel::<String>(1024);
     let out = output_file.clone();
-    tokio::spawn(async move {
+    let writer_handle = tokio::spawn(async move {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -437,7 +448,14 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await {
+                        crate::meprintln!("[!] Output file write failed: {}", e);
+                    }
+                }
+                // Final fsync so results persist even if the process exits
+                // immediately after run_mass_scan returns.
+                if let Err(e) = f.flush().await {
+                    crate::meprintln!("[!] Output file flush failed: {}", e);
                 }
             }
             Err(e) => {
@@ -487,7 +505,7 @@ where
             "{}",
             "[*] Mode: Random Internet Scan (Ctrl+C to stop)".yellow()
         );
-        let max_checks: usize = crate::global_options::GLOBAL_OPTIONS
+        let max_checks: usize = crate::tenant::resolve().global_options()
             .try_get("max_random_hosts")
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000_000);
@@ -617,7 +635,14 @@ where
     }
 
     stop.store(true, Ordering::Relaxed);
+    // Drop our copy of the sender, then wait for the writer to drain the
+    // remaining buffered lines and flush. Without this `await`, the function
+    // can return before the writer finishes, and a subsequent quit/exit
+    // tears down the runtime mid-flush — losing the last batch of hits.
     drop(tx);
+    if let Err(e) = writer_handle.await {
+        crate::meprintln!("[!] Writer task join failed: {}", e);
+    }
     crate::mprintln!(
         "\n[*] {} mass scan complete. Results saved to: {}",
         cfg.protocol_name,
@@ -657,10 +682,17 @@ pub enum ComboMode {
     Spray,
 }
 
+/// Hard cap on materialized combos. Beyond this, callers should route through
+/// `run_bruteforce_streaming` so we don't OOM on a 10⁷×10⁵ wordlist combo.
+const MAX_COMBOS: usize = 10_000_000;
+
 /// Generate credential pairs with full combo mode control.
 /// - Linear: pairs user\[i\] with pass\[i\], cycling the shorter list.
 /// - Combo: full cross product (user × pass).
 /// - Spray: for each password, try all users (lockout-safe ordering).
+///
+/// Output is hard-capped at `MAX_COMBOS` entries; if the requested combo count
+/// exceeds the cap, a warning is printed and the remainder is dropped.
 pub fn generate_combos_mode(
     usernames: &[String],
     passwords: &[String],
@@ -669,40 +701,49 @@ pub fn generate_combos_mode(
     if usernames.is_empty() || passwords.is_empty() {
         return Vec::new();
     }
-    // Cap pre-allocation to avoid OOM on huge wordlists; Vec grows as needed beyond this.
-    const MAX_PREALLOC: usize = 10_000_000;
+    let requested = match mode {
+        ComboMode::Combo | ComboMode::Spray => {
+            usernames.len().saturating_mul(passwords.len())
+        }
+        ComboMode::Linear => std::cmp::max(usernames.len(), passwords.len()),
+    };
+    let cap = requested.min(MAX_COMBOS);
+    if requested > MAX_COMBOS {
+        crate::meprintln!(
+            "{}",
+            format!(
+                "[!] Combo cap reached: requested {} pairs, truncated to {}. Use streaming mode for large wordlists.",
+                requested, MAX_COMBOS
+            ).yellow()
+        );
+    }
+    let mut combos = Vec::with_capacity(cap);
     match mode {
         ComboMode::Combo => {
-            let hint = usernames.len().saturating_mul(passwords.len()).min(MAX_PREALLOC);
-            let mut combos = Vec::with_capacity(hint);
-            for u in usernames {
+            'outer: for u in usernames {
                 for p in passwords {
+                    if combos.len() >= cap { break 'outer; }
                     combos.push((u.clone(), p.clone()));
                 }
             }
-            combos
         }
         ComboMode::Spray => {
-            let hint = usernames.len().saturating_mul(passwords.len()).min(MAX_PREALLOC);
-            let mut combos = Vec::with_capacity(hint);
-            for p in passwords {
+            'outer: for p in passwords {
                 for u in usernames {
+                    if combos.len() >= cap { break 'outer; }
                     combos.push((u.clone(), p.clone()));
                 }
             }
-            combos
         }
         ComboMode::Linear => {
-            let max_len = std::cmp::max(usernames.len(), passwords.len());
-            let mut combos = Vec::with_capacity(max_len.min(MAX_PREALLOC));
-            for i in 0..max_len {
+            for i in 0..cap {
                 let u = &usernames[i % usernames.len()];
                 let p = &passwords[i % passwords.len()];
                 combos.push((u.clone(), p.clone()));
             }
-            combos
         }
     }
+    combos
 }
 
 /// Load user:pass credential pairs from a file (one pair per line, colon-separated).
@@ -827,7 +868,7 @@ where
         Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
-    let semaphore = Arc::new(Semaphore::new(config.concurrency));
+    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
 
     // Progress reporter
     let stats_p = stats.clone();
@@ -849,6 +890,14 @@ where
             break;
         }
 
+        // Acquire the permit BEFORE tokio::spawn so the spawn rate is gated by
+        // concurrency, not just runtime parallelism. Otherwise a 100M-combo
+        // wordlist would materialize 100M task structs immediately.
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
         let target = config.target.clone();
         let port = config.port;
         let display = display_addr.clone();
@@ -859,7 +908,6 @@ where
         let stop_c = stop.clone();
         let paused_c = paused.clone();
         let stats_c = stats.clone();
-        let sem_c = semaphore.clone();
         let try_login_c = try_login.clone();
         let verbose = config.verbose;
         let stop_on_success = config.stop_on_success;
@@ -868,13 +916,7 @@ where
         let jitter_ms = config.jitter_ms;
 
         tasks.push(tokio::spawn(async move {
-            if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
-
-            let _permit = match sem_c.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-
+            let _permit = permit;
             if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
 
             // Respect global rate-limit pause
@@ -1100,7 +1142,7 @@ where
         format!("[*] Subnet {} — {} hosts to scan", target, count).cyan()
     );
 
-    let semaphore = Arc::new(Semaphore::new(config.concurrency));
+    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     let stats_checked = Arc::new(AtomicUsize::new(0));
     let stats_found = Arc::new(AtomicUsize::new(0));
     let creds_pkg = Arc::new((usernames, passwords));
@@ -1166,15 +1208,13 @@ where
         let jitter_ms = config.jitter_ms;
 
         tokio::spawn(async move {
-            // Quick TCP port check (skipped for UDP protocols)
+            // Quick TCP port check (skipped for UDP protocols).
+            // Uses the helper so source-port (`setg src_port`) is honoured.
             if !skip_tcp {
                 let sa = SocketAddr::new(ip, port);
-                if tokio::time::timeout(
-                    Duration::from_millis(3000),
-                    tokio::net::TcpStream::connect(&sa),
-                )
-                .await
-                .is_err()
+                if crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
+                    .await
+                    .is_err()
                 {
                     sc.fetch_add(1, Ordering::Relaxed);
                     drop(permit);

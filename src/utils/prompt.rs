@@ -41,9 +41,15 @@ async fn read_safe_input() -> Result<String> {
     sanitize_string_input(&trimmed)
 }
 
+/// Maximum number of times any interactive prompt will retry on invalid input
+/// before giving up. Prevents a closed/redirected stdin from pinning a worker
+/// in an infinite loop.
+const MAX_PROMPT_RETRIES: usize = 100;
+
 /// Prompts the user for input, ensuring it is not empty.
 pub async fn prompt_required(msg: &str) -> Result<String> {
-    loop {
+    // Bound the retry loop so a closed/looping stdin can't pin a worker.
+    for _ in 0..MAX_PROMPT_RETRIES {
         print!("{}", format!("{}: ", msg).cyan().bold());
         let input = read_safe_input().await?;
         if !input.is_empty() {
@@ -51,6 +57,7 @@ pub async fn prompt_required(msg: &str) -> Result<String> {
         }
         crate::mprintln!("{}", "This field is required.".yellow());
     }
+    Err(anyhow!("Prompt aborted after {} empty inputs", MAX_PROMPT_RETRIES))
 }
 
 /// Prompts the user for input, using a default value if empty.
@@ -67,7 +74,7 @@ pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
 /// Prompts the user for a yes/no answer.
 pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
         let input = read_safe_input().await?;
         match input.to_lowercase().as_str() {
@@ -77,32 +84,35 @@ pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
             _ => crate::mprintln!("{}", "Invalid input. Please enter 'y' or 'n'.".yellow()),
         }
     }
+    Err(anyhow!("Yes/no prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 pub async fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         let input = prompt_default(msg, &default.to_string()).await?;
         match input.trim().parse::<i64>() {
             Ok(n) if n >= min && n <= max => return Ok(n),
             _ => crate::mprintln!("{}", format!("Please enter a number between {} and {}.", min, max).yellow()),
         }
     }
+    Err(anyhow!("Integer range prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 pub async fn prompt_port(msg: &str, default: u16) -> Result<u16> {
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         let input = prompt_default(msg, &default.to_string()).await?;
         match input.parse::<u16>() {
             Ok(n) if n > 0 => return Ok(n),
             _ => crate::mprintln!("{}", "Please enter a valid port (1-65535).".yellow()),
         }
     }
+    Err(anyhow!("Port prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 /// Prompts for an existing file path.
 /// Validates against path traversal, symlinks, and control characters.
 pub async fn prompt_existing_file(msg: &str) -> Result<String> {
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         let candidate = prompt_required(msg).await?;
         match validate_safe_file_path(&candidate) {
             Ok(safe_path) => {
@@ -117,6 +127,7 @@ pub async fn prompt_existing_file(msg: &str) -> Result<String> {
             }
         }
     }
+    Err(anyhow!("Existing-file prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 /// Prompts for a wordlist file path.
@@ -202,7 +213,7 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
             .map_err(|e| anyhow!("Invalid global option for '{}': {}", key, e))?;
         if !sanitized.is_empty() {
@@ -232,7 +243,7 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
         return Ok(if sanitized.is_empty() { default.to_string() } else { sanitized });
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
             .map_err(|e| anyhow!("Invalid global option for '{}': {}", key, e))?;
         if !sanitized.is_empty() {
@@ -273,7 +284,7 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         match val.to_lowercase().trim() {
             "y" | "yes" | "true" | "1" => return Ok(true),
             "n" | "no" | "false" | "0" => return Ok(false),
@@ -315,7 +326,7 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             match trimmed.parse::<u16>() {
@@ -354,7 +365,7 @@ pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         if !val.is_empty() {
             let safe_path = validate_safe_file_path(&val)
                 .map_err(|e| anyhow!("Invalid global file path for '{}': {}", key, e))?;
@@ -404,7 +415,7 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             if let Ok(n) = trimmed.parse::<i64>() {
@@ -460,7 +471,7 @@ pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         if !val.is_empty() {
             if let Ok(safe_path) = validate_safe_file_path(&val) {
                 if Path::new(&safe_path).is_file() {

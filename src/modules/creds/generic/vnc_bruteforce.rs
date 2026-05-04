@@ -14,7 +14,7 @@
 
 use anyhow::{anyhow, Result};
 use colored::*;
-use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use des::cipher::{BlockCipherEncrypt, KeyInit, array::Array};
 use des::Des;
 use std::io::Write;
 use std::net::IpAddr;
@@ -472,23 +472,26 @@ fn vnc_des_key(password: &str) -> [u8; 8] {
 /// Encrypt a 16-byte VNC challenge using DES ECB with the derived key.
 ///
 /// The challenge is encrypted as two 8-byte blocks independently (ECB mode).
-fn vnc_des_encrypt(key: &[u8; 8], challenge: &[u8; 16]) -> [u8; 16] {
-    let des_key = GenericArray::from_slice(key);
-    let cipher = Des::new(des_key);
+/// Returns `Err` only if the cipher API rejects the (always 8-byte) slice
+/// — would indicate a contract violation in the `cipher` crate.
+fn vnc_des_encrypt(key: &[u8; 8], challenge: &[u8; 16]) -> Result<[u8; 16]> {
+    let cipher = Des::new(key.into());
 
     let mut result = [0u8; 16];
 
     // Encrypt first 8-byte block
-    let mut block1 = GenericArray::clone_from_slice(&challenge[0..8]);
+    let mut block1: Array<u8, _> = Array::try_from(&challenge[0..8])
+        .map_err(|_| anyhow!("DES block1 build from 8-byte slice failed"))?;
     cipher.encrypt_block(&mut block1);
     result[0..8].copy_from_slice(&block1);
 
     // Encrypt second 8-byte block
-    let mut block2 = GenericArray::clone_from_slice(&challenge[8..16]);
+    let mut block2: Array<u8, _> = Array::try_from(&challenge[8..16])
+        .map_err(|_| anyhow!("DES block2 build from 8-byte slice failed"))?;
     cipher.encrypt_block(&mut block2);
     result[8..16].copy_from_slice(&block2);
 
-    result
+    Ok(result)
 }
 
 /// Parse the RFB server version string and return (major, minor).
@@ -712,7 +715,10 @@ async fn try_vnc_auth(addr: &str, password: &str) -> VncResult {
 
     // Step 5: Encrypt challenge with DES using bit-reversed password key
     let key = vnc_des_key(password);
-    let response = vnc_des_encrypt(&key, &challenge);
+    let response = match vnc_des_encrypt(&key, &challenge) {
+        Ok(r) => r,
+        Err(e) => return VncResult::ConnectionError(format!("DES encrypt failed: {}", e)),
+    };
 
     // Step 6: Send encrypted response
     if let Err(e) = stream.write_all(&response).await {

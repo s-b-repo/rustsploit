@@ -1,0 +1,8 @@
+grep for bad error hadnling like this   .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?; and this   let _
+
+/home/kali/Documents/bugbounty/
+
+
+grep recusively remove #[allow(dead_code)]     and then implement everything giving warnings and also grep remove other ignore and allow warnings
+
+full clippy audit all rs files recusively

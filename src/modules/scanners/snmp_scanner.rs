@@ -5,7 +5,7 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, Context};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -248,22 +248,40 @@ pub async fn run(target: &str) -> Result<()> {
 
     let timeout_dur = Duration::from_secs(timeout_secs);
 
-    // Determine communities to test
-    let communities: Vec<String> = if custom_wordlist.is_empty() {
-        DEFAULT_COMMUNITIES.iter().map(|s| s.to_string()).collect()
+    // Decide between in-memory load and streaming-batched load.
+    // Wordlists <= STREAM_THRESHOLD load fully; larger files stream in batches.
+    const STREAM_THRESHOLD: u64 = 10 * 1024 * 1024;
+    const BATCH_SIZE: usize = 100_000;
+
+    enum WordlistSource {
+        InMemory(Vec<String>),
+        Streaming(String),
+    }
+
+    let source = if custom_wordlist.is_empty() {
+        WordlistSource::InMemory(DEFAULT_COMMUNITIES.iter().map(|s| s.to_string()).collect())
     } else {
-        // Cap wordlist at 10MB to prevent OOM
-        let meta = std::fs::metadata(&custom_wordlist)
+        let meta = tokio::fs::metadata(&custom_wordlist).await
             .with_context(|| format!("Cannot stat wordlist: {}", custom_wordlist))?;
-        if meta.len() > 10 * 1024 * 1024 {
-            return Err(anyhow!("Wordlist too large ({:.1}MB, max 10MB)", meta.len() as f64 / (1024.0 * 1024.0)));
+        if meta.len() > STREAM_THRESHOLD {
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[*] Large wordlist ({:.1} MB) — streaming in batches of {}",
+                    meta.len() as f64 / (1024.0 * 1024.0),
+                    BATCH_SIZE
+                ).cyan()
+            );
+            WordlistSource::Streaming(custom_wordlist.clone())
+        } else {
+            let content = tokio::fs::read_to_string(&custom_wordlist).await
+                .with_context(|| format!("Failed to read wordlist: {}", custom_wordlist))?;
+            let v: Vec<String> = content.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            WordlistSource::InMemory(v)
         }
-        let content = std::fs::read_to_string(&custom_wordlist)
-            .with_context(|| format!("Failed to read wordlist: {}", custom_wordlist))?;
-        content.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
     };
 
     // Determine versions to test
@@ -278,42 +296,105 @@ pub async fn run(target: &str) -> Result<()> {
         .context("Failed to bind UDP socket")?;
 
     crate::mprintln!();
-    crate::mprintln!("{}", format!("[*] Testing {} communities across {} version(s) against {}",
-        communities.len(), versions.len(), addr).bold());
+    match &source {
+        WordlistSource::InMemory(v) => {
+            crate::mprintln!("{}", format!("[*] Testing {} communities across {} version(s) against {}",
+                v.len(), versions.len(), addr).bold());
+        }
+        WordlistSource::Streaming(_) => {
+            crate::mprintln!("{}", format!("[*] Streaming wordlist; testing across {} version(s) against {}",
+                versions.len(), addr).bold());
+        }
+    }
 
     let mut valid_communities = Vec::new();
+    let mut total_tested = 0usize;
 
-    for (ver_byte, ver_name) in &versions {
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("[*] Testing SNMP {} ...", ver_name).cyan());
+    // Probe one batch sequentially across all configured SNMP versions.
+    async fn probe_batch(
+        batch: &[String],
+        socket: &tokio::net::UdpSocket,
+        addr: &str,
+        versions: &[(u8, &str)],
+        timeout_dur: Duration,
+        valid: &mut Vec<String>,
+    ) {
+        for (ver_byte, ver_name) in versions {
+            for community in batch {
+                if crate::context::is_cancelled() { return; }
+                crate::mprint!("  [*] {} '{}' ... ", ver_name, community);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        for community in &communities {
-            crate::mprint!("  [*] Testing '{}' ... ", community);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+                match test_community(socket, addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
+                    Ok(Some(sys_descr)) => {
+                        crate::mprintln!("{}", "VALID!".green().bold());
+                        crate::mprintln!("    {}", format!("[+] sysDescr: {}", sys_descr).green());
 
-            match test_community(&socket, &addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
-                Ok(Some(sys_descr)) => {
-                    crate::mprintln!("{}", "VALID!".green().bold());
-                    crate::mprintln!("    {}", format!("[+] sysDescr: {}", sys_descr).green());
+                        if let Ok(Some(sys_name)) = test_community(socket, addr, community, OID_SYS_NAME, *ver_byte, timeout_dur).await {
+                            crate::mprintln!("    {}", format!("[+] sysName: {}", sys_name).green());
+                        }
+                        if let Ok(Some(sys_loc)) = test_community(socket, addr, community, OID_SYS_LOCATION, *ver_byte, timeout_dur).await {
+                            crate::mprintln!("    {}", format!("[+] sysLocation: {}", sys_loc).green());
+                        }
 
-                    // Try to get sysName
-                    if let Ok(Some(sys_name)) = test_community(&socket, &addr, community, OID_SYS_NAME, *ver_byte, timeout_dur).await {
-                        crate::mprintln!("    {}", format!("[+] sysName: {}", sys_name).green());
+                        let (ev_host, ev_port) = addr
+                            .rsplit_once(':')
+                            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(161)))
+                            .unwrap_or_else(|| (addr.to_string(), 161));
+                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                            host: ev_host,
+                            port: ev_port,
+                            service: format!("snmp/{}", ver_name),
+                            version: Some(format!("community={} sysDescr={}", community, sys_descr)),
+                        });
+
+                        valid.push(format!("{} ({}): {}", community, ver_name, sys_descr));
                     }
-
-                    // Try to get sysLocation
-                    if let Ok(Some(sys_loc)) = test_community(&socket, &addr, community, OID_SYS_LOCATION, *ver_byte, timeout_dur).await {
-                        crate::mprintln!("    {}", format!("[+] sysLocation: {}", sys_loc).green());
+                    Ok(None) => {
+                        crate::mprintln!("{}", "no response".dimmed());
                     }
+                    Err(e) => {
+                        crate::mprintln!("{}", format!("error: {}", e).red());
+                    }
+                }
+            }
+        }
+    }
 
-                    valid_communities.push(format!("{} ({}): {}", community, ver_name, sys_descr));
+    match source {
+        WordlistSource::InMemory(communities) => {
+            total_tested = communities.len();
+            probe_batch(&communities, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
+        }
+        WordlistSource::Streaming(path) => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
+            let read_path = path.clone();
+            let reader_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                crate::utils::load_lines_batched(&read_path, BATCH_SIZE, |raw_batch| {
+                    let cleaned: Vec<String> = raw_batch.into_iter()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .collect();
+                    if !cleaned.is_empty() {
+                        let _ = tx.blocking_send(cleaned);
+                    }
+                })
+            });
+
+            let mut batch_idx = 0usize;
+            while let Some(batch) = rx.recv().await {
+                batch_idx += 1;
+                crate::mprintln!("{}", format!("[*] Batch {}: {} communities", batch_idx, batch.len()).cyan());
+                total_tested += batch.len();
+                probe_batch(&batch, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
+            }
+
+            match reader_handle.await {
+                Ok(Ok(total_lines)) => {
+                    crate::mprintln!("{}", format!("[*] Streamed {} total lines from wordlist", total_lines).dimmed());
                 }
-                Ok(None) => {
-                    crate::mprintln!("{}", "no response".dimmed());
-                }
-                Err(e) => {
-                    crate::mprintln!("{}", format!("error: {}", e).red());
-                }
+                Ok(Err(e)) => crate::meprintln!("[!] Wordlist read error: {}", e),
+                Err(e) => crate::meprintln!("[!] Wordlist reader task panicked: {}", e),
             }
         }
     }
@@ -322,7 +403,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!();
     crate::mprintln!("{}", "=== Scan Summary ===".bold());
     crate::mprintln!("  Target:               {}:{}", target, port);
-    crate::mprintln!("  Communities tested:    {}", communities.len() * versions.len());
+    crate::mprintln!("  Communities tested:    {}", total_tested * versions.len());
     crate::mprintln!("  Valid communities:     {}", if valid_communities.is_empty() {
         "0".dimmed().to_string()
     } else {

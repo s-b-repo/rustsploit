@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use crate::utils::{
     cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist,
-    normalize_target, load_lines, cfg_prompt_existing_file, safe_read_to_string
+    normalize_target, load_lines_cached, cfg_prompt_existing_file, safe_read_to_string
 };
 use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use rand::seq::IndexedRandom;
@@ -96,17 +96,15 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
-            print_banner();
-        }
-    }
+        print_banner();
 
-    // 1. Wizard Menu
-    crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
-    crate::mprintln!("1. Quick Attack (Default Settings)");
-    crate::mprintln!("2. Create Template (Wizard -> Save)");
-    crate::mprintln!("3. Load Template (Load -> Run)");
-    crate::mprintln!("4. Custom Attack (Wizard -> Run)");
+        // 1. Wizard Menu
+        crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
+        crate::mprintln!("1. Quick Attack (Default Settings)");
+        crate::mprintln!("2. Create Template (Wizard -> Save)");
+        crate::mprintln!("3. Load Template (Load -> Run)");
+        crate::mprintln!("4. Custom Attack (Wizard -> Run)");
+    }
     
     let choice = cfg_prompt_default("mode", "Selection", "1").await?;
     
@@ -292,11 +290,16 @@ async fn load_template() -> Result<DirBruteConfig> {
     crate::mprintln!("Target: {}://{}:{}{}", config.protocol, config.target_host, config.port, config.base_path);
     crate::mprintln!("Mode: Level {}", config.scan_mode);
     crate::mprintln!("Wordlist: {}", config.wordlist_path);
-    
+
+    if config.scan_mode == 3 {
+        crate::mprintln!("\n{}", "[!] WARNING: This template uses DESTROY mode (scan_mode=3).".red().bold());
+        crate::mprintln!("{}", "    DELETE requests will be sent to discovered paths on the target.".red());
+    }
+
     if !cfg_prompt_yes_no("run_template", "Run this configuration?", true).await? {
         return Err(anyhow!("User cancelled after loading template."));
     }
-    
+
     Ok(config)
 }
 
@@ -310,7 +313,26 @@ struct ScanResult {
 }
 
 async fn execute_scan(config: DirBruteConfig) -> Result<()> {
-    let lines = load_lines(&config.wordlist_path)?;
+    // --- DESTROY mode (scan_mode=3) safety gate ---
+    // This runs regardless of how the config was constructed (wizard, template, quick attack).
+    if config.scan_mode == 3 {
+        if crate::utils::is_batch_mode() || crate::config::get_module_config().api_mode {
+            return Err(anyhow!(
+                "DESTROY mode (scan_mode=3) is not allowed in batch or API mode. \
+                 This mode sends HTTP DELETE requests and must be confirmed interactively."
+            ));
+        }
+
+        crate::mprintln!("\n{}", "[!] DESTROY mode will send DELETE requests to discovered paths on the target.".red().bold());
+        crate::mprintln!("{}", "    This can PERMANENTLY DESTROY data on the remote server.".red());
+        let confirm = cfg_prompt_required("destroy_exec_confirm", "Type 'DESTROY' to confirm execution").await?;
+        if confirm != "DESTROY" {
+            crate::mprintln!("{}", "Confirmation failed. Aborting scan.".yellow());
+            return Ok(());
+        }
+    }
+
+    let lines = load_lines_cached(&config.wordlist_path)?;
     let total = lines.len();
     crate::mprintln!("\n{}", format!("Loaded {} words. Starting scan...", total).blue().bold());
     
@@ -324,7 +346,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
     
     let client = Client::builder()
         .default_headers(headers)
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
         .timeout(Duration::from_secs(10))
         .build()?;
 
@@ -341,7 +363,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
 
     let mut tasks = Vec::new();
 
-    for word in lines {
+    for word in lines.iter().cloned() {
         let sem = Arc::clone(&sem);
         let client = client.clone();
         let base = base_url.clone();
@@ -354,12 +376,13 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         
         let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
             let _permit = sem.acquire().await.context("Semaphore acquisition failed")?;
-            
+            if crate::context::is_cancelled() { return Ok(()); }
+
             // Apply delay
             if delay.as_millis() > 0 {
                 tokio::time::sleep(delay).await;
             }
-            
+
             let url = format!("{}{}", base, word);
 
             for method in methods {
@@ -402,12 +425,20 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
                                  format!("[{}]", status).white().to_string()
                              };
                              
-                             crate::mprintln!("{} Size: {} | Method: {} | {}", 
-                                 status_display, 
-                                 len.to_string().dimmed(), 
-                                 method_str.bold(), 
+                             crate::mprintln!("{} Size: {} | Method: {} | {}",
+                                 status_display,
+                                 len.to_string().dimmed(),
+                                 method_str.bold(),
                                  url
                              );
+                             if status >= 200 && status < 400 {
+                                 crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                                     host: url.clone(),
+                                     port: 0,
+                                     service: format!("dir:{}", method_str),
+                                     version: Some(format!("status={} size={}", status, len)),
+                                 });
+                             }
                              
                              let res = ScanResult {
                                  path: url.clone(),

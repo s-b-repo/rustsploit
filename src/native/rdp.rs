@@ -351,6 +351,13 @@ struct NtlmChallenge {
     target_info: Vec<u8>,
 }
 
+/// Hard cap on `target_info` we'll honour from a server-supplied NTLM
+/// challenge. Real challenges top out around 1–2 KB; anything larger is
+/// almost certainly a malformed/abusive server. Bounded by the upstream
+/// 8 KB read buffer, but we tighten it here so a future buffer resize can't
+/// regress the limit.
+const MAX_NTLM_TARGET_INFO: usize = 4096;
+
 fn parse_ntlm_challenge(data: &[u8]) -> Result<NtlmChallenge> {
     if data.len() < 32 { return Err(anyhow!("Challenge too short")); }
     if &data[0..8] != NTLMSSP_SIG { return Err(anyhow!("Bad NTLMSSP sig")); }
@@ -365,8 +372,16 @@ fn parse_ntlm_challenge(data: &[u8]) -> Result<NtlmChallenge> {
     if data.len() >= 48 {
         let ti_len = u16::from_le_bytes([data[40], data[41]]) as usize;
         let ti_off = u32::from_le_bytes([data[44], data[45], data[46], data[47]]) as usize;
-        if ti_off + ti_len <= data.len() {
-            target_info = data[ti_off..ti_off + ti_len].to_vec();
+        if ti_len > MAX_NTLM_TARGET_INFO {
+            return Err(anyhow!("NTLM target_info too large: {} bytes", ti_len));
+        }
+        // checked_add prevents wrap on 32-bit usize where ti_off + ti_len
+        // could overflow. Without this, a malicious NTLM challenge could
+        // make the bounds check pass and panic on the slice.
+        if let Some(end) = ti_off.checked_add(ti_len) {
+            if end <= data.len() {
+                target_info = data[ti_off..end].to_vec();
+            }
         }
     }
     Ok(NtlmChallenge { flags, server_challenge, target_info })
@@ -578,6 +593,12 @@ fn ber_read_len(data: &[u8], pos: &mut usize) -> usize {
     let b = data[*pos]; *pos += 1;
     if b < 0x80 { return b as usize; }
     let nb = (b & 0x7f) as usize;
+    // BER allows up to 127 length octets, but anything past 8 (for 64-bit
+    // usize) would silently truncate via the cumulative left-shifts. Reject
+    // malformed inputs upfront rather than returning a quietly-wrong length.
+    if nb > std::mem::size_of::<usize>() {
+        return 0;
+    }
     let mut val = 0usize;
     for _ in 0..nb {
         if *pos >= data.len() { return 0; }

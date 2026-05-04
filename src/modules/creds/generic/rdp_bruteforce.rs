@@ -68,12 +68,14 @@ impl RdpSecurityLevel {
     }
 
     async fn prompt_selection() -> Result<Self> {
-        crate::mprintln!("\nRDP Security Level Options:");
-        crate::mprintln!("  1. Auto (let client negotiate)");
-        crate::mprintln!("  2. NLA (Network Level Authentication)");
-        crate::mprintln!("  3. TLS (Transport Layer Security)");
-        crate::mprintln!("  4. RDP (Standard RDP encryption)");
-        crate::mprintln!("  5. Negotiate (try all methods)");
+        if !crate::utils::is_batch_mode() {
+            crate::mprintln!("\nRDP Security Level Options:");
+            crate::mprintln!("  1. Auto (let client negotiate)");
+            crate::mprintln!("  2. NLA (Network Level Authentication)");
+            crate::mprintln!("  3. TLS (Transport Layer Security)");
+            crate::mprintln!("  4. RDP (Standard RDP encryption)");
+            crate::mprintln!("  5. Negotiate (try all methods)");
+        }
 
         loop {
             let input = cfg_prompt_default("security_level", "Security level", "1").await?;

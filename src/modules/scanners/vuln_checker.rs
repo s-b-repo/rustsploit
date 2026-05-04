@@ -19,10 +19,11 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(target: &str) -> Result<()> {
+    if crate::utils::is_mass_scan_target(target) {
+        anyhow::bail!("vuln_checker does not support mass-scan targets — it runs ~50 fingerprint probes per host. Set the target to a specific IP/hostname (or run a port scan first and target each result individually).");
+    }
     if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
-            print_banner();
-        }
+        print_banner();
     }
 
     let raw = if target.is_empty() {
@@ -56,6 +57,7 @@ pub async fn run(target: &str) -> Result<()> {
     let http_client = crate::utils::build_http_client(Duration::from_secs(5)).ok();
 
     for (i, probe) in filtered.iter().enumerate() {
+        if crate::context::is_cancelled() { break; }
         if (i + 1) % 10 == 0 || i + 1 == total {
             crate::mprintln!("{} [{}/{}] ...", "[*]".blue(), i + 1, total);
         }
@@ -65,6 +67,15 @@ pub async fn run(target: &str) -> Result<()> {
         match &result {
             CheckResult::Vulnerable(msg) => {
                 crate::mprintln!("{} {} — {}", "[+]".green().bold(), probe.module, msg);
+                // The vuln-checker doesn't know which port/service the probe
+                // hit (probes are CVE-grouped), so we surface the finding as a
+                // ServiceDetected with port 0 and the module path as service.
+                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                    host: target.to_string(),
+                    port: 0,
+                    service: format!("vuln:{}", probe.module),
+                    version: Some(msg.clone()),
+                });
                 vulnerable.push((probe.module.to_string(), msg.clone()));
             }
             CheckResult::Unknown(msg) => {
@@ -144,7 +155,13 @@ async fn run_probe(probe: &Probe, target: &str, client: Option<&reqwest::Client>
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_lowercase();
-                    let body = resp.text().await.unwrap_or_default().to_lowercase();
+                    let body = match resp.text().await {
+                        Ok(b) => b.to_lowercase(),
+                        Err(e) => {
+                            crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
+                            String::new()
+                        }
+                    };
                     for &m in *markers {
                         let ml = m.to_lowercase();
                         if body.contains(&ml) || server.contains(&ml) {
@@ -374,11 +391,8 @@ fn build_probe_registry() -> Vec<Probe> {
         p("exploits/windows/windows_dwm_cve_2026_20805", ProbeType::Skip),
 
         // ── Payload generators (no target) ──
-        p("exploits/payloadgens/batgen", ProbeType::Skip),
-        p("exploits/payloadgens/lnkgen", ProbeType::Skip),
-        p("exploits/payloadgens/narutto_dropper", ProbeType::Skip),
-        p("exploits/payloadgens/payload_encoder", ProbeType::Skip),
-        p("exploits/payloadgens/polymorph_dropper", ProbeType::Skip),
+        // Unified suite — modes: bat, lnk, narutto, polymorph, encode, menu.
+        p("exploits/payloadgens/payloadgen", ProbeType::Skip),
 
         // ── Honeytrap / Snare / Cowrie / Dionaea / SafeLine ──
         p("exploits/honeytrap/ftp_panic", tcp_banner(21, "FTP")),

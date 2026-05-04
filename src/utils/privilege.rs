@@ -7,15 +7,27 @@
 
 use anyhow::{bail, Result};
 
+/// Returns `true` if the current effective UID is root (0).
+///
+/// Safe wrapper around `libc::geteuid()` so callers don't need their own
+/// `unsafe` block just to print a "you need sudo" warning.
+pub fn is_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments, never fails, and returns a
+    // primitive `uid_t`. It has no preconditions and no unsafe state.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// Returns `Ok(())` if the current effective UID is root (0), otherwise a
 /// friendly error mentioning the context (e.g. "icmp raw socket") so the
 /// caller knows why root was required.
 pub fn require_root(context: &str) -> Result<()> {
-    // SAFETY: `geteuid` is a simple syscall with no args and no unsafe state.
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
+    if is_root() {
         Ok(())
     } else {
+        // SAFETY: `geteuid` takes no arguments, never fails, and returns a
+        // primitive `uid_t`. Called only here to surface the actual euid in
+        // the error message.
+        let euid = unsafe { libc::geteuid() };
         bail!(
             "{} requires root privileges (current euid={}). Re-run with sudo.",
             context,

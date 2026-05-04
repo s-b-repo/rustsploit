@@ -150,12 +150,17 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("{}", format!("[*] Initial target: {}", target).cyan());
     crate::mprintln!();
 
-    crate::mprintln!("{}", "[ Configuration Menu ]".bold().green());
-    crate::mprintln!("  1. Single target (use current target only)");
-    crate::mprintln!("  2. Targets from file (ignore current target)");
-    crate::mprintln!("  3. Current target + targets from file");
-    crate::mprintln!();
-    let mode = cfg_prompt_default("mode", "Select mode [1-3] (default 1)", "1").await?;
+    let mode = if crate::utils::is_batch_mode() {
+        // Framework already orchestrated the target — proceed as Single target.
+        "1".to_string()
+    } else {
+        crate::mprintln!("{}", "[ Configuration Menu ]".bold().green());
+        crate::mprintln!("  1. Single target (use current target only)");
+        crate::mprintln!("  2. Targets from file (ignore current target)");
+        crate::mprintln!("  3. Current target + targets from file");
+        crate::mprintln!();
+        cfg_prompt_default("mode", "Select mode [1-3] (default 1)", "1").await?
+    };
 
     // Build initial target list based on selected mode
     let mut targets: Vec<String> = Vec::new();
@@ -330,6 +335,17 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                 .green()
                                 .bold()
                             );
+                            // Surface the discovered username on the structured
+                            // event bus. SMTP user-enum is a credential-adjacent
+                            // finding; map it to ServiceDetected with the user as
+                            // the version slot since CredentialFound expects a
+                            // confirmed login.
+                            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                                host: raw_target.to_string(),
+                                port: config.port,
+                                service: "smtp".to_string(),
+                                version: Some(format!("valid_user={}", username)),
+                            });
                             let mut users = found.lock().unwrap_or_else(|e| e.into_inner());
                             users.push((
                                 format!("{}@{}", username, raw_target),

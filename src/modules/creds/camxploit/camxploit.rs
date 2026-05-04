@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
@@ -247,7 +246,7 @@ fn print_banner() {
 
 fn create_client() -> Result<Client> {
     Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
         .timeout(Duration::from_secs(TIMEOUT))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
@@ -306,12 +305,18 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
         tasks.push(tokio::spawn(async move {
             let _permit = match sem.acquire().await {
                 Ok(p) => p,
-                Err(_) => return None,
+                Err(e) => {
+                    // Semaphore can only error if it was closed; surfacing
+                    // this is important so the operator sees why scanning
+                    // suddenly stopped finding ports.
+                    tracing::warn!(target = %t, port, "scan semaphore acquire failed: {}", e);
+                    return None;
+                }
             };
             let addr = format!("{}:{}", t, port);
-            
-            // Basic TCP Connect
-            if timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), TcpStream::connect(&addr)).await.is_ok() {
+
+            // Basic TCP Connect (canonical helper — honors `setg src_port`)
+            if crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(PORT_SCAN_TIMEOUT)).await.is_ok() {
                 // If open, probe for RTSP
                 let is_rtsp = probe_rtsp(&t, port).await;
                 return Some((port, is_rtsp));
@@ -342,7 +347,7 @@ async fn check_ports(target: &str) -> (Vec<u16>, Vec<u16>) {
 async fn probe_rtsp(target: &str, port: u16) -> bool {
     // Sends a minimal RTSP OPTIONS request
     let addr = format!("{}:{}", target, port);
-    if let Ok(Ok(mut stream)) = timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), TcpStream::connect(&addr)).await {
+    if let Ok(mut stream) = crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(PORT_SCAN_TIMEOUT)).await {
         let request = format!(
             "OPTIONS rtsp://{}:{}/ RTSP/1.0\r\nCSeq: 1\r\n\r\n",
             target, port
@@ -383,7 +388,13 @@ async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> b
             if let Ok(resp) = c.get(&url).send().await {
                 let headers = format!("{:?}", resp.headers()).to_lowercase();
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default().to_lowercase();
+                let body = match resp.text().await {
+                    Ok(b) => b.to_lowercase(),
+                    Err(e) => {
+                        crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
+                        String::new()
+                    }
+                };
 
                 let mut indicators = false;
                 
@@ -465,7 +476,13 @@ async fn fingerprint_camera(target: &str, open_ports: &[u16], client: &Client) {
         
         if let Ok(resp) = client.get(&url).send().await {
              let headers = format!("{:?}", resp.headers()).to_lowercase();
-             let body = resp.text().await.unwrap_or_default().to_lowercase();
+             let body = match resp.text().await {
+                 Ok(b) => b.to_lowercase(),
+                 Err(e) => {
+                     crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
+                     String::new()
+                 }
+             };
              
              if headers.contains("hikvision") || body.contains("hikvision") {
                  crate::mprintln!("🔥 {} on port {}!", "Hikvision Camera Detected".bright_red().bold(), port);
@@ -600,7 +617,7 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
 
 async fn test_rtsp_auth(target: &str, port: u16, user: &str, pass: &str) -> bool {
     let addr = format!("{}:{}", target, port);
-    if let Ok(Ok(mut stream)) = timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await {
+    if let Ok(mut stream) = crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(2)).await {
         let auth_str = BASE64_STANDARD.encode(format!("{}:{}", user, pass));
         let request = format!(
             "OPTIONS rtsp://{}:{}/ RTSP/1.0\r\nAuthorization: Basic {}\r\nCSeq: 1\r\n\r\n",

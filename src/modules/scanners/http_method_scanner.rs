@@ -109,7 +109,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
-    .danger_accept_invalid_certs(true)
+    .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
     .user_agent("RustSploit-HTTP-Method-Scanner/1.0")
     .timeout(Duration::from_secs(timeout_secs))
     .redirect(reqwest::redirect::Policy::limited(5))
@@ -125,10 +125,12 @@ pub async fn run(initial_target: &str) -> Result<()> {
         normalized.len(), METHODS.len()).cyan().bold());
 
     for target in &normalized {
+        if crate::context::is_cancelled() { break; }
         crate::mprintln!("\n{}", format!("=== Target: {} ===", target).bold());
         let mut method_results = Vec::new();
 
         for &method_name in METHODS {
+            if crate::context::is_cancelled() { break; }
             let method = Method::from_bytes(method_name.as_bytes()).unwrap_or(Method::GET);
             let body = match method_name {
                 "POST" | "PUT" | "PATCH" => Some("RustSploit HTTP method scanner test".to_string()),
@@ -159,6 +161,12 @@ pub async fn run(initial_target: &str) -> Result<()> {
                         } else {
                             crate::mprintln!("{}", format!("  [{}] {}", method_name, status).green());
                         }
+                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                            host: target.clone(),
+                            port: 0,
+                            service: format!("http-method:{}", method_name),
+                            version: Some(format!("status={}", status.as_u16())),
+                        });
                     } else {
                         if verbose {
                             crate::mprintln!("{}", format!("  [{}] {} -> {} ({:.2?})", method_name, target, status, elapsed).yellow());
