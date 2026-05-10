@@ -370,11 +370,10 @@ impl JobManager {
         if let Ok(mut jobs) = self.jobs.write() {
             let now = std::time::Instant::now();
             for job in jobs.values_mut() {
-                if let Some(ref handle) = job.handle {
-                    if handle.is_finished() && matches!(job.status, JobStatus::Running) {
+                if let Some(ref handle) = job.handle
+                    && handle.is_finished() && matches!(job.status, JobStatus::Running) {
                         job.status = JobStatus::Completed;
                     }
-                }
                 let terminal = matches!(
                     job.status,
                     JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
@@ -405,13 +404,12 @@ impl JobManager {
     }
 
     pub fn get_detail(&self, id: u32) -> Option<(String, String, String, String, Arc<JobProgress>)> {
-        if let Ok(mut jobs) = self.jobs.write() {
-            if let Some(job) = jobs.get_mut(&id) {
-                if let Some(ref handle) = job.handle {
-                    if handle.is_finished() && matches!(job.status, JobStatus::Running) {
+        if let Ok(mut jobs) = self.jobs.write()
+            && let Some(job) = jobs.get_mut(&id) {
+                if let Some(ref handle) = job.handle
+                    && handle.is_finished() && matches!(job.status, JobStatus::Running) {
                         job.status = JobStatus::Completed;
                     }
-                }
                 let terminal = matches!(
                     job.status,
                     JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
@@ -427,7 +425,6 @@ impl JobManager {
                     job.progress.clone(),
                 ));
             }
-        }
         None
     }
 

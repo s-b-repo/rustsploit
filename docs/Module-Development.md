@@ -6,22 +6,24 @@ Reference for maintainers and contributors writing new Rustsploit modules.
 
 ## How Modules Are Discovered
 
-Rustsploit uses a build-time code-generation approach — no manual registry:
+Rustsploit uses an `inventory`-based compile-time registry — no `build.rs`, no
+codegen file, no central match table:
 
-1. **`build.rs` scan** — Before compilation, `build.rs` recursively walks `src/modules/` looking for `.rs` files that are not `mod.rs`.
-2. **Signature detection** — A file that exposes `pub async fn run(` is treated as a callable module.
-3. **Name generation** — Both a *short name* (`ssh_bruteforce`) and a *qualified path* (`creds/generic/ssh_bruteforce`) are registered.
-4. **Dispatcher emission** — Generated files are written into `OUT_DIR` (not the source tree):
-   - `exploit_dispatch.rs`
-   - `creds_dispatch.rs`
-   - `scanner_dispatch.rs`
-   - `plugins_dispatch.rs`
-   - `module_registry.rs`
+1. **Each module file ends with `crate::register_native_module!(...)`** — a macro
+   that expands to a unique `__ModuleImpl` struct + `impl Module` + an
+   `inventory::submit!` block.
+2. **At binary startup, `inventory::iter::<ModuleEntry>` walks the registry**
+   collected at link time. `crate::module::registered()` returns every
+   `ModuleEntry`; `find(path)` looks up by `category/name` or short leaf name.
+3. **Shell / CLI / API / MCP all resolve modules through `commands::run_module`**,
+   which calls `module::find(...)` and then `scheduler::run(...)`. Single dispatcher.
+4. **Mass-scan fan-out is universal** — `Target::Cidr` / `Multi` / `File` /
+   `Random` is fanned out by `scheduler::run`. Modules only ever see
+   `Target::Single` inside their `run` body.
 
-   Each dispatch file contains an exhaustive `match` mapping names → `use crate::modules::...::run`. The registry file provides a unified module listing across all categories.
-5. **Shell + CLI resolution** — `use exploits/foo` or `--module foo` both resolve through the dispatcher.
-
-Because it's generated at build time, there is **no manual registry drift** as long as modules live in the correct folder and export `run`.
+Because the registry is collected at compile time, there is no runtime
+discovery cost and no drift — if you forget the `register_native_module!`
+line, the module simply isn't reachable.
 
 ---
 
@@ -37,7 +39,6 @@ Because it's generated at build time, there is **no manual registry drift** as l
 ```text
 rustsploit/
 ├── Cargo.toml
-├── build.rs                  # Generates dispatcher by scanning src/modules
 ├── src/
 │   ├── main.rs               # Entry point — CLI or shell mode, input validation
 │   ├── cli.rs                # Clap-based CLI parser and dispatcher
@@ -58,15 +59,15 @@ rustsploit/
 │   │   ├── server.rs         # JSON-RPC stdio transport with binary-safe reads
 │   │   └── tools.rs          # 38 MCP tool implementations
 │   ├── commands/
-│   │   ├── mod.rs            # Module discovery, fuzzy matching, multi-target dispatch
-│   │   ├── exploit.rs
-│   │   ├── scanner.rs
-│   │   └── creds.rs
+│   │   └── mod.rs            # Single dispatcher: module::find → scheduler::run
+│   ├── module.rs             # Module trait, ModuleCtx, register_native_module! macro
+│   ├── scheduler.rs          # Universal mass-scan fan-out, finding routing, checkpoint/resume
 │   ├── modules/
-│   │   ├── exploits/         # Exploit modules (183 modules, 21 categories)
-│   │   ├── scanners/         # Scanner modules (27 modules)
-│   │   ├── creds/            # Credential modules (29 modules)
-│   │   └── plugins/          # Plugin modules (1 module)
+│   │   ├── exploits/         # Exploit modules
+│   │   ├── scanners/         # Scanner modules
+│   │   ├── creds/            # Credential modules
+│   │   ├── osint/            # OSINT modules
+│   │   └── plugins/          # Plugin modules
 │   ├── native/               # Native integrations
 │   │   ├── mod.rs
 │   │   ├── rdp.rs            # Native RDP auth (X.224, TLS, CredSSP/NTLM)
@@ -90,24 +91,96 @@ rustsploit/
 
 ## Required Module Signature
 
-Every module **must** export:
+Two shapes are accepted. New modules should use the **native shape**.
+
+### Native shape (preferred)
 
 ```rust
-use anyhow::Result;
+use anyhow::{Context, Result};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 
-pub async fn run(target: &str) -> Result<()> {
-    // ...
-    Ok(())
+pub fn info() -> ModuleInfo { /* ... */ }
+
+pub async fn check(ctx: &ModuleCtx) -> CheckResult { /* optional */ }
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
+
+    let mut outcome = ModuleOutcome::ok();
+    // ... probe target ...
+    if vulnerable {
+        outcome.findings.push(Finding {
+            target: target.to_string(),
+            kind: FindingKind::Vulnerable,
+            message: "<short marker>".to_string(),
+            data: None,
+        });
+    }
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Exploits, "your_module", native, has_check);
 ```
 
-Optional: also expose `pub async fn run_interactive(target: &str) -> Result<()>` for modules with multiple code paths.
+The macro form selects the body shape:
+- `register_native_module!(Cat::X, "name")` — legacy, no check
+- `register_native_module!(Cat::X, "name", has_check)` — legacy, with check
+- `register_native_module!(Cat::X, "name", native)` — native, no check
+- `register_native_module!(Cat::X, "name", native, has_check)` — native, with check
+
+The scheduler routes `outcome.findings` into LootStore (`Credential`),
+Workspace notes (`Vulnerable`), and the events bus (every kind). No manual
+plumbing — see `route_findings` in `src/scheduler.rs`.
+
+### Legacy shape (existing modules)
+
+```rust
+pub async fn run(target: &str) -> anyhow::Result<()> { /* ... */ Ok(()) }
+pub async fn check(target: &str) -> CheckResult { /* optional */ }
+
+crate::register_native_module!(crate::module::Category::Exploits, "your_module", has_check);
+```
+
+Stdout-only via `mprintln!`. Findings are not emitted — the macro discards
+the `Result<()>` into `ModuleOutcome::ok()`.
+
+---
+
+## Migrating from legacy to native
+
+Mechanical recipe per file:
+
+1. Add the imports — `use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};`.
+2. Change `pub async fn run(target: &str) -> Result<()>` to
+   `pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome>`.
+3. At the top of the body: `let target = ctx.target.as_single().unwrap_or("");`. Mass scan still works — the scheduler fans out `Cidr/Multi/File/Random` into per-host `Target::Single` before invoking `run`, so `as_single()` is `Some(...)` for every legitimate call. `unwrap_or("")` matches the legacy `target: &str` semantic; downstream `cfg_prompt_*` / `normalize_target` will surface a real error if the empty string actually leaks through.
+4. Optionally migrate `check`: `pub async fn check(target: &str) -> CheckResult` →
+   `pub async fn check(ctx: &ModuleCtx) -> CheckResult`, with the same
+   `as_single()` pattern.
+5. Replace `Ok(())` with `Ok(outcome)` (declare `let mut outcome = ModuleOutcome::ok();`
+   near the top).
+6. At each "found something" stdout site (vuln marker, recovered credential,
+   open port banner), push a `Finding` of the right kind.
+7. Update the registration line — append `, native` (and keep `, has_check`
+   if applicable) so the registration becomes
+   `register_native_module!(Cat::X, "name", native[, has_check]);`.
+
+`ctx.options.get_or("port", 22u16)` replaces ad-hoc parsing of legacy
+`cfg_prompt_*` answers when you need typed access; the legacy
+`cfg_prompt_*` helpers continue to work because the macro keeps the
+`RUN_CONTEXT` task-local in scope.
+
+Reference migrations:
+- `src/modules/exploits/sample_exploit.rs` — has_check + Vulnerable finding
+- `src/modules/scanners/sample_scanner.rs` — Banner findings (HTTP/HTTPS)
+- `src/modules/creds/generic/sample_cred_check.rs` — Credential finding with `data` JSON
 
 ---
 
 ## Optional Module Functions
 
-Modules can optionally provide metadata and vulnerability check functions. These are auto-detected by `build.rs` alongside `run()`:
+Modules can optionally provide metadata and vulnerability check functions:
 
 ### Module Info (`info`)
 
@@ -171,16 +244,92 @@ crate::workspace::track_service(ip, 22, "tcp", "ssh", Some("OpenSSH 8.9"));
 
 ## Adding a New Module — Checklist
 
-1. **Choose a location** under `src/modules/{exploits,scanners,creds}`.  
+1. **Choose a location** under `src/modules/{exploits,scanners,creds,osint,plugins}`.
    Use subfolders for vendor families (e.g., `exploits/cisco/`).
-2. **Create the `.rs` file** with the required `pub async fn run` signature.
-3. **Register in `mod.rs`** — add `pub mod your_module;` to the sibling `mod.rs`.  
-   Without this, `build.rs` ignores the file.
-4. **Run `cargo check`** — the dispatcher is regenerated automatically.
+2. **Create the `.rs` file** with `pub fn info()` + `pub async fn run(...)` (native or legacy
+   shape — see above) and end the file with `crate::register_native_module!(Category::X, "name"[, native][, has_check]);`.
+3. **Register in `mod.rs`** — add `pub mod your_module;` to the sibling `mod.rs` so the
+   compiler links the file. Without this the `inventory::submit!` block never reaches the
+   binary and the module is silently un-dispatchable. There is no `build.rs` and no
+   central match table — the registry is collected at link time from every
+   `register_native_module!` invocation.
+4. **Run `cargo build`** — the new module appears in `--list-modules` and is reachable
+   through every front-end (CLI `-m`, shell `use`, `/api/run`, MCP `module.run`).
+5. **Regenerate the catalog** (optional) — `cargo run -- --gen-module-catalog > docs/Module-Catalog.md`
+   walks the live registry and rewrites the catalog.
 
 ---
 
-## Module Skeleton
+## Module Skeleton (native shape)
+
+```rust
+use anyhow::{Context, Result};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::network::{build_http_client_with, HttpClientOpts};
+use std::time::Duration;
+
+pub fn info() -> ModuleInfo {
+    ModuleInfo {
+        name: "example_status_probe".into(),
+        description: "Probe /status for the 'vulnerable' marker.".into(),
+        authors: vec!["Your Name".into()],
+        references: vec!["https://example.com/advisory".into()],
+        disclosure_date: None,
+        rank: ModuleRank::Good,
+    }
+}
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?
+        .to_string();
+    let port: u16 = ctx.options.get_or("port", 80u16);
+
+    // Hierarchical rate limiter — global → per-module → per-target buckets.
+    ctx.rate_limit(&target).await;
+
+    let url = format!("http://{target}:{port}/status");
+    let body = build_http_client_with(Duration::from_secs(15), HttpClientOpts::permissive())?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to reach {url}"))?
+        .text()
+        .await
+        .context("Failed to read response body")?;
+
+    let mut outcome = ModuleOutcome::ok();
+    if body.contains("vulnerable") {
+        outcome.findings.push(Finding {
+            target: target.clone(),
+            kind: FindingKind::Vulnerable,
+            message: format!("{target}:{port} reports vulnerable"),
+            data: None,
+        });
+    }
+    Ok(outcome)
+}
+
+crate::register_native_module!(crate::module::Category::Scanners, "example_status_probe", native, has_check);
+```
+
+Notes:
+
+- Mass-scan fan-out (`Cidr` / `File` / `Multi` / `Random`) is handled by the scheduler;
+  inside `run` you only ever see `Target::Single`. `as_single()` returning `None` is
+  a programming error, not user input.
+- `ctx.options.get_or("key", default)` is the typed escape from string parsing.
+  Operators set values via shell `set port 8080`, CLI `-o port=8080`, or the API
+  `options` map — all routed through `ModuleOptions`.
+- Findings push into `outcome.findings`; the scheduler routes them into LootStore
+  (`Credential`), Workspace notes (`Vulnerable` / `OpenPort` / `Banner` / `Note`),
+  and the events bus automatically. Do not call `cred_store::store_credential` or
+  `workspace::add_note` yourself in native modules — emit a `Finding` instead.
+
+### Legacy skeleton (existing modules)
 
 ```rust
 use anyhow::{Context, Result};
@@ -192,28 +341,18 @@ pub async fn run(target: &str) -> Result<()> {
     let port = cfg_prompt_port("port", "Target port", 80).await?;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
 
-    println!("{} Checking {}:{}", "[*]".cyan(), target, port);
-
-    let url = format!("http://{}:{}/status", target, port);
-    let body = reqwest::get(&url)
-        .await
-        .with_context(|| format!("Failed to reach {}", url))?
-        .text()
-        .await
-        .context("Failed to read response body")?;
-
-    if body.contains("vulnerable") {
-        println!("{} {} appears vulnerable", "[+]".green(), target);
-    } else {
-        if verbose {
-            println!("{} Response: {}", "[*]".cyan(), body);
-        }
-        println!("{} {} not vulnerable", "[-]".red(), target);
-    }
-
+    crate::mprintln!("{} Checking {}:{}", "[*]".cyan(), target, port);
+    // ... probe ...
     Ok(())
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "example", has_check);
 ```
+
+The legacy macro arms keep `cfg_prompt_*`, `mprintln!`, and `is_cancelled()` working
+through the `RUN_CONTEXT` task-local that the macro installs around every call.
+Findings are not emitted — the macro discards `Result<()>` into `ModuleOutcome::ok()`
+and the route-findings pipeline sees nothing.
 
 ---
 
@@ -285,9 +424,127 @@ The framework also emits `ModuleStarted` and `ModuleFinished` events automatical
 
 ---
 
+## Lifecycle Hooks
+
+Native modules can override three optional hooks on the `Module` trait. The
+scheduler runs them in a fixed order around every CLI/API invocation:
+
+```text
+pre_check  →  (per-host) check / run  →  cleanup
+   ↑                                       ↑
+ once, before fan-out                 once, after fan-out
+```
+
+- `pre_check(&ModuleCtx)` — validate `ctx.options` once before fan-out so a `/16`
+  scan with a missing wordlist surfaces one error instead of 65 534 identical ones.
+  Default: succeed.
+- `cleanup(&ModuleCtx, &ModuleOutcome)` — release long-lived resources (open files,
+  persistent connections) after the whole fan-out completes or is cancelled.
+  `outcome` is the aggregate (success count + every routed finding). Default: no-op.
+
+`check(&ModuleCtx)` is the existing non-destructive vulnerability check; the scheduler
+exposes it via the shell `check` command and `POST /api/check`. Override
+`fn has_check()` if your check is meaningful (the `register_native_module!` `has_check`
+token sets this for you).
+
+Tracked task spawns:
+
+```rust
+ctx.spawn(async move {
+    long_running_telemetry().await;
+});
+```
+
+`ctx.spawn` registers the join handle on the active `RunContext`. The scheduler
+calls `crate::context::abort_all_spawned()` from `cleanup`, so cancelled or failed
+runs do not leak orphan tasks. Plain `tokio::spawn` is still allowed but bypasses
+this — only use it for genuinely fire-and-forget work that can outlive the module.
+
+## Capabilities
+
+`fn capabilities(&self) -> Capabilities` advertises what the module needs / promises:
+
+```rust
+use crate::module::Capabilities;
+
+fn capabilities(&self) -> Capabilities {
+    Capabilities {
+        safe_for_high_concurrency: true,  // rate-limit-friendly probe
+        requires_root: false,
+        check_only: false,                // run() is destructive / interactive
+        network: true,
+    }
+}
+```
+
+There is **no** per-module mass-scan flag — the scheduler fans out for every module
+(`Capabilities::native_mass_scan` was removed in v0.5.1). Capabilities feed into UI
+gating ("show check button", "warn that root is needed") and future scheduler
+decisions; they are not load-bearing today, so default values are fine for most
+modules.
+
+## Scheduler Limits & Rate Limiter
+
+`scheduler::SchedulerLimits` carries the per-invocation budget. Defaults are pulled
+from the active tenant's `global_options` (`set` / `setg` in the shell):
+
+| Field | Default | `global_options` key |
+|---|---|---|
+| `concurrency` | 50 | `concurrency` |
+| `timeout_secs` | 60 | `module_timeout` |
+| `max_random_hosts` | 10 000 | `max_random_hosts` |
+| `precheck_port` | _none_ | `port` |
+| `ipv6_max_hosts` | 2³² | _hard limit_ |
+| `warn_threshold` | 65 536 | _hard limit_ |
+| `honeypot_detection` | on | `honeypot_detection` |
+
+Per-target deadlines are enforced with `tokio::time::timeout`; per-host honeypot
+checks call `utils::network::quick_honeypot_check` and skip targets that look like
+they have 11+ common ports open.
+
+Rate limiting is hierarchical (`crate::rate_limit::GlobalLimiter`):
+
+```text
+global RPS  →  per-module RPS  →  per-target RPS
+```
+
+Native modules call `ctx.rate_limit(target_host).await` once per round trip:
+
+```rust
+for cred in &candidates {
+    if ctx.is_cancelled() { break; }
+    ctx.rate_limit(&target).await;          // gate every probe
+    try_login(&target, cred).await?;
+}
+```
+
+All tiers default to RPS = 0 (no-op). Operators tune them through `global_options`:
+
+- `global_rps` — process-wide ceiling (the `LIMITER` singleton in `src/rate_limit.rs`).
+- `module_rps` — default cap per module-type bucket; overridable per module via
+  `module_rps:<category/name>` (e.g. `module_rps:scanners/cors_reflection_scanner`).
+- `target_rps` — cap per `(module, target_host)` bucket.
+
+Because `LIMITER` is a `Lazy<Arc<GlobalLimiter>>`, the same budget applies across
+concurrent scheduler invocations — two parallel runs share one global bucket.
+
 ## Structured Findings
 
-In addition to human-readable `mprintln!` output, modules may emit machine-readable findings on the `crate::events` channel. WebSocket subscribers (panels, MCP tooling, integrations) consume them without grepping stdout.
+Native modules emit findings via `outcome.findings.push(Finding { ... })` — the
+scheduler routes each one based on `kind`:
+
+| `FindingKind` | Routed to |
+|---|---|
+| `Credential` | `LootStore::store_loot` (kind = `"credential"`, payload = `data` JSON or `message`) |
+| `Vulnerable` | `Workspace::add_note` |
+| `OpenPort` / `Banner` / `Note` | `Workspace::track_host` + `Workspace::add_note` (when message non-empty) |
+
+Every finding (regardless of kind) is also broadcast as
+`ModuleEvent::Finding { module, target, kind, message }` on the events bus.
+WebSocket subscribers (panels, MCP tooling, integrations) consume them without
+grepping stdout.
+
+Legacy modules can still emit one-off events directly:
 
 ```rust
 crate::events::emit(crate::events::ModuleEvent::CredentialFound {
@@ -356,26 +613,87 @@ Store under `lists/` and document them in `lists/readme.md`. Reference paths rel
 
 ## Framework-Level Multi-Target Dispatch
 
-The framework's command dispatcher (`src/commands/mod.rs`) automatically handles multiple target types for **all** modules. Module authors do not need to implement multi-target logic themselves -- the dispatcher wraps each module's `run()` function and handles:
+`commands::run_module` resolves the requested name through `module::find` and hands the
+boxed `Module` + parsed `Target` to `scheduler::run`. The scheduler is the only place
+that knows how to fan a target out — module bodies always see `Target::Single`.
 
-- **Comma-separated targets**: `192.168.1.1,192.168.1.2,10.0.0.1` -- splits and dispatches each entry individually.
-- **CIDR subnets**: `192.168.1.0/24` -- expands the subnet and runs the module against each host IP.
-- **File-based target lists**: If the target string is a path to an existing file, each line is read and dispatched as a separate target.
-- **Random mass scan**: `0.0.0.0`, `0.0.0.0/0`, or `random` -- generates random public IPs in an infinite loop (Ctrl+C to stop).
+Supported target shapes (parsed by `Target::parse`):
 
-This means a module that only handles a single host in its `run()` function automatically gains subnet scanning, file-based targeting, and mass-scan capability through the framework.
+- **Single host**: `10.0.0.1`, `example.com`, `[2001:db8::1]:80` → `Target::Single`.
+- **Comma-separated list**: `192.168.1.1,192.168.1.2,10.0.0.1` → `Target::Multi`. Capped
+  at 4 096 entries; each entry recursively re-parses (so a list of CIDRs is allowed).
+- **CIDR subnet**: `192.168.1.0/24` → `Target::Cidr`. Refuses IPv6 ranges wider than
+  `ipv6_max_hosts` (default 2³² hosts) and prompts above `warn_threshold` (default 65 536).
+- **File-based target list**: any path that resolves to an existing file → `Target::File`.
+  Blank/comment lines are skipped at fan-out time.
+- **Random mass scan**: `0.0.0.0`, `0.0.0.0/0`, or `random` → `Target::Random`. Capped
+  at `max_random_hosts` (default 10 000) and skips ranges in `crate::exclusions::ExclusionSet`.
+
+Every shape goes through the same `pre_check` → fan-out → `route_findings` → `cleanup`
+pipeline (see _Lifecycle Hooks_). A module that handles a single host correctly
+inherits subnet, list, file, and `0.0.0.0/0` scanning for free.
 
 ---
 
 ## 0.0.0.0/0 Internet-Wide Scanning
 
-Modules supporting mass-scan accept `0.0.0.0`, `0.0.0.0/0`, or `random` as targets. When detected, the module enters an infinite loop generating random public IPs using:
+`Target::Random` (parsed from `0.0.0.0`, `0.0.0.0/0`, or `random`) fans out random
+public IPs through `scheduler::fanout_random`, capped at `SchedulerLimits::max_random_hosts`.
+The scheduler skips addresses that match `crate::exclusions::ExclusionSet` — by
+default this covers bogons, RFC 1918, reserved/documentation ranges, and the public
+DNS providers. The set is built from the active tenant's `global_options` via
+`crate::exclusions::shared()`; operators add or remove ranges through `set` /
+`setg` keys (or an exclusion file) without touching module code.
 
-```rust
-fn generate_random_public_ip() -> Ipv4Addr { ... }
-fn is_excluded_ip(ip: Ipv4Addr) -> bool { ... }
-```
+Modules do **not** roll their own random-IP loops or `EXCLUDED_RANGES` constants —
+the historical `utils::bruteforce::run_mass_scan` + per-module `MassScanConfig`
+pattern was removed in v0.5.1. Honeypot detection is suppressed in mass-scan mode
+because the per-host probe would itself be the slow path.
 
-The `EXCLUDED_RANGES` constant covers bogons, private, reserved, documentation CIDRs, and public DNS servers. Copy this pattern from an existing mass-scan module (e.g., `telnet_hose` or `hikvision_rce`).
+---
 
-Honeypot detection is disabled in mass-scan mode to avoid interactive prompts.
+## Current Cleanup Work
+
+Active workstreams (snapshot — see `docs/Legacy.md` for the running ledger):
+
+- **Native body migration.** Every module is registered through `register_native_module!`
+  but most still use the legacy `pub async fn run(target: &str)` shape behind the macro.
+  Bodies are being ported one file at a time to `pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome>` so findings flow into LootStore / Workspace / events
+  instead of stdout. Migration recipe is in _Migrating from legacy to native_ above.
+- **Compiler warning sweep.** `cargo build` currently surfaces ~84 warnings — mostly
+  unused imports left behind by mid-migration scanner / exploit modules
+  (`FindingKind`, `Finding`, `cfg_prompt_*` helpers, leftover mass-scan constants
+  like `EXCLUDED_RANGES`, `generate_random_public_ip`, `MASS_SCAN_CONCURRENCY`,
+  `DEFAULT_TIMEOUT_SECS`, `COMMON_TELNET_PORTS`). Fix the underlying cause (delete
+  the leftover code or wire it in) — do not paper over with `#[allow(dead_code)]`,
+  `#[allow(unused_imports)]`, `let _ = ...`, or `_var` renames. The grep policy is
+  zero suppression attributes in `src/`.
+- **Bad error-handling patterns.** `grep -rn 'map_err(|e| anyhow!('` and
+  `grep -rn 'let _ ='` periodically — both usually hide a real propagation path.
+  Prefer `.with_context(|| "...")?` over re-wrapping with `anyhow!`, and replace
+  `let _ = ...` with the explicit `if let Err(e) = ... { tracing::warn!(...); }`
+  pattern when the failure really is recoverable.
+- **Wordlist consolidation.** Module-level `WORDLIST.lines()` / `include_str!` blocks
+  are being moved into `crate::utils::wordlist` so every brute-forcer reads through
+  the same loader (with caching, size caps, and the `--strict-wordlist` toggle).
+- **Helper consolidation.** TLS helpers in `src/native/async_tls.rs`,
+  `read_async_capped` / `DEFAULT_BODY_CAP` in `src/utils/network.rs`, and the
+  `cancellation_token()` accessor in `src/context.rs` are the canonical entry
+  points. Modules (notably `http2_rapid_reset`, `sshpwn_session`, the DoS family)
+  are being migrated off of their per-module reimplementations.
+- **New scanner / OSINT modules** added recently — `cors_reflection_scanner`,
+  `security_headers_scanner`, `csp_audit_scanner`, `subdomain_takeover_scanner`,
+  `source_map_scanner`, `wellknown_scanner`, `wp_xmlrpc_scanner`, `wp_user_enum`,
+  `s3_bucket_scanner`, `m365_userenum_scanner`, plus `osint/cname_chain` and
+  `osint/jwks_inspector`. They auto-appear in `--list-modules` and the catalog;
+  follow-up bug fixes are tracked under the per-module sections of
+  `docs/Changelog.md`.
+- **External bug-bounty corpus.** `_analysis/` carries the cross-program findings
+  index used to drive new module work (which probes earned findings, which vector
+  classes are still untested). It is the source of truth for "where should the next
+  scanner live"; do not edit historical reports under `_analysis/`, append a new
+  finding instead.
+- **Open audit findings (medium / low).** Tenant cache eviction (M2),
+  `std::sync::RwLock` on the tokio path (M3), and the L1–L4 path-validation
+  cleanups remain. P0 items (PQ rekey deadlock, SSRF bypass) are tracked in
+  `docs/Legacy.md` § _Out of scope_ and live on a separate hardening workstream.

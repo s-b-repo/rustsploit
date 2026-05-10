@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -11,7 +12,6 @@ use tokio::time::{timeout as tokio_timeout, Duration};
 use crate::utils::{
     cfg_prompt_port, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_default,
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 /// SSDP Search Target types
 #[derive(Clone, Debug)]
@@ -40,24 +40,8 @@ fn display_banner() {
     crate::mprintln!();
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SSDP",
-            default_port: 1900,
-            state_file: "ssdp_msearch_mass_state.log",
-            default_output: "ssdp_msearch_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                let sock = crate::utils::udp_bind(None).await.ok()?;
-                let addr = format!("{}:{}", ip, port);
-                sock.send_to(&[0u8; 2], &addr).await.ok()?;
-                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                Some(format!("[{}] {}:{} SSDP open\n", ts, ip, port))
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
     display_banner();
 
@@ -173,7 +157,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 async fn send_ssdp_request(
@@ -290,11 +274,10 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> 
         crate::mprintln!("{}", format!("[+] {}", result_line).green());
 
         // Show additional headers if present
-        if let Some(cache) = results.get("cache-control") {
-            if !cache.is_empty() {
+        if let Some(cache) = results.get("cache-control")
+            && !cache.is_empty() {
                 crate::mprintln!("  {} Cache-Control: {}", "  |".dimmed(), cache.dimmed());
             }
-        }
 
         crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
             host: target_ip.to_string(),
@@ -323,3 +306,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "ssdp_msearch", native);

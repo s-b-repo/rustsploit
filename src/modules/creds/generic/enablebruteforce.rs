@@ -1,6 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use colored::*;
 use rlimit::Resource;
+
+use crate::module::{ModuleCtx, ModuleOutcome};
 
 const TARGET_FILE_LIMIT: u64 = 65535;
 
@@ -25,16 +27,14 @@ fn display_banner() {
 }
 
 /// Module entry point for raising ulimit
-pub async fn run(target: &str) -> Result<()> {
-    if crate::utils::is_mass_scan_target(target) {
-        anyhow::bail!("enablebruteforce does not support mass-scan targets — it raises the local process file-descriptor limit (ulimit), no remote interaction");
-    }
-    // Target parameter is part of standard module interface
-    // For ulimit operations, target is informational only
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    // For ulimit operations, target is informational only.
+    let target = ctx.target.as_single().unwrap_or("");
     if !target.is_empty() {
         crate::mprintln!("{}", format!("[*] Target context: {}", target).dimmed());
     }
-    raise_ulimit().await
+    raise_ulimit().await?;
+    Ok(ModuleOutcome::ok())
 }
 
 /// Get current resource limits
@@ -136,3 +136,5 @@ async fn raise_ulimit() -> Result<()> {
     
     Ok(())
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/enablebruteforce", native);

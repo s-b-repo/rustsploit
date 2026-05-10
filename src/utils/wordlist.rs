@@ -59,7 +59,6 @@ const KNOWN_LISTS: &[WordlistSpec] = &[
 ///   - Download failure (timeout, HTTP error, connection refused).
 ///   - Size cap exceeded (`MAX_BYTES`).
 ///   - Checksum mismatch — file is deleted and the call fails loudly.
-#[allow(dead_code)] // public helper for incremental adoption by modules
 pub async fn resolve(name: &str) -> Result<PathBuf> {
     let spec = lookup(name)?;
     let dest = wordlist_dir()?.join(spec.local_name);
@@ -76,7 +75,6 @@ pub async fn resolve(name: &str) -> Result<PathBuf> {
 }
 
 /// List the names of every wordlist this build knows about.
-#[allow(dead_code)]
 pub fn catalogue() -> Vec<&'static str> {
     KNOWN_LISTS.iter().map(|w| w.name).collect()
 }
@@ -147,8 +145,8 @@ async fn download_to(dest: &Path, spec: &WordlistSpec) -> Result<()> {
         );
     }
 
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BYTES {
+    if let Some(len) = resp.content_length()
+        && len > MAX_BYTES {
             anyhow::bail!(
                 "{} reports content-length {} bytes — exceeds {}-byte cap",
                 spec.url,
@@ -156,7 +154,6 @@ async fn download_to(dest: &Path, spec: &WordlistSpec) -> Result<()> {
                 MAX_BYTES
             );
         }
-    }
 
     // Write to `<dest>.tmp` first; rename only after checksum passes so a
     // crashed / cancelled download never leaves a corrupt cached file.
@@ -267,7 +264,6 @@ pub const STREAMING_THRESHOLD: u64 = 16 * 1024 * 1024;
 
 /// Default batch size. Tuned so a single batch fits comfortably in L2 cache
 /// for typical lengths (`8 KiB * 8 KiB = 64 MiB`-ish working set worst-case).
-#[allow(dead_code)] // public constant, used by module callers that opt in
 pub const DEFAULT_BATCH_SIZE: usize = 8 * 1024;
 
 /// Streaming wordlist reader. Yields `Vec<String>` batches of trimmed,
@@ -303,7 +299,6 @@ pub struct BatchedReader {
 impl BatchedReader {
     /// Open `path` for streaming reads with the default batch size
     /// ([`DEFAULT_BATCH_SIZE`]).
-    #[allow(dead_code)] // public helper, called from modules that opt in
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_batch_size(path, DEFAULT_BATCH_SIZE).await
     }
@@ -400,7 +395,6 @@ impl BatchedReader {
 /// For files below the threshold this delegates to a single batch. For
 /// large files, batches are pulled lazily — caller's `cb` runs concurrently
 /// with the next batch's read.
-#[allow(dead_code)] // public helper, called from modules that opt in
 pub async fn for_each_batch<F, Fut>(
     path: impl AsRef<Path>,
     batch_size: usize,
@@ -429,7 +423,6 @@ where
 /// Returns `true` if `path`'s file size is at or above
 /// [`STREAMING_THRESHOLD`]. Callers can use this to decide between
 /// `crate::utils::load_lines` (in-memory) and `BatchedReader` (streaming).
-#[allow(dead_code)]
 pub fn should_stream(path: impl AsRef<Path>) -> bool {
     std::fs::metadata(path.as_ref())
         .map(|m| m.len() >= STREAMING_THRESHOLD)

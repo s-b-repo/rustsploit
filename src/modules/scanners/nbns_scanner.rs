@@ -10,8 +10,8 @@ use anyhow::{Result, Context};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -290,44 +290,15 @@ async fn query_nbns(
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "NBNS",
-            default_port: 137,
-            state_file: "nbns_scanner_mass_state.log",
-            default_output: "nbns_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                let sock = crate::utils::udp_bind(None).await.ok()?;
-                let addr = format!("{}:{}", ip, port);
-                let packet = build_nbns_query();
-                sock.send_to(&packet, &addr).await.ok()?;
-                let mut buf = [0u8; 1024];
-                match tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await {
-                    Ok(Ok((n, _))) if n > 56 => {
-                        let host = ip.to_string();
-                        if let Some(result) = parse_nbns_response(&buf[..n], &host) {
-                            let name = result.get_computer_name().unwrap_or("?").to_string();
-                            crate::events::emit(crate::events::ModuleEvent::HostUp {
-                                host: format!("{} ({})", name, ip),
-                            });
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            Some(format!("[{}] {}:{} NBNS name={} mac={}\n", ts, ip, port, name, result.mac_address))
-                        } else {
-                            crate::events::emit(crate::events::ModuleEvent::HostUp { host: ip.to_string() });
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            Some(format!("[{}] {}:{} NBNS responded\n", ts, ip, port))
-                        }
-                    }
-                    _ => None,
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("nbns_scanner requires a single-host target")?;
 
     display_banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
@@ -352,6 +323,7 @@ pub async fn run(target: &str) -> Result<()> {
             crate::mprintln!("{}", format!("  [*] Attempt {}/{}", attempt, retries).dimmed());
         }
 
+        ctx.rate_limit(target).await;
         match query_nbns(&socket, &addr, timeout_dur).await {
             Ok(Some(r)) => {
                 result = Some(r);
@@ -422,6 +394,28 @@ pub async fn run(target: &str) -> Result<()> {
             if has_dc {
                 crate::mprintln!("{}", "[!] Domain Controller detected!".red().bold());
             }
+
+            let computer_name = r.get_computer_name().map(|s| s.to_string());
+            let domain = r.get_domain().map(|s| s.to_string());
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Banner,
+                message: format!(
+                    "NBNS host {} (computer={:?} domain={:?} mac={})",
+                    target,
+                    computer_name.as_deref().unwrap_or("?"),
+                    domain.as_deref().unwrap_or("?"),
+                    r.mac_address,
+                ),
+                data: Some(serde_json::json!({
+                    "host": target,
+                    "computer_name": computer_name,
+                    "domain": domain,
+                    "mac": r.mac_address,
+                    "is_dc": has_dc,
+                    "is_file_server": has_file_server,
+                })),
+            });
         }
         None => {
             crate::mprintln!("  {}", "No response received.".dimmed());
@@ -431,8 +425,8 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    if save_results {
-        if let Some(r) = &result {
+    if save_results
+        && let Some(r) = &result {
             let output_path = cfg_prompt_output_file("output_file", "Output file", "nbns_scan_results.txt").await?;
             let mut content = format!("NBNS Scan Results - {}\n\n", addr);
             content.push_str(&format!("MAC: {}\n", r.mac_address));
@@ -452,7 +446,8 @@ pub async fn run(target: &str) -> Result<()> {
                 .with_context(|| format!("Failed to write results to {}", output_path))?;
             crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
         }
-    }
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "nbns_scanner", native);

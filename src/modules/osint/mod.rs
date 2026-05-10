@@ -9,3 +9,5 @@
 // and it will be auto-discovered at build time.
 
 pub mod cert_transparency;
+pub mod cname_chain;
+pub mod jwks_inspector;

@@ -6,11 +6,11 @@
 //! For authorized penetration testing only.
 
 use anyhow::{Result, Context};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
 use crate::utils::{cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -210,31 +210,8 @@ async fn test_community(
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SNMP",
-            default_port: 161,
-            state_file: "snmp_scanner_mass_state.log",
-            default_output: "snmp_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                let sock = crate::utils::udp_bind(None).await.ok()?;
-                let addr = format!("{}:{}", ip, port);
-                let packet = build_snmp_get("public", OID_SYS_DESCR, 0x00, rand::random());
-                sock.send_to(&packet, &addr).await.ok()?;
-                let mut buf = [0u8; 1024];
-                match tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await {
-                    Ok(Ok((n, _))) if is_valid_snmp_response(&buf[..n]) => {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        Some(format!("[{}] {}:{} SNMP community 'public' valid\n", ts, ip, port))
-                    }
-                    _ => None,
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
     display_banner();
 
@@ -426,5 +403,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "snmp_scanner", native);

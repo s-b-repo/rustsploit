@@ -32,15 +32,6 @@ pub fn encode(data: &[u8]) -> String {
     unsafe { String::from_utf8_unchecked(buf) }
 }
 
-/// Encode bytes as an uppercase hex string.
-#[inline]
-pub fn encode_upper(data: &[u8]) -> String {
-    let mut buf = vec![0u8; data.len().saturating_mul(2)];
-    encode_upper_into(data, &mut buf);
-    // SAFETY: only ASCII bytes from `HEX_CHARS_UPPER` are written.
-    unsafe { String::from_utf8_unchecked(buf) }
-}
-
 /// Encode `data` into the start of `out`. Caller must ensure `out.len() >= data.len() * 2`.
 #[inline]
 fn encode_into(data: &[u8], out: &mut [u8]) {
@@ -51,20 +42,11 @@ fn encode_into(data: &[u8], out: &mut [u8]) {
     }
 }
 
-#[inline]
-fn encode_upper_into(data: &[u8], out: &mut [u8]) {
-    debug_assert!(out.len() >= data.len() * 2);
-    for (i, &byte) in data.iter().enumerate() {
-        out[i * 2] = HEX_CHARS_UPPER[(byte >> 4) as usize];
-        out[i * 2 + 1] = HEX_CHARS_UPPER[(byte & 0x0f) as usize];
-    }
-}
-
 /// Decode a hex string into bytes. Accepts uppercase and lowercase.
 /// Returns `Err` on odd-length input or invalid hex characters.
 pub fn decode(hex: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = hex.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(DecodeError::OddLength);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

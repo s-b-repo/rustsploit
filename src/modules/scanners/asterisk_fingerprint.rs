@@ -12,6 +12,7 @@ use colored::*;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 use crate::utils::{cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port, tcp_port_open};
 
@@ -63,7 +64,8 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = ctx.target.as_single().unwrap_or("");
     let host = sanitize_host(target);
     let ip = match resolve_first_ip(&host).await {
         Some(ip) => ip,
@@ -90,8 +92,10 @@ pub async fn check(target: &str) -> CheckResult {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
     display_banner();
+    let mut outcome = ModuleOutcome::ok();
     let host = sanitize_host(target);
 
     let asterisk_host_input =
@@ -122,7 +126,7 @@ pub async fn run(target: &str) -> Result<()> {
             "{}",
             format!("[-] {}:{} closed/filtered", host, port).red()
         );
-        return Ok(());
+        return Ok(outcome);
     }
     crate::mprintln!(
         "{}",
@@ -151,22 +155,22 @@ pub async fn run(target: &str) -> Result<()> {
                     .red()
                     .bold()
                 );
-                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                    host: host.clone(),
-                    port,
-                    service: "asterisk-eol".into(),
-                    version: Some(server),
+                outcome.findings.push(Finding {
+                    target: host.clone(),
+                    kind: FindingKind::Vulnerable,
+                    message: format!("EOL Asterisk on {host}:{port}: {server}"),
+                    data: Some(serde_json::json!({"host": host, "port": port, "service": "asterisk-eol", "banner": server})),
                 });
             } else {
                 crate::mprintln!(
                     "{}",
                     format!("[+] Asterisk in supported branch: {}", server).green()
                 );
-                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                    host: host.clone(),
-                    port,
-                    service: "asterisk".into(),
-                    version: Some(server),
+                outcome.findings.push(Finding {
+                    target: host.clone(),
+                    kind: FindingKind::Banner,
+                    message: format!("Asterisk on {host}:{port}: {server}"),
+                    data: Some(serde_json::json!({"host": host, "port": port, "service": "asterisk", "banner": server})),
                 });
             }
         }
@@ -174,7 +178,7 @@ pub async fn run(target: &str) -> Result<()> {
             crate::meprintln!("{}", format!("[!] Banner pull failed: {}", e).red());
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn is_eol_version(server: &str) -> bool {
@@ -227,3 +231,5 @@ fn sanitize_host(target: &str) -> String {
     let t = t.split(':').next().unwrap_or(t);
     t.to_string()
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "asterisk_fingerprint", native, has_check);

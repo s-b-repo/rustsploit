@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use colored::*;
 use std::time::Duration;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 use crate::utils::{build_http_client, cfg_prompt_int_range, cfg_prompt_yes_no};
 
@@ -63,18 +64,21 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = match ctx.target.as_single() {
+        Some(t) => t,
+        None => return CheckResult::Error("php_version_eol requires a single-host target".to_string()),
+    };
     let host = sanitize_host(target);
     let client = match build_http_client(Duration::from_secs(HTTP_TIMEOUT_SECS)) {
         Ok(c) => c,
         Err(e) => return CheckResult::Error(format!("HTTP client build failed: {}", e)),
     };
 
-    if let Some(banner) = peek_php_powered_by(&client, &host).await {
-        if is_eol_php(&banner) {
+    if let Some(banner) = peek_php_powered_by(&client, &host).await
+        && is_eol_php(&banner) {
             return CheckResult::Vulnerable(format!("EOL PHP banner: {}", banner));
         }
-    }
     if peek_any_vicidial(&client, &host).await {
         return CheckResult::Vulnerable(
             "Vicidial install detected (legacy stack often runs EOL PHP)".into(),
@@ -83,10 +87,16 @@ pub async fn check(target: &str) -> CheckResult {
     CheckResult::NotVulnerable("No EOL PHP banner / Vicidial endpoint detected".into())
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("php_version_eol requires a single-host target")?;
     display_banner();
     let host = sanitize_host(target);
     crate::mprintln!("{}", format!("[*] Target: {}", host).cyan());
+
+    let mut outcome = ModuleOutcome::ok();
 
     let timeout_secs = cfg_prompt_int_range(
         "timeout",
@@ -109,6 +119,7 @@ pub async fn run(target: &str) -> Result<()> {
     let mut php_seen: Option<(String, String)> = None;
     for scheme in ["https", "http"] {
         let url = format!("{}://{}/", scheme, host);
+        ctx.rate_limit(&host).await;
         match client.get(&url).send().await {
             Ok(resp) => {
                 if let Some(banner) = resp
@@ -124,11 +135,15 @@ pub async fn run(target: &str) -> Result<()> {
                                 .red()
                                 .bold()
                         );
-                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                            host: host.clone(),
-                            port: if scheme == "https" { 443 } else { 80 },
-                            service: "php-eol".into(),
-                            version: Some(banner.to_string()),
+                        outcome.findings.push(Finding {
+                            target: host.clone(),
+                            kind: FindingKind::Vulnerable,
+                            message: format!("EOL PHP at {}: {}", url, banner),
+                            data: Some(serde_json::json!({
+                                "host": host,
+                                "url": url,
+                                "x_powered_by": banner,
+                            })),
                         });
                     } else {
                         crate::mprintln!(
@@ -166,6 +181,7 @@ pub async fn run(target: &str) -> Result<()> {
         for path in VICIDIAL_PATHS {
             for scheme in ["http", "https"] {
                 let url = format!("{}://{}{}", scheme, host, path);
+                ctx.rate_limit(&host).await;
                 if let Ok(resp) = client.get(&url).send().await {
                     let status = resp.status();
                     let banner = resp
@@ -185,11 +201,16 @@ pub async fn run(target: &str) -> Result<()> {
                             .green()
                             .bold()
                         );
-                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                            host: host.clone(),
-                            port: if scheme == "https" { 443 } else { 80 },
-                            service: "vicidial".into(),
-                            version: if banner.is_empty() { None } else { Some(banner) },
+                        outcome.findings.push(Finding {
+                            target: host.clone(),
+                            kind: FindingKind::Vulnerable,
+                            message: format!("Vicidial endpoint reachable at {} (status {})", url, status),
+                            data: Some(serde_json::json!({
+                                "host": host,
+                                "url": url,
+                                "status": status.as_u16(),
+                                "x_powered_by": banner,
+                            })),
                         });
                     }
                 }
@@ -203,7 +224,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn is_eol_php(banner: &str) -> bool {
@@ -219,11 +240,10 @@ fn is_eol_php(banner: &str) -> bool {
 async fn peek_php_powered_by(client: &reqwest::Client, host: &str) -> Option<String> {
     for scheme in ["https", "http"] {
         let url = format!("{}://{}/", scheme, host);
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Some(v) = resp.headers().get("x-powered-by").and_then(|v| v.to_str().ok()) {
+        if let Ok(resp) = client.get(&url).send().await
+            && let Some(v) = resp.headers().get("x-powered-by").and_then(|v| v.to_str().ok()) {
                 return Some(v.to_string());
             }
-        }
     }
     None
 }
@@ -257,3 +277,5 @@ fn sanitize_host(target: &str) -> String {
     let t = t.split(':').next().unwrap_or(t);
     t.to_string()
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "php_version_eol", native, has_check);

@@ -266,11 +266,10 @@ where
     };
 
     // Check for error code → auth failed
-    if let Some(err_code) = ts_resp.error_code {
-        if err_code != 0 {
+    if let Some(err_code) = ts_resp.error_code
+        && err_code != 0 {
             return Ok(RdpLoginResult::AuthFailed);
         }
-    }
 
     let nego_token = match ts_resp.nego_tokens {
         Some(t) => t,
@@ -307,11 +306,10 @@ where
     // Parse final TSRequest
     match parse_ts_request(&buf[..n]) {
         Ok(resp) => {
-            if let Some(err) = resp.error_code {
-                if err != 0 {
+            if let Some(err) = resp.error_code
+                && err != 0 {
                     return Ok(RdpLoginResult::AuthFailed);
                 }
-            }
             // If we get pubKeyAuth back → success
             if resp.pub_key_auth.is_some() {
                 return Ok(RdpLoginResult::Success);
@@ -378,11 +376,10 @@ fn parse_ntlm_challenge(data: &[u8]) -> Result<NtlmChallenge> {
         // checked_add prevents wrap on 32-bit usize where ti_off + ti_len
         // could overflow. Without this, a malicious NTLM challenge could
         // make the bounds check pass and panic on the slice.
-        if let Some(end) = ti_off.checked_add(ti_len) {
-            if end <= data.len() {
+        if let Some(end) = ti_off.checked_add(ti_len)
+            && end <= data.len() {
                 target_info = data[ti_off..end].to_vec();
             }
-        }
     }
     Ok(NtlmChallenge { flags, server_challenge, target_info })
 }

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use futures::{stream, StreamExt};
 use rand::seq::IndexedRandom;
@@ -11,7 +12,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::utils::{cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist, load_lines, load_lines_cached};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::native::payload_engine::{self as payload_mutator, PayloadCategory, MutatorConfig};
 use serde_json::json;
 
@@ -114,25 +114,8 @@ struct GenericPayload {
 //                            MAIN ENTRY POINT
 // =========================================================================
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "API-Scanner",
-            default_port: 80,
-            state_file: "api_endpoint_scanner_mass_state.log",
-            default_output: "api_endpoint_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} API-Scanner open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
     crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
     crate::mprintln!("{}", "║   API Endpoint Pentest Module                             ║".cyan());
@@ -343,7 +326,7 @@ pub async fn run(target: &str) -> Result<()> {
             async move {
                 let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
                 // Print progress occasionally
-                if current % 10 == 0 || current == total {
+                if current.is_multiple_of(10) || current == total {
                     crate::mprint!("\r[*] Progress: {}/{}", current, total);
                     if let Err(e) = std::io::stdout().flush() {
                         crate::meprintln!("\n[!] Failed to flush stdout: {}", e);
@@ -361,7 +344,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("\n{}", "\n[+] Scan completed!".green().bold());
     crate::mprintln!("[+] Processed {} endpoints.", results.len());
     crate::mprintln!("Time elapsed: {:.2?}", start_time.elapsed());
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 // =========================================================================
@@ -458,7 +441,7 @@ async fn enumerate_endpoints(client: &Client, target_base: &str, base_path: &str
             let clean_base_path = clean_base_path.clone();
             async move {
                 let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                 if current % 50 == 0 || current == total {
+                 if current.is_multiple_of(50) || current == total {
                     crate::mprint!("\r[*] Brute-force Progress: {}/{}", current, total);
                 if let Err(_e) = std::io::stdout().flush() {
                     // Ignore flush errors in tough loops
@@ -675,40 +658,37 @@ async fn perform_id_enumeration(client: &Client, url: &str, method: Method, dir:
          let req_builder = client.request(method.clone(), &target_url)
             .header("User-Agent", "Mozilla/5.0 (IDEnum)");
 
-         match req_builder.send().await {
-             Ok(resp) => {
-                 let status = resp.status();
-                 if status != reqwest::StatusCode::NOT_FOUND {
-                      // Log hit with shared handle
-                      if let Err(e) = run_enum_logging_handle(&mut results_file_handle, &payload, &label, status, &target_url) {
-                          crate::meprintln!("[!] Logging failed: {}", e);
-                      }
-                      crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                          host: target_url.clone(),
-                          port: 0,
-                          service: format!("api-endpoint:{}", label),
-                          version: Some(format!("status={}", status.as_u16())),
-                      });
-                      
-                      // If 200, save body
-                       if status.is_success() {
-                            let body_file = bodies_dir.join(format!("{}.txt", payload));
-                            let body = match resp.bytes().await {
-                                Ok(b) => b,
-                                Err(_) => bytes::Bytes::new(),
-                            };
-                            if let Ok(mut f) = File::create(&body_file) {
-                                if let Err(e) = crate::utils::set_secure_permissions(&body_file, 0o600) {
-                                    crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", body_file.display(), e);
-                                }
-                                if let Err(e) = f.write_all(&body) {
-                                    crate::meprintln!("[!] Failed to write body: {}", e);
-                                }
+         if let Ok(resp) = req_builder.send().await {
+             let status = resp.status();
+             if status != reqwest::StatusCode::NOT_FOUND {
+                  // Log hit with shared handle
+                  if let Err(e) = run_enum_logging_handle(&mut results_file_handle, &payload, &label, status, &target_url) {
+                      crate::meprintln!("[!] Logging failed: {}", e);
+                  }
+                  crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                      host: target_url.clone(),
+                      port: 0,
+                      service: format!("api-endpoint:{}", label),
+                      version: Some(format!("status={}", status.as_u16())),
+                  });
+                  
+                  // If 200, save body
+                   if status.is_success() {
+                        let body_file = bodies_dir.join(format!("{}.txt", payload));
+                        let body = match resp.bytes().await {
+                            Ok(b) => b,
+                            Err(_) => bytes::Bytes::new(),
+                        };
+                        if let Ok(mut f) = File::create(&body_file) {
+                            if let Err(e) = crate::utils::set_secure_permissions(&body_file, 0o600) {
+                                crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", body_file.display(), e);
                             }
-                       }
-                 }
-             },
-             _ => {}
+                            if let Err(e) = f.write_all(&body) {
+                                crate::meprintln!("[!] Failed to write body: {}", e);
+                            }
+                        }
+                   }
+             }
          }
     }
 }
@@ -804,11 +784,10 @@ async fn perform_request(client: &Client, url: &str, method: Method, result_file
         },
         Err(e) => {
              // Log error to file
-             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(result_file) {
-                 if let Err(write_err) = writeln!(file, "=== {} {} ===\nError: {}\n", full_label, url, e) {
+             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(result_file)
+                 && let Err(write_err) = writeln!(file, "=== {} {} ===\nError: {}\n", full_label, url, e) {
                      crate::meprintln!("[!] Failed to write error log: {}", write_err);
                  }
-             }
         }
     }
 }
@@ -824,16 +803,13 @@ async fn log_response(resp: Response, path: &Path, method: &str, url: &str, user
 
     // Safety: Limit body read to 1MB to prevent OOM
     // Bug 11: Check Content-Length first
-    if let Some(cl) = headers.get("content-length") {
-        if let Ok(s) = cl.to_str() {
-            if let Ok(len) = s.parse::<usize>() {
-                if len > 5_000_000 {
+    if let Some(cl) = headers.get("content-length")
+        && let Ok(s) = cl.to_str()
+            && let Ok(len) = s.parse::<usize>()
+                && len > 5_000_000 {
                      writeln!(file, "Body skipped (Content-Length: {} > 5MB)", len)?;
                      return Ok(());
                 }
-            }
-        }
-    }
 
     // Streaming check: cap body at 5MB to prevent OOM when Content-Length is missing
     let max_body = 5_000_000usize;
@@ -897,3 +873,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "api_endpoint_scanner", native);

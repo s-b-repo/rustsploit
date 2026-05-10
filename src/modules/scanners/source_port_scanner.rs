@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::{
     fs::File,
@@ -15,7 +16,6 @@ use crate::utils::{
     cfg_prompt_port,
 };
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 /// Module metadata for `info` command.
 pub fn info() -> ModuleInfo {
@@ -49,71 +49,21 @@ struct ScanSettings {
 }
 
 /// Main module entrypoint.
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan support: CIDR subnets, random IPs, file-based target lists
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SrcPortScan",
-            default_port: 80,
-            state_file: "source_port_scanner_mass_state.log",
-            default_output: "source_port_scanner_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip, port| {
-            async move {
-                // Quick TCP connect probe from a few well-known bypass source ports
-                let bypass_ports: &[u16] = &[20, 53, 67, 80, 88, 443, 500, 8080];
-                let mut hits = Vec::new();
-                for &src in bypass_ports {
-                    let dest = SocketAddr::new(ip, port);
-                    let bind = if ip.is_ipv4() {
-                        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), src)
-                    } else {
-                        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), src)
-                    };
-                    let domain = if ip.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
-                    if let Ok(sock) = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP)) {
-                        let _ = sock.set_reuse_address(true);
-                        let _ = sock.set_nonblocking(true);
-                        if sock.bind(&bind.into()).is_ok() {
-                            let _ = sock.connect(&dest.into());
-                            let std_stream: std::net::TcpStream = sock.into();
-                            if let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) {
-                                if let Ok(Ok(())) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(3), stream.writable()
-                                ).await {
-                                    if let Ok(None) = stream.take_error() {
-                                        hits.push(src);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if hits.is_empty() {
-                    None
-                } else {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let ports_str: Vec<String> = hits.iter().map(|p| p.to_string()).collect();
-                    Some(format!("[{}] {}:{} SrcPortScan allowed_src_ports=[{}]\n",
-                        ts, ip, port, ports_str.join(",")))
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
-    if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
+    if !crate::utils::is_batch_mode()
+        && !crate::utils::is_batch_mode() {
             print_banner();
         }
-    }
 
     let settings = prompt_settings().await?;
 
     let (ip_str, ip) = resolve_target(target)?;
 
     // Warn about privileged ports requiring root
-    if settings.source_start < 1024 {
-        if !crate::utils::is_root() {
+    if settings.source_start < 1024
+        && !crate::utils::is_root() {
             let priv_end = std::cmp::min(settings.source_end, 1023);
             crate::mprintln!("{}", format!(
                 "[!] Warning: Source ports {}-{} are privileged (< 1024). \
@@ -122,7 +72,6 @@ pub async fn run(target: &str) -> Result<()> {
                 settings.source_start, priv_end
             ).yellow().bold());
         }
-    }
 
     let source_ports: Vec<u16> = (settings.source_start..=settings.source_end).collect();
     let total = source_ports.len();
@@ -271,7 +220,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("\n{}", format!("[*] Results saved to {}", settings.output_file).cyan());
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 fn print_banner() {
@@ -541,3 +490,5 @@ impl ProgressTracker {
         self.last_print = self.current;
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "source_port_scanner", native);

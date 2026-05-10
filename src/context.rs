@@ -114,6 +114,16 @@ pub struct RunContext {
     /// Tenant identity for multi-tenant isolation. Set from the PQ session's
     /// `client_name` in API mode; `None` in shell mode (falls back to "local").
     pub tenant_id: Option<String>,
+    /// `category/name` path of the module being run. Set by the scheduler
+    /// before invoking the module so `events::emit` and finding helpers
+    /// can attribute output to the right module without each module
+    /// passing the path manually. Empty when called outside a scheduled
+    /// run (e.g. utility code invoked from the shell).
+    pub module_path: String,
+    /// Tracked task spawns. Modules call `crate::context::spawn(...)` to
+    /// register a `tokio::spawn`; the scheduler aborts every handle here
+    /// in `Module::cleanup` so cancelled runs don't leak orphan tasks.
+    pub spawned: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl RunContext {
@@ -126,6 +136,8 @@ impl RunContext {
             prompt_cache: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             tenant_id: None,
+            module_path: String::new(),
+            spawned: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -139,6 +151,8 @@ impl RunContext {
             prompt_cache: Some(cache),
             cancel: tokio_util::sync::CancellationToken::new(),
             tenant_id: None,
+            module_path: String::new(),
+            spawned: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -149,6 +163,12 @@ impl RunContext {
         self
     }
 
+    /// Attach the module path so finding-emission helpers can attribute
+    /// output to the right module.
+    pub fn with_module_path(mut self, module_path: String) -> Self {
+        self.module_path = module_path;
+        self
+    }
 }
 
 // ============================================================
@@ -168,7 +188,6 @@ impl RunContext {
 ///
 /// Returns `false` if called outside of a `RUN_CONTEXT` scope (e.g. in tests
 /// or top-level CLI code), so it's always safe to call.
-#[allow(dead_code)] // public helper, called from modules that opt in
 pub fn is_cancelled() -> bool {
     RUN_CONTEXT.try_with(|ctx| ctx.cancel.is_cancelled()).unwrap_or(false)
 }
@@ -177,7 +196,6 @@ pub fn is_cancelled() -> bool {
 /// passing to `tokio::select!` or `child.cancelled().await`.
 ///
 /// Returns `None` if called outside of a `RUN_CONTEXT` scope.
-#[allow(dead_code)] // public helper, called from modules that opt in
 pub fn cancellation_token() -> Option<tokio_util::sync::CancellationToken> {
     RUN_CONTEXT.try_with(|ctx| ctx.cancel.clone()).ok()
 }
@@ -186,6 +204,47 @@ pub fn cancellation_token() -> Option<tokio_util::sync::CancellationToken> {
 /// tenant-scoped context (shell mode / no RunContext).
 pub fn current_tenant_id() -> Option<String> {
     RUN_CONTEXT.try_with(|ctx| ctx.tenant_id.clone()).ok().flatten()
+}
+
+/// Returns the `category/name` path of the module currently running in
+/// this task. Empty when called outside a `RUN_CONTEXT` scope.
+pub fn current_module_path() -> String {
+    RUN_CONTEXT
+        .try_with(|ctx| ctx.module_path.clone())
+        .unwrap_or_default()
+}
+
+/// Spawn a tracked tokio task that will be aborted when the current run
+/// finishes (via `Module::cleanup` or cancellation). Falls back to a
+/// plain `tokio::spawn` if called outside a `RUN_CONTEXT` scope.
+pub fn spawn<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let attached = RUN_CONTEXT
+        .try_with(|ctx| ctx.clone())
+        .ok();
+    if let Some(ctx) = attached {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut joinset = ctx.spawned.lock().await;
+            joinset.spawn(future);
+        });
+    } else {
+        tokio::spawn(future);
+    }
+}
+
+/// Abort every tracked spawn registered during the current run. Called by
+/// the scheduler in `Module::cleanup` and on cancellation paths.
+pub async fn abort_all_spawned() {
+    if let Ok(ctx) = RUN_CONTEXT.try_with(|ctx| ctx.clone()) {
+        let mut joinset = ctx.spawned.lock().await;
+        joinset.abort_all();
+        // Drain — abort_all only marks; we want to await so handles drop
+        // before we return.
+        while joinset.join_next().await.is_some() {}
+    }
 }
 
 // ============================================================

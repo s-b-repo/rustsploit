@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 use crate::utils::{cfg_prompt_int_range, cfg_prompt_port, tcp_port_open};
 
@@ -59,7 +60,11 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = match ctx.target.as_single() {
+        Some(t) => t,
+        None => return CheckResult::Error("mysql_exposure requires a single-host target".to_string()),
+    };
     let host = sanitize_host(target);
     let ip = match resolve_first_ip(&host).await {
         Some(ip) => ip,
@@ -74,7 +79,11 @@ pub async fn check(target: &str) -> CheckResult {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("mysql_exposure requires a single-host target")?;
     display_banner();
     let host = sanitize_host(target);
 
@@ -90,6 +99,9 @@ pub async fn run(target: &str) -> Result<()> {
 
     crate::mprintln!("{}", format!("[*] Target: {}:{}", host, port).cyan());
 
+    let mut outcome = ModuleOutcome::ok();
+    ctx.rate_limit(&host).await;
+
     let ip = resolve_first_ip(&host)
         .await
         .with_context(|| format!("Could not resolve {}", host))?;
@@ -98,7 +110,7 @@ pub async fn run(target: &str) -> Result<()> {
             "{}",
             format!("[-] {}:{} closed/filtered", host, port).red()
         );
-        return Ok(());
+        return Ok(outcome);
     }
 
     match grab_handshake(ip, port).await {
@@ -109,11 +121,16 @@ pub async fn run(target: &str) -> Result<()> {
                     .green()
                     .bold()
             );
-            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                host: host.clone(),
-                port,
-                service: "mysql".into(),
-                version: Some(banner),
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Banner,
+                message: format!("MySQL/MariaDB on {host}:{port} — {banner}"),
+                data: Some(serde_json::json!({
+                    "host": host,
+                    "port": port,
+                    "service": "mysql",
+                    "banner": banner,
+                })),
             });
         }
         Err(e) => {
@@ -123,7 +140,7 @@ pub async fn run(target: &str) -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 async fn grab_handshake(ip: IpAddr, port: u16) -> Result<String> {
@@ -187,3 +204,5 @@ fn sanitize_host(target: &str) -> String {
     let t = t.split(':').next().unwrap_or(t);
     t.to_string()
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "mysql_exposure", native, has_check);

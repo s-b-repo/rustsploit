@@ -2,7 +2,6 @@
 name = "rustsploit"
 version = "0.4.9"
 edition = "2024"
-build = "build.rs"
 
 [[bin]]
 name = "rustsploit"
@@ -109,6 +108,11 @@ strsim = "0.11"
 ssh2 = "0.9.5"
 num_cpus = "1.17.0"
 
+# Compile-time module registry — every module self-registers via
+# `register_native_module!` at file scope; `inventory::iter` walks the registry.
+inventory = "0.3"
+async-trait = "0.1"
+
 
 # Constant-time comparison for security (timing attack prevention)
 subtle = "2.6"
@@ -128,10 +132,6 @@ sha2 = "0.11"
 p256 = { version = "0.13", features = ["ecdh"] }
 hex = "0.4"
 
-[build-dependencies]
-regex = "1.12"
-walkdir = "2.5"
-
 # Dependency overrides to address security advisories in transitive dependencies
 # RUSTSEC-2026-0009: time >=0.3.47 fixes DoS via stack exhaustion (used by reqwest via cookie/cookie_store)
 time = "0.3.47"
@@ -141,10 +141,11 @@ time = "0.3.47"
 # Development profile: Fast incremental builds
 # ============================================
 [profile.dev]
-opt-level = 0          # No optimization for fastest compile
-debug = true           # Keep debug symbols
-incremental = true     # Enable incremental compilation
-split-debuginfo = "unpacked"  # Faster link times
+opt-level = 0                    # No optimization for fastest compile
+debug = "line-tables-only"       # Backtraces work; far less link time + disk than full debuginfo
+incremental = true               # Enable incremental compilation
+split-debuginfo = "unpacked"     # Faster link times
+codegen-units = 256              # Maximize parallelism for dev builds
 
 # Optimize dependencies in dev mode (they don't change often)
 [profile.dev.package."*"]

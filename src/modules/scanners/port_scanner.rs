@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, Context, anyhow};
 use colored::*;
 use std::{
     fs::File,
@@ -15,10 +15,10 @@ use tokio::{
 };
 use rand::{RngExt, rng};
 use socket2::{Socket, Domain, Type, Protocol};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScanMethod {
@@ -180,9 +180,10 @@ pub async fn prompt_settings() -> Result<ScanSettings> {
 }
 
 /// Main entrypoint for interactive CLI mode
-pub async fn run_interactive(target: &str) -> Result<()> {
+pub async fn run_interactive(ctx: &ModuleCtx, target: &str) -> Result<ModuleOutcome> {
     let settings = prompt_settings().await?;
     run_with_settings(
+        ctx,
         target,
         settings.concurrency,
         settings.timeout_secs,
@@ -198,31 +199,17 @@ pub async fn run_interactive(target: &str) -> Result<()> {
     .await
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "PortScan",
-            default_port: 80,
-            state_file: "port_scanner_mass_state.log",
-            default_output: "port_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} PortScan open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
-
-    run_interactive(target).await
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("port_scanner requires a single-host target")?;
+    run_interactive(ctx, target).await
 }
 
 /// === Core Scanner Logic ===
 pub async fn run_with_settings(
+    ctx: &ModuleCtx,
     target: &str,
     concurrency: usize,
     timeout_secs: u64,
@@ -234,7 +221,7 @@ pub async fn run_with_settings(
     ttl: Option<u32>,
     source_port: Option<u16>,
     data_length: Option<usize>,
-) -> Result<()> {
+) -> Result<ModuleOutcome> {
     let start_time = Instant::now();
     let (resolved_ip_str, resolved_ip) = resolve_target(target)?;
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -251,6 +238,7 @@ pub async fn run_with_settings(
     
     let stats = Arc::new(Mutex::new(ScanStats::new()));
     let progress = Arc::new(Mutex::new(ProgressTracker::new(total_ports)));
+    let findings_buf: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
     
     let verbose = verbose; // capture for move into async tasks
     crate::mprintln!("\n{}", format!("[*] Starting scan for target: {} (resolved: {})", target, resolved_ip_str).cyan().bold());
@@ -269,11 +257,13 @@ pub async fn run_with_settings(
         crate::mprintln!("{}", "\n[*] Starting TCP scan...".yellow());
         for port in &ports {
             // Honor cancellation before paying for another permit / spawn.
-            if crate::context::is_cancelled() { break; }
+            if ctx.is_cancelled() { break; }
+            ctx.rate_limit(&resolved_ip_str).await;
             let permit = semaphore.clone().acquire_owned().await?;
             let file = file.clone();
             let stats = stats.clone();
             let progress = progress.clone();
+            let findings_buf = findings_buf.clone();
             let ip = resolved_ip;
             let ip_str = resolved_ip_str.clone();
             let port = *port;
@@ -302,13 +292,20 @@ pub async fn run_with_settings(
 
                             let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
                             crate::mprintln!("{}", output_line);
-                            // Structured event for API/MCP/WS subscribers — no-op when none.
-                            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                                host: ip_str.clone(),
-                                port,
-                                service: service_name.to_string(),
-                                version: if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
-                            });
+                            if let Ok(mut buf) = findings_buf.lock() {
+                                buf.push(Finding {
+                                    target: ip_str.clone(),
+                                    kind: FindingKind::OpenPort,
+                                    message: format!("TCP {}:{} open ({})", ip_str, port, service_name),
+                                    data: Some(serde_json::json!({
+                                        "host": ip_str,
+                                        "port": port,
+                                        "transport": "tcp",
+                                        "service": service_name,
+                                        "banner": if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
+                                    })),
+                                });
+                            }
                         }
                         "CLOSED" => {
                             stats_guard.tcp_closed += 1;
@@ -340,11 +337,13 @@ pub async fn run_with_settings(
     if scan_method == ScanMethod::Udp || scan_method == ScanMethod::Both {
         crate::mprintln!("{}", "\n[*] Starting UDP scan...".yellow());
         for port in &ports {
-            if crate::context::is_cancelled() { break; }
+            if ctx.is_cancelled() { break; }
+            ctx.rate_limit(&resolved_ip_str).await;
             let permit = semaphore.clone().acquire_owned().await?;
             let file = file.clone();
             let stats = stats.clone();
             let progress = progress.clone();
+            let findings_buf = findings_buf.clone();
             let ip = resolved_ip;
             let ip_str = resolved_ip_str.clone();
             let port = *port;
@@ -353,10 +352,10 @@ pub async fn run_with_settings(
                 let _permit = permit;
                 if crate::context::is_cancelled() { return; }
                 let result = scan_udp(&ip, port, timeout_secs, ttl, source_port, data_length).await;
-                
+
                 let mut stats_guard = stats.lock().unwrap_or_else(|e| e.into_inner());
                 let mut progress_guard = progress.lock().unwrap_or_else(|e| e.into_inner());
-                
+
                 if let Some(status) = result {
                     match status.as_str() {
                         "OPEN" => {
@@ -366,12 +365,19 @@ pub async fn run_with_settings(
 
                             let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
                             crate::mprintln!("{}", line);
-                            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                                host: ip_str.clone(),
-                                port,
-                                service: format!("{}/udp", service_name),
-                                version: None,
-                            });
+                            if let Ok(mut buf) = findings_buf.lock() {
+                                buf.push(Finding {
+                                    target: ip_str.clone(),
+                                    kind: FindingKind::OpenPort,
+                                    message: format!("UDP {}:{} open ({})", ip_str, port, service_name),
+                                    data: Some(serde_json::json!({
+                                        "host": ip_str,
+                                        "port": port,
+                                        "transport": "udp",
+                                        "service": service_name,
+                                    })),
+                                });
+                            }
                         }
                         "CLOSED" => stats_guard.udp_closed += 1,
                         "FILTERED" => stats_guard.udp_filtered += 1,
@@ -429,8 +435,12 @@ pub async fn run_with_settings(
         writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Closed: {}", stats.udp_closed)?;
         writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "  Filtered: {}", stats.udp_filtered)?;
     }
-    
-    Ok(())
+
+    let mut outcome = ModuleOutcome::ok();
+    if let Ok(mut guard) = findings_buf.lock() {
+        outcome.findings.append(&mut *guard);
+    }
+    Ok(outcome)
 }
 
 /// === TCP Port Scanner with Enhanced Banner Grabbing ===
@@ -495,8 +505,8 @@ async fn scan_tcp(
                 // Check for socket error
                 if let Ok(None) = stream.take_error() {
                     // Send garbage data if configured
-                    if let Some(len) = data_length {
-                        if len > 0 {
+                    if let Some(len) = data_length
+                        && len > 0 {
                             let payload: Vec<u8> = {
                                 let mut rng = rng();
                                 (0..len).map(|_| rng.random()).collect()
@@ -505,7 +515,6 @@ async fn scan_tcp(
                                 // Probe write failed — proceed to banner grab anyway
                             }
                         }
-                    }
                     
                     // Try service-specific probes
                     let (banner, service) = grab_banner(&mut stream, port).await;
@@ -539,17 +548,15 @@ async fn grab_banner(stream: &mut TcpStream, port: u16) -> (String, String) {
     match port {
         80 | 8080 => {
             // HTTP probe
-            if let Ok(_) = stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await {
-                if let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
-                    if n > 0 {
+            if let Ok(_) = stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await
+                && let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut buf)).await
+                    && n > 0 {
                         let response = String::from_utf8_lossy(&buf[..n]);
                         if let Some(server) = extract_http_server(&response) {
                             return (response.trim().to_string(), format!("HTTP ({})", server));
                         }
                         return (response.trim().to_string(), "HTTP".into());
                     }
-                }
-            }
         }
         443 => {
             // HTTPS - can't easily probe without TLS, just return empty
@@ -557,22 +564,20 @@ async fn grab_banner(stream: &mut TcpStream, port: u16) -> (String, String) {
         }
         22 => {
             // SSH - read SSH banner
-            if let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
-                if n > 0 {
+            if let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut buf)).await
+                && n > 0 {
                     let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
                     return (banner, "SSH".into());
                 }
-            }
         }
         _ => {
             // Try reading again for other services
-            if let Ok(Ok(n)) = timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
-                if n > 0 {
+            if let Ok(Ok(n)) = timeout(Duration::from_secs(1), stream.read(&mut buf)).await
+                && n > 0 {
                     let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
                     let service = detect_service_from_banner(&banner, port);
                     return (banner, service);
                 }
-            }
         }
     }
     
@@ -785,3 +790,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "port_scanner", native);

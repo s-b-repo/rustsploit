@@ -1,25 +1,34 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
-use std::net::{ToSocketAddrs, IpAddr};
+use std::net::{ ToSocketAddrs, IpAddr };
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::time::Duration;
-use std::io::{BufRead, BufReader, Write};
-use base64::{engine::general_purpose, Engine as _};
+use std::io::{ BufRead, BufReader, Write };
+use base64::{ engine::general_purpose, Engine as _ };
 
 /// Default SMTP timeout in milliseconds (10 seconds).
 /// Real SMTP servers often do reverse DNS lookups on connect, taking 5-10s.
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
+use crate::module::{ ModuleCtx, ModuleOutcome };
 use crate::utils::{
     load_lines,
-    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_default,
+    cfg_prompt_yes_no,
+    cfg_prompt_existing_file,
+    cfg_prompt_int_range,
+    cfg_prompt_output_file,
 };
 use crate::utils::{
-    BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos_mode, parse_combo_mode, load_credential_file,
-    run_bruteforce, run_subnet_bruteforce,
-    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+    BruteforceConfig,
+    LoginResult,
+    SubnetScanConfig,
+    generate_combos_mode,
+    parse_combo_mode,
+    load_credential_file,
+    run_bruteforce,
+    run_subnet_bruteforce,
+    is_subnet_target,
 };
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -33,69 +42,13 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("smtp_bruteforce requires a single-host target")?;
     crate::mprintln!("\n{}", "=== SMTP Bruteforce Module (RustSploit) ===".bold().cyan());
     crate::mprintln!();
-
-    // --- Mass Scan Mode ---
-    if is_mass_scan_target(target) {
-        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-
-        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = load_lines(&usernames_file)?;
-        let passes = load_lines(&passwords_file)?;
-        if users.is_empty() { return Err(anyhow!("User list empty")); }
-        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
-        let users = Arc::new(users);
-        let passes = Arc::new(passes);
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SMTP",
-            default_port: 25,
-            state_file: "smtp_hose_state.log",
-            default_output: "smtp_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip: IpAddr, port: u16| {
-            let users = users.clone();
-            let passes = passes.clone();
-            async move {
-                // Quick connect check
-                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    return None;
-                }
-
-                let target_str = ip.to_string();
-                for user in users.iter() {
-                    for pass in passes.iter() {
-                        let t = target_str.clone();
-                        let u = user.clone();
-                        let p = pass.clone();
-                        let res = tokio::task::spawn_blocking(move || {
-                            try_smtp_login(&t, port, &u, &p, DEFAULT_TIMEOUT_MS)
-                        }).await;
-
-                        match res {
-                            Ok(Ok(true)) => {
-                                let msg = format!("{} -> {}:{}", target_str, user, pass);
-                                crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                                return Some(format!("{}\n", msg));
-                            }
-                            Ok(Err(e)) => {
-                                let err = e.to_string().to_lowercase();
-                                if err.contains("refused") || err.contains("timeout") || err.contains("reset") {
-                                    return None;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                None
-            }
-        }).await;
-    }
 
     // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
@@ -113,7 +66,9 @@ pub async fn run(target: &str) -> Result<()> {
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output result file", "smtp_subnet_results.txt").await?;
 
-        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -121,9 +76,13 @@ pub async fn run(target: &str) -> Result<()> {
             jitter_ms: 50,
             source_module: "creds/generic/smtp_credcheck",
             skip_tcp_check: false,
+            state_file: None,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            let limiter = limiter.clone();
+            let module_path = module_path.clone();
             async move {
                 let target_str = ip.to_string();
+                limiter.acquire(&module_path, &target_str).await;
                 let res = tokio::task::spawn_blocking(move || {
                     try_smtp_login(&target_str, port, &user, &pass, DEFAULT_TIMEOUT_MS)
                 }).await;
@@ -140,7 +99,8 @@ pub async fn run(target: &str) -> Result<()> {
                     },
                 }
             }
-        }).await;
+        }).await?;
+        return Ok(ModuleOutcome::ok());
     }
 
     // --- Single Target Mode ---
@@ -169,8 +129,13 @@ pub async fn run(target: &str) -> Result<()> {
         combos.extend(load_credential_file(&cred_path)?);
     }
 
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
     let try_login = move |target: String, port: u16, user: String, pass: String| {
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
         async move {
+            limiter.acquire(&module_path, &target).await;
             let res = tokio::task::spawn_blocking(move || {
                 try_smtp_login(&target, port, &user, &pass, DEFAULT_TIMEOUT_MS)
             }).await;
@@ -205,7 +170,7 @@ pub async fn run(target: &str) -> Result<()> {
     result.print_found();
     result.save_to_file(&output_file)?;
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 /// Read a single SMTP response line (terminated by \n).
@@ -273,7 +238,7 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str, timeo
             if let Err(e) = writer.flush() { crate::meprintln!("[!] Write error: {}", e); }
             return Ok(true);
         }
-        if resp.starts_with("5") { return Ok(false); }
+        if resp.starts_with('5') { return Ok(false); }
     }
 
     // Try AUTH LOGIN
@@ -303,9 +268,11 @@ fn try_smtp_login(target: &str, port: u16, username: &str, password: &str, timeo
             if let Err(e) = writer.flush() { crate::meprintln!("[!] Write error: {}", e); }
             return Ok(true);
         }
-        if resp.starts_with("5") { return Ok(false); }
+        if resp.starts_with('5') { return Ok(false); }
     }
 
     Ok(false)
 }
 
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/smtp_bruteforce", native);

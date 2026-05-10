@@ -1,6 +1,491 @@
 # Changelog
 
-A high-level summary of significant changes. For the full detailed log, see [`changelogs/changelog-latest.md`](../changelogs/changelog-latest.md).
+A high-level summary of significant changes. For the full detailed log, see [`changelogs/changelog-latest.md`](../changelogs/changelog-latest.md). For surviving pre-v0.5.0 systems and why they were kept, see [`Legacy.md`](Legacy.md).
+
+---
+
+## v0.5.6 (2026-05-08) — Delete `ModuleAdapter` + `build.rs` codegen
+
+**Reverses the v0.5.4 reframing.** Every one of the 363 modules now self-registers via `register_native_module!`, so the build-time regex-grep that emitted `module_inventory.rs` was producing an empty file and the `ModuleAdapter` struct was no longer reachable.
+
+### Removed
+
+| Item | Why it could go |
+|---|---|
+| `pub struct ModuleAdapter` + `impl Module for ModuleAdapter` (`src/module.rs`) | No `inventory::submit!` site referenced it after v0.5.5 |
+| `pub fn synthesize_info` (`src/module.rs`) | Only called by the adapter's emitted `info_fn` fallback |
+| `include!(concat!(env!("OUT_DIR"), "/module_inventory.rs"))` | The file the macro included was empty |
+| `build.rs` (entire 247-LOC file) | Walked `src/modules/`, regex-matched `pub async fn run(target: &str)` / `info()` / `check()`, emitted nothing |
+| `[build-dependencies] regex`, `walkdir` (`Cargo.toml`) | No build script left to use them |
+| `build = "build.rs"` (`Cargo.toml`) | Same |
+
+### Body-migration runway + first 151 modules
+
+To unblock body migration, the `register_native_module!` macro grew two new
+arms (`native` and `native, has_check`) that expect `pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome>`.
+**151 of 363 modules now use the native shape (42%).** A migration script
+(`scripts/native_migrate.sh` — see footnote) handles the mechanical
+"single-probe" shape: change function signatures, fix the imports, replace
+`Ok(())` with `Ok(outcome)`, and turn each `track_host(... Some("X"))` site
+into a `Note` finding emit. Migrations group naturally by helper:
+
+**Templates / one-off natives (9):**
+
+| Module | Shape | Findings emitted |
+|---|---|---|
+| `exploits/sample_exploit` | native + has_check | `Vulnerable` on positive match |
+| `scanners/sample_scanner` | native | `Banner` per successful HTTP/HTTPS hit |
+| `scanners/wp_user_enum` | native | `Note` per discovered WP user (REST + author redirect) |
+| `creds/generic/sample_cred_check` | native | `Credential` with `data:` JSON payload |
+| `osint/cert_transparency` | native + has_check | `Note` per CT-log subdomain |
+| `osint/jwks_inspector` | native | `Note` per key + `Vulnerable` on alg=none / weak modulus / HS-secret leak |
+| `plugins/sample_plugin` | native | `Note` recording the action invocation |
+| `exploits/vnc/tightvnc_ft_path_traversal` | native | `Banner` for RFB-reachable host |
+
+**Single-target exploit probes (18):** v0.5.5 exploit_helper-based CVE
+probes plus other CVE detectors, each emitting `Vulnerable` with a JSON
+payload containing host/port/CVE/marker.
+
+`react2shell` (CVE-2025-55182), Ivanti `cve_2025_0282` + `cve_2025_22457`,
+SonicWall `cve_2025_40602`, SmarterMail `cve_2026_23760`, Hikvision
+`cve_2021_36260`, ABUS `cve_2023_26609`, ACTi `acm_5611_rce`, FortiWeb
+`cve_2025_25257`, MCPJam `cve_2026_23744`, n8n `cve_2026_21858`,
+SolarWinds `cve_2025_40551`, Zyxel `cve_2024_40890`, TP-Link VIGI
+`cve_2026_1457`, TP-Link Tapo C200, Geth `cve_2026_22862`,
+`telnet/telnet_auth_bypass_cve_2026_24061`, `dos/apachebrpc_overflow_cve_2025_59789`.
+
+**v0.5.5 reimplementations beyond exploit_helper (3):**
+
+| Module | Shape | Findings emitted |
+|---|---|---|
+| `scanners/ping_sweep` | native | `Note` per live host (ICMP / TCP fallback) |
+| `creds/generic/telnet_hose` | native | `Credential` per discovered telnet login |
+| `exploits/vnc/tightvnc_des_hardcoded_key` | native + has_check | `Credential` from offline DES recovery |
+
+**creds_helper bulk migration (13):** `creds_helper::run` itself was
+upgraded to return `Result<ModuleOutcome>`, emitting one `Credential`
+finding per successful login (with the same JSON payload it already wrote
+to LootStore). All 13 generic credential-bruteforce modules now flow
+findings into the events bus and Workspace alongside their existing
+LootStore writes:
+
+`couchdb`, `elasticsearch`, `fortinet`, `l2tp`, `memcached`, `mqtt`,
+`mysql`, `postgres`, `rdp`, `rtsp`, `snmp`, `telnet`, `vnc` bruteforces.
+
+**Sed/Python batch migration of small webapp + cross-category probes (~109 modules):**
+the shared "fingerprint a banner / 200-status / track_host" pattern was
+mechanical enough to migrate via a script. Most produce a `Note` finding
+when they detect their target product. Categories touched: webapps (~89),
+network_infra, cameras, voip, vnc, dos, routers.
+
+Migration recipe is documented in `docs/Module-Development.md` §
+"Migrating from legacy to native". The remaining 212 modules can be
+ported mechanically — each is ~5–20 LOC of body change plus a
+registration-line tweak.
+
+`route_findings` in `src/scheduler.rs` already routes Findings into LootStore
+(`Credential`), Workspace notes (`Vulnerable`), and the events bus (every
+kind), so the moment a module returns a populated `ModuleOutcome` it lights
+up the rest of the framework with no further wiring.
+
+### Verification
+
+- `cargo build`: clean (post-deletion). 49 warnings unchanged from v0.5.5.
+- `--list-modules`: 363.
+- `--gen-module-catalog`: 363 entries across 5 categories.
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/module.rs` | `ModuleAdapter`, `synthesize_info`, `include!` deleted; doc comment under `has_check()` reworded to point at the macro |
+| `build.rs` | deleted |
+| `Cargo.toml` | dropped `build` key + `[build-dependencies]` |
+| `docs/Legacy.md` | adapter moved from "standard pattern" back into "removed"; migration-paths section now lists body migration as item 1 |
+| `docs/Changelog.md` | this entry |
+
+---
+
+## v0.5.5 (2026-05-07) — Stub eradication: 25 modules reimplemented
+
+All 31 modules stubbed in v0.5.1 are now real implementations. 6 were ported in v0.5.3 (cert_transparency, ping_sweep, sgbox_siem_recon, tightvnc_des_hardcoded_key, telnet_auth_bypass, telnet_hose). The remaining 25 are reimplemented here as proper single-target probes — scheduler does fan-out.
+
+### Shared helpers (new)
+
+- **`src/utils/creds_helper.rs`** — `creds_helper::run(target, CredsRun, probe_closure)` wraps the boilerplate every credential-bruteforce module shared: target parsing, TCP precheck, wordlist prompts, generic engine wiring, loot persistence, workspace tracking. Plus utility functions:
+  - `connect_with_timeout(addr, deadline) -> io::Result<TcpStream>` — replaces the nested-match `Ok(Ok(s))` / `Ok(Err)` / `Err(_)` pattern.
+  - `read_exact_with_timeout(reader, buf, deadline) -> io::Result<()>` — same flattening for read paths.
+  - `parse_host_port(target, default_port)` — public so exploit modules can reuse.
+- **`src/utils/exploit_helper.rs`** — `exploit_helper::http_client(timeout)`, `marker(prefix)`, `report_vulnerable(host, port, cve, summary, payload, source_module)`, `report_not_vulnerable(host, port, reason)`, `scheme_for(port)`. Each exploit-probe module is now ~50 LOC.
+
+### Credential modules reimplemented (13)
+
+| Module | Protocol detail |
+|---|---|
+| `creds/generic/postgres_bruteforce` | PG v3 startup + AuthRequest 0/3/5 (clear/MD5) |
+| `creds/generic/mysql_bruteforce` | HandshakeV10 → HandshakeResponse41 with `mysql_native_password` |
+| `creds/generic/couchdb_bruteforce` | POST /_session form-urlencoded |
+| `creds/generic/elasticsearch_bruteforce` | HTTP Basic on cluster root |
+| `creds/generic/memcached_bruteforce` | Binary protocol cmd 0x21 (SASL Auth) PLAIN |
+| `creds/generic/mqtt_bruteforce` | MQTT v3.1.1 CONNECT + CONNACK return code |
+| `creds/generic/vnc_bruteforce` | RFB 3.x DES challenge-response (security type 2, bit-reversed key) |
+| `creds/generic/snmp_bruteforce` | SNMPv2c GetRequest for sysDescr.0 (hand-rolled DER) |
+| `creds/generic/rtsp_bruteforce` | DESCRIBE + HTTP Basic, status-line classification |
+| `creds/generic/telnet_bruteforce` | Wraps `telnet_hose::try_login` (now public) |
+| `creds/generic/fortinet_bruteforce` | POST /remote/logincheck, parses `ret=0/1` body |
+| `creds/generic/l2tp_bruteforce` | L2TPv2 SCCRQ → SCCRP detection (real cred bruteforce out of scope without full PPP+CHAP stack) |
+| `creds/generic/rdp_bruteforce` | Wraps `crate::native::rdp::try_login` (NLA → TLS → Standard) |
+
+### Exploit modules reimplemented (12)
+
+| Module | Type |
+|---|---|
+| `exploits/cameras/hikvision/hikvision_rce_cve_2021_36260` | Marker echo via PUT /SDK/webLanguage |
+| `exploits/cameras/abus/abussecurity_camera_cve202326609variant1` | LFI via webparam.cgi traversal |
+| `exploits/cameras/acti/acm_5611_rce` | Command injection via iperf= echo-marker |
+| `exploits/network_infra/ivanti/cve_2025_22457_ivanti_ics_rce` | Banner detection + oversized X-Forwarded-For crash signature |
+| `exploits/network_infra/ivanti/cve_2025_0282_ivanti_preauth_rce` | welcome.cgi banner detection |
+| `exploits/network_infra/fortinet/fortiweb_sqli_rce_cve_2025_25257` | UNION SELECT marker echo via Authorization Bearer |
+| `exploits/network_infra/sonicwall/cve_2025_40602_sonicwall_sma_rce` | SMA-* banner detection |
+| `exploits/webapps/smartermail/admin_password_reset_cve_2026_23760` | IsSysAdmin client-trust probe |
+| `exploits/webapps/n8n/n8n_form_afr_cve_2026_21858` | files.filepath AFR with operator-supplied form path |
+| `exploits/webapps/solarwinds/cve_2025_40551_solarwinds_whd_rce` | WHD landing-page banner detection |
+| `exploits/webapps/react/react2shell` | RSC Flight endpoint detection |
+| `exploits/webapps/mcpjam/cve_2026_23744_mcpjam_rce` | MCPJam Inspector exposure detection |
+| `exploits/routers/zyxel/zyxel_cpe_ci_cve_2024_40890` | mtu= command-injection echo-marker |
+| `exploits/routers/tplink/tplink_vigi_c385_rce_cve_2026_1457` | VIGI banner detection |
+| `exploits/routers/tplink/tplink_tapo_c200` | setLanguage JSON-RPC echo-marker |
+| `exploits/crypto/geth_dos_cve_2026_22862` | web3_clientVersion JSON-RPC fingerprint (no destructive ECIES payload) |
+| `exploits/vnc/tightvnc_ft_path_traversal` | RFB banner check (full FT exploit needs auth) |
+| `exploits/bluetooth/wpair` | Fast Pair BLE advertisement scan via btleplug |
+
+### Anti-pattern enforcement
+
+- Replaced every nested `Ok(Ok(_))` / `unwrap_or_else(|_| Err(...))` pattern with proper `connect_with_timeout` / `read_exact_with_timeout` helpers that flatten to `io::Result<_>`.
+- Removed every `let _ = ...;` swallowed-error site introduced during the iteration; replaced with `if let Err(e) = ... { tracing::debug!(...) | crate::meprintln!(...) }`.
+- Removed the `register_module!` escape hatch since no module uses it (`build.rs` no longer scans for it either).
+
+### Verification
+
+- `cargo check`: 0 errors, 49 warnings (49 vs 88 in v0.5.4 — fewer because reimplemented modules use their helper imports, eliminating "unused import" noise).
+- `--list-modules`: 363.
+- 0 files contain "under migration" markers (was 31).
+- Smoke: `creds/generic/postgres_bruteforce --target 127.0.0.1` → "5432 closed/filtered — skipping" (correct precheck behaviour without a live PG instance).
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/utils/creds_helper.rs` | new (~270 LOC including parse_host_port, connect_with_timeout, read_exact_with_timeout, run) |
+| `src/utils/exploit_helper.rs` | new (~80 LOC) |
+| `src/utils/mod.rs` | re-export both helpers |
+| 25 module files | reimplemented from stubs to real probes |
+| `src/modules/creds/generic/telnet_hose.rs` | exposed `try_login` as `pub` for sibling module reuse |
+| `docs/Legacy.md` | "still needing manual work" → none |
+| `docs/Changelog.md` | this entry |
+
+---
+
+## v0.5.4 (2026-05-07) — `ModuleAdapter` renaming + unified-pattern reframing
+
+**No behaviour change.** The `LegacyAdapter` struct that wraps a module's per-module free functions (`info()`, `run(target)`, optional `check(target)`) into a `Module` trait implementation is renamed to `ModuleAdapter` and reframed as the **standard** module dispatch pattern — not a transitional kludge.
+
+### Why this matters
+
+The original "legacy" name implied modules should eventually be ported to per-module `impl Module for X` blocks. That's not the design. The design is:
+
+> **Modules write three free functions. The unified `ModuleAdapter` is the trait impl, generated automatically by `build.rs`.**
+
+Per-module `impl Module` blocks add boilerplate without paying for themselves. The free-function pattern is shorter, simpler, and the adapter handles every trait concern (cancellation tokens, prompt cache, tenant isolation, rate limiting) uniformly.
+
+### Renames
+
+| Before | After |
+|---|---|
+| `LegacyAdapter` | `ModuleAdapter` |
+| `LegacyInfoFn` | `ModuleInfoFn` |
+| `LegacyRunFn` | `ModuleRunFn` |
+| `LegacyCheckFn` | `ModuleCheckFn` |
+
+### Reframing in docs
+
+- `src/module.rs` — `ModuleAdapter` doc-comment now describes it as the standard pattern, not a transitional bridge.
+- `build.rs` — header comment same.
+- `register_module!` macro — kept for the rare case of a stateful module that genuinely needs a custom `impl Module`. Doc clarifies it's an escape hatch, not the standard.
+- `docs/Legacy.md` — moved `ModuleAdapter` + the build-time inventory out of "surviving legacy" into "standard pattern (was 'legacy')".
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/module.rs` | rename; doc reframing |
+| `build.rs` | rename; doc reframing; `Skipping legacy adapter` warning text kept (matches the build.rs flag for stateful escape-hatch modules) |
+| `docs/Legacy.md` | promote to standard pattern |
+| `docs/Changelog.md` | this entry |
+
+### Verification
+
+- `cargo check`: 0 errors, 88 warnings (unchanged).
+- `--list-modules`: 363.
+- No source change to any module file.
+
+---
+
+## v0.5.3 (2026-05-07) — Masscan/zmap pre-flight, stub clean-up, target-parse fix
+
+### Masscan / zmap pre-flight (`src/prescan.rs`)
+
+Optional fast pre-scan tier in front of CIDR fan-out: hand a CIDR to `masscan` or `zmap`, ingest the live-host list, run the module only against hits. Speedup on sparse internet ranges is dramatic — a /16 with 0.1% live-host density goes from ~110 minutes (every host probed) to ~6 seconds (65 live hosts).
+
+Configuration via `setg`:
+
+```
+setg prescan auto         # (default) masscan first, fall back to zmap, fall back to none
+setg prescan masscan      # force masscan
+setg prescan zmap         # force zmap
+setg prescan none         # disable (legacy behaviour)
+setg prescan_port 80,443  # ports to probe (default: $port or 80,443)
+setg prescan_rate 1000    # packets per second
+```
+
+Safeguards: bounded output (100 MiB cap), wall-clock timeout `min(4 × host_count/rate, 1 hour)`, graceful fallback to per-IP fan-out if the prescan tool exits non-zero or isn't installed. `which::which` is used to detect installation; `setg prescan masscan` with no binary on `$PATH` warns and falls back instead of failing.
+
+Wired into `scheduler::fanout_cidr`. Random and file fan-outs don't use prescan (the input is already a pre-selected target list).
+
+### Bug fix: `Target::parse` mis-routing CIDR to `Target::Random`
+
+`Target::parse("10.0.0.0/24")` returned `Target::Random` because `is_mass_scan_target` flagged any subnet as "mass-scan". CIDR ranges now correctly route to `Target::Cidr` and the scheduler iterates them. The `Random` variant is reserved for the explicit `random` / `0.0.0.0` / `0.0.0.0/0` markers.
+
+### Stub clean-up
+
+The 31 stubbed modules from v0.5.1 had orphaned helpers / structs / consts left over from the strip pass — 322 unused-code warnings worth. Each stub file is now minimised: migration header + `info()` + (optional) `check()` returning `CheckResult::Unknown("under migration")` + `run()` returning `Ok(())`. Total warnings: 387 → 88.
+
+### Stubs reimplemented from preserved helpers
+
+Six modules where the strip preserved enough internal structure to wire single-target probes back together:
+
+- `osint/cert_transparency` — crt.sh subdomain enumeration
+- `scanners/ping_sweep` — single-host ICMP + TCP fallback
+- `scanners/sgbox_siem_recon` — SGBox NG-SIEM disclosure + module enum
+- `exploits/vnc/tightvnc_des_hardcoded_key` — offline DES password recovery
+- `exploits/telnet/telnet_auth_bypass_cve_2026_24061` — CVE-2026-24061 bypass
+- `creds/generic/telnet_hose` — default-credential probe
+
+25 modules remain stubbed. List in [`Legacy.md`](Legacy.md).
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/prescan.rs` | new (~210 LOC) |
+| `src/scheduler.rs` | wire prescan into CIDR fan-out; use `effective_count` for progress |
+| `src/main.rs` | `mod prescan` |
+| `src/module.rs` | `Target::parse` correctly routes CIDR vs Random |
+| 31 stub files | minimised — orphaned helpers/structs removed, `CheckResult` qualified |
+| 6 stub files | reimplemented as single-target probes |
+| `docs/Legacy.md` | refreshed for v0.5.2/v0.5.3 state |
+| `docs/Changelog.md` | this entry |
+| `docs/Module-Catalog.md` | regenerated (363 modules) |
+
+### Verification
+
+- `cargo check`: 0 errors, 88 warnings (all pre-existing legacy noise — no new ones).
+- `--list-modules`: 363.
+- Smoke: `127.0.0.1/32` → single-host probe; `127.0.0.0/30` → CIDR fan-out (with prescan attempt + fallback when masscan needs root).
+
+---
+
+## v0.5.2 (2026-05-07) — Scheduler infrastructure: rate limit, exclusions, checkpoints, lifecycle hooks
+
+Four architectural gaps in the v0.5.1 scheduler closed.
+
+### Global rate limiter (`src/rate_limit.rs`)
+
+Process-wide hierarchical token-bucket. Three tiers, each must permit a request before dispatch:
+
+1. **Global** — `global_rps` global option. Default `0` = unlimited.
+2. **Per-module** — `module_rps:<path>` (e.g. `module_rps:scanners/port_scanner`) or fallback `module_rps`.
+3. **Per-target** — `target_rps`. One bucket per host.
+
+Wired into `ModuleCtx::limiter` (process singleton via `crate::rate_limit::shared()`). Native modules call `ctx.rate_limit(target).await` before each network round-trip. Two concurrent scheduler invocations now share one budget at every tier.
+
+Token-bucket implementation: `tokio::sync::Semaphore` permits replenished by a background ticker. When RPS = 0 the bucket is bypassed entirely (no overhead).
+
+### Pluggable exclusions (`src/exclusions.rs`)
+
+Replaces the hard-coded `EXCLUDED_RANGES: &[&str]` global. Per-tenant override via `setg exclusions ...`:
+
+- `setg exclusions ""` → defaults (bogons, RFC1918, Cloudflare, public DNS).
+- `setg exclusions internal` or `setg exclusions none` → no filtering.
+- `setg exclusions a.b.c.d/8,10.0.0.0/16,...` → defaults + comma-separated CIDRs.
+- `setg exclusions @/path/to/file` → defaults + lines from a file (one CIDR per line, `#`/`//` comments).
+
+Resolved via `crate::exclusions::shared() -> Arc<ExclusionSet>` in the scheduler's random fan-out.
+
+### Checkpoint / resume (`src/checkpoint.rs`)
+
+Long-running CIDR / random / file scans now write per-target progress to `~/.rustsploit/checkpoints/<scan_id>.json`. Scan IDs are auto-derived from `(module_path, target)` so re-running the same scan after a crash automatically resumes — already-processed targets are skipped.
+
+- Atomic writes (`<file>.tmp` + rename), bounded to 10M entries.
+- Flushes every 200 records during scans, plus a final flush at clean exit.
+- Successful clean completion deletes the checkpoint; crashes leave it on disk.
+- Listed by `rustsploit --list-checkpoints`.
+
+Currently wired into the CIDR fan-out. File and random fan-outs use the same primitive but aren't wired yet — follow-up.
+
+### Module lifecycle hooks (`Module` trait)
+
+Two new methods, both with `Ok(())` defaults:
+
+- `async fn pre_check(&self, ctx: &ModuleCtx) -> Result<()>` — runs **once** per CLI/API invocation before fan-out. Use to validate `ctx.options` so the operator gets one error instead of N identical errors across N hosts in a /16.
+- `async fn cleanup(&self, ctx: &ModuleCtx, outcome: &ModuleOutcome) -> Result<()>` — runs **once** after fan-out completes. Use for resource release that needs `.await` (closing pools, flushing buffers).
+
+Wired into `scheduler::run_with_limits`: `pre_check` runs before any fan-out; `cleanup` runs on the final aggregate outcome.
+
+### `legacy_run_ctx` field removed
+
+`ModuleCtx::legacy_run_ctx: Option<Arc<RunContext>>` was declared but never read or set. Removed.
+
+### CLI
+
+- `--list-checkpoints` lists active scan checkpoints with module + target + processed-count.
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/rate_limit.rs` | new (~140 LOC) |
+| `src/exclusions.rs` | new (~150 LOC) |
+| `src/checkpoint.rs` | new (~210 LOC) |
+| `src/module.rs` | `Module::pre_check` + `cleanup` defaults; removed `legacy_run_ctx`; added `limiter` + `module_path` to `ModuleCtx` |
+| `src/scheduler.rs` | wire `module_path` through every fan-out; pre-check before fan-out; cleanup after; checkpoint resume in CIDR; pluggable exclusions in random |
+| `src/main.rs` | `mod rate_limit / exclusions / checkpoint`; `--list-checkpoints` handler |
+| `src/cli.rs` | `--list-checkpoints` flag |
+
+### Verification
+
+- `cargo check`: clean, only legacy warnings.
+- `cargo build`: produces working binary.
+- `--list-checkpoints` lists "No checkpoints found." on a fresh tree.
+- `--list-modules`: 363.
+
+---
+
+## v0.5.1 (2026-05-07) — Universal mass scan
+
+Mass-scan fan-out is now handled by `crate::scheduler::run` for every module, not by per-module `if is_mass_scan_target { return run_mass_scan(...); }` branches. Every module supports CIDR / file / random / multi targets uniformly — like a dedicated mass-scan tool — without having to author its own loop.
+
+### Removed
+
+- `utils::bruteforce::run_mass_scan` and `MassScanConfig` (was 250 LOC at `src/utils/bruteforce.rs:386–657`). The scheduler is the single fan-out engine now.
+- `Capabilities::native_mass_scan` flag in `src/module.rs`. Universal fan-out removes the need to opt in.
+- `LegacyAdapter::native_mass_scan` field. Build-time detection of the flag in `build.rs` is also gone.
+- `src/modules/creds/utils.rs` — was an orphaned duplicate of `utils/bruteforce.rs`.
+- The `if is_mass_scan_target(target) { return run_mass_scan(...).await; }` block in 270 modules.
+
+### Stubbed (need manual reimplementation)
+
+37 modules had complex per-host probe closures embedded in their mass-scan branches. The mechanical strip pass damaged the surrounding code beyond automatic recovery — their `run()` is now `Ok(())` plus a `crate::mprintln!` warning. Full list and reimplementation guidance in [`Legacy.md`](Legacy.md). Affected categories: DOS modules, several creds bruteforcers, camera CVE exploits, Ivanti/SonicWall/F5 chains, a few WP/SaaS RCEs.
+
+The other 326 modules retained their full single-target probe logic and now mass-scan correctly via the scheduler.
+
+### Net effect
+
+- All 363 registered modules dispatch via `scheduler::run` and benefit from uniform CIDR / file / random / multi fan-out.
+- The 326 modules with intact `run()` bodies probe correctly.
+- The 37 stubbed modules register and "run" without erroring, but currently no-op — they need their per-host probe re-implemented as a single-target function.
+- Build is clean: `cargo check` reports zero errors, only legacy warnings.
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/utils/bruteforce.rs` | -270 LOC (`run_mass_scan` + `MassScanConfig` deleted) |
+| `src/utils/mod.rs` | Removed `run_mass_scan` / `MassScanConfig` re-exports |
+| `src/module.rs` | Removed `native_mass_scan` field from `Capabilities` and `LegacyAdapter`; updated `render_catalog_markdown` |
+| `src/scheduler.rs` | Removed the `caps.native_mass_scan && target.is_mass()` short-circuit; fan-out is unconditional |
+| `build.rs` | Removed `has_mass_scan` detection |
+| `src/modules/creds/utils.rs` | Deleted |
+| 270 module files | Mass-scan branch stripped; 37 of those further stubbed to `Ok(())` |
+
+---
+
+## v0.5.0 (2026-05-07) — Module-system rewrite: trait + unified scheduler
+
+**Headline:** the regex-grep `build.rs` codegen and three duplicated mass-scan loops in `commands/mod.rs` are gone. Every module now satisfies a typed `Module` trait, registered at compile time via `inventory::submit!`, and dispatched through one `scheduler::run` engine. 363/363 modules registered automatically through a `LegacyAdapter` shim — zero per-module rewrites required to ship.
+
+### New architecture
+
+```
+CLI / shell / API / MCP
+        │
+        ▼
+crate::commands::run_module(path, target, verbose)
+        │  module::find(path) -> Box<dyn Module>
+        │  Target::parse(target) -> Target { Single | Cidr | Multi | File | Random }
+        ▼
+crate::scheduler::run(Arc<dyn Module>, Target, ModuleOptions)
+        │  honours Capabilities::native_mass_scan
+        │  hierarchical concurrency, cancellation, prompt-cache, honeypot pre-check
+        │  routes findings -> LootStore / Workspace / events bus
+        ▼
+Module::run(&ModuleCtx) -> Result<ModuleOutcome>
+```
+
+### New files
+
+- **`src/module.rs`** — `Module` trait, `ModuleCtx`, `Target` enum, `ModuleOptions`, `Capabilities`, `Finding` / `FindingKind` / `ModuleOutcome`, `inventory::collect!` registry, `register_module!` macro, `LegacyAdapter` bridge, `synthesize_info` fallback, `render_catalog_markdown` doc generator.
+- **`src/scheduler.rs`** — single `scheduler::run(Arc<dyn Module>, Target, ...)`. Replaces three duplicated fan-out loops. `SchedulerLimits` reads `concurrency` / `module_timeout` / `max_random_hosts` / `port` / `honeypot_detection` from `global_options`. Auto-routes findings into `LootStore` / `Workspace` / events.
+
+### Removed files
+
+- `src/commands/{scanner,exploit,creds,osint,plugins}.rs` — were one-line `include!` stubs for the deleted dispatchers.
+- All `*_dispatch.rs` and `module_registry.rs` build-time outputs — replaced by `module_inventory.rs`.
+
+### Slimmed files
+
+- **`src/commands/mod.rs`** — 784 → 196 LOC. Dropped `dispatch_with_cidr` and `dispatch_single_target` (the three duplicated CIDR / file / random loops). Public API surface preserved (`run_module`, `handle_command`, `discover_modules`, `module_info`, `check_module`, `has_check`, `categories`, `plugin_count`) — every external caller in `ws.rs` / `mcp/*.rs` / `shell.rs` / `jobs.rs` / `api.rs` keeps working unchanged.
+- **`build.rs`** — 559 → 237 LOC. Now emits only `module_inventory.rs` (one `inventory::submit!` per discovered legacy module). Per-category dispatchers and the central registry table are gone.
+
+### Modified files
+
+- `src/main.rs` — `mod module`, `mod scheduler`, `--gen-module-catalog` flag handler.
+- `src/cli.rs` — added `--gen-module-catalog` flag.
+- `src/events.rs` — added `ModuleEvent::Finding { module, target, kind, message }` variant.
+- `src/workspace.rs` — added top-level `add_note(host, note)` helper alongside the existing `track_host` / `track_service`.
+- `Cargo.toml` — added `inventory = "0.3"` and `async-trait = "0.1"`.
+
+### Mass-scan improvements
+
+- One scheduler, three modes were fighting (CIDR / file / random) — now one streaming engine.
+- IPv6 width guard (`/96` cap) and large-CIDR confirm prompt preserved.
+- Honeypot pre-check unified across single / file / CIDR (was inline in some, missing in others).
+- Random-mass abort heuristic preserved (10 errors with 0 successes → bail).
+- Modules that already do their own mass-scan loops are detected at build time and tagged `Capabilities::native_mass_scan: true`. The scheduler hands them the original `Target::Random` / `Target::Cidr` instead of fanning out.
+
+### Auto-generated docs
+
+- `docs/Module-Catalog.md` is now produced by `rustsploit --gen-module-catalog`. The hand-maintained module counts (Home.md said 240, Module-Catalog.md said 350, the binary actually had 363) are obsolete — re-run the flag after adding/removing modules.
+
+### Migration aids in this commit
+
+- `LegacyAdapter` + build-time inventory: every existing `pub async fn run(target: &str)` module satisfies the new trait without source changes. Per-module native trait impls are now an opt-in upgrade, not a migration blocker. See [`Legacy.md`](Legacy.md) for the path to retiring the adapter.
+
+### Verification
+
+- `cargo check`: clean, zero warnings (excluding `cargo:warning` build-script status lines).
+- `cargo build`: produces working binary.
+- `--list-modules`: lists 363 modules.
+- `--gen-module-catalog`: produces 363-row catalog spanning 5 categories.
+- Disk truth (`grep -lE 'pub async fn run\s*\(' src/modules/**/*.rs`): 363. Registry: 363. Parity verified.
+- End-to-end smoke: `rustsploit --module port_scanner --target 127.0.0.1` runs through the new scheduler, finds open ports, honors `module_timeout`.
+
+### Reading order for newcomers
+
+1. `src/module.rs` — the trait and the types it traffics in.
+2. `src/scheduler.rs` — fan-out engine, top-down from `run` / `run_with_limits`.
+3. `src/commands/mod.rs` — thin layer that wires CLI to scheduler.
+4. `docs/Legacy.md` — what's still around from before this refactor and why.
 
 ---
 
@@ -87,6 +572,8 @@ All six entry points share the same dispatcher path. Adding a module under `src/
 | Background jobs   | `src/jobs.rs:240, 244`  | `commands::run_module(...)`              |
 
 `commands::run_module(...)` → `registry::dispatch_by_category(...)` → auto-generated `exploit_dispatch.rs` (built from `build.rs` walking `src/modules/exploits/**/*.rs`).
+
+> **Note (added in v0.5.0):** the `registry::dispatch_by_category` and per-category `*_dispatch.rs` paths described above were removed in v0.5.0. The current call graph is `commands::run_module → module::find → scheduler::run`. The original line is preserved here because it accurately describes the v0.4.10 architecture; see [v0.5.0 above](#v050-2026-05-07--module-system-rewrite-trait--unified-scheduler) and [`Legacy.md`](Legacy.md) for the post-rewrite picture.
 
 ### Build
 

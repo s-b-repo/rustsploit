@@ -425,13 +425,64 @@ pub static WORKSPACE: Lazy<Workspace> = Lazy::new(Workspace::new);
 
 /// Convenience functions for modules to auto-populate workspace data.
 /// Routes through the tenant registry when in a tenant context (API mode),
-/// otherwise uses the global singleton (shell mode).
+/// otherwise uses the global singleton (shell mode). Also emits a
+/// `ModuleEvent::Finding` so panel / MCP / WS subscribers see the
+/// discovery in real time without each module having to call
+/// `events::emit` itself.
 pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
     let s = crate::tenant::resolve();
     s.workspace().add_host(ip, hostname, os_guess).await;
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: emitting_module(),
+        target: ip.to_string(),
+        kind: "host".to_string(),
+        message: match (hostname, os_guess) {
+            (Some(h), Some(o)) => format!("host up — hostname={h} os={o}"),
+            (Some(h), None) => format!("host up — hostname={h}"),
+            (None, Some(o)) => format!("host up — os={o}"),
+            (None, None) => "host up".to_string(),
+        },
+    });
 }
 
-pub async fn track_service(host: &str, port: u16, protocol: &str, service_name: &str, version: Option<&str>) {
+pub async fn track_service(
+    host: &str,
+    port: u16,
+    protocol: &str,
+    service_name: &str,
+    version: Option<&str>,
+) {
     let s = crate::tenant::resolve();
     s.workspace().add_service(host, port, protocol, service_name, version).await;
+    let version_str = version.map(|v| format!(" {v}")).unwrap_or_default();
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: emitting_module(),
+        target: format!("{host}:{port}"),
+        kind: "service".to_string(),
+        message: format!("{protocol}/{service_name}{version_str}"),
+    });
+}
+
+pub async fn add_note(host: &str, note: &str) {
+    let s = crate::tenant::resolve();
+    s.workspace().add_note(host, note).await;
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: emitting_module(),
+        target: host.to_string(),
+        kind: "note".to_string(),
+        message: note.to_string(),
+    });
+}
+
+/// The module path that produced this finding. Resolved from the active
+/// `RunContext` set by the scheduler before invoking the module. Falls
+/// back to a generic `"workspace"` when called outside a scheduled run
+/// (CLI / shell utility paths).
+fn emitting_module() -> String {
+    let path = crate::context::current_module_path();
+    if path.is_empty() {
+        "workspace".to_string()
+    } else {
+        path
+    }
 }

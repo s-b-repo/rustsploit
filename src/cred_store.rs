@@ -178,12 +178,11 @@ impl CredStore {
     }
 
     async fn save_locked(&self, entries: &[CredEntry]) {
-        if let Some(parent) = self.file_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        if let Some(parent) = self.file_path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await {
                 eprintln!("[!] Failed to create creds directory: {}", e);
                 return;
             }
-        }
         let tmp = self.file_path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(entries) {
             Ok(j) => j,

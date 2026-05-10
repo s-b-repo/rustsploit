@@ -240,11 +240,10 @@ async fn handle_ws(
         loop {
             match module_rx.recv().await {
                 Ok(te) => {
-                    if let Some(ref tid) = te.tenant_id {
-                        if tid != &my_tenant {
+                    if let Some(ref tid) = te.tenant_id
+                        && tid != &my_tenant {
                             continue;
                         }
-                    }
                     let envelope = json!({"type": "event", "event": "module", "data": te.event});
                     let bytes = match serde_json::to_vec(&envelope) {
                         Ok(b) => b,
@@ -386,11 +385,10 @@ async fn handle_ws(
             continue;
         }
         if method == "unsubscribe:output" {
-            if let Some(job_id_u64) = params.get("jobId").and_then(|v| v.as_u64()) {
-                if let Ok(job_id) = u32::try_from(job_id_u64) {
+            if let Some(job_id_u64) = params.get("jobId").and_then(|v| v.as_u64())
+                && let Ok(job_id) = u32::try_from(job_id_u64) {
                     reader_jobs.lock().await.remove(&job_id);
                 }
-            }
             continue;
         }
 

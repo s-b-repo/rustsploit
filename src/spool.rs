@@ -35,13 +35,12 @@ impl SpoolState {
             ));
         }
         // Reject paths with directory components to prevent writing outside CWD
-        if let Some(parent) = p.parent() {
-            if parent != Path::new("") {
+        if let Some(parent) = p.parent()
+            && parent != Path::new("") {
                 // Ensure parent directory exists
                 let resolved = resolve_spool_path(path)?;
                 return self.start_at_path(&resolved, path);
             }
-        }
         // Simple filename — write in CWD
         self.start_at_path(&PathBuf::from(path), path)
     }
@@ -135,11 +134,10 @@ impl SpoolState {
     /// comes from the write syscall itself.
     pub fn write_line(&self, msg: &str) -> Result<(), std::io::Error> {
         // Fast-path: skip lock entirely if no spool file is active.
-        if let Ok(g) = self.file.read() {
-            if g.is_none() {
+        if let Ok(g) = self.file.read()
+            && g.is_none() {
                 return Ok(());
             }
-        }
         let mut buf = String::with_capacity(msg.len() + 1);
         buf.push_str(msg);
         buf.push('\n');
@@ -156,8 +154,8 @@ impl SpoolState {
 
 fn resolve_spool_path(path: &str) -> Result<PathBuf> {
     let p = PathBuf::from(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty() {
             if !parent.exists() {
                 return Err(anyhow!(
                     "Parent directory '{}' does not exist",
@@ -185,7 +183,6 @@ fn resolve_spool_path(path: &str) -> Result<PathBuf> {
                 }
             }
         }
-    }
     Ok(p)
 }
 

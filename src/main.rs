@@ -16,18 +16,24 @@ mod native;
 mod shell;
 mod utils;
 
+pub mod checkpoint;
 pub mod cred_store;
 pub mod events;
+pub mod exclusions;
 pub mod tenant;
 pub mod export;
 pub mod global_options;
 pub mod jobs;
 pub mod loot;
 pub mod mcp;
+pub mod module;
 pub mod module_info;
 pub mod output;
 pub mod pq_channel;
 pub mod pq_middleware;
+pub mod prescan;
+pub mod rate_limit;
+pub mod scheduler;
 pub mod spool;
 pub mod workspace;
 pub mod ws;
@@ -134,6 +140,35 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Regenerate docs/Module-Catalog.md from the live registry
+    if cli_args.gen_module_catalog {
+        let md = module::render_catalog_markdown();
+        let out = std::path::Path::new("docs/Module-Catalog.md");
+        std::fs::write(out, md).context("Failed to write docs/Module-Catalog.md")?;
+        println!("{} Wrote {} ({} modules)",
+            "✓".green(), out.display(), module::count());
+        return Ok(());
+    }
+
+    // List on-disk scan checkpoints
+    if cli_args.list_checkpoints {
+        match checkpoint::list_checkpoints() {
+            Ok(list) if list.is_empty() => {
+                println!("No checkpoints found.");
+            }
+            Ok(list) => {
+                println!("Active checkpoints (resume by re-running the same module + target):\n");
+                for cp in list {
+                    println!("  {}", cp);
+                }
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to enumerate checkpoints: {e:#}"));
+            }
+        }
+        return Ok(());
+    }
+
     // API server mode — PQ-encrypted, no TLS, no API keys
     if cli_args.api {
         let host_key_path = pq_host_key_path(cli_args.pq_host_key.as_deref());
@@ -162,11 +197,10 @@ async fn run() -> Result<()> {
     }
 
     // Validate target if provided
-    if let Some(ref target) = cli_args.target {
-        if let Err(e) = utils::normalize_target(target) {
+    if let Some(ref target) = cli_args.target
+        && let Err(e) = utils::normalize_target(target) {
             return Err(anyhow!("Invalid target '{}': {}", target, e));
         }
-    }
 
     // Set global target if provided
     if let Some(ref target) = cli_args.set_target {

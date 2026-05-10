@@ -21,14 +21,17 @@
 //!
 //! FOR AUTHORIZED TESTING ONLY.
 
-use anyhow::{Context, Result};
+use anyhow::{ Context, Result };
 use colored::*;
 use std::time::Duration;
 
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
 use crate::utils::{
-    build_http_client, cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no,
-    is_mass_scan_target, run_mass_scan, MassScanConfig,
+    build_http_client,
+    cfg_prompt_default,
+    cfg_prompt_int_range,
+    cfg_prompt_yes_no,
 };
 
 const HTTP_TIMEOUT_SECS: u64 = 8;
@@ -89,7 +92,11 @@ pub fn info() -> ModuleInfo {
 
 /// Non-destructive check: does `/redfish/v1` respond, and does at least one
 /// sensitive endpoint return 200 unauthenticated?
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = match ctx.target.as_single() {
+        Some(t) => t,
+        None => return CheckResult::Error("redfish_unauth_enum requires a single-host target".to_string()),
+    };
     let host = sanitize_host(target);
     let client = match build_http_client(Duration::from_secs(HTTP_TIMEOUT_SECS)) {
         Ok(c) => c,
@@ -105,51 +112,31 @@ pub async fn check(target: &str) -> CheckResult {
             }
             // Probe one cheap sensitive endpoint
             let probe = format!("{}://{}/redfish/v1/Systems/1", scheme, host);
-            if let Ok(probe_resp) = client.get(&probe).send().await {
-                if probe_resp.status().is_success() {
-                    if let Ok(body) = probe_resp.text().await {
-                        if body.contains("SerialNumber") || body.contains("Manufacturer") {
+            if let Ok(probe_resp) = client.get(&probe).send().await
+                && probe_resp.status().is_success()
+                    && let Ok(body) = probe_resp.text().await
+                        && (body.contains("SerialNumber") || body.contains("Manufacturer")) {
                             return CheckResult::Vulnerable(format!(
                                 "Redfish Systems/1 returns identity data without auth on {}",
                                 scheme
                             ));
                         }
-                    }
-                }
-            }
             return CheckResult::Unknown(format!("Redfish reachable on {} but Systems/1 was not anonymous-readable", scheme));
         }
     }
     CheckResult::NotVulnerable("Redfish endpoint not reachable".into())
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "Redfish Unauth Enum",
-            default_port: 443,
-            state_file: "redfish_unauth_enum_mass_state.log",
-            default_output: "redfish_unauth_enum_mass_results.txt",
-            default_concurrency: 100,
-        }, |ip, port| async move {
-            let host = format!("{}:{}", ip, port);
-            let client = build_http_client(Duration::from_secs(5)).ok()?;
-            let url = format!("https://{}/redfish/v1/Systems/1", host);
-            let resp = client.get(&url).send().await.ok()?;
-            if !resp.status().is_success() {
-                return None;
-            }
-            let body = resp.text().await.ok()?;
-            if body.contains("SerialNumber") || body.contains("Manufacturer") {
-                Some(format!("{} unauth Redfish Systems/1 200 OK\n", host))
-            } else {
-                None
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("redfish_unauth_enum requires a single-host target")?;
 
     display_banner();
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
+
+    let mut outcome = ModuleOutcome::ok();
 
     let scheme = cfg_prompt_default("scheme", "Scheme (http/https/auto)", "auto").await?;
     let timeout_secs = cfg_prompt_int_range("timeout", "HTTP timeout (seconds)", HTTP_TIMEOUT_SECS as i64, 1, 60).await? as u64;
@@ -170,6 +157,7 @@ pub async fn run(target: &str) -> Result<()> {
     let mut working_scheme: Option<&str> = None;
     for s in schemes {
         let root = format!("{}://{}/redfish/v1", s, host);
+        ctx.rate_limit(&host).await;
         match client.get(&root).send().await {
             Ok(r) if r.status().is_success() => {
                 working_scheme = Some(s);
@@ -191,7 +179,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     let Some(scheme) = working_scheme else {
         crate::mprintln!("{}", "[-] No Redfish endpoint reachable on either scheme.".red());
-        return Ok(());
+        return Ok(outcome);
     };
 
     let mut hits = 0usize;
@@ -199,6 +187,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("\n{}", "── Redfish endpoints ──".bold());
     for (path, label, fields) in SENSITIVE_ENDPOINTS {
         let url = format!("{}://{}{}", scheme, host, path);
+        ctx.rate_limit(&host).await;
         match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -215,10 +204,11 @@ pub async fn run(target: &str) -> Result<()> {
                         crate::mprintln!("{}", format!("[~] {} ({}) -> 200 but no sensitive fields matched", path, label).yellow());
                     } else {
                         hits += 1;
+                        let leaked_names: Vec<String> = leaked.iter().map(|s| (**s).to_string()).collect();
                         crate::mprintln!("{}", format!(
                             "[+] {} ({}) -> 200 — leaks: {}",
                             path, label,
-                            leaked.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                            leaked_names.join(", ")
                         ).red().bold());
                         // Surface up to 3 sample leaked field values
                         for f in leaked.iter().take(3) {
@@ -226,6 +216,17 @@ pub async fn run(target: &str) -> Result<()> {
                                 crate::mprintln!("    {} = {}", f, snippet.dimmed());
                             }
                         }
+                        outcome.findings.push(Finding {
+                            target: host.clone(),
+                            kind: FindingKind::Vulnerable,
+                            message: format!("Redfish unauthenticated leak at {} ({}): {}", url, label, leaked_names.join(", ")),
+                            data: Some(serde_json::json!({
+                                "host": host,
+                                "url": url,
+                                "label": label,
+                                "leaked_fields": leaked_names,
+                            })),
+                        });
                     }
                 } else if verbose {
                     crate::mprintln!("{}", format!("[-] {} -> {}", path, status).dimmed());
@@ -243,25 +244,34 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("\n{}", "── Auxiliary endpoints ──".bold());
         for (path, label) in AUX_ENDPOINTS {
             let url = format!("{}://{}{}", scheme, host, path);
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        let len = resp
-                            .content_length()
-                            .map(|l| l as usize)
-                            .unwrap_or_else(|| resp.headers().get("content-length")
-                                .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0));
-                        hits += 1;
-                        crate::mprintln!("{}", format!(
-                            "[+] {} ({}) -> 200 ({} bytes leaked unauth)",
-                            path, label, len
-                        ).red().bold());
-                    } else if verbose {
-                        crate::mprintln!("{}", format!("[-] {} -> {}", path, status).dimmed());
-                    }
+            ctx.rate_limit(&host).await;
+            if let Ok(resp) = client.get(&url).send().await {
+                let status = resp.status();
+                if status.is_success() {
+                    let len = resp
+                        .content_length()
+                        .map(|l| l as usize)
+                        .unwrap_or_else(|| resp.headers().get("content-length")
+                            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0));
+                    hits += 1;
+                    crate::mprintln!("{}", format!(
+                        "[+] {} ({}) -> 200 ({} bytes leaked unauth)",
+                        path, label, len
+                    ).red().bold());
+                    outcome.findings.push(Finding {
+                        target: host.clone(),
+                        kind: FindingKind::Vulnerable,
+                        message: format!("Auxiliary unauth endpoint {} ({}) returned {} bytes", url, label, len),
+                        data: Some(serde_json::json!({
+                            "host": host,
+                            "url": url,
+                            "label": label,
+                            "size": len,
+                        })),
+                    });
+                } else if verbose {
+                    crate::mprintln!("{}", format!("[-] {} -> {}", path, status).dimmed());
                 }
-                Err(_) => {}
             }
         }
     }
@@ -273,7 +283,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", format!("[!] {} unauthenticated info-disclosure endpoint(s) found.", hits).red().bold());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Extract a short snippet of a JSON field's value for display.
@@ -317,3 +327,5 @@ fn sanitize_host(target: &str) -> String {
     }
     t
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "redfish_unauth_enum", native, has_check);

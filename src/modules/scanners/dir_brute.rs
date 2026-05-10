@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist,
     normalize_target, load_lines_cached, cfg_prompt_existing_file, safe_read_to_string
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use rand::seq::IndexedRandom;
 
 // --- Constants & Data ---
@@ -72,27 +72,14 @@ impl Default for DirBruteConfig {
 
 // --- Main Entry Point ---
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("dir_brute requires a single-host target")?;
+
     if crate::utils::get_global_source_port().await.is_some() {
         crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
-    }
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "DirBrute",
-            default_port: 80,
-            state_file: "dir_brute_mass_state.log",
-            default_output: "dir_brute_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} DirBrute open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
     }
 
     if !crate::utils::is_batch_mode() {
@@ -105,16 +92,16 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("3. Load Template (Load -> Run)");
         crate::mprintln!("4. Custom Attack (Wizard -> Run)");
     }
-    
+
     let choice = cfg_prompt_default("mode", "Selection", "1").await?;
-    
+
     let config = match choice.as_str() {
         "1" => setup_quick_attack(target).await?,
         "2" => {
             let cfg = setup_wizard(target).await?;
             save_template(&cfg).await?;
             crate::mprintln!("\n{}", "Template saved. Exiting module.".green());
-            return Ok(());
+            return Ok(ModuleOutcome::ok());
         },
         "3" => load_template().await?,
         "4" => setup_wizard(target).await?,
@@ -125,7 +112,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     // 2. Execution
-    execute_scan(config).await
+    execute_scan(ctx, config).await
 }
 
 fn print_banner() {
@@ -312,7 +299,9 @@ struct ScanResult {
     len: u64,
 }
 
-async fn execute_scan(config: DirBruteConfig) -> Result<()> {
+async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleOutcome> {
+    let mut outcome = ModuleOutcome::ok();
+
     // --- DESTROY mode (scan_mode=3) safety gate ---
     // This runs regardless of how the config was constructed (wizard, template, quick attack).
     if config.scan_mode == 3 {
@@ -328,7 +317,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         let confirm = cfg_prompt_required("destroy_exec_confirm", "Type 'DESTROY' to confirm execution").await?;
         if confirm != "DESTROY" {
             crate::mprintln!("{}", "Confirmation failed. Aborting scan.".yellow());
-            return Ok(());
+            return Ok(outcome);
         }
     }
 
@@ -374,9 +363,14 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         let config_verbose = config.verbose;
         let random_agent = config.random_agent;
         
+        let target_host = config.target_host.clone();
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        let cancel = ctx.cancel.clone();
+
         let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
             let _permit = sem.acquire().await.context("Semaphore acquisition failed")?;
-            if crate::context::is_cancelled() { return Ok(()); }
+            if cancel.is_cancelled() || crate::context::is_cancelled() { return Ok(()); }
 
             // Apply delay
             if delay.as_millis() > 0 {
@@ -387,69 +381,59 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
 
             for method in methods {
                 let mut req_builder = client.request(method.clone(), &url);
-                
+
                 if random_agent {
                      let agent = USER_AGENTS.choose(&mut rand::rng()).unwrap_or(&"RustSploit");
                      req_builder = req_builder.header(header::USER_AGENT, *agent);
                 } else {
                      req_builder = req_builder.header(header::USER_AGENT, "RustSploit/0.3");
                 }
-                
-                match req_builder.send().await {
-                    Ok(resp) => {
-                         let status = resp.status().as_u16();
-                         let len = resp.content_length().unwrap_or(0);
-                         
-                         // Special handling for 403 Forbidden
-                         if status == 403 {
-                             f_count.fetch_add(1, Ordering::Relaxed);
-                             if !config_verbose {
-                                 continue; // Skip printing if not verbose
-                             }
-                         }
 
-                         // Determine if "Interesting"
-                         if COMMON_STATUS_CODES.contains(&status) {
-                             let method_str = method.as_str();
-                             
-                             // Enhanced Color Logic
-                             let status_display = if status >= 200 && status < 300 {
-                                 format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
-                             } else if status >= 300 && status < 400 {
-                                 format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
-                             } else if status >= 500 {
-                                 format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
-                             } else if status == 403 || status == 401 {
-                                 format!("{} {}", "[AUTH]".yellow().bold(), status.to_string().yellow())
-                             } else {
-                                 format!("[{}]", status).white().to_string()
-                             };
-                             
-                             crate::mprintln!("{} Size: {} | Method: {} | {}",
-                                 status_display,
-                                 len.to_string().dimmed(),
-                                 method_str.bold(),
-                                 url
-                             );
-                             if status >= 200 && status < 400 {
-                                 crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                                     host: url.clone(),
-                                     port: 0,
-                                     service: format!("dir:{}", method_str),
-                                     version: Some(format!("status={} size={}", status, len)),
-                                 });
-                             }
-                             
-                             let res = ScanResult {
-                                 path: url.clone(),
-                                 method: method.to_string(),
-                                 status,
-                                 len,
-                             };
-                             r_mutex.lock().await.push(res);
+                limiter.acquire(&module_path, &target_host).await;
+                if let Ok(resp) = req_builder.send().await {
+                     let status = resp.status().as_u16();
+                     let len = resp.content_length().unwrap_or(0);
+
+                     // Special handling for 403 Forbidden
+                     if status == 403 {
+                         f_count.fetch_add(1, Ordering::Relaxed);
+                         if !config_verbose {
+                             continue; // Skip printing if not verbose
                          }
-                    }
-                    Err(_) => {}
+                     }
+
+                     // Determine if "Interesting"
+                     if COMMON_STATUS_CODES.contains(&status) {
+                         let method_str = method.as_str();
+
+                         // Enhanced Color Logic
+                         let status_display = if status >= 200 && status < 300 {
+                             format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
+                         } else if status >= 300 && status < 400 {
+                             format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
+                         } else if status >= 500 {
+                             format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
+                         } else if status == 403 || status == 401 {
+                             format!("{} {}", "[AUTH]".yellow().bold(), status.to_string().yellow())
+                         } else {
+                             format!("[{}]", status).white().to_string()
+                         };
+
+                         crate::mprintln!("{} Size: {} | Method: {} | {}",
+                             status_display,
+                             len.to_string().dimmed(),
+                             method_str.bold(),
+                             url
+                         );
+
+                         let res = ScanResult {
+                             path: url.clone(),
+                             method: method.to_string(),
+                             status,
+                             len,
+                         };
+                         r_mutex.lock().await.push(res);
+                     }
                 }
             }
             Ok(())
@@ -472,6 +456,21 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
 
     // Report & Save
     let final_results = results_mutex.lock().await;
+    for r in final_results.iter() {
+        if r.status >= 200 && r.status < 400 {
+            outcome.findings.push(Finding {
+                target: config.target_host.clone(),
+                kind: FindingKind::Note,
+                message: format!("dir_brute hit {} {} -> {} ({} bytes)", r.method, r.path, r.status, r.len),
+                data: Some(serde_json::json!({
+                    "url": r.path,
+                    "method": r.method,
+                    "status": r.status,
+                    "size": r.len,
+                })),
+            });
+        }
+    }
     if !final_results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
         let sort_choice = cfg_prompt_default("sort_by", "Sort by (1) Status or (2) Size", "1").await?;
         
@@ -494,7 +493,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         crate::mprintln!("Results saved to {}", filename.green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn get_methods_for_mode(mode: u8) -> Vec<Method> {
@@ -541,3 +540,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "dir_brute", native);

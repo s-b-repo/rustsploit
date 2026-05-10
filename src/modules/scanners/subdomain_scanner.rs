@@ -5,15 +5,16 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context, anyhow};
+use anyhow::{ Result, Context, anyhow };
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{ AtomicU64, Ordering };
 use tokio::sync::Semaphore;
-use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{ cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range };
+use crate::module_info::{ ModuleInfo, ModuleRank };
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -85,10 +86,8 @@ async fn resolve_subdomain(fqdn: &str, timeout_dur: Duration) -> Option<Vec<Stri
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if crate::utils::is_mass_scan_target(target) {
-        anyhow::bail!("subdomain_scanner does not support mass-scan targets — it brute-forces DNS subdomains, target must be a registrable domain like example.com");
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
     display_banner();
 
     // Clean domain: strip protocol, paths, ports
@@ -232,12 +231,11 @@ pub async fn run(target: &str) -> Result<()> {
                 let fqdn = format!("{}.{}", sub, domain);
 
                 if let Some(ips) = resolve_subdomain(&fqdn, timeout_dur).await {
-                    if let Some(ref wildcard_ips) = wf {
-                        if ips == *wildcard_ips {
+                    if let Some(ref wildcard_ips) = wf
+                        && ips == *wildcard_ips {
                             tested.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
-                    }
                     crate::mprintln!("{}", format!("[+] {} -> {}", fqdn, ips.join(", ")).green());
                     found.fetch_add(1, Ordering::Relaxed);
                     crate::events::emit(crate::events::ModuleEvent::HostUp {
@@ -247,7 +245,7 @@ pub async fn run(target: &str) -> Result<()> {
                 }
 
                 let done = tested.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 50 == 0 {
+                if done.is_multiple_of(50) {
                     crate::mprint!("\r{} {} tested, {} found    ",
                         "[Progress]".cyan(),
                         done,
@@ -341,5 +339,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "subdomain_scanner", native);

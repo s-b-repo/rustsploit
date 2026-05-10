@@ -5,7 +5,7 @@
 //! enforced (`p=quarantine` / `p=reject`). Missing or non-enforcing DMARC
 //! is a common finding because it lets attackers spoof email From headers.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::*;
 use std::net::{IpAddr, SocketAddr};
 use tokio::time::{timeout, Duration};
@@ -15,6 +15,7 @@ use hickory_proto::rr::{DNSClass, Name, RecordType};
 use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::udp::UdpClientStream;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 use crate::utils::cfg_prompt_default;
 
@@ -60,7 +61,11 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = match ctx.target.as_single() {
+        Some(t) => t,
+        None => return CheckResult::Error("dmarc_check requires a single-host target".to_string()),
+    };
     let domain = registrable_domain(&sanitize_host(target));
     match lookup_dmarc(&domain, "1.1.1.1").await {
         Ok(Some(rec)) => {
@@ -84,7 +89,11 @@ pub async fn check(target: &str) -> CheckResult {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("dmarc_check requires a single-host target")?;
     display_banner();
 
     let host = sanitize_host(target);
@@ -96,6 +105,9 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("{}", format!("[*] Domain: {}", domain).cyan());
     crate::mprintln!("{}", format!("[*] Resolver: {}", resolver).cyan());
 
+    let mut outcome = ModuleOutcome::ok();
+    ctx.rate_limit(&domain).await;
+
     match lookup_dmarc(&domain, resolver).await {
         Ok(Some(rec)) => {
             let lower = rec.to_ascii_lowercase();
@@ -106,11 +118,11 @@ pub async fn run(target: &str) -> Result<()> {
                         .yellow()
                         .bold()
                 );
-                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                    host: domain.clone(),
-                    port: 53,
-                    service: "dmarc-monitor-only".to_string(),
-                    version: Some(rec),
+                outcome.findings.push(Finding {
+                    target: domain.clone(),
+                    kind: FindingKind::Vulnerable,
+                    message: format!("DMARC p=none for {domain} (monitoring only): {rec}"),
+                    data: None,
                 });
             } else if lower.contains("p=quarantine") || lower.contains("p=reject") {
                 crate::mprintln!(
@@ -122,6 +134,12 @@ pub async fn run(target: &str) -> Result<()> {
                     "{}",
                     format!("[?] DMARC record found but policy unclear: {}", rec).yellow()
                 );
+                outcome.findings.push(Finding {
+                    target: domain.clone(),
+                    kind: FindingKind::Note,
+                    message: format!("DMARC record present but policy unclear for {domain}: {rec}"),
+                    data: None,
+                });
             }
         }
         Ok(None) => {
@@ -134,18 +152,19 @@ pub async fn run(target: &str) -> Result<()> {
                 .red()
                 .bold()
             );
-            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                host: domain.clone(),
-                port: 53,
-                service: "dmarc-missing".to_string(),
-                version: None,
+            outcome.findings.push(Finding {
+                target: domain.clone(),
+                kind: FindingKind::Vulnerable,
+                message: format!("No DMARC record at _dmarc.{domain} — open to email spoofing"),
+                data: None,
             });
         }
         Err(e) => {
             crate::meprintln!("{}", format!("[!] DMARC lookup failed: {}", e).red());
+            outcome.success = false;
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 async fn lookup_dmarc(domain: &str, resolver: &str) -> Result<Option<String>> {
@@ -190,3 +209,5 @@ fn registrable_domain(host: &str) -> String {
         host.to_string()
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "dmarc_check", native, has_check);

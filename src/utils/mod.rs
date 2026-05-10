@@ -3,13 +3,17 @@
 // Re-export hub — all existing `use crate::utils::*` imports continue to work.
 
 pub mod bruteforce;
+pub mod creds_helper;
+pub mod exploit_helper;
 pub mod modules;
 pub mod network;
+pub mod parallel;
 pub mod privilege;
 pub mod prompt;
 pub mod safe_io;
 pub mod sanitize;
 pub mod target;
+pub mod throttle;
 pub mod wordlist;
 
 use colored::*;
@@ -89,12 +93,7 @@ pub use target::{
 };
 
 // --- safe_io.rs ---
-#[allow(unused_imports)]
-pub use safe_io::{
-    read_async_capped,
-    read_http_body_capped,
-    DEFAULT_BODY_CAP,
-};
+pub use safe_io::read_http_body_capped;
 
 // --- network.rs ---
 pub use network::blocking_tcp_connect;
@@ -129,11 +128,11 @@ pub use modules::{
 };
 
 // --- bruteforce.rs (migrated from modules/creds/utils.rs) ---
+// `run_mass_scan` and `MassScanConfig` were removed in v0.5.1 — universal
+// mass-scan fan-out is handled by `crate::scheduler::run` for every module.
 pub use bruteforce::{
     backoff_delay,
     BruteforceConfig,
-    BruteforceResult,
-    ComboMode,
     EXCLUDED_RANGES,
     generate_combos_mode,
     generate_random_public_ip,
@@ -141,13 +140,10 @@ pub use bruteforce::{
     is_subnet_target,
     load_credential_file,
     LoginResult,
-    MassScanConfig,
     parse_combo_mode,
-    parse_exclusions,
     parse_subnet,
     run_bruteforce,
     run_bruteforce_streaming,
-    run_mass_scan,
     run_subnet_bruteforce,
     subnet_host_count,
     SubnetScanConfig,
