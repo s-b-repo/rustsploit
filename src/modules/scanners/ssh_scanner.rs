@@ -6,6 +6,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{anyhow, Result};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::{
     collections::HashSet,
@@ -26,7 +27,6 @@ use tokio::{
     time::sleep,
 };
 use ipnetwork::IpNetwork;
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
@@ -179,8 +179,8 @@ fn parse_targets(spec: &str, port: u16) -> Vec<(String, u16)> {
         }
         
         // Try CIDR
-        if s.contains('/') {
-            if let Ok(network) = s.parse::<IpNetwork>() {
+        if s.contains('/')
+            && let Ok(network) = s.parse::<IpNetwork>() {
                 const MAX_CIDR_HOSTS: usize = 65536;
                 let host_count: u128 = match network.size() {
                     ipnetwork::NetworkSize::V4(n) => n as u128,
@@ -195,22 +195,19 @@ fn parse_targets(spec: &str, port: u16) -> Vec<(String, u16)> {
                 }
                 continue;
             }
-        }
         
         // Try IP range (e.g., 192.168.1.1-254)
         if s.contains('-') && s.contains('.') {
             let parts: Vec<&str> = s.rsplitn(2, '.').collect();
-            if parts.len() == 2 {
-                if let Some((start_str, end_str)) = parts[0].split_once('-') {
-                    if let (Ok(start), Ok(end)) = (start_str.parse::<u8>(), end_str.parse::<u8>()) {
+            if parts.len() == 2
+                && let Some((start_str, end_str)) = parts[0].split_once('-')
+                    && let (Ok(start), Ok(end)) = (start_str.parse::<u8>(), end_str.parse::<u8>()) {
                         let base = parts[1];
                         for i in start..=end {
                             targets.push((format!("{}.{}", base, i), port));
                         }
                         continue;
                     }
-                }
-            }
         }
         
         // Single IP/hostname
@@ -234,12 +231,11 @@ fn load_targets_from_file(path: &str, port: u16) -> Result<Vec<(String, u16)>> {
         }
         
         // Check for port override (host:port)
-        if let Some((host, port_str)) = line.rsplit_once(':') {
-            if let Ok(p) = port_str.parse::<u16>() {
+        if let Some((host, port_str)) = line.rsplit_once(':')
+            && let Ok(p) = port_str.parse::<u16>() {
                 targets.push((host.to_string(), p));
                 continue;
             }
-        }
         
         targets.push((line.to_string(), port));
     }
@@ -357,25 +353,8 @@ fn save_results(results: &[SshScanResult], path: &str) -> Result<()> {
 }
 
 /// Main entry point
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SSH-Scanner",
-            default_port: 22,
-            state_file: "ssh_scanner_mass_state.log",
-            default_output: "ssh_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} SSH-Scanner open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
     display_banner();
 
@@ -451,7 +430,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!();
     crate::mprintln!("{}", format!("[*] SSH scanner complete. Found {} services.", results.len()).green());
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -465,3 +444,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
+
+crate::register_native_module!(crate::module::Category::Scanners, "ssh_scanner", native);

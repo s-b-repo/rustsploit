@@ -20,16 +20,18 @@
 //!
 //! FOR AUTHORIZED TESTING ONLY.
 
-use anyhow::{anyhow, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 use tokio::net::TcpStream;
 
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no,
-    is_mass_scan_target, run_mass_scan, MassScanConfig,
+    cfg_prompt_default,
+    cfg_prompt_int_range,
+    cfg_prompt_yes_no,
 };
 
 const DEFAULT_PORTS: &[u16] = &[5120, 5123, 5124, 5126, 5127];
@@ -66,7 +68,11 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = match ctx.target.as_single() {
+        Some(t) => t,
+        None => return CheckResult::Error("iusb_virtualmedia_probe requires a single-host target".to_string()),
+    };
     let host = sanitize_host(target);
     for &port in DEFAULT_PORTS {
         if probe_one(&host, port, false).await.unwrap_or(false) {
@@ -79,28 +85,16 @@ pub async fn check(target: &str) -> CheckResult {
     CheckResult::NotVulnerable("No IUSB-speaking port among the default set".into())
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "IUSB Virtual-Media",
-            default_port: 5124,
-            state_file: "iusb_virtualmedia_mass_state.log",
-            default_output: "iusb_virtualmedia_mass_results.txt",
-            default_concurrency: 200,
-        }, |ip, port| async move {
-            let host = ip.to_string();
-            if probe_one(&host, port, false).await.unwrap_or(false) {
-                Some(format!("{}:{} IUSB plaintext\n", host, port))
-            } else if probe_one(&host, port, true).await.unwrap_or(false) {
-                Some(format!("{}:{} IUSB TLS\n", host, port))
-            } else {
-                None
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("iusb_virtualmedia_probe requires a single-host target")?;
 
     display_banner();
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
+
+    let mut outcome = ModuleOutcome::ok();
 
     let port_input = cfg_prompt_default(
         "ports",
@@ -122,18 +116,32 @@ pub async fn run(target: &str) -> Result<()> {
 
     for port in ports {
         crate::mprint!("{}", format!("[*] {}:{} ", host, port).cyan());
+        ctx.rate_limit(&host).await;
         match probe_one_with_timeout(&host, port, false, timeout_ms).await {
             Ok(true) => {
                 hits += 1;
                 crate::mprintln!("{}", "→ IUSB (plaintext) ✓".green().bold());
+                outcome.findings.push(Finding {
+                    target: host.clone(),
+                    kind: FindingKind::Vulnerable,
+                    message: format!("IUSB virtual-media reachable at {}:{} (plaintext)", host, port),
+                    data: Some(serde_json::json!({"host": host, "port": port, "transport": "plaintext"})),
+                });
                 continue;
             }
             Ok(false) => {
                 if try_tls {
+                    ctx.rate_limit(&host).await;
                     match probe_one_with_timeout(&host, port, true, timeout_ms).await {
                         Ok(true) => {
                             hits += 1;
                             crate::mprintln!("{}", "→ IUSB (TLS) ✓".green().bold());
+                            outcome.findings.push(Finding {
+                                target: host.clone(),
+                                kind: FindingKind::Vulnerable,
+                                message: format!("IUSB virtual-media reachable at {}:{} (TLS)", host, port),
+                                data: Some(serde_json::json!({"host": host, "port": port, "transport": "tls"})),
+                            });
                         }
                         Ok(false) => crate::mprintln!("{}", "→ no IUSB reply".dimmed()),
                         Err(e) => crate::mprintln!("{}", format!("→ TLS error: {}", e).dimmed()),
@@ -154,7 +162,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "[*] No IUSB-speaking ports detected.".cyan());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 async fn probe_one(host: &str, port: u16, tls: bool) -> Result<bool> {
@@ -231,3 +239,5 @@ fn sanitize_host(target: &str) -> String {
     if let Some(colon) = t.find(':') { t.truncate(colon); }
     t
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "iusb_virtualmedia_probe", native, has_check);

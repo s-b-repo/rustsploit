@@ -5,14 +5,14 @@
 //!
 //! FOR AUTHORIZED SECURITY TESTING ONLY.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use std::net::IpAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::cfg_prompt_default;
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_PORTS: &str = "8080,3128,1080,8888,9050,80,3129,8118";
 const CONNECT_HOST: &str = "httpbin.org";
@@ -140,45 +140,16 @@ fn display_banner() {
     crate::mprintln!();
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    // --- Mass scan ---
-    if is_mass_scan_target(target) {
-        let ports_input = cfg_prompt_default("ports", "Ports to scan", DEFAULT_PORTS).await?;
-        let ports = parse_ports(&ports_input);
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "ProxyScan",
-            default_port: 8080,
-            state_file: "proxy_scan_mass_state.log",
-            default_output: "proxy_scan_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip: IpAddr, _port: u16| {
-            let ports = ports.clone();
-            async move {
-                if crate::context::is_cancelled() { return None; }
-                let dur = Duration::from_secs(5);
-                let mut lines = Vec::new();
-                for &p in &ports {
-                    if crate::context::is_cancelled() { break; }
-                    let hits = probe_port(ip, p, dur).await;
-                    for h in hits {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        lines.push(format!("[{}] {}:{} {} ({})", ts, ip, h.port, h.kind, h.detail));
-                        crate::mprintln!("\r{}", format!("[+] {}:{} {} — {}", ip, h.port, h.kind, h.detail).green().bold());
-                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                            host: ip.to_string(),
-                            port: h.port,
-                            service: format!("proxy:{}", h.kind),
-                            version: Some(h.detail.clone()),
-                        });
-                    }
-                }
-                if lines.is_empty() { None } else { Some(lines.join("\n") + "\n") }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("proxy_scanner requires a single-host target")?;
 
     // --- Single target ---
     display_banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     let ports_input = cfg_prompt_default("ports", "Ports to scan", DEFAULT_PORTS).await?;
     let ports = parse_ports(&ports_input);
@@ -197,21 +168,27 @@ pub async fn run(target: &str) -> Result<()> {
     let mut found = Vec::new();
 
     for &port in &ports {
-        if crate::context::is_cancelled() { break; }
+        if ctx.is_cancelled() { break; }
         if verbose {
             crate::mprintln!("[*] Probing {}:{}...", ip, port);
         }
+        ctx.rate_limit(target).await;
         let hits = probe_port(ip, port, dur).await;
         if hits.is_empty() && verbose {
             crate::mprintln!("  {}", format!("[-] {}:{} — no proxy detected", ip, port).dimmed());
         }
         for h in &hits {
             crate::mprintln!("  {}", format!("[+] {}:{} — {} ({})", ip, h.port, h.kind, h.detail).green().bold());
-            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                host: ip.to_string(),
-                port: h.port,
-                service: format!("proxy:{}", h.kind),
-                version: Some(h.detail.clone()),
+            outcome.findings.push(Finding {
+                target: ip.to_string(),
+                kind: FindingKind::Vulnerable,
+                message: format!("Open proxy {}:{} ({}) — {}", ip, h.port, h.kind, h.detail),
+                data: Some(serde_json::json!({
+                    "host": ip.to_string(),
+                    "port": h.port,
+                    "kind": h.kind,
+                    "detail": h.detail,
+                })),
             });
         }
         found.extend(hits);
@@ -232,7 +209,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
         crate::mprintln!();
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn parse_ports(input: &str) -> Vec<u16> {
@@ -252,3 +229,5 @@ fn resolve_target(target: &str) -> Result<IpAddr> {
             .ok_or_else(|| anyhow!("No addresses for {}", target))
     })
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "proxy_scanner", native);

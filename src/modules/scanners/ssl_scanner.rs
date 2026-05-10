@@ -7,12 +7,12 @@
 //! For authorized penetration testing only.
 
 use anyhow::{anyhow, Context, Result};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port,
     cfg_prompt_yes_no,
@@ -597,11 +597,10 @@ async fn scan_target(
     if let Some(ref ci) = cert_info {
         if ci.is_expired() {
             issues.push("EXPIRED certificate".to_string());
-        } else if ci.is_expiring_soon() {
-            if let Some(days) = ci.days_until_expiry() {
+        } else if ci.is_expiring_soon()
+            && let Some(days) = ci.days_until_expiry() {
                 issues.push(format!("Certificate expires in {} days", days));
             }
-        }
         if ci.is_self_signed {
             issues.push("Self-signed certificate".to_string());
         }
@@ -851,53 +850,8 @@ fn format_result_for_file(result: &SslScanResult) -> String {
 // Entry point
 // ============================================================
 
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan mode
-    if is_mass_scan_target(target) {
-        return run_mass_scan(
-            target,
-            MassScanConfig {
-                protocol_name: "SSL-Scanner",
-                default_port: 443,
-                state_file: "ssl_scanner_mass_state.log",
-                default_output: "ssl_scanner_mass_results.txt",
-                default_concurrency: 200,
-            },
-            move |ip, port| async move {
-                // Quick probe: connect, grab cert subject and expiry
-                let host = ip.to_string();
-                match scan_target(&host, port, 5).await {
-                    Ok(result) => {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let summary = if let Some(ref ci) = result.cert_info {
-                            let mut parts = vec![format!("CN={}", ci.subject_cn())];
-                            if ci.is_expired() {
-                                parts.push("EXPIRED".to_string());
-                            }
-                            if ci.is_self_signed {
-                                parts.push("self-signed".to_string());
-                            }
-                            if let Some(na) = ci.not_after {
-                                parts.push(format!(
-                                    "expires={}",
-                                    na.format("%Y-%m-%d")
-                                ));
-                            }
-                            parts.join(" | ")
-                        } else {
-                            "TLS open (cert parse failed)".to_string()
-                        };
-                        Some(format!(
-                            "[{}] {}:{} {} | {}\n",
-                            ts, ip, port, result.tls_version, summary
-                        ))
-                    }
-                    Err(_) => None,
-                }
-            },
-        )
-        .await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
     display_banner();
 
@@ -1059,5 +1013,7 @@ pub async fn run(target: &str) -> Result<()> {
         format!("[*] SSL/TLS scan complete. {} target(s) analyzed.", results.len()).green()
     );
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "ssl_scanner", native);

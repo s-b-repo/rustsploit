@@ -1,14 +1,15 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use colored::*;
 use std::time::Duration;
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
         name: "Sample Default Credential Checker".to_string(),
-        description: "Sample module that tests HTTP Basic Auth with default admin:admin credentials. Serves as a template for building custom credential checking modules.".to_string(),
+        description: "Sample module that tests HTTP Basic Auth with default admin:admin credentials. Serves as a template for building custom credential checking modules — uses the native ModuleCtx/ModuleOutcome shape so credential findings flow into LootStore.".to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,
@@ -25,35 +26,12 @@ fn display_banner() {
     crate::mprintln!();
 }
 
-/// A sample credential check - tries a basic auth login
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan mode: random IPs, CIDR subnets, or target file
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "HTTP Basic Auth",
-            default_port: 80,
-            state_file: "sample_cred_mass_state.log",
-            default_output: "sample_cred_mass_results.txt",
-            default_concurrency: 200,
-        }, |ip: std::net::IpAddr, port: u16| async move {
-            if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                return None;
-            }
-            let client = crate::utils::build_http_client(Duration::from_secs(5)).ok()?;
-            let url = format!("http://{}:{}/login", ip, port);
-            let resp = client.post(&url)
-                .basic_auth("admin", Some("admin"))
-                .send()
-                .await
-                .ok()?;
-            if resp.status().is_success() {
-                let msg = format!("{}:{}:admin:admin", ip, port);
-                crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                return Some(format!("{}\n", msg));
-            }
-            None
-        }).await;
-    }
+/// Sample credential check — tries an HTTP Basic Auth login with `admin:admin`.
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("sample_cred_check requires a single-host target")?;
 
     display_banner();
 
@@ -71,17 +49,33 @@ pub async fn run(target: &str) -> Result<()> {
         .await
         .context("Failed to send login request")?;
 
+    let mut outcome = ModuleOutcome::ok();
     if resp.status().is_success() {
         crate::mprintln!("{}", "[+] Default credentials admin:admin are valid!".green().bold());
-        // Persist discovered credential to the framework's credential store
+        // Persist discovered credential to the framework's credential store.
+        // The scheduler also routes the Finding below into LootStore.
         let _ = crate::cred_store::store_credential(
             target, 80, "http", "admin", "admin",
             crate::cred_store::CredType::Password,
             "creds/generic/sample_cred_check",
         ).await;
+        outcome.findings.push(Finding {
+            target: target.to_string(),
+            kind: FindingKind::Credential,
+            message: format!("HTTP basic auth admin:admin succeeded at {}", url),
+            data: Some(serde_json::json!({
+                "service": "http",
+                "port": 80,
+                "username": "admin",
+                "password": "admin",
+                "url": url,
+            })),
+        });
     } else {
         crate::mprintln!("{}", "[-] Default credentials admin:admin failed.".yellow());
     }
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/sample_cred_check", native);

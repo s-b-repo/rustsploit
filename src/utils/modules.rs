@@ -168,11 +168,10 @@ pub fn load_lines_cached<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<String>>> {
 
     {
         let cache = WORDLIST_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = cache.get(&canonical) {
-            if cached.len == len && cached.mtime == mtime {
+        if let Some(cached) = cache.get(&canonical)
+            && cached.len == len && cached.mtime == mtime {
                 return Ok(cached.lines.clone());
             }
-        }
     }
 
     // Cache miss — load fresh. Honour the same size cap as `load_lines`.

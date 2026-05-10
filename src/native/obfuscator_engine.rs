@@ -555,8 +555,8 @@ fn chunk_permute(input: &[u8], perm: &[usize]) -> Result<Vec<u8>> {
 }
 
 fn ensure_chunk_permutation(method: &mut Method, len: usize) {
-    if let Method::Chunk(perm) = method {
-        if perm.len() != len {
+    if let Method::Chunk(perm) = method
+        && perm.len() != len {
             let mut p: Vec<usize> = (0..len).collect();
             // Fisher-Yates over the index vector.
             let mut rng = rand::rng();
@@ -568,7 +568,6 @@ fn ensure_chunk_permutation(method: &mut Method, len: usize) {
             }
             *perm = p;
         }
-    }
 }
 
 /// Apply one round of the chain. `method` is `&mut` because `Chunk` populates
@@ -936,6 +935,10 @@ fn emit_python(blob: &[u8], chain: &[Method], original: &[u8]) -> String {
     out
 }
 
+// PY_HELPERS embeds the Python decoder for the zero-width-joiner obfuscation
+// method. The U+200B and U+200C characters in `_zw_dec` are the actual alphabet
+// the encoder uses; they have to be present literally for round-tripping.
+#[allow(clippy::invisible_characters)]
 const PY_HELPERS: &str = r#"
 def _xor(data, key):
     if not key: return data

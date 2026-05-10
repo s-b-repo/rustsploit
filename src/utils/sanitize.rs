@@ -59,11 +59,10 @@ pub fn validate_safe_file_path(path: &str) -> Result<String> {
     // consumer is still responsible for opening with O_NOFOLLOW (or the
     // platform equivalent) since the path could be replaced between this
     // check and any subsequent open() call.
-    if let Ok(m) = p.symlink_metadata() {
-        if m.file_type().is_symlink() {
+    if let Ok(m) = p.symlink_metadata()
+        && m.file_type().is_symlink() {
             return Err(anyhow!("Symlinks are not allowed: {}", trimmed));
         }
-    }
     Ok(trimmed.to_string())
 }
 
@@ -130,11 +129,10 @@ pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
     if trimmed.chars().any(|c| c.is_control()) {
         return Err(anyhow!("File path cannot contain control characters"));
     }
-    if !allow_absolute {
-        if trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':')) {
+    if !allow_absolute
+        && (trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':'))) {
             return Err(anyhow!("Absolute paths not allowed"));
         }
-    }
     if trimmed.contains('\x00') {
         return Err(anyhow!("File path cannot contain null bytes"));
     }

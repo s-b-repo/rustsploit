@@ -4,10 +4,11 @@ use std::fs::File;
 use std::io::Write;
 
 use std::time::{Duration, Instant};
+
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 fn display_banner() {
     if crate::utils::is_batch_mode() { return; }
@@ -18,43 +19,30 @@ fn display_banner() {
     crate::mprintln!();
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "Sample",
-            default_port: 80,
-            state_file: "sample_scanner_mass_state.log",
-            default_output: "sample_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} Sample open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("sample_scanner requires a single-host target")?;
 
     display_banner();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-    
+
     let timeout_secs = cfg_prompt_int_range("timeout", "Timeout in seconds", 10, 1, 120).await? as u64;
     let check_http = cfg_prompt_yes_no("check_http", "Check HTTP (port 80)?", true).await?;
     let check_https = cfg_prompt_yes_no("check_https", "Check HTTPS (port 443)?", true).await?;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
-    
+
     if !check_http && !check_https {
         return Err(anyhow!("At least one protocol must be selected"));
     }
     
     let client = crate::utils::build_http_client(Duration::from_secs(timeout_secs))?;
-    
+
     let mut results = Vec::new();
+    let mut outcome = ModuleOutcome::ok();
     let start = Instant::now();
     
     crate::mprintln!();
@@ -86,8 +74,14 @@ pub async fn run(target: &str) -> Result<()> {
                     .unwrap_or("unknown");
                 
                 if status.is_success() {
-                    crate::mprintln!("{}", format!("[+] HTTP {} -> {} (Server: {}, Content-Type: {})", 
+                    crate::mprintln!("{}", format!("[+] HTTP {} -> {} (Server: {}, Content-Type: {})",
                         url, status_str, server, content_type).green());
+                    outcome.findings.push(Finding {
+                        target: target.to_string(),
+                        kind: FindingKind::Banner,
+                        message: format!("HTTP {} {} server={} content-type={}", status_str, url, server, content_type),
+                        data: None,
+                    });
                 } else if status.is_redirection() {
                     let location = resp.headers()
                         .get("location")
@@ -97,7 +91,7 @@ pub async fn run(target: &str) -> Result<()> {
                 } else {
                     crate::mprintln!("{}", format!("[-] HTTP {} -> {}", url, status_str).red());
                 }
-                
+
                 results.push(format!("HTTP {} -> {} (Server: {})", url, status_str, server));
             }
             Err(e) => {
@@ -133,8 +127,14 @@ pub async fn run(target: &str) -> Result<()> {
                     .unwrap_or("unknown");
                 
                 if status.is_success() {
-                    crate::mprintln!("{}", format!("[+] HTTPS {} -> {} (Server: {}, Content-Type: {})", 
+                    crate::mprintln!("{}", format!("[+] HTTPS {} -> {} (Server: {}, Content-Type: {})",
                         url, status_str, server, content_type).green());
+                    outcome.findings.push(Finding {
+                        target: target.to_string(),
+                        kind: FindingKind::Banner,
+                        message: format!("HTTPS {} {} server={} content-type={}", status_str, url, server, content_type),
+                        data: None,
+                    });
                 } else if status.is_redirection() {
                     let location = resp.headers()
                         .get("location")
@@ -144,7 +144,7 @@ pub async fn run(target: &str) -> Result<()> {
                 } else {
                     crate::mprintln!("{}", format!("[-] HTTPS {} -> {}", url, status_str).red());
                 }
-                
+
                 results.push(format!("HTTPS {} -> {} (Server: {})", url, status_str, server));
             }
             Err(e) => {
@@ -180,7 +180,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", filename).green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -193,3 +193,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "sample_scanner", native);

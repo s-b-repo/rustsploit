@@ -203,15 +203,14 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
         }
     }
     // For "target" key, check the per-request RunContext target (API mode)
-    if key == "target" {
-        if let Some(val) = crate::config::get_run_target() {
+    if key == "target"
+        && let Some(val) = crate::config::get_run_target() {
             let sanitized = sanitize_string_input(&val)
                 .map_err(|e| anyhow!("Invalid run target: {}", e))?;
             if !sanitized.is_empty() {
                 return Ok(sanitized);
             }
         }
-    }
     // Check global options (setg)
     if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
@@ -354,8 +353,8 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
 /// Priority: custom_prompts > global_options > interactive stdin
 pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
     let config = crate::config::get_module_config();
-    if let Some(val) = config.custom_prompts.get(key) {
-        if !val.is_empty() {
+    if let Some(val) = config.custom_prompts.get(key)
+        && !val.is_empty() {
             let safe_path = validate_safe_file_path(val)
                 .map_err(|e| anyhow!("Invalid file path for '{}': {}", key, e))?;
             if Path::new(&safe_path).is_file() {
@@ -363,17 +362,15 @@ pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
             }
             return Err(anyhow!("File not found: {}", safe_path));
         }
-    }
     // Check global options (setg)
-    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
-        if !val.is_empty() {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await
+        && !val.is_empty() {
             let safe_path = validate_safe_file_path(&val)
                 .map_err(|e| anyhow!("Invalid global file path for '{}': {}", key, e))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }
         }
-    }
     if config.api_mode {
         return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply a valid file path in the 'prompts' field.", key, msg));
     }
@@ -417,13 +414,11 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
     // Check global options (setg)
     if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            if let Ok(n) = trimmed.parse::<i64>() {
-                if n >= min && n <= max {
+        if !trimmed.is_empty()
+            && let Ok(n) = trimmed.parse::<i64>()
+                && n >= min && n <= max {
                     return Ok(n);
                 }
-            }
-        }
     }
     if config.api_mode {
         return Ok(default);
@@ -460,8 +455,8 @@ pub async fn cfg_prompt_output_file(key: &str, msg: &str, default: &str) -> Resu
 /// Priority: custom_prompts > global_options > interactive stdin
 pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
     let config = crate::config::get_module_config();
-    if let Some(val) = config.custom_prompts.get(key) {
-        if !val.is_empty() {
+    if let Some(val) = config.custom_prompts.get(key)
+        && !val.is_empty() {
             let safe_path = validate_safe_file_path(val)
                 .map_err(|e| anyhow!("Invalid wordlist path for '{}': {}", key, e))?;
             if Path::new(&safe_path).is_file() {
@@ -469,17 +464,13 @@ pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
             }
             return Err(anyhow!("Wordlist file not found: '{}'", val));
         }
-    }
     // Check global options (setg)
-    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
-        if !val.is_empty() {
-            if let Ok(safe_path) = validate_safe_file_path(&val) {
-                if Path::new(&safe_path).is_file() {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await
+        && !val.is_empty()
+            && let Ok(safe_path) = validate_safe_file_path(&val)
+                && Path::new(&safe_path).is_file() {
                     return Ok(safe_path);
                 }
-            }
-        }
-    }
     if config.api_mode {
         return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
     }

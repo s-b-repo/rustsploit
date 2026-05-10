@@ -104,6 +104,14 @@ pub enum ModuleEvent {
     PqSessionEvicted {
         client_name: String,
     },
+    /// Generic structured finding emitted by a module run. Used by the
+    /// unified scheduler to surface results without losing them in stdout.
+    Finding {
+        module: String,
+        target: String,
+        kind: String,
+        message: String,
+    },
 }
 
 /// Envelope that carries a module event along with the tenant that produced it.

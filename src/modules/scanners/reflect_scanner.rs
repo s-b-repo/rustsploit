@@ -7,15 +7,15 @@
 //!
 //! FOR AUTHORIZED SECURITY TESTING ONLY.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use std::net::{IpAddr, SocketAddr};
 use tokio::time::{timeout, Duration};
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no,
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 // ============================================================================
 // MODULE INFO
@@ -185,24 +185,21 @@ async fn probe_host(
     let mut results = Vec::new();
     let dur = Duration::from_millis(timeout_ms);
 
-    if protocols.dns {
-        if let Some(r) = probe_single(ip, 53, &dns_probe(), dur, |buf, n, plen| check_dns(buf, n, plen)).await {
+    if protocols.dns
+        && let Some(r) = probe_single(ip, 53, &dns_probe(), dur, check_dns).await {
             results.push(r);
         }
-    }
-    if protocols.ntp {
-        if let Some(r) = probe_single(ip, 123, &NTP_MONLIST_PROBE, dur, |buf, n, _| check_ntp(buf, n)).await {
+    if protocols.ntp
+        && let Some(r) = probe_single(ip, 123, &NTP_MONLIST_PROBE, dur, |buf, n, _| check_ntp(buf, n)).await {
             results.push(r);
         }
-    }
-    if protocols.ssdp {
-        if let Some(r) = probe_single(ip, 1900, SSDP_MSEARCH_PROBE, dur, |buf, n, _| check_ssdp(buf, n)).await {
+    if protocols.ssdp
+        && let Some(r) = probe_single(ip, 1900, SSDP_MSEARCH_PROBE, dur, |buf, n, _| check_ssdp(buf, n)).await {
             results.push(r);
         }
-    }
     if protocols.memcached {
         let probe = memcached_probe();
-        if let Some(r) = probe_single(ip, 11211, &probe, dur, |buf, n, plen| check_memcached(buf, n, plen)).await {
+        if let Some(r) = probe_single(ip, 11211, &probe, dur, check_memcached).await {
             results.push(r);
         }
     }
@@ -269,54 +266,17 @@ fn display_banner() {
 // MAIN ENTRY POINT
 // ============================================================================
 
-pub async fn run(target: &str) -> Result<()> {
-    // --- Mass scan mode ---
-    if is_mass_scan_target(target) {
-        let protos_input = cfg_prompt_default(
-            "protocols", "Protocols to scan (dns,ntp,ssdp,memcached,all)", "all"
-        ).await?;
-        let protocols = parse_protocols(&protos_input);
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "Amplification",
-            default_port: 0, // unused — we scan each protocol's port
-            state_file: "amplification_mass_state.log",
-            default_output: "amplification_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip: IpAddr, _port: u16| {
-            let protos = protocols.clone();
-            async move {
-                if crate::context::is_cancelled() { return None; }
-                let results = probe_host(ip, &protos, 3000).await;
-                if results.is_empty() {
-                    return None;
-                }
-                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                let mut lines = Vec::new();
-                for r in &results {
-                    lines.push(format!(
-                        "[{}] {}:{} {} vulnerable ({}B response, {:.1}x amplification, {})",
-                        ts, ip, r.port, r.protocol, r.response_size, r.amplification, r.detail
-                    ));
-                    crate::mprintln!("\r{}", format!(
-                        "[+] {}:{} {} — {:.1}x amplification ({} bytes, {})",
-                        ip, r.port, r.protocol, r.amplification, r.response_size, r.detail
-                    ).green().bold());
-                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                        host: ip.to_string(),
-                        port: r.port,
-                        service: format!("amplifier:{}", r.protocol),
-                        version: Some(format!("{:.1}x amp, {} bytes", r.amplification, r.response_size)),
-                    });
-                }
-                Some(lines.join("\n") + "\n")
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("reflect_scanner requires a single-host target")?;
 
     // --- Single/multi-target mode ---
     let batch = crate::utils::is_batch_mode();
     display_banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     let protos_input = cfg_prompt_default(
         "protocols", "Protocols to scan (dns,ntp,ssdp,memcached,all)", "all"
@@ -356,7 +316,27 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!();
     }
 
+    ctx.rate_limit(target).await;
     let results = probe_host(ip, &protocols, timeout_ms).await;
+
+    for r in &results {
+        outcome.findings.push(Finding {
+            target: ip.to_string(),
+            kind: FindingKind::Vulnerable,
+            message: format!(
+                "{} amplification on {}:{} — {:.1}x ({} bytes, {})",
+                r.protocol, ip, r.port, r.amplification, r.response_size, r.detail
+            ),
+            data: Some(serde_json::json!({
+                "host": ip.to_string(),
+                "port": r.port,
+                "protocol": r.protocol,
+                "amplification": r.amplification,
+                "response_size": r.response_size,
+                "detail": r.detail,
+            })),
+        });
+    }
 
     if results.is_empty() {
         if !batch {
@@ -425,7 +405,7 @@ pub async fn run(target: &str) -> Result<()> {
     if !batch {
         crate::mprintln!();
     }
-    Ok(())
+    Ok(outcome)
 }
 
 // ============================================================================
@@ -454,3 +434,5 @@ fn probe_size(protocol: &str) -> usize {
         _ => 0,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "reflect_scanner", native);

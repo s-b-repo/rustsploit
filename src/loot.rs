@@ -255,11 +255,10 @@ impl LootStore {
             names
         };
         for fname in filenames {
-            if let Some(path) = self.file_path(&fname) {
-                if let Err(e) = tokio::fs::remove_file(&path).await {
+            if let Some(path) = self.file_path(&fname)
+                && let Err(e) = tokio::fs::remove_file(&path).await {
                     eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
                 }
-            }
         }
     }
 
@@ -344,6 +343,9 @@ pub static LOOT_STORE: Lazy<LootStore> = Lazy::new(LootStore::new);
 
 /// Convenience function for modules to store loot.
 /// Routes through the tenant registry when in a tenant context (API mode).
+/// Also emits a `ModuleEvent::LootStored` and a `Finding` so panel / MCP /
+/// WS subscribers see the discovery without each module having to call
+/// `events::emit` manually.
 pub async fn store_loot(
     host: &str,
     loot_type: &str,
@@ -352,5 +354,19 @@ pub async fn store_loot(
     source_module: &str,
 ) -> Option<String> {
     let s = crate::tenant::resolve();
-    s.loot_store().add(host, loot_type, description, data, source_module).await
+    let id = s.loot_store().add(host, loot_type, description, data, source_module).await;
+    if let Some(id_str) = id.as_deref() {
+        crate::events::emit(crate::events::ModuleEvent::LootStored {
+            id: id_str.to_string(),
+            host: host.to_string(),
+            kind: loot_type.to_string(),
+        });
+    }
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: source_module.to_string(),
+        target: host.to_string(),
+        kind: loot_type.to_string(),
+        message: description.to_string(),
+    });
+    id
 }

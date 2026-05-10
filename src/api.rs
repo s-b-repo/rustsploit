@@ -113,8 +113,8 @@ fn percent_decode_host(host: &str) -> String {
     let bytes = host.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
                 hex_val(bytes[i + 1]),
                 hex_val(bytes[i + 2]),
             ) {
@@ -122,7 +122,6 @@ fn percent_decode_host(host: &str) -> String {
                 i += 3;
                 continue;
             }
-        }
         result.push(bytes[i] as char);
         i += 1;
     }
@@ -483,11 +482,10 @@ async fn api_dispatcher(
         ("GET", "creds", None, _) => {
             merge_query!(params, query, ["host", "service", "search"]);
             merge_query_int!(params, query, ["limit", "offset"]);
-            if let Some(v) = query.get("reveal") {
-                if v == "1" || v.eq_ignore_ascii_case("true") {
+            if let Some(v) = query.get("reveal")
+                && (v == "1" || v.eq_ignore_ascii_case("true")) {
                     params.insert("reveal".to_string(), Value::Bool(true));
                 }
-            }
             "list_creds"
         }
         ("GET", "creds", Some("search"), _) => {
@@ -740,11 +738,10 @@ pub async fn start_api_server(
                 let store = cleanup_sessions.read().await;
                 let mut out = Vec::new();
                 for (id, sess_arc) in store.iter() {
-                    if let Ok(sess) = sess_arc.try_lock() {
-                        if sess.last_activity.elapsed() >= std::time::Duration::from_secs(3600) {
+                    if let Ok(sess) = sess_arc.try_lock()
+                        && sess.last_activity.elapsed() >= std::time::Duration::from_secs(3600) {
                             out.push(*id);
                         }
-                    }
                 }
                 out
             };

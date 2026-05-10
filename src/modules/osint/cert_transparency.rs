@@ -13,6 +13,7 @@ use colored::*;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 
 const CRT_SH_BASE: &str = "https://crt.sh";
@@ -39,118 +40,122 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(_target: &str) -> CheckResult {
+pub async fn check(_ctx: &ModuleCtx) -> CheckResult {
     // OSINT modules don't have a "vulnerable" state — they always run.
     CheckResult::Unknown("OSINT enumeration; no vulnerability check applicable".to_string())
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if crate::utils::is_mass_scan_target(target) {
-        anyhow::bail!("cert_transparency does not support mass-scan targets — it queries crt.sh by domain, target should be a registrable domain like example.com");
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("cert_transparency requires a single domain target")?;
     let domain = sanitize_domain(target)
-        .context("invalid target — expected a registrable domain like example.com")?;
+        .with_context(|| format!("invalid domain '{}'", target))?;
 
-    crate::mprintln!(
-        "{}",
-        format!("[*] crt.sh subdomain enumeration for {}", domain).cyan()
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!("{}", "=== Certificate Transparency Subdomain Enum ===".bold());
+        crate::mprintln!("[*] Querying crt.sh for {}", domain.cyan());
+    }
+
+    let url = format!(
+        "{}/?q={}&output=json",
+        CRT_SH_BASE,
+        urlencoding_encode(&domain)
     );
-
     let client = crate::utils::build_http_client(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-        .context("failed to build HTTP client")?;
-
-    let url = format!("{}/?q=%25.{}&output=json", CRT_SH_BASE, urlencoding_encode(&domain));
+        .context("failed to construct HTTP client")?;
     let resp = client
         .get(&url)
         .header("Accept", "application/json")
         .send()
         .await
-        .context("crt.sh request failed (network or service unavailable)")?;
-
+        .with_context(|| format!("crt.sh request to {} failed", url))?;
     if !resp.status().is_success() {
-        anyhow::bail!("crt.sh returned HTTP {}", resp.status());
+        anyhow::bail!("crt.sh returned status {}", resp.status());
     }
-
-    let body_bytes =
-        crate::utils::read_http_body_capped(resp, MAX_CRTSH_BODY)
-            .await
-            .context("failed to read crt.sh response body")?;
-    let entries: Vec<CrtEntry> =
-        serde_json::from_slice(&body_bytes).context("failed to parse crt.sh JSON response")?;
+    // Cap the response body to avoid OOM on popular domains (crt.sh
+    // commonly returns 5–50 MB JSON for high-traffic certs).
+    let body = crate::utils::read_http_body_capped(resp, MAX_CRTSH_BODY)
+        .await
+        .context("reading crt.sh response body")?;
+    let entries: Vec<CrtEntry> = serde_json::from_slice(&body)
+        .context("crt.sh response was not valid JSON")?;
 
     let mut subdomains: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
-        if crate::context::is_cancelled() {
-            crate::mprintln!("{}", "[!] Cancelled during result parsing".yellow());
-            return Ok(());
-        }
         for name in entry.all_names() {
-            if let Some(clean) = normalize_name(&name, &domain) {
-                subdomains.insert(clean);
+            if let Some(s) = normalize_name(&name, &domain) {
+                subdomains.insert(s);
             }
         }
     }
 
     if subdomains.is_empty() {
-        crate::mprintln!("{}", "[-] No subdomains found in CT logs".yellow());
-        return Ok(());
+        crate::mprintln!(
+            "{}",
+            format!("[-] No subdomains found for {} in CT logs.", domain).yellow()
+        );
+        return Ok(ModuleOutcome::ok());
     }
 
+    let mut outcome = ModuleOutcome::ok();
+    for sub in &subdomains {
+        outcome.findings.push(Finding {
+            target: domain.clone(),
+            kind: FindingKind::Note,
+            message: format!("CT log: subdomain {}", sub),
+            data: Some(serde_json::json!({
+                "vector": "crt.sh",
+                "subdomain": sub,
+                "parent_domain": domain,
+            })),
+        });
+    }
+
+    let total = subdomains.len();
     crate::mprintln!(
         "{}",
         format!(
-            "[+] Found {} unique subdomains across {} certificate records",
-            subdomains.len(),
-            entries.len()
+            "[+] {} unique subdomain{} discovered for {}:",
+            total,
+            if total == 1 { "" } else { "s" },
+            domain
         )
         .green()
+        .bold()
     );
 
-    for (i, sd) in subdomains.iter().enumerate() {
-        if i >= MAX_RESULTS_DISPLAYED {
+    // Cap on-screen output; the operator can re-run with `setg verbose y`
+    // to get the full set if needed.
+    let mut shown = 0usize;
+    for sub in &subdomains {
+        if shown >= MAX_RESULTS_DISPLAYED {
             crate::mprintln!(
                 "{}",
                 format!(
-                    "    ... and {} more (truncated; total {})",
-                    subdomains.len() - MAX_RESULTS_DISPLAYED,
-                    subdomains.len()
+                    "  ... ({} more, omitted from console; raise MAX_RESULTS_DISPLAYED to see all)",
+                    total - shown
                 )
                 .dimmed()
             );
             break;
         }
-        crate::mprintln!("    {}", sd);
+        crate::mprintln!("  {}", sub);
+        shown += 1;
     }
 
-    // Persist as a loot entry so the workspace tracks the finding.
-    let summary = subdomains.iter().cloned().collect::<Vec<_>>().join("\n");
-    let description = format!(
-        "crt.sh certificate-transparency subdomains for {} ({} entries)",
-        domain,
-        subdomains.len()
-    );
-    let loot_id = crate::loot::store_loot(
-        &domain,
-        "subdomain-list",
-        &description,
-        summary.as_bytes(),
-        "osint/cert_transparency",
-    )
-    .await;
-
-    // Structured event for API/MCP/WS subscribers (no-op when no subscribers).
-    if let Some(id) = loot_id {
-        crate::events::emit(crate::events::ModuleEvent::LootStored {
-            id,
-            host: domain.clone(),
-            kind: "subdomain-list".to_string(),
-        });
-    }
-    for sd in &subdomains {
-        crate::events::emit(crate::events::ModuleEvent::HostUp { host: sd.clone() });
+    // Auto-populate workspace with the discovered names so downstream
+    // resolvers and crawlers pick them up without operator effort.
+    // (The Finding records above also flow through `route_findings` →
+    // workspace::add_note for kind=Note, so this is intentional double-write
+    // to preserve the existing operator-visible note format. Will be
+    // collapsed once the route handles structured `data:` payloads.)
+    for sub in &subdomains {
+        crate::workspace::add_note(&domain, &format!("[cert_transparency] subdomain: {}", sub)).await;
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 // ----------------------------------------------------------------------------
@@ -224,3 +229,5 @@ fn normalize_name(raw: &str, domain: &str) -> Option<String> {
 fn urlencoding_encode(s: &str) -> String {
     crate::utils::url_encode(s)
 }
+
+crate::register_native_module!(crate::module::Category::Osint, "cert_transparency", native, has_check);

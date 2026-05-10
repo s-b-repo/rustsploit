@@ -81,8 +81,8 @@ pub fn normalize_target(raw: &str) -> Result<String> {
     }
 
     // Try to parse as URL first
-    if let Ok(url) = Url::parse(trimmed) {
-        if let Some(host) = url.host_str() {
+    if let Ok(url) = Url::parse(trimmed)
+        && let Some(host) = url.host_str() {
             let port = url.port().unwrap_or(0);
             let normalized = if port > 0 {
                 format!("{}:{}", host, port)
@@ -91,7 +91,6 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             };
             return normalize_target(&normalized);
         }
-    }
 
     // Basic sanitization
     let sanitized: String = trimmed
@@ -198,8 +197,8 @@ pub fn normalize_target(raw: &str) -> Result<String> {
     }
 
     // IPv4 or hostname with port
-    if sanitized.contains(':') {
-        if let Some(colon_pos) = sanitized.rfind(':') {
+    if sanitized.contains(':')
+        && let Some(colon_pos) = sanitized.rfind(':') {
             let host_part = &sanitized[..colon_pos];
             let port_str = &sanitized[colon_pos + 1..];
             if port_str.is_empty() {
@@ -219,7 +218,6 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             }
             return Ok(format!("{}:{}", host_part, port));
         }
-    }
 
     // No port
     if sanitized.contains(' ') {

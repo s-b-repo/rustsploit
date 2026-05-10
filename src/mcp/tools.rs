@@ -679,17 +679,15 @@ async fn handle_add_host(args: &Value) -> ToolResult {
         return ToolResult::error("IP too long (max 256) or contains control characters".into());
     }
     let hostname = str_param(args, "hostname");
-    if let Some(h) = hostname {
-        if h.len() > 256 || h.chars().any(|c| c.is_control()) {
+    if let Some(h) = hostname
+        && (h.len() > 256 || h.chars().any(|c| c.is_control())) {
             return ToolResult::error("hostname too long (max 256) or contains control characters".into());
         }
-    }
     let os_guess = str_param(args, "os_guess");
-    if let Some(o) = os_guess {
-        if o.len() > 256 || o.chars().any(|c| c.is_control()) {
+    if let Some(o) = os_guess
+        && (o.len() > 256 || o.chars().any(|c| c.is_control())) {
             return ToolResult::error("os_guess too long (max 256) or contains control characters".into());
         }
-    }
     crate::workspace::WORKSPACE
         .add_host(ip, hostname, os_guess)
         .await;

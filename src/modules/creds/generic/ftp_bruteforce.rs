@@ -1,23 +1,35 @@
-use anyhow::{anyhow, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
-use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
+use suppaftp::tokio::{ AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream };
 use suppaftp::async_native_tls::TlsConnector;
 use std::{
     net::IpAddr,
     time::Duration,
 };
-use tokio::time::{sleep, timeout};
+use tokio::time::{ sleep, timeout };
 
+use crate::module::{ ModuleCtx, ModuleOutcome };
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_port, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_yes_no, cfg_prompt_output_file, load_lines, load_lines_uncapped, file_size,
+    cfg_prompt_default,
+    cfg_prompt_port,
+    cfg_prompt_existing_file,
+    cfg_prompt_int_range,
+    cfg_prompt_yes_no,
+    cfg_prompt_output_file,
+    load_lines,
+    load_lines_uncapped,
+    file_size,
     STREAMING_THRESHOLD,
 };
 use crate::utils::{
-    BruteforceConfig, LoginResult, SubnetScanConfig,
-    parse_combo_mode, load_credential_file,
-    run_bruteforce_streaming, run_subnet_bruteforce,
-    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+    BruteforceConfig,
+    LoginResult,
+    SubnetScanConfig,
+    parse_combo_mode,
+    load_credential_file,
+    run_bruteforce_streaming,
+    run_subnet_bruteforce,
+    is_subnet_target,
 };
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -108,59 +120,12 @@ fn format_addr(target: &str, port: u16) -> String {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("ftp_bruteforce requires a single-host target")?;
     display_banner();
-
-    // --- Mass Scan Mode ---
-    if is_mass_scan_target(target) {
-        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-
-        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = load_lines(&usernames_file)?;
-        let pass_lines = load_lines(&passwords_file)?;
-        if users.is_empty() { return Err(anyhow!("User list empty")); }
-        if pass_lines.is_empty() { return Err(anyhow!("Pass list empty")); }
-        let users = std::sync::Arc::new(users);
-        let pass_lines = std::sync::Arc::new(pass_lines);
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "FTP Bruteforce",
-            default_port: 21,
-            state_file: "ftp_brute_hose_state.log",
-            default_output: "ftp_brute_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip: IpAddr, port: u16| {
-            let users = users.clone();
-            let pass_lines = pass_lines.clone();
-            async move {
-                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    return None;
-                }
-                let addr_str = format!("{}:{}", ip, port);
-                for user in users.iter() {
-                    for pass in pass_lines.iter() {
-                        match try_ftp_login(&addr_str, &ip.to_string(), user, pass, false).await {
-                            Ok(true) => {
-                                let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
-                                crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                                return Some(format!("{}\n", msg));
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                let err = e.to_string().to_lowercase();
-                                if err.contains("refused") || err.contains("timeout") || err.contains("reset") {
-                                    return None;
-                                }
-                            }
-                        }
-                    }
-                }
-                None
-            }
-        }).await;
-    }
 
     // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
@@ -178,7 +143,7 @@ pub async fn run(target: &str) -> Result<()> {
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output result file", "ftp_subnet_results.txt").await?;
 
-        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -186,6 +151,7 @@ pub async fn run(target: &str) -> Result<()> {
             jitter_ms: 50,
             source_module: "creds/generic/ftp_credcheck",
             skip_tcp_check: false,
+            state_file: None,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             async move {
                 let addr = format!("{}:{}", ip, port);
@@ -198,7 +164,8 @@ pub async fn run(target: &str) -> Result<()> {
                     }
                 }
             }
-        }).await;
+        }).await?;
+        return Ok(ModuleOutcome::ok());
     }
 
     // --- Single Target Mode ---
@@ -221,7 +188,7 @@ pub async fn run(target: &str) -> Result<()> {
     let users = load_lines(&usernames_file)?;
     if users.is_empty() {
         crate::mprintln!("[!] Username wordlist is empty or invalid. Exiting.");
-        return Ok(());
+        return Ok(ModuleOutcome::ok());
     }
     crate::mprintln!("{}", format!("[*] Loaded {} usernames", users.len()).cyan());
 
@@ -232,7 +199,7 @@ pub async fn run(target: &str) -> Result<()> {
         let p = load_lines_uncapped(&passwords_file)?;
         if p.is_empty() {
             crate::mprintln!("[!] Password wordlist is empty or invalid. Exiting.");
-            return Ok(());
+            return Ok(ModuleOutcome::ok());
         }
         crate::mprintln!("{}", format!("[*] Loaded {} passwords", p.len()).cyan());
         p
@@ -249,10 +216,15 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Capture verbose in the closure for try_ftp_login
     let target_owned = target.to_string();
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
     let try_login = move |t: String, p: u16, user: String, pass: String| {
         let addr = format_addr(&t, p);
         let verbose_flag = verbose;
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
         async move {
+            limiter.acquire(&module_path, &t).await;
             match try_ftp_login(&addr, &t, &user, &pass, verbose_flag).await {
                 Ok(true) => LoginResult::Success,
                 Ok(false) => LoginResult::AuthFailed,
@@ -285,7 +257,7 @@ pub async fn run(target: &str) -> Result<()> {
         result.save_to_file(&path)?;
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 /// Try FTP login with FTPS fallback when TLS is required.
@@ -355,3 +327,5 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose
         }
     }
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/ftp_bruteforce", native);

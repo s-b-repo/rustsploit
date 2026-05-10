@@ -339,7 +339,6 @@ pub fn make_dst_sockaddr(ip: Ipv4Addr) -> libc::sockaddr_in {
 /// variant, `sin6_port` is left zero — for raw sockets the L4 port lives
 /// in the user-built packet, not the sockaddr.
 #[inline]
-#[allow(dead_code)] // public helper for IPv6-aware DoS modules
 pub fn make_dst_sockaddr_v6(ip: Ipv6Addr, scope_id: u32) -> libc::sockaddr_in6 {
     // SAFETY: `sockaddr_in6` is a POSIX POD struct; same reasoning as the
     // IPv4 variant — we zero-initialise then populate the fields the kernel
@@ -357,7 +356,6 @@ pub fn make_dst_sockaddr_v6(ip: Ipv6Addr, scope_id: u32) -> libc::sockaddr_in6 {
 /// sockaddr variant + the `socklen_t` value the kernel expects for a given
 /// `sendto` call. Use with [`make_dst_sockaddr_any`] / [`send_one_raw_any`]
 /// when the module needs to support both IPv4 and IPv6 targets.
-#[allow(dead_code)] // public helper, used by family-agnostic modules
 pub enum DstAddr {
     V4(libc::sockaddr_in),
     V6(libc::sockaddr_in6),
@@ -368,7 +366,6 @@ impl DstAddr {
     /// the pointer to `&self`, so it's only valid for the duration of the
     /// borrow — which is exactly what `sendto` needs.
     #[inline]
-    #[allow(dead_code)]
     pub fn as_ptr_len(&self) -> (*const libc::sockaddr, libc::socklen_t) {
         match self {
             DstAddr::V4(a) => (
@@ -387,7 +384,6 @@ impl DstAddr {
 /// matters, build the `sockaddr_in6` directly with [`make_dst_sockaddr_v6`]
 /// and wrap with [`DstAddr::V6`] — this convenience uses `scope_id = 0`.
 #[inline]
-#[allow(dead_code)]
 pub fn make_dst_sockaddr_any(ip: IpAddr) -> DstAddr {
     match ip {
         IpAddr::V4(v4) => DstAddr::V4(make_dst_sockaddr(v4)),
@@ -432,7 +428,6 @@ pub fn send_one_raw(
 /// IPv6 counterpart of [`send_one_raw`]. Caller is responsible for the
 /// `fd` being an AF_INET6 raw socket.
 #[inline]
-#[allow(dead_code)]
 pub fn send_one_raw_v6(
     fd: i32,
     buf: &[u8],
@@ -459,29 +454,20 @@ pub fn send_one_raw_v6(
 /// Family-agnostic `sendto`. The right `socklen_t` is computed from the
 /// `DstAddr` variant — caller doesn't have to remember IPv4 vs IPv6 sizes.
 #[inline]
-#[allow(dead_code)]
 pub fn send_one_raw_any(
     fd: i32,
     buf: &[u8],
     dst: &DstAddr,
 ) -> std::io::Result<usize> {
-    let (ptr, len) = dst.as_ptr_len();
-    // SAFETY: same reasoning as `send_one_raw` but length comes from
-    // `DstAddr::as_ptr_len`, which returns the exact `socklen_t` the
-    // kernel expects for the wrapped sockaddr family.
-    let ret = unsafe {
-        libc::sendto(
-            fd,
-            buf.as_ptr() as *const libc::c_void,
-            buf.len(),
-            0,
-            ptr,
-            len,
-        )
-    };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(ret as usize)
+    debug_assert_eq!(
+        dst.as_ptr_len().1 as usize,
+        match dst {
+            DstAddr::V4(_) => std::mem::size_of::<libc::sockaddr_in>(),
+            DstAddr::V6(_) => std::mem::size_of::<libc::sockaddr_in6>(),
+        }
+    );
+    match dst {
+        DstAddr::V4(addr) => send_one_raw(fd, buf, addr),
+        DstAddr::V6(addr) => send_one_raw_v6(fd, buf, addr),
     }
 }

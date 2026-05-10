@@ -39,6 +39,17 @@ pub struct Cli {
     #[arg(long)]
     pub list_modules: bool,
 
+    /// Regenerate `docs/Module-Catalog.md` from the live module registry
+    /// and exit. Replaces hand-maintained module counts/lists.
+    #[arg(long)]
+    pub gen_module_catalog: bool,
+
+    /// List all on-disk scan checkpoints from `~/.rustsploit/checkpoints/`
+    /// and exit. CIDR / random / file fan-outs are checkpointed
+    /// automatically; rerunning the same `(module, target)` resumes.
+    #[arg(long)]
+    pub list_checkpoints: bool,
+
     /// Output format (text, json)
     #[arg(long, default_value = "text")]
     pub output_format: Option<String>,

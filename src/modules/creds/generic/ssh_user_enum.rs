@@ -5,9 +5,9 @@
 //!
 //! For authorized penetration testing only.
 
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_default, cfg_prompt_required, cfg_prompt_yes_no};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use ssh2::Session;
 use std::{
@@ -307,47 +307,12 @@ const DEFAULT_USERNAMES: &[&str] = &[
 ];
 
 /// Main entry point
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("ssh_user_enum requires a single-host target")?;
     display_banner();
-
-    // Mass scan mode: random IPs, target file, or CIDR subnet (all handled concurrently)
-    if is_mass_scan_target(target) {
-        return run_mass_scan(
-            target,
-            MassScanConfig {
-                protocol_name: "SSH User Enum",
-                default_port: 22,
-                state_file: "ssh_user_enum_mass_state.log",
-                default_output: "ssh_user_enum_mass_results.txt",
-                default_concurrency: 200,
-            },
-            |ip: std::net::IpAddr, port: u16| async move {
-                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(5)).await {
-                    return None;
-                }
-                // Quick timing test with a few default usernames
-                let host = ip.to_string();
-                let test_users = ["root", "admin", "ubuntu", "test", "user"];
-                let mut valid = Vec::new();
-                // Baseline with known-invalid user
-                let baseline = time_auth_attempt(&host, port, "xyznonexistent12345", 5)?;
-                for user in &test_users {
-                    if let Some(elapsed) = time_auth_attempt(&host, port, user, 5) {
-                        if (elapsed - baseline).abs() > 0.3 {
-                            valid.push(*user);
-                        }
-                    }
-                }
-                if !valid.is_empty() {
-                    let msg = format!("{}:{}:valid_users={}", ip, port, valid.join(","));
-                    crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                    return Some(format!("{}\n", msg));
-                }
-                None
-            },
-        )
-        .await;
-    }
 
     let host = normalize_target(target);
     crate::mprintln!("{}", format!("[*] Target: {}", host).cyan());
@@ -419,7 +384,21 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!();
 
     // Run enumeration
+    ctx.rate_limit(&host).await;
     let valid_users = enumerate_users(&host, port, &usernames, samples, timeout, threshold).await;
+    let mut outcome = ModuleOutcome::ok();
+    for user in &valid_users {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Note,
+            message: format!("Likely-valid SSH user '{}' on {}:{} (timing side-channel)", user, host, port),
+            data: Some(serde_json::json!({
+                "service": "ssh",
+                "port": port,
+                "username": user,
+            })),
+        });
+    }
 
     // Save results?
     if !valid_users.is_empty()
@@ -444,5 +423,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!();
     crate::mprintln!("{}", "[*] SSH user enumeration complete".green());
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/ssh_user_enum", native);

@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use telnet::{Telnet, Event};
 use crossbeam_channel::unbounded;
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
     cfg_prompt_int_range, cfg_prompt_existing_file, cfg_prompt_output_file,
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SMTP_PORT: u16 = 25;
@@ -126,25 +126,11 @@ struct SmtpUserEnumConfig {
 }
 
 /// Main entry point
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SMTP-Enum",
-            default_port: 25,
-            state_file: "smtp_user_enum_mass_state.log",
-            default_output: "smtp_user_enum_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} SMTP-Enum open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("smtp_user_enum requires a single-host target")?;
 
     display_banner();
     crate::mprintln!("{}", format!("[*] Initial target: {}", target).cyan());
@@ -216,11 +202,11 @@ pub async fn run(target: &str) -> Result<()> {
         timeout_ms,
         verbose,
     };
-    
-    run_smtp_user_enum(config).await
+
+    run_smtp_user_enum(ctx, config).await
 }
 
-async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
+async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Result<ModuleOutcome> {
     // Normalize and validate all targets
     let mut normalized_targets: Vec<(String, String)> = Vec::new();
     for raw in &config.targets {
@@ -244,6 +230,12 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         .with_context(|| format!("Failed to stat username wordlist: {}", config.username_wordlist))?;
     let size_bytes = metadata.len();
     let use_streaming = size_bytes > STREAMING_THRESHOLD_BYTES;
+
+    // Pace one rate-limit token per host per scan invocation. The hot loop
+    // sits behind a thread pool, so we record one acquire per target up front.
+    for (_raw, addr) in &normalized_targets {
+        ctx.rate_limit(addr).await;
+    }
 
     if !use_streaming {
         let usernames = read_lines(&config.username_wordlist)?;
@@ -335,17 +327,6 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
                                 .green()
                                 .bold()
                             );
-                            // Surface the discovered username on the structured
-                            // event bus. SMTP user-enum is a credential-adjacent
-                            // finding; map it to ServiceDetected with the user as
-                            // the version slot since CredentialFound expects a
-                            // confirmed login.
-                            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                                host: raw_target.to_string(),
-                                port: config.port,
-                                service: "smtp".to_string(),
-                                version: Some(format!("valid_user={}", username)),
-                            });
                             let mut users = found.lock().unwrap_or_else(|e| e.into_inner());
                             users.push((
                                 format!("{}@{}", username, raw_target),
@@ -402,7 +383,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
         let _ = progress_handle.join();
 
         // Final reporting including unknown responses
-        return finalize_and_report(found, unknown, stats).await;
+        return finalize_and_report(&config.targets.join(","), config.port, found, unknown, stats).await;
     }
 
     // Streaming mode for very large username lists
@@ -564,7 +545,7 @@ async fn run_smtp_user_enum(config: SmtpUserEnumConfig) -> Result<()> {
     let _ = progress_handle.join();
     
     // Final reporting including unknown responses
-    finalize_and_report(found, unknown, stats).await
+    finalize_and_report(&config.targets.join(","), config.port, found, unknown, stats).await
 }
 
 /// Verify a username using SMTP VRFY command
@@ -716,10 +697,13 @@ fn load_targets_from_file(path: &str) -> Result<Vec<String>> {
 }
 
 async fn finalize_and_report(
+    target: &str,
+    port: u16,
     found: Arc<Mutex<Vec<(String, String)>>>,
     unknown: Arc<Mutex<Vec<(String, String)>>>,
     stats: Arc<Statistics>,
-) -> Result<()> {
+) -> Result<ModuleOutcome> {
+    let mut outcome = ModuleOutcome::ok();
     // Print final statistics
     stats.print_final();
 
@@ -737,13 +721,24 @@ async fn finalize_and_report(
             );
             for (username, response) in found_guard.iter() {
                 crate::mprintln!("  {}  {} - {}", "✓".green(), username, response);
+                outcome.findings.push(Finding {
+                    target: target.to_string(),
+                    kind: FindingKind::Credential,
+                    message: format!("Valid SMTP user {} on {}:{}", username, target, port),
+                    data: Some(serde_json::json!({
+                        "host": target,
+                        "port": port,
+                        "username": username,
+                        "response": response,
+                    })),
+                });
             }
             false
         }
     }; // guard dropped here — before any .await
 
-    if !found_empty {
-        if cfg_prompt_yes_no("save_valid", "Save valid usernames?", false).await? {
+    if !found_empty
+        && cfg_prompt_yes_no("save_valid", "Save valid usernames?", false).await? {
             let filename = cfg_prompt_output_file("valid_output", "What should the valid results be saved as?", "smtp_valid_users.txt").await?;
             if filename.is_empty() {
                 crate::mprintln!("{}", "[-] Filename cannot be empty.".red());
@@ -753,7 +748,6 @@ async fn finalize_and_report(
                 crate::mprintln!("{}", format!("[+] Results saved to {}", filename).green());
             }
         }
-    }
 
     let unknown_has_data = {
         let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
@@ -773,8 +767,8 @@ async fn finalize_and_report(
         }
     }; // guard dropped before await
 
-    if unknown_has_data {
-        if cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false).await? {
+    if unknown_has_data
+        && cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false).await? {
             let default_name = "smtp_unknown_responses.txt";
             let chosen = cfg_prompt_output_file("unknown_output", "What should the unknown results be saved as?", default_name).await?;
             let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
@@ -790,9 +784,8 @@ async fn finalize_and_report(
                 );
             }
         }
-    }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn save_results(path: &str, users: &[(String, String)]) -> Result<()> {
@@ -868,3 +861,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
+
+crate::register_native_module!(crate::module::Category::Scanners, "smtp_user_enum", native);

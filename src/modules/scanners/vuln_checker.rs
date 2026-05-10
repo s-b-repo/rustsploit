@@ -1,8 +1,9 @@
 use anyhow::Result;
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
-use crate::utils::{cfg_prompt_default, cfg_prompt_required, normalize_target};
+use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
+use crate::utils::{ cfg_prompt_default, cfg_prompt_required, normalize_target };
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -18,10 +19,8 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if crate::utils::is_mass_scan_target(target) {
-        anyhow::bail!("vuln_checker does not support mass-scan targets — it runs ~50 fingerprint probes per host. Set the target to a specific IP/hostname (or run a port scan first and target each result individually).");
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
     if !crate::utils::is_batch_mode() {
         print_banner();
     }
@@ -122,7 +121,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("  {} not vulnerable, {} errors", not_vulnerable, errors);
     crate::mprintln!();
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 // ─── Probe types ───────────────────────────────────────────────────────────
@@ -468,3 +467,5 @@ fn print_banner() {
         format!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan())
     );
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "vuln_checker", native);

@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
 use ssh2::Session;
 use std::{
     io::Write,
-    net::{IpAddr, ToSocketAddrs},
+    net::{IpAddr,
+    ToSocketAddrs},
     time::Duration,
 };
 use tokio::{
@@ -11,17 +12,28 @@ use tokio::{
     time::timeout,
 };
 
+use crate::module::{ ModuleCtx, ModuleOutcome };
 use crate::utils::{
     normalize_target,
-    load_lines, get_filename_in_current_dir,
-    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_port,
+    load_lines,
+    get_filename_in_current_dir,
+    cfg_prompt_default,
+    cfg_prompt_yes_no,
+    cfg_prompt_existing_file,
+    cfg_prompt_port,
     cfg_prompt_output_file,
 };
+use crate::utils::wordlist;
 use crate::utils::{
-    BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos_mode, parse_combo_mode, load_credential_file,
-    run_bruteforce, run_subnet_bruteforce,
-    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+    BruteforceConfig,
+    LoginResult,
+    SubnetScanConfig,
+    generate_combos_mode,
+    parse_combo_mode,
+    load_credential_file,
+    run_bruteforce,
+    run_subnet_bruteforce,
+    is_subnet_target,
 };
 
 // Constants
@@ -54,50 +66,13 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("ssh_bruteforce requires a single-host target")?;
     crate::mprintln!("{}", "=== SSH Brute Force Module ===".bold());
     crate::mprintln!("[*] Target: {}", target);
-
-    // --- Mass Scan Mode ---
-    if is_mass_scan_target(target) {
-        crate::mprintln!("{}", format!("[*] Target: {} — Mass Scan Mode", target).yellow());
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SSH",
-            default_port: 22,
-            state_file: "ssh_hose_state.log",
-            default_output: "ssh_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip, port| {
-            async move {
-                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(5)).await {
-                    return None;
-                }
-                let addr = format!("{}:{}", ip, port);
-                let tcp = match crate::utils::blocking_tcp_connect(
-                    &addr.parse().ok()?, std::time::Duration::from_secs(5)
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::trace!(target = %addr, "SSH TCP connect failed: {}", e);
-                        return None;
-                    }
-                };
-                let mut sess = ssh2::Session::new().ok()?;
-                sess.set_tcp_stream(tcp);
-                sess.set_timeout(10000);
-                if sess.handshake().is_err() { return None; }
-                // Try common defaults
-                let creds = [("root","root"),("admin","admin"),("root",""),("admin",""),("root","123456"),("admin","password")];
-                for (user, pass) in creds {
-                    if sess.userauth_password(user, pass).is_ok() && sess.authenticated() {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
-                    }
-                }
-                None
-            }
-        }).await;
-    }
 
     // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
@@ -105,8 +80,26 @@ pub async fn run(target: &str) -> Result<()> {
 
         let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
         let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = load_lines(&usernames_file)?;
-        let passes = load_lines(&passwords_file)?;
+        let users = if wordlist::should_stream(&usernames_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&usernames_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&usernames_file)?
+        };
+        let passes = if wordlist::should_stream(&passwords_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&passwords_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&passwords_file)?
+        };
         if users.is_empty() { return Err(anyhow!("User list empty")); }
         if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
 
@@ -123,7 +116,9 @@ pub async fn run(target: &str) -> Result<()> {
         };
         let timeout_duration = Duration::from_secs(connection_timeout);
 
-        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -131,9 +126,14 @@ pub async fn run(target: &str) -> Result<()> {
             jitter_ms: 50,
             source_module: "creds/generic/ssh_credcheck",
             skip_tcp_check: false,
+            state_file: None,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
             let timeout_dur = timeout_duration;
+            let limiter = limiter.clone();
+            let module_path = module_path.clone();
             async move {
+                let host = ip.to_string();
+                limiter.acquire(&module_path, &host).await;
                 let addr = format!("{}:{}", ip, port);
                 match try_ssh_login(&addr, &user, &pass, timeout_dur).await {
                     Ok(true) => LoginResult::Success,
@@ -141,7 +141,8 @@ pub async fn run(target: &str) -> Result<()> {
                     Err(e) => LoginResult::Error { message: e.to_string(), retryable: true },
                 }
             }
-        }).await;
+        }).await?;
+        return Ok(ModuleOutcome::ok());
     }
 
     // --- Single Target Mode ---
@@ -156,8 +157,24 @@ pub async fn run(target: &str) -> Result<()> {
         None
     };
 
+    let builtin_lists = wordlist::catalogue();
+    if !builtin_lists.is_empty() {
+        crate::mprintln!("{}", format!("[*] Built-in wordlists available: {}", builtin_lists.join(", ")).dimmed());
+    }
+
     let passwords_file = if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true).await? {
-        Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?)
+        let file_input = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        // If input matches a built-in wordlist name, resolve it to a local path
+        if !std::path::Path::new(&file_input).exists() {
+            if let Ok(resolved) = wordlist::resolve(&file_input).await {
+                crate::mprintln!("{}", format!("[*] Resolved built-in wordlist to: {}", resolved.display()).green());
+                Some(resolved.to_string_lossy().to_string())
+            } else {
+                Some(file_input)
+            }
+        } else {
+            Some(file_input)
+        }
     } else {
         None
     };
@@ -198,10 +215,17 @@ pub async fn run(target: &str) -> Result<()> {
 
     crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}", connect_addr).cyan());
 
-    // Load wordlists
+    // Load wordlists — use streaming reader for large files to avoid OOM
     let mut usernames = Vec::new();
     if let Some(ref file) = usernames_file {
-        usernames = load_lines(file)?;
+        if wordlist::should_stream(file) {
+            wordlist::for_each_batch(file, wordlist::DEFAULT_BATCH_SIZE, |batch| {
+                usernames.extend(batch);
+                async { Ok(()) }
+            }).await?;
+        } else {
+            usernames = load_lines(file)?;
+        }
         if usernames.is_empty() {
             crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
         } else {
@@ -211,7 +235,14 @@ pub async fn run(target: &str) -> Result<()> {
 
     let mut passwords = Vec::new();
     if let Some(ref file) = passwords_file {
-        passwords = load_lines(file)?;
+        if wordlist::should_stream(file) {
+            wordlist::for_each_batch(file, wordlist::DEFAULT_BATCH_SIZE, |batch| {
+                passwords.extend(batch);
+                async { Ok(()) }
+            }).await?;
+        } else {
+            passwords = load_lines(file)?;
+        }
         if passwords.is_empty() {
             crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
         } else {
@@ -246,9 +277,14 @@ pub async fn run(target: &str) -> Result<()> {
     }
     let timeout_duration = Duration::from_secs(connection_timeout);
 
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
     let try_login = move |t: String, p: u16, user: String, pass: String| {
         let timeout_dur = timeout_duration;
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
         async move {
+            limiter.acquire(&module_path, &t).await;
             let addr = normalize_target(&format!("{}:{}", t, p))
                 .unwrap_or_else(|_| format!("{}:{}", t, p));
             match try_ssh_login(&addr, &user, &pass, timeout_dur).await {
@@ -330,7 +366,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
 
 async fn try_ssh_login(
@@ -373,3 +409,5 @@ async fn try_ssh_login(
 
     join_result.map_err(|e| anyhow!("Join error: {}", e))?
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/ssh_bruteforce", native);

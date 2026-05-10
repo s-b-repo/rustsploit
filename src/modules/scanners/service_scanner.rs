@@ -14,8 +14,8 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 /// Default ports to scan when the user accepts the default list.
@@ -71,26 +71,15 @@ impl ServiceResult {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan support: TCP connect to port 80, extract HTTP server header.
-    if is_mass_scan_target(target) {
-        return run_mass_scan(
-            target,
-            MassScanConfig {
-                protocol_name: "ServiceScan",
-                default_port: 80,
-                state_file: "service_scanner_mass_state.log",
-                default_output: "service_scanner_mass_results.txt",
-                default_concurrency: 500,
-            },
-            move |ip: std::net::IpAddr, port: u16| async move {
-                mass_scan_probe(&ip.to_string(), port).await
-            },
-        )
-        .await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("service_scanner requires a single-host target")?;
 
     display_banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     // --- Prompts ---
     let port_list_str = cfg_prompt_default(
@@ -151,7 +140,8 @@ pub async fn run(target: &str) -> Result<()> {
 
     let mut handles = Vec::with_capacity(ports.len());
     for port in &ports {
-        if crate::context::is_cancelled() { break; }
+        if ctx.is_cancelled() { break; }
+        ctx.rate_limit(target).await;
         let permit = semaphore.clone().acquire_owned().await?;
         let tgt = target_str.clone();
         let p = *port;
@@ -167,14 +157,21 @@ pub async fn run(target: &str) -> Result<()> {
     for handle in handles {
         match handle.await {
             Ok(Some(r)) => {
-                // Surface every detected service on the structured event bus
-                // so API/MCP/WS subscribers see findings as they arrive, not
-                // only at the end via the printed table.
-                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                    host: target_str.clone(),
-                    port: r.port,
-                    service: r.service.clone(),
-                    version: if r.version.is_empty() { None } else { Some(r.version.clone()) },
+                outcome.findings.push(Finding {
+                    target: target_str.clone(),
+                    kind: FindingKind::Banner,
+                    message: format!(
+                        "{}:{} {} {} {}",
+                        target_str, r.port, r.service, r.version, r.banner
+                    ),
+                    data: Some(serde_json::json!({
+                        "host": target_str,
+                        "port": r.port,
+                        "service": r.service,
+                        "version": r.version,
+                        "banner": r.banner,
+                        "notes": r.notes,
+                    })),
                 });
                 results.push(r);
             }
@@ -205,7 +202,7 @@ pub async fn run(target: &str) -> Result<()> {
             .bold()
     );
 
-    Ok(())
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +322,7 @@ fn save_results_to_file(
     writeln!(f, "Service Version Scan Results for {}", target)?;
     writeln!(f, "Timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
     writeln!(f, "{}", "-".repeat(80))?;
-    writeln!(f, "{:<8} {:<16} {:<30} {}", "Port", "Service", "Version", "Notes")?;
+    writeln!(f, "{:<8} {:<16} {:<30} Notes", "Port", "Service", "Version")?;
     writeln!(f, "{}", "-".repeat(80))?;
 
     for r in results {
@@ -386,40 +383,6 @@ fn parse_port_list(input: &str) -> Result<Vec<u16>> {
 }
 
 // ---------------------------------------------------------------------------
-// Mass scan probe (HTTP server header extraction)
-// ---------------------------------------------------------------------------
-
-async fn mass_scan_probe(ip: &str, port: u16) -> Option<String> {
-    let addr = format!("{}:{}", ip, port);
-    let mut stream = crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(3))
-        .await
-        .ok()?;
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        ip
-    );
-    stream.write_all(request.as_bytes()).await.ok()?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = timeout(Duration::from_secs(3), stream.read(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-
-    if n == 0 {
-        return None;
-    }
-
-    let response = String::from_utf8_lossy(&buf[..n]);
-    let server = extract_http_header(&response, "server").unwrap_or_default();
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    Some(format!(
-        "[{}] {}:{} ServiceScan server={}\n",
-        ts, ip, port, server
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // Core probe dispatcher
 // ---------------------------------------------------------------------------
 
@@ -435,7 +398,9 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
         }
     };
 
-    let result = match port {
+    
+
+    match port {
         21 => probe_ftp(stream, port, dur).await,
         22 => probe_ssh(stream, port, dur).await,
         23 => probe_telnet(stream, port, dur).await,
@@ -452,9 +417,7 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
         11211 => probe_memcached(stream, port, dur).await,
         27017 => probe_mongodb(stream, port, dur).await,
         _ => probe_generic(stream, port, dur).await,
-    };
-
-    result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -495,8 +458,8 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
     let anon_cmd = b"USER anonymous\r\n";
     if stream.write_all(anon_cmd).await.is_ok() {
         let mut anon_buf = vec![0u8; 512];
-        if let Ok(Ok(an)) = timeout(dur, stream.read(&mut anon_buf)).await {
-            if an > 0 {
+        if let Ok(Ok(an)) = timeout(dur, stream.read(&mut anon_buf)).await
+            && an > 0 {
                 let resp = String::from_utf8_lossy(&anon_buf[..an]);
                 if resp.starts_with("230") {
                     // 230 = Logged in without password
@@ -505,8 +468,8 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
                     // 331 = Password required — send anonymous email
                     if stream.write_all(b"PASS anonymous@\r\n").await.is_ok() {
                         let mut pass_buf = vec![0u8; 512];
-                        if let Ok(Ok(pn)) = timeout(dur, stream.read(&mut pass_buf)).await {
-                            if pn > 0 {
+                        if let Ok(Ok(pn)) = timeout(dur, stream.read(&mut pass_buf)).await
+                            && pn > 0 {
                                 let pass_resp = String::from_utf8_lossy(&pass_buf[..pn]);
                                 if pass_resp.starts_with("230") {
                                     r.notes = "ANONYMOUS LOGIN ALLOWED".to_string();
@@ -514,13 +477,11 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
                                     r.notes = "Anonymous login denied".to_string();
                                 }
                             }
-                        }
                     }
                 } else if resp.starts_with("530") {
                     r.notes = "Anonymous login denied".to_string();
                 }
             }
-        }
     }
 
     Some(r)
@@ -783,8 +744,8 @@ async fn probe_postgres(
     }
 
     let mut buf = vec![0u8; 1024];
-    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await {
-        if n > 0 {
+    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await
+        && n > 0 {
             match buf[0] {
                 b'S' => {
                     r.notes = "SSL supported".to_string();
@@ -799,7 +760,6 @@ async fn probe_postgres(
                 }
             }
         }
-    }
 
     Some(r)
 }
@@ -857,8 +817,8 @@ async fn probe_mongodb(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
     }
 
     let mut buf = vec![0u8; 4096];
-    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await {
-        if n > 0 {
+    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await
+        && n > 0 {
             let data = &buf[..n];
             // Look for version string pattern in the BSON response.
             // MongoDB includes "version" : "x.y.z" in the isMaster reply.
@@ -869,7 +829,6 @@ async fn probe_mongodb(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
             r.banner = format!("MongoDB ({}B response)", n);
             r.notes = "Responded to isMaster".to_string();
         }
-    }
 
     Some(r)
 }
@@ -1035,22 +994,19 @@ async fn probe_generic(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
 
     // First, try a passive read (many services send banners on connect).
     let short_dur = Duration::from_secs(dur.as_secs().min(2));
-    if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await {
-        if n > 0 {
+    if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await
+        && n > 0 {
             let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
             r.banner = banner.clone();
             detect_service_from_banner(&banner, &mut r);
             return Some(r);
         }
-    }
 
     // Fallback: send an HTTP GET and see if we get an HTTP response.
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    );
-    if stream.write_all(http_req.as_bytes()).await.is_ok() {
-        if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await {
-            if n > 0 {
+    let http_req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
+    if stream.write_all(http_req.as_bytes()).await.is_ok()
+        && let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await
+            && n > 0 {
                 let resp = String::from_utf8_lossy(&buf[..n]).to_string();
                 if resp.starts_with("HTTP/") {
                     r.service = "HTTP".to_string();
@@ -1062,8 +1018,6 @@ async fn probe_generic(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
                 r.banner = truncate_display(&r.banner, 120);
                 return Some(r);
             }
-        }
-    }
 
     // Port is open but no data -- still report it.
     r.notes = "Open, no banner".to_string();
@@ -1236,3 +1190,5 @@ fn build_is_master_query() -> Vec<u8> {
 
     msg
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "service_scanner", native);

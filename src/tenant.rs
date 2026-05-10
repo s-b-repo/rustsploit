@@ -69,11 +69,10 @@ impl TenantRegistry {
         if sanitized.is_empty() {
             return Err("tenant name is empty after sanitization".to_string());
         }
-        if let Ok(tenants) = self.tenants.read() {
-            if let Some(data) = tenants.get(&sanitized) {
+        if let Ok(tenants) = self.tenants.read()
+            && let Some(data) = tenants.get(&sanitized) {
                 return Ok(data.clone());
             }
-        }
         let mut tenants = self.tenants.write().unwrap_or_else(|e| e.into_inner());
         if let Some(data) = tenants.get(&sanitized) {
             return Ok(data.clone());

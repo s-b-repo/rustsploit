@@ -121,12 +121,11 @@ impl GlobalOptions {
 
     /// Save to disk using atomic write (write to temp, then rename).
     async fn save_locked(&self, opts: &HashMap<String, String>) {
-        if let Some(parent) = self.file_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        if let Some(parent) = self.file_path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await {
                 eprintln!("[!] Failed to create options directory: {}", e);
                 return;
             }
-        }
         let tmp = self.file_path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(opts) {
             Ok(j) => j,

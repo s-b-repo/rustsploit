@@ -1,15 +1,20 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::*;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{ Arc, atomic::{AtomicUsize, Ordering} };
 use std::time::Instant;
 use tokio::sync::Semaphore;
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
+    cfg_prompt_default,
+    cfg_prompt_int_range,
+    cfg_prompt_yes_no,
+    cfg_prompt_output_file,
 };
 use crate::utils::target::extract_ip_from_target;
 use crate::utils::{
-    is_mass_scan_target, is_subnet_target, parse_subnet, subnet_host_count,
-    run_mass_scan, MassScanConfig,
+    is_subnet_target,
+    parse_subnet,
+    subnet_host_count,
 };
 
 /// Ports to scan for honeypot detection (50 common service ports).
@@ -86,6 +91,7 @@ fn colored_status(status: &str, color: &str) -> String {
 
 /// Scan a list of IPs for honeypot indicators with concurrency control.
 async fn scan_targets(
+    ctx: &ModuleCtx,
     ips: Vec<String>,
     timeout_ms: u64,
     concurrency: usize,
@@ -98,7 +104,7 @@ async fn scan_targets(
     let mut tasks = Vec::with_capacity(total);
 
     for ip_str in ips {
-        if crate::context::is_cancelled() { break; }
+        if ctx.is_cancelled() { break; }
         let permit = semaphore.clone().acquire_owned().await;
         let permit = match permit {
             Ok(p) => p,
@@ -106,22 +112,12 @@ async fn scan_targets(
         };
         let res = results.clone();
         let prog = progress.clone();
+        ctx.rate_limit(&ip_str).await;
 
         tasks.push(tokio::spawn(async move {
             if crate::context::is_cancelled() { drop(permit); return; }
             let (open_count, open_ports) = scan_ip_ports(&ip_str, timeout_ms).await;
             let (status, color) = classify(open_count);
-
-            // Emit any host that scored high enough to be flagged honeypot
-            // or suspicious so subscribers see findings as they arrive.
-            if open_count >= 8 {
-                crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                    host: ip_str.clone(),
-                    port: 0,
-                    service: format!("honeypot:{}", status),
-                    version: Some(format!("{} open ports", open_count)),
-                });
-            }
 
             if let Ok(mut list) = res.lock() {
                 list.push((
@@ -134,7 +130,7 @@ async fn scan_targets(
             }
 
             let idx = prog.fetch_add(1, Ordering::Relaxed) + 1;
-            if verbose || idx % 20 == 0 || idx == 1 || idx == total {
+            if verbose || idx.is_multiple_of(20) || idx == 1 || idx == total {
                 crate::mprintln!("[*] Honeypot scan progress: {}/{} hosts", idx, total);
             }
 
@@ -188,8 +184,8 @@ fn save_results(
     writeln!(file, "=========================")?;
     writeln!(file, "Scan time: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
     writeln!(file)?;
-    writeln!(file, "{:<40} {:<8} {:<22} {}",
-        "IP", "Open", "Status", "Ports")?;
+    writeln!(file, "{:<40} {:<8} {:<22} Ports",
+        "IP", "Open", "Status")?;
     writeln!(file, "{}", "-".repeat(100))?;
 
     for (ip, open_count, status, _color, ports) in results {
@@ -219,31 +215,11 @@ async fn store_to_workspace(results: &[(String, usize, String, String, Vec<u16>)
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan mode: random / 0.0.0.0 / file-based targets
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "HoneypotScan",
-            default_port: 80,
-            state_file: "honeypot_scanner_mass_state.log",
-            default_output: "honeypot_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, _port| {
-            async move {
-                let ip_str = ip.to_string();
-                let (open_count, ports) = scan_ip_ports(&ip_str, 200).await;
-                if open_count >= 6 {
-                    let (status, _) = classify(open_count);
-                    let ports_str = ports.iter().take(15).map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {} {} ({} open) ports:[{}]\n",
-                        ts, ip_str, status, open_count, ports_str))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("honeypot_scanner requires a single-host target")?;
 
     // Only print the header if we're NOT running inside a batch/mass scan context
     if !crate::utils::is_batch_mode() {
@@ -251,6 +227,8 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "=== Honeypot Detection Scanner ===".cyan().bold());
         crate::mprintln!();
     }
+
+    let mut outcome = ModuleOutcome::ok();
 
     // Prompts
     let target_input = cfg_prompt_default("target", "Target (IP/CIDR/file)", target).await?;
@@ -268,7 +246,7 @@ pub async fn run(target: &str) -> Result<()> {
     let confirm = cfg_prompt_yes_no("confirm", "Start honeypot scan?", true).await?;
     if !confirm {
         crate::mprintln!("{}", "[*] Scan cancelled.".yellow());
-        return Ok(());
+        return Ok(outcome);
     }
 
     let start = Instant::now();
@@ -304,7 +282,23 @@ pub async fn run(target: &str) -> Result<()> {
     ).cyan());
 
     // Run scan
-    let results = scan_targets(ips, timeout_ms, concurrency, verbose).await;
+    let results = scan_targets(ctx, ips, timeout_ms, concurrency, verbose).await;
+
+    // Capture findings for hosts that look honeypot-y
+    for (ip, open_count, status, _color, open_ports) in &results {
+        if *open_count >= 8 {
+            outcome.findings.push(Finding {
+                target: ip.clone(),
+                kind: FindingKind::Note,
+                message: format!("Honeypot indicator at {} ({} open ports, status={})", ip, open_count, status),
+                data: Some(serde_json::json!({
+                    "host": ip,
+                    "open_ports": open_ports,
+                    "status": status,
+                })),
+            });
+        }
+    }
 
     let elapsed = start.elapsed();
 
@@ -338,7 +332,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "[+] Honeypot/suspicious hosts added to workspace with notes.".green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -358,3 +352,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         rank: crate::module_info::ModuleRank::Normal,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "honeypot_scanner", native);

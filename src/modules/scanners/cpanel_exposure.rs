@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use colored::*;
 use std::time::Duration;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
 use crate::utils::{build_http_client, cfg_prompt_int_range, cfg_prompt_yes_no};
 
@@ -67,7 +68,11 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(target: &str) -> CheckResult {
+pub async fn check(ctx: &ModuleCtx) -> CheckResult {
+    let target = match ctx.target.as_single() {
+        Some(t) => t,
+        None => return CheckResult::Error("cpanel_exposure requires a single-host target".to_string()),
+    };
     let host = sanitize_host(target);
     let client = match build_http_client(Duration::from_secs(HTTP_TIMEOUT_SECS)) {
         Ok(c) => c,
@@ -89,10 +94,16 @@ pub async fn check(target: &str) -> CheckResult {
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("cpanel_exposure requires a single-host target")?;
     display_banner();
     let host = sanitize_host(target);
     crate::mprintln!("{}", format!("[*] Target host: {}", host).cyan());
+
+    let mut outcome = ModuleOutcome::ok();
 
     let timeout_secs = cfg_prompt_int_range(
         "timeout",
@@ -120,6 +131,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
         let scheme = if https { "https" } else { "http" };
         let url = format!("{}://{}:{}/", scheme, host, port);
+        ctx.rate_limit(&host).await;
         match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -164,11 +176,16 @@ pub async fn run(target: &str) -> Result<()> {
                         }
                     );
                     crate::mprintln!("{}", format!("[+] {}", line).green().bold());
-                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
-                        host: host.clone(),
-                        port,
-                        service: format!("panel:{}", label),
-                        version: Some(server),
+                    outcome.findings.push(Finding {
+                        target: host.clone(),
+                        kind: FindingKind::OpenPort,
+                        message: format!("Exposed {} on {}:{} (server={})", label, host, port, server),
+                        data: Some(serde_json::json!({
+                            "host": host,
+                            "port": port,
+                            "service": format!("panel:{}", label),
+                            "server": server,
+                        })),
                     });
                 } else {
                     crate::mprintln!(
@@ -191,7 +208,7 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!("  Host:           {}", host);
     crate::mprintln!("  Exposed panels: {}", exposed);
 
-    Ok(())
+    Ok(outcome)
 }
 
 async fn probe_panel(client: &reqwest::Client, host: &str, port: u16, https: bool) -> bool {
@@ -233,3 +250,5 @@ fn sanitize_host(target: &str) -> String {
     let t = t.split(':').next().unwrap_or(t);
     t.to_string()
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "cpanel_exposure", native, has_check);

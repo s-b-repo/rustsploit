@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -28,38 +27,6 @@ const CHAIN_SEPARATORS: &[char] = &['&', ';'];
 const MAX_URL_LENGTH: usize = 2048;
 
 const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
-
-// ─── Shell-active flag ──────────────────────────────────────────────────────
-/// True while the user is inside the interactive REPL shell (this file's
-/// `interactive_shell_inner`). False when invoked via `--api`, `--mcp`, or
-/// `-m <module> -t <target>` direct CLI mode.
-///
-/// Modules can call `crate::shell::is_interactive_shell()` to opt into
-/// extra interactive behaviour (e.g. wpair loops its action prompt so the
-/// operator can chain commands without re-entering the module).
-static IN_INTERACTIVE_SHELL: AtomicBool = AtomicBool::new(false);
-
-/// RAII guard returned by `enter_interactive_shell()` — flips the flag back
-/// to `false` on drop so the marker stays correct even on `?` early returns.
-pub struct InteractiveShellGuard(());
-
-impl Drop for InteractiveShellGuard {
-    fn drop(&mut self) {
-        IN_INTERACTIVE_SHELL.store(false, Ordering::Release);
-    }
-}
-
-/// Mark the interactive shell as active. Returns a guard that clears the
-/// flag on drop.
-pub fn enter_interactive_shell() -> InteractiveShellGuard {
-    IN_INTERACTIVE_SHELL.store(true, Ordering::Release);
-    InteractiveShellGuard(())
-}
-
-/// True if the caller is running inside the interactive REPL shell.
-pub fn is_interactive_shell() -> bool {
-    IN_INTERACTIVE_SHELL.load(Ordering::Acquire)
-}
 
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
@@ -219,20 +186,12 @@ pub async fn interactive_shell(verbose: bool) -> Result<()> {
 }
 
 async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> Result<()> {
-    // Mark this thread as being inside the interactive shell so modules can
-    // opt into shell-only UX (e.g. wpair loops its action prompt). Cleared
-    // automatically when the guard drops, including on `?` early returns.
-    let _shell_guard = enter_interactive_shell();
-
     println!("Welcome to RustSploit Shell (inspired by RouterSploit)");
     println!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
 
     // Show global target if set
     if config::GLOBAL_CONFIG.has_target() {
-        let target_str = match config::GLOBAL_CONFIG.get_target() {
-            Some(t) => t,
-            None => String::new(),
-        };
+        let target_str = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
         if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
             if size > 1 {
                 println!("{}", format!("[*] Global target set: {} ({} IPs)", target_str, size).cyan());
@@ -414,10 +373,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 }
                 "show_target" | "target" => {
                     if config::GLOBAL_CONFIG.has_target() {
-                        let target_str = match config::GLOBAL_CONFIG.get_target() {
-                            Some(t) => t,
-                            None => String::new(),
-                        };
+                        let target_str = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
                         let is_multi = target_str.contains(',');
                         let is_subnet = config::GLOBAL_CONFIG.is_subnet() && !is_multi;
                         if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
@@ -1149,8 +1105,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     .unwrap_or(true);
 
                                 let mut skip_target = false;
-                                if honeypot_on && !is_mass_scan {
-                                    if crate::utils::network::quick_honeypot_check(t).await {
+                                if honeypot_on && !is_mass_scan
+                                    && crate::utils::network::quick_honeypot_check(t).await {
                                         println!("{}", format!(
                                             "[!] Target {} appears to be a honeypot (11+ common ports open)",
                                             t
@@ -1164,7 +1120,6 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                             skip_target = true;
                                         }
                                     }
-                                }
 
                                 if !skip_target {
                                     println!("Running module '{}' against target '{}'", module_path, t);
@@ -1321,77 +1276,77 @@ fn render_help() {
     // --- Navigation & Discovery ---
     println!("  {}", "Navigation & Discovery".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "help".green(), "h | ?".dimmed(), "Show this screen");
-    println!("    {:<20} {:<24} {}", "modules".green(), "ls | m".dimmed(), "List all available modules");
-    println!("    {:<20} {:<24} {}", "find <kw>".green(), "f1 <kw>".dimmed(), "Search modules by keyword");
-    println!("    {:<20} {:<24} {}", "use <path>".green(), "u <path>".dimmed(), "Select a module to load");
-    println!("    {:<20} {:<24} {}", "info [path]".green(), "i".dimmed(), "Show module metadata (CVE, author, rank)");
-    println!("    {:<20} {:<24} {}", "back".green(), "b | clear".dimmed(), "Deselect current module and target");
+    println!("    {:<20} {:<24} Show this screen", "help".green(), "h | ?".dimmed());
+    println!("    {:<20} {:<24} List all available modules", "modules".green(), "ls | m".dimmed());
+    println!("    {:<20} {:<24} Search modules by keyword", "find <kw>".green(), "f1 <kw>".dimmed());
+    println!("    {:<20} {:<24} Select a module to load", "use <path>".green(), "u <path>".dimmed());
+    println!("    {:<20} {:<24} Show module metadata (CVE, author, rank)", "info [path]".green(), "i".dimmed());
+    println!("    {:<20} {:<24} Deselect current module and target", "back".green(), "b | clear".dimmed());
     println!();
 
     // --- Targeting ---
     println!("  {}", "Targeting".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "set target".green(), "t <val>".dimmed(), "Set global target (IP, domain, CIDR, or comma-separated)");
-    println!("    {:<20} {:<24} {}", "set subnet".green(), "sn <CIDR>".dimmed(), "Set target to a CIDR subnet");
-    println!("    {:<20} {:<24} {}", "set port".green(), "".dimmed(), "Set target port for all modules");
-    println!("    {:<20} {:<24} {}", "set source_port".green(), "".dimmed(), "Set source port (0 to clear)");
-    println!("    {:<20} {:<24} {}", "show_target".green(), "st".dimmed(), "Display current targets");
-    println!("    {:<20} {:<24} {}", "clear_target".green(), "ct".dimmed(), "Clear all targets");
+    println!("    {:<20} {:<24} Set global target (IP, domain, CIDR, or comma-separated)", "set target".green(), "t <val>".dimmed());
+    println!("    {:<20} {:<24} Set target to a CIDR subnet", "set subnet".green(), "sn <CIDR>".dimmed());
+    println!("    {:<20} {:<24} Set target port for all modules", "set port".green(), "".dimmed());
+    println!("    {:<20} {:<24} Set source port (0 to clear)", "set source_port".green(), "".dimmed());
+    println!("    {:<20} {:<24} Display current targets", "show_target".green(), "st".dimmed());
+    println!("    {:<20} {:<24} Clear all targets", "clear_target".green(), "ct".dimmed());
     println!();
 
     // --- Execution ---
     println!("  {}", "Execution".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "run".green(), "go, ra".dimmed(), "Execute the selected module");
-    println!("    {:<20} {:<24} {}", "run -j".green(), "".dimmed(), "Run module as background job");
-    println!("    {:<20} {:<24} {}", "check".green(), "ch".dimmed(), "Non-destructive vulnerability check");
+    println!("    {:<20} {:<24} Execute the selected module", "run".green(), "go, ra".dimmed());
+    println!("    {:<20} {:<24} Run module as background job", "run -j".green(), "".dimmed());
+    println!("    {:<20} {:<24} Non-destructive vulnerability check", "check".green(), "ch".dimmed());
     println!();
 
     // --- Global Options ---
     println!("  {}", "Global Options".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "setg <k> <v>".green(), "sg".dimmed(), "Set a global option (persists across modules)");
-    println!("    {:<20} {:<24} {}", "unsetg <key>".green(), "ug".dimmed(), "Remove a global option");
-    println!("    {:<20} {:<24} {}", "show options".green(), "so".dimmed(), "Display all global options");
+    println!("    {:<20} {:<24} Set a global option (persists across modules)", "setg <k> <v>".green(), "sg".dimmed());
+    println!("    {:<20} {:<24} Remove a global option", "unsetg <key>".green(), "ug".dimmed());
+    println!("    {:<20} {:<24} Display all global options", "show options".green(), "so".dimmed());
     println!();
 
     // --- Data Management ---
     println!("  {}", "Data Management".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "creds".green(), "".dimmed(), "List stored credentials");
-    println!("    {:<20} {:<24} {}", "creds add".green(), "".dimmed(), "Add a credential interactively");
-    println!("    {:<20} {:<24} {}", "creds search <q>".green(), "".dimmed(), "Search credentials");
-    println!("    {:<20} {:<24} {}", "hosts".green(), "".dimmed(), "List tracked hosts");
-    println!("    {:<20} {:<24} {}", "hosts add <ip>".green(), "".dimmed(), "Add a host to workspace");
-    println!("    {:<20} {:<24} {}", "services".green(), "svcs".dimmed(), "List tracked services");
-    println!("    {:<20} {:<24} {}", "notes <ip> <text>".green(), "".dimmed(), "Add a note to a host");
-    println!("    {:<20} {:<24} {}", "loot".green(), "".dimmed(), "List collected loot");
-    println!("    {:<20} {:<24} {}", "workspace [name]".green(), "ws".dimmed(), "Show/switch workspaces");
+    println!("    {:<20} {:<24} List stored credentials", "creds".green(), "".dimmed());
+    println!("    {:<20} {:<24} Add a credential interactively", "creds add".green(), "".dimmed());
+    println!("    {:<20} {:<24} Search credentials", "creds search <q>".green(), "".dimmed());
+    println!("    {:<20} {:<24} List tracked hosts", "hosts".green(), "".dimmed());
+    println!("    {:<20} {:<24} Add a host to workspace", "hosts add <ip>".green(), "".dimmed());
+    println!("    {:<20} {:<24} List tracked services", "services".green(), "svcs".dimmed());
+    println!("    {:<20} {:<24} Add a note to a host", "notes <ip> <text>".green(), "".dimmed());
+    println!("    {:<20} {:<24} List collected loot", "loot".green(), "".dimmed());
+    println!("    {:<20} {:<24} Show/switch workspaces", "workspace [name]".green(), "ws".dimmed());
     println!();
 
     // --- Automation & Export ---
     println!("  {}", "Automation & Export".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "resource <file>".green(), "rc".dimmed(), "Execute a resource script");
-    println!("    {:<20} {:<24} {}", "makerc <file>".green(), "".dimmed(), "Save command history to file");
-    println!("    {:<20} {:<24} {}", "spool <file>".green(), "".dimmed(), "Log console output to file");
-    println!("    {:<20} {:<24} {}", "spool off".green(), "".dimmed(), "Stop console logging");
-    println!("    {:<20} {:<24} {}", "export json <f>".green(), "".dimmed(), "Export all data to JSON");
-    println!("    {:<20} {:<24} {}", "export csv <f>".green(), "".dimmed(), "Export all data to CSV");
-    println!("    {:<20} {:<24} {}", "export summary <f>".green(), "".dimmed(), "Export human-readable report");
+    println!("    {:<20} {:<24} Execute a resource script", "resource <file>".green(), "rc".dimmed());
+    println!("    {:<20} {:<24} Save command history to file", "makerc <file>".green(), "".dimmed());
+    println!("    {:<20} {:<24} Log console output to file", "spool <file>".green(), "".dimmed());
+    println!("    {:<20} {:<24} Stop console logging", "spool off".green(), "".dimmed());
+    println!("    {:<20} {:<24} Export all data to JSON", "export json <f>".green(), "".dimmed());
+    println!("    {:<20} {:<24} Export all data to CSV", "export csv <f>".green(), "".dimmed());
+    println!("    {:<20} {:<24} Export human-readable report", "export summary <f>".green(), "".dimmed());
     println!();
 
     // --- Jobs ---
     println!("  {}", "Background Jobs".bold().underline());
     println!();
-    println!("    {:<20} {:<24} {}", "jobs".green(), "j".dimmed(), "List background jobs");
-    println!("    {:<20} {:<24} {}", "jobs -k <id>".green(), "".dimmed(), "Kill a background job");
-    println!("    {:<20} {:<24} {}", "jobs clean".green(), "".dimmed(), "Clean up finished jobs");
+    println!("    {:<20} {:<24} List background jobs", "jobs".green(), "j".dimmed());
+    println!("    {:<20} {:<24} Kill a background job", "jobs -k <id>".green(), "".dimmed());
+    println!("    {:<20} {:<24} Clean up finished jobs", "jobs clean".green(), "".dimmed());
     println!();
 
     // --- Other ---
-    println!("    {:<20} {:<24} {}", "exit".green(), "quit | q".dimmed(), "Leave the shell");
+    println!("    {:<20} {:<24} Leave the shell", "exit".green(), "quit | q".dimmed());
     println!();
 
     // --- Tips ---
@@ -1406,7 +1361,7 @@ fn render_help() {
         ">>".dimmed(),
         "&".cyan().bold(),
         ";".cyan().bold(),
-        format!("set target 10.0.0.1 & use scanners/smtp_user_enum & run ; use exploits/... & run").cyan());
+        "set target 10.0.0.1 & use scanners/smtp_user_enum & run ; use exploits/... & run".to_string().cyan());
     println!("  {} Use {} to set options that apply to all modules.",
         ">>".dimmed(), "setg".cyan().bold());
     println!("  {} Use {} to save engagement data.",

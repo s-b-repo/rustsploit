@@ -7,11 +7,11 @@
 //! For authorized penetration testing only.
 
 use anyhow::{Result, Context};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use std::collections::HashMap;
 use crate::utils::{cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -179,12 +179,11 @@ fn check_signatures(
     // Check headers
     for (header_name, header_value) in &sig.header_checks {
         let key = header_name.to_lowercase();
-        if let Some(val) = headers.get(&key) {
-            if header_value.is_empty() || val.to_lowercase().contains(&header_value.to_lowercase()) {
+        if let Some(val) = headers.get(&key)
+            && (header_value.is_empty() || val.to_lowercase().contains(&header_value.to_lowercase())) {
                 methods.push(format!("header '{}' = '{}'", header_name, val));
                 score += 3;
             }
-        }
     }
 
     // Check cookies
@@ -212,25 +211,8 @@ fn check_signatures(
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "WAF-Detect",
-            default_port: 80,
-            state_file: "waf_detector_mass_state.log",
-            default_output: "waf_detector_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} HTTP open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().unwrap_or("");
 
     display_banner();
 
@@ -422,5 +404,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(())
+    Ok(ModuleOutcome::ok())
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "waf_detector", native);

@@ -265,7 +265,7 @@ impl GlobalConfig {
 /// Global configuration instance
 use once_cell::sync::Lazy;
 
-pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new());
+pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(GlobalConfig::new);
 
 /// Module-level configuration for API-driven execution
 /// This is set by the API before running a module and read by modules

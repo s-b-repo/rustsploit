@@ -159,11 +159,10 @@ async fn send_request(
         "id": id,
         "method": method,
     });
-    if let Some(p) = params {
-        if let Some(obj) = request.as_object_mut() {
+    if let Some(p) = params
+        && let Some(obj) = request.as_object_mut() {
             obj.insert("params".to_string(), p);
         }
-    }
 
     // Serialize and send as a single line
     let line = serde_json::to_string(&request).context("Failed to serialize JSON-RPC request")?;
@@ -199,8 +198,8 @@ async fn send_request(
             serde_json::from_str(trimmed).context("Failed to parse JSON-RPC response")?;
 
         // Check if this is a response (has "id") matching our request
-        if let Some(resp_id) = response.get("id") {
-            if resp_id.as_u64() == Some(id) {
+        if let Some(resp_id) = response.get("id")
+            && resp_id.as_u64() == Some(id) {
                 // Check for error
                 if let Some(error) = response.get("error") {
                     let msg = error
@@ -213,7 +212,6 @@ async fn send_request(
                 // Return the result field
                 return Ok(response.get("result").cloned().unwrap_or(Value::Null));
             }
-        }
         // Not our response (notification or different id) -- skip and keep reading
     }
 }

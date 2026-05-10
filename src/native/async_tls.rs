@@ -18,7 +18,6 @@ use tokio_rustls::TlsConnector;
 
 /// Default upper bound on TLS handshake duration. Prevents a slow/malicious
 /// peer from hanging a worker indefinitely.
-#[allow(dead_code)]
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A `ServerCertVerifier` that accepts every certificate without validation.
@@ -98,7 +97,6 @@ pub fn make_dangerous_tls_connector() -> TlsConnector {
 /// enforcing a timeout. Use this whenever the peer is attacker-controlled
 /// (cameras, routers, BMCs, honeypots) so a stalled handshake can't pin a
 /// worker forever.
-#[allow(dead_code)]
 pub async fn dangerous_tls_handshake<S>(
     server_name: ServerName<'static>,
     stream: S,
