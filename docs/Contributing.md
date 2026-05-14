@@ -60,7 +60,7 @@ If your module discovers credentials, hosts, or services, use the framework help
 
 ```rust
 crate::cred_store::store_credential(host, port, "ssh", user, pass,
-    crate::cred_store::CredType::Password, "my_module");
+crate::cred_store::CredType::Password, "my_module");
 crate::workspace::track_host(ip, Some("hostname"), None);
 crate::workspace::track_service(ip, 22, "tcp", "ssh", Some("OpenSSH 8.9"));
 ```
