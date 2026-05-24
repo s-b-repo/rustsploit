@@ -263,11 +263,11 @@ impl HostIdentity {
             let salt_bytes = b64.decode(data["argon2_salt"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing argon2_salt"))?)?;
             let salt: [u8; 32] = salt_bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("invalid argon2 salt length"))?;
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid argon2 salt length (got {} bytes)", v.len()))?;
             let nonce_vec = b64.decode(data["nonce"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing nonce"))?)?;
             let nonce_arr: [u8; 12] = nonce_vec.try_into()
-                .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid nonce length (got {} bytes)", v.len()))?;
             let ciphertext = b64.decode(data["ciphertext"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing ciphertext"))?)?;
 
@@ -286,14 +286,14 @@ impl HostIdentity {
             aad.extend_from_slice(version.as_bytes());
             let plaintext = cipher
                 .decrypt(&nonce, Payload { msg: &ciphertext, aad: &aad })
-                .map_err(|_| anyhow::anyhow!("decryption failed — wrong passphrase or tampered key file?"))?;
+                .map_err(|e| anyhow::anyhow!("decryption failed — wrong passphrase or tampered key file? {e:?}"))?;
 
             let secrets: serde_json::Value = serde_json::from_slice(&plaintext)?;
 
             let secret_bytes = b64.decode(secrets["x25519_secret"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing x25519_secret in decrypted payload"))?)?;
             let secret_arr: [u8; 32] = secret_bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("invalid x25519 secret length"))?;
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid x25519 secret length (got {} bytes)", v.len()))?;
             let x25519_secret = StaticSecret::from(secret_arr);
             let x25519_public = PublicKey::from(&x25519_secret);
             let mlkem_dk = b64.decode(secrets["mlkem_dk"].as_str()
@@ -317,7 +317,7 @@ impl HostIdentity {
             let secret_bytes = b64.decode(data["x25519_secret"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("missing x25519_secret"))?)?;
             let secret_arr: [u8; 32] = secret_bytes.try_into()
-                .map_err(|_| anyhow::anyhow!("invalid x25519 secret length"))?;
+                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid x25519 secret length (got {} bytes)", v.len()))?;
             let x25519_secret = StaticSecret::from(secret_arr);
             let x25519_public = PublicKey::from(&x25519_secret);
             let mlkem_dk = b64.decode(data["mlkem_dk"].as_str()
@@ -370,7 +370,7 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<ClientPublicIdent
         let x25519_bytes = b64.decode(data["x25519_pub"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Line {}: missing x25519_pub", i + 1))?)?;
         let x25519_pub: [u8; 32] = x25519_bytes.try_into()
-            .map_err(|_| anyhow::anyhow!("Line {}: invalid x25519 pub length", i + 1))?;
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("Line {}: invalid x25519 pub length (got {} bytes)", i + 1, v.len()))?;
         let mlkem_ek = b64.decode(data["mlkem_ek"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Line {}: missing mlkem_ek", i + 1))?)?;
         keys.push(ClientPublicIdentity { name, x25519_public: x25519_pub, mlkem_ek });
@@ -409,7 +409,7 @@ pub fn upsert_authorized_key(path: &Path, key: &ClientPublicIdentity) -> anyhow:
             // Replace any existing entry for the same name.
             let keep = match serde_json::from_str::<serde_json::Value>(trimmed) {
                 Ok(v) => v.get("name").and_then(|n| n.as_str()) != Some(key.name.as_str()),
-                Err(_) => true,
+                Err(e) => { tracing::debug!("preserving malformed authorized-key line: {e}"); true }
             };
             if keep {
                 lines.push(line.to_string());
@@ -470,9 +470,7 @@ pub fn remove_authorized_key(path: &Path, name: &str) -> anyhow::Result<bool> {
                     true
                 }
             }
-            // Preserve unparseable lines so we don't silently corrupt the
-            // file on partial-write or hand-edit.
-            Err(_) => true,
+            Err(e) => { tracing::debug!("preserving malformed authorized-key line: {e}"); true }
         };
         if keep {
             lines.push(line.to_string());
@@ -589,11 +587,11 @@ pub fn process_handshake(
 
     let client_eph_bytes = b64.decode(&request.client_x25519_pub)?;
     let client_eph_arr: [u8; 32] = client_eph_bytes.try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid ephemeral X25519 pub"))?;
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid ephemeral X25519 pub (got {} bytes)", v.len()))?;
 
     let client_id_bytes = b64.decode(&request.client_identity_x25519_pub)?;
     let client_id_arr: [u8; 32] = client_id_bytes.try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid identity X25519 pub"))?;
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid identity X25519 pub (got {} bytes)", v.len()))?;
 
     // Verify authorized. The compared value is a public key (not secret), so
     // a non-constant-time compare wouldn't leak anything meaningful — but the
@@ -607,7 +605,7 @@ pub fn process_handshake(
             matched = Some(k);
         }
     }
-    let _authorized = matched
+    let authorized = matched
         .ok_or_else(|| anyhow::anyhow!("Client not in authorized_keys"))?;
 
     // Ephemeral X25519 DH
@@ -624,9 +622,9 @@ pub fn process_handshake(
     // Parse client's ML-KEM encapsulation key and encapsulate
     let ek_key: Key<ml_kem::EncapsulationKey<MlKem768>> = client_mlkem_bytes.as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid ML-KEM encapsulation key length"))?;
+        .map_err(|e| anyhow::anyhow!("Invalid ML-KEM encapsulation key length: {e:?}"))?;
     let ek = ml_kem::EncapsulationKey::<MlKem768>::new(&ek_key)
-        .map_err(|_| anyhow::anyhow!("Invalid ML-KEM encapsulation key"))?;
+        .map_err(|e| anyhow::anyhow!("Invalid ML-KEM encapsulation key: {e:?}"))?;
     let (ct, ss_mlkem) = ek.encapsulate_with_rng(&mut rand::rng());
 
     // Combine 3 shared secrets
@@ -652,26 +650,26 @@ pub fn process_handshake(
     let handshake_salt = derive_salt(
         KDF_LABEL_HANDSHAKE,
         &host_x25519_pub_arr,
-        &_authorized.x25519_public,
+        &authorized.x25519_public,
         &id_dh_bytes,
     );
     let ratchet_salt = derive_salt(
         KDF_LABEL_RATCHET,
         &host_x25519_pub_arr,
-        &_authorized.x25519_public,
+        &authorized.x25519_public,
         &id_dh_bytes,
     );
     let ws_salt = derive_salt(
         KDF_LABEL_WS_V1,
         &host_x25519_pub_arr,
-        &_authorized.x25519_public,
+        &authorized.x25519_public,
         &id_dh_bytes,
     );
 
     let hk = Hkdf::<Sha512>::new(Some(&handshake_salt), &ikm);
     let mut root_key = Zeroizing::new(vec![0u8; 64]);
     hk.expand(instance_id.as_bytes(), &mut root_key)
-        .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        .map_err(|e| anyhow::anyhow!("HKDF expand failed: {e:?}"))?;
 
     // Directional labels: s2c (server→client) feeds the server's send chain
     // and the client's recv chain; c2s (client→server) feeds the opposite
@@ -693,13 +691,13 @@ pub fn process_handshake(
         let mut h = sha2::Sha256::new();
         h.update(ss_id.as_bytes());
         h.update(server_eph_public.as_bytes());
-        h.update(&client_eph_arr);
+        h.update(client_eph_arr);
         hex::encode(h.finalize())
     };
 
     let session = PqSession {
         session_id,
-        client_name: _authorized.name.clone(),
+        client_name: authorized.name.clone(),
         root_key,
         send_chain_key: send_chain,
         recv_chain_key: recv_chain,
@@ -740,7 +738,7 @@ pub fn process_handshake(
 fn derive_chain_key(root_key: &[u8], label: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let hk = Hkdf::<Sha256>::new(None, root_key);
     let mut out = Zeroizing::new(vec![0u8; 32]);
-    hk.expand(label, &mut out).map_err(|_| anyhow::anyhow!("HKDF chain key failed"))?;
+    hk.expand(label, &mut out).map_err(|e| anyhow::anyhow!("HKDF chain key failed: {e:?}"))?;
     Ok(out)
 }
 
@@ -749,7 +747,7 @@ fn ratchet_step(chain_key: &[u8], counter: u64) -> anyhow::Result<(Zeroizing<Vec
     let hk = Hkdf::<Sha256>::new(None, chain_key);
     let mut derived = Zeroizing::new(vec![0u8; 64]);
     hk.expand(info.as_bytes(), &mut derived)
-        .map_err(|_| anyhow::anyhow!("HKDF ratchet step failed"))?;
+        .map_err(|e| anyhow::anyhow!("HKDF ratchet step failed: {e:?}"))?;
     let new_chain = Zeroizing::new(derived[..32].to_vec());
     let msg_key = derived[32..64].to_vec();
     Ok((new_chain, msg_key))
@@ -775,7 +773,7 @@ fn ratchet_root(
     let hk = Hkdf::<Sha512>::new(Some(&session.ratchet_salt), &ikm);
     let mut new_root = Zeroizing::new(vec![0u8; 64]);
     hk.expand(&info, &mut new_root)
-        .map_err(|_| anyhow::anyhow!("HKDF DH ratchet failed"))?;
+        .map_err(|e| anyhow::anyhow!("HKDF DH ratchet failed: {e:?}"))?;
     session.send_chain_key = derive_chain_key(&new_root, b"s2c")?;
     session.recv_chain_key = derive_chain_key(&new_root, b"c2s")?;
     session.root_key = new_root;
@@ -840,12 +838,15 @@ where
     session.recv_chain_key = new_chain;
     session.recv_counter += 1;
     session.last_activity = Instant::now();
-    let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
+    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     cipher
         .decrypt(nonce_bytes.into(), Payload { msg: ciphertext, aad: &aad })
         .map_err(|e| anyhow::anyhow!("PQ decrypt failed: {e}"))
 }
+
+/// Result of encrypting an outbound message: (ciphertext, nonce, rekey_pub, effective_epoch).
+type EncryptedResponse = (Vec<u8>, [u8; 12], Option<PublicKey>, u64);
 
 /// Encrypt an outbound message. Returns `(ciphertext, nonce, rekey_pub,
 /// effective_epoch)`. The caller MUST surface `effective_epoch` in the
@@ -855,7 +856,7 @@ pub fn encrypt_response<F>(
     session: &mut PqSession,
     plaintext: &[u8],
     aad_builder: F,
-) -> anyhow::Result<(Vec<u8>, [u8; 12], Option<PublicKey>, u64)>
+) -> anyhow::Result<EncryptedResponse>
 where
     F: FnOnce(u64) -> Vec<u8>,
 {
@@ -873,7 +874,7 @@ where
     session.send_chain_key = new_chain;
     session.send_counter += 1;
     session.last_activity = Instant::now();
-    let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
+    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     let mut nonce_bytes = [0u8; 12];
     {
@@ -950,7 +951,7 @@ pub fn derive_ws_subsession(
     info.extend_from_slice(connection_nonce);
     let mut ws_root = Zeroizing::new(vec![0u8; 64]);
     hk.expand(&info, &mut ws_root)
-        .map_err(|_| anyhow::anyhow!("HKDF WS sub-session derivation failed"))?;
+        .map_err(|e| anyhow::anyhow!("HKDF WS sub-session derivation failed: {e:?}"))?;
     let (send_label, recv_label): (&[u8], &[u8]) = match role {
         WsRole::Server => (b"ws-s2c", b"ws-c2s"),
         WsRole::Client => (b"ws-c2s", b"ws-s2c"),
@@ -971,7 +972,7 @@ pub fn encrypt_ws_frame(sub: &mut WsSubSession, plaintext: &[u8], aad: &[u8]) ->
     let (new_chain, msg_key) = ratchet_step(&sub.send_chain_key, sub.send_counter)?;
     sub.send_chain_key = new_chain;
     sub.send_counter += 1;
-    let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
+    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     if sub.epoch > u32::MAX as u64 {
         anyhow::bail!("WS sub-session epoch exhausted");
@@ -992,10 +993,10 @@ pub fn decrypt_ws_frame(sub: &mut WsSubSession, frame: &[u8], aad: &[u8]) -> any
         anyhow::bail!("WS frame too short (need at least 12 bytes for nonce)");
     }
     let nonce_bytes: [u8; 12] = frame[..12].try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid nonce slice"))?;
+        .map_err(|e| anyhow::anyhow!("Invalid nonce slice: {e:?}"))?;
     let ciphertext = &frame[12..];
     let (candidate_chain, msg_key) = ratchet_step(&sub.recv_chain_key, sub.recv_counter)?;
-    let key: [u8; 32] = msg_key.try_into().map_err(|_| anyhow::anyhow!("Bad key len"))?;
+    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     let plaintext = cipher
         .decrypt((&nonce_bytes).into(), Payload { msg: ciphertext, aad })

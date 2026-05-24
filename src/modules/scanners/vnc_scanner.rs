@@ -6,7 +6,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{Result, Context, anyhow};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -28,6 +28,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -124,6 +125,8 @@ async fn scan_vnc(
                     );
                     error_msg = Some(String::from_utf8_lossy(&sec_buf[8..8 + msg_len]).to_string());
                 }
+            } else if sec_type > 255 {
+                tracing::warn!("Unknown VNC security type {sec_type}, skipping");
             } else {
                 let t = sec_type as u8;
                 security_types.push(t);
@@ -198,7 +201,7 @@ impl std::fmt::Display for VncResult {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -218,6 +221,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     };
 
     let mut results = Vec::new();
+    let mut outcome = ModuleOutcome::ok();
 
     for p in &ports {
         if crate::context::is_cancelled() { break; }
@@ -235,6 +239,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         service: "vnc".to_string(),
                         version: Some(format!("noauth display=:{}", display_num)),
                     });
+
+                    // No-auth VNC is a vulnerability
+                    outcome.findings.push(Finding {
+                        target: format!("{}:{}", target, p),
+                        kind: FindingKind::Vulnerable,
+                        message: format!(
+                            "VNC server requires no authentication (display :{})",
+                            display_num
+                        ),
+                        data: Some(serde_json::json!({
+                            "host": target,
+                            "port": p,
+                            "display": display_num,
+                            "version": result.version,
+                            "no_auth": true,
+                            "security_types": result.security_types.iter()
+                                .map(|t| format!("{}({})", t, security_type_name(*t)))
+                                .collect::<Vec<_>>(),
+                        })),
+                    });
                 } else if !result.security_types.is_empty() {
                     crate::mprintln!("{}", format!("[+] {}", result).green());
                     crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
@@ -242,6 +266,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         port: *p,
                         service: "vnc".to_string(),
                         version: Some(format!("display=:{}", display_num)),
+                    });
+
+                    // Open VNC with auth is informational
+                    outcome.findings.push(Finding {
+                        target: format!("{}:{}", target, p),
+                        kind: FindingKind::Banner,
+                        message: format!(
+                            "VNC service detected: {} (display :{})",
+                            result.version, display_num
+                        ),
+                        data: Some(serde_json::json!({
+                            "host": target,
+                            "port": p,
+                            "display": display_num,
+                            "version": result.version,
+                            "no_auth": false,
+                            "security_types": result.security_types.iter()
+                                .map(|t| format!("{}({})", t, security_type_name(*t)))
+                                .collect::<Vec<_>>(),
+                        })),
                     });
                 } else if let Some(ref err) = result.error_msg {
                     crate::mprintln!("{}", format!("[!] Server error: {}", err).yellow());
@@ -280,12 +324,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(&output_path, content)
+        tokio::fs::write(&output_path, content).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 crate::register_native_module!(crate::module::Category::Scanners, "vnc_scanner", native);

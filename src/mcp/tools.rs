@@ -557,7 +557,6 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     let module_config = crate::config::ModuleConfig {
         api_mode: true,
         custom_prompts: prompts,
-        ..Default::default()
     };
 
     let output_buf = crate::output::OutputBuffer::new();
@@ -649,7 +648,7 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
     };
 
     match crate::cred_store::CRED_STORE
-        .add(host, port, service, username, secret, cred_type, "mcp")
+        .add(crate::cred_store::NewCred { host, port, service, username, secret, cred_type, source_module: "mcp" })
         .await
     {
         Some(id) => ToolResult::json(&json!({ "id": id, "status": "added" })),

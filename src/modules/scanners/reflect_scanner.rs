@@ -32,6 +32,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         ],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -301,15 +302,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // Resolve target IP
-    let ip: IpAddr = target.parse().map_err(|_| {
-        // Try DNS resolution
-        use std::net::ToSocketAddrs;
-        format!("{}:0", target).to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .map(|sa| sa.ip())
-            .ok_or_else(|| anyhow!("Cannot resolve target: {}", target))
-    }).or_else(|r: Result<IpAddr, _>| r)?;
+    let ip: IpAddr = match target.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            tracing::debug!("parse IP failed: {e}");
+            tokio::net::lookup_host(format!("{}:0", target))
+                .await
+                .ok()
+                .and_then(|mut a| a.next())
+                .map(|sa| sa.ip())
+                .ok_or_else(|| anyhow!("Cannot resolve target: {}", target))?
+        }
+    };
 
     if !batch {
         crate::mprintln!("[*] Scanning {}...", ip);

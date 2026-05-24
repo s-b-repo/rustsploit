@@ -12,7 +12,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     cfg_prompt_default,
     cfg_prompt_existing_file,
@@ -23,6 +23,7 @@ use crate::utils::{
     load_lines,
     normalize_target,
 };
+use crate::utils::wordlist;
 use crate::utils::{
     generate_combos_mode,
     parse_combo_mode,
@@ -43,6 +44,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 
@@ -114,9 +116,9 @@ async fn try_http_connect_auth(
     let mut buf = [0u8; 1024];
     let n = match tokio::time::timeout(dur, stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
-        Ok(Ok(_)) => return LoginResult::Error { message: "Empty response".to_string(), retryable: false },
+        Ok(Ok(n)) => { tracing::trace!("proxy read returned {n} bytes (empty)"); return LoginResult::Error { message: "Empty response".to_string(), retryable: false }; }
         Ok(Err(e)) => return LoginResult::Error { message: e.to_string(), retryable: true },
-        Err(_) => return LoginResult::Error { message: "Read timeout".to_string(), retryable: true },
+        Err(e) => return LoginResult::Error { message: format!("Read timeout: {e}"), retryable: true },
     };
 
     let resp = String::from_utf8_lossy(&buf[..n]);
@@ -142,13 +144,21 @@ async fn try_socks5_auth(
     };
 
     // SOCKS5 greeting: version 5, 1 method, username/password (0x02)
-    if tokio::time::timeout(dur, stream.write_all(&[0x05, 0x01, 0x02])).await.is_err() {
-        return LoginResult::Error { message: "Greeting timeout".to_string(), retryable: true };
+    match tokio::time::timeout(dur, stream.write_all(&[0x05, 0x01, 0x02])).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::trace!("SOCKS5 greeting write failed: {e}");
+            return LoginResult::Error { message: "Greeting write failed".to_string(), retryable: true };
+        }
+        Err(e) => {
+            tracing::trace!("SOCKS5 greeting write timed out: {e}");
+            return LoginResult::Error { message: "Greeting timeout".to_string(), retryable: true };
+        }
     }
 
     let mut buf = [0u8; 2];
     match tokio::time::timeout(dur, stream.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(n)) => { tracing::trace!("SOCKS5 greeting read_exact returned {n} bytes"); }
         _ => return LoginResult::Error { message: "Greeting response timeout".to_string(), retryable: true },
     }
 
@@ -172,13 +182,21 @@ async fn try_socks5_auth(
     auth_pkt.push(pass_bytes.len() as u8);
     auth_pkt.extend_from_slice(pass_bytes);
 
-    if tokio::time::timeout(dur, stream.write_all(&auth_pkt)).await.is_err() {
-        return LoginResult::Error { message: "Auth write timeout".to_string(), retryable: true };
+    match tokio::time::timeout(dur, stream.write_all(&auth_pkt)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::trace!("SOCKS5 auth write failed: {e}");
+            return LoginResult::Error { message: "Auth write failed".to_string(), retryable: true };
+        }
+        Err(e) => {
+            tracing::trace!("SOCKS5 auth write timed out: {e}");
+            return LoginResult::Error { message: "Auth write timeout".to_string(), retryable: true };
+        }
     }
 
     let mut resp = [0u8; 2];
     match tokio::time::timeout(dur, stream.read_exact(&mut resp)).await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(n)) => { tracing::trace!("SOCKS5 auth read_exact returned {n} bytes"); }
         _ => return LoginResult::Error { message: "Auth response timeout".to_string(), retryable: true },
     }
 
@@ -207,8 +225,16 @@ async fn try_http_forward_auth(
         cred
     );
 
-    if tokio::time::timeout(dur, stream.write_all(req.as_bytes())).await.is_err() {
-        return LoginResult::Error { message: "Write timeout".to_string(), retryable: true };
+    match tokio::time::timeout(dur, stream.write_all(req.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::trace!("HTTP proxy request write failed: {e}");
+            return LoginResult::Error { message: "Write failed".to_string(), retryable: true };
+        }
+        Err(e) => {
+            tracing::trace!("HTTP proxy request write timed out: {e}");
+            return LoginResult::Error { message: "Write timeout".to_string(), retryable: true };
+        }
     }
 
     let mut buf = [0u8; 2048];
@@ -264,8 +290,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let port = cfg_prompt_port("port", &format!("{} port", proxy_type.name()), proxy_type.default_port()).await?;
         let users_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
         let pass_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = load_lines(&users_file)?;
-        let passes = load_lines(&pass_file)?;
+        let users = if wordlist::should_stream(&users_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&users_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&users_file)?
+        };
+        let passes = if wordlist::should_stream(&pass_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&pass_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&pass_file)?
+        };
         if users.is_empty() { return Err(anyhow!("Username list empty")); }
         if passes.is_empty() { return Err(anyhow!("Password list empty")); }
         let concurrency = cfg_prompt_int_range("concurrency", "Concurrent hosts", 50, 1, 500).await? as usize;
@@ -296,6 +340,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Single target ---
+    let mut outcome = ModuleOutcome::ok();
     display_banner();
 
     let proxy_type_input = cfg_prompt_default("proxy_type", "Proxy type (http_connect/socks5/http_forward)", "http_connect").await?;
@@ -305,8 +350,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let users_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
     let pass_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-    let usernames = load_lines(&users_file)?;
-    let passwords = load_lines(&pass_file)?;
+    let usernames = if wordlist::should_stream(&users_file) {
+        let mut lines = Vec::new();
+        let mut reader = wordlist::BatchedReader::open(&users_file).await?;
+        while let Some(batch) = reader.next_batch().await? {
+            lines.extend(batch);
+        }
+        lines
+    } else {
+        load_lines(&users_file)?
+    };
+    let passwords = if wordlist::should_stream(&pass_file) {
+        let mut lines = Vec::new();
+        let mut reader = wordlist::BatchedReader::open(&pass_file).await?;
+        while let Some(batch) = reader.next_batch().await? {
+            lines.extend(batch);
+        }
+        lines
+    } else {
+        load_lines(&pass_file)?
+    };
     if usernames.is_empty() { return Err(anyhow!("Username list empty")); }
     if passwords.is_empty() { return Err(anyhow!("Password list empty")); }
 
@@ -356,7 +419,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     result.print_found();
     result.save_to_file(&save_path)?;
 
-    Ok(ModuleOutcome::ok())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid proxy credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "proxy",
+                "proxy_type": format!("{:?}", proxy_type),
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 crate::register_native_module!(crate::module::Category::Creds, "generic/proxy_bruteforce", native);

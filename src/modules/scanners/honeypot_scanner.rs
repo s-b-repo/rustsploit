@@ -31,7 +31,7 @@ const HONEYPOT_PORTS: &[u16] = &[
 async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
     let parsed_ip: std::net::IpAddr = match ip.parse() {
         Ok(addr) => addr,
-        Err(_) => return (0, Vec::new()),
+        Err(e) => { tracing::debug!("parse IP failed: {e}"); return (0, Vec::new()); }
     };
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -47,7 +47,7 @@ async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
         tasks.push(tokio::spawn(async move {
             let _permit = match sem.acquire().await {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(e) => { tracing::debug!("semaphore closed: {e}"); return; }
             };
             if crate::utils::network::tcp_port_open(parsed_ip, port, timeout).await {
                 count.fetch_add(1, Ordering::Relaxed);
@@ -59,7 +59,9 @@ async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
 
     let count = open_count.load(Ordering::Relaxed);
@@ -108,7 +110,7 @@ async fn scan_targets(
         let permit = semaphore.clone().acquire_owned().await;
         let permit = match permit {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(e) => { tracing::debug!("semaphore closed: {e}"); continue; }
         };
         let res = results.clone();
         let prog = progress.clone();
@@ -139,7 +141,9 @@ async fn scan_targets(
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
 
     let mut out = results.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -350,6 +354,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         ],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

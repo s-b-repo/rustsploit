@@ -8,11 +8,11 @@
 //!      .well-known/openid-configuration` to confirm tenant exists.
 //!   2. POST `https://login.microsoftonline.com/common/GetCredentialType`
 //!      `{"Username": "user@domain"}` and parse `IfExistsResult`:
-//!        0 = exists, 1 = does-not-exist, 5 = federated, 6 = exists-throttled.
+//!      0 = exists, 1 = does-not-exist, 5 = federated, 6 = exists-throttled.
 //!
 //! Non-destructive; widely accepted as P3 finding.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use colored::*;
 use std::time::Duration;
 
@@ -44,14 +44,21 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
 async fn probe_tenant(client: &reqwest::Client, tenant_label: &str) -> Result<bool> {
     let url = format!("https://login.microsoftonline.com/{}/.well-known/openid-configuration", tenant_label);
-    let r = client.get(&url).send().await.map_err(|e| anyhow!(e))?;
+    let r = client.get(&url).send().await.context("OIDC config request failed")?;
     let s = r.status();
-    let body = r.text().await.unwrap_or_default();
+    let body = match r.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to read response body: {}", e);
+            String::new()
+        }
+    };
     if s.is_success() && body.contains("token_endpoint") {
         crate::mprintln!("{}", format!("[+] Tenant '{}' exists ({} bytes OIDC config)", tenant_label, body.len()).green().bold());
         Ok(true)
@@ -85,9 +92,15 @@ async fn check_user(client: &reqwest::Client, username: &str) -> Result<i64> {
             .send().await
     })
     .await
-    .map_err(|e| anyhow!(e))?;
+    .context("GetCredentialType request failed")?;
 
-    let txt = r.text().await.unwrap_or_default();
+    let txt = match r.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to read response body: {}", e);
+            String::new()
+        }
+    };
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
     let result = v.get("IfExistsResult").and_then(|x| x.as_i64()).unwrap_or(-1);
     Ok(result)
@@ -140,7 +153,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     let path = cfg_prompt_existing_file("user_list", "Path to newline-separated user@domain list").await?;
-    let users = std::fs::read_to_string(&path)?;
+    let users = tokio::fs::read_to_string(&path).await.context("Failed to read user list")?;
     let candidates: Vec<&str> = users.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
     crate::mprintln!("{}", format!("[*] Probing {} users via GetCredentialType (paced)...", candidates.len()).cyan());
 

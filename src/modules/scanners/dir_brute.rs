@@ -352,7 +352,7 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
 
     let mut tasks = Vec::new();
 
-    for word in lines.iter().cloned() {
+    for word in lines.iter() {
         let sem = Arc::clone(&sem);
         let client = client.clone();
         let base = base_url.clone();
@@ -367,6 +367,7 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
         let cancel = ctx.cancel.clone();
+        let word = word.clone();
 
         let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
             let _permit = sem.acquire().await.context("Semaphore acquisition failed")?;
@@ -390,50 +391,57 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
                 }
 
                 limiter.acquire(&module_path, &target_host).await;
-                if let Ok(resp) = req_builder.send().await {
-                     let status = resp.status().as_u16();
-                     let len = resp.content_length().unwrap_or(0);
+                match req_builder.send().await {
+                    Ok(resp) => {
+                         let status = resp.status().as_u16();
+                         let len = resp.content_length().unwrap_or(0);
 
-                     // Special handling for 403 Forbidden
-                     if status == 403 {
-                         f_count.fetch_add(1, Ordering::Relaxed);
-                         if !config_verbose {
-                             continue; // Skip printing if not verbose
+                         // Special handling for 403 Forbidden
+                         if status == 403 {
+                             f_count.fetch_add(1, Ordering::Relaxed);
+                             if !config_verbose {
+                                 continue; // Skip printing if not verbose
+                             }
                          }
-                     }
 
-                     // Determine if "Interesting"
-                     if COMMON_STATUS_CODES.contains(&status) {
-                         let method_str = method.as_str();
+                         // Determine if "Interesting"
+                         if COMMON_STATUS_CODES.contains(&status) {
+                             let method_str = method.as_str();
 
-                         // Enhanced Color Logic
-                         let status_display = if status >= 200 && status < 300 {
-                             format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
-                         } else if status >= 300 && status < 400 {
-                             format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
-                         } else if status >= 500 {
-                             format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
-                         } else if status == 403 || status == 401 {
-                             format!("{} {}", "[AUTH]".yellow().bold(), status.to_string().yellow())
-                         } else {
-                             format!("[{}]", status).white().to_string()
-                         };
+                             // Enhanced Color Logic
+                             let status_display = if (200..300).contains(&status) {
+                                 format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
+                             } else if (300..400).contains(&status) {
+                                 format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
+                             } else if status >= 500 {
+                                 format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
+                             } else if status == 403 || status == 401 {
+                                 format!("{} {}", "[AUTH]".yellow().bold(), status.to_string().yellow())
+                             } else {
+                                 format!("[{}]", status).white().to_string()
+                             };
 
-                         crate::mprintln!("{} Size: {} | Method: {} | {}",
-                             status_display,
-                             len.to_string().dimmed(),
-                             method_str.bold(),
-                             url
-                         );
+                             crate::mprintln!("{} Size: {} | Method: {} | {}",
+                                 status_display,
+                                 len.to_string().dimmed(),
+                                 method_str.bold(),
+                                 url
+                             );
 
-                         let res = ScanResult {
-                             path: url.clone(),
-                             method: method.to_string(),
-                             status,
-                             len,
-                         };
-                         r_mutex.lock().await.push(res);
-                     }
+                             let res = ScanResult {
+                                 path: url.clone(),
+                                 method: method.to_string(),
+                                 status,
+                                 len,
+                             };
+                             r_mutex.lock().await.push(res);
+                         }
+                    }
+                    Err(e) => {
+                        if config_verbose {
+                            crate::meprintln!("[!] Request failed for {}: {}", url, e);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -443,7 +451,15 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
     
     // Await all
     for t in tasks {
-        let _ = t.await;
+        match t.await {
+            Err(e) => {
+                eprintln!("[!] Task join failed: {}", e);
+            }
+            Ok(Err(e)) => {
+                eprintln!("[!] Task inner error: {}", e);
+            }
+            Ok(Ok(())) => {}
+        }
     }
 
     crate::mprintln!("\n{}", "Scan Complete.".green().bold());
@@ -476,9 +492,9 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
         
         let mut sorted: Vec<&ScanResult> = final_results.iter().collect();
         if sort_choice == "2" {
-            sorted.sort_by(|a, b| b.len.cmp(&a.len)); // Size desc
+            sorted.sort_by_key(|b| std::cmp::Reverse(b.len)); // Size desc
         } else {
-            sorted.sort_by(|a, b| a.status.cmp(&b.status)); // Status asc
+            sorted.sort_by_key(|a| a.status); // Status asc
         }
         
         let filename = format!("scan_results_{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S"));
@@ -538,6 +554,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

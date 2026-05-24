@@ -7,6 +7,7 @@
 //!   `subfinder | dnsx -cname -resp-only | grep cloudfront/heroku/github.io | httpx`
 
 use anyhow::Result;
+use anyhow::Context;
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::net::{IpAddr, SocketAddr};
@@ -86,6 +87,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -123,7 +125,7 @@ async fn resolve_cname_chain(host: &str, resolver: &str) -> Vec<String> {
                     None => break,
                 }
             }
-            Err(_) => break,
+            Err(e) => { tracing::debug!("CNAME lookup failed: {e}"); break; }
         }
     }
     chain
@@ -134,7 +136,7 @@ async fn resolves_to_a(host: &str, resolver: &str) -> bool {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     banner();
     let mut outcome = ModuleOutcome::ok();
 
@@ -194,7 +196,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         match client.get(&url).send().await {
             Ok(r) => {
                 let status = r.status();
-                let body = r.text().await.unwrap_or_default();
+                let body = match r.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Failed to read response body: {}", e);
+                        String::new()
+                    }
+                };
                 let snippet: String = body.chars().take(200).collect();
                 crate::mprintln!("{}", format!("[*] {} status={} body[0..200]={:?}", url, status, snippet).cyan());
                 if let Some(fp) = matched_fp

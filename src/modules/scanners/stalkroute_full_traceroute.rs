@@ -23,7 +23,7 @@ use socket2::{ Domain, Protocol, Socket, Type };
 use colored::*;
 
 use anyhow::{ Result, Context, anyhow, bail };
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 
 
 const IPV4_FLAG_DF: u16 = 2;
@@ -70,7 +70,7 @@ enum ProbeProtocolType {
 }
 
 impl ProbeProtocolType {
-    fn to_ip_next_header_protocol(&self) -> pnet_packet::ip::IpNextHeaderProtocol {
+    fn to_ip_next_header_protocol(self) -> pnet_packet::ip::IpNextHeaderProtocol {
         match self {
             ProbeProtocolType::Icmp => IpNextHeaderProtocols::Icmp,
             ProbeProtocolType::Udp => IpNextHeaderProtocols::Udp,
@@ -78,7 +78,7 @@ impl ProbeProtocolType {
         }
     }
 
-    fn to_string_lc(&self) -> String {
+    fn to_string_lc(self) -> String {
         match self {
             ProbeProtocolType::Icmp => "icmp".to_string(),
             ProbeProtocolType::Udp => "udp".to_string(),
@@ -126,7 +126,6 @@ fn craft_probe_packet(
     let payload: Vec<u8> = rng.clone()
         .sample_iter(&Alphanumeric)
         .take(payload_size)
-        .map(|c| c as u8)
         .collect();
 
     let (transport_header_len, transport_packet_data) = match protocol_type {
@@ -269,7 +268,8 @@ async fn send_and_receive_one(
                 && ip_pkt.get_next_level_protocol() == IpNextHeaderProtocols::Icmp
                     && let Some(icmp_pkt) = icmp::IcmpPacket::new(ip_pkt.payload()) {
                         let icmp_type = icmp_pkt.get_icmp_type();
-                        let _ = icmp_pkt.get_icmp_code();
+                        let icmp_code = icmp_pkt.get_icmp_code();
+                        tracing::trace!("ICMP response: type={}, code={}", icmp_type.0, icmp_code.0);
                         let mut matched = false;
 
                         if icmp_type == IcmpTypes::TimeExceeded || icmp_type == IcmpTypes::DestinationUnreachable {
@@ -324,7 +324,17 @@ async fn send_and_receive_one(
     }
 }
 
-async fn execute_traceroute(target_name: &str) -> Result<()> {
+#[derive(Debug, Clone)]
+struct TracerouteHop {
+    ttl: u8,
+    ip: String,
+    rtt_ms: f32,
+    protocol: String,
+    icmp_desc: String,
+    reached_target: bool,
+}
+
+async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
     crate::mprintln!("{}", format!("[+] Traceroute to {} (max {} hops)", target_name, MAX_TTL).cyan());
 
     let resolved_ips = tokio::net::lookup_host(format!("{}:0", target_name))
@@ -348,6 +358,7 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
 
     let src_ip_override_opt: Option<Ipv4Addr> = SPOOF_SRC_IP_CONFIG.and_then(|s| s.parse().ok());
 
+    let mut hops: Vec<TracerouteHop> = Vec::new();
 
     for ttl_val in 1..=MAX_TTL {
         if crate::context::is_cancelled() {
@@ -399,11 +410,19 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
                 crate::mprint!("{} ", res.icmp_info.description);
                 crate::mprintln!("({}) {}", res.probe_protocol_used.dimmed(), rtt_str);
 
-                if res.source_ip == dst_ip
-                    && (res.icmp_info.icmp_type == IcmpTypes::EchoReply.0 ||
-                        (res.icmp_info.icmp_type == IcmpTypes::DestinationUnreachable.0 && res.source_ip == dst_ip)) {
+                let reached = (res.icmp_info.icmp_type == IcmpTypes::DestinationUnreachable.0 || res.icmp_info.icmp_type == IcmpTypes::EchoReply.0) && res.source_ip == dst_ip;
+                hops.push(TracerouteHop {
+                    ttl: ttl_val,
+                    ip: res.source_ip.to_string(),
+                    rtt_ms: res.rtt_ms,
+                    protocol: res.probe_protocol_used.clone(),
+                    icmp_desc: res.icmp_info.description.clone(),
+                    reached_target: reached,
+                });
+
+                if reached {
                         crate::mprintln!("{}", format!("[+] Target reached: {}", res.source_ip).green());
-                        return Ok(());
+                        return Ok(hops);
                     }
             }
 
@@ -419,11 +438,11 @@ async fn execute_traceroute(target_name: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(hops)
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     crate::utils::require_root("stalkroute_full_traceroute (raw ICMP/TCP/UDP probes)")?;
 
     crate::mprintln!("by suicidalteddy");
@@ -435,11 +454,41 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     ctx.rate_limit(target).await;
-    execute_traceroute(target).await.map_err(|e| {
+    let hops = execute_traceroute(target).await.map_err(|e| {
         crate::meprintln!("{}", format!("[-] Error: {}", e).red());
         e
     })?;
-    Ok(ModuleOutcome::ok())
+
+    let mut outcome = ModuleOutcome::ok();
+    let hop_summaries: Vec<serde_json::Value> = hops.iter().map(|h| {
+        serde_json::json!({
+            "ttl": h.ttl,
+            "ip": h.ip,
+            "rtt_ms": h.rtt_ms,
+            "protocol": h.protocol,
+            "icmp_desc": h.icmp_desc,
+            "reached_target": h.reached_target,
+        })
+    }).collect();
+    let total_hops = hops.len();
+    let reached = hops.iter().any(|h| h.reached_target);
+    outcome = outcome.with(Finding {
+        target: target.to_string(),
+        kind: FindingKind::Note,
+        message: format!(
+            "Traceroute to {} completed: {} hops, target {}",
+            target,
+            total_hops,
+            if reached { "reached" } else { "not reached" }
+        ),
+        data: Some(serde_json::json!({
+            "target": target,
+            "total_hops": total_hops,
+            "reached": reached,
+            "hops": hop_summaries,
+        })),
+    });
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -450,6 +499,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

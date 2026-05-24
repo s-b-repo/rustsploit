@@ -11,7 +11,7 @@
 //!   - `http:` (mixed content) sources
 //!   - Bypassable CDNs (jsdelivr, unpkg, googletagmanager, googleapis)
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use colored::*;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -54,6 +54,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -132,13 +133,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     })?;
     ctx.rate_limit(target).await;
     let resp = client.get(&url).send().await
-        .map_err(|e| anyhow!("Request failed: {}", e))?;
+        .context("Request failed")?;
     let status = resp.status();
     let header_csp = resp.headers()
         .get("content-security-policy")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let body = resp.text().await.unwrap_or_default();
+    let body = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to read response body: {}", e);
+            String::new()
+        }
+    };
     let meta_csp = extract_meta_csp(&body);
 
     crate::mprintln!("{}", format!("[*] {} -> {}", url, status).cyan());

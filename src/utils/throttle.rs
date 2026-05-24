@@ -75,7 +75,8 @@ impl BackoffConfig {
     }
 
     /// Conservative one-shot policy: try the request, retry once if 429.
-    #[allow(dead_code)] // public preset offered for downstream scanners
+    /// Used by light-weight probes that prefer to skip a host rather than
+    /// retry through a long Retry-After.
     pub fn lenient() -> Self {
         Self {
             base_ms: 250,

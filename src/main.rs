@@ -65,7 +65,7 @@ fn validate_bind_address(addr: &str) -> Result<String> {
 
     with_port
         .parse::<SocketAddr>()
-        .map_err(|e| anyhow!("Invalid bind address '{}': {}", with_port, e))?;
+        .with_context(|| format!("Invalid bind address '{}'", with_port))?;
 
     Ok(with_port)
 }
@@ -75,10 +75,13 @@ fn pq_host_key_path(custom: Option<&str>) -> std::path::PathBuf {
     if let Some(p) = custom {
         std::path::PathBuf::from(p)
     } else {
-        home::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".rustsploit")
-            .join("pq_host_key")
+        // Refuse to fall back to CWD for security-sensitive key material —
+        // CWD may be world-readable or an attacker-controlled directory.
+        let home = home::home_dir().unwrap_or_else(|| {
+            eprintln!("[!] $HOME not set — PQ host key will use /tmp/.rustsploit (insecure fallback)");
+            std::path::PathBuf::from("/tmp")
+        });
+        home.join(".rustsploit").join("pq_host_key")
     }
 }
 
@@ -87,10 +90,11 @@ fn pq_authorized_keys_path(custom: Option<&str>) -> std::path::PathBuf {
     if let Some(p) = custom {
         std::path::PathBuf::from(p)
     } else {
-        home::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".rustsploit")
-            .join("pq_authorized_keys")
+        let home = home::home_dir().unwrap_or_else(|| {
+            eprintln!("[!] $HOME not set — PQ authorized keys will use /tmp/.rustsploit (insecure fallback)");
+            std::path::PathBuf::from("/tmp")
+        });
+        home.join(".rustsploit").join("pq_authorized_keys")
     }
 }
 
@@ -144,7 +148,7 @@ async fn run() -> Result<()> {
     if cli_args.gen_module_catalog {
         let md = module::render_catalog_markdown();
         let out = std::path::Path::new("docs/Module-Catalog.md");
-        std::fs::write(out, md).context("Failed to write docs/Module-Catalog.md")?;
+        tokio::fs::write(out, md).await.context("Failed to write docs/Module-Catalog.md")?;
         println!("{} Wrote {} ({} modules)",
             "✓".green(), out.display(), module::count());
         return Ok(());

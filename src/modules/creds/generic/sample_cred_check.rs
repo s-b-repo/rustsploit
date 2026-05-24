@@ -14,6 +14,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 
@@ -54,11 +55,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         crate::mprintln!("{}", "[+] Default credentials admin:admin are valid!".green().bold());
         // Persist discovered credential to the framework's credential store.
         // The scheduler also routes the Finding below into LootStore.
-        let _ = crate::cred_store::store_credential(
-            target, 80, "http", "admin", "admin",
-            crate::cred_store::CredType::Password,
-            "creds/generic/sample_cred_check",
-        ).await;
+        if crate::cred_store::store_credential(crate::cred_store::NewCred {
+            host: target, port: 80, service: "http", username: "admin", secret: "admin",
+            cred_type: crate::cred_store::CredType::Password,
+            source_module: "creds/generic/sample_cred_check",
+        }).await.is_none() { eprintln!("[!] Failed to store credential"); }
         outcome.findings.push(Finding {
             target: target.to_string(),
             kind: FindingKind::Credential,

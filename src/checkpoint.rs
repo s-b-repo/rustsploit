@@ -121,7 +121,7 @@ impl CheckpointWriter {
         let mut g = self.inner.lock().await;
         g.closed = true;
         if g.path.exists() {
-            std::fs::remove_file(&g.path)
+            tokio::fs::remove_file(&g.path).await
                 .with_context(|| format!("rm {}", g.path.display()))?;
         }
         Ok(())
@@ -183,7 +183,7 @@ pub fn list_checkpoints() -> Result<Vec<Checkpoint>> {
         }
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => { tracing::debug!("skipping unreadable checkpoint {}: {e}", path.display()); continue; }
         };
         if let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw) {
             out.push(cp);

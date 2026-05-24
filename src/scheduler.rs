@@ -63,10 +63,16 @@ impl SchedulerLimits {
         let mut l = Self::default();
         let scope = crate::tenant::resolve();
         let opts = scope.global_options();
-        if let Some(v) = opts.try_get("concurrency").and_then(|v| v.parse().ok()) {
+        if let Some(v) = opts.try_get("concurrency")
+            .or_else(|| opts.try_get("threads"))
+            .and_then(|v| v.parse().ok())
+        {
             l.concurrency = v;
         }
-        if let Some(v) = opts.try_get("module_timeout").and_then(|v| v.parse().ok()) {
+        if let Some(v) = opts.try_get("module_timeout")
+            .or_else(|| opts.try_get("timeout"))
+            .and_then(|v| v.parse().ok())
+        {
             l.timeout_secs = v;
         }
         if let Some(v) = opts.try_get("max_random_hosts").and_then(|v| v.parse().ok()) {
@@ -106,13 +112,14 @@ impl ScanStats {
                 } else {
                     self.failed.fetch_add(1, Ordering::Relaxed);
                 }
-                if !out.findings.is_empty()
-                    && let Ok(mut g) = self.findings.lock() {
-                        g.extend(out.findings);
-                    }
+                if !out.findings.is_empty() {
+                    let mut g = self.findings.lock().unwrap_or_else(|e| e.into_inner());
+                    g.extend(out.findings);
+                }
                 false
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!("module run failed: {e:#}");
                 self.failed.fetch_add(1, Ordering::Relaxed);
                 true
             }
@@ -173,7 +180,7 @@ async fn run_with_limits_shared(
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
     let cancel = crate::context::cancellation_token()
-        .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+        .unwrap_or_default();
     let tenant_id = crate::context::current_tenant_id();
     let module_path = current_module_path(module.as_ref());
 
@@ -191,20 +198,38 @@ async fn run_with_limits_shared(
     }
     drop(precheck_ctx);
 
+    // If no explicit `setg port` was given, fall back to the module's
+    // declared default_port so mass-scan pre-checks can skip hosts that
+    // don't have the service port open.
+    let limits = {
+        let mut l = limits;
+        if l.precheck_port.is_none() {
+            l.precheck_port = module.info().default_port;
+        }
+        l
+    };
+
     // Mass-scan fan-out is universal: every module gets fanned out per host
     // for Cidr/Multi/File/Random, sees `Target::Single` inside `run()`.
     let outcome = match target.clone() {
-        Target::Single(_) => fanout_single(module.clone(), target, options, cancel, tenant_id.clone(), verbose, limits, module_path.clone()).await,
-        Target::Cidr(_) => fanout_cidr(module.clone(), target, options, cancel, tenant_id.clone(), limits, module_path.clone(), shared_sem.clone()).await,
-        Target::File(_) => fanout_file(module.clone(), target, options, cancel, tenant_id.clone(), limits, module_path.clone(), shared_sem.clone()).await,
+        Target::Single(_) => fanout_single(FanoutParams { module: module.clone(), target, options, cancel, tenant_id: tenant_id.clone(), limits, module_path: module_path.clone() }, verbose).await,
+        Target::Cidr(_) => fanout_cidr(FanoutParams { module: module.clone(), target, options, cancel, tenant_id: tenant_id.clone(), limits, module_path: module_path.clone() }, shared_sem.clone()).await,
+        Target::File(_) => fanout_file(FanoutParams { module: module.clone(), target, options, cancel, tenant_id: tenant_id.clone(), limits, module_path: module_path.clone() }, shared_sem.clone()).await,
         Target::Multi(_) => fanout_multi(module.clone(), target, options, cancel, tenant_id.clone(), verbose, limits).await,
         Target::Random => fanout_random(module.clone(), options, cancel, tenant_id.clone(), limits, module_path.clone(), shared_sem.clone()).await,
     };
 
-    // Cleanup runs whether the fan-out succeeded or failed. Module owners
-    // should rely on this for resource release rather than `Drop` impls so
-    // async cleanup paths can `.await`.
-    if let Ok(ref out) = outcome {
+    // Cleanup runs whether the fan-out succeeded or failed so modules
+    // can release resources (connections, temp files) unconditionally.
+    {
+        let fallback = ModuleOutcome::fail();
+        let out = match outcome {
+            Ok(ref o) => o,
+            Err(ref e) => {
+                crate::meprintln!("[!] Fan-out failed: {e:#}");
+                &fallback
+            }
+        };
         let mut cleanup_ctx = ModuleCtx::new(Target::Single(String::new()));
         cleanup_ctx.tenant_id = tenant_id;
         cleanup_ctx.verbose = verbose;
@@ -222,10 +247,13 @@ async fn run_with_limits_shared(
 /// limiter and finding-routing know which entry produced a given outcome.
 fn current_module_path(module: &dyn Module) -> String {
     let info_name = module.info().name;
+    // Pass 1: compare display name without instantiating every module.
+    // `entry.name` is the registry key (e.g. "ssh/known_vuln"), while
+    // `info_name` is the human-readable title. We need to compare
+    // info().name from the factory, but avoid instantiating all modules.
+    // Instead, compare the passed module's info().name against each
+    // factory's info().name — break on first match to avoid O(N) allocs.
     for entry in crate::module::registered() {
-        if entry.name == info_name {
-            return format!("{}/{}", entry.category.as_str(), entry.name);
-        }
         if (entry.factory)().info().name == info_name {
             return format!("{}/{}", entry.category.as_str(), entry.name);
         }
@@ -237,16 +265,22 @@ fn current_module_path(module: &dyn Module) -> String {
 // FAN-OUT
 // ============================================================
 
-async fn fanout_single(
+/// Shared parameters for all fanout dispatch functions.
+struct FanoutParams {
     module: Arc<dyn Module>,
     target: Target,
     options: ModuleOptions,
     cancel: tokio_util::sync::CancellationToken,
     tenant_id: Option<String>,
-    verbose: bool,
     limits: SchedulerLimits,
     module_path: String,
+}
+
+async fn fanout_single(
+    params: FanoutParams,
+    verbose: bool,
 ) -> Result<ModuleOutcome> {
+    let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
     let host = target.as_single().unwrap_or("").to_string();
     if limits.honeypot_detection
         && crate::utils::network::quick_honeypot_check(&host).await
@@ -273,21 +307,16 @@ async fn fanout_single(
         module.run(&ctx),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Module timed out after {}s", limits.timeout_secs))??;
+    .map_err(|e| anyhow::anyhow!("Module timed out after {}s: {e}", limits.timeout_secs))??;
     route_findings(&outcome, module.as_ref()).await;
     Ok(outcome)
 }
 
 async fn fanout_cidr(
-    module: Arc<dyn Module>,
-    target: Target,
-    options: ModuleOptions,
-    cancel: tokio_util::sync::CancellationToken,
-    tenant_id: Option<String>,
-    limits: SchedulerLimits,
-    module_path: String,
+    params: FanoutParams,
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
+    let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
     let cidr = match &target {
         Target::Cidr(s) => s.clone(),
         _ => unreachable!("fanout_cidr called with non-Cidr target"),
@@ -341,7 +370,7 @@ async fn fanout_cidr(
         }
     }
 
-    let _batch = crate::context::enter_batch_mode();
+    let batch_guard = crate::context::enter_batch_mode();
     let stats = Arc::new(ScanStats::default());
     // When the parent (e.g. `fanout_multi`) supplies a shared semaphore,
     // use it so cross-target runs share one concurrency budget; otherwise
@@ -458,7 +487,7 @@ async fn fanout_cidr(
                 module_clone.run(&ctx),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("timed out"))
+            .map_err(|e| anyhow::anyhow!("timed out: {e}"))
             .and_then(|r| r);
             stats_clone.record(outcome);
             record_checkpoint(&cp_clone, &ip_str).await;
@@ -470,19 +499,15 @@ async fn fanout_cidr(
     finalize_checkpoint(&checkpoint, completed_cleanly).await;
     let outcome = finalize(&format!("Subnet Scan ({})", network), &stats, effective_count as usize);
     route_findings(&outcome, module.as_ref()).await;
+    drop(batch_guard);
     Ok(outcome)
 }
 
 async fn fanout_file(
-    module: Arc<dyn Module>,
-    target: Target,
-    options: ModuleOptions,
-    cancel: tokio_util::sync::CancellationToken,
-    tenant_id: Option<String>,
-    limits: SchedulerLimits,
-    module_path: String,
+    params: FanoutParams,
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
+    let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
     let path = match &target {
         Target::File(p) => p.clone(),
         _ => unreachable!("fanout_file called with non-File target"),
@@ -511,7 +536,7 @@ async fn fanout_file(
         .bold()
     );
 
-    let _batch = crate::context::enter_batch_mode();
+    let batch_guard = crate::context::enter_batch_mode();
     let stats = Arc::new(ScanStats::default());
     let sem = shared_sem
         .unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
@@ -565,7 +590,7 @@ async fn fanout_file(
                 module_clone.run(&ctx),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("timed out"))
+            .map_err(|e| anyhow::anyhow!("timed out: {e}"))
             .and_then(|r| r);
             stats_clone.record(outcome);
             record_checkpoint(&cp_clone, &host).await;
@@ -577,6 +602,7 @@ async fn fanout_file(
     finalize_checkpoint(&checkpoint, completed_cleanly).await;
     let outcome = finalize("File Target Scan", &stats, count);
     route_findings(&outcome, module.as_ref()).await;
+    drop(batch_guard);
     Ok(outcome)
 }
 
@@ -585,7 +611,7 @@ async fn fanout_multi(
     target: Target,
     options: ModuleOptions,
     cancel: tokio_util::sync::CancellationToken,
-    _tenant_id: Option<String>,
+    tenant_id: Option<String>,
     verbose: bool,
     limits: SchedulerLimits,
 ) -> Result<ModuleOutcome> {
@@ -594,6 +620,9 @@ async fn fanout_multi(
         _ => unreachable!("fanout_multi called with non-Multi target"),
     };
     let total = parts.len();
+    if let Some(ref tid) = tenant_id {
+        tracing::debug!("fanout_multi: tenant_id={}, targets={}", tid, total);
+    }
     crate::mprintln!(
         "{}",
         format!(
@@ -650,7 +679,7 @@ async fn fanout_random(
     module_path: String,
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
-    let _batch = crate::context::enter_batch_mode();
+    let batch_guard = crate::context::enter_batch_mode();
     let stats = Arc::new(ScanStats::default());
     let sem = shared_sem
         .unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
@@ -739,7 +768,7 @@ async fn fanout_random(
                 module_clone.run(&ctx),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("timed out"))
+            .map_err(|e| anyhow::anyhow!("timed out: {e}"))
             .and_then(|r| r);
             let was_err = stats_clone.record(outcome);
             record_checkpoint(&cp_clone, &ip.to_string()).await;
@@ -770,6 +799,7 @@ async fn fanout_random(
         stats.processed.load(Ordering::Relaxed),
     );
     route_findings(&outcome, module.as_ref()).await;
+    drop(batch_guard);
     Ok(outcome)
 }
 
@@ -862,10 +892,11 @@ fn finalize(label: &str, stats: &ScanStats, total: usize) -> ModuleOutcome {
     if sk > 0 {
         crate::mprintln!("  {}", format!("Skipped:    {}", sk).yellow());
     }
-    let mut findings = Vec::new();
-    if let Ok(g) = stats.findings.lock() {
-        findings.extend(g.iter().cloned());
-    }
+    let findings = stats.findings.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect();
     ModuleOutcome {
         success: err == 0,
         findings,
@@ -890,14 +921,17 @@ async fn route_findings(outcome: &ModuleOutcome, module: &dyn Module) {
                     .as_ref()
                     .and_then(|v| serde_json::to_vec(v).ok())
                     .unwrap_or_else(|| f.message.as_bytes().to_vec());
-                let _ = crate::loot::store_loot(
+                if crate::loot::store_loot(
                     &f.target,
                     "credential",
                     &f.message,
                     &payload,
                     &module_name,
                 )
-                .await;
+                .await
+                .is_none() {
+                    eprintln!("[!] Failed to store loot for {}", f.target);
+                }
             }
             FindingKind::Vulnerable => {
                 crate::workspace::add_note(

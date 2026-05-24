@@ -38,6 +38,7 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(23),
     }
 }
 
@@ -52,18 +53,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: false,
         },
-        |host, port, user, pass| async move { probe(&host, port, &user, &pass).await },
+        |host, port, user, pass, timeout| async move { probe(&host, port, &user, &pass, timeout).await },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: std::time::Duration) -> LoginResult {
     use std::net::SocketAddr;
-    use std::time::Duration;
 
     let socket: SocketAddr = match format!("{}:{}", host, port).parse() {
         Ok(sa) => sa,
-        Err(_) => match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+        Err(e) => { tracing::debug!("parse socket addr failed: {e}"); match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
             Ok(mut iter) => match iter.next() {
                 Some(sa) => sa,
                 None => {
@@ -79,20 +79,19 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
                     retryable: false,
                 }
             }
-        },
+        } }
     };
 
-    let _ = Duration::from_secs(5); // (kept for future per-attempt tuning)
-
-    // Reuse the helper: it implements the full IAC + banner + login state
-    // machine. Returns Ok(true) on success, Ok(false) on auth fail or
-    // closed port. Errors propagate as retryable.
     use super::telnet_hose;
-    match telnet_hose::try_login(&socket, user, pass).await {
-        Ok(true) => LoginResult::Success,
-        Ok(false) => LoginResult::AuthFailed,
-        Err(e) => LoginResult::Error {
+    match tokio::time::timeout(timeout, telnet_hose::try_login(&socket, user, pass)).await {
+        Ok(Ok(true)) => LoginResult::Success,
+        Ok(Ok(false)) => LoginResult::AuthFailed,
+        Ok(Err(e)) => LoginResult::Error {
             message: format!("telnet: {e:#}"),
+            retryable: true,
+        },
+        Err(e) => LoginResult::Error {
+            message: format!("telnet timed out after {}s: {e}", timeout.as_secs()),
             retryable: true,
         },
     }

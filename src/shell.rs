@@ -31,9 +31,10 @@ const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
     "help", "modules", "find", "use", "set target", "set subnet",
-    "set port", "set source_port",
+    "set port", "set source_port", "set concurrency", "set timeout",
+    "set threads", "set wordlist", "set verbose",
     "show_target", "clear_target", "run", "back", "exit", "quit",
-    "info", "check", "setg", "unsetg", "show options",
+    "info", "check", "setg", "unsetg", "unset", "show options",
     "creds", "creds add", "creds search", "creds delete", "creds clear",
     "spool", "spool off", "resource", "makerc",
     "hosts", "hosts add", "hosts delete", "hosts clear",
@@ -74,10 +75,8 @@ impl Completer for RsfCompleter {
             Some(rest)
         } else if let Some(rest) = line_up_to_cursor.strip_prefix("info ") {
             Some(rest)
-        } else if let Some(rest) = line_up_to_cursor.strip_prefix("check ") {
-            Some(rest)
         } else {
-            None
+            line_up_to_cursor.strip_prefix("check ")
         };
 
         if let Some(prefix) = module_prefix {
@@ -122,10 +121,8 @@ impl Hinter for RsfCompleter {
         // After "use " or "u ", hint module paths
         let module_prefix = if let Some(rest) = trimmed.strip_prefix("use ") {
             Some(rest)
-        } else if let Some(rest) = trimmed.strip_prefix("u ") {
-            Some(rest)
         } else {
-            None
+            trimmed.strip_prefix("u ")
         };
 
         if let Some(prefix) = module_prefix {
@@ -246,7 +243,9 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
     let mut rl = Editor::with_config(rl_config)?;
     rl.set_helper(Some(RsfCompleter::new()));
     let hist = history_path();
-    let _ = rl.load_history(&hist);
+    if let Err(e) = rl.load_history(&hist) {
+        eprintln!("[!] Failed to load history: {}", e);
+    }
 
     // Auto-load startup.rc if it exists
     let startup_rc = home::home_dir()
@@ -342,7 +341,9 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         }
     }
 
-    let _ = rl.save_history(&hist);
+    if let Err(e) = rl.save_history(&hist) {
+        eprintln!("[!] Failed to save history: {}", e);
+    }
     Ok(())
 }
 
@@ -368,8 +369,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 }
                 "back" => {
                     ctx.current_module = None;
-                    config::GLOBAL_CONFIG.clear_target();
-                    println!("{}", "Cleared current module and target.".green());
+                    println!("{}", "Cleared current module.".green());
                 }
                 "show_target" | "target" => {
                     if config::GLOBAL_CONFIG.has_target() {
@@ -438,106 +438,77 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     }
                 }
                 "set" => {
-                    // Handle "set port <val>" and "set source_port <val>" as global option shortcuts
-                    if let Some(val) = rest.strip_prefix("port ") {
-                        let val = val.trim();
-                        match val.parse::<u16>() {
-                            Ok(p) if p > 0 => {
-                                crate::global_options::GLOBAL_OPTIONS.set("port", val).await;
-                                println!("{}", format!("Global port set to: {}", val).green());
-                            }
-                            _ => println!("{}", "Invalid port. Must be 1-65535.".yellow()),
-                        }
-                    } else if let Some(val) = rest.strip_prefix("source_port ") {
-                        let val = val.trim();
-                        if val == "0" || val.is_empty() {
-                            crate::global_options::GLOBAL_OPTIONS.unset("source_port").await;
-                            println!("{}", "Source port cleared (will use OS-assigned).".green());
+                    // Normalize Metasploit aliases to rustsploit keys
+                    let rest_normalized = normalize_option_alias(&rest);
+                    let rest_ref = rest_normalized.as_str();
+
+                    // Detect "set <key> <value>" for ANY option
+                    if let Some((raw_key, raw_val)) = rest_ref.split_once(char::is_whitespace) {
+                        let raw_key = raw_key.trim();
+                        let raw_val = raw_val.trim();
+
+                        // Route target/rhost/rhosts to the target-setter
+                        if raw_key == "target" || raw_key == "t" {
+                            handle_set_target(raw_val).await;
+                        } else if raw_val.is_empty() {
+                            println!("{}", format!("Usage: set {} <value>", raw_key).yellow());
                         } else {
-                            match val.parse::<u16>() {
-                                Ok(p) if p > 0 => {
-                                    crate::global_options::GLOBAL_OPTIONS.set("source_port", val).await;
-                                    println!("{}", format!("Global source port set to: {}", val).green());
+                            match (
+                                crate::utils::sanitize::sanitize_string_input(raw_key),
+                                crate::utils::sanitize::sanitize_string_input(raw_val),
+                            ) {
+                                (Ok(skey), Ok(sval)) => {
+                                    if skey == "port" || skey == "source_port" {
+                                        match sval.parse::<u16>() {
+                                            Ok(p) if p > 0 => {
+                                                crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                                println!("{} => {}", skey.green(), sval);
+                                            }
+                                            _ if skey == "source_port" && (sval == "0" || sval.is_empty()) => {
+                                                crate::global_options::GLOBAL_OPTIONS.unset("source_port").await;
+                                                println!("{}", "Source port cleared (will use OS-assigned).".green());
+                                            }
+                                            _ => println!("{}", format!("Invalid {}. Must be 1-65535.", skey).yellow()),
+                                        }
+                                    } else {
+                                        crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                        println!("{} => {}", skey.green(), sval);
+                                        if skey == "verbose" {
+                                            ctx.verbose = matches!(sval.as_str(), "y" | "yes" | "true" | "1" | "on");
+                                        }
+                                    }
                                 }
-                                _ => println!("{}", "Invalid source port. Must be 1-65535 (or 0 to clear).".yellow()),
+                                (Err(e), _) | (_, Err(e)) => {
+                                    println!("{}", format!("[!] Invalid input: {}", e).red());
+                                }
                             }
                         }
                     } else {
-                    // Handle shortcuts: "target <val>", "t <val>", "set target <val>", "set t <val>"
-                    let raw_value = if cmd == "target" || cmd == "t" {
-                        &rest
-                    } else if let Some(val) = rest.strip_prefix("target ") {
-                        val
-                    } else if let Some(val) = rest.strip_prefix("t ") {
-                        val
-                    } else {
-                        ""
-                    };
-
-                    let raw_value = raw_value.trim();
-
-                    if raw_value.is_empty() {
-                        println!("{}", "Usage: set target <value>".yellow());
-                        println!("{}", "  Shortcuts: t <value>, target <value>".dimmed());
-                        println!("{}", "  For subnets: set subnet <CIDR> or sn <CIDR>".dimmed());
-                        println!("{}", "  set port <1-65535>    — Set target port for all modules".dimmed());
-                        println!("{}", "  set source_port <val> — Set source port (0 to clear)".dimmed());
-                        println!("{}", "  Examples:".dimmed());
-                        println!("{}", "    t 192.168.1.1".dimmed());
-                        println!("{}", "    t 10.0.0.1, 192.168.1.1, 172.16.0.5".dimmed());
-                        println!("{}", "    t 10.0.0.0/24, 192.168.1.1".dimmed());
-                        println!("{}", "    sn 10.16.0.0/24".dimmed());
-                        println!("{}", "    set target example.com".dimmed());
-                        println!("{}", "    set target random".dimmed());
-                        println!("{}", "    set target /path/to/targets.txt".dimmed());
-                        println!("{}", "    set port 8080".dimmed());
-                        println!("{}", "    set source_port 31337".dimmed());
-                    } else {
-                        match sanitize_target(raw_value) {
-                            Ok(valid_target) => {
-                                // Check if target is a domain — offer protocol/port selection
-                                // Skip domain prompt for multi-target (comma-separated)
-                                let final_target = if !valid_target.contains(',') && utils::is_domain(&valid_target) {
-                                    match utils::prompt_domain_target(&valid_target).await {
-                                        Ok((resolved, _url)) => resolved,
-                                        Err(e) => {
-                                            println!("{}", format!("[!] Domain targeting failed: {}", e).red());
-                                            println!("{}", "[*] Falling back to raw target".yellow());
-                                            valid_target.clone()
-                                        }
-                                    }
-                                } else {
-                                    valid_target.clone()
-                                };
-
-                                match config::GLOBAL_CONFIG.set_target(&final_target) {
-                                    Ok(_) => {
-                                        if final_target.contains(',') {
-                                            let count = final_target.split(',').count();
-                                            if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
-                                                println!("{}", format!("Target set to: {} ({} entries, ~{} IPs)", final_target, count, size).green());
-                                            } else {
-                                                println!("{}", format!("Target set to: {} ({} entries)", final_target, count).green());
-                                            }
-                                        } else if final_target.contains('/') {
-                                            let ip_part = final_target.split('/').next().unwrap_or(&final_target);
-                                            let prefix = final_target.split('/').nth(1).unwrap_or("");
-                                            println!("{}", format!("Target set to: {} (subnet: /{})", ip_part, prefix).green());
-                                        } else {
-                                            println!("{}", format!("Target set to: {}", final_target).green());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("{}", format!("[!] Failed to set target: {}", e).red());
-                                    }
-                                }
-                            }
-                            Err(reason) => {
-                                println!("{}", format!("[!] {}", reason).yellow());
-                            }
+                        // Bare "set" or "set <something>" without a value
+                        let bare = rest_ref.trim();
+                        if bare.is_empty() {
+                            println!("{}", "Usage: set <key> <value>".yellow());
+                            println!("{}", "  set target <ip/cidr/file>  — Set target".dimmed());
+                            println!("{}", "  set port <1-65535>         — Set target port".dimmed());
+                            println!("{}", "  set source_port <val>      — Set source port (0=clear)".dimmed());
+                            println!("{}", "  set concurrency <N>        — Max concurrent tasks".dimmed());
+                            println!("{}", "  set timeout <secs>         — Per-module timeout".dimmed());
+                            println!("{}", "  set threads <N>            — Alias for concurrency".dimmed());
+                            println!("{}", "  set wordlist <path>        — Default wordlist".dimmed());
+                            println!("{}", "  set verbose y/n            — Verbose output".dimmed());
+                            println!();
+                            println!("{}", "Metasploit aliases:".dimmed());
+                            println!("{}", "  RHOST/RHOSTS → target, RPORT → port".dimmed());
+                            println!("{}", "  LPORT → source_port, THREADS → concurrency".dimmed());
+                        } else if bare == "target" || bare == "t" {
+                            println!("{}", "Usage: set target <ip/cidr/file>".yellow());
+                        } else {
+                            println!("{}", format!("Usage: set {} <value>", bare).yellow());
                         }
                     }
-                    } // end of else (port/source_port/target handling)
+                }
+                "set_target" => {
+                    handle_set_target(&rest).await;
                 }
                 "set_subnet" => {
                     // Handle shortcuts: "subnet <val>", "sn <val>", "set subnet <val>", "set sn <val>"
@@ -545,10 +516,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         &rest
                     } else if let Some(val) = rest.strip_prefix("subnet ") {
                         val
-                    } else if let Some(val) = rest.strip_prefix("sn ") {
-                        val
                     } else {
-                        ""
+                        rest.strip_prefix("sn ").unwrap_or_default()
                     };
 
                     let raw_value = raw_value.trim();
@@ -648,19 +617,34 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 // GLOBAL OPTIONS (Feature 2)
                 // ═══════════════════════════════════════════════
                 "setg" => {
-                    if let Some((key, value)) = rest.split_once(char::is_whitespace) {
+                    let rest_normalized = normalize_option_alias(&rest);
+                    if let Some((key, value)) = rest_normalized.split_once(char::is_whitespace) {
                         let key = key.trim();
                         let value = value.trim();
                         if key.is_empty() || value.is_empty() {
                             println!("{}", "Usage: setg <key> <value>".yellow());
+                        } else if key == "target" {
+                            handle_set_target(value).await;
                         } else {
                             match (
                                 crate::utils::sanitize::sanitize_string_input(key),
                                 crate::utils::sanitize::sanitize_string_input(value),
                             ) {
                                 (Ok(skey), Ok(sval)) => {
-                                    crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
-                                    println!("{}", format!("{} => {}", skey.green(), sval));
+                                    if skey == "port" || skey == "source_port" {
+                                        match sval.parse::<u16>() {
+                                            Ok(p) if p > 0 => {
+                                                crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                                println!("{} => {}", skey.green(), sval);
+                                            }
+                                            _ => {
+                                                println!("{}", format!("[!] Invalid port value: {}", sval).red());
+                                            }
+                                        }
+                                    } else {
+                                        crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                        println!("{} => {}", skey.green(), sval);
+                                    }
                                 }
                                 (Err(e), _) | (_, Err(e)) => {
                                     println!("{}", format!("[!] Invalid input: {}", e).red());
@@ -674,6 +658,12 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 }
                 "unsetg" => {
                     let key = rest.trim();
+                    let key = match key.to_uppercase().as_str() {
+                        "RPORT" => "port",
+                        "LPORT" => "source_port",
+                        "THREADS" => "concurrency",
+                        _ => key,
+                    };
                     if key.is_empty() {
                         println!("{}", "Usage: unsetg <key>".yellow());
                     } else if crate::global_options::GLOBAL_OPTIONS.unset(key).await {
@@ -683,7 +673,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     }
                 }
                 "show_options" => {
-                    crate::global_options::GLOBAL_OPTIONS.display().await;
+                    display_all_options(&ctx).await;
                 }
 
                 // ═══════════════════════════════════════════════
@@ -694,26 +684,26 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         crate::cred_store::CRED_STORE.display().await;
                     } else if rest == "add" {
                         // Interactive cred add
-                        let host = match utils::prompt_required("Host").await { Ok(v) => v, Err(_) => return false };
-                        let port_str = match utils::prompt_default("Port", "0").await { Ok(v) => v, Err(_) => return false };
+                        let host = match utils::prompt_required("Host").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let port_str = match utils::prompt_default("Port", "0").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
                         let port: u16 = match port_str.parse() {
                             Ok(p) => p,
-                            Err(_) => {
-                                println!("{}", format!("[!] Invalid port '{}' (must be 0-65535)", port_str).red());
+                            Err(e) => {
+                                println!("{}", format!("[!] Invalid port '{}' (must be 0-65535): {e}", port_str).red());
                                 return false;
                             }
                         };
-                        let service = match utils::prompt_default("Service", "unknown").await { Ok(v) => v, Err(_) => return false };
-                        let username = match utils::prompt_required("Username").await { Ok(v) => v, Err(_) => return false };
-                        let secret = match utils::prompt_required("Password/Hash/Key").await { Ok(v) => v, Err(_) => return false };
-                        let ctype = match utils::prompt_default("Type (password/hash/key/token)", "password").await { Ok(v) => v, Err(_) => return false };
+                        let service = match utils::prompt_default("Service", "unknown").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let username = match utils::prompt_required("Username").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let secret = match utils::prompt_required("Password/Hash/Key").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let ctype = match utils::prompt_default("Type (password/hash/key/token)", "password").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
                         let cred_type = match ctype.as_str() {
                             "hash" => crate::cred_store::CredType::Hash,
                             "key" => crate::cred_store::CredType::Key,
                             "token" => crate::cred_store::CredType::Token,
                             _ => crate::cred_store::CredType::Password,
                         };
-                        match crate::cred_store::CRED_STORE.add(&host, port, &service, &username, &secret, cred_type, "manual").await {
+                        match crate::cred_store::CRED_STORE.add(crate::cred_store::NewCred { host: &host, port, service: &service, username: &username, secret: &secret, cred_type, source_module: "manual" }).await {
                             Some(id) => println!("{}", format!("[+] Credential stored (ID: {})", id).green()),
                             None => println!("{}", "[!] Failed to store credential (validation failure)".red()),
                         }
@@ -779,9 +769,9 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         match crate::utils::sanitize::validate_safe_file_path(&rest) {
                             Ok(safe_path) => {
                                 let hist_path = history_path();
-                                match std::fs::read_to_string(&hist_path) {
+                                match tokio::fs::read_to_string(&hist_path).await {
                                     Ok(contents) => {
-                                        match std::fs::write(&safe_path, &contents) {
+                                        match tokio::fs::write(&safe_path, &contents).await {
                                             Ok(_) => println!("{}", format!("[+] Command history saved to '{}'", safe_path).green()),
                                             Err(e) => println!("{}", format!("[!] Failed to write: {}", e).red()),
                                         }
@@ -830,12 +820,12 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     if rest.is_empty() {
                         crate::workspace::WORKSPACE.display_services().await;
                     } else if rest == "add" {
-                        let host = match utils::prompt_required("Host IP").await { Ok(v) => v, Err(_) => return false };
+                        let host = match utils::prompt_required("Host IP").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
                         if let Err(e) = sanitize_target(&host) {
                             println!("{}", format!("[!] Invalid host: {}", e).red());
                             return false;
                         }
-                        let port_str = match utils::prompt_required("Port").await { Ok(v) => v, Err(_) => return false };
+                        let port_str = match utils::prompt_required("Port").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
                         let port: u16 = match port_str.parse() {
                             Ok(p) if p > 0 => p,
                             _ => {
@@ -843,9 +833,9 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 return false;
                             }
                         };
-                        let proto = match utils::prompt_default("Protocol", "tcp").await { Ok(v) => v, Err(_) => return false };
-                        let svc = match utils::prompt_required("Service name").await { Ok(v) => v, Err(_) => return false };
-                        let ver = match utils::prompt_default("Version", "").await { Ok(v) => v, Err(_) => return false };
+                        let proto = match utils::prompt_default("Protocol", "tcp").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let svc = match utils::prompt_required("Service name").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let ver = match utils::prompt_default("Version", "").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
                         let version = if ver.is_empty() { None } else { Some(ver.as_str()) };
                         crate::workspace::WORKSPACE.add_service(&host, port, &proto, &svc, version).await;
                         println!("{}", format!("[+] Service {}:{}/{} added.", host, port, svc).green());
@@ -906,6 +896,9 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         } else if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
                             crate::workspace::WORKSPACE.switch(name).await;
                             println!("{}", format!("[+] Switched to workspace '{}'", name).green());
+                            if ctx.current_module.is_some() || config::GLOBAL_CONFIG.has_target() {
+                                println!("{}", "[*] Note: current module and target are preserved from previous workspace".yellow());
+                            }
                         } else {
                             println!("{}", "Workspace name must be alphanumeric (with _ and -).".red());
                         }
@@ -919,10 +912,10 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     if rest.is_empty() {
                         crate::loot::LOOT_STORE.display().await;
                     } else if rest == "add" {
-                        let host = match utils::prompt_required("Host").await { Ok(v) => v, Err(_) => return false };
-                        let ltype = match utils::prompt_default("Type (config/password_file/firmware/hash/other)", "other").await { Ok(v) => v, Err(_) => return false };
-                        let desc = match utils::prompt_required("Description").await { Ok(v) => v, Err(_) => return false };
-                        let data = match utils::prompt_required("Data/content").await { Ok(v) => v, Err(_) => return false };
+                        let host = match utils::prompt_required("Host").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let ltype = match utils::prompt_default("Type (config/password_file/firmware/hash/other)", "other").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let desc = match utils::prompt_required("Description").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
+                        let data = match utils::prompt_required("Data/content").await { Ok(v) => v, Err(e) => { tracing::debug!("prompt cancelled: {e}"); return false } };
                         if let Some(id) = crate::loot::LOOT_STORE.add_text(&host, &ltype, &desc, &data, "manual").await {
                             println!("{}", format!("[+] Loot stored (ID: {})", id).green());
                         } else {
@@ -1073,7 +1066,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                         }
                                     }
                                 },
-                                Err(_) => None,
+                                Err(e) => { tracing::debug!("prompt error: {e}"); None }
                             }
                         } else {
                             target
@@ -1169,7 +1162,7 @@ fn execute_resource_file_inner<'a>(ctx: &'a mut ShellContext, path: &'a str, dep
                 return;
             }
         };
-        match std::fs::read_to_string(&safe_path) {
+        match tokio::fs::read_to_string(&safe_path).await {
             Ok(contents) => {
                 let mut count = 0;
                 for line in contents.lines() {
@@ -1204,7 +1197,8 @@ pub fn resolve_command(cmd: &str) -> String {
         "find" | "search" | "f" | "f1" => "find",
 
         "use" | "u" => "use",
-        "set" | "target" | "t" => "set",
+        "set" => "set",
+        "target" | "t" => "set_target",
         "subnet" | "sn" => "set_subnet",
         "show_target" | "showtarget" | "st" => "show_target",
         "clear_target" | "cleartarget" | "ct" => "clear_target",
@@ -1216,7 +1210,7 @@ pub fn resolve_command(cmd: &str) -> String {
         "info" | "i" => "info",
         "check" | "ch" => "check",
         "setg" | "sg" => "setg",
-        "unsetg" | "ug" => "unsetg",
+        "unsetg" | "ug" | "unset" => "unsetg",
         "show_options" | "showoptions" | "so" => "show_options",
         "creds" | "credentials" => "creds",
         "spool" => "spool",
@@ -1233,6 +1227,157 @@ pub fn resolve_command(cmd: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// Display comprehensive options view: target state, global options, and
+/// scheduler-relevant defaults. When a module is selected, shows what that
+/// module's prompts will read.
+async fn display_all_options(ctx: &ShellContext) {
+    println!();
+    println!("{}", "═══ Current Configuration ═══".bold().cyan());
+    println!();
+
+    // Target
+    if let Some(t) = config::GLOBAL_CONFIG.get_target() {
+        let size = config::GLOBAL_CONFIG.get_target_size().unwrap_or(1);
+        if size > 1 {
+            println!("  {:<24} {} {} {}", "target".green().bold(), t, format!("({} IPs)", size).dimmed(), "(RHOST/RHOSTS)".dimmed());
+        } else {
+            println!("  {:<24} {} {}", "target".green().bold(), t, "(RHOST)".dimmed());
+        }
+    } else {
+        println!("  {:<24} {}", "target".green().bold(), "<not set>".dimmed());
+    }
+
+    // Global options with human-readable descriptions
+    let opts = crate::global_options::GLOBAL_OPTIONS.all().await;
+    let known_keys: &[(&str, &str, &str)] = &[
+        ("port",               "Target port for all modules",   "RPORT"),
+        ("source_port",        "Outgoing source port binding",  "LPORT"),
+        ("concurrency",        "Max concurrent tasks in mass scan", "THREADS"),
+        ("timeout",            "Per-module timeout (seconds)",  ""),
+        ("module_timeout",     "Alias for timeout",             ""),
+        ("max_random_hosts",   "Max IPs for random target",     ""),
+        ("wordlist",           "Default wordlist path",          ""),
+        ("verbose",            "Verbose output (y/n)",           ""),
+        ("honeypot_detection", "Skip honeypot hosts (y/n)",      ""),
+        ("prescan",            "Pre-scan tool (auto/masscan/zmap/none)", ""),
+    ];
+
+    let mut displayed = std::collections::HashSet::new();
+    for &(key, desc, alias) in known_keys {
+        let val = opts.get(key).cloned().unwrap_or_default();
+        let mut suffix = String::new();
+        if !alias.is_empty() { suffix.push_str(&format!(" ({})", alias)); }
+        if val.is_empty() { suffix.push_str(&format!(" — {}", desc)); }
+        if val.is_empty() {
+            println!("  {:<24} {}", key.green(), suffix.dimmed());
+        } else {
+            println!("  {:<24} {} {}", key.green(), val, suffix.dimmed());
+        }
+        displayed.insert(key.to_string());
+    }
+
+    // Show any extra user-set options not in the known list
+    let mut extras: Vec<_> = opts.keys()
+        .filter(|k| !displayed.contains(k.as_str()))
+        .collect();
+    extras.sort();
+    for key in extras {
+        if let Some(val) = opts.get(key) {
+            println!("  {:<24} {}", key.green(), val);
+        }
+    }
+
+    // Current module
+    println!();
+    if let Some(ref module) = ctx.current_module {
+        println!("  {:<24} {}", "module".cyan().bold(), module);
+    } else {
+        println!("  {:<24} {}", "module".cyan().bold(), "<none selected>".dimmed());
+    }
+
+    println!();
+    println!("{}", "  Use 'set <key> <value>' or 'setg <key> <value>' to change.".dimmed());
+    println!("{}", "  Use 'unsetg <key>' to remove a global option.".dimmed());
+    println!();
+}
+
+/// Normalize Metasploit-style aliases to rustsploit option keys.
+/// `set RPORT 8080` → `set port 8080`, `set THREADS 50` → `set concurrency 50`, etc.
+fn normalize_option_alias(input: &str) -> String {
+    if let Some((key, val)) = input.split_once(char::is_whitespace) {
+        let canonical = match key.to_uppercase().as_str() {
+            "RHOST" | "RHOSTS" => "target",
+            "RPORT" => "port",
+            "LPORT" => "source_port",
+            "LHOST" => "source_ip",
+            "THREADS" => "concurrency",
+            "MODULE_TIMEOUT" => "timeout",
+            _ => return input.to_string(),
+        };
+        format!("{} {}", canonical, val)
+    } else {
+        match input.trim().to_uppercase().as_str() {
+            "RHOST" | "RHOSTS" => "target".to_string(),
+            "RPORT" => "port".to_string(),
+            "LPORT" => "source_port".to_string(),
+            "LHOST" => "source_ip".to_string(),
+            "THREADS" => "concurrency".to_string(),
+            "MODULE_TIMEOUT" => "timeout".to_string(),
+            _ => input.to_string(),
+        }
+    }
+}
+
+/// Handle `set target <value>` (and aliases RHOST, RHOSTS, t).
+async fn handle_set_target(raw_value: &str) {
+    let raw_value = raw_value.trim();
+    if raw_value.is_empty() {
+        println!("{}", "Usage: set target <ip/cidr/file>".yellow());
+        return;
+    }
+    match sanitize_target(raw_value) {
+        Ok(valid_target) => {
+            let final_target = if !valid_target.contains(',') && utils::is_domain(&valid_target) {
+                match utils::prompt_domain_target(&valid_target).await {
+                    Ok((resolved, _url)) => resolved,
+                    Err(e) => {
+                        println!("{}", format!("[!] Domain targeting failed: {}", e).red());
+                        println!("{}", "[*] Falling back to raw target".yellow());
+                        valid_target.clone()
+                    }
+                }
+            } else {
+                valid_target.clone()
+            };
+
+            match config::GLOBAL_CONFIG.set_target(&final_target) {
+                Ok(_) => {
+                    if final_target.contains(',') {
+                        let count = final_target.split(',').count();
+                        if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+                            println!("{}", format!("Target set to: {} ({} entries, ~{} IPs)", final_target, count, size).green());
+                        } else {
+                            println!("{}", format!("Target set to: {} ({} entries)", final_target, count).green());
+                        }
+                    } else if final_target.contains('/') {
+                        let ip_part = final_target.split('/').next().unwrap_or(&final_target);
+                        let prefix = final_target.split('/').nth(1).unwrap_or("");
+                        println!("{}", format!("Target set to: {} (subnet: /{})", ip_part, prefix).green());
+                    } else {
+                        println!("{}", format!("Target set to: {}", final_target).green());
+                    }
+                }
+                Err(e) => {
+                    println!("{}", format!("[!] Failed to set target: {}", e).red());
+                }
+            }
+        }
+        Err(reason) => {
+            println!("{}", format!("[!] {}", reason).yellow());
+        }
+    }
 }
 
 pub fn sanitize_module_path(input: &str) -> Option<String> {
@@ -1536,39 +1681,67 @@ fn render_help_topic(topic: &str) {
             ],
             &["run", "info"],
         ),
+        "set" => man_page(
+            "set",
+            "Set any option. Works for target, port, source_port, and all global options. \
+             Accepts Metasploit aliases (RHOST, RPORT, LPORT, THREADS).",
+            &["set <key> <value>", "set target <ip/cidr/file>"],
+            "The `set` and `setg` commands are interchangeable — both store values in the same \
+             global options store (~/.rustsploit/global_options.json). Values persist across modules \
+             and shell sessions. Every module prompt checks global options before prompting interactively.\n\n\
+             During mass scans (CIDR/file/multi-target), all per-host tasks share the same settings.\n\n\
+             Metasploit aliases: RHOST/RHOSTS→target, RPORT→port, LPORT→source_port, THREADS→concurrency.",
+            &[
+                ("set target 10.0.0.0/24",    "Target a subnet"),
+                ("set port 8080",              "All modules use port 8080"),
+                ("set source_port 53",         "Bind outgoing TCP/UDP to port 53"),
+                ("set concurrency 200",        "200 concurrent tasks in mass scan"),
+                ("set timeout 15",             "15s per-module timeout"),
+                ("set threads 100",            "Alias for concurrency"),
+                ("set RPORT 443",              "Metasploit alias for port"),
+                ("set wordlist /path/to/list", "Default wordlist for brute-force"),
+            ],
+            &["setg", "unsetg", "show_options", "mass-scan"],
+        ),
         "setg" => man_page(
             "setg",
-            "Set a global option (persists across modules and across shell sessions).",
+            "Set a global option (identical to `set` — both persist to the same store).",
             &["setg <key> <value>", "sg <key> <value>"],
-            "Values are stored in ~/.rustsploit/global_options.json. They are consulted by every \
-             module prompt (cfg_prompt_*) after per-run `custom_prompts` but before interactive stdin. \
-             Useful keys: `concurrency`, `max_random_hosts`, `module_timeout`, `honeypot_detection`, \
-             `source_port`, `port`, `ports`, `wordlist`, `timeout`.",
+            "Values are stored in ~/.rustsploit/global_options.json. Consulted by every \
+             module prompt after per-run `custom_prompts` but before interactive stdin. \
+             Accepts Metasploit aliases (RHOST, RPORT, LPORT, THREADS).\n\n\
+             Key options: port, source_port, concurrency, timeout, max_random_hosts, \
+             honeypot_detection, prescan, wordlist, verbose.",
             &[
                 ("setg concurrency 200",                  "Run 200 tasks in parallel"),
                 ("setg max_random_hosts 100000",          "Scan up to 100k random IPs"),
-                ("setg module_timeout 30",                "Per-task timeout (seconds)"),
+                ("setg timeout 30",                       "Per-task timeout (seconds)"),
                 ("setg honeypot_detection n",             "Disable the pre-scan honeypot check"),
-                ("setg source_port 53",                   "Bind TCP connections to port 53"),
+                ("setg source_port 53",                   "Bind TCP/UDP connections to port 53"),
+                ("setg THREADS 100",                      "Metasploit alias for concurrency"),
                 ("setg wordlist /usr/share/wordlists/rockyou.txt", "Default wordlist for brute-force modules"),
             ],
-            &["unsetg", "show_options", "mass-scan"],
+            &["set", "unsetg", "show_options", "mass-scan"],
         ),
         "unsetg" => man_page(
             "unsetg",
-            "Remove a global option.",
-            &["unsetg <key>", "ug <key>"],
-            "Deletes the key from ~/.rustsploit/global_options.json.",
-            &[("ug concurrency", "Revert to default concurrency (50)")],
-            &["setg", "show_options"],
+            "Remove a global option. Also available as 'unset'.",
+            &["unsetg <key>", "unset <key>", "ug <key>"],
+            "Deletes the key from ~/.rustsploit/global_options.json. Accepts Metasploit aliases.",
+            &[
+                ("unsetg concurrency", "Revert to default concurrency (50)"),
+                ("unset RPORT",        "Remove port override"),
+            ],
+            &["set", "setg", "show_options"],
         ),
         "show_options" => man_page(
             "show_options",
-            "Display every global option currently set.",
+            "Display all current settings: target, port, source_port, concurrency, and more.",
             &["show options", "show_options", "so"],
-            "Prints key/value pairs from ~/.rustsploit/global_options.json.",
-            &[("so", "Quick look")],
-            &["setg", "unsetg"],
+            "Shows the complete configuration including target state, all global options, \
+             Metasploit alias mappings, and the currently selected module.",
+            &[("so", "Quick look at all settings")],
+            &["set", "setg", "unsetg"],
         ),
         "mass-scan" => man_page(
             "mass-scan",
@@ -1839,7 +2012,7 @@ async fn prompt_string_default(message: &str, default: &str) -> io::Result<Strin
         io::stdin().read_line(&mut s).map(|_| s)
     })
     .await
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    .map_err(io::Error::other)?
     ?;
 
     // Length check

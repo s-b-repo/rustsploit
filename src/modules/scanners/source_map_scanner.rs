@@ -6,17 +6,20 @@
 //! Also probes a handful of common bundler conventions (main.*.js.map,
 //! vendors~*.js.map) on the same path.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, Context};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::parallel::{run_buffered, BoxFut};
+use crate::utils::parallel::{run_buffered, run_buffered_unordered, BoxFut};
 use crate::utils::{build_http_client, cfg_prompt_default, is_batch_mode};
 
 const SOURCEMAP_CONCURRENCY: usize = 12;
+
+/// Result from checking a single source-map URL: (status, byte_length, snippet).
+type MapProbeResult = (String, Option<(u16, usize, String)>);
 
 fn banner() {
     if is_batch_mode() { return; }
@@ -41,6 +44,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -105,7 +109,16 @@ const COMMON_BUNDLE_PATHS: &[&str] = &[
 /// commonly serve the same index.html for any path and would otherwise
 /// flood the report with false positives.
 async fn check_map(client: &reqwest::Client, url: &str) -> Option<(u16, usize, String)> {
-    let r = client.get(url).send().await.ok()?;
+    // CDNs serving JS assets occasionally 429 under burst load. The probe is
+    // best-effort and we'd rather move on than wait minutes on a Retry-After,
+    // so use the lenient backoff preset (1 retry, ≤10s cap).
+    let r = crate::utils::throttle::with_backoff(
+        crate::utils::throttle::BackoffConfig::lenient(),
+        url.to_string(),
+        || async { client.get(url).send().await },
+    )
+    .await
+    .ok()?;
     let status = r.status().as_u16();
     if status >= 400 { return None; }
     let ct = r.headers().get("content-type")
@@ -135,24 +148,30 @@ fn map_url_for(asset: &url::Url) -> String {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     banner();
     let mut outcome = ModuleOutcome::ok();
     let url = cfg_prompt_default("url", "Target URL", &url_with_scheme(target)).await?;
-    let base = url::Url::parse(&url).map_err(|e| anyhow!("bad URL: {}", e))?;
+    let base = url::Url::parse(&url).context("bad URL")?;
 
     let client = build_http_client(Duration::from_secs(15))?;
 
     crate::mprintln!("{}", format!("[*] Fetching {} ...", url).cyan());
-    let resp = client.get(&url).send().await.map_err(|e| anyhow!("fetch: {}", e))?;
-    let html = resp.text().await.unwrap_or_default();
+    let resp = client.get(&url).send().await.context("fetch")?;
+    let html = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to read response body: {}", e);
+            String::new()
+        }
+    };
     let scripts = extract_script_srcs(&html, &base);
     crate::mprintln!("{}", format!("[*] Discovered {} <script src> URLs", scripts.len()).cyan());
 
     let mut hits: Vec<(String, usize)> = Vec::new();
 
     // Phase 1: probe each script's companion .map (concurrent fan-out).
-    let phase1_work: Vec<BoxFut<(String, Option<(u16, usize, String)>)>> =
+    let phase1_work: Vec<BoxFut<MapProbeResult>> =
         scripts.iter().map(|s| {
             let map_url = map_url_for(s);
             let client = client.clone();
@@ -173,7 +192,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let origin = format!("{}://{}", base.scheme(), base.host_str().unwrap_or(""));
     crate::mprintln!();
     crate::mprintln!("{}", format!("[*] Probing {} common bundler paths...", COMMON_BUNDLE_PATHS.len()).cyan());
-    let phase2_work: Vec<BoxFut<(String, Option<(u16, usize, String)>)>> =
+    let phase2_work: Vec<BoxFut<MapProbeResult>> =
         COMMON_BUNDLE_PATHS.iter().map(|path| {
             let full = format!("{}{}", origin, path);
             let client = client.clone();
@@ -182,7 +201,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 (full, r)
             }) as _
         }).collect();
-    for (full, r) in run_buffered(phase2_work, SOURCEMAP_CONCURRENCY).await {
+    // Bundler-convention probes are independent and printed as-they-complete,
+    // so prefer completion-order over input-order — operators see hits faster
+    // and the final summary sorts hits by URL regardless.
+    for (full, r) in run_buffered_unordered(phase2_work, SOURCEMAP_CONCURRENCY).await {
         if let Some((_status, len, _snippet)) = r {
             crate::mprintln!("{}", format!("[+] {} -> {} bytes (valid sourcemap)", full, len).green());
             hits.push((full, len));

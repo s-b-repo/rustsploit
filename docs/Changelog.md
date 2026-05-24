@@ -4,6 +4,101 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
+## v0.5.0-dev (2026-05-24) — Universal source port, probe timeout passthrough, inter-feature integration
+
+Full integration sweep ensuring all features work together across all modules.
+
+### Source port universalisation
+
+All TCP/UDP connections now go through the framework's network wrappers
+(`tcp_connect_str`, `tcp_connect_addr`, `blocking_tcp_connect`, `udp_bind`),
+which honour `setg source_port <port>` via `socket2` with `SO_REUSEADDR` /
+`SO_REUSEPORT` for concurrent mass-scan compatibility.
+
+**Third-party library bypasses fixed (8 call sites):**
+
+| Module | Library | Fix |
+|--------|---------|-----|
+| `ftp_bruteforce` (plain + FTPS) | suppaftp | `tcp_connect_str` → `connect_with_stream` |
+| `ftp_anonymous` (plain + FTPS) | suppaftp | `tcp_connect_str` → `connect_with_stream` |
+| `ftp_bounce_test` | suppaftp | `tcp_connect_str` → `connect_with_stream` |
+| `acti_camera_default` (FTP) | suppaftp | `tcp_connect_str` → `connect_with_stream` |
+| `acti_camera_default` (Telnet) | telnet crate | `blocking_tcp_connect` → `from_stream` |
+| `pachev_ftp_path_traversal` | suppaftp (blocking) | `blocking_tcp_connect` → `connect_with_stream` |
+
+**UDP modules fixed:** `snmp_bruteforce` and `l2tp_bruteforce` replaced raw
+`UdpSocket::bind` with `crate::utils::udp_bind(Some(ip))`.
+
+**Port scanner:** `scan_udp` added `socket2` `SO_REUSEPORT` fallback for
+source-port-bound concurrent scanning.
+
+### Probe timeout passthrough
+
+The `creds_helper::run` probe closure signature was extended to
+`Fn(String, u16, String, String, Duration)` — the fifth parameter is the
+user-configured timeout from `setg timeout N`. All 13 credential modules
+updated so the operator's timeout reaches inner probe functions instead of
+being overridden by hardcoded values.
+
+| Module | Change |
+|--------|--------|
+| `postgres_bruteforce` | Probe uses caller timeout for TCP connect + auth exchange |
+| `mysql_bruteforce` | Probe uses caller timeout for handshake + auth |
+| `rdp_bruteforce` | Probe passes timeout to `native::rdp::try_login` |
+| `mqtt_bruteforce` | Probe uses caller timeout for CONNECT packet exchange |
+| `memcached_bruteforce` | Probe uses caller timeout for SASL auth |
+| `rtsp_bruteforce` | Probe uses caller timeout for DESCRIBE request |
+| `elasticsearch_bruteforce` | Probe uses caller timeout for HTTP Basic request |
+| `couchdb_bruteforce` | Probe uses caller timeout for session auth |
+| `fortinet_bruteforce` | Probe uses caller timeout for FortiOS login |
+| `snmp_bruteforce` | Probe uses caller timeout for UDP GetRequest |
+| `l2tp_bruteforce` | Detect uses caller timeout for SCCRQ exchange |
+| `vnc_bruteforce` | Probe uses caller timeout for RFB challenge-response |
+| `telnet_bruteforce` | Probe wraps `try_login` with `tokio::time::timeout(timeout, ...)` |
+
+### Mass-scan file clobbering fixes
+
+| Module | Before | After |
+|--------|--------|-------|
+| ZTE RCE | `config.bin`, `decrypted.xml` | `config_{host}.bin`, `decrypted_{host}.xml` |
+| Tomcat RCE | shared `Exploit.java` | Per-invocation temp directory |
+| Pachev FTP | `results.txt` | `results_{target}.txt` |
+| MongoBleed | `vulnerable_mongodb.txt` | `vulnerable_mongodb_{timestamp}.txt` |
+| JWKS Inspector | `jwks_*.pem` | `jwks_{target}_{kid}_{i}.pem` |
+
+### Batch-mode guards
+
+- `h3c_websocket_dump`: Bails in batch mode (interactive REPL)
+- `windows_dwm_cve_2026_20805`: Bails in batch mode (local exploit generator)
+
+### Metasploit aliases
+
+Shell `set` / `setg` now accepts Metasploit-style option names:
+`RHOST`/`RHOSTS` → `target`, `RPORT` → `port`, `LPORT` → `source_port`,
+`THREADS` → `concurrency`, `MODULE_TIMEOUT` → `timeout`.
+
+### Documentation updated
+
+All docs in `docs/` updated to reflect current design: source port integration,
+mass scan compatibility, global options with aliases, probe timeout passthrough,
+FTP/Telnet wrapper pattern, batch_mode guards, target-specific filenames,
+`creds_helper` API, and network wrapper bypass patterns added to BAD_PATTERNS.
+
+### Files
+
+| File | Change |
+|---|---|
+| `src/utils/network.rs` | Source port binding in all TCP/UDP wrappers |
+| `src/utils/creds_helper.rs` | Probe closure extended with Duration parameter |
+| 13 credential module files | Timeout passthrough in probe functions |
+| 8 module files | Third-party library TCP bypasses fixed |
+| 5 module files | Target-specific output filenames |
+| 2 module files | Batch-mode guards added |
+| `src/modules/scanners/port_scanner.rs` | SO_REUSEPORT for UDP source port |
+| `docs/*.md` | Updated to reflect current design |
+
+---
+
 ## v0.5.6 (2026-05-08) — Delete `ModuleAdapter` + `build.rs` codegen
 
 **Reverses the v0.5.4 reframing.** Every one of the 363 modules now self-registers via `register_native_module!`, so the build-time regex-grep that emitted `module_inventory.rs` was producing an empty file and the `ModuleAdapter` struct was no longer reachable.

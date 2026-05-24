@@ -48,7 +48,8 @@ pub async fn ws_upgrade(
 
     let session_id_vec = match B64.decode(&session_b64) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("invalid session ID encoding: {e}");
             return axum::response::IntoResponse::into_response((
                 axum::http::StatusCode::BAD_REQUEST,
                 "Invalid session ID encoding",
@@ -58,7 +59,8 @@ pub async fn ws_upgrade(
 
     let session_id: [u8; 16] = match session_id_vec.try_into() {
         Ok(id) => id,
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("session ID wrong length: {} bytes", e.len());
             return axum::response::IntoResponse::into_response((
                 axum::http::StatusCode::BAD_REQUEST,
                 "Session ID must be 16 bytes",
@@ -106,13 +108,23 @@ pub async fn ws_upgrade(
         }
     };
 
-    let prev = TOTAL_WS_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
-    if prev >= MAX_TOTAL_CONNECTIONS {
-        TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
-        return axum::response::IntoResponse::into_response((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "WebSocket connection limit reached",
-        ));
+    // Atomically claim a connection slot via compare-exchange loop to
+    // avoid the TOCTOU where concurrent fetch_add + check can reject
+    // all connections or admit too many.
+    loop {
+        let current = TOTAL_WS_CONNECTIONS.load(Ordering::Acquire);
+        if current >= MAX_TOTAL_CONNECTIONS {
+            return axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "WebSocket connection limit reached",
+            ));
+        }
+        if TOTAL_WS_CONNECTIONS
+            .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
     }
 
     let pq_clone = pq.clone();
@@ -218,7 +230,8 @@ async fn handle_ws(
                             continue;
                         }
                     };
-                    if event_tx.send(bytes).await.is_err() {
+                    if let Err(e) = event_tx.send(bytes).await {
+                        tracing::trace!("Event channel closed: {e}");
                         break;
                     }
                 }
@@ -240,10 +253,10 @@ async fn handle_ws(
         loop {
             match module_rx.recv().await {
                 Ok(te) => {
-                    if let Some(ref tid) = te.tenant_id
-                        && tid != &my_tenant {
-                            continue;
-                        }
+                    match te.tenant_id {
+                        Some(ref tid) if tid == &my_tenant => { /* deliver */ }
+                        _ => continue,
+                    }
                     let envelope = json!({"type": "event", "event": "module", "data": te.event});
                     let bytes = match serde_json::to_vec(&envelope) {
                         Ok(b) => b,
@@ -252,7 +265,8 @@ async fn handle_ws(
                             continue;
                         }
                     };
-                    if module_event_tx.send(bytes).await.is_err() {
+                    if let Err(e) = module_event_tx.send(bytes).await {
+                        tracing::trace!("Module event channel closed: {e}");
                         break;
                     }
                 }
@@ -277,9 +291,12 @@ async fn handle_ws(
                 break;
             }
             drop(store);
-            let pong = serde_json::to_vec(&json!({"type": "heartbeat"}))
-                .unwrap_or_default();
-            if heartbeat_tx.send(pong).await.is_err() {
+            let pong = match serde_json::to_vec(&json!({"type": "heartbeat"})) {
+                Ok(v) => v,
+                Err(e) => { tracing::warn!("Failed to serialize heartbeat: {e}"); continue; }
+            };
+            if let Err(e) = heartbeat_tx.send(pong).await {
+                tracing::trace!("Heartbeat channel closed: {e}");
                 break;
             }
         }
@@ -337,8 +354,11 @@ async fn handle_ws(
             Ok(v) => v,
             Err(e) => {
                 let err_resp = json!({"error": {"code": "PARSE_ERROR", "message": format!("Invalid JSON: {}", e)}});
-                if let Ok(bytes) = serde_json::to_vec(&err_resp) && reader_tx.send(bytes).await.is_err() {
-                    break;
+                if let Ok(bytes) = serde_json::to_vec(&err_resp) {
+                    if let Err(e) = reader_tx.send(bytes).await {
+                        tracing::trace!("RPC response channel closed: {e}");
+                        break;
+                    }
                 }
                 continue;
             }
@@ -352,10 +372,14 @@ async fn handle_ws(
             if let Some(job_id_u64) = params.get("jobId").and_then(|v| v.as_u64()) {
                 let job_id: u32 = match u32::try_from(job_id_u64) {
                     Ok(id) => id,
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::debug!("jobId exceeds u32 range: {e}");
                         let resp = json!({"id": req_id, "error": {"code": "INVALID_JOB_ID", "message": "jobId exceeds u32 range"}});
-                        if let Ok(bytes) = serde_json::to_vec(&resp) && reader_tx.send(bytes).await.is_err() {
-                            break;
+                        if let Ok(bytes) = serde_json::to_vec(&resp) {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -363,8 +387,11 @@ async fn handle_ws(
                 let mut jobs = reader_jobs.lock().await;
                 if jobs.len() >= 100 {
                     let resp = json!({"id": req_id, "error": {"code": "SUB_LIMIT", "message": "Max 100 job subscriptions per connection"}});
-                    if let Ok(bytes) = serde_json::to_vec(&resp) && reader_tx.send(bytes).await.is_err() {
-                        break;
+                    if let Ok(bytes) = serde_json::to_vec(&resp) {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
                     }
                 } else {
                     // Send the ack BEFORE inserting: if the send fails the
@@ -374,9 +401,10 @@ async fn handle_ws(
                     let resp = json!({"id": req_id, "result": {"subscribed": job_id}});
                     let bytes = match serde_json::to_vec(&resp) {
                         Ok(b) => b,
-                        Err(_) => continue,
+                        Err(e) => { tracing::warn!("failed to serialize WS ack: {e}"); continue; }
                     };
-                    if reader_tx.send(bytes).await.is_err() {
+                    if let Err(e) = reader_tx.send(bytes).await {
+                        tracing::trace!("RPC response channel closed: {e}");
                         break;
                     }
                     jobs.insert(job_id);
@@ -400,8 +428,11 @@ async fn handle_ws(
             Ok(data) => json!({"id": req_id, "result": data}),
             Err(e) => json!({"id": req_id, "error": {"code": e.0, "message": e.1}}),
         };
-        if let Ok(bytes) = serde_json::to_vec(&response) && reader_tx.send(bytes).await.is_err() {
-            break;
+        if let Ok(bytes) = serde_json::to_vec(&response) {
+            if let Err(e) = reader_tx.send(bytes).await {
+                tracing::trace!("RPC response channel closed: {e}");
+                break;
+            }
         }
     }
 
@@ -437,6 +468,9 @@ pub(crate) async fn dispatch_rpc(method: &str, params: &Value) -> RpcResult {
         "set_target" => rpc_set_target(params).await,
         "clear_target" => rpc_clear_target().await,
         "run_module" => rpc_run_module(params).await,
+        // M44: run_all is intentionally an alias for run_module — both
+        // dispatch to the same handler. A dedicated multi-module runner is
+        // not yet implemented; callers should loop client-side.
         "run_all" => rpc_run_module(params).await,
         "check_module" => rpc_check_module(params).await,
         "honeypot_check" => rpc_honeypot_check(params).await,
@@ -507,6 +541,7 @@ async fn rpc_list_modules_enriched() -> RpcResult {
         let info = crate::commands::module_info(m).unwrap_or_else(|| crate::module_info::ModuleInfo {
             name: m.to_string(), description: String::new(), authors: vec![],
             references: vec![], disclosure_date: None, rank: crate::module_info::ModuleRank::Good,
+        default_port: None,
         });
         let category = m.split('/').next().unwrap_or("other");
         json!({
@@ -548,12 +583,12 @@ async fn rpc_module_info(params: &Value) -> RpcResult {
 // ── Target ───────────────────────────────────────────────────────────
 
 async fn rpc_get_target() -> RpcResult {
-    let target = crate::config::GLOBAL_CONFIG.get_target();
-    let size = crate::config::GLOBAL_CONFIG.get_target_size().unwrap_or(0);
+    let s = crate::tenant::resolve();
+    let target = s.global_options().get("__target").await;
     Ok(json!({
         "target": target,
-        "size": size,
-        "is_subnet": size > 1,
+        "size": if target.is_some() { 1 } else { 0 },
+        "is_subnet": false,
     }))
 }
 
@@ -568,18 +603,17 @@ async fn rpc_set_target(params: &Value) -> RpcResult {
     if crate::api::is_blocked_target_resolved(target).await {
         return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
     }
-    match crate::config::GLOBAL_CONFIG.set_target(target) {
-        Ok(_) => {
-            let t = crate::config::GLOBAL_CONFIG.get_target();
-            let size = crate::config::GLOBAL_CONFIG.get_target_size().unwrap_or(0);
-            Ok(json!({"target": t, "size": size}))
-        }
-        Err(e) => Err(rpc_err("TARGET_ERROR", e.to_string())),
+    let s = crate::tenant::resolve();
+    if !s.global_options().set("__target", target).await {
+        return Err(rpc_err("TARGET_ERROR", "Failed to store target in tenant options"));
     }
+    let stored = s.global_options().get("__target").await;
+    Ok(json!({"target": stored, "size": 1}))
 }
 
 async fn rpc_clear_target() -> RpcResult {
-    crate::config::GLOBAL_CONFIG.clear_target();
+    let s = crate::tenant::resolve();
+    s.global_options().unset("__target").await;
     Ok(json!({"cleared": true}))
 }
 
@@ -650,7 +684,7 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
     if let Some(port) = params.get("port").and_then(|v| v.as_u64()) {
         // P2-A1: range-check port at the RPC boundary so 99999 / huge u64
         // values can't slip into prompt strings and reach module parsers.
-        if port < 1 || port > 65535 {
+        if !(1..=65535).contains(&port) {
             return Err(rpc_err("INVALID_PORT", "port must be 1..=65535"));
         }
         custom_prompts.entry("port".into()).or_insert_with(|| port.to_string());
@@ -705,7 +739,7 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         let output_buf = crate::output::OutputBuffer::new();
         let buf_clone = output_buf.clone();
 
-        let (result, _ctx) = crate::context::run_with_context_target(
+        let (result, run_ctx) = crate::context::run_with_context_target(
             module_config,
             target_owned.clone(),
             || async move {
@@ -720,6 +754,7 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
 
         let stdout = output_buf.drain_stdout();
         let stderr = output_buf.drain_stderr();
+        drop(run_ctx);
         match result {
             Ok(_) => Ok(json!({
                 "status": "completed",
@@ -774,6 +809,11 @@ async fn rpc_list_options() -> RpcResult {
 async fn rpc_set_option(params: &Value) -> RpcResult {
     let s = crate::tenant::resolve();
     let obj = params.as_object().ok_or_else(|| rpc_err("INVALID_INPUT", "params must be an object"))?;
+    const MAX_OPTIONS: usize = 256;
+    let current_count = s.global_options().all().await.len();
+    if current_count + obj.len() > MAX_OPTIONS {
+        return Err(rpc_err("OPTION_LIMIT", format!("Options cap exceeded ({} existing + {} new > {} max)", current_count, obj.len(), MAX_OPTIONS)));
+    }
     let mut set_count = 0usize;
     for (key, val) in obj {
         let value = val.as_str().unwrap_or("");
@@ -876,7 +916,7 @@ async fn rpc_add_cred(params: &Value) -> RpcResult {
     };
 
     let s = crate::tenant::resolve();
-    let id = match s.cred_store().add(host, port, service, username, secret, cred_type, source).await {
+    let id = match s.cred_store().add(crate::cred_store::NewCred { host, port, service, username, secret, cred_type, source_module: source }).await {
         Some(id) => id,
         None => return Err(rpc_err("STORE_ERROR", "Credential add failed (store limit or validation)")),
     };
@@ -899,9 +939,24 @@ async fn rpc_search_creds(params: &Value) -> RpcResult {
     if query.len() > 256 {
         return Err(rpc_err("INVALID_INPUT", "Search query too long (max 256)"));
     }
+    let reveal = params.get("reveal").and_then(|v| v.as_bool()).unwrap_or(false);
     let results = s.cred_store().search(query).await;
-    let results_json = serde_json::to_value(&results).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?;
-    Ok(json!({"results": results_json, "total": results.len()}))
+    let total = results.len();
+    let results_json = if reveal {
+        serde_json::to_value(&results).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?
+    } else {
+        let redacted: Vec<Value> = results.iter().map(|c| {
+            let masked = "********".to_string();
+            json!({
+                "id": c.id, "host": c.host, "port": c.port,
+                "service": c.service, "username": c.username,
+                "secret": masked, "cred_type": format!("{:?}", c.cred_type),
+                "valid": c.valid, "source_module": c.source_module,
+            })
+        }).collect();
+        serde_json::to_value(redacted).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?
+    };
+    Ok(json!({"results": results_json, "total": total}))
 }
 
 async fn rpc_clear_creds() -> RpcResult {
@@ -999,7 +1054,7 @@ async fn rpc_list_services(params: &Value) -> RpcResult {
     let s = crate::tenant::resolve();
     let all = s.workspace().services().await;
     let filter_host = params.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-    let filter_port = params.get("port").and_then(|v| v.as_u64()).map(|p| p as u16);
+    let filter_port = params.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok());
     let filter_search = params.get("search").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
     let filtered: Vec<_> = all.into_iter().filter(|s| {
@@ -1195,7 +1250,7 @@ async fn rpc_get_job(params: &Value) -> RpcResult {
     let id_u64 = params.get("id").and_then(|v| v.as_u64())
         .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: id"))?;
     let id = u32::try_from(id_u64)
-        .map_err(|_| rpc_err("INVALID_INPUT", "id exceeds u32 range"))?;
+        .map_err(|e| rpc_err("INVALID_INPUT", format!("id exceeds u32 range: {e}")))?;
     let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     let s = crate::tenant::resolve();
@@ -1223,7 +1278,7 @@ async fn rpc_kill_job(params: &Value) -> RpcResult {
     let id_u64 = params.get("id").and_then(|v| v.as_u64())
         .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: id"))?;
     let id = u32::try_from(id_u64)
-        .map_err(|_| rpc_err("INVALID_INPUT", "id exceeds u32 range"))?;
+        .map_err(|e| rpc_err("INVALID_INPUT", format!("id exceeds u32 range: {e}")))?;
     let s = crate::tenant::resolve();
     if s.job_manager().kill(id) {
         Ok(json!({"killed": id}))
@@ -1236,7 +1291,7 @@ async fn rpc_set_job_limit(params: &Value) -> RpcResult {
     let limit_u64 = params.get("limit").and_then(|v| v.as_u64())
         .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: limit"))?;
     let limit = u32::try_from(limit_u64)
-        .map_err(|_| rpc_err("INVALID_INPUT", "limit exceeds u32 range"))?;
+        .map_err(|e| rpc_err("INVALID_INPUT", format!("limit exceeds u32 range: {e}")))?;
     if limit == 0 || limit > 100 {
         return Err(rpc_err("INVALID_INPUT", "limit must be 1-100"));
     }
@@ -1248,9 +1303,17 @@ async fn rpc_set_job_limit(params: &Value) -> RpcResult {
 // ── Spool ────────────────────────────────────────────────────────────
 
 async fn rpc_spool_status() -> RpcResult {
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
     let active = crate::spool::SPOOL.is_active();
     let filename = crate::spool::SPOOL.current_file();
-    Ok(json!({"active": active, "filename": filename}))
+    // Only report active if the spool belongs to the requesting tenant
+    let tenant_prefix = format!("{}_", tenant_id);
+    let is_mine = filename.as_ref().is_some_and(|f| f.starts_with(&tenant_prefix));
+    Ok(json!({"active": active && is_mine, "filename": if is_mine { filename } else { None }}))
 }
 
 async fn rpc_spool_start(params: &Value) -> RpcResult {
@@ -1269,13 +1332,31 @@ async fn rpc_spool_start(params: &Value) -> RpcResult {
     if !filename.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
         return Err(rpc_err("INVALID_INPUT", "Filename must be alphanumeric with _ - . only"));
     }
-    match crate::spool::SPOOL.start(filename) {
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    let scoped_filename = format!("{}_{}", tenant_id, filename);
+    match crate::spool::SPOOL.start(&scoped_filename) {
         Ok(_) => Ok(json!({"started": filename})),
         Err(e) => Err(rpc_err("SPOOL_ERROR", format!("{:#}", e))),
     }
 }
 
 async fn rpc_spool_stop() -> RpcResult {
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    let tenant_prefix = format!("{}_", tenant_id);
+    // Verify the active spool belongs to the requesting tenant
+    if let Some(current) = crate::spool::SPOOL.current_file() {
+        if !current.starts_with(&tenant_prefix) {
+            return Err(rpc_err("SPOOL_ERROR", "Spool is not active for this tenant"));
+        }
+    }
     match crate::spool::SPOOL.stop() {
         Some(name) => Ok(json!({"stopped": name})),
         None => Err(rpc_err("SPOOL_ERROR", "Spool is not active")),
@@ -1285,21 +1366,27 @@ async fn rpc_spool_stop() -> RpcResult {
 // ── Results ──────────────────────────────────────────────────────────
 
 async fn rpc_list_results() -> RpcResult {
-    let results_dir = crate::config::results_dir();
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    let results_dir = crate::config::results_dir().join(&tenant_id);
     if !results_dir.exists() {
         return Ok(json!({"files": [], "total": 0}));
     }
     let mut files = Vec::new();
-    let entries = match std::fs::read_dir(&results_dir) {
+    let mut entries = match tokio::fs::read_dir(&results_dir).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("Failed to read results directory: {}", e);
             return Ok(json!({"files": [], "total": 0}));
         }
     };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
             Err(e) => {
                 tracing::debug!("Skipping unreadable entry: {}", e);
                 continue;
@@ -1307,7 +1394,7 @@ async fn rpc_list_results() -> RpcResult {
         };
         let name = entry.file_name().to_string_lossy().to_string();
         if name.ends_with(".txt") && crate::api::validate_result_filename(&name) {
-            let meta = entry.metadata();
+            let meta = entry.metadata().await;
             files.push(json!({
                 "filename": name,
                 "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -1322,9 +1409,20 @@ async fn rpc_get_result(params: &Value) -> RpcResult {
     if !crate::api::validate_result_filename(filename) {
         return Err(rpc_err("INVALID_INPUT", "Invalid result filename"));
     }
-    let path = crate::config::results_dir().join(filename);
-    if !path.exists() {
-        return Err(rpc_err("NOT_FOUND", format!("Result file '{}' not found", filename)));
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    let tenant_results_dir = crate::config::results_dir().join(&tenant_id);
+    let path = tenant_results_dir.join(filename);
+    // Path traversal protection: verify resolved path stays within the tenant's results dir
+    let canonical_path = path.canonicalize()
+        .map_err(|e| rpc_err("NOT_FOUND", format!("Result file '{}' not found: {}", filename, e)))?;
+    let canonical_dir = tenant_results_dir.canonicalize()
+        .map_err(|e| rpc_err("IO_ERROR", format!("Results directory error: {}", e)))?;
+    if !canonical_path.starts_with(&canonical_dir) {
+        return Err(rpc_err("SECURITY", "Path traversal detected in result filename"));
     }
     let meta = std::fs::symlink_metadata(&path)
         .map_err(|e| rpc_err("IO_ERROR", e.to_string()))?;

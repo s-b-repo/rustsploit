@@ -250,7 +250,7 @@ fn collect_initial_targets(initial_target: &str) -> Vec<String> {
 
 fn split_targets(input: &str) -> Vec<String> {
     input
-    .split(|c| c == ',' || c == '\n' || c == ';')
+    .split([',', '\n', ';'])
     .map(|item| item.trim().trim_end_matches('/').to_string())
     .filter(|item| !item.is_empty())
     .collect()
@@ -360,6 +360,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

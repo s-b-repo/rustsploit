@@ -37,6 +37,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -65,7 +66,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", format!("[*] GET {}", url).cyan());
     if let Ok(r) = client.get(&url).send().await {
         let s = r.status().as_u16();
-        let body = r.text().await.unwrap_or_default();
+        let body = match r.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                String::new()
+            }
+        };
         if s == 200 && body.starts_with('[') {
             crate::mprintln!("{}", "[+] /wp-json/wp/v2/users returned a JSON array".green().bold());
             // crude id/slug/name extraction
@@ -126,7 +133,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let probe = format!("{}/?p=1", base);
     if let Ok(r) = client.get(format!("{}/wp-json/oembed/1.0/embed?url={}", base, url_encode(&probe))).send().await {
         let s = r.status().as_u16();
-        let body = r.text().await.unwrap_or_default();
+        let body = match r.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                String::new()
+            }
+        };
         if s == 200 && body.contains("author_name") {
             crate::mprintln!("{}", format!("[+] oembed disclosed author for {}: {}",
                 probe, body.chars().take(200).collect::<String>()).green());

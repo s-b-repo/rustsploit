@@ -147,7 +147,9 @@ pub fn emit(event: ModuleEvent) {
                 .try_with(|t| t.clone())
                 .ok()
         });
-    let _ = bus().send(TenantEvent { tenant_id, event });
+    if let Err(e) = bus().send(TenantEvent { tenant_id, event }) {
+        tracing::trace!("Event bus: no active subscribers ({})", e);
+    }
 }
 
 /// Subscriber count, useful for debug logging.

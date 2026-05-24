@@ -98,7 +98,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
             crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)",
                 idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
         }
 
         ctx.rate_limit(url).await;
@@ -257,7 +257,7 @@ fn collect_initial_targets(initial_target: &str) -> Vec<String> {
 
 fn split_targets(input: &str) -> Vec<String> {
     input
-        .split(|c| c == ',' || c == '\n' || c == ';')
+        .split([',', '\n', ';'])
         .map(|item| item.trim().trim_end_matches('/').to_string())
         .filter(|item| !item.is_empty())
         .collect()
@@ -381,6 +381,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::time::{ sleep, timeout };
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     cfg_prompt_default,
     cfg_prompt_port,
@@ -40,6 +40,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(21),
     }
 }
 
@@ -102,9 +103,9 @@ fn display_banner() {
 
 /// Format IPv4 or IPv6 addresses with port for display.
 fn format_addr(target: &str, port: u16) -> String {
-    if target.starts_with('[') && target.contains("]:") {
-        target.to_string()
-    } else if target.matches(':').count() == 1 && !target.contains('[') {
+    if (target.starts_with('[') && target.contains("]:"))
+        || (target.matches(':').count() == 1 && !target.contains('['))
+    {
         target.to_string()
     } else {
         let clean = if target.starts_with('[') && target.ends_with(']') {
@@ -169,6 +170,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     let port = cfg_prompt_port("port", "FTP Port", 21).await?;
@@ -257,44 +259,73 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         result.save_to_file(&path)?;
     }
 
-    Ok(ModuleOutcome::ok())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid FTP credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "ftp",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 /// Try FTP login with FTPS fallback when TLS is required.
 async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose: bool) -> Result<bool> {
-    // Attempt plain FTP
-    match timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), AsyncFtpStream::connect(addr)).await {
-        Ok(Ok(mut ftp)) => {
-            match ftp.login(user, pass).await {
-                Ok(_) => {
-                    if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
-                    return Ok(true);
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    match FtpErrorType::classify_error(&msg) {
-                        FtpErrorType::AuthenticationFailed => return Ok(false),
-                        FtpErrorType::TlsRequired => { if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); } }
-                        FtpErrorType::ConnectionLimitExceeded => {
-                            sleep(Duration::from_secs(1)).await;
-                            return Err(anyhow!("Connection limit exceeded (421)"));
+    // Attempt plain FTP via source-port-aware TCP wrapper
+    let tcp_result = timeout(
+        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        crate::utils::network::tcp_connect_str(addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    ).await;
+    match tcp_result {
+        Ok(Ok(tcp_stream)) => match AsyncFtpStream::connect_with_stream(tcp_stream).await {
+            Ok(mut ftp) => {
+                match ftp.login(user, pass).await {
+                    Ok(_) => {
+                        if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); }
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        match FtpErrorType::classify_error(&msg) {
+                            FtpErrorType::AuthenticationFailed => return Ok(false),
+                            FtpErrorType::TlsRequired => { if let Err(e) = ftp.quit().await { crate::meprintln!("[!] FTP quit error: {}", e); } }
+                            FtpErrorType::ConnectionLimitExceeded => {
+                                sleep(Duration::from_secs(1)).await;
+                                return Err(anyhow!("Connection limit exceeded (421)"));
+                            }
+                            _ => return Err(anyhow!("FTP login error: {}", msg)),
                         }
-                        _ => return Err(anyhow!("FTP login error: {}", msg)),
                     }
                 }
             }
-        }
+            Err(e) => return Err(anyhow!("FTP handshake error: {}", e)),
+        },
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow!("Timeout")),
+        Err(e) => return Err(anyhow!("Timeout: {e}")),
     }
 
     // FTPS fallback
     if verbose {
         crate::mprintln!("  [v] {} — trying FTPS (TLS)...", addr);
     }
-    let mut ftp_tls = match timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS), AsyncNativeTlsFtpStream::connect(addr)).await {
+    let tcp_stream_tls = match timeout(
+        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        crate::utils::network::tcp_connect_str(addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    ).await {
         Ok(Ok(s)) => s,
-        _ => return Err(anyhow!("FTPS Connect failed")),
+        Ok(Err(e)) => return Err(anyhow!("FTPS TCP connect failed: {}", e)),
+        Err(e) => return Err(anyhow!("FTPS connect timed out: {}", e)),
+    };
+
+    let ftp_plain_tls = match AsyncNativeTlsFtpStream::connect_with_stream(tcp_stream_tls).await {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow!("FTPS FTP handshake failed: {}", e)),
     };
 
     let connector = AsyncNativeTlsConnector::from(
@@ -309,7 +340,7 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose
         target.split(':').next().unwrap_or(target)
     };
 
-    ftp_tls = match ftp_tls.into_secure(connector, domain).await {
+    let mut ftp_tls = match ftp_plain_tls.into_secure(connector, domain).await {
         Ok(s) => s,
         Err(e) => return Err(anyhow!("TLS Upgrade: {}", e)),
     };

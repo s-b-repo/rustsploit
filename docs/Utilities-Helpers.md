@@ -7,6 +7,8 @@ Rustsploit provides several utility modules that every module developer should k
 | **Core Utils** | `crate::utils` | Target normalization, file loading, config-aware prompts, input validation |
 | **Network Utils** | `crate::utils::network` | HTTP client builders, TCP/UDP connect helpers, honeypot check |
 | **Privilege Utils** | `crate::utils::privilege` | Root privilege check for raw-socket modules |
+| **Creds Helper** | `crate::utils::creds_helper` | Single-target credential brute-force harness (prompt, engine, loot, findings) |
+| **Exploit Helper** | `crate::utils::exploit_helper` | HTTP probe helpers for single-target CVE exploit modules |
 | **Creds Utils** | `crate::modules::creds::utils` | Bruteforce statistics, subnet helpers, IP exclusion, scan state tracking |
 | **Config** | `crate::config` | Global target state, module config, API prompt keys, results directory |
 | **Global Options** | `crate::global_options` | Persistent `setg` options — checked by `cfg_prompt_*` after custom_prompts |
@@ -227,37 +229,108 @@ let lines = load_lines(&wordlist)?;
 
 ### Complete Module Integration Example
 
-Here's a typical module using all the core utils together:
+Here's a typical native module using core utils:
 
 ```rust
+use anyhow::{Context, Result};
+use crate::module::{ModuleCtx, ModuleOutcome};
 use crate::utils::{
-    load_lines, normalize_target,
-    cfg_prompt_required, cfg_prompt_yes_no, cfg_prompt_existing_file,
-    cfg_prompt_int_range, cfg_prompt_default, cfg_prompt_port,
-    cfg_prompt_output_file, cfg_prompt_wordlist,
+    load_lines,
+    cfg_prompt_yes_no, cfg_prompt_existing_file,
+    cfg_prompt_int_range, cfg_prompt_port,
+    cfg_prompt_output_file,
 };
 
-pub async fn run(target: &str) -> anyhow::Result<()> {
-    let target = normalize_target(target)?;
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().context("requires single target")?;
+    let mut outcome = ModuleOutcome::ok();
 
-    // Gather config — works in both shell and API mode
-    let port       = cfg_prompt_port("port", "Target port", 22)?;
-    let user_file  = cfg_prompt_existing_file("user_wordlist", "Username wordlist")?;
-    let pass_file  = cfg_prompt_existing_file("pass_wordlist", "Password wordlist")?;
-    let threads    = cfg_prompt_int_range("threads", "Threads", 10, 1, 100)? as usize;
-    let delay      = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 60000)? as u64;
-    let verbose    = cfg_prompt_yes_no("verbose", "Verbose output?", false)?;
-    let output     = cfg_prompt_output_file("output_file", "Output file", "results.txt")?;
+    let port       = cfg_prompt_port("port", "Target port", 22).await?;
+    let user_file  = cfg_prompt_existing_file("user_wordlist", "Username wordlist").await?;
+    let pass_file  = cfg_prompt_existing_file("pass_wordlist", "Password wordlist").await?;
+    let threads    = cfg_prompt_int_range("threads", "Threads", 10, 1, 100).await? as usize;
+    let verbose    = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
+    let output     = cfg_prompt_output_file("output_file", "Output file", "results.txt").await?;
 
-    // Load wordlists
     let users = load_lines(&user_file)?;
     let passwords = load_lines(&pass_file)?;
 
-    println!("[*] Targeting {} with {} users × {} passwords", target, users.len(), passwords.len());
-    // ... bruteforce logic ...
-    Ok(())
+    crate::mprintln!("[*] Targeting {} with {} users × {} passwords", target, users.len(), passwords.len());
+    // ... bruteforce logic using tcp_connect_str for source port support ...
+    Ok(outcome)
 }
 ```
+
+---
+
+## `crate::utils::creds_helper` — Single-Target Credential Harness (v0.5.5+)
+
+The preferred way to write a credential brute-force module. Wraps: target parsing,
+TCP precheck, wordlist prompts, brute-force engine wiring, loot persistence,
+workspace tracking, and `Finding` emission.
+
+```rust
+use crate::utils::creds_helper::{self, CredsRun};
+use crate::utils::LoginResult;
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().context("requires single target")?;
+    creds_helper::run(
+        target,
+        CredsRun {
+            service_name: "myproto",
+            default_port: 1234,
+            source_module: "creds/generic/myproto_bruteforce",
+            defaults: &[("admin", "admin")],
+            password_only: false,
+        },
+        |host, port, user, pass, timeout| async move {
+            probe(&host, port, &user, &pass, timeout).await
+        },
+    )
+    .await
+}
+```
+
+### Probe closure signature
+
+```rust
+Fn(String, u16, String, String, Duration) -> Future<Output = LoginResult>
+```
+
+The fifth parameter (`Duration`) is the user-configured timeout from `setg timeout N`
+or the interactive prompt. It is passed through to the probe so inner functions honour
+the operator's setting — no hardcoded timeouts inside probes.
+
+### Utility functions
+
+| Function | Description |
+|----------|-------------|
+| `connect_with_timeout(addr, deadline)` | Async TCP connect via framework wrapper → `io::Result<TcpStream>` |
+| `read_exact_with_timeout(reader, buf, deadline)` | Exact-read with timeout, flattened error |
+| `parse_host_port(target, default_port)` | Public `(host, port)` splitter |
+
+### Modules using creds_helper
+
+All 13 generic credential modules: `couchdb`, `elasticsearch`, `fortinet`,
+`l2tp`, `memcached`, `mqtt`, `mysql`, `postgres`, `rdp`, `rtsp`, `snmp`,
+`telnet`, `vnc` bruteforces.
+
+---
+
+## `crate::utils::exploit_helper` — HTTP Exploit Probe Helpers (v0.5.5+)
+
+Shared helpers for single-target CVE exploit probes:
+
+| Function | Description |
+|----------|-------------|
+| `http_client(timeout)` | `reqwest::Client` via `build_http_client` |
+| `marker(prefix)` | Random marker string for echo-based detection |
+| `report_vulnerable(host, port, cve, summary, payload, source)` | Emit finding + loot |
+| `report_not_vulnerable(host, port, reason)` | Log not-vulnerable result |
+| `scheme_for(port)` | Returns `"https"` for 443/8443, `"http"` otherwise |
+
+Used by 18+ exploit modules to reduce each to ~50 LOC.
 
 ---
 
@@ -362,7 +435,11 @@ println!("Scanning {} hosts", subnet_host_count(&net));
 
 ### `generate_random_public_ip(exclusions) → IpAddr`
 
-Generates a random IPv4 address that is **not** in any excluded range. Automatically skips `10.x.x.x`, `127.x.x.x`, and `0.x.x.x` in addition to the provided exclusion list. Used by mass-scanning modules (Camxploit, etc.).
+> **Deprecated for module use.** Random IP generation is now handled by
+> `scheduler::fanout_random` with `crate::exclusions::ExclusionSet`. Modules
+> should NOT call this directly — the scheduler does the fan-out.
+
+Generates a random IPv4 address that is **not** in any excluded range. Automatically skips `10.x.x.x`, `127.x.x.x`, and `0.x.x.x` in addition to the provided exclusion list.
 
 ```rust
 use crate::modules::creds::utils::{generate_random_public_ip, parse_exclusions};
@@ -423,47 +500,42 @@ for ip in network.iter() {
 
 ## Complete Credential Module Example
 
-Putting both utility modules together in a real bruteforce module:
+The preferred pattern uses `creds_helper::run` (see the creds_helper section above).
+For modules that need custom logic beyond the harness:
 
 ```rust
-use std::sync::Arc;
+use anyhow::{Context, Result};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
-    load_lines, normalize_target,
+    load_lines,
     cfg_prompt_port, cfg_prompt_existing_file,
     cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
 };
-use crate::modules::creds::utils::{
-    BruteforceStats, is_subnet_target, parse_subnet, subnet_host_count,
-    generate_random_public_ip, is_ip_checked, mark_ip_checked, parse_exclusions,
-};
 
-pub async fn run(target: &str) -> anyhow::Result<()> {
-    let target = normalize_target(target)?;
-    let port = cfg_prompt_port("port", "Target port", 1883)?;
-    let user_file = cfg_prompt_existing_file("user_wordlist", "Username wordlist")?;
-    let pass_file = cfg_prompt_existing_file("pass_wordlist", "Password wordlist")?;
-    let threads = cfg_prompt_int_range("threads", "Threads", 10, 1, 200)? as usize;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose?", false)?;
-    let output = cfg_prompt_output_file("output_file", "Output file", "results.txt")?;
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().context("requires single target")?;
+    let mut outcome = ModuleOutcome::ok();
+
+    let port = cfg_prompt_port("port", "Target port", 1883).await?;
+    let user_file = cfg_prompt_existing_file("user_wordlist", "Username wordlist").await?;
+    let pass_file = cfg_prompt_existing_file("pass_wordlist", "Password wordlist").await?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose?", false).await?;
 
     let users = load_lines(&user_file)?;
     let passwords = load_lines(&pass_file)?;
-    let stats = Arc::new(BruteforceStats::new());
 
-    if is_subnet_target(&target) {
-        let network = parse_subnet(&target)?;
-        println!("[*] Subnet scan: {} hosts", subnet_host_count(&network));
-        for ip in network.iter() {
-            if is_ip_checked(&ip, &output).await { continue; }
-            // ... bruteforce ip ...
-            mark_ip_checked(&ip, &output).await;
+    for user in &users {
+        for pass in &passwords {
+            // Use framework wrappers for source port support
+            let stream = crate::utils::network::tcp_connect_str(
+                &format!("{}:{}", target, port),
+                std::time::Duration::from_secs(10),
+            ).await;
+            // ... attempt login ...
         }
-    } else {
-        // ... single host bruteforce ...
     }
 
-    stats.print_final().await;
-    Ok(())
+    Ok(outcome)
 }
 ```
 
@@ -676,7 +748,12 @@ let client = build_http_client_with(Duration::from_secs(10), HttpClientOpts {
 
 ### `tcp_connect_addr(addr, timeout) → io::Result<TcpStream>`
 
-Async TCP connection to a `SocketAddr` with timeout and optional source port binding. Preferred over raw `TcpStream::connect` — respects global source port setting.
+Async TCP connection to a `SocketAddr` with timeout and **source port binding**.
+When `setg source_port <port>` is active, the socket is bound to that port via
+`socket2` before connecting. Uses `SO_REUSEADDR` (and `SO_REUSEPORT` on Linux)
+so concurrent mass-scan tasks can share the same source port.
+
+Preferred over raw `TcpStream::connect` — respects global source port setting.
 
 ```rust
 use crate::utils::network::tcp_connect_addr;
@@ -689,6 +766,7 @@ let stream = tcp_connect_addr(addr, Duration::from_secs(5)).await?;
 ### `tcp_connect_str(addr_str, timeout) → io::Result<TcpStream>`
 
 Async TCP connection from a `"host:port"` string. Resolves DNS and connects.
+Same source port binding as `tcp_connect_addr`.
 
 ---
 
@@ -698,15 +776,49 @@ Quick async check if a TCP port is open.
 
 ---
 
-### `blocking_tcp_connect(addr, timeout) → io::Result<TcpStream>`
+### `blocking_tcp_connect(addr, timeout) → io::Result<std::net::TcpStream>`
 
-Synchronous TCP connection for use in `spawn_blocking` contexts.
+Synchronous TCP connection for use in `spawn_blocking` contexts. Same source
+port binding as the async variants. Used when third-party libraries require
+a `std::net::TcpStream` (e.g. `telnet` crate's `Telnet::from_stream`).
 
 ---
 
 ### `udp_bind(target_ip) → io::Result<UdpSocket>`
 
 Binds a UDP socket to the appropriate address family (IPv4 or IPv6) for the target.
+When `setg source_port <port>` is active, binds to that source port.
+
+---
+
+### Source port binding details
+
+All four TCP/UDP wrappers read `GlobalOptions::get("source_port")` at call time.
+The implementation uses `socket2::Socket` to:
+
+1. Create a socket with the correct address family
+2. Set `SO_REUSEADDR` (and `SO_REUSEPORT` on Linux) for concurrent mass-scan compatibility
+3. Bind to `0.0.0.0:<source_port>` (or `[::]:<source_port>` for IPv6)
+4. Connect to the target
+
+**Third-party library integration:** Libraries that normally create their own
+TCP connections (suppaftp, telnet crate) must receive a pre-connected stream
+from these wrappers:
+
+```rust
+// FTP via suppaftp
+let tcp = tcp_connect_str(&addr, timeout).await?;
+let ftp = AsyncFtpStream::connect_with_stream(tcp).await?;
+
+// FTPS via suppaftp
+let tcp = tcp_connect_str(&addr, timeout).await?;
+let ftp_plain = AsyncNativeTlsFtpStream::connect_with_stream(tcp).await?;
+let ftp_tls = ftp_plain.into_secure(connector, domain).await?;
+
+// Telnet (blocking, via spawn_blocking)
+let tcp = blocking_tcp_connect(&socket_addr, timeout)?;
+let telnet = Telnet::from_stream(Box::new(tcp), 500);
+```
 
 ---
 

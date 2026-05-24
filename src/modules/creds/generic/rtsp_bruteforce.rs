@@ -33,6 +33,7 @@ pub fn info() -> ModuleInfo {
         references: vec!["https://www.rfc-editor.org/rfc/rfc7826".to_string()],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(554),
     }
 }
 
@@ -47,16 +48,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: false,
         },
-        |host, port, user, pass| async move { probe(&host, port, &user, &pass).await },
+        |host, port, user, pass, timeout| async move { probe(&host, port, &user, &pass, timeout).await },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
     use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let timeout = Duration::from_secs(5);
     let addr = format!("{}:{}", host, port);
     let mut stream = match crate::utils::creds_helper::connect_with_timeout(&addr, timeout).await {
         Ok(s) => s,
@@ -103,9 +103,9 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
                 retryable: true,
             }
         }
-        Err(_) => {
+        Err(e) => {
             return LoginResult::Error {
-                message: "read timeout".to_string(),
+                message: format!("read timeout: {e}"),
                 retryable: true,
             }
         }

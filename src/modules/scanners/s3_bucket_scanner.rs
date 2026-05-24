@@ -8,8 +8,8 @@
 //!   - `?acl` — ACL disclosure
 //!   - `?policy` — bucket policy disclosure
 //!   - `?versioning`, `?logging`, `?location`
-//! Reports public-listing, AccessDenied (exists but locked), and NoSuchBucket
-//! (free for registration in the org's name = takeover opportunity).
+//!     Reports public-listing, AccessDenied (exists but locked), and NoSuchBucket
+//!     (free for registration in the org's name = takeover opportunity).
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -45,6 +45,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -107,7 +108,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             Err(e) => { crate::mprintln!("{}", format!("[-] {} -> {}", label, e).dimmed()); continue; }
         };
         let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
+        let body = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                String::new()
+            }
+        };
         let snippet: String = body.chars().take(160).collect();
 
         if body.contains("<Code>NoSuchBucket</Code>") {

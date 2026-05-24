@@ -116,15 +116,19 @@ pub use modules::{
     find_modules,
     get_filename_in_current_dir,
     list_all_modules,
-    load_lines,
-    load_lines_batched,
-    load_lines_cached,
-    load_lines_uncapped,
     file_size,
     module_exists,
     safe_read_to_string,
     safe_read_to_string_async,
     STREAMING_THRESHOLD,
+};
+
+// --- wordlist.rs (line-loading functions migrated from modules.rs) ---
+pub use wordlist::{
+    load_lines,
+    load_lines_batched,
+    load_lines_cached,
+    load_lines_uncapped,
 };
 
 // --- bruteforce.rs (migrated from modules/creds/utils.rs) ---

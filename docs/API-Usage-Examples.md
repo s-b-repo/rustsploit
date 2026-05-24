@@ -38,7 +38,7 @@ curl -H "Authorization: Bearer my-secret-key" \
     "scanners/dir_brute",
     "creds/generic/ssh_bruteforce"
   ],
-  "count": 240,
+  "count": 363,
   "request_id": "abc123",
   "timestamp": "2026-03-17T14:01:00Z",
   "duration_ms": 2

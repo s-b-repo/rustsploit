@@ -4,7 +4,7 @@ use native_tls::TlsConnector;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     load_lines,
     cfg_prompt_default,
@@ -34,6 +34,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(110),
     }
 }
 
@@ -189,6 +190,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
     let use_ssl = cfg_prompt_yes_no("use_ssl", "Use SSL/TLS (POP3S)?", false).await?;
     let default_port = if use_ssl { 995 } else { 110 };
 
@@ -275,7 +277,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     result.print_found();
     result.save_to_file(&output_file)?;
 
-    Ok(ModuleOutcome::ok())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid POP3 credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "pop3",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 /// POP3 login result: Ok(true) = authenticated, Ok(false) = auth rejected, Err = classified error.

@@ -44,6 +44,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: Some("2026-04-24".to_string()),
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -67,7 +68,7 @@ pub async fn check(ctx: &ModuleCtx) -> CheckResult {
             Ok(b) => b,
             Err(e) => return CheckResult::Unknown(format!("Failed to read body: {}", e)),
         },
-        Err(_) => return CheckResult::Unknown(format!("Could not reach {}", url)),
+        Err(e) => return CheckResult::Unknown(format!("Could not reach {}: {e}", url)),
     };
 
     if !body.contains("SGFrame") && !body.contains("window._vars") && !body.contains("sgbox") {
@@ -122,7 +123,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 return Ok(outcome);
             }
         },
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("request failed: {e}");
             if !crate::utils::is_batch_mode() {
                 crate::mprintln!(
                     "{}",
@@ -434,7 +436,7 @@ async fn probe_login_rate_limit(
                 }
                 p.successes += 1;
             }
-            Err(_) => continue,
+            Err(e) => { tracing::debug!("login probe failed: {e}"); continue; }
         }
     }
     Ok(p)

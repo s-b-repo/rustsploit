@@ -1,5 +1,6 @@
 use anyhow::Result;
-use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::Context;
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
@@ -16,11 +17,12 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     if !crate::utils::is_batch_mode() {
         print_banner();
     }
@@ -48,12 +50,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{} Running {} probes against {}...", "[*]".cyan(), total, target);
     crate::mprintln!();
 
+    let mut outcome = ModuleOutcome::ok();
     let mut vulnerable = Vec::new();
     let mut unknown = Vec::new();
     let mut not_vulnerable = 0u32;
     let mut errors = 0u32;
 
-    let http_client = crate::utils::build_http_client(Duration::from_secs(5)).ok();
+    let http_client = match crate::utils::build_http_client(Duration::from_secs(5)) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!("failed to build HTTP client for vuln checks: {e}");
+            None
+        }
+    };
 
     for (i, probe) in filtered.iter().enumerate() {
         if crate::context::is_cancelled() { break; }
@@ -76,10 +85,30 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     version: Some(msg.clone()),
                 });
                 vulnerable.push((probe.module.to_string(), msg.clone()));
+                outcome = outcome.with(Finding {
+                    target: target.to_string(),
+                    kind: FindingKind::Vulnerable,
+                    message: format!("{} — {}", probe.module, msg),
+                    data: Some(serde_json::json!({
+                        "module": probe.module,
+                        "status": "vulnerable",
+                        "detail": msg,
+                    })),
+                });
             }
             CheckResult::Unknown(msg) => {
                 crate::mprintln!("{} {} — {}", "[?]".yellow(), probe.module, msg);
                 unknown.push((probe.module.to_string(), msg.clone()));
+                outcome = outcome.with(Finding {
+                    target: target.to_string(),
+                    kind: FindingKind::Note,
+                    message: format!("{} — {}", probe.module, msg),
+                    data: Some(serde_json::json!({
+                        "module": probe.module,
+                        "status": "unknown/possible",
+                        "detail": msg,
+                    })),
+                });
             }
             CheckResult::NotVulnerable(msg) => {
                 not_vulnerable += 1;
@@ -121,7 +150,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("  {} not vulnerable, {} errors", not_vulnerable, errors);
     crate::mprintln!();
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 // ─── Probe types ───────────────────────────────────────────────────────────
@@ -171,14 +200,14 @@ async fn run_probe(probe: &Probe, target: &str, client: Option<&reqwest::Client>
                     }
                     CheckResult::NotVulnerable(format!("no markers at {}", base))
                 }
-                Err(_) => CheckResult::NotVulnerable(format!("{} not reachable", base)),
+                Err(e) => CheckResult::NotVulnerable(format!("{} not reachable: {e}", base)),
             }
         }
         ProbeType::Tcp { port } => {
             let addr = format!("{}:{}", target, port);
             match crate::utils::network::tcp_connect(&addr, Duration::from_secs(3)).await {
                 Ok(_) => CheckResult::Unknown(format!("port {} open at {}", port, target)),
-                Err(_) => CheckResult::NotVulnerable(format!("{}:{} closed", target, port)),
+                Err(e) => CheckResult::NotVulnerable(format!("{}:{} closed: {e}", target, port)),
             }
         }
         ProbeType::TcpBanner { port, marker } => {
@@ -203,7 +232,7 @@ async fn run_probe(probe: &Probe, target: &str, client: Option<&reqwest::Client>
                         _ => CheckResult::Unknown(format!("port {} open at {} (no banner)", port, target)),
                     }
                 }
-                Err(_) => CheckResult::NotVulnerable(format!("{}:{} closed", target, port)),
+                Err(e) => CheckResult::NotVulnerable(format!("{}:{} closed: {e}", target, port)),
             }
         }
         ProbeType::Skip => {

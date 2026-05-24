@@ -3,7 +3,8 @@ use colored::*;
 use reqwest::{Client, header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
+use tokio::fs;
 use std::io::Write;
 use std::fmt::Write as FmtWrite; // Rename to avoid conflict with io::Write
 use std::sync::Arc;
@@ -126,8 +127,9 @@ fn encode_payload(input: &str, encoding: EncodingType) -> String {
              // Randomly apply an encoding per byte (simplified: raw or url or hex)
              let mut rng = rand::rng();
              input.as_bytes().iter().map(|b| {
-                 match [0, 1, 2].choose(&mut rng).unwrap_or(&0) {
-                     0 => String::from(*b as char),
+                 match [0, 1, 2].choose(&mut rng).copied().unwrap_or(0) {
+                     0 if b.is_ascii() => String::from(*b as char),
+                     0 => format!("%{:02X}", b),
                      1 => format!("%{:02X}", b),
                      _ => format!("\\x{:02X}", b),
                  }
@@ -334,7 +336,7 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
 async fn save_template(config: &SequentialFuzzerConfig) -> Result<()> {
     let name = cfg_prompt_default("template_name", "Template Name", "fuzz_template.json").await?;
     let json = serde_json::to_string_pretty(config)?;
-    fs::write(&name, json).context("Failed to write template")?;
+    fs::write(&name, json).await.context("Failed to write template")?;
     crate::mprintln!("Saved to {}", name);
     Ok(())
 }
@@ -359,7 +361,7 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
     // 1. Prepare Output Dir
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let out_dir = format!("scans/fuzz_{}", timestamp);
-    fs::create_dir_all(&out_dir).context("Failed to create output dir")?;
+    fs::create_dir_all(&out_dir).await.context("Failed to create output dir")?;
     crate::mprintln!("Output Directory: {}", out_dir.cyan());
 
     // 2. Spawn Writer Actor
@@ -380,22 +382,17 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
                     let file_path = format!("{}/raw_{}.txt", writer_dir, res.status);
                     let line = format!("[Size: {}] {}\n", res.size, res.path);
                     
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&file_path) {
-                        let _ = file.write_all(line.as_bytes());
-                    }
+                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&file_path)
+                        && let Err(e) = file.write_all(line.as_bytes()) { eprintln!("[!] Write failed: {}", e); }
 
                     // 2. Print Control (Real-time Output)
                     let status = res.status;
-                    let should_print = if status == 403 && !verbose {
-                        false
-                    } else {
-                        true
-                    };
+                    let should_print = status != 403 || verbose;
 
                     if should_print {
-                         let status_display = if status >= 200 && status < 300 {
+                         let status_display = if (200..300).contains(&status) {
                              format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
-                         } else if status >= 300 && status < 400 {
+                         } else if (300..400).contains(&status) {
                              format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
                          } else if status >= 500 {
                              format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
@@ -436,26 +433,26 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
     // We iterate lengths
     for len in config.min_length..=config.max_length {
         if ctx.is_cancelled() { break; }
-        spawn_combinations_iterative(
+        spawn_combinations_iterative(&CombinationCtx {
             ctx,
             target,
-            &client,
-            &config,
-            &charset,
-            len,
-            &sem,
-            &tx
-        ).await;
+            client: &client,
+            config: &config,
+            charset: &charset,
+            length: len,
+            sem: &sem,
+            tx: &tx,
+        }).await;
     }
     
     // 5. Wait for all tasks to finish
     // We do this by attempting to acquire ALL permits.
     // This will block until all active tasks release their permits.
     crate::mprintln!("Generation done. Waiting for active tasks to complete...");
-    let _ = sem.acquire_many(config.concurrency as u32).await;
-    
+    if let Err(e) = sem.acquire_many(config.concurrency as u32).await { eprintln!("[!] Semaphore acquire failed: {}", e); }
+
     // Stop Writer
-    let _ = tx.send(WriterMessage::Stop).await;
+    if let Err(e) = tx.send(WriterMessage::Stop).await { eprintln!("[!] Channel send failed: {}", e); }
     let final_buffer = writer_handle.await?;
     
     crate::mprintln!("\n{}", "Scan Complete. Sorting results...".blue());
@@ -468,7 +465,7 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
             total_403 += results.len();
         }
 
-        results.sort_by(|a, b| b.size.cmp(&a.size)); // Descending size
+        results.sort_by_key(|b| std::cmp::Reverse(b.size)); // Descending size
 
         // Surface non-403 hits as findings before consuming the vec.
         if status != 403 && status != 404 {
@@ -490,9 +487,9 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
         let mut content = String::new();
         for r in results {
             // Avoid unwrap on string write (very unlikely to fail on memory, but strictness requested)
-            let _ = writeln!(content, "[Size: {}] {}", r.size, r.path);
+            if let Err(e) = writeln!(content, "[Size: {}] {}", r.size, r.path) { eprintln!("[!] Write failed: {}", e); }
         }
-        fs::write(&file_path, content)?;
+        fs::write(&file_path, content).await?;
         crate::mprintln!("Saved sorted results for status {} to {}", status, file_path.green());
     }
 
@@ -503,17 +500,20 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
     Ok(outcome)
 }
 
-// Iterative generator that spawns tasks (Base-N Counting)
-async fn spawn_combinations_iterative(
-    ctx: &ModuleCtx,
-    target: &str,
-    client: &Client,
-    config: &SequentialFuzzerConfig,
-    charset: &[char],
+struct CombinationCtx<'a> {
+    ctx: &'a ModuleCtx,
+    target: &'a str,
+    client: &'a Client,
+    config: &'a SequentialFuzzerConfig,
+    charset: &'a [char],
     length: usize,
-    sem: &Arc<Semaphore>,
-    tx: &mpsc::Sender<WriterMessage>
-) {
+    sem: &'a Arc<Semaphore>,
+    tx: &'a mpsc::Sender<WriterMessage>,
+}
+
+// Iterative generator that spawns tasks (Base-N Counting)
+async fn spawn_combinations_iterative(cc: &CombinationCtx<'_>) {
+    let CombinationCtx { ctx, target, client, config, charset, length, sem, tx } = *cc;
     if charset.is_empty() || length == 0 { return; }
     
     // Performance: Parse headers ONCE, not per iteration
@@ -537,8 +537,8 @@ async fn spawn_combinations_iterative(
         // Safety: Handle semaphore error (closed) gracefully
         let permit = match sem.clone().acquire_owned().await {
             Ok(p) => p,
-            Err(_) => {
-                // Semaphore closed or poisoned, stop generation
+            Err(e) => {
+                tracing::debug!("semaphore closed: {e}");
                 return;
             }
         };
@@ -568,7 +568,7 @@ async fn spawn_combinations_iterative(
                     size,
                 };
                 // If receiver dropped, we just stop sending.
-                let _ = tx.send(WriterMessage::Result(res)).await;
+                if let Err(e) = tx.send(WriterMessage::Result(res)).await { eprintln!("[!] Channel send failed: {}", e); }
             }
         });
         
@@ -597,6 +597,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

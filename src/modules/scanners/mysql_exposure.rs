@@ -11,7 +11,6 @@ use colored::*;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
@@ -57,6 +56,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -145,9 +145,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
 async fn grab_handshake(ip: IpAddr, port: u16) -> Result<String> {
     let addr = SocketAddr::new(ip, port);
-    let stream = timeout(Duration::from_secs(TCP_TIMEOUT_SECS), TcpStream::connect(addr))
+    let stream = crate::utils::network::tcp_connect_addr(addr, Duration::from_secs(TCP_TIMEOUT_SECS))
         .await
-        .context("connect timeout")?
         .context("connect failed")?;
     let mut stream = stream;
     let mut buf = [0u8; 256];

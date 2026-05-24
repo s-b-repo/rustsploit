@@ -168,7 +168,9 @@ impl BruteforceStats {
                 rate
             );
         }
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+            eprintln!("[!] Flush failed: {}", e);
+        }
     }
 
     pub async fn print_final(&self) {
@@ -245,45 +247,40 @@ pub fn backoff_delay(base_ms: u64, attempt: u32, max_multiplier: u64) -> Duratio
     } else {
         0
     };
-    Duration::from_millis(backoff + jitter)
+    Duration::from_millis(backoff.saturating_add(jitter))
 }
 
 pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
     let mut rng = rand::rng();
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        if attempts > 100_000 {
-            // Fallback: return a random non-excluded IP from common ranges
-            return IpAddr::V4(std::net::Ipv4Addr::new(
-                rng.random_range(1..224),
-                rng.random_range(0..256) as u8,
-                rng.random_range(0..256) as u8,
-                rng.random_range(1..255) as u8,
-            ));
-        }
-
-        let octets: [u8; 4] = rng.random();
-        let ip = Ipv4Addr::from(octets);
-        let ip_addr = IpAddr::V4(ip);
-
-        // Basic check first to avoid expensive loop
-        if octets[0] == 10 || octets[0] == 127 || octets[0] == 0 {
+    const MAX_ATTEMPTS: u32 = 500_000;
+    for _ in 0..MAX_ATTEMPTS {
+        let first = rng.random_range(1u8..224);
+        if first == 10 || first == 127 {
             continue;
         }
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            first,
+            rng.random_range(0..=255),
+            rng.random_range(0..=255),
+            rng.random_range(1..=254),
+        ));
 
-        let mut excluded = false;
-        for net in exclusions {
-            if net.contains(ip_addr) {
-                excluded = true;
-                break;
-            }
-        }
-
-        if !excluded {
-            return ip_addr;
+        if !exclusions.iter().any(|net| net.contains(ip)) {
+            return ip;
         }
     }
+    // Exhausted attempts — exclusion set covers most of the IPv4 space.
+    // Return a best-effort candidate from a rarely-excluded range.
+    tracing::warn!(
+        "generate_random_public_ip: exhausted {} attempts; exclusion set may be too broad",
+        MAX_ATTEMPTS
+    );
+    IpAddr::V4(Ipv4Addr::new(
+        rng.random_range(44u8..46),
+        rng.random_range(0..=255),
+        rng.random_range(0..=255),
+        rng.random_range(1..=254),
+    ))
 }
 
 pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
@@ -299,11 +296,11 @@ pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
     match tokio::fs::metadata(state_file).await {
         Ok(meta) if meta.len() > MAX_STATE_FILE => return false,
         Ok(_) => {}
-        Err(_) => return false,
+        Err(e) => { tracing::trace!("state file {state_file} not accessible: {e}"); return false; }
     }
     match tokio::fs::read_to_string(state_file).await {
         Ok(contents) => contents.lines().any(|line| line.contains(&needle)),
-        Err(_) => false,
+        Err(e) => { tracing::debug!("failed to read state file {state_file}: {e}"); false }
     }
 }
 
@@ -319,13 +316,20 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
         return;
     }
     let data = format!("checked: {}\n", ip.to_string());
-    if let Ok(mut file) = OpenOptions::new()
+    match OpenOptions::new()
         .create(true)
         .append(true)
         .open(state_file)
         .await
     {
-        let _ = file.write_all(data.as_bytes()).await;
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(data.as_bytes()).await {
+                eprintln!("[!] Write failed: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("[!] Could not open state file '{}': {}", state_file, e);
+        }
     }
 }
 
@@ -467,12 +471,23 @@ pub fn generate_combos_mode(
 }
 
 /// Load user:pass credential pairs from a file (one pair per line, colon-separated).
+/// Uses streaming for large files to avoid OOM with huge credential lists.
 pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
-    let lines = crate::utils::load_lines(path)?;
     let mut combos = Vec::new();
-    for line in lines {
-        if let Some((user, pass)) = line.split_once(':') {
-            combos.push((user.to_string(), pass.to_string()));
+    if crate::utils::wordlist::should_stream(path) {
+        crate::utils::load_lines_batched(path, crate::utils::wordlist::DEFAULT_BATCH_SIZE, |batch| {
+            for line in batch {
+                if let Some((user, pass)) = line.split_once(':') {
+                    combos.push((user.to_string(), pass.to_string()));
+                }
+            }
+        })?;
+    } else {
+        let lines = crate::utils::load_lines(path)?;
+        for line in lines {
+            if let Some((user, pass)) = line.split_once(':') {
+                combos.push((user.to_string(), pass.to_string()));
+            }
         }
     }
     Ok(combos)
@@ -542,7 +557,9 @@ impl BruteforceResult {
             Ok(mut file) => {
                 use std::io::Write;
                 for (host, user, pass) in &self.found {
-                    let _ = writeln!(file, "{}:{}:{}", host, user, pass);
+                    if let Err(e) = writeln!(file, "{}:{}:{}", host, user, pass) {
+                        eprintln!("[!] Write failed: {}", e);
+                    }
                 }
                 crate::mprintln!("[+] Results saved to '{}'", file_path.display());
             }
@@ -553,6 +570,11 @@ impl BruteforceResult {
         Ok(())
     }
 }
+
+/// Shared list of successful credentials: (host, username, password).
+type BruteforceFoundList = Arc<Mutex<Vec<(String, String, String)>>>;
+/// Shared list of errors: (host, username, password, error_message).
+type BruteforceErrorList = Arc<Mutex<Vec<(String, String, String, String)>>>;
 
 /// Run the generic bruteforce engine against a single target.
 ///
@@ -571,6 +593,14 @@ where
     F: Fn(String, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
     Fut: Future<Output = LoginResult> + Send,
 {
+    // Deduplicate combos preserving order
+    let combos = {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = combos;
+        deduped.retain(|combo| seen.insert(combo.clone()));
+        deduped
+    };
+
     let total = combos.len();
     if total == 0 {
         anyhow::bail!("No credential combinations to test");
@@ -583,9 +613,8 @@ where
 
     let stats = Arc::new(BruteforceStats::new());
     stats.set_total(total as u64);
-    let found: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let errors: Arc<Mutex<Vec<(String, String, String, String)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let found: BruteforceFoundList = Arc::new(Mutex::new(Vec::new()));
+    let errors: BruteforceErrorList = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
@@ -615,7 +644,7 @@ where
         // wordlist would materialize 100M task structs immediately.
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
-            Err(_) => break,
+            Err(e) => { tracing::debug!("bruteforce semaphore closed, stopping: {e}"); break; }
         };
 
         let target = config.target.clone();
@@ -651,11 +680,13 @@ where
                 match result {
                     LoginResult::Success => {
                         crate::mprintln!("\r{}", format!("[+] {} -> {}:{}", display, user, pass).green().bold());
-                        let _ = crate::cred_store::store_credential(
-                            &target, port, service, &user, &pass,
-                            crate::cred_store::CredType::Password,
-                            source,
-                        ).await;
+                        if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                            host: &target, port, service, username: &user, secret: &pass,
+                            cred_type: crate::cred_store::CredType::Password,
+                            source_module: source,
+                        }).await.is_none() {
+                            eprintln!("[!] Failed to store credential for {}:{}@{}", user, pass, target);
+                        }
                         found_c.lock().await.push((display.clone(), user.clone(), pass.clone()));
                         stats_c.record_success();
                         if stop_on_success {
@@ -687,6 +718,7 @@ where
                         if stats_c.is_lockout_likely(10) && !paused_c.swap(true, Ordering::AcqRel) {
                             crate::meprintln!("\n{}", "[!] WARNING: 10+ consecutive errors — possible rate limiting. Pausing 30s...".red().bold());
                             tokio::time::sleep(Duration::from_secs(30)).await;
+                            stats_c.consecutive_errors.store(0, Ordering::Relaxed);
                             paused_c.store(false, Ordering::Release);
                         }
                         errors_c.lock().await.push((display.clone(), user.clone(), pass.clone(), message.clone()));
@@ -710,14 +742,15 @@ where
 
     // Wait for remaining tasks
     while let Some(res) = tasks.next().await {
-        if let Err(e) = res
-            && config.verbose {
-                crate::mprintln!("\r{}", format!("[!] Task error: {}", e).red());
-            }
+        if let Err(e) = res {
+            crate::meprintln!("[!] Task join error: {}", e);
+        }
     }
 
     stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    if let Err(e) = progress_handle.await {
+        eprintln!("[!] Task join failed: {}", e);
+    }
     stats.print_final().await;
 
     let found_creds = found.lock().await.clone();
@@ -774,19 +807,27 @@ where
     };
 
     const BATCH_SIZE: usize = 500_000;
-    let user_ref = &usernames;
     let config_ref = config;
     let mode_val = mode;
     let try_login_ref = &try_login;
 
-    let mut batches: Vec<Vec<String>> = Vec::new();
-    crate::utils::load_lines_batched(pass_path, BATCH_SIZE, |batch| {
-        batches.push(batch);
-    })?;
+    // Stream batches through a channel instead of collecting all into memory
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
 
-    for (i, pass_batch) in batches.into_iter().enumerate() {
-        crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", i + 1, pass_batch.len()).cyan());
-        let combos = generate_combos_mode(user_ref, &pass_batch, mode_val);
+    let pass_path_owned = pass_path.to_string();
+    let reader_handle = tokio::task::spawn_blocking(move || {
+        crate::utils::load_lines_batched(&pass_path_owned, BATCH_SIZE, |batch| {
+            if let Err(e) = batch_tx.blocking_send(batch) {
+                tracing::debug!("Batch send failed (receiver dropped?): {}", e);
+            }
+        })
+    });
+
+    let mut batch_idx = 0usize;
+    while let Some(pass_batch) = batch_rx.recv().await {
+        batch_idx += 1;
+        crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", batch_idx, pass_batch.len()).cyan());
+        let combos = generate_combos_mode(&usernames, &pass_batch, mode_val);
         let result = run_bruteforce(config_ref, combos, try_login_ref.clone()).await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
@@ -794,6 +835,8 @@ where
             return Ok(aggregate);
         }
     }
+
+    reader_handle.await.context("batch reader task panicked")??;
 
     if !extra_combos.is_empty() {
         crate::mprintln!("{}", format!("[*] Processing {} extra combos from credential file", extra_combos.len()).cyan());
@@ -878,7 +921,7 @@ where
     let s_found = stats_found.clone();
     let progress_stop = Arc::new(AtomicBool::new(false));
     let stop_flag = progress_stop.clone();
-    tokio::spawn(async move {
+    let progress_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if stop_flag.load(Ordering::Relaxed) {
@@ -905,7 +948,9 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await {
+                        eprintln!("[!] Write failed: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -943,10 +988,10 @@ where
             // Uses the helper so source-port (`setg src_port`) is honoured.
             if !skip_tcp {
                 let sa = SocketAddr::new(ip, port);
-                if crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
+                if let Err(e) = crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
                     .await
-                    .is_err()
                 {
+                    tracing::trace!("Pre-check TCP connect to {} failed: {}", sa, e);
                     sc.fetch_add(1, Ordering::Relaxed);
                     if let Some(ref sf_name) = state_file_task {
                         mark_ip_checked(&ip, sf_name).await;
@@ -968,17 +1013,22 @@ where
                         LoginResult::Success => {
                             let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
                             crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                            let _ = crate::cred_store::store_credential(
-                                &ip.to_string(),
+                            if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                                host: &ip.to_string(),
                                 port,
                                 service,
-                                user,
-                                pass,
-                                crate::cred_store::CredType::Password,
-                                source,
-                            )
-                            .await;
-                            let _ = tx.send(format!("{}\n", msg)).await;
+                                username: user,
+                                secret: pass,
+                                cred_type: crate::cred_store::CredType::Password,
+                                source_module: source,
+                            })
+                            .await
+                            .is_none() {
+                                eprintln!("[!] Failed to store credential for {}:{}", user, ip);
+                            }
+                            if let Err(e) = tx.send(format!("{}\n", msg)).await {
+                                eprintln!("[!] Channel send failed: {}", e);
+                            }
                             sf.fetch_add(1, Ordering::Relaxed);
                             break 'outer;
                         }
@@ -1017,13 +1067,20 @@ where
     }
 
     // Drain barrier: wait until all in-flight tasks release their permits.
-    let _drain = semaphore.acquire_many(config.concurrency as u32).await.context("Semaphore closed")?;
+    // Use the same `.max(1)` as the Semaphore creation to stay consistent,
+    // and cap to u32::MAX to avoid truncation on exotic configs.
+    let drain_permits = (config.concurrency.max(1)).min(u32::MAX as usize) as u32;
+    let drain = semaphore.acquire_many(drain_permits).await.context("Semaphore closed")?;
+    drop(drain);
 
     // Shut down writer task
     drop(tx);
-    let _ = writer_handle.await;
+    if let Err(e) = writer_handle.await {
+        eprintln!("[!] Task join failed: {}", e);
+    }
 
     progress_stop.store(true, Ordering::Relaxed);
+    progress_handle.abort();
     crate::mprintln!(
         "\n{}",
         format!(

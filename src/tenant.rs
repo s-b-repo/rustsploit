@@ -69,22 +69,39 @@ impl TenantRegistry {
         if sanitized.is_empty() {
             return Err("tenant name is empty after sanitization".to_string());
         }
-        if let Ok(tenants) = self.tenants.read()
-            && let Some(data) = tenants.get(&sanitized) {
+        {
+            let tenants = self.tenants.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(data) = tenants.get(&sanitized) {
                 return Ok(data.clone());
             }
+        }
         let mut tenants = self.tenants.write().unwrap_or_else(|e| e.into_inner());
         if let Some(data) = tenants.get(&sanitized) {
             return Ok(data.clone());
         }
+        // Evict tenants with no active references (Arc strong_count == 1 means only the registry holds it)
+        if tenants.len() >= MAX_TENANTS {
+            let before = tenants.len();
+            tenants.retain(|name, data| {
+                let active = Arc::strong_count(data) > 1;
+                if !active {
+                    tracing::info!("Evicting idle tenant '{}' to make room", name);
+                }
+                active
+            });
+            let evicted = before - tenants.len();
+            if evicted > 0 {
+                tracing::info!("Evicted {} idle tenant(s), {} remaining", evicted, tenants.len());
+            }
+        }
         if tenants.len() >= MAX_TENANTS {
             tracing::error!(
-                "Tenant cap ({}) reached — rejecting new tenant '{}'",
+                "Tenant cap ({}) reached — rejecting new tenant '{}' (all tenants active)",
                 MAX_TENANTS,
                 tenant_id
             );
             return Err(format!(
-                "server at capacity ({} tenants) — connection refused",
+                "server at capacity ({} active tenants) — connection refused",
                 MAX_TENANTS
             ));
         }

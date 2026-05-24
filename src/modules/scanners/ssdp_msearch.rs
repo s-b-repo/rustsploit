@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ fn display_banner() {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -55,7 +55,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let target = clean_ipv6_brackets(target);
     // Validate target format
-    let _ = normalize_target(&target, port)
+    normalize_target(&target, port)
         .with_context(|| format!("Failed to normalize target '{}'", target))?;
 
     // Determine search targets
@@ -75,6 +75,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let mut found_any = false;
     let mut results = Vec::new();
+    let mut outcome = ModuleOutcome::ok();
     let start_time = Instant::now();
 
     for (idx, st) in search_targets.iter().enumerate() {
@@ -96,6 +97,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     found_any = true;
                     let result = parse_ssdp_response(&response, &target, port, st.st_header());
                     if let Some(r) = result {
+                        outcome.findings.push(Finding {
+                            target: format!("{}:{}", target, port),
+                            kind: FindingKind::Banner,
+                            message: format!("SSDP/UPnP device discovered: {}", r),
+                            data: Some(serde_json::json!({
+                                "host": target,
+                                "port": port,
+                                "search_target": st.st_header(),
+                                "result": r,
+                            })),
+                        });
                         results.push(r);
                     }
                     break; // Success, no need to retry
@@ -146,18 +158,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             if let Err(e) = crate::utils::set_secure_permissions(&filename, 0o600) {
                 crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", filename, e);
             }
-            writeln!(file, "SSDP M-SEARCH Scan Results").ok();
-            writeln!(file, "Target: {}:{}", target, port).ok();
-            writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()).ok();
-            writeln!(file).ok();
+            if let Err(e) = writeln!(file, "SSDP M-SEARCH Scan Results") { tracing::debug!("ssdp log write: {e}"); }
+            if let Err(e) = writeln!(file, "Target: {}:{}", target, port) { tracing::debug!("ssdp log write: {e}"); }
+            if let Err(e) = writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()) { tracing::debug!("ssdp log write: {e}"); }
+            if let Err(e) = writeln!(file) { tracing::debug!("ssdp log write: {e}"); }
             for result in &results {
-                writeln!(file, "{}", result).ok();
+                if let Err(e) = writeln!(file, "{}", result) { tracing::debug!("ssdp log write: {e}"); }
             }
             crate::mprintln!("{}", format!("[+] Results saved to '{}'", filename).green());
         }
     }
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 async fn send_ssdp_request(
@@ -203,7 +215,10 @@ async fn send_ssdp_request(
             Ok(Some(response))
         }
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {}", e)),
-        Err(_) => Ok(None), // Timeout
+        Err(e) => {
+            tracing::debug!("SSDP response timed out: {e}");
+            Ok(None)
+        }
     }
 }
 
@@ -304,6 +319,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

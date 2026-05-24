@@ -7,7 +7,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{Result, Context};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -212,7 +213,7 @@ fn check_signatures(
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -345,7 +346,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("WAF probe failed: {e}");
                     crate::mprintln!("{}", format!("  [-] Request blocked/failed for: {}", payload).dimmed());
                 }
             }
@@ -389,6 +391,23 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     }
 
+    let mut outcome = ModuleOutcome::ok();
+
+    // Add Banner findings for each detected WAF/CDN
+    for det in &detections {
+        outcome.findings.push(Finding {
+            target: target.to_string(),
+            kind: FindingKind::Banner,
+            message: format!("WAF/CDN detected: {} (confidence: {})", det.name, det.confidence),
+            data: Some(serde_json::json!({
+                "waf_name": det.name,
+                "confidence": det.confidence,
+                "detection_methods": det.methods,
+                "url": base_url,
+            })),
+        });
+    }
+
     if save_results && !detections.is_empty() {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "waf_detect_results.txt").await?;
         let mut content = format!("WAF Detection Results - {}\n\n", base_url);
@@ -399,12 +418,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
             content.push('\n');
         }
-        std::fs::write(&output_path, content)
+        tokio::fs::write(&output_path, content).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 crate::register_native_module!(crate::module::Category::Scanners, "waf_detector", native);

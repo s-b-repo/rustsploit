@@ -9,10 +9,10 @@
 //!   - Referrer-Policy
 //!   - Permissions-Policy
 //!   - Cross-Origin-{Opener,Embedder,Resource}-Policy
-//! Also surfaces verbose `Server:` and `X-Powered-By:` banners and
-//! cookies missing `Secure` / `HttpOnly` / `SameSite`.
+//!     Also surfaces verbose `Server:` and `X-Powered-By:` banners and
+//!     cookies missing `Secure` / `HttpOnly` / `SameSite`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use colored::*;
 use std::time::Duration;
 
@@ -45,6 +45,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -74,7 +75,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     })?;
     ctx.rate_limit(target).await;
     let resp = client.get(&url).send().await
-        .map_err(|e| anyhow!("Request failed: {}", e))?;
+        .context("Request failed")?;
     let final_url = resp.url().to_string();
     if final_url != url {
         crate::mprintln!("{}", format!("[*] redirected -> {}", final_url).dimmed());
@@ -215,7 +216,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // free-text substrings (otherwise `name=secureguid` falsely satisfies `Secure`).
     let mut cookie_issues: Vec<String> = Vec::new();
     for sc in headers.get_all("set-cookie").iter() {
-        let s = match sc.to_str() { Ok(s) => s, Err(_) => continue };
+        let s = match sc.to_str() { Ok(s) => s, Err(e) => { tracing::debug!("non-utf8 header: {e}"); continue; } };
         let mut parts = s.split(';');
         let name_eq = parts.next().unwrap_or("");
         let name = name_eq.split('=').next().unwrap_or("?").trim().to_string();

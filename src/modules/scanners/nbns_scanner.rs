@@ -28,6 +28,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -248,7 +249,7 @@ fn parse_nbns_response(data: &[u8], host: &str) -> Option<NbnsResult> {
     }
 
     // MAC address: 6 bytes after all name entries
-    let mac = if offset.checked_add(6).map_or(false, |end| end <= data.len()) {
+    let mac = if offset.checked_add(6).is_some_and(|end| end <= data.len()) {
         let mut s = String::with_capacity(17);
         for i in 0..6 {
             if i > 0 { s.push(':'); }
@@ -285,8 +286,8 @@ async fn query_nbns(
             let host = addr.split(':').next().unwrap_or(addr);
             Ok(parse_nbns_response(&buf[..n], host))
         }
-        Ok(Err(_)) => Ok(None),
-        Err(_) => Ok(None), // Timeout
+        Ok(Err(e)) => { tracing::debug!("NBNS recv error: {e}"); Ok(None) }
+        Err(e) => { tracing::debug!("timeout: {e}"); Ok(None) }
     }
 }
 
@@ -442,8 +443,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 content.push_str(&format!("  {} 0x{:02X} {} {}\n",
                     entry.name, entry.suffix, type_str, nbns_suffix_name(entry.suffix)));
             }
-            std::fs::write(&output_path, content)
+            tokio::fs::write(&output_path, content).await
                 .with_context(|| format!("Failed to write results to {}", output_path))?;
+            if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+                crate::meprintln!("[!] Failed to set file permissions: {}", e);
+            }
             crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
         }
 

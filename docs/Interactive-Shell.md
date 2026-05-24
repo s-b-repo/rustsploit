@@ -126,35 +126,73 @@ Manual call (from module code): `utils::basic_honeypot_check(&ip).await`
 
 ---
 
-## Global Options
+## Global Options (`set` / `setg`)
 
-Use `setg` to set options that persist across all module executions. These are checked by `cfg_prompt_*` functions after API custom_prompts but before interactive stdin:
+`set` and `setg` both write to the persistent global options store
+(`~/.rustsploit/global_options.json`). They are functionally identical — `set`
+is the shorter form, `setg` is kept for Metasploit muscle memory. Both are
+checked by `cfg_prompt_*` functions after API custom_prompts but before
+interactive stdin.
 
 ```text
-rsf> setg port 8080
+rsf> set port 8080
 rsf> setg concurrency 50
 rsf> show options
-rsf> unsetg port
+rsf> unset port
+rsf> unsetg concurrency
 ```
 
-Global options are saved to `~/.rustsploit/global_options.json` and loaded on startup.
+### Metasploit Aliases
+
+The shell accepts Metasploit-style option names and maps them to Rustsploit keys:
+
+| Metasploit name | Rustsploit key | Example |
+|-----------------|----------------|---------|
+| `RHOST` / `RHOSTS` | `target` | `set RHOST 10.0.0.1` |
+| `RPORT` | `port` | `set RPORT 443` |
+| `LPORT` | `source_port` | `set LPORT 31337` |
+| `THREADS` | `concurrency` | `set THREADS 100` |
+| `MODULE_TIMEOUT` | `timeout` | `set MODULE_TIMEOUT 30` |
 
 ### Common Global Options
 
 | Option | Example | Effect |
 |--------|---------|--------|
-| `port` | `setg port 443` | Default port for all modules |
-| `source_port` | `setg source_port 31337` | Outbound source port |
-| `honeypot_detection` | `setg honeypot_detection n` | Disable honeypot checks before `run` |
-| `timeout` | `setg timeout 30` | Connection timeout (seconds) |
-| `concurrency` | `setg concurrency 50` | Default thread count |
-| `verbose` | `setg verbose y` | Verbose output |
-| `username_wordlist` | `setg username_wordlist users.txt` | Default username wordlist |
-| `password_wordlist` | `setg password_wordlist pass.txt` | Default password wordlist |
-| `stop_on_success` | `setg stop_on_success y` | Stop on first valid credential |
-| `save_results` | `setg save_results y` | Auto-save results to file |
-| `combo_mode` | `setg combo_mode y` | Full user x pass combination mode |
-| Any custom key | `setg my_key value` | Modules read via `cfg_prompt_*` |
+| `port` | `set port 443` | Default port for all modules |
+| `source_port` | `set source_port 31337` | Outbound source port for all TCP/UDP connections |
+| `honeypot_detection` | `set honeypot_detection n` | Disable honeypot checks before `run` |
+| `timeout` | `set timeout 30` | Connection/probe timeout (seconds) — passed through to probe functions |
+| `concurrency` | `set concurrency 50` | Default thread/task count for brute-force and fan-out |
+| `verbose` | `set verbose y` | Verbose output |
+| `username_wordlist` | `set username_wordlist users.txt` | Default username wordlist |
+| `password_wordlist` | `set password_wordlist pass.txt` | Default password wordlist |
+| `stop_on_success` | `set stop_on_success y` | Stop on first valid credential |
+| `save_results` | `set save_results y` | Auto-save results to file |
+| `combo_mode` | `set combo_mode y` | Full user x pass combination mode |
+| `module_timeout` | `set module_timeout 60` | Per-target deadline in scheduler |
+| `max_random_hosts` | `set max_random_hosts 10000` | Cap for random mass scan |
+| `global_rps` | `set global_rps 100` | Process-wide rate limit (requests/sec) |
+| `module_rps` | `set module_rps 50` | Per-module rate limit |
+| `target_rps` | `set target_rps 10` | Per-target rate limit |
+| `prescan` | `set prescan auto` | Pre-scan tool for CIDR (auto/masscan/zmap/none) |
+| `prescan_rate` | `set prescan_rate 1000` | Pre-scan packets per second |
+| Any custom key | `set my_key value` | Modules read via `cfg_prompt_*` |
+
+### Source Port Binding
+
+`set source_port <port>` binds all outbound TCP and UDP connections to the
+specified source port. This is enforced at the framework level through the
+network wrappers (`tcp_connect_str`, `tcp_connect_addr`, `blocking_tcp_connect`,
+`udp_bind`) — including connections made through third-party libraries (FTP,
+Telnet) that receive pre-connected streams from these wrappers.
+
+```text
+rsf> set source_port 31337
+rsf> use creds/generic/ssh_bruteforce
+rsf> set target 10.0.0.1
+rsf> run
+[*] All connections will originate from source port 31337
+```
 
 ---
 

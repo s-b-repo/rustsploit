@@ -19,7 +19,7 @@ cargo clippy
 cargo check
 ```
 
-A clean `cargo check` with **0 errors and 0 warnings** is required. The current codebase (all 240 modules) passes this check cleanly.
+A clean `cargo check` with **0 errors** is required. The current codebase (363 modules) compiles with legacy warnings from mid-migration modules — see the Changelog for the running count.
 
 ---
 
@@ -29,7 +29,10 @@ A clean `cargo check` with **0 errors and 0 warnings** is required. The current 
 cargo build
 ```
 
-`build.rs` regenerates the dispatchers (`exploit_dispatch.rs`, `scanner_dispatch.rs`, `creds_dispatch.rs`, `plugins_dispatch.rs`, `module_registry.rs`) into `OUT_DIR` during compilation. All 240 modules (183 exploits, 27 scanners, 29 creds, 1 plugin) are auto-discovered and dispatched by `build.rs`. If a new module fails to register, ensure `pub mod your_module;` is present in the sibling `mod.rs`.
+Modules self-register via `register_native_module!` at compile time using
+the `inventory` crate — there is no `build.rs` codegen (removed in v0.5.6).
+All 363 modules are auto-discovered at link time. If a new module fails to
+register, ensure `pub mod your_module;` is present in the sibling `mod.rs`.
 
 ---
 
@@ -142,11 +145,13 @@ curl http://localhost:8080/health
 | New cred module | Correct concurrency model, DNS resolved once (not per attempt) |
 | New exploit | Response validated before declaring success, artifacts written to CWD |
 | New scanner | Outputs parseable results, status codes filtered correctly |
-| Mass-scan module | `EXCLUDED_RANGES` applied, no private/bogon IPs targeted |
+| Mass-scan module | Scheduler exclusions applied, no per-module `EXCLUDED_RANGES`, target-specific filenames |
 | API change | `cargo check` clean, endpoint documented in [API Server](API-Server.md) |
 | Utils change | All prompt helpers still compile, no dead code warnings |
-| Module with `info()` | Build generates info_dispatch entry, `info` command displays metadata |
-| Module with `check()` | Build generates check_dispatch entry, `check` command runs verification |
+| Module with `info()` | `info` command displays metadata |
+| Module with `check()` | `check` command runs verification |
+| Source port | Connections use `tcp_connect_str`/`udp_bind`, not raw socket calls |
+| Batch mode | Interactive/REPL modules bail with `is_batch_mode()` guard |
 | Global options change | JSON file updated atomically, `cfg_prompt_*` respects priority chain |
 | Workspace change | JSON saved on modification, workspace switch preserves data |
 | Cred store change | JSON persistence works, search returns correct results |

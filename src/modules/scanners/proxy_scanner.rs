@@ -26,6 +26,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 
@@ -223,7 +224,7 @@ fn resolve_target(target: &str) -> Result<IpAddr> {
     target.parse::<IpAddr>().or_else(|_| {
         use std::net::ToSocketAddrs;
         format!("{}:0", target).to_socket_addrs()
-            .map_err(|e| anyhow!("Cannot resolve {}: {}", target, e))?
+            .with_context(|| format!("Cannot resolve {}", target))?
             .next()
             .map(|sa| sa.ip())
             .ok_or_else(|| anyhow!("No addresses for {}", target))

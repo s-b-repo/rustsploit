@@ -36,6 +36,7 @@ pub fn info() -> ModuleInfo {
         references: vec!["https://www.rfc-editor.org/rfc/rfc6143".to_string()],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(5900),
     }
 }
 
@@ -50,17 +51,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: true,
         },
-        |host, port, _user, pass| async move { probe(&host, port, &pass).await },
+        |host, port, user, pass, timeout| async move {
+            drop(user);
+            probe(&host, port, &pass, timeout).await
+        },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginResult {
     use cipher::{BlockCipherEncrypt, KeyInit};
     use des::Des;
     use tokio::io::AsyncWriteExt;
 
-    let timeout = Duration::from_secs(5);
     let addr = format!("{}:{}", host, port);
     let mut stream = match crate::utils::creds_helper::connect_with_timeout(&addr, timeout).await {
         Ok(s) => s,
@@ -157,7 +160,8 @@ async fn probe(host: &str, port: u16, pass: &str) -> LoginResult {
     }
     let cipher = match Des::new_from_slice(&key) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("DES init failed: {e}");
             return LoginResult::Error {
                 message: "DES init failed".to_string(),
                 retryable: false,
@@ -169,7 +173,8 @@ async fn probe(host: &str, port: u16, pass: &str) -> LoginResult {
     for chunk in response.chunks_exact_mut(8) {
         let block: cipher::array::Array<u8, _> = match cipher::array::Array::try_from(&chunk[..]) {
             Ok(b) => b,
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!("DES block build failed: {e}");
                 return LoginResult::Error {
                     message: "DES block build failed".to_string(),
                     retryable: false,

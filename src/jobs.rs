@@ -73,16 +73,15 @@ impl JobProgress {
         } else {
             line
         };
-        if let Ok(mut buf) = self.output.write() {
+        {
+            let mut buf = self.output.write().unwrap_or_else(|e| e.into_inner());
             if buf.len() >= MAX_OUTPUT_LINES {
                 buf.pop_front();
             }
             buf.push_back(capped);
         }
         self.total_lines_pushed.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut ts) = self.last_activity.write() {
-            *ts = chrono::Local::now();
-        }
+        *self.last_activity.write().unwrap_or_else(|e| e.into_inner()) = chrono::Local::now();
     }
 
     pub fn get_output(&self, from: usize) -> Vec<String> {
@@ -179,7 +178,7 @@ impl JobManager {
         verbose: bool,
         config: Option<crate::config::ModuleConfig>,
     ) -> Result<(u32, Arc<JobProgress>), String> {
-        let mut jobs = self.jobs.write().map_err(|_| "Job lock poisoned".to_string())?;
+        let mut jobs = self.jobs.write().map_err(|e| format!("Job lock poisoned: {e}"))?;
 
         let running = jobs.values().filter(|j| {
             j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
@@ -367,87 +366,82 @@ impl JobManager {
 
     pub fn list(&self) -> Vec<(u32, String, String, String, String)> {
         let mut result = Vec::new();
-        if let Ok(mut jobs) = self.jobs.write() {
-            let now = std::time::Instant::now();
-            for job in jobs.values_mut() {
-                if let Some(ref handle) = job.handle
-                    && handle.is_finished() && matches!(job.status, JobStatus::Running) {
-                        job.status = JobStatus::Completed;
-                    }
-                let terminal = matches!(
-                    job.status,
-                    JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
-                ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
-                if terminal && job.finished_at.is_none() {
-                    job.finished_at = Some(now);
+        let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        for job in jobs.values_mut() {
+            if let Some(ref handle) = job.handle
+                && handle.is_finished() && matches!(job.status, JobStatus::Running) {
+                    job.status = JobStatus::Completed;
                 }
+            let terminal = matches!(
+                job.status,
+                JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
+            ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+            if terminal && job.finished_at.is_none() {
+                job.finished_at = Some(now);
             }
-            jobs.retain(|_, job| match job.finished_at {
-                None => true,
-                Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
-            });
-            let mut ids: Vec<_> = jobs.keys().collect();
-            ids.sort();
-            for &id in &ids {
-                if let Some(job) = jobs.get(id) {
-                    result.push((
-                        *id,
-                        job.module.clone(),
-                        job.target.clone(),
-                        job.started_at.format("%H:%M:%S").to_string(),
-                        format!("{}", job.status),
-                    ));
-                }
+        }
+        jobs.retain(|_, job| match job.finished_at {
+            None => true,
+            Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
+        });
+        let mut ids: Vec<_> = jobs.keys().collect();
+        ids.sort();
+        for &id in &ids {
+            if let Some(job) = jobs.get(id) {
+                result.push((
+                    *id,
+                    job.module.clone(),
+                    job.target.clone(),
+                    job.started_at.format("%H:%M:%S").to_string(),
+                    format!("{}", job.status),
+                ));
             }
         }
         result
     }
 
     pub fn get_detail(&self, id: u32) -> Option<(String, String, String, String, Arc<JobProgress>)> {
-        if let Ok(mut jobs) = self.jobs.write()
-            && let Some(job) = jobs.get_mut(&id) {
-                if let Some(ref handle) = job.handle
-                    && handle.is_finished() && matches!(job.status, JobStatus::Running) {
-                        job.status = JobStatus::Completed;
-                    }
-                let terminal = matches!(
-                    job.status,
-                    JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
-                ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
-                if terminal && job.finished_at.is_none() {
-                    job.finished_at = Some(std::time::Instant::now());
-                }
-                return Some((
-                    job.module.clone(),
-                    job.target.clone(),
-                    job.started_at.format("%H:%M:%S").to_string(),
-                    format!("{}", job.status),
-                    job.progress.clone(),
-                ));
+        let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
+        let job = jobs.get_mut(&id)?;
+        if let Some(ref handle) = job.handle
+            && handle.is_finished() && matches!(job.status, JobStatus::Running) {
+                job.status = JobStatus::Completed;
             }
-        None
+        let terminal = matches!(
+            job.status,
+            JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
+        ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+        if terminal && job.finished_at.is_none() {
+            job.finished_at = Some(std::time::Instant::now());
+        }
+        Some((
+            job.module.clone(),
+            job.target.clone(),
+            job.started_at.format("%H:%M:%S").to_string(),
+            format!("{}", job.status),
+            job.progress.clone(),
+        ))
     }
 
     pub fn get_progress(&self, id: u32) -> Option<Arc<JobProgress>> {
-        self.jobs.read().ok().and_then(|jobs| {
-            jobs.get(&id).map(|j| j.progress.clone())
-        })
+        self.jobs.read().unwrap_or_else(|e| e.into_inner())
+            .get(&id).map(|j| j.progress.clone())
     }
 
     pub fn cleanup(&self) {
-        if let Ok(mut jobs) = self.jobs.write() {
-            let now = std::time::Instant::now();
-            for job in jobs.values_mut() {
-                let finished = job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(true);
-                if finished && job.finished_at.is_none() {
-                    job.finished_at = Some(now);
-                }
+        let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        for job in jobs.values_mut() {
+            let finished = job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(true);
+            if finished && job.finished_at.is_none() {
+                job.finished_at = Some(now);
             }
-            jobs.retain(|_, job| match job.finished_at {
-                None => true,
-                Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
-            });
         }
+        jobs.retain(|_, job| match job.finished_at {
+            None => true,
+            Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
+        });
     }
 
     pub fn display(&self) {

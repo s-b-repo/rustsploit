@@ -24,7 +24,6 @@ use anyhow::{ anyhow, Context, Result };
 use colored::*;
 use std::time::Duration;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
-use tokio::net::TcpStream;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
@@ -65,6 +64,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Great,
+        default_port: None,
     }
 }
 
@@ -177,52 +177,48 @@ async fn probe_one_with_timeout(host: &str, port: u16, tls: bool, timeout_ms: u6
         // TLS path — use the project's vendored dangerous-cert connector
         // (BMCs ship self-signed certs whose CN never matches the IP).
         use tokio_rustls::rustls::pki_types::ServerName;
-        let stream = match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(anyhow!(e)),
-            Err(_) => return Err(anyhow!("TCP connect timed out")),
-        };
+        let stream = crate::utils::network::tcp_connect_str(&addr, timeout)
+            .await
+            .map_err(|e| anyhow!(e))?;
         let connector = crate::native::async_tls::make_dangerous_tls_connector();
         // ServerName::try_from will fail for bare IP literals on some rustls
         // versions — fall back to a plain "localhost" sentinel since we
         // disabled cert verification anyway.
         let server_name = ServerName::try_from(host.to_string())
             .or_else(|_| ServerName::try_from("localhost".to_string()))
-            .map_err(|e| anyhow!("ServerName: {}", e))?;
+            .context("ServerName")?;
         let mut tls_stream = match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(anyhow!(e)),
-            Err(_) => return Err(anyhow!("TLS handshake timed out")),
+            Err(e) => return Err(anyhow!("TLS handshake timed out: {e}")),
         };
         match tokio::time::timeout(timeout, tls_stream.write_all(HANDSHAKE)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(anyhow!(e)),
-            Err(_) => return Err(anyhow!("write timed out")),
+            Err(e) => return Err(anyhow!("write timed out: {e}")),
         }
         let mut buf = [0u8; 64];
         match tokio::time::timeout(timeout, tls_stream.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => Ok(buf[..n].windows(4).any(|w| w == b"IUSB")),
-            Ok(Ok(_)) => Ok(false),
-            Ok(Err(_)) => Ok(false),
-            Err(_) => Ok(false),
+            Ok(Ok(n)) => { tracing::trace!("TLS read returned {n} bytes (no IUSB match)"); Ok(false) }
+            Ok(Err(e)) => { tracing::debug!("TLS read error: {e}"); Ok(false) }
+            Err(e) => { tracing::debug!("timeout: {e}"); Ok(false) }
         }
     } else {
-        let mut sock = match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(anyhow!(e)),
-            Err(_) => return Err(anyhow!("TCP connect timed out")),
-        };
+        let mut sock = crate::utils::network::tcp_connect_str(&addr, timeout)
+            .await
+            .map_err(|e| anyhow!(e))?;
         match tokio::time::timeout(timeout, sock.write_all(HANDSHAKE)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(anyhow!(e)),
-            Err(_) => return Err(anyhow!("write timed out")),
+            Err(e) => return Err(anyhow!("write timed out: {e}")),
         }
         let mut buf = [0u8; 64];
         match tokio::time::timeout(timeout, sock.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => Ok(buf[..n].windows(4).any(|w| w == b"IUSB")),
-            Ok(Ok(_)) => Ok(false),
-            Ok(Err(_)) => Ok(false),
-            Err(_) => Ok(false),
+            Ok(Ok(n)) => { tracing::trace!("TCP read returned {n} bytes (no IUSB match)"); Ok(false) }
+            Ok(Err(e)) => { tracing::debug!("TCP read error: {e}"); Ok(false) }
+            Err(e) => { tracing::debug!("timeout: {e}"); Ok(false) }
         }
     }
 }

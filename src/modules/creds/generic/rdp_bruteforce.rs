@@ -32,6 +32,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(3389),
     }
 }
 
@@ -46,14 +47,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: false,
         },
-        |host, port, user, pass| async move { probe(&host, port, &user, &pass).await },
+        |host, port, user, pass, timeout| async move { probe(&host, port, &user, &pass, timeout).await },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
     let addr = format!("{}:{}", host, port);
-    let timeout = Duration::from_secs(10);
     // Negotiate protocols best-to-worst: NLA → TLS → Standard. The native
     // helper picks whichever the server selects.
     let proto = PROTO_HYBRID | PROTO_SSL | PROTO_RDP;

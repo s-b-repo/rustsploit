@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ipnetwork::IpNetwork;
 use regex::Regex;
 
@@ -60,7 +60,7 @@ impl GlobalConfig {
 
         // Mass scan keywords: "random", "0.0.0.0" — store as-is
         if trimmed == "random" || trimmed == "0.0.0.0" {
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
             return Ok(());
         }
@@ -72,7 +72,7 @@ impl GlobalConfig {
         if path.exists() && path.is_file() {
             // Resolve to canonical path (eliminates .., symlinks, etc.)
             let canonical = path.canonicalize()
-                .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", trimmed, e))?;
+                .with_context(|| format!("Failed to resolve file path '{}'", trimmed))?;
             let canonical_str = canonical.to_string_lossy().to_string();
             if canonical_str.len() > MAX_TARGET_LENGTH {
                 return Err(anyhow!(
@@ -80,7 +80,7 @@ impl GlobalConfig {
                     MAX_TARGET_LENGTH
                 ));
             }
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(canonical_str));
             return Ok(());
         }
@@ -118,7 +118,7 @@ impl GlobalConfig {
                     Self::validate_hostname_or_ip(t)?;
                 }
             }
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Multi(targets));
             return Ok(());
         }
@@ -127,7 +127,7 @@ impl GlobalConfig {
         if let Ok(network) = trimmed.parse::<IpNetwork>() {
             // No size limit enforced here - user can set 0.0.0.0/0 if they want.
             // Consumers (looping logic) must handle large subnets responsibly (e.g. via iterators).
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Subnet(network));
             return Ok(());
         }
@@ -136,7 +136,7 @@ impl GlobalConfig {
         Self::validate_hostname_or_ip(trimmed)?;
 
         // Otherwise, treat as single IP or hostname
-        let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+        let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
         *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
         Ok(())
     }
@@ -168,11 +168,6 @@ impl GlobalConfig {
             ));
         }
         
-        // Check for spaces
-        if target.contains(' ') {
-            return Err(anyhow!("Target cannot contain spaces"));
-        }
-        
         // Basic hostname format check (not starting/ending with special chars)
         if target.starts_with('.') || target.starts_with('-') {
             return Err(anyhow!("Target cannot start with '.' or '-'"));
@@ -192,7 +187,7 @@ impl GlobalConfig {
 
     /// Get the global target as a single string (for display)
     pub fn get_target(&self) -> Option<String> {
-        let guard = self.target.read().ok()?;
+        let guard = self.target.read().unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|t| match t {
             TargetConfig::Single(ip) => ip.clone(),
             TargetConfig::Subnet(net) => net.to_string(),
@@ -214,7 +209,7 @@ impl GlobalConfig {
     /// For single IPs, returns 1
     /// For subnets, returns the subnet size without expanding
     pub fn get_target_size(&self) -> Option<u64> {
-        let target_guard = self.target.read().ok()?;
+        let target_guard = self.target.read().unwrap_or_else(|e| e.into_inner());
         match target_guard.as_ref() {
             Some(TargetConfig::Single(_)) => Some(1),
             Some(TargetConfig::Subnet(net)) => {
@@ -256,9 +251,7 @@ impl GlobalConfig {
 
     /// Clear the global target
     pub fn clear_target(&self) {
-        if let Ok(mut target_guard) = self.target.write() {
-             *target_guard = None;
-        }
+        *self.target.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -339,7 +332,7 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(GlobalConfig::new);
 ///
 /// ### Sample Scanner (`scanners/sample_scanner`)
 /// `check_http`, `check_https`
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ModuleConfig {
     pub custom_prompts: HashMap<String, String>,
     pub api_mode: bool,
@@ -348,15 +341,6 @@ pub struct ModuleConfig {
 impl ModuleConfig {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-impl Default for ModuleConfig {
-    fn default() -> Self {
-        Self {
-            custom_prompts: HashMap::new(),
-            api_mode: false,
-        }
     }
 }
 

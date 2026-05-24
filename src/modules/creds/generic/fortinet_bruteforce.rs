@@ -33,6 +33,7 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(443),
     }
 }
 
@@ -47,14 +48,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: false,
         },
-        |host, port, user, pass| async move { probe(&host, port, &user, &pass).await },
+        |host, port, user, pass, timeout| async move { probe(&host, port, &user, &pass, timeout).await },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
     let opts = HttpClientOpts::permissive();
-    let client = match build_http_client_with(Duration::from_secs(8), opts) {
+    let client = match build_http_client_with(timeout, opts) {
         Ok(c) => c,
         Err(e) => {
             return LoginResult::Error {
