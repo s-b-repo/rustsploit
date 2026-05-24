@@ -3,7 +3,7 @@ use colored::*;
 use std::{
     fs::File,
     io::{Write, BufWriter},
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -105,7 +105,7 @@ fn get_service_name(port: u16) -> &'static str {
 }
 
 /// Interactive config prompt
-pub async fn prompt_settings() -> Result<ScanSettings> {
+pub async fn prompt_settings_for(target: &str) -> Result<ScanSettings> {
     if !crate::utils::is_batch_mode() {
         crate::mprintln!("{}", "\n=== Port Scanner Configuration ===".cyan().bold());
     }
@@ -121,8 +121,8 @@ pub async fn prompt_settings() -> Result<ScanSettings> {
             let start_val = cfg_prompt_int_range("port_start", "Start port", 1, 1, 65535).await? as usize;
             let end_val = cfg_prompt_int_range("port_end", "End port", 65535, 1, 65535).await? as usize;
             
-            let start: u16 = start_val.try_into().map_err(|_| anyhow!("Invalid start port"))?;
-            let end: u16 = end_val.try_into().map_err(|_| anyhow!("Invalid end port"))?;
+            let start: u16 = start_val.try_into().map_err(|e| anyhow!("Invalid start port: {e}"))?;
+            let end: u16 = end_val.try_into().map_err(|e| anyhow!("Invalid end port: {e}"))?;
             
             if start > end {
                 return Err(anyhow!("Start port must be <= end port"));
@@ -171,7 +171,11 @@ pub async fn prompt_settings() -> Result<ScanSettings> {
         show_only_open: cfg_prompt_yes_no("show_only_open", "Show only open ports?", true).await?,
         verbose: cfg_prompt_yes_no("verbose", "Verbose output?", false).await?,
         scan_method,
-        output_file: cfg_prompt_output_file("output_file", "Output filename", "scan_results.txt").await?,
+        output_file: {
+            let safe_target = target.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '.', "_");
+            let default_name = format!("port_scan_{}.txt", safe_target);
+            cfg_prompt_output_file("output_file", "Output filename", &default_name).await?
+        },
         port_range,
         ttl,
         source_port,
@@ -181,22 +185,8 @@ pub async fn prompt_settings() -> Result<ScanSettings> {
 
 /// Main entrypoint for interactive CLI mode
 pub async fn run_interactive(ctx: &ModuleCtx, target: &str) -> Result<ModuleOutcome> {
-    let settings = prompt_settings().await?;
-    run_with_settings(
-        ctx,
-        target,
-        settings.concurrency,
-        settings.timeout_secs,
-        settings.show_only_open,
-        settings.verbose,
-        settings.scan_method,
-        &settings.output_file,
-        settings.port_range,
-        settings.ttl,
-        settings.source_port,
-        settings.data_length,
-    )
-    .await
+    let settings = prompt_settings_for(target).await?;
+    run_with_settings(ctx, target, &settings).await
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
@@ -211,19 +201,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 pub async fn run_with_settings(
     ctx: &ModuleCtx,
     target: &str,
-    concurrency: usize,
-    timeout_secs: u64,
-    _show_only_open: bool,
-    verbose: bool,
-    scan_method: ScanMethod,
-    output_file: &str,
-    port_range: PortRange,
-    ttl: Option<u32>,
-    source_port: Option<u16>,
-    data_length: Option<usize>,
+    settings: &ScanSettings,
 ) -> Result<ModuleOutcome> {
+    let concurrency = settings.concurrency;
+    let timeout_secs = settings.timeout_secs;
+    let verbose = settings.verbose;
+    let show_only_open = settings.show_only_open;
+    let scan_method = settings.scan_method;
+    let output_file = &settings.output_file;
+    let port_range = settings.port_range.clone();
+    let ttl = settings.ttl;
+    let source_port = settings.source_port;
+    let data_length = settings.data_length;
     let start_time = Instant::now();
-    let (resolved_ip_str, resolved_ip) = resolve_target(target)?;
+    let (resolved_ip_str, resolved_ip) = resolve_target(target).await?;
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let file = {
         let f = File::create(output_file)?;
@@ -240,7 +231,7 @@ pub async fn run_with_settings(
     let progress = Arc::new(Mutex::new(ProgressTracker::new(total_ports)));
     let findings_buf: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
     
-    let verbose = verbose; // capture for move into async tasks
+    // verbose is captured for move into async tasks
     crate::mprintln!("\n{}", format!("[*] Starting scan for target: {} (resolved: {})", target, resolved_ip_str).cyan().bold());
     crate::mprintln!("{}", format!("[*] Scanning {} ports with concurrency: {}", total_ports, concurrency).cyan());
     writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "Port Scan Results for {} ({})\n", target, resolved_ip_str)?;
@@ -267,7 +258,6 @@ pub async fn run_with_settings(
             let ip = resolved_ip;
             let ip_str = resolved_ip_str.clone();
             let port = *port;
-            let verbose = verbose;
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -290,32 +280,37 @@ pub async fn run_with_settings(
                                 line
                             };
 
-                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line);
+                            if let Err(e) = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", output_line) { eprintln!("[!] Write failed: {}", e); }
                             crate::mprintln!("{}", output_line);
-                            if let Ok(mut buf) = findings_buf.lock() {
-                                buf.push(Finding {
-                                    target: ip_str.clone(),
-                                    kind: FindingKind::OpenPort,
-                                    message: format!("TCP {}:{} open ({})", ip_str, port, service_name),
-                                    data: Some(serde_json::json!({
-                                        "host": ip_str,
-                                        "port": port,
-                                        "transport": "tcp",
-                                        "service": service_name,
-                                        "banner": if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
-                                    })),
-                                });
+                            match findings_buf.lock() {
+                                Ok(mut buf) => {
+                                    buf.push(Finding {
+                                        target: ip_str.clone(),
+                                        kind: FindingKind::OpenPort,
+                                        message: format!("TCP {}:{} open ({})", ip_str, port, service_name),
+                                        data: Some(serde_json::json!({
+                                            "host": ip_str,
+                                            "port": port,
+                                            "transport": "tcp",
+                                            "service": service_name,
+                                            "banner": if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
+                                        })),
+                                    });
+                                }
+                                Err(e) => {
+                                    crate::meprintln!("[!] Mutex lock failed: {}", e);
+                                }
                             }
                         }
                         "CLOSED" => {
                             stats_guard.tcp_closed += 1;
-                            if verbose {
+                            if verbose && !show_only_open {
                                 crate::mprintln!("  {} TCP {}:{} CLOSED", "✗".red(), ip_str, port);
                             }
                         }
                         "TIMEOUT" | "FILTERED" => {
                             stats_guard.tcp_filtered += 1;
-                            if verbose {
+                            if verbose && !show_only_open {
                                 crate::mprintln!("  {} TCP {}:{} FILTERED", "~".yellow(), ip_str, port);
                             }
                         }
@@ -363,20 +358,25 @@ pub async fn run_with_settings(
                             let service_name = get_service_name(port);
                             let line = format!("[UDP] {}:{} ({}) => {}", ip_str, port, service_name, status.green());
 
-                            let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line);
+                            if let Err(e) = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{}", line) { eprintln!("[!] Write failed: {}", e); }
                             crate::mprintln!("{}", line);
-                            if let Ok(mut buf) = findings_buf.lock() {
-                                buf.push(Finding {
-                                    target: ip_str.clone(),
-                                    kind: FindingKind::OpenPort,
-                                    message: format!("UDP {}:{} open ({})", ip_str, port, service_name),
-                                    data: Some(serde_json::json!({
-                                        "host": ip_str,
-                                        "port": port,
-                                        "transport": "udp",
-                                        "service": service_name,
-                                    })),
-                                });
+                            match findings_buf.lock() {
+                                Ok(mut buf) => {
+                                    buf.push(Finding {
+                                        target: ip_str.clone(),
+                                        kind: FindingKind::OpenPort,
+                                        message: format!("UDP {}:{} open ({})", ip_str, port, service_name),
+                                        data: Some(serde_json::json!({
+                                            "host": ip_str,
+                                            "port": port,
+                                            "transport": "udp",
+                                            "service": service_name,
+                                        })),
+                                    });
+                                }
+                                Err(e) => {
+                                    crate::meprintln!("[!] Mutex lock failed: {}", e);
+                                }
                             }
                         }
                         "CLOSED" => stats_guard.udp_closed += 1,
@@ -396,10 +396,14 @@ pub async fn run_with_settings(
 
     // Await all tasks
     for task in tcp_tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
     for task in udp_tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
 
     let elapsed = start_time.elapsed();
@@ -458,20 +462,20 @@ async fn scan_tcp(
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
         Ok(s) => s,
-        Err(_) => return Some(("ERROR".into(), "".into(), "".into())),
+        Err(e) => { tracing::debug!("socket create failed: {e}"); return Some(("ERROR".into(), "".into(), "".into())); }
     };
     
     // Set options
     if let Some(ttl_val) = ttl {
         if domain == Domain::IPV4 {
-            let _ = socket.set_ttl_v4(ttl_val);
+            if let Err(e) = socket.set_ttl_v4(ttl_val) { eprintln!("[!] Failed to set TTL: {}", e); }
         } else {
-            let _ = socket.set_unicast_hops_v6(ttl_val);
+            if let Err(e) = socket.set_unicast_hops_v6(ttl_val) { eprintln!("[!] Failed to set hop limit: {}", e); }
         }
     }
-    
-    let _ = socket.set_nonblocking(true);
-    let _ = socket.set_tcp_nodelay(true);
+
+    if let Err(e) = socket.set_nonblocking(true) { eprintln!("[!] Failed to set nonblocking: {}", e); }
+    if let Err(e) = socket.set_tcp_nodelay(true) { eprintln!("[!] Failed to set TCP nodelay: {}", e); }
 
     // Bind to custom source port if configured
     if let Some(src_port) = source_port {
@@ -480,7 +484,7 @@ async fn scan_tcp(
         } else {
             SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), src_port)
         };
-        let _ = socket.bind(&bind_addr.into());
+        if let Err(e) = socket.bind(&bind_addr.into()) { eprintln!("[!] Failed to bind source port: {}", e); }
     }
 
     // Connect (non-blocking). On Linux EINPROGRESS is the expected "in progress"
@@ -491,7 +495,7 @@ async fn scan_tcp(
         Ok(_) => {},
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
         Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {},
-        Err(_) => return Some(("CLOSED".into(), "".into(), "".into())),
+        Err(e) => { tracing::debug!("connect failed: {e}"); return Some(("CLOSED".into(), "".into(), "".into())); }
     }
 
     // Convert to Tokio TcpStream
@@ -501,7 +505,7 @@ async fn scan_tcp(
     match stream_res {
         Ok(mut stream) => {
             // Wait for connection to complete
-            if let Ok(_) = timeout(Duration::from_secs(timeout_secs), stream.writable()).await {
+            if timeout(Duration::from_secs(timeout_secs), stream.writable()).await.is_ok() {
                 // Check for socket error
                 if let Ok(None) = stream.take_error() {
                     // Send garbage data if configured
@@ -511,8 +515,8 @@ async fn scan_tcp(
                                 let mut rng = rng();
                                 (0..len).map(|_| rng.random()).collect()
                             };
-                            if stream.write_all(&payload).await.is_err() {
-                                // Probe write failed — proceed to banner grab anyway
+                            if let Err(e) = stream.write_all(&payload).await {
+                                tracing::trace!("Probe write failed: {e}");
                             }
                         }
                     
@@ -526,7 +530,7 @@ async fn scan_tcp(
                 Some(("TIMEOUT".into(), "".into(), "".into()))
             }
         }
-        Err(_) => Some(("CLOSED".into(), "".into(), "".into())),
+        Err(e) => { tracing::debug!("from_std failed: {e}"); Some(("CLOSED".into(), "".into(), "".into())) }
     }
 }
 
@@ -624,7 +628,8 @@ async fn scan_udp(
     source_port: Option<u16>,
     data_length: Option<usize>
 ) -> Option<String> {
-    // Bind address (source port logic)
+    // Bind address (source port logic) — use socket2 with SO_REUSEPORT
+    // so concurrent mass-scan tasks sharing a source port don't fail.
     let sock = if let Some(src_port) = source_port {
         let bind_addr = if ip.is_ipv4() {
             SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), src_port)
@@ -633,18 +638,44 @@ async fn scan_udp(
         };
         match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
-            Err(_) => return Some("ERROR".into()),
+            Err(e) => {
+                tracing::debug!("UDP bind to {bind_addr} failed ({e}), retrying with SO_REUSEPORT");
+                let domain = if ip.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+                let socket = match Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) {
+                    Ok(s) => s,
+                    Err(e) => { tracing::debug!("socket2 UDP create failed: {e}"); return Some("ERROR".into()); }
+                };
+                if let Err(e) = socket.set_reuse_address(true) {
+                    tracing::debug!("set_reuse_address failed: {e}");
+                }
+                #[cfg(target_os = "linux")]
+                if let Err(e) = socket.set_reuse_port(true) {
+                    tracing::debug!("set_reuse_port failed: {e}");
+                }
+                if let Err(e) = socket.set_nonblocking(true) {
+                    tracing::debug!("set_nonblocking failed: {e}");
+                }
+                if let Err(e) = socket.bind(&bind_addr.into()) {
+                    tracing::debug!("socket2 UDP bind failed: {e}");
+                    return Some("ERROR".into());
+                }
+                let std_sock: std::net::UdpSocket = socket.into();
+                match UdpSocket::from_std(std_sock) {
+                    Ok(s) => s,
+                    Err(e) => { tracing::debug!("UdpSocket::from_std failed: {e}"); return Some("ERROR".into()); }
+                }
+            }
         }
     } else {
         match crate::utils::udp_bind(None).await {
             Ok(s) => s,
-            Err(_) => return Some("ERROR".into()),
+            Err(e) => { tracing::debug!("UDP bind failed: {e}"); return Some("ERROR".into()); }
         }
     };
     
     // Set TTL if configured
-    if let Some(ttl_val) = ttl {
-        let _ = sock.set_ttl(ttl_val);
+    if let Some(ttl_val) = ttl
+        && let Err(e) = sock.set_ttl(ttl_val) { eprintln!("[!] Failed to set TTL: {}", e);
     }
 
     let target = SocketAddr::new(*ip, port);
@@ -661,20 +692,23 @@ async fn scan_udp(
         b"\x00\x00\x10\x10".to_vec()
     };
     
-    let _ = sock.send_to(&payload, target).await;
+    if let Err(e) = sock.send_to(&payload, target).await { eprintln!("[!] UDP send failed: {}", e); }
     
     let mut buf = [0u8; 1500];
     match timeout(Duration::from_secs(timeout_secs), sock.recv_from(&mut buf)).await {
         Ok(Ok((_len, _src))) => Some("OPEN".into()),
-        Ok(Err(_)) => Some("CLOSED".into()),
-        Err(_) => Some("FILTERED".into()),
+        Ok(Err(e)) => { tracing::debug!("UDP recv error: {e}"); Some("CLOSED".into()) }
+        Err(e) => { tracing::debug!("timeout: {e}"); Some("FILTERED".into()) }
     }
 }
 
 /// === Target Resolution ===
-fn resolve_target(input: &str) -> Result<(String, std::net::IpAddr)> {
+async fn resolve_target(input: &str) -> Result<(String, std::net::IpAddr)> {
     let cleaned = input.trim().trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<_> = (cleaned, 0).to_socket_addrs()?.collect();
+    let lookup = format!("{}:0", cleaned);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup).await
+        .with_context(|| format!("Could not resolve target '{}'", input))?
+        .collect();
     if let Some(addr) = addrs.iter().find(|a| a.is_ipv4()) {
         Ok((addr.ip().to_string(), addr.ip()))
     } else if let Some(addr) = addrs.first() {
@@ -770,8 +804,10 @@ impl ProgressTracker {
         ).cyan());
         // Note: This is in a sync context (ProgressTracker), so we use blocking flush
         // The ProgressTracker is called from async context but uses sync printing
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+            eprintln!("[!] Flush failed: {}", e);
+        }
+
         if self.current == self.total {
             crate::mprintln!();
         }
@@ -788,6 +824,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

@@ -63,7 +63,7 @@ pub struct ExclusionSet {
 }
 
 impl ExclusionSet {
-    /// Parse a slice of CIDR strings, silently skipping invalid entries.
+    /// Parse a slice of CIDR strings, warning on invalid entries.
     pub fn from_strs<I, S>(strs: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -71,7 +71,15 @@ impl ExclusionSet {
     {
         let nets = strs
             .into_iter()
-            .filter_map(|s| s.as_ref().parse::<IpNetwork>().ok())
+            .filter_map(|s| {
+                match s.as_ref().parse::<IpNetwork>() {
+                    Ok(net) => Some(net),
+                    Err(e) => {
+                        eprintln!("[!] Invalid exclusion entry '{}': {}", s.as_ref(), e);
+                        None
+                    }
+                }
+            })
             .collect();
         Self { nets }
     }

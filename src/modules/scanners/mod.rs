@@ -11,7 +11,6 @@ pub mod php_version_eol;
 pub mod honeypot_scanner;
 pub mod http_method_scanner;
 pub mod http_title_scanner;
-pub mod ipmi_enum_exploit;
 pub mod iusb_virtualmedia_probe;
 pub mod m365_userenum_scanner;
 pub mod nbns_scanner;

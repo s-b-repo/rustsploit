@@ -141,9 +141,9 @@ pub async fn discover_live(cidr: &IpNetwork, tool: Prescan) -> Result<Vec<String
     match tokio::time::timeout(wall_timeout, run_capture_lines(cmd, tool, max_output)).await {
         Ok(Ok(ips)) => Ok(ips),
         Ok(Err(e)) => Err(e.context("prescan tool exited with error")),
-        Err(_) => {
+        Err(e) => {
             crate::meprintln!(
-                "[!] prescan timed out after {}s — falling back to per-IP fan-out.",
+                "[!] prescan timed out after {}s ({e}) — falling back to per-IP fan-out.",
                 wall_timeout.as_secs()
             );
             Ok(Vec::new())
@@ -186,7 +186,7 @@ fn masscan_cmd(cidr: &IpNetwork, ports: &str, rate: u32) -> Command {
         .args(["-oG", "-"])
         .args(["--wait", "0"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd
 }
 
@@ -198,7 +198,7 @@ fn zmap_cmd(cidr: &IpNetwork, ports: &str, rate: u32) -> Command {
         .args(["-r", &rate.to_string()])
         .args(["-o", "-"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd
 }
 
@@ -232,9 +232,31 @@ async fn run_capture_lines(
         }
     }
 
+    // Capture stderr before waiting for exit
+    let stderr_output = if let Some(mut stderr) = child.stderr.take() {
+        let mut err_buf = String::new();
+        use tokio::io::AsyncReadExt;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stderr.read_to_string(&mut err_buf),
+        ).await {
+            Ok(Ok(n)) => tracing::trace!("Read {} bytes from prescan stderr", n),
+            Ok(Err(e)) => tracing::trace!("stderr read error: {e}"),
+            Err(e) => tracing::trace!("stderr read timed out: {e}"),
+        }
+        err_buf
+    } else {
+        String::new()
+    };
+
     let status = child.wait().await.context("wait for prescan")?;
     if !status.success() {
-        anyhow::bail!("prescan exit status {:?}", status.code());
+        let stderr_msg = if stderr_output.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr_output.trim())
+        };
+        anyhow::bail!("prescan exit status {:?}{}", status.code(), stderr_msg);
     }
 
     // De-dupe: masscan with multiple ports can emit the same IP twice.

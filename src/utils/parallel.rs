@@ -45,8 +45,10 @@ where
     stream::iter(work).buffered(max).collect().await
 }
 
-/// Same as [`run_buffered`] but yields results in completion order.
-#[allow(dead_code)] // public utility for future scanners that prefer streaming-as-ready output
+/// Same as [`run_buffered`] but yields results in completion order — use this
+/// when the caller doesn't care about input ordering and can benefit from
+/// progressing on fastest-completing work first (e.g. scanners that emit hits
+/// as they land).
 pub async fn run_buffered_unordered<R>(work: Vec<BoxFut<R>>, max_concurrency: usize) -> Vec<R>
 where
     R: Send + 'static,

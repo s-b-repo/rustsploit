@@ -5,7 +5,7 @@ use std::io::{ Read, Write };
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     load_lines,
     get_filename_in_current_dir,
@@ -64,6 +64,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         ],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(143),
     }
 }
 
@@ -224,6 +225,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
     let use_tls = cfg_prompt_yes_no("use_tls", "Use TLS/IMAPS?", false).await?;
     let default_port = if use_tls { DEFAULT_IMAPS_PORT } else { DEFAULT_IMAP_PORT };
     let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
@@ -414,7 +416,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     }
 
-    Ok(ModuleOutcome::ok())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid IMAP credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "imap",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 // ============================================================================

@@ -87,6 +87,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Great,
+        default_port: None,
     }
 }
 
@@ -302,8 +303,8 @@ fn extract_field_snippet(body: &str, field: &str) -> Option<String> {
         return None;
     }
     let rest = &after[value_start..];
-    let snippet: String = if rest.starts_with('"') {
-        rest[1..].chars().take_while(|c| *c != '"').take(80).collect()
+    let snippet: String = if let Some(stripped) = rest.strip_prefix('"') {
+        stripped.chars().take_while(|c| *c != '"').take(80).collect()
     } else {
         rest.chars().take_while(|c| *c != ',' && *c != '}' && *c != '\n').take(80).collect()
     };

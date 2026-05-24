@@ -113,7 +113,14 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
     });
 
     let module: Arc<dyn Module> = module_box.into();
-    let result = scheduler::run(module, target, ModuleOptions::default(), verbose).await;
+    let mut opts = ModuleOptions::default();
+    // Populate ModuleOptions from global options so native modules can read
+    // them via ctx.options (e.g. port, source_port, threads, etc.).
+    let global_opts = crate::global_options::GLOBAL_OPTIONS.all().await;
+    for (k, v) in &global_opts {
+        opts.set(k.clone(), v.clone());
+    }
+    let result = scheduler::run(module, target, opts, verbose).await;
 
     crate::events::emit(crate::events::ModuleEvent::ModuleFinished {
         module: resolved_path,
@@ -167,8 +174,20 @@ pub async fn check_module(
     target: &str,
 ) -> Option<crate::module_info::CheckResult> {
     let m = module::find(module_path)?;
-    let target_parsed = Target::parse(target).ok()?;
+    let target_parsed = match Target::parse(target) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("check_module: invalid target '{}': {}", target, e);
+            return None;
+        }
+    };
+    // Reject mass targets for check
+    if !matches!(&target_parsed, Target::Single(_)) {
+        tracing::warn!("check_module: mass targets not supported for check, use a single host");
+        return None;
+    }
     let mut ctx = crate::module::ModuleCtx::new(target_parsed);
+    ctx.module_path = module_path.to_string();
     ctx.tenant_id = crate::context::current_tenant_id();
     if let Some(tok) = crate::context::cancellation_token() {
         ctx.cancel = tok;

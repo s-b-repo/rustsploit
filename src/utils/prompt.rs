@@ -197,7 +197,7 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         if !sanitized.is_empty() {
             return Ok(sanitized);
         }
@@ -206,7 +206,7 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
     if key == "target"
         && let Some(val) = crate::config::get_run_target() {
             let sanitized = sanitize_string_input(&val)
-                .map_err(|e| anyhow!("Invalid run target: {}", e))?;
+                .context("Invalid run target")?;
             if !sanitized.is_empty() {
                 return Ok(sanitized);
             }
@@ -214,7 +214,7 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
     // Check global options (setg)
     if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
-            .map_err(|e| anyhow!("Invalid global option for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid global option for '{}'", key))?;
         if !sanitized.is_empty() {
             return Ok(sanitized);
         }
@@ -238,13 +238,13 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         return Ok(if sanitized.is_empty() { default.to_string() } else { sanitized });
     }
     // Check global options (setg)
     if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
-            .map_err(|e| anyhow!("Invalid global option for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid global option for '{}'", key))?;
         if !sanitized.is_empty() {
             return Ok(sanitized);
         }
@@ -269,7 +269,7 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         match sanitized.to_lowercase().trim() {
             "y" | "yes" | "true" | "1" => return Ok(true),
             "n" | "no" | "false" | "0" => return Ok(false),
@@ -310,13 +310,14 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         let trimmed = sanitized.trim();
         if !trimmed.is_empty() {
             match trimmed.parse::<u16>() {
                 Ok(p) if p > 0 => return Ok(p),
                 Ok(_) => return Err(anyhow!("Invalid port for '{}': port cannot be 0", key)),
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("port parse error for '{key}': {e}");
                     if config.api_mode {
                         return Err(anyhow!("Invalid port value for '{}': '{}'", key, trimmed));
                     }
@@ -344,7 +345,7 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
         Ok(val.to_string())
     }).await {
         let val = result?;
-        return val.parse::<u16>().map_err(|_| anyhow!("Invalid cached port value for '{}'", key));
+        return val.parse::<u16>().map_err(|e| anyhow!("Invalid cached port value for '{}': {e}", key));
     }
     prompt_port(msg, default).await
 }
@@ -356,7 +357,7 @@ pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
     if let Some(val) = config.custom_prompts.get(key)
         && !val.is_empty() {
             let safe_path = validate_safe_file_path(val)
-                .map_err(|e| anyhow!("Invalid file path for '{}': {}", key, e))?;
+                .with_context(|| format!("Invalid file path for '{}'", key))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }
@@ -366,7 +367,7 @@ pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
     if let Some(val) = crate::tenant::resolve().global_options().get(key).await
         && !val.is_empty() {
             let safe_path = validate_safe_file_path(&val)
-                .map_err(|e| anyhow!("Invalid global file path for '{}': {}", key, e))?;
+                .with_context(|| format!("Invalid global file path for '{}'", key))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }
@@ -390,7 +391,7 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         let trimmed = sanitized.trim();
         if !trimmed.is_empty() {
             match trimmed.parse::<i64>() {
@@ -403,7 +404,8 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
                         ));
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("numeric parse error for '{key}': {e}");
                     if config.api_mode {
                         return Err(anyhow!("Invalid numeric value for '{}': '{}'", key, trimmed));
                     }
@@ -430,7 +432,7 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
         Ok(val.to_string())
     }).await {
         let val = result?;
-        return val.parse::<i64>().map_err(|_| anyhow!("Invalid cached int value for '{}'", key));
+        return val.parse::<i64>().map_err(|e| anyhow!("Invalid cached int value for '{}': {e}", key));
     }
     prompt_int_range(msg, default, min, max).await
 }
@@ -458,7 +460,7 @@ pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
     if let Some(val) = config.custom_prompts.get(key)
         && !val.is_empty() {
             let safe_path = validate_safe_file_path(val)
-                .map_err(|e| anyhow!("Invalid wordlist path for '{}': {}", key, e))?;
+                .with_context(|| format!("Invalid wordlist path for '{}'", key))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }

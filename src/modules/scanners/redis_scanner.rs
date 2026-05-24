@@ -28,6 +28,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -291,8 +292,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if save_results {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "redis_scan_results.txt").await?;
         let content = report_lines.join("\n");
-        std::fs::write(&output_path, content)
+        tokio::fs::write(&output_path, content).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 

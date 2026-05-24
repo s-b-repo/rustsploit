@@ -69,11 +69,18 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
         }
 
         let address = normalize_target(&config.target, config.port);
-        match AsyncFtpStream::connect(address).await {
+        let tcp_stream = match crate::utils::network::tcp_connect_str(&address, Duration::from_secs(DEFAULT_TIMEOUT_SECS)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "TCP connect failed: {}", e);
+                continue;
+            }
+        };
+        match AsyncFtpStream::connect_with_stream(tcp_stream).await {
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
                     crate::mprintln!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
-                    let _ = ftp.quit().await;
+                    if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
                     let result = Some((ServiceType::Ftp, username.to_string(), password.to_string()));
                     // Respect stop_on_success: if true, stop after first valid credential
                     if config.stop_on_success {
@@ -82,7 +89,7 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
                     // If false, continue checking but still return first found (for consistency)
                     return Ok(result);
                 }
-                let _ = ftp.quit().await;
+                if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
             }
             Err(e) => {
                 tracing::trace!(target = %config.target, port = config.port, user = %username, "FTP login attempt failed: {}", e);
@@ -147,19 +154,41 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
         let host = parts[1];
         let port: u16 = parts[0].parse().unwrap_or(23);
 
-        if let Ok(mut telnet) = Telnet::connect((host, port), 500) {
-            let _ = telnet.write(format!("{}\r\n", username).as_bytes());
-            let _ = telnet.write(format!("{}\r\n", password).as_bytes());
+        let socket_addr: std::net::SocketAddr = match format!("{}:{}", host, port).parse() {
+            Ok(sa) => sa,
+            Err(e) => {
+                tracing::debug!(addr = %address, "Telnet target parse failed: {}", e);
+                continue;
+            }
+        };
+        if let Ok(tcp_stream) = crate::utils::network::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+            let mut telnet = Telnet::from_stream(Box::new(tcp_stream), 500);
+            if let Err(e) = telnet.write(format!("{}\r\n", username).as_bytes()) { eprintln!("[!] Write failed: {}", e); }
+            if let Err(e) = telnet.write(format!("{}\r\n", password).as_bytes()) { eprintln!("[!] Write failed: {}", e); }
 
             // Give device time to respond
             std::thread::sleep(Duration::from_millis(500));
 
             if let Ok(Event::Data(buffer)) = telnet.read_timeout(Duration::from_millis(800)) {
                 let response = String::from_utf8_lossy(&buffer);
-                if !response.contains("incorrect") && !response.contains("failed") {
+                // Explicit failure indicators -> auth failed
+                if response.contains("incorrect") || response.contains("failed") {
+                    continue;
+                }
+                // Require a positive indicator of a successful login:
+                // shell prompts ($, #, >, ~) or welcome/session messages.
+                let has_shell_prompt = response.contains('$')
+                    || response.contains('#')
+                    || response.contains('>')
+                    || response.contains('~');
+                let has_welcome = response.contains("Welcome")
+                    || response.contains("Last login");
+                if has_shell_prompt || has_welcome {
                     crate::mprintln!("{}", format!("[+] Telnet credentials valid: {}:{}", username, password).green().bold());
                     return Ok(Some((ServiceType::Telnet, username.to_string(), password.to_string())));
                 }
+                // Otherwise the response is inconclusive (e.g. empty,
+                // connection-closed, re-prompt of "login:") -> treat as failed.
             }
         }
     }
@@ -295,11 +324,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 "HTTP" => (80, "http"),
                 _ => (0, "unknown"),
             };
-            let _ = crate::cred_store::store_credential(
-                target, svc_port, svc_name, user, pass,
-                crate::cred_store::CredType::Password,
-                "creds/camera/acti/acti_camera_default",
-            ).await;
+            if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                host: target, port: svc_port, service: svc_name, username: user, secret: pass,
+                cred_type: crate::cred_store::CredType::Password,
+                source_module: "creds/camera/acti/acti_camera_default",
+            }).await.is_none() { eprintln!("[!] Failed to store credential"); }
             outcome.findings.push(Finding {
                 target: target.to_string(),
                 kind: FindingKind::Credential,
@@ -328,6 +357,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

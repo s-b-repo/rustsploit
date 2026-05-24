@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result, anyhow};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::{
     fs::File,
@@ -33,6 +33,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -50,12 +51,11 @@ struct ScanSettings {
 
 /// Main module entrypoint.
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
-    if !crate::utils::is_batch_mode()
-        && !crate::utils::is_batch_mode() {
-            print_banner();
-        }
+    if !crate::utils::is_batch_mode() {
+        print_banner();
+    }
 
     let settings = prompt_settings().await?;
 
@@ -161,7 +161,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
 
     let elapsed = start_time.elapsed();
@@ -194,6 +196,29 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     }
 
+    // Build structured findings for each allowed source port (firewall bypass)
+    let mut outcome = ModuleOutcome::ok();
+    for r in &results {
+        let well_known = well_known_source_port(r.source_port);
+        outcome = outcome.with(Finding {
+            target: ip_str.clone(),
+            kind: FindingKind::Vulnerable,
+            message: format!(
+                "Source port bypass: {}:{} allows traffic from src port {} {}",
+                ip_str, settings.dest_port, r.source_port,
+                if well_known.is_empty() { String::new() } else { format!("({})", well_known) }
+            ),
+            data: Some(serde_json::json!({
+                "host": ip_str,
+                "dest_port": settings.dest_port,
+                "source_port": r.source_port,
+                "protocol": protocol_label,
+                "well_known_service": well_known,
+                "banner": if r.banner.is_empty() { None } else { Some(r.banner.trim().to_string()) },
+            })),
+        });
+    }
+
     // Save results
     if !settings.output_file.is_empty() {
         let file = File::create(&settings.output_file)?;
@@ -220,7 +245,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         crate::mprintln!("\n{}", format!("[*] Results saved to {}", settings.output_file).cyan());
     }
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 fn print_banner() {
@@ -294,9 +319,9 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
         Err(e) => return ProbeResult::Error(e.to_string()),
     };
 
-    let _ = socket.set_reuse_address(true);
-    let _ = socket.set_nonblocking(true);
-    let _ = socket.set_tcp_nodelay(true);
+    if let Err(e) = socket.set_reuse_address(true) { eprintln!("[!] Failed to set reuse address: {}", e); }
+    if let Err(e) = socket.set_nonblocking(true) { eprintln!("[!] Failed to set nonblocking: {}", e); }
+    if let Err(e) = socket.set_tcp_nodelay(true) { eprintln!("[!] Failed to set TCP nodelay: {}", e); }
 
     // Bind to the specific source port
     let bind_addr = if ip.is_ipv4() {
@@ -315,7 +340,7 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(_) => return ProbeResult::Denied,
+        Err(e) => { tracing::debug!("connect failed: {e}"); return ProbeResult::Denied; }
     }
 
     // Convert to tokio TcpStream and wait for writable
@@ -331,15 +356,15 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
                             let banner = quick_banner(&stream, timeout_secs).await;
                             ProbeResult::Allowed { banner }
                         }
-                        Ok(Some(_)) => ProbeResult::Denied,
-                        Err(_) => ProbeResult::Denied,
+                        Ok(Some(e)) => { tracing::debug!("socket error: {e}"); ProbeResult::Denied }
+                        Err(e) => { tracing::debug!("take_error failed: {e}"); ProbeResult::Denied }
                     }
                 }
-                Ok(Err(_)) => ProbeResult::Denied,
-                Err(_) => ProbeResult::Timeout,
+                Ok(Err(e)) => { tracing::debug!("writable failed: {e}"); ProbeResult::Denied }
+                Err(e) => { tracing::debug!("timeout: {e}"); ProbeResult::Timeout }
             }
         }
-        Err(_) => ProbeResult::Denied,
+        Err(e) => { tracing::debug!("from_std failed: {e}"); ProbeResult::Denied }
     }
 }
 
@@ -373,8 +398,8 @@ async fn probe_udp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
             };
             ProbeResult::Allowed { banner }
         }
-        Ok(Err(_)) => ProbeResult::Denied,
-        Err(_) => ProbeResult::Timeout,
+        Ok(Err(e)) => { tracing::debug!("UDP recv error: {e}"); ProbeResult::Denied }
+        Err(e) => { tracing::debug!("timeout: {e}"); ProbeResult::Timeout }
     }
 }
 
@@ -482,7 +507,7 @@ impl ProgressTracker {
             "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
             self.current, self.total, pct, rate, eta
         ).cyan());
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
         if self.current == self.total {
             crate::mprintln!();

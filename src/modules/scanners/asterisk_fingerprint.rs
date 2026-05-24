@@ -61,6 +61,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -74,7 +75,7 @@ pub async fn check(ctx: &ModuleCtx) -> CheckResult {
     if !tcp_port_open(ip, 8089, Duration::from_secs(TCP_PROBE_TIMEOUT_SECS)).await {
         return CheckResult::NotVulnerable(format!("{}:8089 closed/filtered", host));
     }
-    match fetch_server_header(&host, 8089).await {
+    match fetch_server_header(&host, 8089, HTTP_TIMEOUT_SECS).await {
         Ok(server) => {
             if !server.to_ascii_lowercase().contains("asterisk") {
                 return CheckResult::Unknown(format!(
@@ -93,7 +94,7 @@ pub async fn check(ctx: &ModuleCtx) -> CheckResult {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     display_banner();
     let mut outcome = ModuleOutcome::ok();
     let host = sanitize_host(target);
@@ -107,7 +108,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     };
 
     let port = cfg_prompt_port("port", "Asterisk HTTP/WS port", 8089).await?;
-    let _timeout_secs = cfg_prompt_int_range(
+    let timeout_secs = cfg_prompt_int_range(
         "timeout",
         "HTTPS timeout (seconds)",
         HTTP_TIMEOUT_SECS as i64,
@@ -133,7 +134,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         format!("[+] {}:{} reachable; pulling HTTPS banner...", host, port).cyan()
     );
 
-    match fetch_server_header(&host, port).await {
+    match fetch_server_header(&host, port, timeout_secs).await {
         Ok(server) => {
             let s = server.to_ascii_lowercase();
             if !s.contains("asterisk") {
@@ -185,10 +186,10 @@ fn is_eol_version(server: &str) -> bool {
     EOL_MAJOR_PREFIXES.iter().any(|p| server.contains(p))
 }
 
-async fn fetch_server_header(host: &str, port: u16) -> Result<String> {
+async fn fetch_server_header(host: &str, port: u16, timeout_secs: u64) -> Result<String> {
     let opts = crate::utils::network::HttpClientOpts::permissive();
     let client = crate::utils::network::build_http_client_with(
-        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        Duration::from_secs(timeout_secs),
         opts,
     )
     .context("HTTPS client init failed")?;

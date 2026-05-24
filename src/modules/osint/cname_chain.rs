@@ -5,7 +5,7 @@
 //! host or a file of hosts and tags terminal records that match known cloud
 //! providers — feeder for `subdomain_takeover_scanner`.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use colored::*;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -80,6 +80,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -104,7 +105,7 @@ async fn chain_for(host: &str, resolver: &str) -> (Vec<String>, bool) {
                 let next = ans.into_iter().map(|s| s.trim_end_matches('.').to_string()).find(|s| !s.is_empty() && s != &current);
                 match next { Some(n) => { chain.push(n.clone()); current = n; } None => break }
             }
-            Err(_) => break,
+            Err(e) => { tracing::debug!("CNAME lookup for {} failed: {}", current, e); break; }
         }
     }
     let resolves = dns_lookup(host, RecordType::A, resolver).await.map(|v| !v.is_empty()).unwrap_or(false);
@@ -123,15 +124,15 @@ fn sanitize(t: &str) -> String {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     banner();
     let mut outcome = ModuleOutcome::ok();
     let resolver = cfg_prompt_default("resolver", "DNS resolver", "1.1.1.1").await?;
     let from_file = cfg_prompt_yes_no("from_file", "Treat target as a path to a host list?", false).await?;
 
     let hosts: Vec<String> = if from_file {
-        let raw = std::fs::read_to_string(target)
-            .map_err(|e| anyhow!("read {}: {}", target, e))?;
+        let raw = tokio::fs::read_to_string(target).await
+            .with_context(|| format!("read {}", target))?;
         raw.lines().map(sanitize).filter(|l| !l.is_empty() && !l.starts_with('#')).collect()
     } else {
         vec![sanitize(target)]
@@ -159,7 +160,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if dangling_tag { dangling += 1; }
         if provider.is_some() { tagged += 1; }
 
-        let label = match (provider.clone(), dangling_tag) {
+        let label = match (provider, dangling_tag) {
             (_, true) => "[!!] DANGLING".red().bold().to_string(),
             (Some(ref p), false) => format!("[!] {}", p).yellow().to_string(),
             (None, false) if chain.is_empty() => "[ ]".dimmed().to_string(),

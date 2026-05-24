@@ -126,6 +126,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -229,11 +230,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     "[+] HIT: {}:{} ({}) -> X-Auth-Token={}",
                     user, pass, enc.label(), token
                 ).green().bold());
-                let _ = crate::cred_store::store_credential(
-                    &host, port, "https", user, pass,
-                    crate::cred_store::CredType::Password,
-                    "creds/generic/h3c_oem_kvm_bruteforce",
-                ).await;
+                if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                    host: &host, port, service: "https", username: user, secret: pass,
+                    cred_type: crate::cred_store::CredType::Password,
+                    source_module: "creds/generic/h3c_oem_kvm_bruteforce",
+                }).await.is_none() { eprintln!("[!] Failed to store credential"); }
                 outcome.findings.push(Finding {
                     target: target.to_string(),
                     kind: FindingKind::Credential,
@@ -324,8 +325,8 @@ fn extract_token(body: &str) -> Option<String> {
     }
     if value_start >= bytes.len() { return None; }
     let rest = &after[value_start..];
-    if rest.starts_with('"') {
-        let val: String = rest[1..].chars().take_while(|c| *c != '"').collect();
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let val: String = stripped.chars().take_while(|c| *c != '"').collect();
         if val.is_empty() { None } else { Some(val) }
     } else {
         let val: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ',' && *c != '}').collect();

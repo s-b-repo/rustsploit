@@ -31,7 +31,10 @@ pub(crate) fn is_blocked_target(target: &str) -> bool {
     // Mass-scan keywords are deliberately allowed — this function exists for
     // SSRF mitigation, not for restricting scan scope. Modules that opt in
     // to mass-scan mode parse these keywords themselves.
-    const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
+    // M45: "0.0.0.0" alone resolves to localhost and must NOT be allowlisted.
+    // Only "0.0.0.0/0" (full-internet CIDR) and "random" are genuine
+    // mass-scan keywords that modules parse themselves.
+    const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0/0"];
     if MASS_SCAN_KEYWORDS.contains(&target) {
         return false;
     }
@@ -64,7 +67,14 @@ pub(crate) fn is_blocked_target(target: &str) -> bool {
         .or_else(|| lower.strip_prefix("https://"))
         .or_else(|| lower.strip_prefix("ftp://"))
         .or_else(|| lower.strip_prefix("gopher://"))
-        .unwrap_or(&lower);
+        .unwrap_or_else(|| {
+            // Generic scheme stripping for any other protocol (e.g. dict://, tftp://)
+            if let Some(idx) = lower.find("://") {
+                &lower[idx + 3..]
+            } else {
+                &lower
+            }
+        });
     // Strip userinfo (everything before @)
     let host_part = if let Some(at_pos) = host_part.find('@') {
         &host_part[at_pos + 1..]
@@ -216,7 +226,8 @@ pub(crate) async fn is_blocked_target_resolved(target: &str) -> bool {
 /// Callers should connect to the returned addresses directly (not re-resolve)
 /// to prevent DNS rebinding attacks.
 pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::SocketAddr>, String> {
-    const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
+    // M45: "0.0.0.0" alone resolves to localhost — must not be allowlisted.
+    const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0/0"];
     if MASS_SCAN_KEYWORDS.contains(&target) {
         return Ok(vec![]);
     }
@@ -252,9 +263,9 @@ pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::Sock
             tracing::debug!(target = lookup_addr, "SSRF resolve failed → blocking: {}", e);
             Err(format!("DNS resolution failed: {}", e))
         }
-        Err(_elapsed) => {
-            tracing::debug!(target = lookup_addr, "SSRF resolve timed out (5s) → blocking");
-            Err("DNS resolution timed out".to_string())
+        Err(e) => {
+            tracing::debug!(target = lookup_addr, "SSRF resolve timed out (5s) → blocking: {e}");
+            Err(format!("DNS resolution timed out: {e}"))
         }
     }
 }
@@ -363,7 +374,8 @@ async fn api_dispatcher(
     } else {
         match serde_json::from_slice::<Value>(&body) {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!("API JSON parse error: {e}");
                 return err_resp(
                     StatusCode::BAD_REQUEST,
                     "PARSE_ERROR",
@@ -674,11 +686,14 @@ async fn api_dispatcher(
 
 pub async fn start_api_server(
     bind_address: &str,
-    _verbose: bool,
+    verbose: bool,
     host_key_path: &std::path::Path,
     authorized_keys_path: &std::path::Path,
     passphrase: Option<&str>,
 ) -> Result<()> {
+    if verbose {
+        tracing::info!("Starting API server in verbose mode");
+    }
     // We don't refuse any bind address. The bootstrap path is gated by a
     // one-time enrollment token printed at startup (see /pq/register-key),
     // not by the bind interface — the token is the sole authority that

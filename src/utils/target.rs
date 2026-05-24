@@ -113,9 +113,9 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         }
         let network = parts[0].trim();
         let prefix_str = parts[1].trim();
-        let prefix: u8 = prefix_str.parse().map_err(|_| {
+        let prefix: u8 = prefix_str.parse().map_err(|e| {
             anyhow!(
-                "Invalid CIDR prefix: '{}' (must be 0-128 for IPv6, 0-32 for IPv4)",
+                "Invalid CIDR prefix: '{}' (must be 0-128 for IPv6, 0-32 for IPv4): {e}",
                 prefix_str
             )
         })?;
@@ -140,14 +140,14 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             if !is_valid_ipv6(ipv6_part) {
                 return Err(anyhow!("Invalid IPv6 address: '{}'", ipv6_part));
             }
-            if after_bracket.starts_with(':') {
-                let port_str = &after_bracket[1..].trim();
+            if let Some(port_part) = after_bracket.strip_prefix(':') {
+                let port_str = port_part.trim();
                 if port_str.is_empty() {
                     return Err(anyhow!("Invalid port format: missing port number"));
                 }
                 let port: u16 = port_str
                     .parse()
-                    .map_err(|_| anyhow!("Invalid port number: '{}'", port_str))?;
+                    .map_err(|e| anyhow!("Invalid port number: '{}': {e}", port_str))?;
                 if port == 0 {
                     return Err(anyhow!("Port cannot be 0"));
                 }
@@ -174,13 +174,19 @@ pub fn normalize_target(raw: &str) -> Result<String> {
     let is_likely_ipv6 = parses_as_ipv6 || (colon_count >= 2 && !has_dots);
 
     if is_likely_ipv6 {
+        // If the full string is valid IPv6, prefer the full-address
+        // interpretation and skip port-splitting to avoid ambiguity
+        // (e.g. "::1" should not treat "1" as a port).
+        if parses_as_ipv6 {
+            return Ok(format!("[{}]", sanitized));
+        }
         if let Some(last_colon_pos) = sanitized.rfind(':') {
             let before_colon = &sanitized[..last_colon_pos];
             let after_colon = &sanitized[last_colon_pos + 1..];
             if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
                 let port: u16 = after_colon
                     .parse()
-                    .map_err(|_| anyhow!("Invalid port number: '{}'", after_colon))?;
+                    .map_err(|e| anyhow!("Invalid port number: '{}': {e}", after_colon))?;
                 if port == 0 {
                     return Err(anyhow!("Port cannot be 0"));
                 }
@@ -206,7 +212,7 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             }
             let port: u16 = port_str
                 .parse()
-                .map_err(|_| anyhow!("Invalid port number: '{}'", port_str))?;
+                .map_err(|e| anyhow!("Invalid port number: '{}': {e}", port_str))?;
             if port == 0 {
                 return Err(anyhow!("Port cannot be 0"));
             }
@@ -254,7 +260,7 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
         Lazy::new(|| Regex::new(r"^[a-zA-Z0-9.\-_]+$"));
     let re = match &*HOST_RE {
         Ok(re) => re,
-        Err(_) => return false,
+        Err(e) => { tracing::error!("HOST_RE failed to compile: {e}"); return false; }
     };
     if !re.is_match(host) {
         return false;
@@ -415,8 +421,8 @@ pub async fn prompt_domain_target(domain: &str) -> Result<(String, String)> {
     let host = if use_ip {
         match resolve_domain(clean_domain) {
             Ok(ip) => ip,
-            Err(_) => {
-                crate::mprintln!("{}", "[!] Resolution failed, using domain name".yellow());
+            Err(e) => {
+                crate::mprintln!("{}", format!("[!] Resolution failed ({e}), using domain name").yellow());
                 clean_domain.to_string()
             }
         }

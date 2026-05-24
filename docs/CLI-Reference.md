@@ -25,7 +25,11 @@ An optional positional argument (`exploit`, `scanner`, `creds`) can be used to s
 |------|--------|-------------|
 | `--module` / `-m` | module name or path | Module to execute (short name or qualified path) |
 | `--target` / `-t` | IP / hostname / CIDR | Target to run against |
+| `-o` | `key=value` | Set a module option (repeatable: `-o port=443 -o verbose=y`) |
 | *(positional)* | `exploit`, `scanner`, `creds` | Optional module category subcommand |
+
+Options set via `-o` are equivalent to `set key value` in the shell. Metasploit
+aliases are supported: `-o RPORT=443`, `-o LPORT=31337`, `-o THREADS=100`.
 
 ---
 
@@ -81,7 +85,7 @@ Modules can be referenced by:
 - **Short name:** `ssh_bruteforce`, `heartbleed`, `port_scanner`
 - **Qualified path:** `creds/generic/ssh_bruteforce`, `exploits/heartbleed`, `scanners/port_scanner`
 
-Both forms resolve to the same underlying function via the build-generated dispatcher.
+Both forms resolve to the same module via `module::find()` (compile-time `inventory` registry).
 
 Use `--list-modules` or the shell's `modules` command for the authoritative list.
 

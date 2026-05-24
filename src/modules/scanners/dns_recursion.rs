@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use tokio::time::{timeout, Duration};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
@@ -283,8 +283,8 @@ async fn resolve_target(host: &str, port: u16) -> Result<(SocketAddr, String)> {
         return Ok((addr, format_endpoint(host, port)));
     }
 
-    let mut addrs_iter = (host, port)
-        .to_socket_addrs()
+    let mut addrs_iter = tokio::net::lookup_host((host, port))
+        .await
         .with_context(|| format!("Unable to resolve '{}:{}'", host, port))?;
     let addr = addrs_iter
         .next()
@@ -338,6 +338,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 crate::register_native_module!(crate::module::Category::Scanners, "dns_recursion", native);

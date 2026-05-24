@@ -12,7 +12,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     normalize_target,
     load_lines,
@@ -63,6 +63,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(22),
     }
 }
 
@@ -105,14 +106,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let concurrency: usize = {
             let input = cfg_prompt_default("concurrency", "Max concurrent hosts", "10").await?;
-            input.parse::<usize>().unwrap_or(10).max(1).min(256)
+            input.parse::<usize>().unwrap_or(10).clamp(1, 256)
         };
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output result file", "ssh_subnet_results.txt").await?;
 
         let connection_timeout: u64 = {
             let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "5").await?;
-            input.parse::<u64>().unwrap_or(5).max(1).min(60)
+            input.parse::<u64>().unwrap_or(5).clamp(1, 60)
         };
         let timeout_duration = Duration::from_secs(connection_timeout);
 
@@ -142,7 +143,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         }).await?;
-        return Ok(ModuleOutcome::ok());
+        let outcome = ModuleOutcome::ok();
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
@@ -185,18 +187,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let concurrency: usize = {
         let input = cfg_prompt_default("concurrency", "Max concurrent tasks", "10").await?;
-        input.parse::<usize>().unwrap_or(10).max(1).min(256)
+        input.parse::<usize>().unwrap_or(10).clamp(1, 256)
     };
 
     let connection_timeout: u64 = {
         let input = cfg_prompt_default("timeout", "Connection timeout (seconds)", "5").await?;
-        input.parse::<u64>().unwrap_or(5).max(1).min(60)
+        input.parse::<u64>().unwrap_or(5).clamp(1, 60)
     };
 
     let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
     let max_retries: usize = if retry_on_error {
         let input = cfg_prompt_default("max_retries", "Max retries per attempt", "2").await?;
-        input.parse::<usize>().unwrap_or(2).max(1).min(10)
+        input.parse::<usize>().unwrap_or(2).clamp(1, 10)
     } else {
         0
     };
@@ -211,7 +213,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
     let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
-    let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|_| format!("{}:{}", target, port));
+    let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|e| {
+        tracing::debug!("normalize_target failed: {e}");
+        format!("{}:{}", target, port)
+    });
 
     crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}", connect_addr).cyan());
 
@@ -286,7 +291,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         async move {
             limiter.acquire(&module_path, &t).await;
             let addr = normalize_target(&format!("{}:{}", t, p))
-                .unwrap_or_else(|_| format!("{}:{}", t, p));
+                .unwrap_or_else(|e| {
+                    tracing::debug!("normalize_target failed: {e}");
+                    format!("{}:{}", t, p)
+                });
             match try_ssh_login(&addr, &user, &pass, timeout_dur).await {
                 Ok(true) => LoginResult::Success,
                 Ok(false) => LoginResult::AuthFailed,
@@ -366,7 +374,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     }
 
-    Ok(ModuleOutcome::ok())
+    let mut outcome = ModuleOutcome::ok();
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid SSH credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "ssh",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 async fn try_ssh_login(
@@ -383,31 +405,32 @@ async fn try_ssh_login(
             let socket_addr: std::net::SocketAddr = addr_owned.parse()
                 .or_else(|_| addr_owned.to_socket_addrs().and_then(|mut a|
                     a.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No addresses resolved"))))
-                .map_err(|e| anyhow!("Cannot resolve address {}: {}", addr_owned, e))?;
+                .with_context(|| format!("Cannot resolve address {}", addr_owned))?;
             let tcp = crate::utils::blocking_tcp_connect(&socket_addr, timeout_duration)
-                .map_err(|e| anyhow!("Connection error: {}", e))?;
-            tcp.set_read_timeout(Some(timeout_duration)).ok();
-            tcp.set_write_timeout(Some(timeout_duration)).ok();
+                .context("Connection error")?;
+            tcp.set_read_timeout(Some(timeout_duration))?;
+            tcp.set_write_timeout(Some(timeout_duration))?;
 
             let mut sess = Session::new()
-                .map_err(|e| anyhow!("Failed to create SSH session: {}", e))?;
+                .context("Failed to create SSH session")?;
             sess.set_timeout(timeout_duration.as_millis() as u32);
             sess.set_tcp_stream(tcp);
 
             sess.handshake()
-                .map_err(|e| anyhow!("SSH handshake failed: {}", e))?;
+                .context("SSH handshake failed")?;
 
             sess.userauth_password(&user_owned, &pass_owned)
-                .map_err(|e| anyhow!("Authentication failed: {}", e))?;
+                .context("Authentication failed")?;
 
+            if let Err(e) = sess.disconnect(None, "", None) { tracing::trace!("SSH disconnect: {e}"); }
             Ok(sess.authenticated())
     });
 
-    let join_result = timeout(timeout_duration, handle)
+    let join_result = timeout(timeout_duration + Duration::from_secs(2), handle)
         .await
-        .map_err(|_| anyhow!("Connection timeout"))?;
+        .map_err(|e| anyhow!("Connection timeout: {e}"))?;
 
-    join_result.map_err(|e| anyhow!("Join error: {}", e))?
+    join_result.context("Join error")?
 }
 
 crate::register_native_module!(crate::module::Category::Creds, "generic/ssh_bruteforce", native);

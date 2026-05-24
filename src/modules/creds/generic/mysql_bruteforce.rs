@@ -43,6 +43,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(3306),
     }
 }
 
@@ -57,18 +58,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULT_MYSQL_CREDS,
             password_only: false,
         },
-        |host: String, port: u16, user: String, pass: String| async move {
-            probe(&host, port, &user, &pass).await
+        |host: String, port: u16, user: String, pass: String, timeout: std::time::Duration| async move {
+            probe(&host, port, &user, &pass, timeout).await
         },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
     use sha1::{Digest, Sha1};
     use tokio::io::AsyncWriteExt;
 
-    let timeout = Duration::from_secs(5);
     let addr = format!("{}:{}", host, port);
     let mut stream = match crate::utils::creds_helper::connect_with_timeout(&addr, timeout).await {
         Ok(s) => s,
@@ -247,7 +247,28 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
         }
         match p2[0] {
             0x00 => LoginResult::Success,
-            0xff => LoginResult::AuthFailed,
+            0xff => {
+                // ERR packet: marker (1) + error-code (2 LE) + ...
+                if p2.len() >= 3 {
+                    let err_code = u16::from_le_bytes([p2[1], p2[2]]);
+                    match err_code {
+                        1044 | 1045 => LoginResult::AuthFailed,
+                        _ => {
+                            let msg = if p2.len() > 9 {
+                                String::from_utf8_lossy(&p2[9..]).to_string()
+                            } else {
+                                format!("MySQL error {err_code}")
+                            };
+                            LoginResult::Error {
+                                message: msg,
+                                retryable: true,
+                            }
+                        }
+                    }
+                } else {
+                    LoginResult::AuthFailed
+                }
+            }
             0xfe => {
                 // AuthSwitchRequest — the server wants a different plugin.
                 // Treat as auth fail for now to avoid recursion.

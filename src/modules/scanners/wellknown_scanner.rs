@@ -6,6 +6,7 @@
 //! with status, content-type, length, and a short body snippet.
 
 use anyhow::Result;
+use anyhow::Context;
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
@@ -15,6 +16,9 @@ use crate::utils::parallel::{run_buffered, BoxFut};
 use crate::utils::{build_http_client, cfg_prompt_default, is_batch_mode};
 
 const WELLKNOWN_CONCURRENCY: usize = 16;
+
+/// Result from probing a single well-known path: (path, full_url, optional (status, content_type, body)).
+type WellknownProbeResult = (&'static str, String, Option<(u16, String, String)>);
 
 const PATHS: &[&str] = &[
     // RFC / standards
@@ -93,6 +97,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -102,7 +107,7 @@ fn url_with_scheme(t: &str) -> String {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     banner();
     let mut outcome = ModuleOutcome::ok();
     let base = cfg_prompt_default("url", "Target base URL", &url_with_scheme(target)).await?;
@@ -120,10 +125,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let status = r.status().as_u16();
             let ct = r.headers().get("content-type")
                 .and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-            let body = r.text().await.unwrap_or_default();
+            let body = match r.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Failed to read response body: {}", e);
+                    String::new()
+                }
+            };
             Some((status, ct, body.len()))
         }
-        Err(_) => None,
+        Err(e) => { tracing::debug!("baseline request failed: {e}"); None }
     };
     let spa_fallback = baseline.as_ref().map(|(s, ct, _)| *s < 400 && (ct.contains("text/html") || ct.is_empty())).unwrap_or(false);
     if spa_fallback {
@@ -135,17 +146,23 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // Probe all paths concurrently (up to WELLKNOWN_CONCURRENCY in flight).
-    let work: Vec<BoxFut<(&'static str, String, Option<(u16, String, String)>)>> =
+    let work: Vec<BoxFut<WellknownProbeResult>> =
         PATHS.iter().copied().map(|path| {
             let client = client.clone();
             let full = format!("{}{}", base, path);
             Box::pin(async move {
-                let resp = match client.get(&full).send().await { Ok(r) => r, Err(_) => return (path, full, None) };
+                let resp = match client.get(&full).send().await { Ok(r) => r, Err(e) => { tracing::debug!("request failed: {e}"); return (path, full, None); } };
                 let status = resp.status().as_u16();
                 if status >= 400 { return (path, full, None); }
                 let ct = resp.headers().get("content-type")
                     .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let body = resp.text().await.unwrap_or_default();
+                let body = match resp.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Failed to read response body: {}", e);
+                        String::new()
+                    }
+                };
                 (path, full, Some((status, ct, body)))
             }) as _
         }).collect();

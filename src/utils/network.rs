@@ -2,7 +2,7 @@
 //
 // Network utility functions: honeypot detection, TCP connection with source port, etc.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use colored::*;
@@ -106,8 +106,8 @@ pub async fn tcp_connect_with_source(
     };
 
     if let Some(port) = src_port {
-        // Use socket2 to bind source port before connecting
-        let dest: SocketAddr = addr.to_socket_addrs()
+        let dest: SocketAddr = tokio::net::lookup_host(addr)
+            .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
             .next()
             .ok_or_else(|| std::io::Error::new(
@@ -122,7 +122,7 @@ pub async fn tcp_connect_with_source(
         };
 
         let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         socket.set_reuse_address(true)?;
         socket.set_nonblocking(true)?;
@@ -146,7 +146,7 @@ pub async fn tcp_connect_with_source(
 
         // Wait for connection to complete with timeout
         tokio::time::timeout(timeout, stream.writable()).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"))??;
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}")))??;
 
         // Check for connection errors
         if let Some(err) = stream.take_error()? {
@@ -159,7 +159,8 @@ pub async fn tcp_connect_with_source(
         // Cap the resolved address list: a malicious DNS responder can hand back
         // hundreds of A/AAAA records and force us to try them all serially.
         const MAX_RESOLVED_ADDRS: usize = 16;
-        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr)
+            .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
             .take(MAX_RESOLVED_ADDRS)
             .collect();
@@ -174,7 +175,7 @@ pub async fn tcp_connect_with_source(
             match tokio::time::timeout(timeout, TcpStream::connect(sa)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => last_err = e,
-                Err(_) => last_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"),
+                Err(e) => last_err = std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}")),
             }
         }
         Err(last_err)
@@ -195,7 +196,7 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
         };
 
         let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         socket.set_reuse_address(true)?;
         socket.set_nonblocking(true)?;
@@ -218,7 +219,7 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
         let stream = TcpStream::from_std(std_stream)?;
 
         tokio::time::timeout(timeout, stream.writable()).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"))??;
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}")))??;
 
         if let Some(err) = stream.take_error()? {
             return Err(err);
@@ -229,7 +230,7 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
         match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => Ok(stream),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out")),
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}"))),
         }
     }
 }
@@ -493,7 +494,9 @@ pub fn build_http_client_with(
     // "No provider set". Install the ring provider once, lazily.
     static PROVIDER: std::sync::Once = std::sync::Once::new();
     PROVIDER.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+            tracing::warn!("Failed to install default crypto provider: {:?}", e);
+        }
     });
 
     let mut builder = reqwest::Client::builder()
@@ -588,7 +591,7 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
         tasks.push(tokio::spawn(async move {
             let _permit = match sem.acquire().await {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(e) => { tracing::trace!("host-alive semaphore closed: {e}"); return; }
             };
             let addr = format!("{}:{}", ip_clone, port);
             if tcp_connect(&addr, scan_timeout).await.is_ok() {
@@ -598,7 +601,9 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
 
     open_count.load(std::sync::atomic::Ordering::Relaxed) >= 11
@@ -665,7 +670,7 @@ pub fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> String
         None => String::new(),
         Some(v) => match v.to_str() {
             Ok(s) => s.to_string(),
-            Err(_) => String::from("<non-utf8>"),
+            Err(e) => { tracing::trace!("non-utf8 header value: {e}"); String::from("<non-utf8>") }
         },
     }
 }

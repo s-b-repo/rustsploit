@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, Context};
 use colored::*;
 use rlimit::Resource;
 
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 
 const TARGET_FILE_LIMIT: u64 = 65535;
 
@@ -14,6 +14,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 
@@ -29,25 +30,38 @@ fn display_banner() {
 /// Module entry point for raising ulimit
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // For ulimit operations, target is informational only.
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     if !target.is_empty() {
         crate::mprintln!("{}", format!("[*] Target context: {}", target).dimmed());
     }
     raise_ulimit().await?;
-    Ok(ModuleOutcome::ok())
+    let mut outcome = ModuleOutcome::ok();
+    if let Ok((soft, hard)) = get_current_limits() {
+        outcome.findings.push(Finding {
+            target: "localhost".to_string(),
+            kind: FindingKind::Note,
+            message: format!("File descriptor limits — soft: {}, hard: {}", soft, hard),
+            data: Some(serde_json::json!({
+                "soft_limit": soft,
+                "hard_limit": hard,
+                "target_limit": TARGET_FILE_LIMIT,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 /// Get current resource limits
 fn get_current_limits() -> Result<(u64, u64)> {
     let (soft, hard) = Resource::NOFILE.get()
-        .map_err(|e| anyhow!("Failed to get current limits: {}", e))?;
+        .context("Failed to get current limits")?;
     Ok((soft, hard))
 }
 
 /// Set resource limits directly in the current process
 fn set_file_limit(soft: u64, hard: u64) -> Result<()> {
     Resource::NOFILE.set(soft, hard)
-        .map_err(|e| anyhow!("Failed to set limits: {}", e))
+        .context("Failed to set limits")
 }
 
 /// Raise ulimit to 65535 using setrlimit syscall (actually works for current process)

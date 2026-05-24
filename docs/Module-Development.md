@@ -198,6 +198,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: Some("2025-01-15".to_string()),
         rank: ModuleRank::Good,
+        default_port: Some(8080),
     }
 }
 ```
@@ -568,6 +569,60 @@ Emission is non-blocking and silently drops when there are no subscribers (the c
 
 ---
 
+## Network Wrappers & Source Port
+
+All TCP/UDP connections must go through the framework's network wrappers so
+`setg source_port <port>` is honoured universally — including during mass-scan
+fan-out where hundreds of concurrent tasks share the same source port via
+`SO_REUSEADDR` / `SO_REUSEPORT`.
+
+| Wrapper | Use case |
+|---------|----------|
+| `tcp_connect_str(addr, timeout)` | Async TCP from `"host:port"` string |
+| `tcp_connect_addr(addr, timeout)` | Async TCP from `SocketAddr` |
+| `blocking_tcp_connect(addr, timeout)` | Sync TCP for `spawn_blocking` (e.g. telnet crate) |
+| `udp_bind(Some(ip))` | UDP socket with correct address family |
+
+**Third-party library pattern:** Libraries (suppaftp, telnet) that create their
+own TCP connections bypass source port binding. Instead, connect through the
+framework wrapper and pass the pre-connected stream:
+
+```rust
+// FTP (suppaftp)
+let tcp = crate::utils::network::tcp_connect_str(&addr, timeout).await?;
+let ftp = AsyncFtpStream::connect_with_stream(tcp).await?;
+
+// Telnet (telnet crate, blocking)
+let tcp = crate::utils::network::blocking_tcp_connect(&sa, timeout)?;
+let telnet = Telnet::from_stream(Box::new(tcp), 500);
+```
+
+**Never use** `TcpStream::connect()`, `UdpSocket::bind("0.0.0.0:0")`, or
+library-level connect functions (`AsyncFtpStream::connect(addr)`,
+`Telnet::connect(addr)`) — they bypass source port binding.
+
+---
+
+## Target-Specific Filenames
+
+When a module writes output files (results, configs, payloads), include the
+target in the filename to avoid clobbering under concurrent mass scan:
+
+```rust
+let safe = target.replace(['/', ':', '.', '[', ']'], "_");
+let path = format!("results_{}.txt", safe);
+```
+
+For temp directories, use per-invocation isolation:
+
+```rust
+let work_dir = std::env::temp_dir().join(
+    format!("rsploit_module_{:08x}", rand::rng().random::<u32>())
+);
+```
+
+---
+
 ## Batch Mode
 
 When the framework dispatches a mass-scan target (`0.0.0.0`, `random`, CIDR, file, comma-separated), it enters **batch mode** and fans out N concurrent module invocations against single IPs. **Modules MUST gate interactive UI behind `is_batch_mode()`** or risk N concurrent menu prints flooding the terminal:
@@ -602,6 +657,18 @@ pub async fn run(target: &str) -> Result<()> {
 ```
 
 The cached `cfg_prompt_default(...)` returns the same value every call, so a REPL loop reading prompts spins forever in batch mode unless you `break;` after one iteration. This was the v0.4.9 root cause for ~22 modules across two sweeps — see the changelog entry.
+
+### Interactive REPLs and local-only modules
+
+Modules with interactive REPLs (e.g. `h3c_websocket_dump`) or local-only
+functionality (e.g. `windows_dwm_cve_2026_20805`) should bail immediately
+in batch mode since they cannot operate meaningfully under fan-out:
+
+```rust
+if crate::utils::is_batch_mode() {
+    anyhow::bail!("Interactive REPL not supported in mass-scan mode.");
+}
+```
 
 ---
 

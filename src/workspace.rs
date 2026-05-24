@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::*;
 use once_cell::sync::Lazy;
@@ -76,7 +76,7 @@ impl Workspace {
     }
 
     /// Sync load used only during initial construction (Lazy init).
-    fn load_sync(base_dir: &PathBuf, name: &str) -> WorkspaceData {
+    fn load_sync(base_dir: &Path, name: &str) -> WorkspaceData {
         let path = base_dir.join(format!("{}.json", name));
         if path.exists() {
             match std::fs::read_to_string(&path) {
@@ -94,7 +94,9 @@ impl Workspace {
                 Err(e) => {
                     eprintln!("[!] Failed to read workspace '{}': {}. Preserving original.", name, e);
                     let backup = path.with_extension("json.unreadable");
-                    let _ = std::fs::rename(&path, &backup);
+                    if let Err(e) = std::fs::rename(&path, &backup) {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     WorkspaceData::default()
                 }
             }
@@ -128,7 +130,9 @@ impl Workspace {
                     // start doesn't silently overwrite the original.
                     eprintln!("[!] Warning: Failed to read workspace '{}': {}. Preserving original.", name, e);
                     let backup = path.with_extension("json.unreadable");
-                    let _ = tokio::fs::rename(&path, &backup).await;
+                    if let Err(e) = tokio::fs::rename(&path, &backup).await {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     WorkspaceData::default()
                 }
             }

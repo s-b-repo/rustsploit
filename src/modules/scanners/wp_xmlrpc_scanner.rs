@@ -38,6 +38,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -65,7 +66,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut reachable = false;
     if let Ok(r) = get {
         let s = r.status().as_u16();
-        let body = r.text().await.unwrap_or_default();
+        let body = match r.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                String::new()
+            }
+        };
         if body.contains("XML-RPC server accepts POST requests only") || s == 405 {
             crate::mprintln!("{}", format!("[+] xmlrpc.php reachable (status {})", s).green().bold());
             reachable = true;
@@ -100,7 +107,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if let Ok(r) = resp {
         let s = r.status().as_u16();
-        let body = r.text().await.unwrap_or_default();
+        let body = match r.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                String::new()
+            }
+        };
         if body.contains("methodResponse") && body.contains("<string>") {
             has_multicall = body.contains("system.multicall");
             has_pingback = body.contains("pingback.ping");

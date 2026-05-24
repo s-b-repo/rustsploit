@@ -49,7 +49,7 @@ impl SpoolState {
         let mut guard = self
             .file
             .write()
-            .map_err(|e| anyhow!("Failed to acquire spool lock: {}", e))?;
+            .map_err(|e| anyhow!("Failed to acquire spool lock (poisoned): {e}"))?;
 
         use std::fs::OpenOptions;
         #[cfg(unix)]
@@ -123,7 +123,7 @@ impl SpoolState {
 
     /// Get the current spool filename.
     pub fn current_file(&self) -> Option<String> {
-        let g = self.file.read().ok()?;
+        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
         g.as_ref().map(|(_, name)| name.clone())
     }
 
@@ -143,7 +143,7 @@ impl SpoolState {
         buf.push('\n');
         let mut guard = match self.file.write() {
             Ok(g) => g,
-            Err(_) => return Ok(()), // poisoned: silently no-op
+            Err(e) => { tracing::warn!("spool RwLock poisoned, dropping message: {e}"); return Ok(()); }
         };
         if let Some((ref mut file, _)) = *guard {
             file.write_all(buf.as_bytes())?;

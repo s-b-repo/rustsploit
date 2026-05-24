@@ -60,20 +60,24 @@ pub async fn try_login(
     timeout_duration: Duration,
     requested_protocols: u32,
 ) -> Result<RdpLoginResult> {
-    // 1. TCP connect
-    let stream = match timeout(timeout_duration, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Ok(RdpLoginResult::ConnectionFailed(e.to_string())),
-        Err(_) => return Ok(RdpLoginResult::ConnectionFailed("Connection timeout".into())),
+    let stream = match crate::utils::network::tcp_connect_str(addr, timeout_duration).await {
+        Ok(s) => s,
+        Err(e) => return Ok(RdpLoginResult::ConnectionFailed(e.to_string())),
     };
 
     // 2. X.224 Connection Request
     let cookie = if user.is_empty() { "rustsploit" } else { user };
-    let cr_pdu = build_x224_cr(cookie, requested_protocols);
+    let cr_pdu = build_x224_cr(cookie, requested_protocols)?;
 
     let mut stream = stream;
-    if let Err(e) = timeout(timeout_duration, stream.write_all(&cr_pdu)).await {
-        return Ok(RdpLoginResult::ConnectionFailed(format!("Write CR: {}", e)));
+    match timeout(timeout_duration, stream.write_all(&cr_pdu)).await {
+        Err(elapsed) => {
+            return Ok(RdpLoginResult::ConnectionFailed(format!("Write CR timeout: {}", elapsed)));
+        }
+        Ok(Err(io_err)) => {
+            return Ok(RdpLoginResult::ConnectionFailed(format!("Write CR I/O error: {}", io_err)));
+        }
+        Ok(Ok(())) => {}
     }
 
     // 3. Read X.224 Connection Confirm (read full TPKT frame)
@@ -81,7 +85,7 @@ pub async fn try_login(
     let n = match timeout(timeout_duration, read_tpkt_frame(&mut stream, &mut buf)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Ok(RdpLoginResult::ConnectionFailed(format!("Read CC: {}", e))),
-        Err(_) => return Ok(RdpLoginResult::ConnectionFailed("CC timeout".into())),
+        Err(e) => return Ok(RdpLoginResult::ConnectionFailed(format!("CC timeout: {e}"))),
     };
 
     let selected = match parse_x224_cc(&buf[..n]) {
@@ -130,6 +134,9 @@ async fn read_tpkt_frame<S: AsyncReadExt + Unpin>(stream: &mut S, buf: &mut [u8]
         return Err(anyhow!("Bad TPKT version 0x{:02x}", buf[0]));
     }
     let frame_len = ((buf[2] as usize) << 8) | buf[3] as usize;
+    if frame_len < 4 {
+        return Err(anyhow!("TPKT frame length too small: {}", frame_len));
+    }
     if frame_len > buf.len() {
         return Err(anyhow!("TPKT frame too large: {} bytes", frame_len));
     }
@@ -143,10 +150,67 @@ async fn read_tpkt_frame<S: AsyncReadExt + Unpin>(stream: &mut S, buf: &mut [u8]
 }
 
 // ============================================================================
+// CredSSP BER-framed message reader — ensures full TSRequest is received
+// ============================================================================
+
+/// Read a complete BER-encoded TSRequest from a stream.
+/// Parses the BER tag+length header first, then reads exactly that many payload bytes.
+async fn read_credssp_message<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    timeout_duration: Duration,
+) -> Result<Vec<u8>> {
+    let mut header = [0u8; 4];
+    // Read the BER tag byte and first length byte
+    timeout(timeout_duration, stream.read_exact(&mut header[..2]))
+        .await
+        .map_err(|elapsed| anyhow!("CredSSP header read timeout: {}", elapsed))?
+        .map_err(|io_err| anyhow!("CredSSP header read I/O error: {}", io_err))?;
+
+    // Parse BER length from header bytes
+    let (total_len, header_size) = if header[1] & 0x80 == 0 {
+        // Short form: length is directly in header[1]
+        (header[1] as usize, 2)
+    } else {
+        let num_len_bytes = (header[1] & 0x7f) as usize;
+        if num_len_bytes == 0 || num_len_bytes > 2 {
+            anyhow::bail!("TSRequest BER length field unsupported: {} octets", num_len_bytes);
+        }
+        // Read the additional length bytes
+        timeout(
+            timeout_duration,
+            stream.read_exact(&mut header[2..2 + num_len_bytes]),
+        )
+        .await
+        .map_err(|elapsed| anyhow!("CredSSP length read timeout: {}", elapsed))?
+        .map_err(|io_err| anyhow!("CredSSP length read I/O error: {}", io_err))?;
+
+        let len = if num_len_bytes == 1 {
+            header[2] as usize
+        } else {
+            ((header[2] as usize) << 8) | header[3] as usize
+        };
+        (len, 2 + num_len_bytes)
+    };
+
+    // Assemble the complete message: header + payload
+    let mut buf = vec![0u8; header_size + total_len];
+    buf[..header_size].copy_from_slice(&header[..header_size]);
+    timeout(
+        timeout_duration,
+        stream.read_exact(&mut buf[header_size..]),
+    )
+    .await
+    .map_err(|elapsed| anyhow!("CredSSP payload read timeout: {}", elapsed))?
+    .map_err(|io_err| anyhow!("CredSSP payload read I/O error: {}", io_err))?;
+
+    Ok(buf)
+}
+
+// ============================================================================
 // X.224 Protocol
 // ============================================================================
 
-fn build_x224_cr(cookie: &str, protocols: u32) -> Vec<u8> {
+fn build_x224_cr(cookie: &str, protocols: u32) -> Result<Vec<u8>> {
     let cookie_str = format!("Cookie: mstshash={}\r\n", cookie);
     let cookie_bytes = cookie_str.as_bytes();
     // Negotiation Request: type(1) + flags(1) + length(2) + protocols(4) = 8
@@ -155,9 +219,13 @@ fn build_x224_cr(cookie: &str, protocols: u32) -> Vec<u8> {
 
     let mut pdu = Vec::with_capacity(tpkt_len);
     // TPKT header
-    pdu.extend_from_slice(&[TPKT_VERSION, 0, (tpkt_len >> 8) as u8, tpkt_len as u8]);
+    let tpkt_u16 = u16::try_from(tpkt_len)
+        .map_err(|_| anyhow!("X.224 connection request too large ({} bytes); max cookie length ~500 bytes", tpkt_len))?;
+    pdu.extend_from_slice(&[TPKT_VERSION, 0, (tpkt_u16 >> 8) as u8, tpkt_u16 as u8]);
     // X.224 CR
-    pdu.push(x224_payload_len as u8); // length indicator
+    let x224_len_u8 = u8::try_from(x224_payload_len)
+        .map_err(|_| anyhow!("X.224 payload length too large ({} bytes); max cookie length ~500 bytes", x224_payload_len))?;
+    pdu.push(x224_len_u8); // length indicator
     pdu.push(X224_TYPE_CR);
     pdu.extend_from_slice(&[0, 0, 0, 0, 0]); // dst-ref(2) + src-ref(2) + class(1)
     pdu.extend_from_slice(cookie_bytes);
@@ -166,7 +234,7 @@ fn build_x224_cr(cookie: &str, protocols: u32) -> Vec<u8> {
     pdu.push(0x00); // flags
     pdu.extend_from_slice(&8u16.to_le_bytes()); // length = 8
     pdu.extend_from_slice(&protocols.to_le_bytes());
-    pdu
+    Ok(pdu)
 }
 
 fn parse_x224_cc(data: &[u8]) -> Result<u32> {
@@ -220,12 +288,12 @@ async fn tls_upgrade(
     };
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()))
-        .map_err(|_| anyhow!("Invalid server name"))?;
+        .map_err(|e| anyhow!("Invalid server name: {e}"))?;
 
     match timeout(timeout_duration, connector.connect(server_name, stream)).await {
         Ok(Ok(tls)) => Ok(tls),
         Ok(Err(e)) => Err(anyhow!("TLS handshake failed: {}", e)),
-        Err(_) => Err(anyhow!("TLS handshake timeout")),
+        Err(e) => Err(anyhow!("TLS handshake timeout: {e}")),
     }
 }
 
@@ -247,20 +315,23 @@ where
     let spnego_init = wrap_spnego_init(&ntlm_negotiate);
     let ts_req1 = build_ts_request(6, Some(&spnego_init), None, None);
 
-    if timeout(timeout_duration, stream.write_all(&ts_req1)).await.is_err() {
-        return Ok(RdpLoginResult::ConnectionFailed("CredSSP write timeout".into()));
+    match timeout(timeout_duration, stream.write_all(&ts_req1)).await {
+        Err(elapsed) => {
+            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP write timeout: {}", elapsed)));
+        }
+        Ok(Err(io_err)) => {
+            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP write I/O error: {}", io_err)));
+        }
+        Ok(Ok(())) => {}
     }
 
     // Step 2: Read TSRequest with NTLM Challenge (Type 2)
-    let mut buf = vec![0u8; 8192];
-    let n = match timeout(timeout_duration, stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        Ok(Ok(_)) => return Ok(RdpLoginResult::ConnectionFailed("Empty CredSSP response".into())),
-        Ok(Err(e)) => return Ok(RdpLoginResult::ProtocolError(format!("CredSSP read: {}", e))),
-        Err(_) => return Ok(RdpLoginResult::ConnectionFailed("CredSSP read timeout".into())),
+    let challenge_buf = match read_credssp_message(&mut stream, timeout_duration).await {
+        Ok(buf) => buf,
+        Err(e) => return Ok(RdpLoginResult::ProtocolError(format!("CredSSP challenge read: {}", e))),
     };
 
-    let ts_resp = match parse_ts_request(&buf[..n]) {
+    let ts_resp = match parse_ts_request(&challenge_buf) {
         Ok(r) => r,
         Err(e) => return Ok(RdpLoginResult::ProtocolError(format!("TSRequest parse: {}", e))),
     };
@@ -290,21 +361,25 @@ where
     let spnego_resp = wrap_spnego_response(&ntlm_auth);
     let ts_req3 = build_ts_request(6, Some(&spnego_resp), None, None);
 
-    if timeout(timeout_duration, stream.write_all(&ts_req3)).await.is_err() {
-        return Ok(RdpLoginResult::ConnectionFailed("CredSSP auth write timeout".into()));
+    match timeout(timeout_duration, stream.write_all(&ts_req3)).await {
+        Err(elapsed) => {
+            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP auth write timeout: {}", elapsed)));
+        }
+        Ok(Err(io_err)) => {
+            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP auth write I/O error: {}", io_err)));
+        }
+        Ok(Ok(())) => {}
     }
 
     // Step 4: Read final response
-    let n = match timeout(timeout_duration, stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        // Connection closed = auth failed (server drops connection on bad creds)
-        Ok(Ok(_)) => return Ok(RdpLoginResult::AuthFailed),
-        Ok(Err(_)) => return Ok(RdpLoginResult::AuthFailed),
-        Err(_) => return Ok(RdpLoginResult::AuthFailed),
+    let final_buf = match read_credssp_message(&mut stream, timeout_duration).await {
+        Ok(buf) => buf,
+        // Connection closed or read error after auth = auth failed (server drops connection on bad creds)
+        Err(e) => { tracing::debug!("CredSSP final read failed: {e}"); return Ok(RdpLoginResult::AuthFailed); }
     };
 
     // Parse final TSRequest
-    match parse_ts_request(&buf[..n]) {
+    match parse_ts_request(&final_buf) {
         Ok(resp) => {
             if let Some(err) = resp.error_code
                 && err != 0 {
@@ -314,14 +389,14 @@ where
             if resp.pub_key_auth.is_some() {
                 return Ok(RdpLoginResult::Success);
             }
-            // If we get negoTokens back, check for SPNEGO accept
+            // If we get negoTokens back, this is a continuation, not success
             if resp.nego_tokens.is_some() {
-                // Server sent more negotiation → could be success continuation
-                return Ok(RdpLoginResult::Success);
+                // Server sent more negotiation tokens -- multi-round SPNEGO not supported
+                return Ok(RdpLoginResult::ProtocolError("Multi-round SPNEGO negotiation not supported".into()));
             }
             Ok(RdpLoginResult::AuthFailed)
         }
-        Err(_) => Ok(RdpLoginResult::AuthFailed),
+        Err(e) => { tracing::debug!("TSRequest parse failed: {e}"); Ok(RdpLoginResult::AuthFailed) }
     }
 }
 
@@ -585,24 +660,24 @@ fn ber_len(buf: &mut Vec<u8>, len: usize) {
     }
 }
 
-fn ber_read_len(data: &[u8], pos: &mut usize) -> usize {
-    if *pos >= data.len() { return 0; }
+fn ber_read_len(data: &[u8], pos: &mut usize) -> Result<usize> {
+    if *pos >= data.len() { anyhow::bail!("BER length: read past end of data"); }
     let b = data[*pos]; *pos += 1;
-    if b < 0x80 { return b as usize; }
+    if b < 0x80 { return Ok(b as usize); }
     let nb = (b & 0x7f) as usize;
     // BER allows up to 127 length octets, but anything past 8 (for 64-bit
     // usize) would silently truncate via the cumulative left-shifts. Reject
     // malformed inputs upfront rather than returning a quietly-wrong length.
     if nb > std::mem::size_of::<usize>() {
-        return 0;
+        anyhow::bail!("BER length field too large: {} octets", nb);
     }
     let mut val = 0usize;
     for _ in 0..nb {
-        if *pos >= data.len() { return 0; }
+        if *pos >= data.len() { anyhow::bail!("BER length: truncated multi-byte length"); }
         val = (val << 8) | data[*pos] as usize;
         *pos += 1;
     }
-    val
+    Ok(val)
 }
 
 fn build_ts_request(version: u32, nego: Option<&[u8]>, auth: Option<&[u8]>, pubkey: Option<&[u8]>) -> Vec<u8> {
@@ -650,15 +725,16 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
     let mut pos = 0;
     if pos >= data.len() || data[pos] != 0x30 { return Err(anyhow!("Not a SEQUENCE")); }
     pos += 1;
-    let _seq_len = ber_read_len(data, &mut pos);
+    let seq_len = ber_read_len(data, &mut pos)?;
+    let seq_end = pos + seq_len;
 
     let mut result = TsRequestData {
         nego_tokens: None, auth_info: None, pub_key_auth: None, error_code: None,
     };
 
-    while pos < data.len() {
+    while pos < data.len() && pos < seq_end {
         let tag = data[pos]; pos += 1;
-        let field_len = ber_read_len(data, &mut pos);
+        let field_len = ber_read_len(data, &mut pos)?;
         if pos + field_len > data.len() { break; }
         let field_data = &data[pos..pos + field_len];
 
@@ -667,17 +743,17 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
             0xA1 => {
                 // negoTokens: SEQUENCE OF SEQUENCE { [0] OCTET STRING }
                 // Drill down to get the OCTET STRING content
-                result.nego_tokens = Some(extract_nested_octet(field_data));
+                result.nego_tokens = Some(extract_nested_octet(field_data)?);
             }
             0xA2 => {
-                result.auth_info = Some(extract_octet(field_data));
+                result.auth_info = Some(extract_octet(field_data)?);
             }
             0xA3 => {
-                result.pub_key_auth = Some(extract_octet(field_data));
+                result.pub_key_auth = Some(extract_octet(field_data)?);
             }
             0xA4 => {
                 // errorCode: INTEGER
-                if let Some(val) = extract_integer(field_data) {
+                if let Some(val) = extract_integer(field_data)? {
                     result.error_code = Some(val);
                 }
             }
@@ -688,54 +764,54 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
     Ok(result)
 }
 
-fn extract_octet(data: &[u8]) -> Vec<u8> {
+fn extract_octet(data: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0;
     if pos < data.len() && data[pos] == 0x04 {
         pos += 1;
-        let len = ber_read_len(data, &mut pos);
+        let len = ber_read_len(data, &mut pos)?;
         if pos + len <= data.len() {
-            return data[pos..pos + len].to_vec();
+            return Ok(data[pos..pos + len].to_vec());
         }
     }
-    data.to_vec()
+    Ok(data.to_vec())
 }
 
-fn extract_nested_octet(data: &[u8]) -> Vec<u8> {
+fn extract_nested_octet(data: &[u8]) -> Result<Vec<u8>> {
     // Drill: SEQUENCE { SEQUENCE { [0] OCTET_STRING { ... } } }
     let mut pos = 0;
     // Skip SEQUENCE tags
     for _ in 0..3 {
-        if pos >= data.len() { return data.to_vec(); }
+        if pos >= data.len() { return Ok(data.to_vec()); }
         let tag = data[pos];
         if tag == 0x30 || tag == 0xA0 || tag == 0x04 {
             pos += 1;
-            let _len = ber_read_len(data, &mut pos);
+            let len = ber_read_len(data, &mut pos)?;
             if tag == 0x04 {
                 let remaining = data.len() - pos;
-                let actual_len = _len.min(remaining);
-                return data[pos..pos + actual_len].to_vec();
+                let actual_len = len.min(remaining);
+                return Ok(data[pos..pos + actual_len].to_vec());
             }
         } else {
             break;
         }
     }
-    data.to_vec()
+    Ok(data.to_vec())
 }
 
-fn extract_integer(data: &[u8]) -> Option<i64> {
+fn extract_integer(data: &[u8]) -> Result<Option<i64>> {
     let mut pos = 0;
     if pos < data.len() && data[pos] == 0x02 {
         pos += 1;
-        let len = ber_read_len(data, &mut pos);
-        if len == 0 || pos + len > data.len() { return None; }
+        let len = ber_read_len(data, &mut pos)?;
+        if len == 0 || pos + len > data.len() { return Ok(None); }
         // Sign-extend: if first byte has high bit set, the value is negative
         let mut val: i64 = if data[pos] & 0x80 != 0 { -1 } else { 0 };
         for i in 0..len {
             val = (val << 8) | data[pos + i] as i64;
         }
-        return Some(val);
+        return Ok(Some(val));
     }
-    None
+    Ok(None)
 }
 
 fn encode_ber_int(val: i64) -> Vec<u8> {
@@ -813,10 +889,16 @@ fn wrap_spnego_response(ntlm_token: &[u8]) -> Vec<u8> {
 }
 
 fn unwrap_spnego_response(data: &[u8]) -> Option<Vec<u8>> {
-    // Try to find the NTLM token inside SPNEGO response
-    // Look for NTLMSSP signature anywhere in the data
-    if let Some(idx) = data.windows(8).position(|w| w == NTLMSSP_SIG) {
-        return Some(data[idx..].to_vec());
+    // Find the NTLM token inside SPNEGO response.
+    // Validate that the NTLMSSP signature appears at a reasonable offset
+    // (within the first 128 bytes, where a responseToken field would be),
+    // not deep in unrelated fields.
+    if let Some(pos) = data.windows(8).position(|w| w == NTLMSSP_SIG) {
+        if pos > 128 {
+            tracing::warn!("NTLMSSP signature found at suspicious offset {} (max 128); ignoring", pos);
+            return None;
+        }
+        return Some(data[pos..].to_vec());
     }
     None
 }

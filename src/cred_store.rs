@@ -40,6 +40,17 @@ pub struct CredEntry {
     pub valid: bool,
 }
 
+/// Parameters for adding a new credential.
+pub struct NewCred<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub service: &'a str,
+    pub username: &'a str,
+    pub secret: &'a str,
+    pub cred_type: CredType,
+    pub source_module: &'a str,
+}
+
 /// Credential store backed by a JSON file.
 pub struct CredStore {
     entries: RwLock<Vec<CredEntry>>,
@@ -78,7 +89,9 @@ impl CredStore {
                     // creds with an empty store.
                     eprintln!("[!] Failed to read creds.json: {}. Preserving original.", e);
                     let backup = file_path.with_extension("json.unreadable");
-                    let _ = std::fs::rename(&file_path, &backup);
+                    if let Err(e) = std::fs::rename(&file_path, &backup) {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     Vec::new()
                 }
             }
@@ -96,33 +109,24 @@ impl CredStore {
     const MAX_FIELD_LEN: usize = 4096;
 
     /// Add a credential. Returns `Some(id)` on success, `None` on validation failure.
-    pub async fn add(
-        &self,
-        host: &str,
-        port: u16,
-        service: &str,
-        username: &str,
-        secret: &str,
-        cred_type: CredType,
-        source_module: &str,
-    ) -> Option<String> {
+    pub async fn add(&self, cred: NewCred<'_>) -> Option<String> {
         // Input validation
-        if host.is_empty() || host.len() > Self::MAX_FIELD_LEN {
+        if cred.host.is_empty() || cred.host.len() > Self::MAX_FIELD_LEN {
             return None;
         }
-        if secret.len() > Self::MAX_FIELD_LEN || username.len() > Self::MAX_FIELD_LEN {
+        if cred.secret.len() > Self::MAX_FIELD_LEN || cred.username.len() > Self::MAX_FIELD_LEN {
             return None;
         }
         let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let entry = CredEntry {
             id: id.clone(),
-            host: host.to_string(),
-            port,
-            service: service.to_string(),
-            username: username.to_string(),
-            secret: secret.to_string(),
-            cred_type,
-            source_module: source_module.to_string(),
+            host: cred.host.to_string(),
+            port: cred.port,
+            service: cred.service.to_string(),
+            username: cred.username.to_string(),
+            secret: cred.secret.to_string(),
+            cred_type: cred.cred_type,
+            source_module: cred.source_module.to_string(),
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             valid: true,
         };
@@ -213,6 +217,10 @@ impl CredStore {
                 eprintln!("[!] Failed to write temp creds file: {}", e);
                 return;
             }
+            if let Err(e) = file.sync_all().await {
+                eprintln!("[!] Failed to fsync temp creds file: {}", e);
+                return;
+            }
         }
         if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
             eprintln!("[!] Failed to rename creds file: {}", e);
@@ -237,7 +245,7 @@ impl CredStore {
             let valid_str = if e.valid { "yes".green() } else { "no".red() };
             println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
                 e.id, e.host, e.port, e.service, e.username,
-                if e.secret.len() > 18 { format!("{}...", &e.secret[..15]) } else { e.secret.clone() },
+                if e.secret.chars().count() > 18 { format!("{}...", e.secret.chars().take(15).collect::<String>()) } else { e.secret.clone() },
                 e.cred_type, valid_str);
         }
         println!();
@@ -266,15 +274,7 @@ pub static CRED_STORE: Lazy<CredStore> = Lazy::new(CredStore::new);
 
 /// Convenience function for modules to store a discovered credential.
 /// Routes through the tenant registry when in a tenant context (API mode).
-pub async fn store_credential(
-    host: &str,
-    port: u16,
-    service: &str,
-    username: &str,
-    secret: &str,
-    cred_type: CredType,
-    source_module: &str,
-) -> Option<String> {
+pub async fn store_credential(cred: NewCred<'_>) -> Option<String> {
     let s = crate::tenant::resolve();
-    s.cred_store().add(host, port, service, username, secret, cred_type, source_module).await
+    s.cred_store().add(cred).await
 }

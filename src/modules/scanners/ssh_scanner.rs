@@ -6,7 +6,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{anyhow, Result};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::{
     collections::HashSet,
@@ -95,7 +95,7 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
     }
     
     fn print_summary(&self) {
@@ -142,9 +142,12 @@ fn grab_ssh_banner(host: &str, port: u16, timeout_secs: u64) -> Option<String> {
     
     for addr in addrs {
         if let Ok(stream) = crate::utils::blocking_tcp_connect(&addr, timeout) {
-            if stream.set_read_timeout(Some(timeout)).is_err()
-                || stream.set_write_timeout(Some(timeout)).is_err()
-            {
+            if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+                tracing::trace!("set_read_timeout failed for {}: {}", addr, e);
+                continue;
+            }
+            if let Err(e) = stream.set_write_timeout(Some(timeout)) {
+                tracing::trace!("set_write_timeout failed for {}: {}", addr, e);
                 continue;
             }
             
@@ -294,7 +297,7 @@ pub async fn scan_ssh(
                         banner: banner.clone(),
                     };
                     crate::mprintln!("\r{}", format!("[+] {}:{} - {}", host, port, banner).green());
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
                     crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
                         host: host.clone(),
                         port,
@@ -306,7 +309,8 @@ pub async fn scan_ssh(
                 Ok(None) => {
                     stats.record_scan(false, false);
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("SSH scan failed: {e}");
                     stats.record_scan(false, true);
                 }
             }
@@ -318,12 +322,16 @@ pub async fn scan_ssh(
     
     // Wait for all tasks
     for handle in handles {
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
-    
+
     // Stop progress reporter
     stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    if let Err(e) = progress_handle.await {
+        eprintln!("[!] Task join failed: {}", e);
+    }
     
     // Print summary
     stats.print_summary();
@@ -354,7 +362,7 @@ fn save_results(results: &[SshScanResult], path: &str) -> Result<()> {
 
 /// Main entry point
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -418,7 +426,40 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     
     // Run scan
     let results = scan_ssh(targets, threads, timeout).await;
-    
+
+    let mut outcome = ModuleOutcome::ok();
+
+    // Build findings from scan results
+    for r in &results {
+        // Each discovered SSH service is a Banner finding
+        outcome.findings.push(Finding {
+            target: format!("{}:{}", r.host, r.port),
+            kind: FindingKind::Banner,
+            message: format!("SSH service: {}", r.banner),
+            data: Some(serde_json::json!({
+                "host": r.host,
+                "port": r.port,
+                "banner": r.banner,
+            })),
+        });
+
+        // Flag weak/outdated SSH versions as Note (misconfiguration)
+        let banner_lower = r.banner.to_lowercase();
+        if banner_lower.contains("ssh-1.") {
+            outcome.findings.push(Finding {
+                target: format!("{}:{}", r.host, r.port),
+                kind: FindingKind::Note,
+                message: format!("Deprecated SSH protocol version: {}", r.banner),
+                data: Some(serde_json::json!({
+                    "host": r.host,
+                    "port": r.port,
+                    "issue": "deprecated_ssh_version",
+                    "banner": r.banner,
+                })),
+            });
+        }
+    }
+
     // Save results?
     if !results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "ssh_scan_results.txt").await?;
@@ -426,11 +467,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             crate::mprintln!("{}", format!("[-] Failed to save: {}", e).red());
         }
     }
-    
+
     crate::mprintln!();
     crate::mprintln!("{}", format!("[*] SSH scanner complete. Found {} services.", results.len()).green());
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -441,6 +482,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 

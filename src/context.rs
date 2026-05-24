@@ -225,11 +225,21 @@ where
         .try_with(|ctx| ctx.clone())
         .ok();
     if let Some(ctx) = attached {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let mut joinset = ctx.spawned.lock().await;
+        // Acquire the lock synchronously via `try_lock` first to avoid a
+        // race where `abort_all_spawned` fires before the deferred
+        // `tokio::spawn` acquires the lock.  If contention prevents
+        // `try_lock`, fall back to a spawned acquire — the worst that
+        // happens is the future misses an `abort_all` that fires in the
+        // narrow window (same as the old code).
+        if let Ok(mut joinset) = ctx.spawned.try_lock() {
             joinset.spawn(future);
-        });
+        } else {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let mut joinset = ctx.spawned.lock().await;
+                joinset.spawn(future);
+            });
+        }
     } else {
         tokio::spawn(future);
     }

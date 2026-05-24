@@ -7,7 +7,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{anyhow, Context, Result};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,7 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -163,7 +164,10 @@ fn parse_sequence_items(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 /// Decode a DER-encoded string (UTF8String, PrintableString, IA5String, etc.)
 fn decode_der_string(data: &[u8]) -> String {
     // Try UTF-8 first, fall back to lossy
-    String::from_utf8(data.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(data).to_string())
+    String::from_utf8(data.to_vec()).unwrap_or_else(|e| {
+        tracing::trace!("DER string not valid UTF-8, using lossy: {e}");
+        String::from_utf8_lossy(data).to_string()
+    })
 }
 
 /// Known OID bytes for common X.509 name attributes.
@@ -364,7 +368,7 @@ impl CertInfo {
 
     fn is_expiring_soon(&self) -> bool {
         self.days_until_expiry()
-            .map(|d| d >= 0 && d <= 30)
+            .map(|d| (0..=30).contains(&d))
             .unwrap_or(false)
     }
 }
@@ -562,7 +566,7 @@ async fn scan_target(
     // Build server name — for IP addresses, use the IP directly
     let server_name = ServerName::try_from(host.to_string())
         .or_else(|_| ServerName::try_from("localhost".to_string()))
-        .map_err(|_| anyhow!("Invalid server name: {}", host))?;
+        .map_err(|e| anyhow!("Invalid server name: {}: {e}", host))?;
 
     // TLS handshake with timeout
     let tls_stream = tokio::time::timeout(
@@ -851,7 +855,7 @@ fn format_result_for_file(result: &SslScanResult) -> String {
 // ============================================================
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -873,7 +877,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Parse targets: support comma-separated hosts
     let hosts: Vec<&str> = target
-        .split(|c: char| c == ',' || c == ' ')
+        .split([',', ' '])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
@@ -887,7 +891,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             .await?;
     let mut all_hosts: Vec<String> = hosts.iter().map(|s| s.to_string()).collect();
     if !additional.is_empty() {
-        for h in additional.split(|c: char| c == ',' || c == ' ') {
+        for h in additional.split([',', ' ']) {
             let h = h.trim();
             if !h.is_empty() {
                 all_hosts.push(h.to_string());
@@ -906,6 +910,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!();
 
     let mut results = Vec::new();
+    let mut outcome = ModuleOutcome::ok();
     let total = all_hosts.len();
 
     for (idx, host) in all_hosts.iter().enumerate() {
@@ -917,6 +922,64 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         match scan_target(host, port, timeout_secs).await {
             Ok(result) => {
                 print_result(&result);
+
+                // Emit a Banner finding for the TLS connection info
+                outcome.findings.push(Finding {
+                    target: format!("{}:{}", result.host, result.port),
+                    kind: FindingKind::Banner,
+                    message: format!(
+                        "SSL/TLS service: {} cipher={}",
+                        result.tls_version, result.cipher_suite
+                    ),
+                    data: Some(serde_json::json!({
+                        "host": result.host,
+                        "port": result.port,
+                        "tls_version": result.tls_version,
+                        "cipher_suite": result.cipher_suite,
+                        "chain_depth": result.chain_depth,
+                    })),
+                });
+
+                // Emit certificate details as a Banner finding
+                if let Some(ref ci) = result.cert_info {
+                    outcome.findings.push(Finding {
+                        target: format!("{}:{}", result.host, result.port),
+                        kind: FindingKind::Banner,
+                        message: format!(
+                            "Certificate: subject={} issuer={} self_signed={}",
+                            ci.subject_cn(),
+                            ci.issuer_cn(),
+                            ci.is_self_signed
+                        ),
+                        data: Some(serde_json::json!({
+                            "subject_cn": ci.subject_cn(),
+                            "issuer_cn": ci.issuer_cn(),
+                            "subject": format_dn(&ci.subject),
+                            "issuer": format_dn(&ci.issuer),
+                            "serial": ci.serial_hex,
+                            "self_signed": ci.is_self_signed,
+                            "not_before": ci.not_before.map(|t| t.to_string()),
+                            "not_after": ci.not_after.map(|t| t.to_string()),
+                            "san_names": ci.san_names,
+                            "days_until_expiry": ci.days_until_expiry(),
+                        })),
+                    });
+                }
+
+                // Emit Note findings for each issue (misconfigurations/weaknesses)
+                for issue in &result.issues {
+                    outcome.findings.push(Finding {
+                        target: format!("{}:{}", result.host, result.port),
+                        kind: FindingKind::Note,
+                        message: format!("SSL issue: {}", issue),
+                        data: Some(serde_json::json!({
+                            "issue": issue,
+                            "host": result.host,
+                            "port": result.port,
+                        })),
+                    });
+                }
+
                 results.push(result);
             }
             Err(e) => {
@@ -999,8 +1062,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             lines.push(String::new());
         }
 
-        std::fs::write(&output_path, lines.join("\n"))
+        tokio::fs::write(&output_path, lines.join("\n")).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!(
             "{}",
             format!("[+] Results saved to: {}", output_path).green()
@@ -1013,7 +1079,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         format!("[*] SSL/TLS scan complete. {} target(s) analyzed.", results.len()).green()
     );
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 crate::register_native_module!(crate::module::Category::Scanners, "ssl_scanner", native);

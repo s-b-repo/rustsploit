@@ -104,6 +104,16 @@ non-zero count as a hard failure.
 | G3 | `format!\(.*"\{:\?\}".*\b[eE]rr\b` | Debug-format on errors loses the `Display` impl that gives a clean human message. | `format!("...: {}", err)` or `format!("...: {:#}", err)` for full chain. |
 | G4 | `\.context\("")\|\.context\("\?"\)` | Empty / unhelpful context — adds nothing to the error chain. | `with_context(\|\| format!("…{}…", info))`. |
 
+## G2. Network layer — go through the framework wrappers
+
+| # | Pattern | Why bad | Fix |
+|---|---|---|---|
+| G2.1 | `TcpStream::connect\(`, `tokio::net::TcpStream::connect\(` | Bypasses source port binding (`setg source_port`). | `crate::utils::network::tcp_connect_str` or `tcp_connect_addr`. |
+| G2.2 | `UdpSocket::bind\("0.0.0.0:0"\)`, `tokio::net::UdpSocket::bind\("0.0.0.0:0"\)` | Same — bypasses source port binding. | `crate::utils::udp_bind(Some(ip))`. |
+| G2.3 | `AsyncFtpStream::connect\(` (without `connect_with_stream`) | suppaftp creates its own TCP connection, bypassing source port. | `tcp_connect_str` → `AsyncFtpStream::connect_with_stream(tcp)`. |
+| G2.4 | `Telnet::connect\(` (without `from_stream`) | telnet crate creates its own TCP connection. | `blocking_tcp_connect` → `Telnet::from_stream(Box::new(tcp), buf)`. |
+| G2.5 | `FtpStream::connect\(` (without `connect_with_stream`) | Blocking suppaftp bypasses source port. | `blocking_tcp_connect` → `FtpStream::connect_with_stream(tcp)`. |
+
 ## H. HTTP layer — go through the framework client
 
 | # | Pattern | Why bad | Fix |
@@ -130,6 +140,15 @@ non-zero count as a hard failure.
 | J4 | `XXXXXX`, `TODO`, `FIXME`, `HACK\b` | Placeholder URLs / unfinished work. | Replace with real value or remove. |
 | J5 | `Bearer\s+[A-Za-z0-9_.-]{40,}`, `sk-[A-Za-z0-9]{20,}`, `AKIA[A-Z0-9]{16}`, hardcoded `"admin"\s*,\s*"admin"` and friends | Embedded secrets in source / placeholder pairs that look like secrets to scanners. | Prompt for values via `cfg_prompt_required` / read from env. |
 | J6 | `Box<dyn` in module returns | Module trait-objects are unnecessary in this codebase; `anyhow::Error` is the framework's error type. | `anyhow::Result<T>` / `anyhow::Error`. |
+
+## K0. Mass-scan compatibility
+
+| # | Pattern | Why bad | Fix |
+|---|---|---|---|
+| K0.1 | Hardcoded output filenames like `"results.txt"`, `"config.bin"` without target in name | Concurrent fan-out tasks clobber each other's files. | `format!("results_{}.txt", safe_target)` where `safe_target = target.replace(['/', ':', '.', '[', ']'], "_")`. |
+| K0.2 | Interactive REPL loops without `is_batch_mode()` guard | REPL spins forever on cached prompts under mass scan, or N concurrent REPLs flood the terminal. | `if crate::utils::is_batch_mode() { anyhow::bail!("REPL not supported in mass-scan mode."); }` |
+| K0.3 | `stdin().read_line()` or blocking stdin reads in module code | Blocks under mass scan; N concurrent tasks all wait on one stdin. | `cfg_prompt_*` from `crate::utils` (returns cached values in batch mode). |
+| K0.4 | `let _ = timeout;` or `_timeout` to suppress unused timeout parameter | Probe ignores user-configured timeout — hardcoded duration used instead. | Use the timeout parameter: wrap operations with `tokio::time::timeout(timeout, ...)` or pass it to connect functions. |
 
 ## K. Resource handling
 

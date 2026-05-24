@@ -32,6 +32,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(1883),
     }
 }
 
@@ -46,15 +47,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: false,
         },
-        |host, port, user, pass| async move { probe(&host, port, &user, &pass).await },
+        |host, port, user, pass, timeout| async move { probe(&host, port, &user, &pass, timeout).await },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
     use tokio::io::AsyncWriteExt;
 
-    let timeout = Duration::from_secs(5);
     let addr = format!("{}:{}", host, port);
     let mut stream = match crate::utils::creds_helper::connect_with_timeout(&addr, timeout).await {
         Ok(s) => s,
@@ -128,7 +128,13 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
 
 fn push_str(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
-    let len = bytes.len() as u16;
+    let len = match u16::try_from(bytes.len()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("MQTT string too long ({} bytes), truncating length to u16::MAX: {e}", bytes.len());
+            u16::MAX
+        }
+    };
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(bytes);
 }

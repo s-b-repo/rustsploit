@@ -111,10 +111,19 @@ impl GlobalLimiter {
         b
     }
 
+    const MAX_TARGET_BUCKETS: usize = 16_384;
+
     async fn target_bucket(&self, target: &str) -> Arc<Bucket> {
         let mut m = self.per_target.lock().await;
         if let Some(b) = m.get(target) {
             return b.clone();
+        }
+        // Cap the number of per-target buckets to prevent unbounded growth
+        if m.len() >= Self::MAX_TARGET_BUCKETS {
+            if let Some(old_key) = m.keys().next().cloned() {
+                tracing::debug!("Rate limiter: evicting target bucket '{}' (cap {} reached)", old_key, Self::MAX_TARGET_BUCKETS);
+                m.remove(&old_key);
+            }
         }
         let rps = self.target_default.load(Ordering::Relaxed);
         let b = Arc::new(Bucket::new(rps));

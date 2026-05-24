@@ -17,6 +17,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(23),
     }
 }
 
@@ -137,16 +138,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     for &port in &ports {
         let socket: SocketAddr = match format!("{}:{}", host, port).parse() {
             Ok(sa) => sa,
-            Err(_) => {
-                // Hostname targets need DNS — `tcp_connect_addr` only takes
-                // SocketAddr, so resolve once.
+            Err(e) => {
+                tracing::debug!("parse socket addr failed: {e}");
                 let lookup = format!("{}:{}", host, port);
                 match tokio::net::lookup_host(&lookup).await {
                     Ok(mut iter) => match iter.next() {
                         Some(sa) => sa,
                         None => continue,
                     },
-                    Err(_) => continue,
+                    Err(e) => { tracing::debug!("DNS lookup failed: {e}"); continue; }
                 }
             }
         };
@@ -180,7 +180,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         &host,
                         "credential",
                         &format!("telnet {}:{}@{}:{}", user, pass, host, port),
-                        serde_json::to_string(&payload).unwrap_or_default().as_bytes(),
+                        serde_json::to_string(&payload).unwrap_or_else(|e| { tracing::warn!("JSON serialization failed: {e}"); String::new() }).as_bytes(),
                         "creds/generic/telnet_hose",
                     )
                     .await
@@ -320,8 +320,9 @@ async fn do_telnet_session(
         let n = match timeout(Duration::from_millis(1500), read_future).await {
             Ok(Ok(0)) => return Ok((false, banner_detected)), // EOF
             Ok(Ok(n)) => n,
-            Ok(Err(_)) => return Ok((false, banner_detected)), // Error
-            Err(_) => {
+            Ok(Err(e)) => { tracing::debug!("telnet read error: {e}"); return Ok((false, banner_detected)); }
+            Err(e) => {
+                tracing::debug!("timeout: {e}");
                 // Read Timeout logic
 
                 // If waiting for banner and timed out -> No Banner Detected
@@ -364,17 +365,15 @@ async fn do_telnet_session(
                     state = TelnetState::SendingUsername;
                 }
             }
-            TelnetState::SendingUsername => {
+            TelnetState::SendingUsername
                 // Should not happen here if we just transitioned,
                 // but if we are reading response after sending user:
-                if lower.contains("pass") || lower.contains("word") {
+                if lower.contains("pass") || lower.contains("word") => {
                     state = TelnetState::SendingPassword;
-                }
             }
-            TelnetState::WaitingForPasswordPrompt => {
-                if lower.contains("pass") || lower.contains("word") {
+            TelnetState::WaitingForPasswordPrompt
+                if lower.contains("pass") || lower.contains("word") => {
                     state = TelnetState::SendingPassword;
-                }
             }
             TelnetState::WaitingForResult => {
                 if lower.contains("incorrect")

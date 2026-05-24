@@ -12,6 +12,10 @@ pub struct ModuleInfo {
     /// ISO date string, e.g. "2024-01-15"
     pub disclosure_date: Option<String>,
     pub rank: ModuleRank,
+    /// Default service port for this module (used by scheduler for mass-scan
+    /// pre-checks when the operator hasn't set `setg port`).
+    #[serde(default)]
+    pub default_port: Option<u16>,
 }
 
 /// Reliability/safety rank for modules (inspired by Metasploit ranking).

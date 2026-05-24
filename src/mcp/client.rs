@@ -124,12 +124,12 @@ impl McpClient {
     pub async fn close(mut self) -> Result<()> {
         drop(self.stdin);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => return Ok(()),
+            Ok(Ok(status)) => { tracing::trace!("MCP server exited: {status}"); return Ok(()); }
             Ok(Err(e)) => {
                 eprintln!("[!] MCP server wait error: {}", e);
             }
-            Err(_) => {
-                eprintln!("[!] MCP server did not exit within 5s, killing");
+            Err(e) => {
+                eprintln!("[!] MCP server did not exit within 5s ({e}), killing");
             }
         }
         if let Err(e) = self.child.kill().await {

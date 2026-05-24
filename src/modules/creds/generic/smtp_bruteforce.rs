@@ -10,7 +10,7 @@ use base64::{ engine::general_purpose, Engine as _ };
 /// Real SMTP servers often do reverse DNS lookups on connect, taking 5-10s.
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     load_lines,
     cfg_prompt_default,
@@ -39,6 +39,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(25),
     }
 }
 
@@ -104,6 +105,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
     let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535).await? as u16;
     let username_wordlist = cfg_prompt_existing_file("username_wordlist", "Username wordlist file").await?;
     let password_wordlist = cfg_prompt_existing_file("password_wordlist", "Password wordlist file").await?;
@@ -170,7 +172,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     result.print_found();
     result.save_to_file(&output_file)?;
 
-    Ok(ModuleOutcome::ok())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid SMTP credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "smtp",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 /// Read a single SMTP response line (terminated by \n).

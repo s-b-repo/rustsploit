@@ -51,6 +51,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -114,7 +115,7 @@ fn pem_from_rsa_n_e(n_b64: &str, e_b64: &str) -> Option<String> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&spki);
     let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
     for chunk in b64.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push_str(std::str::from_utf8(chunk).unwrap_or(""));
         pem.push('\n');
     }
     pem.push_str("-----END PUBLIC KEY-----\n");
@@ -143,9 +144,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut found_url: Option<String> = None;
     let mut keyset: serde_json::Value = serde_json::Value::Null;
     for url in &candidates {
-        let r = match client.get(url).send().await { Ok(r) => r, Err(_) => continue };
+        let r = match client.get(url).send().await { Ok(r) => r, Err(e) => { tracing::debug!("JWKS probe {} failed: {}", url, e); continue } };
         if !r.status().is_success() { continue; }
-        let body = r.text().await.unwrap_or_default();
+        let body = match r.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                continue;
+            }
+        };
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
             && v.get("keys").and_then(|k| k.as_array()).is_some() {
                 crate::mprintln!("{}", format!("[+] JWKS at {}", url).green().bold());
@@ -185,7 +192,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         // the full key inventory; promote to Vulnerable when a JOSE
         // weakness is detected.
         let key_payload = serde_json::json!({
-            "source_url": "<placeholder>", // overwritten below once `url` is known
+            "source_url": &url,
             "kid": kid,
             "kty": kty,
             "alg": alg,
@@ -211,7 +218,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if export && kty.eq_ignore_ascii_case("RSA") && !n.is_empty() && !e.is_empty()
             && let Some(pem) = pem_from_rsa_n_e(n, e) {
                 let safe_kid: String = kid.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-                let path = format!("jwks_{}_{}.pem", safe_kid, i);
+                let safe_target: String = target.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+                let path = format!("jwks_{}_{}_{}.pem", safe_target, safe_kid, i);
                 let mut f = File::create(&path)?;
                 f.write_all(pem.as_bytes())?;
                 if let Err(e) = crate::utils::set_secure_permissions(&path, 0o600) {

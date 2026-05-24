@@ -35,6 +35,7 @@ pub fn info() -> ModuleInfo {
         references: vec!["https://www.rfc-editor.org/rfc/rfc1157".to_string()],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(161),
     }
 }
 
@@ -49,19 +50,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULT_COMMUNITIES,
             password_only: true,
         },
-        |host, port, _user, community| async move { probe(&host, port, &community).await },
+        |host, port, user, community, timeout| async move {
+            drop(user);
+            probe(&host, port, &community, timeout).await
+        },
     )
     .await
 }
 
-async fn probe(host: &str, port: u16, community: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, community: &str, timeout: Duration) -> LoginResult {
     use std::net::IpAddr;
-    use tokio::net::UdpSocket;
-
-    let timeout = Duration::from_secs(3);
     let ip: IpAddr = match host.parse() {
         Ok(ip) => ip,
-        Err(_) => match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+        Err(e) => { tracing::debug!("parse IP failed: {e}"); match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
             Ok(mut iter) => match iter.next() {
                 Some(sa) => sa.ip(),
                 None => {
@@ -77,10 +78,9 @@ async fn probe(host: &str, port: u16, community: &str) -> LoginResult {
                     retryable: false,
                 }
             }
-        },
+        } }
     };
-    let local = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    let sock = match UdpSocket::bind(local).await {
+    let sock = match crate::utils::udp_bind(Some(ip)).await {
         Ok(s) => s,
         Err(e) => {
             return LoginResult::Error {
@@ -106,7 +106,10 @@ async fn probe(host: &str, port: u16, community: &str) -> LoginResult {
                 retryable: true,
             }
         }
-        Err(_) => return LoginResult::AuthFailed, // no response = wrong community
+        Err(e) => {
+            tracing::debug!("SNMP recv timed out: {e}");
+            return LoginResult::AuthFailed;
+        }
     };
     // Quick sanity check: response must be a SEQUENCE (0x30) and contain
     // GetResponse PDU (context-specific tag 0xa2).

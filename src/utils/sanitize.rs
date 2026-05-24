@@ -4,7 +4,7 @@
 
 use std::path::{Component, Path};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use url::Url;
 
 /// Maximum length for command inputs to prevent DoS
@@ -98,14 +98,13 @@ pub fn validate_command_input(command: &str) -> Result<String> {
             trimmed.len()
         ));
     }
-    let sanitized: String = trimmed
-        .chars()
-        .filter(|c| *c != '\0')
-        .collect();
-    if sanitized.is_empty() {
-        return Err(anyhow!("Command contains only invalid characters"));
+    if trimmed.contains('\0') {
+        return Err(anyhow!("Command input contains null bytes"));
     }
-    Ok(sanitized)
+    if trimmed.chars().any(|c| c.is_control() && c != '\t' && c != '\n') {
+        return Err(anyhow!("Command input contains control characters"));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Validates file path to prevent path traversal attacks.
@@ -160,10 +159,10 @@ pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<Strin
         ));
     }
     let parsed_url = Url::parse(trimmed)
-        .map_err(|e| anyhow!("Invalid URL format: {}", e))?;
+        .context("Invalid URL format")?;
     if let Some(schemes) = allowed_schemes {
         let scheme = parsed_url.scheme();
-        if !schemes.iter().any(|&s| s == scheme) {
+        if !schemes.contains(&scheme) {
             return Err(anyhow!(
                 "URL scheme '{}' not allowed. Allowed schemes: {:?}",
                 scheme,

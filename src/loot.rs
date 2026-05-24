@@ -57,7 +57,9 @@ impl LootStore {
                 Err(e) => {
                     eprintln!("[!] Failed to read loot_index.json: {}. Preserving original.", e);
                     let backup = index_path.with_extension("json.unreadable");
-                    let _ = std::fs::rename(&index_path, &backup);
+                    if let Err(e) = std::fs::rename(&index_path, &backup) {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     Vec::new()
                 }
             }
@@ -327,8 +329,8 @@ impl LootStore {
             "ID".bold(), "Host".bold(), "Type".bold(), "Description".bold(), "Module".bold());
         println!("  {}", "-".repeat(90).dimmed());
         for e in &entries {
-            let desc = if e.description.len() > 28 {
-                format!("{}...", &e.description[..25])
+            let desc = if e.description.chars().count() > 28 {
+                format!("{}...", e.description.chars().take(25).collect::<String>())
             } else {
                 e.description.clone()
             };
@@ -362,11 +364,13 @@ pub async fn store_loot(
             kind: loot_type.to_string(),
         });
     }
-    crate::events::emit(crate::events::ModuleEvent::Finding {
-        module: source_module.to_string(),
-        target: host.to_string(),
-        kind: loot_type.to_string(),
-        message: description.to_string(),
-    });
+    if id.is_some() {
+        crate::events::emit(crate::events::ModuleEvent::Finding {
+            module: source_module.to_string(),
+            target: host.to_string(),
+            kind: loot_type.to_string(),
+            message: description.to_string(),
+        });
+    }
     id
 }

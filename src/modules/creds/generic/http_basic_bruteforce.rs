@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::module::{ ModuleCtx, ModuleOutcome };
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
     load_lines,
     get_filename_in_current_dir,
@@ -16,6 +16,7 @@ use crate::utils::{
     cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
+use crate::utils::wordlist;
 use crate::utils::network::build_http_client;
 use crate::utils::{
     BruteforceConfig,
@@ -64,6 +65,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(80),
     }
 }
 
@@ -165,8 +167,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
         let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = load_lines(&usernames_file)?;
-        let passes = load_lines(&passwords_file)?;
+        let users = if wordlist::should_stream(&usernames_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&usernames_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&usernames_file)?
+        };
+        let passes = if wordlist::should_stream(&passwords_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&passwords_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&passwords_file)?
+        };
         if users.is_empty() { return Err(anyhow!("User list empty")); }
         if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
 
@@ -178,7 +198,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         // accepts invalid certs — same shape, one canonical builder.
         let subnet_client = Arc::new(
             build_http_client(Duration::from_secs(5))
-                .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?,
+                .context("Failed to build HTTP client")?,
         );
 
         let limiter = ctx.limiter.clone();
@@ -218,6 +238,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
     let use_https = cfg_prompt_yes_no("use_https", "Use HTTPS?", false).await?;
     let default_port = if use_https { DEFAULT_HTTPS_PORT } else { DEFAULT_HTTP_PORT };
     let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
@@ -262,14 +283,24 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let scheme = if use_https { "https" } else { "http" };
     let base_url = format!("{}://{}:{}{}", scheme, target, port, url_path);
     let connect_addr = normalize_target(&format!("{}:{}", target, port))
-        .unwrap_or_else(|_| format!("{}:{}", target, port));
+        .unwrap_or_else(|e| {
+            tracing::debug!("normalize_target failed: {e}");
+            format!("{}:{}", target, port)
+        });
 
     crate::mprintln!("\n{}", format!("[*] Starting brute-force on {} ({})", connect_addr, base_url).cyan());
 
-    // Load wordlists
+    // Load wordlists — use streaming reader for large files to avoid OOM
     let mut usernames = Vec::new();
     if let Some(ref file) = usernames_file {
-        usernames = load_lines(file)?;
+        if wordlist::should_stream(file) {
+            let mut reader = wordlist::BatchedReader::open(file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                usernames.extend(batch);
+            }
+        } else {
+            usernames = load_lines(file)?;
+        }
         if usernames.is_empty() {
             crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
         } else {
@@ -279,7 +310,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let mut passwords = Vec::new();
     if let Some(ref file) = passwords_file {
-        passwords = load_lines(file)?;
+        if wordlist::should_stream(file) {
+            let mut reader = wordlist::BatchedReader::open(file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                passwords.extend(batch);
+            }
+        } else {
+            passwords = load_lines(file)?;
+        }
         if passwords.is_empty() {
             crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
         } else {
@@ -315,7 +353,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let shared_client = Arc::new(
         build_http_client(Duration::from_secs(connection_timeout))
-            .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?,
+            .context("Failed to build HTTP client")?,
     );
 
     let limiter = ctx.limiter.clone();
@@ -412,7 +450,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     }
 
-    Ok(ModuleOutcome::ok())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid HTTP Basic Auth credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "http-basic",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 // ============================================================================
@@ -433,12 +484,16 @@ async fn try_http_login(
         .basic_auth(user, Some(pass))
         .send()
         .await
-        .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
+        .context("HTTP request failed")?;
 
     let status = response.status().as_u16();
     match status {
         200..=299 => Ok(true),
-        401 | 403 => Ok(false),
+        401 => Ok(false),
+        403 => {
+            crate::mprintln!("{}", format!("[?] 403 Forbidden for {}:{} — authenticated but unauthorized", user, pass).yellow().dimmed());
+            Ok(false)
+        }
         301 | 302 | 303 | 307 | 308 => {
             // Only count redirect as success if it doesn't point to a login/auth page
             if let Some(location) = response.headers().get("location") {

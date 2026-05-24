@@ -41,6 +41,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: Some(5432),
     }
 }
 
@@ -55,8 +56,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULT_PG_CREDS,
             password_only: false,
         },
-        |host: String, port: u16, user: String, pass: String| async move {
-            probe(&host, port, &user, &pass).await
+        |host: String, port: u16, user: String, pass: String, timeout: std::time::Duration| async move {
+            probe(&host, port, &user, &pass, timeout).await
         },
     )
     .await
@@ -66,10 +67,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 /// supplied user, then either Password / Md5 response on demand.
 /// Returns Success on `AuthenticationOk` (R 0), AuthFailed on
 /// `ErrorResponse` (E), retryable Error on connection issues.
-async fn probe(host: &str, port: u16, user: &str, pass: &str) -> LoginResult {
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
     use tokio::io::AsyncWriteExt;
 
-    let timeout = Duration::from_secs(5);
     let addr = format!("{}:{}", host, port);
     let mut stream = match crate::utils::creds_helper::connect_with_timeout(&addr, timeout).await {
         Ok(s) => s,

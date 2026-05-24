@@ -6,7 +6,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{ Result, Context, anyhow };
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -30,6 +30,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -87,7 +88,7 @@ async fn resolve_subdomain(fqdn: &str, timeout_dur: Duration) -> Option<Vec<Stri
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
     display_banner();
 
     // Clean domain: strip protocol, paths, ports
@@ -199,30 +200,33 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let wf_outer = wildcard_filter.clone();
 
-    // Process a single batch of subdomains: spawn per-name resolution tasks
-    // and await them all before returning. Memory peaks at one batch.
+    struct ScanState {
+        results: Arc<tokio::sync::Mutex<Vec<SubdomainResult>>>,
+        tested: Arc<AtomicU64>,
+        found: Arc<AtomicU64>,
+        semaphore: Arc<Semaphore>,
+    }
+
     async fn scan_batch(
         batch: Vec<String>,
         domain: &str,
         timeout_dur: Duration,
         wildcard_filter: Option<Vec<String>>,
-        results: Arc<tokio::sync::Mutex<Vec<SubdomainResult>>>,
-        tested: Arc<AtomicU64>,
-        found: Arc<AtomicU64>,
-        semaphore: Arc<Semaphore>,
+        state: &ScanState,
     ) {
+        let ScanState { results, tested, found, semaphore } = state;
         let mut handles = Vec::with_capacity(batch.len());
         for sub in batch {
             // Acquire the permit BEFORE tokio::spawn so that a 100k-line batch
             // doesn't materialize 100k task structs at once.
-            let permit = match Arc::clone(&semaphore).acquire_owned().await {
+            let permit = match Arc::clone(semaphore).acquire_owned().await {
                 Ok(p) => p,
-                Err(_) => break,
+                Err(e) => { tracing::debug!("semaphore closed: {e}"); break; }
             };
             let domain = domain.to_string();
-            let results = Arc::clone(&results);
-            let tested = Arc::clone(&tested);
-            let found = Arc::clone(&found);
+            let results = Arc::clone(results);
+            let tested = Arc::clone(tested);
+            let found = Arc::clone(found);
             let wf = wildcard_filter.clone();
 
             handles.push(tokio::spawn(async move {
@@ -251,18 +255,25 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         done,
                         found.load(Ordering::Relaxed).to_string().green()
                     );
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
                 }
             }));
         }
-        for h in handles { let _ = h.await; }
+        for h in handles { if let Err(e) = h.await { eprintln!("[!] Task join failed: {}", e); } }
     }
+
+    let scan_state = ScanState {
+        results: Arc::clone(&results),
+        tested: Arc::clone(&tested),
+        found: Arc::clone(&found),
+        semaphore: Arc::clone(&semaphore),
+    };
 
     match source {
         WordlistSource::InMemory(batch) => {
             scan_batch(
                 batch, &domain, timeout_dur, wf_outer.clone(),
-                Arc::clone(&results), Arc::clone(&tested), Arc::clone(&found), Arc::clone(&semaphore),
+                &scan_state,
             ).await;
         }
         WordlistSource::Streaming { path, size: _ } => {
@@ -276,9 +287,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         .map(|l| l.trim().to_lowercase())
                         .filter(|l| !l.is_empty() && !l.starts_with('#'))
                         .collect();
-                    if !cleaned.is_empty() {
-                        let _ = tx.blocking_send(cleaned);
-                    }
+                    if !cleaned.is_empty()
+                        && let Err(e) = tx.blocking_send(cleaned) { eprintln!("[!] Channel send failed: {}", e); }
                 })
             });
 
@@ -288,7 +298,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 crate::mprintln!("{}", format!("[*] Batch {}: {} entries", batch_idx, batch.len()).cyan());
                 scan_batch(
                     batch, &domain, timeout_dur, wf_outer.clone(),
-                    Arc::clone(&results), Arc::clone(&tested), Arc::clone(&found), Arc::clone(&semaphore),
+                    &scan_state,
                 ).await;
             }
 
@@ -319,11 +329,23 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         "0".dimmed().to_string()
     });
 
+    let mut outcome = ModuleOutcome::ok();
+
     if !results.is_empty() {
         crate::mprintln!();
         crate::mprintln!("{}", "Found subdomains:".bold());
         for r in results.iter() {
             crate::mprintln!("  {} -> {}", r.subdomain.green(), r.ips.join(", "));
+            outcome = outcome.with(Finding {
+                target: r.subdomain.clone(),
+                kind: FindingKind::Note,
+                message: format!("Subdomain discovered: {} -> {}", r.subdomain, r.ips.join(", ")),
+                data: Some(serde_json::json!({
+                    "subdomain": r.subdomain,
+                    "ips": r.ips,
+                    "domain": domain,
+                })),
+            });
         }
     }
 
@@ -334,12 +356,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(&output_path, format!("Subdomain Enumeration - {}\n\n{}", domain, content))
+        tokio::fs::write(&output_path, format!("Subdomain Enumeration - {}\n\n{}", domain, content)).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 crate::register_native_module!(crate::module::Category::Scanners, "subdomain_scanner", native);

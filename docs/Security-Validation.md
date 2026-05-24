@@ -180,9 +180,14 @@ basic_honeypot_check(&ip).await;
 
 ---
 
-## IP Exclusion Ranges (`EXCLUDED_RANGES`)
+## IP Exclusion Ranges (`crate::exclusions::ExclusionSet`)
 
-Standard across mass-scan capable modules (e.g., `camxploit`, `telnet_hose`, `telnet_bruteforce`, exploit modules with 0.0.0.0/0 support):
+IP exclusions are handled by `crate::exclusions::shared()` (v0.5.2+), a
+per-tenant pluggable exclusion set. **Modules do NOT implement their own
+`EXCLUDED_RANGES` constants** — the scheduler enforces exclusions during
+random fan-out.
+
+Default exclusions (applied when `setg exclusions ""` or not set):
 
 | CIDR | Category |
 |------|----------|
@@ -200,6 +205,16 @@ Standard across mass-scan capable modules (e.g., `camxploit`, `telnet_hose`, `te
 | `203.0.113.0/24` | Documentation |
 | `255.255.255.255/32` | Broadcast |
 | Public DNS | 1.1.1.1, 8.8.8.8, etc. |
+
+### Configuration via `setg`
+
+```text
+setg exclusions ""                  # defaults (above)
+setg exclusions internal            # no filtering (pentesting internal networks)
+setg exclusions none                # no filtering
+setg exclusions 10.0.0.0/8,172.16.0.0/12  # defaults + extra CIDRs
+setg exclusions @/path/to/file      # defaults + CIDRs from file (one per line)
+```
 
 Uses the `ipnetwork` crate for proper CIDR matching.
 

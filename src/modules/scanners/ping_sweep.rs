@@ -34,6 +34,7 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 

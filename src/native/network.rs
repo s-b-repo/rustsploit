@@ -37,7 +37,9 @@ pub const DEFAULT_RAW_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// once after creating a raw socket and before handing it to worker threads.
 #[inline]
 pub fn apply_raw_send_timeout(socket: &socket2::Socket) {
-    let _ = socket.set_write_timeout(Some(DEFAULT_RAW_SEND_TIMEOUT));
+    if let Err(e) = socket.set_write_timeout(Some(DEFAULT_RAW_SEND_TIMEOUT)) {
+        eprintln!("[!] Failed to set write timeout: {}", e);
+    }
 }
 
 // ============================================================================

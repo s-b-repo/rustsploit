@@ -34,6 +34,7 @@ pub fn info() -> ModuleInfo {
         references: vec!["https://www.rfc-editor.org/rfc/rfc2661".to_string()],
         disclosure_date: None,
         rank: ModuleRank::Manual,
+        default_port: None,
     }
 }
 
@@ -48,19 +49,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             defaults: DEFAULTS,
             password_only: true,
         },
-        |host, port, _user, _pass| async move { detect(&host, port).await },
+        |host, port, user, pass, timeout| async move {
+            drop((user, pass));
+            detect(&host, port, timeout).await
+        },
     )
     .await
 }
 
-async fn detect(host: &str, port: u16) -> LoginResult {
+async fn detect(host: &str, port: u16, timeout: Duration) -> LoginResult {
     use std::net::IpAddr;
-    use tokio::net::UdpSocket;
-
-    let timeout = Duration::from_secs(3);
     let ip: IpAddr = match host.parse() {
         Ok(ip) => ip,
-        Err(_) => match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+        Err(e) => { tracing::debug!("parse IP failed: {e}"); match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
             Ok(mut iter) => match iter.next() {
                 Some(sa) => sa.ip(),
                 None => {
@@ -76,11 +77,10 @@ async fn detect(host: &str, port: u16) -> LoginResult {
                     retryable: false,
                 }
             }
-        },
+        } }
     };
 
-    let local = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    let sock = match UdpSocket::bind(local).await {
+    let sock = match crate::utils::udp_bind(Some(ip)).await {
         Ok(s) => s,
         Err(e) => {
             return LoginResult::Error {
@@ -107,7 +107,7 @@ async fn detect(host: &str, port: u16) -> LoginResult {
                 retryable: true,
             }
         }
-        Err(_) => return LoginResult::AuthFailed,
+        Err(e) => { tracing::debug!("timeout: {e}"); return LoginResult::AuthFailed }
     };
     // L2TPv2 control packet: first byte's top bit (T) = 1, length bit = 1.
     // Type byte after length bytes ≥ AVP "Message Type" with value SCCRP(2)

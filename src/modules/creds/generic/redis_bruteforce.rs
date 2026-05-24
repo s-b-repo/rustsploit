@@ -14,6 +14,7 @@ use crate::utils::{
     cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
+use crate::utils::wordlist;
 use crate::utils::{
     BruteforceConfig,
     LoginResult,
@@ -73,6 +74,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         ],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(6379),
     }
 }
 
@@ -176,12 +178,30 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let port = cfg_prompt_int_range("port", "Port", DEFAULT_REDIS_PORT as i64, 1, 65535).await? as u16;
 
         let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let passes = load_lines(&passwords_file)?;
+        let passes = if wordlist::should_stream(&passwords_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&passwords_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&passwords_file)?
+        };
         if passes.is_empty() { return Err(anyhow!("Password list empty")); }
 
         let users = if use_acl {
             let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-            let u = load_lines(&usernames_file)?;
+            let u = if wordlist::should_stream(&usernames_file) {
+                let mut lines = Vec::new();
+                let mut reader = wordlist::BatchedReader::open(&usernames_file).await?;
+                while let Some(batch) = reader.next_batch().await? {
+                    lines.extend(batch);
+                }
+                lines
+            } else {
+                load_lines(&usernames_file)?
+            };
             if u.is_empty() { return Err(anyhow!("User list empty")); }
             u
         } else {
@@ -326,7 +346,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if use_acl
         && let Some(ref file) = usernames_file {
-            usernames = load_lines(file)?;
+            if wordlist::should_stream(file) {
+                let mut reader = wordlist::BatchedReader::open(file).await?;
+                while let Some(batch) = reader.next_batch().await? {
+                    usernames.extend(batch);
+                }
+            } else {
+                usernames = load_lines(file)?;
+            }
             if usernames.is_empty() {
                 crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
             } else {
@@ -335,7 +362,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
 
     if let Some(ref file) = passwords_file {
-        passwords = load_lines(file)?;
+        if wordlist::should_stream(file) {
+            let mut reader = wordlist::BatchedReader::open(file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                passwords.extend(batch);
+            }
+        } else {
+            passwords = load_lines(file)?;
+        }
         if passwords.is_empty() {
             crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
         } else {

@@ -48,7 +48,12 @@ impl OutputBuffer {
             text
         } else {
             let mut truncated = text;
-            truncated.truncate(Self::MAX_LINE_BYTES);
+            // Find the last valid UTF-8 char boundary at or before MAX_LINE_BYTES
+            let mut boundary = Self::MAX_LINE_BYTES;
+            while boundary > 0 && !truncated.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            truncated.truncate(boundary);
             truncated.push_str(" [truncated]");
             truncated
         }
@@ -196,7 +201,9 @@ pub fn _mprint_raw(text: &str) {
     if buffered.is_err() {
         use std::io::Write;
         print!("{}", text);
-        let _ = std::io::stdout().flush();
+        if let Err(e) = std::io::stdout().flush() {
+            eprintln!("[!] Flush failed: {}", e);
+        }
         if let Err(e) = crate::spool::SPOOL.write_line(text) {
             handle_spool_error(e);
         }
@@ -213,13 +220,14 @@ pub fn _mprint_block(lines: &[&str]) {
         }
     });
     if buffered.is_err() {
-        let _guard = STDOUT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = STDOUT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         for line in lines {
             println!("{}", line);
             if let Err(e) = crate::spool::SPOOL.write_line(line) {
                 handle_spool_error(e);
             }
         }
+        drop(guard);
     }
 }
 
@@ -251,7 +259,9 @@ pub fn _meprint_raw(text: &str) {
     if buffered.is_err() {
         use std::io::Write;
         eprint!("{}", text);
-        let _ = std::io::stderr().flush();
+        if let Err(e) = std::io::stderr().flush() {
+            eprintln!("[!] Flush failed: {}", e);
+        }
     }
 }
 
@@ -328,7 +338,7 @@ impl OutputAccumulator {
 // CONVENIENCE FUNCTIONS (use task-local RunContext)
 // ============================================================
 
-/// Record a structured finding. Silently no-ops if no RunContext is active.
+/// Record a structured finding. No-ops if no RunContext is active.
 pub fn add_finding(finding: Finding) {
     let _ = crate::context::RUN_CONTEXT.try_with(|ctx| {
         ctx.output.add_finding(finding);

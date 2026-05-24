@@ -6,7 +6,7 @@
 //! For authorized penetration testing only.
 
 use anyhow::{Result, Context};
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -27,6 +27,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -205,13 +206,16 @@ async fn test_community(
                 Ok(None)
             }
         }
-        Ok(Err(_)) => Ok(None),
-        Err(_) => Ok(None), // Timeout
+        Ok(Err(e)) => {
+            tracing::debug!("SNMP recv error: {e}");
+            Ok(None)
+        }
+        Err(e) => { tracing::debug!("timeout: {e}"); Ok(None) }
     }
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().unwrap_or("");
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -300,7 +304,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             for community in batch {
                 if crate::context::is_cancelled() { return; }
                 crate::mprint!("  [*] {} '{}' ... ", ver_name, community);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
+                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
                 match test_community(socket, addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
                     Ok(Some(sys_descr)) => {
@@ -352,9 +356,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         .map(|l| l.trim().to_string())
                         .filter(|l| !l.is_empty() && !l.starts_with('#'))
                         .collect();
-                    if !cleaned.is_empty() {
-                        let _ = tx.blocking_send(cleaned);
-                    }
+                    if !cleaned.is_empty()
+                        && let Err(e) = tx.blocking_send(cleaned) { eprintln!("[!] Channel send failed: {}", e); }
                 })
             });
 
@@ -376,6 +379,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     }
 
+    let mut outcome = ModuleOutcome::ok();
+
     // Summary
     crate::mprintln!();
     crate::mprintln!("{}", "=== Scan Summary ===".bold());
@@ -392,18 +397,33 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         crate::mprintln!("{}", "[!] Valid community strings found:".red().bold());
         for vc in &valid_communities {
             crate::mprintln!("    - {}", vc);
+
+            // Each valid community string is a misconfiguration (default/guessable community)
+            outcome.findings.push(Finding {
+                target: format!("{}:{}", target, port),
+                kind: FindingKind::Note,
+                message: format!("SNMP community string accepted: {}", vc),
+                data: Some(serde_json::json!({
+                    "host": target,
+                    "port": port,
+                    "community": vc,
+                })),
+            });
         }
     }
 
     if save_results && !valid_communities.is_empty() {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "snmp_scan_results.txt").await?;
         let content = valid_communities.join("\n");
-        std::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content))
+        tokio::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content)).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(ModuleOutcome::ok())
+    Ok(outcome)
 }
 
 crate::register_native_module!(crate::module::Category::Scanners, "snmp_scanner", native);

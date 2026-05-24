@@ -58,6 +58,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -174,7 +175,7 @@ async fn lookup_dmarc(domain: &str, resolver: &str) -> Result<Option<String>> {
     let (mut client, bg) = Client::connect(stream).await?;
     tokio::spawn(bg);
 
-    let qname = Name::from_str_relaxed(&format!("_dmarc.{}", domain))?;
+    let qname = Name::from_str_relaxed(format!("_dmarc.{}", domain))?;
     let resp = timeout(
         Duration::from_secs(DNS_TIMEOUT_SECS),
         client.query(qname, DNSClass::IN, RecordType::TXT),

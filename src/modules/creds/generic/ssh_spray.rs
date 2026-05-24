@@ -37,6 +37,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(22),
     }
 }
 
@@ -160,7 +161,7 @@ fn try_ssh_auth(host: &str, port: u16, username: &str, password: &str, timeout_s
     
     match sess.userauth_password(username, password) {
         Ok(_) => Ok(sess.authenticated()),
-        Err(_) => Ok(false),
+        Err(e) => { tracing::debug!("SSH auth failed: {e}"); Ok(false) }
     }
 }
 
@@ -210,7 +211,10 @@ fn load_list_from_file(path: &str) -> Result<Vec<String>> {
     let reader = BufReader::new(file);
     let items: Vec<String> = reader
         .lines()
-        .filter_map(|l| l.ok())
+        .filter_map(|r| match r {
+            Ok(l) => Some(l),
+            Err(e) => { tracing::trace!("Skipping non-UTF-8 line: {e}"); None }
+        })
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
@@ -307,11 +311,11 @@ pub async fn password_spray(
                             results.lock().await.push(cred);
                             // Persist credential to framework credential store
                             {
-                                let id = crate::cred_store::store_credential(
-                                    &host, port, "ssh", &user, &password,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/ssh_sweep",
-                                ).await;
+                                let id = crate::cred_store::store_credential(crate::cred_store::NewCred {
+                                    host: &host, port, service: "ssh", username: &user, secret: &password,
+                                    cred_type: crate::cred_store::CredType::Password,
+                                    source_module: "creds/generic/ssh_sweep",
+                                }).await;
                                 if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
                             }
                             // Signal stop if stop_on_success is enabled
@@ -324,7 +328,21 @@ pub async fn password_spray(
                             stats.record_attempt(false, false);
                             break;
                         }
-                        Ok(Err(_)) | Err(_) => {
+                        Ok(Err(e)) => {
+                            tracing::debug!("SSH connection error: {e}");
+                            // Connection error — retry with exponential backoff
+                            if attempt < MAX_RETRIES {
+                                attempt += 1;
+                                // Exponential backoff: 500ms, 1000ms
+                                let delay_ms = 500u64 * (1u64 << (attempt - 1));
+                                sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            stats.record_attempt(false, true);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::debug!("timeout: {e}");
                             // Connection error — retry with exponential backoff
                             if attempt < MAX_RETRIES {
                                 attempt += 1;

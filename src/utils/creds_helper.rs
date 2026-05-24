@@ -33,27 +33,19 @@ pub async fn read_exact_with_timeout<R>(
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
-    let bytes = tokio::time::timeout(deadline, reader.read_exact(buf))
+    tokio::time::timeout(deadline, reader.read_exact(buf))
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
-    if bytes != buf.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("short read: {} of {}", bytes, buf.len()),
-        ));
-    }
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("read timeout: {e}")))?
+        ?;
     Ok(())
 }
 
-/// `TcpStream::connect` with a wall-clock timeout. Flattened to a single
-/// `io::Result<TcpStream>`.
+/// TCP connect with a wall-clock timeout and global source port support.
 pub async fn connect_with_timeout(
     addr: &str,
     deadline: Duration,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    tokio::time::timeout(deadline, tokio::net::TcpStream::connect(addr))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
+    crate::utils::network::tcp_connect_str(addr, deadline).await
 }
 
 /// Per-module configuration — keeps the call site small.
@@ -79,7 +71,7 @@ pub struct CredsRun {
 /// session secrets) by capturing in the closure.
 pub async fn run<F, Fut>(target: &str, cfg: CredsRun, probe: F) -> Result<ModuleOutcome>
 where
-    F: Fn(String, u16, String, String) -> Fut + Send + Sync + Clone + 'static,
+    F: Fn(String, u16, String, String, Duration) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = LoginResult> + Send,
 {
     if !crate::utils::is_batch_mode() {
@@ -166,13 +158,14 @@ where
     let probe_for_engine = {
         let probe = probe.clone();
         let timeout = Duration::from_secs(timeout_secs);
+        let outer_timeout = timeout + Duration::from_secs(2);
         move |t: String, p: u16, u: String, pw: String| {
             let probe = probe.clone();
             async move {
-                match tokio::time::timeout(timeout, probe(t, p, u, pw)).await {
+                match tokio::time::timeout(outer_timeout, probe(t, p, u, pw, timeout)).await {
                     Ok(r) => r,
-                    Err(_) => LoginResult::Error {
-                        message: format!("attempt timed out after {}s", timeout.as_secs()),
+                    Err(e) => LoginResult::Error {
+                        message: format!("attempt timed out after {}s: {e}", outer_timeout.as_secs()),
                         retryable: true,
                     },
                 }
@@ -196,14 +189,24 @@ where
             "username": user,
             "password": pass,
         });
-        let _ = crate::loot::store_loot(
+        let serialized = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::meprintln!("[!] Serialization failed: {}", e);
+                return Err(e.into());
+            }
+        };
+        if crate::loot::store_loot(
             &host,
             "credential",
             &format!("{} {}:{}@{}", cfg.service_name, user, pass, addr),
-            serde_json::to_string(&payload).unwrap_or_default().as_bytes(),
+            serialized.as_bytes(),
             cfg.source_module,
         )
-        .await;
+        .await
+        .is_none() {
+            eprintln!("[!] Failed to store loot for {}:{}", host, addr);
+        }
         crate::workspace::track_service(&host, port, "tcp", cfg.service_name, None).await;
 
         outcome.findings.push(Finding {
@@ -241,23 +244,25 @@ pub fn parse_host_port(raw: &str, default_port: u16) -> Result<(String, u16)> {
             && let Ok(port) = after.parse::<u16>() {
                 return Ok((before.to_string(), port));
             }
-    let normalised = normalize_target(trimmed).unwrap_or_else(|_| trimmed.to_string());
+    let normalised = normalize_target(trimmed).unwrap_or_else(|e| {
+        tracing::debug!("normalize_target failed for '{}': {e}", trimmed);
+        trimmed.to_string()
+    });
     Ok((normalised, default_port))
 }
 
 async fn is_port_open(host: &str, port: u16) -> bool {
     let ip: IpAddr = match host.parse() {
         Ok(ip) => ip,
-        Err(_) => {
-            // Fall back to DNS lookup; if that fails we assume the host
-            // isn't reachable.
+        Err(e) => {
+            tracing::debug!("parse IP failed: {e}");
             let lookup = format!("{}:{}", host, port);
             match tokio::net::lookup_host(&lookup).await {
                 Ok(mut iter) => match iter.next() {
                     Some(sa) => sa.ip(),
                     None => return false,
                 },
-                Err(_) => return false,
+                Err(e) => { tracing::debug!("DNS lookup for {host} failed: {e}"); return false; }
             }
         }
     };

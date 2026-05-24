@@ -95,6 +95,19 @@ pub async fn handshake_handler(
             return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
         }
         timestamps.push(now);
+        // Evict stale entries (IPs with no recent timestamps) to prevent unbounded growth
+        let before = limiter.len();
+        limiter.retain(|ip, ts| {
+            let keep = !ts.is_empty();
+            if !keep {
+                tracing::trace!("Evicting stale rate-limit entry for {}", ip);
+            }
+            keep
+        });
+        let evicted = before.saturating_sub(limiter.len());
+        if evicted > 0 {
+            tracing::debug!("Rate limiter: evicted {} stale IP entries, {} remaining", evicted, limiter.len());
+        }
     }
 
     let tenant_id = &request.client_name;
@@ -193,11 +206,11 @@ pub async fn register_key_handler(
         return Err((StatusCode::BAD_REQUEST, "name must be 1-64 [a-zA-Z0-9_-]".into()));
     }
     let x25519_bytes = B64.decode(&request.x25519_pub)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "x25519_pub is not base64".into()))?;
+        .map_err(|e| { tracing::debug!("x25519_pub is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "x25519_pub is not base64".into()) })?;
     let x25519_pub: [u8; 32] = x25519_bytes.try_into()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "x25519_pub must decode to 32 bytes".into()))?;
+        .map_err(|e: Vec<u8>| { tracing::debug!("x25519_pub must decode to 32 bytes (got {} bytes)", e.len()); (StatusCode::BAD_REQUEST, "x25519_pub must decode to 32 bytes".into()) })?;
     let mlkem_ek = B64.decode(&request.mlkem_ek)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "mlkem_ek is not base64".into()))?;
+        .map_err(|e| { tracing::debug!("mlkem_ek is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "mlkem_ek is not base64".into()) })?;
     // ML-KEM-768 encapsulation key is exactly 1184 bytes.
     if mlkem_ek.len() != 1184 {
         return Err((StatusCode::BAD_REQUEST, format!("mlkem_ek must be 1184 bytes, got {}", mlkem_ek.len())));
@@ -289,14 +302,14 @@ pub async fn pq_middleware(
         }
     };
 
-    let session_id_b64 = pq_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let session_id_vec = B64.decode(session_id_b64).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let session_id: [u8; 16] = session_id_vec.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let session_id_b64 = pq_header.to_str().map_err(|e| { tracing::debug!("X-PQ-Session header not valid UTF-8: {e:?}"); StatusCode::BAD_REQUEST })?;
+    let session_id_vec = B64.decode(session_id_b64).map_err(|e| { tracing::debug!("X-PQ-Session not valid base64: {e:?}"); StatusCode::BAD_REQUEST })?;
+    let session_id: [u8; 16] = session_id_vec.try_into().map_err(|e: Vec<u8>| { tracing::debug!("session ID wrong length: got {} bytes", e.len()); StatusCode::BAD_REQUEST })?;
 
     let nonce_b64 = request.headers().get("X-PQ-Nonce")
         .and_then(|v| v.to_str().ok()).ok_or(StatusCode::BAD_REQUEST)?.to_string();
-    let nonce: [u8; 12] = B64.decode(&nonce_b64).map_err(|_| StatusCode::BAD_REQUEST)?
-        .try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let nonce: [u8; 12] = B64.decode(&nonce_b64).map_err(|e| { tracing::debug!("X-PQ-Nonce not valid base64: {e:?}"); StatusCode::BAD_REQUEST })?
+        .try_into().map_err(|e: Vec<u8>| { tracing::debug!("X-PQ-Nonce wrong length: got {} bytes", e.len()); StatusCode::BAD_REQUEST })?;
 
     // X-PQ-Epoch is informational on the request side (the AAD is built
     // from the post-ratchet session epoch on both sides; AEAD verification
@@ -334,8 +347,8 @@ pub async fn pq_middleware(
         axum::body::to_bytes(body, 1024 * 1024),
     )
         .await
-        .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
-        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+        .map_err(|e| { tracing::debug!("PQ request body read timed out: {e:?}"); StatusCode::REQUEST_TIMEOUT })?
+        .map_err(|e| { tracing::debug!("PQ request body too large: {e:?}"); StatusCode::PAYLOAD_TOO_LARGE })?;
 
     // Look up the per-session mutex via a SHORT read lock on the map. Hold
     // an Arc clone so the session survives concurrent registrations. The
@@ -384,7 +397,7 @@ pub async fn pq_middleware(
     };
 
     let decrypted: serde_json::Value = serde_json::from_slice(&plaintext)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| { tracing::debug!("PQ decrypted body is not valid JSON: {e:?}"); StatusCode::BAD_REQUEST })?;
 
     let inner_body = decrypted.get("body").map(|v| {
         if v.is_string() { v.as_str().unwrap_or("").to_string() } else { v.to_string() }
@@ -414,8 +427,8 @@ pub async fn pq_middleware(
         axum::body::to_bytes(resp_body, 10 * 1024 * 1024),
     )
         .await
-        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| { tracing::debug!("PQ response body read timed out: {e:?}"); StatusCode::GATEWAY_TIMEOUT })?
+        .map_err(|e| { tracing::debug!("PQ response body read failed: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     let session_id_b64_for_aad = session_id_b64.to_string();
     let status_code = resp_parts.status.as_u16();
@@ -428,22 +441,22 @@ pub async fn pq_middleware(
         encrypt_response(&mut session, &resp_bytes, move |ep| {
             format!("{status_code}|{ep}|{session_id_b64_for_aad}").into_bytes()
         })
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| { tracing::debug!("PQ response encryption failed: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?
     };
 
     let mut resp = Response::new(Body::from(ct));
     *resp.status_mut() = resp_parts.status;
     resp.headers_mut().insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
     resp.headers_mut().insert("X-PQ-Nonce",
-        HeaderValue::from_str(&B64.encode(resp_nonce)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+        HeaderValue::from_str(&B64.encode(resp_nonce)).map_err(|e| { tracing::debug!("X-PQ-Nonce header value invalid: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?);
     // Surface the post-encryption (post-ratchet, if rekey fired) epoch so the
     // client can sanity-check against its session state.
     resp.headers_mut().insert("X-PQ-Epoch",
-        HeaderValue::from_str(&effective_epoch.to_string()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+        HeaderValue::from_str(&effective_epoch.to_string()).map_err(|e| { tracing::debug!("X-PQ-Epoch header value invalid: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?);
 
     if let Some(pub_key) = rekey {
         resp.headers_mut().insert("X-PQ-Rekey",
-            HeaderValue::from_str(&B64.encode(pub_key.as_bytes())).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+            HeaderValue::from_str(&B64.encode(pub_key.as_bytes())).map_err(|e| { tracing::debug!("X-PQ-Rekey header value invalid: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?);
     }
 
     Ok(resp)

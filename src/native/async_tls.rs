@@ -110,8 +110,8 @@ where
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(anyhow::anyhow!("TLS handshake failed: {}", e)),
-        Err(_) => Err(anyhow::anyhow!(
-            "TLS handshake timed out after {:?}",
+        Err(e) => Err(anyhow::anyhow!(
+            "TLS handshake timed out after {:?}: {e}",
             timeout
         )),
     }

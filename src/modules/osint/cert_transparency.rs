@@ -37,6 +37,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Normal,
+        default_port: None,
     }
 }
 
@@ -128,8 +129,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Cap on-screen output; the operator can re-run with `setg verbose y`
     // to get the full set if needed.
-    let mut shown = 0usize;
-    for sub in &subdomains {
+    for (shown, sub) in subdomains.iter().enumerate() {
         if shown >= MAX_RESULTS_DISPLAYED {
             crate::mprintln!(
                 "{}",
@@ -142,7 +142,6 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             break;
         }
         crate::mprintln!("  {}", sub);
-        shown += 1;
     }
 
     // Auto-populate workspace with the discovered names so downstream

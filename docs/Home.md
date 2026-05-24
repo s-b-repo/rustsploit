@@ -19,11 +19,12 @@ Welcome to the Rustsploit documentation hub. Use the links below to navigate to 
 | [Module Development](Module-Development.md) | How to author new modules — `Module` trait, lifecycle hooks, scheduler, rate limiter |
 | [Legacy / Migration Status](Legacy.md) | Pre-v0.5.0 code paths kept on purpose, in-flight migrations, audit findings ledger |
 | [Security & Validation](Security-Validation.md) | Input validation constants, security patterns, honeypot detection |
-| [Credential Modules Guide](Credential-Modules-Guide.md) | Best practices for 29 cred modules — mass scan, cfg_prompt_*, concurrency |
-| [Exploit Modules Guide](Exploit-Modules-Guide.md) | Best practices for 183 exploit modules — multi-target, cfg_prompt_*, validation |
-| [Utilities & Helpers](Utilities-Helpers.md) | `utils.rs` public API, target normalization, honeypot check |
+| [Credential Modules Guide](Credential-Modules-Guide.md) | Best practices for credential modules — creds_helper, source port, timeout passthrough |
+| [Exploit Modules Guide](Exploit-Modules-Guide.md) | Best practices for exploit modules — mass scan compat, batch guards, target-specific files |
+| [Utilities & Helpers](Utilities-Helpers.md) | Network wrappers, creds_helper, exploit_helper, source port binding, cfg_prompt_* |
+| [Bad Patterns](BAD_PATTERNS.md) | Banned code patterns — 95+ regex checks for panics, error swallowing, network bypasses |
 | [Testing & QA](Testing-QA.md) | Build checks (0 errors, 0 warnings), smoke tests, wordlist validation |
-| [Changelog](Changelog.md) | Release notes and version history (current: v0.4.8) |
+| [Changelog](Changelog.md) | Release notes and version history (current: v0.5.0) |
 | [Contributing](Contributing.md) | Fork guide, PR checklist, code style |
 | [Credits](Credits.md) | Authors, acknowledgements, legal notice |
 | [Future Features](Future-Features.md) | Roadmap and completed features (plugins, metadata, global options, etc.) |

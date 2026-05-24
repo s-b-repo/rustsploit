@@ -85,7 +85,7 @@ pub enum Method {
     ZeroWidth,
     HexSplit,
     Utf16Le,
-    CharSubst([u8; 256]),
+    CharSubst(Box<[u8; 256]>),
     AnsiEscape,
     Chunk(Vec<usize>), // permutation of 0..n
 }
@@ -275,7 +275,7 @@ pub fn instantiate(id: &str) -> Result<Method> {
             if tbl.iter().enumerate().all(|(i, &b)| b == i as u8) {
                 tbl.swap(0, 1);
             }
-            Method::CharSubst(tbl)
+            Method::CharSubst(Box::new(tbl))
         }
         "ansi" => Method::AnsiEscape,
         "chunk" => Method::Chunk(Vec::new()), // length-dependent; populated at encode
@@ -852,7 +852,7 @@ fn emit_raw(blob: &[u8]) -> String {
     // ASCII); otherwise we hex-encode for safety.
     match std::str::from_utf8(blob) {
         Ok(s) => s.to_string(),
-        Err(_) => HEXUPPER.encode(blob),
+        Err(e) => { tracing::trace!("blob is not valid UTF-8, hex-encoding: {e}"); HEXUPPER.encode(blob) }
     }
 }
 
@@ -880,7 +880,7 @@ fn emit_recipe(blob: &[u8], chain: &[Method], recipe_lines: &[String], original:
     out.push_str("# Encoded blob follows.\n");
     match std::str::from_utf8(blob) {
         Ok(s) => out.push_str(s),
-        Err(_) => out.push_str(&HEXUPPER.encode(blob)),
+        Err(e) => { tracing::trace!("recipe blob not UTF-8, hex-encoding: {e}"); out.push_str(&HEXUPPER.encode(blob)) }
     }
     out.push('\n');
     out
@@ -912,19 +912,19 @@ fn emit_python(blob: &[u8], chain: &[Method], original: &[u8]) -> String {
     out.push_str("#!/usr/bin/env python3\n");
     out.push_str("# obfuscator-generated self-decoder. DO NOT EDIT THE BLOB.\n");
     out.push_str("import base64, gzip, sys, codecs, os\n");
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("# helper functions for every method we may have used:\n");
     out.push_str(PY_HELPERS);
-    out.push_str("\n");
+    out.push('\n');
     out.push_str(&format!("BLOB = base64.b64decode({:?})\n", blob_b64));
     out.push_str("DATA = BLOB  # final encoded form\n");
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("# decode chain (inverse of encoding):\n");
     for m in chain.iter().rev() {
         let line = py_inverse(m);
         out.push_str(&format!("DATA = {}\n", line));
     }
-    out.push_str("\n");
+    out.push('\n');
     out.push_str(&format!(
         "# Original was {} bytes. Uncomment to execute:\n",
         original.len()
@@ -937,9 +937,9 @@ fn emit_python(blob: &[u8], chain: &[Method], original: &[u8]) -> String {
 
 // PY_HELPERS embeds the Python decoder for the zero-width-joiner obfuscation
 // method. The U+200B and U+200C characters in `_zw_dec` are the actual alphabet
-// the encoder uses; they have to be present literally for round-tripping.
-#[allow(clippy::invisible_characters)]
-const PY_HELPERS: &str = r#"
+// the encoder uses; they must be present literally for round-tripping.
+// The invisible characters are expressed via \u{...} escapes to satisfy clippy.
+const PY_HELPERS: &str = concat!(r#"
 def _xor(data, key):
     if not key: return data
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
@@ -995,8 +995,8 @@ def _zw_dec(data):
     bits = []
     s = data.decode('utf-8', 'ignore')
     for ch in s:
-        if ch == '‌': bits.append(1)
-        elif ch == '​': bits.append(0)
+        if ch == '"#, "\u{200C}", r#"': bits.append(1)
+        elif ch == '"#, "\u{200B}", r#"': bits.append(0)
     out = bytearray()
     for i in range(0, len(bits) - 7, 8):
         v = 0
@@ -1042,7 +1042,7 @@ def _url_dec(data):
         else:
             out.append(ord(s[i])); i += 1
     return bytes(out)
-"#;
+"#);
 
 fn py_inverse(m: &Method) -> String {
     match m {

@@ -39,6 +39,7 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -176,7 +177,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 results.push(r);
             }
             Ok(None) => {}
-            Err(_) => {}
+            Err(e) => { tracing::debug!("probe failed: {e}"); }
         }
     }
 
@@ -293,7 +294,9 @@ fn truncate_display(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let end = max.saturating_sub(3);
+        let truncated: String = s.chars().take(end).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -679,7 +682,8 @@ async fn probe_https(target: &str, port: u16, dur: Duration) -> Option<ServiceRe
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("TLS probe failed: {e}");
             r.notes = "TLS connection failed or timeout".to_string();
         }
     }
@@ -739,7 +743,8 @@ async fn probe_postgres(
         0x04, 0xd2, 0x16, 0x2f, // SSL request code = 80877103
     ];
 
-    if stream.write_all(&ssl_request).await.is_err() {
+    if let Err(e) = stream.write_all(&ssl_request).await {
+        tracing::trace!("PostgreSQL SSL request write failed: {e}");
         return Some(r);
     }
 
@@ -769,7 +774,8 @@ async fn probe_redis(mut stream: TcpStream, port: u16, dur: Duration) -> Option<
     let mut r = ServiceResult::new(port);
     r.service = "Redis".to_string();
 
-    if stream.write_all(b"INFO\r\n").await.is_err() {
+    if let Err(e) = stream.write_all(b"INFO\r\n").await {
+        tracing::trace!("Redis INFO write failed: {e}");
         return Some(r);
     }
 
@@ -812,7 +818,8 @@ async fn probe_mongodb(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
     //   numberToReturn (4), query BSON document
     let is_master_bson: Vec<u8> = build_is_master_query();
 
-    if stream.write_all(&is_master_bson).await.is_err() {
+    if let Err(e) = stream.write_all(&is_master_bson).await {
+        tracing::trace!("MongoDB isMaster write failed: {e}");
         return Some(r);
     }
 
@@ -842,7 +849,8 @@ async fn probe_memcached(
     let mut r = ServiceResult::new(port);
     r.service = "Memcached".to_string();
 
-    if stream.write_all(b"version\r\n").await.is_err() {
+    if let Err(e) = stream.write_all(b"version\r\n").await {
+        tracing::trace!("Memcached version write failed: {e}");
         return Some(r);
     }
 
@@ -876,7 +884,13 @@ async fn probe_rdp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
     // X.224 CR: length=14, CR code=0xE0, dst-ref=0, src-ref=0, class=0
     // Cookie: "Cookie: mstshash=test\r\n"
     let cookie = b"Cookie: mstshash=test\r\n";
-    let x224_len: u8 = 6 + cookie.len() as u8; // CR header (6) + cookie
+    let x224_len = match u8::try_from(6 + cookie.len()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("X.224 payload too large for u8 length: {e}");
+            return None;
+        }
+    };
     let tpkt_len: u16 = 4 + 1 + x224_len as u16; // TPKT header (4) + x224 length byte + x224 payload
 
     let mut pkt = Vec::with_capacity(tpkt_len as usize);
@@ -892,7 +906,8 @@ async fn probe_rdp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
     pkt.push(0x00); // class option
     pkt.extend_from_slice(cookie);
 
-    if stream.write_all(&pkt).await.is_err() {
+    if let Err(e) = stream.write_all(&pkt).await {
+        tracing::trace!("RDP X.224 CR write failed: {e}");
         return Some(r);
     }
 
@@ -950,7 +965,8 @@ async fn probe_elasticsearch(
     r.service = "Elasticsearch".to_string();
 
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    if stream.write_all(request).await.is_err() {
+    if let Err(e) = stream.write_all(request).await {
+        tracing::trace!("Elasticsearch HTTP request write failed: {e}");
         return Some(r);
     }
 
@@ -1063,7 +1079,7 @@ fn extract_version_after(text: &str, keyword: &str) -> String {
         let rest = &text[start..];
         // Take until whitespace or end.
         let token = rest
-            .split(|c: char| c == '\r' || c == '\n')
+            .split(['\r', '\n'])
             .next()
             .unwrap_or("")
             .trim();
@@ -1094,7 +1110,7 @@ fn extract_http_header(response: &str, header: &str) -> Option<String> {
     for line in response.lines() {
         let line_lower = line.to_lowercase();
         if line_lower.starts_with(&header_lower) && line.contains(':') {
-            let value = line.splitn(2, ':').nth(1)?.trim().to_string();
+            let value = line.split_once(':')?.1.trim().to_string();
             return Some(value);
         }
     }
