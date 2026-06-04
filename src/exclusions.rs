@@ -112,17 +112,24 @@ impl ExclusionSet {
         }
         let mut set = Self::defaults();
         if let Some(path) = trimmed.strip_prefix('@') {
-            if let Ok(extra) = read_exclusion_file(PathBuf::from(path.trim())) {
-                set.nets.extend(extra.nets);
+            let path = path.trim();
+            match read_exclusion_file(PathBuf::from(path)) {
+                Ok(extra) => set.nets.extend(extra.nets),
+                // Fail LOUD: an operator who pointed at a file expects their
+                // custom exclusions applied. Silently falling back to defaults
+                // would scan ranges they meant to exclude.
+                Err(e) => tracing::warn!(
+                    "exclusions: could not read '{}': {e}. Custom exclusions NOT applied — using defaults only.",
+                    path
+                ),
             }
         } else {
-            set.nets.extend(
-                trimmed
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|s| s.parse::<IpNetwork>().ok()),
-            );
+            for s in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match s.parse::<IpNetwork>() {
+                    Ok(net) => set.nets.push(net),
+                    Err(e) => tracing::warn!("exclusions: ignoring invalid CIDR '{}': {e}", s),
+                }
+            }
         }
         set
     }

@@ -188,7 +188,14 @@ async fn handle_ws(
     let tenant_stores = match crate::tenant::resolve_for(&client_name) {
         Ok(s) => s,
         Err(e) => {
+            // Fail closed: the connect-time tenant could not be resolved/validated,
+            // so we must not fall back to any process-global store. Tear down the
+            // already-spawned writer and release the connection slot we claimed in
+            // ws_upgrade — otherwise every tenant-rejected upgrade permanently
+            // consumes one of MAX_TOTAL_CONNECTIONS, a reachable DoS.
             tracing::error!("Tenant rejected for '{}': {}", client_name, e);
+            writer_handle.abort();
+            TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
             return;
         }
     };
@@ -254,6 +261,14 @@ async fn handle_ws(
             match module_rx.recv().await {
                 Ok(te) => {
                     match te.tenant_id {
+                        // Deliver only events tagged for THIS tenant. PQ
+                        // lifecycle events are now tagged to their owning client
+                        // via `events::emit_for` (pq_middleware), so they arrive
+                        // here as `Some(my_tenant)`. Untagged (`None`) events are
+                        // dropped per the bus's tenant-filtering contract —
+                        // broadcasting them to every subscriber would leak one
+                        // tenant's client name / peer IP / revocation details to
+                        // all others.
                         Some(ref tid) if tid == &my_tenant => { /* deliver */ }
                         _ => continue,
                     }
@@ -409,24 +424,60 @@ async fn handle_ws(
                     }
                     jobs.insert(job_id);
                 }
+            } else {
+                // Missing/non-numeric jobId: a JSON-RPC client keyed by req_id
+                // would hang forever without an ack or error, so emit one.
+                let resp = json!({"id": req_id, "error": {"code": "INVALID_INPUT", "message": "jobId must be a number"}});
+                if let Ok(bytes) = serde_json::to_vec(&resp) {
+                    if let Err(e) = reader_tx.send(bytes).await {
+                        tracing::trace!("RPC response channel closed: {e}");
+                        break;
+                    }
+                }
             }
             continue;
         }
         if method == "unsubscribe:output" {
-            if let Some(job_id_u64) = params.get("jobId").and_then(|v| v.as_u64())
-                && let Ok(job_id) = u32::try_from(job_id_u64) {
+            let job_id = params.get("jobId").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok());
+            match job_id {
+                Some(job_id) => {
                     reader_jobs.lock().await.remove(&job_id);
+                    let resp = json!({"id": req_id, "result": {"unsubscribed": job_id}});
+                    if let Ok(bytes) = serde_json::to_vec(&resp) {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
+                    }
                 }
+                None => {
+                    let resp = json!({"id": req_id, "error": {"code": "INVALID_INPUT", "message": "jobId must be a number"}});
+                    if let Ok(bytes) = serde_json::to_vec(&resp) {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
             continue;
         }
 
         let cn = client_name.clone();
-        let result = crate::tenant::CURRENT_TENANT
-            .scope(cn, dispatch_rpc(method, &params))
-            .await;
-        let response = match result {
-            Ok(data) => json!({"id": req_id, "result": data}),
-            Err(e) => json!({"id": req_id, "error": {"code": e.0, "message": e.1}}),
+        // Fail closed: only dispatch under the tenant that was validated at
+        // connect time. If the tenant can no longer be resolved (e.g. evicted
+        // mid-session), reject the request rather than letting a handler fall
+        // back to a process-global store and cross tenant boundaries.
+        let response = if crate::tenant::resolve_for(&cn).is_err() {
+            json!({"id": req_id, "error": {"code": "TENANT_REJECTED", "message": "Tenant no longer valid for this connection"}})
+        } else {
+            let result = crate::tenant::CURRENT_TENANT
+                .scope(cn, dispatch_rpc(method, &params))
+                .await;
+            match result {
+                Ok(data) => json!({"id": req_id, "result": data}),
+                Err(e) => json!({"id": req_id, "error": {"code": e.0, "message": e.1}}),
+            }
         };
         if let Ok(bytes) = serde_json::to_vec(&response) {
             if let Err(e) = reader_tx.send(bytes).await {
@@ -468,11 +519,10 @@ pub(crate) async fn dispatch_rpc(method: &str, params: &Value) -> RpcResult {
         "set_target" => rpc_set_target(params).await,
         "clear_target" => rpc_clear_target().await,
         "run_module" => rpc_run_module(params).await,
-        // M44: run_all is intentionally an alias for run_module — both
-        // dispatch to the same handler. A dedicated multi-module runner is
-        // not yet implemented; callers should loop client-side.
-        "run_all" => rpc_run_module(params).await,
-        "check_module" => rpc_check_module(params).await,
+        // `run_all` (a real multi-module runner) is not implemented; it used to
+        // silently alias run_module, advertising a capability that didn't exist.
+        // Return METHOD_NOT_FOUND so callers loop client-side over run_module.
+        "run_all" => Err(rpc_err("METHOD_NOT_FOUND", "run_all is not implemented; call run_module per module (loop client-side)")),
         "honeypot_check" => rpc_honeypot_check(params).await,
         "list_options" => rpc_list_options().await,
         "set_option" => rpc_set_option(params).await,
@@ -550,7 +600,6 @@ async fn rpc_list_modules_enriched() -> RpcResult {
             "description": info.description,
             "authors": info.authors,
             "category": category,
-            "has_check": crate::commands::has_check(m),
             "rank": format!("{:?}", info.rank),
         })
     }).collect();
@@ -585,10 +634,27 @@ async fn rpc_module_info(params: &Value) -> RpcResult {
 async fn rpc_get_target() -> RpcResult {
     let s = crate::tenant::resolve();
     let target = s.global_options().get("__target").await;
+    // Report the real subnet flag and host count instead of the old hardcoded
+    // is_subnet:false / size:1 (which mislabeled CIDRs and comma-lists).
+    let (is_subnet, size) = match target.as_deref() {
+        None | Some("") => (false, 0u64),
+        Some(t) if t.contains(',') => {
+            let n = t.split(',').filter(|p| !p.trim().is_empty()).count() as u64;
+            (n > 1, n.max(1))
+        }
+        Some(t) if t.contains('/') => match crate::utils::parse_subnet(t) {
+            Ok(net) => {
+                let sz = crate::utils::subnet_host_count(&net).min(u64::MAX as u128) as u64;
+                (sz > 1, sz.max(1))
+            }
+            Err(_) => (false, 1),
+        },
+        Some(_) => (false, 1),
+    };
     Ok(json!({
         "target": target,
-        "size": if target.is_some() { 1 } else { 0 },
-        "is_subnet": false,
+        "size": size,
+        "is_subnet": is_subnet,
     }))
 }
 
@@ -600,8 +666,8 @@ async fn rpc_set_target(params: &Value) -> RpcResult {
     if crate::api::is_blocked_target(target) {
         return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
     }
     let s = crate::tenant::resolve();
     if !s.global_options().set("__target", target).await {
@@ -629,8 +695,13 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
     if !crate::api::validate_target(target) {
         return Err(rpc_err("INVALID_INPUT", "Invalid target"));
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+    // Static literal-range check first (not subject to DNS rebinding), then the
+    // resolving check.
+    if crate::api::is_blocked_target(target) {
+        return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
+    }
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
     }
     if !crate::commands::discover_modules().contains(&module.to_string()) {
         return Err(rpc_err("MODULE_NOT_FOUND", format!("Module '{}' not found", module)));
@@ -720,6 +791,22 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         custom_prompts,
     };
 
+    // SSRF TOCTOU mitigation: the module (or background job) re-resolves
+    // `target` at connect time, which an attacker-controlled DNS name could
+    // rebind to a blocked address (loopback / link-local / RFC1918 / cloud
+    // metadata) after the initial validation above. Re-run both block-checks
+    // immediately before handing off to shrink the rebinding window to the
+    // minimum. Full address-pinning (passing resolved SocketAddrs into the
+    // module/job so it never re-resolves) would require cross-file signature
+    // changes to job_manager().spawn / commands::run_module, which are outside
+    // this handler's scope; this is the strongest in-handler guard available.
+    if crate::api::is_blocked_target(target) {
+        return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
+    }
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
+    }
+
     if background {
         let s = crate::tenant::resolve();
         match s.job_manager().spawn(
@@ -768,31 +855,22 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
     }
 }
 
-async fn rpc_check_module(params: &Value) -> RpcResult {
-    let module = require_str(params, "module")?;
-    let target = require_str(params, "target")?;
-    if !crate::api::validate_module_name(module) {
-        return Err(rpc_err("INVALID_INPUT", "Invalid module name"));
-    }
-    if !crate::api::validate_target(target) {
-        return Err(rpc_err("INVALID_INPUT", "Invalid target"));
-    }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
-    }
-    match crate::commands::check_module(module, target).await {
-        Some(result) => Ok(json!({"module": module, "target": target, "result": result.to_string()})),
-        None => Err(rpc_err("CHECK_ERROR", "Module does not support check or was not found")),
-    }
-}
-
 async fn rpc_honeypot_check(params: &Value) -> RpcResult {
     let target = require_str(params, "target")?;
     if !crate::api::validate_target(target) {
         return Err(rpc_err("INVALID_INPUT", "Invalid target"));
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+    // Static literal-range check first (not subject to DNS rebinding), then the
+    // resolving check.
+    if crate::api::is_blocked_target(target) {
+        return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
+    }
+    // SSRF TOCTOU mitigation: quick_honeypot_check re-resolves `target`, so run
+    // the resolving block-check immediately before handoff to shrink the
+    // DNS-rebinding window. (A second identical pre-check added nothing — the
+    // only meaningful window is right before quick_honeypot_check.)
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
     }
     let is_honeypot = crate::utils::network::quick_honeypot_check(target).await;
     Ok(json!({"target": target, "is_honeypot": is_honeypot}))
@@ -820,6 +898,12 @@ async fn rpc_set_option(params: &Value) -> RpcResult {
         if key.is_empty() || key.len() > 256 {
             return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' invalid (1-256 chars)", key)));
         }
+        // Reserved keys (e.g. `__target`) must only be written through their
+        // dedicated validated RPC (set_target runs SSRF/format checks); allowing
+        // them here would let a caller set the target bypassing those checks.
+        if key.starts_with("__") {
+            return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' is reserved; use the dedicated RPC", key)));
+        }
         if value.len() > 4096 {
             return Err(rpc_err("INVALID_INPUT", format!("Value for '{}' too long (max 4096)", key)));
         }
@@ -834,6 +918,9 @@ async fn rpc_set_option(params: &Value) -> RpcResult {
 async fn rpc_delete_option(params: &Value) -> RpcResult {
     let s = crate::tenant::resolve();
     let key = require_str(params, "key")?;
+    if key.starts_with("__") {
+        return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' is reserved; use the dedicated RPC", key)));
+    }
     if s.global_options().unset(key).await {
         Ok(json!({"deleted": key}))
     } else {
@@ -1112,8 +1199,10 @@ async fn rpc_delete_service(params: &Value) -> RpcResult {
         return Err(rpc_err("INVALID_INPUT", "port must be 1-65535"));
     }
     let port = port_raw as u16;
+    // Optional protocol scoping: omit to delete every protocol on the port.
+    let protocol = params.get("protocol").and_then(|v| v.as_str());
     let s = crate::tenant::resolve();
-    if s.workspace().delete_service(host, port).await {
+    if s.workspace().delete_service(host, port, protocol).await {
         Ok(json!({"deleted": format!("{}:{}", host, port)}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Service {}:{} not found", host, port)))
@@ -1308,12 +1397,11 @@ async fn rpc_spool_status() -> RpcResult {
         .ok()
         .or_else(crate::context::current_tenant_id)
         .unwrap_or_default();
-    let active = crate::spool::SPOOL.is_active();
-    let filename = crate::spool::SPOOL.current_file();
-    // Only report active if the spool belongs to the requesting tenant
-    let tenant_prefix = format!("{}_", tenant_id);
-    let is_mine = filename.as_ref().is_some_and(|f| f.starts_with(&tenant_prefix));
-    Ok(json!({"active": active && is_mine, "filename": if is_mine { filename } else { None }}))
+    // Only report active if the spool is owned by the requesting tenant
+    // (exact owner match, not a filename prefix that '_' could collide on).
+    let is_mine = crate::spool::SPOOL.owner().as_deref() == Some(tenant_id.as_str());
+    let filename = if is_mine { crate::spool::SPOOL.current_file() } else { None };
+    Ok(json!({"active": crate::spool::SPOOL.is_active() && is_mine, "filename": filename}))
 }
 
 async fn rpc_spool_start(params: &Value) -> RpcResult {
@@ -1337,8 +1425,21 @@ async fn rpc_spool_start(params: &Value) -> RpcResult {
         .ok()
         .or_else(crate::context::current_tenant_id)
         .unwrap_or_default();
+    // The spool is a single process-global sink. Refuse to start over a spool
+    // that this tenant does not own (another tenant's, or a shell's) — otherwise
+    // this start would stop their spool (denial) and capture their output.
+    if crate::spool::SPOOL.is_active()
+        && crate::spool::SPOOL.owner().as_deref() != Some(tenant_id.as_str())
+    {
+        return Err(rpc_err(
+            "SPOOL_BUSY",
+            "Another session is currently spooling; try again later",
+        ));
+    }
+    // Keep the tenant prefix in the on-disk filename so different tenants' spool
+    // files never collide; ownership itself is tracked explicitly via `owner`.
     let scoped_filename = format!("{}_{}", tenant_id, filename);
-    match crate::spool::SPOOL.start(&scoped_filename) {
+    match crate::spool::SPOOL.start(&scoped_filename, Some(&tenant_id)) {
         Ok(_) => Ok(json!({"started": filename})),
         Err(e) => Err(rpc_err("SPOOL_ERROR", format!("{:#}", e))),
     }
@@ -1350,12 +1451,12 @@ async fn rpc_spool_stop() -> RpcResult {
         .ok()
         .or_else(crate::context::current_tenant_id)
         .unwrap_or_default();
-    let tenant_prefix = format!("{}_", tenant_id);
-    // Verify the active spool belongs to the requesting tenant
-    if let Some(current) = crate::spool::SPOOL.current_file() {
-        if !current.starts_with(&tenant_prefix) {
-            return Err(rpc_err("SPOOL_ERROR", "Spool is not active for this tenant"));
-        }
+    if !crate::spool::SPOOL.is_active() {
+        return Err(rpc_err("SPOOL_ERROR", "Spool is not active"));
+    }
+    // Exact owner match: a tenant may only stop its own spool.
+    if crate::spool::SPOOL.owner().as_deref() != Some(tenant_id.as_str()) {
+        return Err(rpc_err("SPOOL_ERROR", "Spool is not active for this tenant"));
     }
     match crate::spool::SPOOL.stop() {
         Some(name) => Ok(json!({"stopped": name})),

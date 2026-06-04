@@ -1,0 +1,46 @@
+# Build artifacts
+/target/
+**/__pycache__/
+*.log
+
+# Local agent / editor config
+/.claude/
+
+# Separate sub-projects / scratch analysis (not part of rustsploit core)
+/arcticalopex/
+/_analysis/
+/addme/
+
+# Audit & scratch artifacts
+/AUDIT_FINDINGS.md
+/audit-findings.md
+/_audit_findings.json
+/_audit_summary.txt
+/arcticalopex_audit.md
+/arcticalopex_audit_phase_a_b_d_summary.md
+/arcticalopex_wiring_audit.md
+/rustsploit_audit.md
+/bugs.txt
+/todo.txt
+/test.txt
+
+# Engagement data / secrets — NEVER commit
+/creds.txt
+/found_backend2026.csv
+/results.txt
+/results_*.txt
+/hydra_targets_*.txt
+/hydra.restore
+/paused.conf
+/blocklist.conf
+/*.gnmap
+/za-target.txt
+/za_targets_final.txt
+/xneelo
+/xneelo_mapp.txt
+/should_not_exist2.bat
+
+# Stray placeholder files
+/src/t
+/src/modules/t
+/src/modules/exploits/t

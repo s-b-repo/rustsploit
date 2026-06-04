@@ -14,7 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::{cfg_prompt_int_range, cfg_prompt_port, tcp_port_open};
 
 const TCP_TIMEOUT_SECS: u64 = 4;
@@ -57,25 +57,6 @@ pub fn info() -> ModuleInfo {
         disclosure_date: None,
         rank: ModuleRank::Excellent,
         default_port: None,
-    }
-}
-
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("mysql_exposure requires a single-host target".to_string()),
-    };
-    let host = sanitize_host(target);
-    let ip = match resolve_first_ip(&host).await {
-        Some(ip) => ip,
-        None => return CheckResult::Error(format!("Could not resolve {}", host)),
-    };
-    if !tcp_port_open(ip, 3306, Duration::from_secs(TCP_TIMEOUT_SECS)).await {
-        return CheckResult::NotVulnerable(format!("{}:3306 closed/filtered", host));
-    }
-    match grab_handshake(ip, 3306).await {
-        Ok(banner) => CheckResult::Vulnerable(format!("MySQL/MariaDB exposed: {}", banner)),
-        Err(e) => CheckResult::Unknown(format!("3306 reachable but banner read failed: {}", e)),
     }
 }
 
@@ -204,4 +185,4 @@ fn sanitize_host(target: &str) -> String {
     t.to_string()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "mysql_exposure", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "mysql_exposure", native);

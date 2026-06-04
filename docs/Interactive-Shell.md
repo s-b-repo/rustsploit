@@ -24,9 +24,8 @@ All commands are **case-insensitive** and support aliases:
 | `set subnet <CIDR>` | `sn <CIDR>` | Set target to a CIDR subnet |
 | `show_target` | `st`, `showtarget` | Display current target |
 | `clear_target` | `ct`, `cleartarget` | Clear target |
-| `run` | `go`, `exec` | Execute the selected module |
+| `run` | `go`, `exec`, `ra` | Execute the selected module |
 | `run -j` | | Run module as background job |
-| `run_all` | `runall`, `ra` | Run module against all IPs in subnet |
 | `check` | `ch` | Non-destructive vulnerability check |
 | `setg <key> <val>` | `sg` | Set a global option (persists across modules) |
 | `unsetg <key>` | `ug` | Remove a global option |
@@ -72,14 +71,19 @@ rsf> go
 
 ## Command Chaining
 
-Execute multiple commands on one line using the `&` separator:
+Execute multiple commands on one line using the `&` or `;` separator (both are
+sequential — there is no parallel/background semantics implied by `&`):
 
 ```text
 rsf> u creds/generic/ssh_bruteforce & set target 10.10.10.10 & go
-rsf> f1 ssh & u creds/generic/ssh_bruteforce & set target 192.168.1.1
+rsf> f1 ssh ; u creds/generic/ssh_bruteforce ; set target 192.168.1.1
 ```
 
 Commands are parsed and executed left-to-right. Useful for scripting quick workflows.
+
+To run a module against every host in a subnet, just `set target <CIDR>` (or
+`random`) and `run` — the dispatcher fans out automatically; there is no
+separate `run_all` command.
 
 ---
 
@@ -112,17 +116,21 @@ The framework-level dispatcher handles multiple target types transparently for a
 
 All modules benefit from this automatically -- the dispatcher expands multi-target values and invokes the module once per resolved target.
 
+> **Note:** Only `random` and `0.0.0.0/0` trigger a full-internet random mass
+> scan. Bare `0.0.0.0` is treated as a normal single host, **not** a mass-scan
+> keyword, so `t 0.0.0.0` will not launch an internet-wide scan.
+
 ---
 
 ## Honeypot Detection
 
 After a target is set, Rustsploit automatically runs a honeypot check before module execution:
 
-- Scans **200 common ports** with a 250 ms timeout each.
+- Scans **30 common ports** with a 200 ms timeout each.
 - If **11 or more** ports are open, it warns that the target is likely a honeypot.
 - Runs automatically on every `run`/`go` invocation.
 
-Manual call (from module code): `utils::basic_honeypot_check(&ip).await`
+Manual call (from module code): `crate::utils::network::quick_honeypot_check(ip)`
 
 ---
 
@@ -176,6 +184,13 @@ The shell accepts Metasploit-style option names and maps them to Rustsploit keys
 | `target_rps` | `set target_rps 10` | Per-target rate limit |
 | `prescan` | `set prescan auto` | Pre-scan tool for CIDR (auto/masscan/zmap/none) |
 | `prescan_rate` | `set prescan_rate 1000` | Pre-scan packets per second |
+| `target_mac` | `setg target_mac AA:BB:CC:DD:EE:FF` | wpair: target a single Fast Pair device |
+| `adapter` | `setg adapter 1` | wpair: BLE adapter index |
+| `scan_secs` | `setg scan_secs 20` | wpair: BLE scan window (3–300 s) |
+| `model_id` | `setg model_id 0x0582FD` | wpair: Fast Pair model ID when not in the advert |
+| `antispoofing_key` | `setg antispoofing_key <base64>` | wpair: Provider Anti-Spoofing public key |
+| `gfp_metadata_url` | `setg gfp_metadata_url <tmpl>` | wpair: metadata API URL template (`{model_id}`/`{api_key}`) |
+| `gfp_api_key` | `setg gfp_api_key <key>` | wpair: metadata API key |
 | Any custom key | `set my_key value` | Modules read via `cfg_prompt_*` |
 
 ### Source Port Binding

@@ -139,7 +139,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .get("content-security-policy")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let body = match resp.text().await {
+    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);

@@ -146,7 +146,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     for url in &candidates {
         let r = match client.get(url).send().await { Ok(r) => r, Err(e) => { tracing::debug!("JWKS probe {} failed: {}", url, e); continue } };
         if !r.status().is_success() { continue; }
-        let body = match r.text().await {
+        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);

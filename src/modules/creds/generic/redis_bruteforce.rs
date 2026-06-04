@@ -217,7 +217,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
-        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -249,7 +249,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         }).await?;
-        return Ok(ModuleOutcome::ok());
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(crate::module::Finding {
+                target: host.clone(),
+                kind: crate::module::FindingKind::Credential,
+                message: format!("Valid Redis credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "redis",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
@@ -460,6 +474,23 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     result.print_found();
     if let Some(ref path) = save_path {
         result.save_to_file(path)?;
+    }
+
+    // Surface every discovered credential as a Finding (was previously printed
+    // and saved but never pushed into the outcome, so the scheduler/LootStore
+    // never saw brute-forced Redis creds).
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(crate::module::Finding {
+            target: host.clone(),
+            kind: crate::module::FindingKind::Credential,
+            message: format!("Valid Redis credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "redis",
+                "port": port,
+            })),
+        });
     }
 
     // Unknown / errored attempts

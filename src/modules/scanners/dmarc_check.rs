@@ -16,7 +16,7 @@ use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::udp::UdpClientStream;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::cfg_prompt_default;
 
 const DNS_TIMEOUT_SECS: u64 = 5;
@@ -59,34 +59,6 @@ pub fn info() -> ModuleInfo {
         disclosure_date: None,
         rank: ModuleRank::Excellent,
         default_port: None,
-    }
-}
-
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("dmarc_check requires a single-host target".to_string()),
-    };
-    let domain = registrable_domain(&sanitize_host(target));
-    match lookup_dmarc(&domain, "1.1.1.1").await {
-        Ok(Some(rec)) => {
-            let lower = rec.to_ascii_lowercase();
-            if lower.contains("p=none") {
-                CheckResult::Vulnerable(format!(
-                    "DMARC present but policy is p=none (monitoring only): {}",
-                    rec
-                ))
-            } else if lower.contains("p=quarantine") || lower.contains("p=reject") {
-                CheckResult::NotVulnerable(format!("DMARC enforced: {}", rec))
-            } else {
-                CheckResult::Unknown(format!("DMARC record found but policy unclear: {}", rec))
-            }
-        }
-        Ok(None) => CheckResult::Vulnerable(format!(
-            "No DMARC TXT record at _dmarc.{} — domain is open to spoofing",
-            domain
-        )),
-        Err(e) => CheckResult::Error(e.to_string()),
     }
 }
 
@@ -211,4 +183,4 @@ fn registrable_domain(host: &str) -> String {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "dmarc_check", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "dmarc_check", native);

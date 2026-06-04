@@ -181,6 +181,8 @@ fn is_valid_snmp_response(data: &[u8]) -> bool {
 
 /// Send SNMP GET and check for valid response
 async fn test_community(
+    ctx: &ModuleCtx,
+    target: &str,
     socket: &tokio::net::UdpSocket,
     addr: &str,
     community: &str,
@@ -191,6 +193,9 @@ async fn test_community(
     let request_id = rand::random::<u32>();
     let packet = build_snmp_get(community, oid, version, request_id);
 
+    // Honor the global/per-module/per-target rate limiter before every UDP probe
+    // (matches nbns_scanner / reflect_scanner) so fan-out scans don't flood targets.
+    ctx.rate_limit(target).await;
     socket.send_to(&packet, addr).await
         .context("Failed to send SNMP packet")?;
 
@@ -293,6 +298,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Probe one batch sequentially across all configured SNMP versions.
     async fn probe_batch(
+        ctx: &ModuleCtx,
+        target: &str,
         batch: &[String],
         socket: &tokio::net::UdpSocket,
         addr: &str,
@@ -306,15 +313,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 crate::mprint!("  [*] {} '{}' ... ", ver_name, community);
                 if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
-                match test_community(socket, addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
+                match test_community(ctx, target, socket, addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
                     Ok(Some(sys_descr)) => {
                         crate::mprintln!("{}", "VALID!".green().bold());
                         crate::mprintln!("    {}", format!("[+] sysDescr: {}", sys_descr).green());
 
-                        if let Ok(Some(sys_name)) = test_community(socket, addr, community, OID_SYS_NAME, *ver_byte, timeout_dur).await {
+                        if let Ok(Some(sys_name)) = test_community(ctx, target, socket, addr, community, OID_SYS_NAME, *ver_byte, timeout_dur).await {
                             crate::mprintln!("    {}", format!("[+] sysName: {}", sys_name).green());
                         }
-                        if let Ok(Some(sys_loc)) = test_community(socket, addr, community, OID_SYS_LOCATION, *ver_byte, timeout_dur).await {
+                        if let Ok(Some(sys_loc)) = test_community(ctx, target, socket, addr, community, OID_SYS_LOCATION, *ver_byte, timeout_dur).await {
                             crate::mprintln!("    {}", format!("[+] sysLocation: {}", sys_loc).green());
                         }
 
@@ -345,7 +352,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     match source {
         WordlistSource::InMemory(communities) => {
             total_tested = communities.len();
-            probe_batch(&communities, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
+            probe_batch(ctx, target, &communities, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
         }
         WordlistSource::Streaming(path) => {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
@@ -366,7 +373,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 batch_idx += 1;
                 crate::mprintln!("{}", format!("[*] Batch {}: {} communities", batch_idx, batch.len()).cyan());
                 total_tested += batch.len();
-                probe_batch(&batch, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
+                probe_batch(ctx, target, &batch, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
             }
 
             match reader_handle.await {
@@ -413,7 +420,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     if save_results && !valid_communities.is_empty() {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "snmp_scan_results.txt").await?;
+        let default_name = format!("snmp_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
         let content = valid_communities.join("\n");
         tokio::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content)).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;

@@ -9,12 +9,18 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use colored::*;
 use reqwest::{Client, Method};
 use serde_json::json;
 
+use crate::module::Finding;
 use crate::native::payload_engine::{self as payload_mutator, PayloadCategory};
+
+/// Shared collector threaded through the scan path so detections reach the
+/// `ModuleOutcome` instead of only the on-disk result files.
+pub(super) type FindingSink = Arc<tokio::sync::Mutex<Vec<Finding>>>;
 
 use super::config::{Endpoint, ScanConfig, ScanModule, SPOOF_HEADERS};
 use super::idenum::perform_id_enumeration;
@@ -41,7 +47,12 @@ fn expand_with_mutations(
     mutated
 }
 
-pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint: Endpoint) {
+pub(super) async fn scan_endpoint(
+    client: &Client,
+    config: &ScanConfig,
+    endpoint: Endpoint,
+    findings: &FindingSink,
+) {
     // Per-endpoint output dir keyed on `<sanitized_key>_<path_hash>` so two
     // endpoints that sanitize to the same name still get separate directories.
     use std::collections::hash_map::DefaultHasher;
@@ -75,8 +86,10 @@ pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint
         for module in &config.modules {
             match module {
                 ScanModule::Baseline => {
-                    scan_method(client, &url, method.clone(), &endpoint_dir, &method_str, config)
-                        .await;
+                    scan_method(
+                        client, &url, method.clone(), &endpoint_dir, &method_str, config, findings,
+                    )
+                    .await;
                 }
                 ScanModule::Spoofing => {
                     scan_spoofing(
@@ -86,6 +99,7 @@ pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint
                         &endpoint_dir,
                         &method_str,
                         config,
+                        findings,
                     )
                     .await;
                 }
@@ -101,6 +115,7 @@ pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint
                                 payload,
                                 &endpoint_dir,
                                 config,
+                                findings,
                             )
                             .await;
                         }
@@ -119,6 +134,7 @@ pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint
                                 payload,
                                 &endpoint_dir,
                                 config,
+                                findings,
                             )
                             .await;
                         }
@@ -136,6 +152,7 @@ pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint
                                 payload,
                                 &endpoint_dir,
                                 config,
+                                findings,
                             )
                             .await;
                         }
@@ -154,14 +171,17 @@ pub(super) async fn scan_endpoint(client: &Client, config: &ScanConfig, endpoint
                                 payload,
                                 &endpoint_dir,
                                 config,
+                                findings,
                             )
                             .await;
                         }
                     }
                 }
                 ScanModule::IdEnumeration => {
-                    perform_id_enumeration(client, &url, method.clone(), &endpoint_dir, config)
-                        .await;
+                    perform_id_enumeration(
+                        client, &url, method.clone(), &endpoint_dir, config, findings,
+                    )
+                    .await;
                 }
             }
         }
@@ -175,6 +195,7 @@ async fn scan_method(
     dir: &Path,
     method_name: &str,
     config: &ScanConfig,
+    findings: &FindingSink,
 ) {
     let result_file = dir.join("results.txt");
     perform_request(&RequestSpec {
@@ -187,6 +208,8 @@ async fn scan_method(
         header: None,
         custom_json: None,
         config,
+        injection_type: None,
+        findings,
     })
     .await;
 }
@@ -198,6 +221,7 @@ async fn scan_spoofing(
     dir: &Path,
     method_name: &str,
     config: &ScanConfig,
+    findings: &FindingSink,
 ) {
     let result_file = dir.join("results.txt");
     for &header in SPOOF_HEADERS {
@@ -216,6 +240,8 @@ async fn scan_spoofing(
             header: Some((header, value)),
             custom_json: None,
             config,
+            injection_type: None,
+            findings,
         })
         .await;
     }
@@ -229,6 +255,7 @@ async fn perform_injection(
     payload: &str,
     dir: &Path,
     config: &ScanConfig,
+    findings: &FindingSink,
 ) {
     let result_file = dir.join("injection_results.txt");
 
@@ -249,6 +276,8 @@ async fn perform_injection(
         header: None,
         custom_json: None,
         config,
+        injection_type: Some(type_name),
+        findings,
     })
     .await;
 
@@ -273,6 +302,8 @@ async fn perform_injection(
                 header: None,
                 custom_json: Some(json_payload),
                 config,
+                injection_type: Some(type_name),
+                findings,
             })
             .await;
         }

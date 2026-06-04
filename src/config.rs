@@ -58,11 +58,29 @@ impl GlobalConfig {
             return Err(anyhow!("Target cannot contain control characters"));
         }
 
-        // Mass scan keywords: "random", "0.0.0.0" — store as-is
-        if trimmed == "random" || trimmed == "0.0.0.0" {
+        // Mass scan keyword: "random" — store as-is. Bare "0.0.0.0" is NOT a
+        // mass-scan keyword (M45); it falls through to normal single-host
+        // handling. "0.0.0.0/0" is handled below as a CIDR subnet.
+        if trimmed == "random" {
             let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
             return Ok(());
+        }
+
+        // Sequential mass-scan keywords: `seq`/`sequential` (whole public range)
+        // or `seq:<ip>`/`sequential:<ip>` (explicit start). Stored verbatim;
+        // `module::Target::parse` turns it into `Target::Sequential`.
+        {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower == "seq"
+                || lower == "sequential"
+                || lower.starts_with("seq:")
+                || lower.starts_with("sequential:")
+            {
+                let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+                *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+                return Ok(());
+            }
         }
 
         // File-based target list: resolve canonical path to prevent traversal,
@@ -105,7 +123,7 @@ impl GlobalConfig {
                 return self.set_target(&targets[0]);
             }
             // Validate each individual target
-            const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
+            const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0/0"];
             for t in &targets {
                 // Allow mass scan keywords, CIDRs, file paths, and hostnames/IPs
                 if MASS_SCAN_KEYWORDS.contains(&t.as_str()) {
@@ -173,10 +191,8 @@ impl GlobalConfig {
             return Err(anyhow!("Target cannot start with '.' or '-'"));
         }
         
-        if target.ends_with('.') && !target.ends_with("..") {
-            // Allow trailing dot for FQDN, but not double dots
-        }
-        
+        // A single trailing dot (FQDN root label, e.g. "example.com.") is
+        // allowed implicitly; consecutive dots are rejected just below.
         // Check for consecutive dots (invalid in hostnames)
         if target.contains("..") {
             return Err(anyhow!("Target cannot contain consecutive dots"));
@@ -220,6 +236,22 @@ impl GlobalConfig {
                 for t in targets {
                     if let Ok(net) = t.parse::<IpNetwork>() {
                         total = total.saturating_add(Self::network_size(&net));
+                    } else if std::path::Path::new(t).is_file() {
+                        // A file member contributes its real target count (one per
+                        // non-empty, non-comment line), not a flat 1 — otherwise a
+                        // comma-list containing a host file wildly under-estimates
+                        // the scan size used for ETA/throttling.
+                        let lines = std::fs::read_to_string(t)
+                            .map(|s| {
+                                s.lines()
+                                    .filter(|l| {
+                                        let l = l.trim();
+                                        !l.is_empty() && !l.starts_with('#')
+                                    })
+                                    .count() as u64
+                            })
+                            .unwrap_or(1);
+                        total = total.saturating_add(lines.max(1));
                     } else {
                         total = total.saturating_add(1);
                     }

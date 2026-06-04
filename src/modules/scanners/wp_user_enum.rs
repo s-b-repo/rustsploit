@@ -66,7 +66,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", format!("[*] GET {}", url).cyan());
     if let Ok(r) = client.get(&url).send().await {
         let s = r.status().as_u16();
-        let body = match r.text().await {
+        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);
@@ -133,7 +133,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let probe = format!("{}/?p=1", base);
     if let Ok(r) = client.get(format!("{}/wp-json/oembed/1.0/embed?url={}", base, url_encode(&probe))).send().await {
         let s = r.status().as_u16();
-        let body = match r.text().await {
+        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);
@@ -141,8 +141,28 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
         };
         if s == 200 && body.contains("author_name") {
-            crate::mprintln!("{}", format!("[+] oembed disclosed author for {}: {}",
-                probe, body.chars().take(200).collect::<String>()).green());
+            let author_name = body.split("\"author_name\":\"").nth(1)
+                .and_then(|s| s.split('"').next()).unwrap_or("").to_string();
+            let author_url = body.split("\"author_url\":\"").nth(1)
+                .and_then(|s| s.split('"').next()).unwrap_or("").to_string();
+            // derive slug from /author/<slug> in the author_url if present
+            let slug = author_url.split("/author/").nth(1)
+                .and_then(|s| s.trim_end_matches('/').split('/').next())
+                .unwrap_or("").to_string();
+            crate::mprintln!("{}", format!("[+] oembed disclosed author for {}: name='{}' url='{}'",
+                probe, author_name, author_url).green());
+            users.push(("oembed".to_string(), slug.clone(), author_name.clone()));
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Note,
+                message: format!("WP author disclosed via oembed: name={} url={}", author_name, author_url),
+                data: Some(serde_json::json!({
+                    "vector": "oembed",
+                    "author_name": author_name,
+                    "author_url": author_url,
+                    "slug": slug,
+                })),
+            });
         }
     }
 

@@ -9,10 +9,14 @@ fn safe_write(path: &str, data: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // Owner-only (0o600): the export aggregates every credential secret in
+        // cleartext plus hosts/loot, so it must never be created world-readable
+        // — matching the cred/loot/workspace stores which all write 0o600.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .context(format!("Failed to open '{}' (symlinks not allowed)", path))?;
@@ -196,12 +200,14 @@ pub async fn export_summary(path: &str) -> Result<()> {
 
 fn csv_escape(s: &str) -> String {
     let mut val = s.to_string();
-    let needs_formula_guard = val.starts_with('=')
-        || val.starts_with('+')
-        || val.starts_with('@')
-        || val.starts_with('-')
-        || val.starts_with('\t')
-        || val.starts_with('\r');
+    // Spreadsheets trim leading whitespace before evaluating a cell, so check
+    // the first *non-whitespace* char — otherwise " =cmd|'/c calc'!A1" (note
+    // the leading space) slips past a naive `starts_with('=')` guard.
+    let needs_formula_guard = val
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '=' | '+' | '@' | '-' | '\t' | '\r'));
     if needs_formula_guard {
         val = format!("'{}", val);
     }

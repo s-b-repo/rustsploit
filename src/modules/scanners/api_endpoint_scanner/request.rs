@@ -15,7 +15,10 @@ use futures::StreamExt;
 use rand::seq::IndexedRandom;
 use reqwest::{Client, Method, Response};
 
+use crate::module::{Finding, FindingKind};
+
 use super::config::{GenericPayload, ScanConfig, CHROME_USER_AGENTS};
+use super::scan::FindingSink;
 
 pub(super) struct RequestSpec<'a> {
     pub client: &'a Client,
@@ -27,6 +30,56 @@ pub(super) struct RequestSpec<'a> {
     pub header: Option<(&'a str, &'a str)>,
     pub custom_json: Option<serde_json::Value>,
     pub config: &'a ScanConfig,
+    /// Injection category ("SQLi"/"NoSQLi"/"CMDi"/"Traversal") when this is an
+    /// injection probe; `None` for baseline/spoofing requests.
+    pub injection_type: Option<&'a str>,
+    pub findings: &'a FindingSink,
+}
+
+/// Inspect a captured response body for a confirmed injection signature given
+/// the injection category. Reuses standard, well-known indicators only — no new
+/// heuristics beyond confirming the payload the scanner already sent.
+fn detect_injection_signature(injection_type: &str, body: &str) -> Option<&'static str> {
+    let lower = body.to_ascii_lowercase();
+    match injection_type {
+        "SQLi" => {
+            const SQL_ERRORS: &[&str] = &[
+                "sql syntax",
+                "mysql_fetch",
+                "you have an error in your sql syntax",
+                "unclosed quotation mark",
+                "ora-01756",
+                "ora-00933",
+                "sqlite3::",
+                "sqlstate",
+                "psql: error",
+                "pg_query",
+                "syntax error at or near",
+            ];
+            SQL_ERRORS.iter().copied().find(|sig| lower.contains(*sig))
+        }
+        "NoSQLi" => {
+            const NOSQL_ERRORS: &[&str] = &[
+                "mongoerror",
+                "unexpected token",
+                "$where",
+                "bson",
+            ];
+            NOSQL_ERRORS.iter().copied().find(|sig| lower.contains(*sig))
+        }
+        "CMDi" => {
+            // `id` output or /etc/passwd contents leaking into the response.
+            const CMD_SIGNS: &[&str] = &["uid=", "gid=", "root:x:", "/bin/bash"];
+            CMD_SIGNS.iter().copied().find(|sig| lower.contains(*sig))
+        }
+        "Traversal" => {
+            // /etc/passwd or win.ini contents.
+            const TRAVERSAL_SIGNS: &[&str] =
+                &["root:x:0:0:", "daemon:x:", "[fonts]", "[extensions]"];
+            TRAVERSAL_SIGNS.iter().copied().find(|sig| lower.contains(*sig))
+        }
+        _ => None,
+    }
 }
 
 pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
@@ -55,7 +108,17 @@ pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
 
     match req_builder.send().await {
         Ok(resp) => {
-            if let Err(e) = log_response(resp, spec.result_file, &full_label, spec.url, user_agent).await {
+            if let Err(e) = log_response(
+                resp,
+                spec.result_file,
+                &full_label,
+                spec.url,
+                user_agent,
+                spec.injection_type,
+                spec.findings,
+            )
+            .await
+            {
                 crate::meprintln!(
                     "\n{}",
                     format!("[!] Failed to log response for {}: {}", full_label, e).red()
@@ -76,12 +139,15 @@ pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_response(
     resp: Response,
     path: &Path,
     method: &str,
     url: &str,
     user_agent: &str,
+    injection_type: Option<&str>,
+    findings: &FindingSink,
 ) -> Result<()> {
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -147,6 +213,35 @@ async fn log_response(
             if truncated { " (TRUNCATED)" } else { "" },
             body_str
         )?;
+
+        // Confirmed-injection detection: only for injection probes, and only
+        // when a standard signature for that category is present in the body.
+        if let Some(itype) = injection_type
+            && let Some(signature) = detect_injection_signature(itype, &body_str)
+        {
+            let message = format!(
+                "{} injection signature detected ({}) at {}",
+                itype, signature, url
+            );
+            crate::events::emit(crate::events::ModuleEvent::Finding {
+                module: "api_endpoint_scanner".to_string(),
+                target: url.to_string(),
+                kind: "Vulnerable".to_string(),
+                message: message.clone(),
+            });
+            findings.lock().await.push(Finding {
+                target: url.to_string(),
+                kind: FindingKind::Vulnerable,
+                message,
+                data: Some(serde_json::json!({
+                    "url": url,
+                    "injection_type": itype,
+                    "signature": signature,
+                    "status": status.as_u16(),
+                    "label": method,
+                })),
+            });
+        }
     } else {
         writeln!(file, "Body is binary or non-UTF8")?;
     }

@@ -9,7 +9,10 @@ use once_cell::sync::Lazy;
 
 /// Global spool state for console logging.
 pub struct SpoolState {
-    file: RwLock<Option<(File, String)>>, // (file handle, filename)
+    // (file handle, filename, owning tenant). The owner is tracked explicitly
+    // so cross-tenant ownership checks are exact equality, not a brittle
+    // filename-prefix match (`foo` must not be able to stop `foo_bar`'s spool).
+    file: RwLock<Option<(File, String, Option<String>)>>,
 }
 
 impl SpoolState {
@@ -19,9 +22,10 @@ impl SpoolState {
         }
     }
 
-    /// Start spooling to a file.
+    /// Start spooling to a file. `owner` is the tenant that owns this spool
+    /// (`None` in single-user shell mode); used for exact-match ownership checks.
     /// Path is validated against traversal, absolute paths, and symlinks.
-    pub fn start(&self, path: &str) -> Result<()> {
+    pub fn start(&self, path: &str, owner: Option<&str>) -> Result<()> {
         // Reject path traversal
         if path.contains("..") || path.contains('\0') {
             return Err(anyhow!("Path traversal not allowed in spool path {:?}", path));
@@ -39,13 +43,13 @@ impl SpoolState {
             && parent != Path::new("") {
                 // Ensure parent directory exists
                 let resolved = resolve_spool_path(path)?;
-                return self.start_at_path(&resolved, path);
+                return self.start_at_path(&resolved, path, owner);
             }
         // Simple filename — write in CWD
-        self.start_at_path(&PathBuf::from(path), path)
+        self.start_at_path(&PathBuf::from(path), path, owner)
     }
 
-    fn start_at_path(&self, resolved: &Path, display_name: &str) -> Result<()> {
+    fn start_at_path(&self, resolved: &Path, display_name: &str, owner: Option<&str>) -> Result<()> {
         let mut guard = self
             .file
             .write()
@@ -83,7 +87,7 @@ impl SpoolState {
         if let Err(e) = file.flush() {
             eprintln!("[!] Flush error: {}", e);
         }
-        *guard = Some((file, display_name.to_string()));
+        *guard = Some((file, display_name.to_string(), owner.map(|s| s.to_string())));
         Ok(())
     }
 
@@ -96,7 +100,7 @@ impl SpoolState {
                 return None;
             }
         };
-        let (mut file, name) = guard.take()?;
+        let (mut file, name, _owner) = guard.take()?;
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         if let Err(e) = writeln!(file) {
             eprintln!("[!] Spool write error: {}", e);
@@ -124,7 +128,14 @@ impl SpoolState {
     /// Get the current spool filename.
     pub fn current_file(&self) -> Option<String> {
         let g = self.file.read().unwrap_or_else(|e| e.into_inner());
-        g.as_ref().map(|(_, name)| name.clone())
+        g.as_ref().map(|(_, name, _)| name.clone())
+    }
+
+    /// The tenant that owns the active spool, if any. Used for exact-match
+    /// cross-tenant ownership checks (a tenant may only stop/inspect its own).
+    pub fn owner(&self) -> Option<String> {
+        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|(_, _, owner)| owner.clone())
     }
 
     /// Write a line to the spool file (if active).
@@ -145,8 +156,26 @@ impl SpoolState {
             Ok(g) => g,
             Err(e) => { tracing::warn!("spool RwLock poisoned, dropping message: {e}"); return Ok(()); }
         };
-        if let Some((ref mut file, _)) = *guard {
+        if let Some((ref mut file, _, _)) = *guard {
             file.write_all(buf.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Write raw text to the spool WITHOUT appending a newline. Used for
+    /// no-newline console output (`mprint!`/`meprint!`) so a progress line
+    /// rendered as one terminal line is not split across multiple spool lines.
+    pub fn write_raw(&self, msg: &str) -> Result<(), std::io::Error> {
+        if let Ok(g) = self.file.read()
+            && g.is_none() {
+                return Ok(());
+            }
+        let mut guard = match self.file.write() {
+            Ok(g) => g,
+            Err(e) => { tracing::warn!("spool RwLock poisoned, dropping message: {e}"); return Ok(()); }
+        };
+        if let Some((ref mut file, _, _)) = *guard {
+            file.write_all(msg.as_bytes())?;
         }
         Ok(())
     }

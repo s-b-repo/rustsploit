@@ -144,7 +144,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
         let output_file = cfg_prompt_output_file("output_file", "Output result file", "ftp_subnet_results.txt").await?;
 
-        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -166,7 +166,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         }).await?;
-        return Ok(ModuleOutcome::ok());
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid FTP credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "ftp",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
@@ -180,7 +194,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(cfg_prompt_output_file("output_file", "Output file", "ftp_results.txt").await?)
+        let default_name = format!("ftp_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        Some(cfg_prompt_output_file("output_file", "Output file", &default_name).await?)
     } else {
         None
     };

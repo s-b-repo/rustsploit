@@ -96,7 +96,7 @@ async fn dns_lookup(name: &str, rtype: RecordType, resolver: &str) -> Result<Vec
     Ok(msg.answers().iter().map(|r| format!("{}", r.data())).collect())
 }
 
-async fn chain_for(host: &str, resolver: &str) -> (Vec<String>, bool) {
+async fn chain_for(host: &str, resolver: &str) -> (Vec<String>, Option<bool>) {
     let mut chain = Vec::new();
     let mut current = host.to_string();
     for _ in 0..10 {
@@ -108,7 +108,20 @@ async fn chain_for(host: &str, resolver: &str) -> (Vec<String>, bool) {
             Err(e) => { tracing::debug!("CNAME lookup for {} failed: {}", current, e); break; }
         }
     }
-    let resolves = dns_lookup(host, RecordType::A, resolver).await.map(|v| !v.is_empty()).unwrap_or(false);
+    // Distinguish a genuine empty/NXDOMAIN answer (real non-resolution -> dangling
+    // candidate) from a transport error (timeout/SERVFAIL/packet loss -> unknown).
+    // A transport error must NOT be coerced to "does not resolve", which would
+    // manufacture false-positive subdomain-takeover findings on benign hosts.
+    // Retry a couple of times before concluding non-resolution to tolerate lossy UDP.
+    let mut resolves: Option<bool> = None;
+    for attempt in 0..3 {
+        match dns_lookup(host, RecordType::A, resolver).await {
+            Ok(v) => { resolves = Some(!v.is_empty()); break; }
+            Err(e) => {
+                tracing::debug!("A lookup for {} failed (attempt {}): {}", host, attempt + 1, e);
+            }
+        }
+    }
     (chain, resolves)
 }
 
@@ -142,7 +155,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut tagged: usize = 0;
 
     // Resolve up to CNAME_CONCURRENCY hosts in parallel; preserve input order.
-    let work: Vec<BoxFut<(String, Vec<String>, bool)>> = hosts.into_iter().map(|host| {
+    let work: Vec<BoxFut<(String, Vec<String>, Option<bool>)>> = hosts.into_iter().map(|host| {
         let resolver = resolver.clone();
         Box::pin(async move {
             let (chain, resolves) = chain_for(&host, &resolver).await;
@@ -156,22 +169,39 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let provider = tag_provider(&terminal);
         let chain_str = if chain.is_empty() { "(none)".to_string() } else { chain.join(" -> ") };
 
-        let dangling_tag = !resolves && !chain.is_empty();
+        // Only treat as dangling when the terminal A lookup *succeeded* and returned
+        // an empty answer (Some(false)). A transport error yields None (unknown) and
+        // must not be reported as a takeover candidate.
+        let dangling_tag = resolves == Some(false) && !chain.is_empty();
+        let lookup_failed = resolves.is_none();
         if dangling_tag { dangling += 1; }
         if provider.is_some() { tagged += 1; }
 
         let label = match (provider, dangling_tag) {
             (_, true) => "[!!] DANGLING".red().bold().to_string(),
+            (Some(ref p), false) if lookup_failed => format!("[?] {} (resolution unknown)", p).yellow().to_string(),
             (Some(ref p), false) => format!("[!] {}", p).yellow().to_string(),
+            (None, false) if lookup_failed => "[?]".yellow().to_string(),
             (None, false) if chain.is_empty() => "[ ]".dimmed().to_string(),
             (None, false) => "[+]".green().to_string(),
         };
-        crate::mprintln!("{} {} -> {} (resolves={})", label, host, chain_str, resolves);
+        let resolves_str = match resolves { Some(true) => "true", Some(false) => "false", None => "unknown" };
+        crate::mprintln!("{} {} -> {} (resolves={})", label, host, chain_str, resolves_str);
         if dangling_tag {
             outcome.findings.push(Finding {
                 target: host.clone(),
                 kind: FindingKind::Vulnerable,
                 message: format!("Dangling CNAME {host} -> {chain_str} (terminal does not resolve)"),
+                data: None,
+            });
+        } else if lookup_failed && !chain.is_empty() {
+            // CNAME chain exists but the terminal A lookup could not be determined
+            // (transport error). Surface as a Note so it can be re-checked rather than
+            // silently dropped or falsely flagged as a takeover.
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Note,
+                message: format!("CNAME {host} -> {chain_str} (terminal resolution unconfirmed; A lookup failed, requires re-check)"),
                 data: None,
             });
         } else if let Some(p) = provider {

@@ -157,18 +157,36 @@ impl LootStore {
         }
 
         let entry = LootEntry {
+            // Scrub host + source_module too (not just loot_type/description):
+            // both are printed raw by `loot` and could carry terminal-escape
+            // bytes from an attacker-controlled banner / module string.
             id: id.clone(),
-            host: host.to_string(),
-            loot_type: loot_type.to_string(),
+            host: crate::utils::scrub_stored_text(host),
+            loot_type: crate::utils::scrub_stored_text(loot_type),
             filename,
-            description: description.to_string(),
-            source_module: source_module.to_string(),
+            description: crate::utils::scrub_stored_text(description),
+            source_module: crate::utils::scrub_stored_text(source_module),
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         };
 
         // P1-1: hold the write lock across the disk save.
         {
             let mut entries = self.entries.write().await;
+            // Re-check the cap under the write lock. The earlier read-lock check
+            // is only a fast path: concurrent `add`s can each pass it and then
+            // all push, blowing past the cap. Re-checking here also handles the
+            // file we already wrote above — remove it so a rejected add doesn't
+            // leave an orphan loot file on disk.
+            if entries.len() >= Self::MAX_LOOT_ENTRIES {
+                eprintln!(
+                    "[!] Loot store full ({} entries) — discarding just-written loot file",
+                    Self::MAX_LOOT_ENTRIES
+                );
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    tracing::debug!("failed to remove orphan loot file {}: {e}", file_path.display());
+                }
+                return None;
+            }
             entries.push(entry);
             let snapshot = entries.clone();
             self.save_locked(&snapshot).await;

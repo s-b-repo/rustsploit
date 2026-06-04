@@ -240,7 +240,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 1000).await? as usize;
     let save_results_opt = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
     let output_file = if save_results_opt {
-        cfg_prompt_output_file("output_file", "Output file", "honeypot_results.txt").await?
+        let default_name = format!("honeypot_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        cfg_prompt_output_file("output_file", "Output file", &default_name).await?
     } else {
         String::new()
     };

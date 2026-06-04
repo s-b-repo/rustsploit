@@ -125,7 +125,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let status = r.status().as_u16();
             let ct = r.headers().get("content-type")
                 .and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-            let body = match r.text().await {
+            let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Failed to read response body: {}", e);
@@ -156,7 +156,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 if status >= 400 { return (path, full, None); }
                 let ct = resp.headers().get("content-type")
                     .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let body = match resp.text().await {
+                let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!("Failed to read response body: {}", e);

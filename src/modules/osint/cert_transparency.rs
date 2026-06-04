@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module_info::{ModuleInfo, ModuleRank};
 
 const CRT_SH_BASE: &str = "https://crt.sh";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -39,11 +39,6 @@ pub fn info() -> ModuleInfo {
         rank: ModuleRank::Normal,
         default_port: None,
     }
-}
-
-pub async fn check(_ctx: &ModuleCtx) -> CheckResult {
-    // OSINT modules don't have a "vulnerable" state — they always run.
-    CheckResult::Unknown("OSINT enumeration; no vulnerability check applicable".to_string())
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
@@ -229,4 +224,4 @@ fn urlencoding_encode(s: &str) -> String {
     crate::utils::url_encode(s)
 }
 
-crate::register_native_module!(crate::module::Category::Osint, "cert_transparency", native, has_check);
+crate::register_native_module!(crate::module::Category::Osint, "cert_transparency", native);

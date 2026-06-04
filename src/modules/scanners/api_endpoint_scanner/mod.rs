@@ -14,7 +14,7 @@ use colored::*;
 use futures::{stream, StreamExt};
 use reqwest::Method;
 
-use crate::module::{ModuleCtx, ModuleOutcome};
+use crate::module::{Finding, ModuleCtx, ModuleOutcome};
 use crate::native::payload_engine::MutatorConfig;
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
@@ -43,8 +43,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!();
 
     // 1. Input parsing & configuration.
+    let default_output_dir =
+        format!("api_scan_results_{}", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
     let output_dir_name =
-        cfg_prompt_default("output_dir", "Output directory name", "api_scan_results").await?;
+        cfg_prompt_default("output_dir", "Output directory name", &default_output_dir).await?;
     let use_spoofing = cfg_prompt_yes_no(
         "use_spoofing",
         "Enable IP Spoofing/Bypass headers logic? (Applies to all selected modules)",
@@ -329,11 +331,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let counter = Arc::new(AtomicUsize::new(0));
     let total = endpoints.len();
 
+    // Shared findings collector — every detection along the scan path pushes
+    // into this so results reach loot/export instead of only landing on disk.
+    let findings: Arc<tokio::sync::Mutex<Vec<Finding>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
     let stream = stream::iter(endpoints)
         .map(|endpoint| {
             let config = Arc::clone(&config);
             let client = client.clone();
             let counter = Arc::clone(&counter);
+            let findings = Arc::clone(&findings);
             async move {
                 let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if current.is_multiple_of(10) || current == total {
@@ -343,7 +351,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     }
                 }
 
-                scan_endpoint(&client, &config, endpoint).await
+                scan_endpoint(&client, &config, endpoint, &findings).await
             }
         })
         .buffer_unordered(concurrency);
@@ -353,7 +361,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("\n{}", "\n[+] Scan completed!".green().bold());
     crate::mprintln!("[+] Processed {} endpoints.", results.len());
     crate::mprintln!("Time elapsed: {:.2?}", start_time.elapsed());
-    Ok(ModuleOutcome::ok())
+
+    // Move the collected detections into the outcome so they are exported.
+    let collected = std::mem::take(&mut *findings.lock().await);
+    if !collected.is_empty() {
+        crate::mprintln!(
+            "{}",
+            format!("[+] {} finding(s) recorded.", collected.len()).green().bold()
+        );
+    }
+    let mut outcome = ModuleOutcome::ok();
+    outcome.findings = collected;
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {

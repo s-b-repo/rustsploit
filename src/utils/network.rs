@@ -10,6 +10,89 @@ use tokio::net::TcpStream;
 
 use super::target::extract_ip_from_target;
 
+// ============================================================
+// SSRF DNS pinning (anti-rebinding)
+// ============================================================
+//
+// The API/MCP SSRF guard (`crate::api::resolve_and_check`) resolves a target
+// hostname and verifies none of the resolved IPs are blocked (cloud-metadata /
+// link-local / loopback / RFC1918). Without pinning, the module re-resolves the
+// hostname at connect time, so an attacker-controlled DNS name can return a
+// public IP for the validation lookup and a blocked IP for the connect
+// (DNS-rebinding / TOCTOU), bypassing the filter. To close that window,
+// `resolve_and_check` records the validated IPs here via `pin_resolved_ips`, and
+// every reqwest client built through `build_http_client_with` installs
+// `PinningResolver`, which returns the pinned IPs for a pinned host (no
+// re-resolution) and otherwise performs a standard system lookup. Pins expire
+// after a short TTL. In shell mode the SSRF guard never runs, so the cache stays
+// empty and the resolver always falls back — behaviour identical to reqwest's
+// default GAI resolver.
+
+const DNS_PIN_TTL: Duration = Duration::from_secs(30);
+
+fn dns_pins() -> &'static std::sync::Mutex<std::collections::HashMap<String, (Vec<IpAddr>, std::time::Instant)>> {
+    static PINS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (Vec<IpAddr>, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    PINS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the SSRF-validated IPs for `host` (lowercased hostname, no port) so a
+/// subsequent HTTP connect to that hostname uses exactly these addresses,
+/// preventing a DNS-rebinding TOCTOU between the SSRF check and the connect.
+pub fn pin_resolved_ips(host: &str, ips: &[IpAddr]) {
+    if host.is_empty() || ips.is_empty() {
+        return;
+    }
+    // Recover from a poisoned lock rather than dropping the pin: the map is still
+    // logically valid after another thread panicked, and silently skipping the
+    // insert would leave the host unpinned (re-resolved at connect → the very
+    // rebind window we are closing). The data is non-secret, so reusing it is safe.
+    let mut m = dns_pins().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Evict stale entries first so a long-lived daemon scanning many hostnames
+    // can't grow the map without bound. `retain` always passes the key; we keep
+    // an entry iff its pin is still within the TTL.
+    m.retain(|_host, entry| {
+        let (_ips, pinned_at) = entry;
+        pinned_at.elapsed() < DNS_PIN_TTL
+    });
+    m.insert(host.to_ascii_lowercase(), (ips.to_vec(), std::time::Instant::now()));
+}
+
+/// Return the pinned IPs for `host` if the pin is still fresh.
+fn pinned_ips(host: &str) -> Option<Vec<IpAddr>> {
+    // Recover a poisoned lock (see pin_resolved_ips) so a fresh pin is still
+    // honoured rather than silently falling back to re-resolution.
+    let m = dns_pins().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ips, t) = m.get(&host.to_ascii_lowercase())?;
+    (t.elapsed() < DNS_PIN_TTL).then(|| ips.clone())
+}
+
+/// reqwest DNS resolver that honours SSRF-validated pins and otherwise performs
+/// a standard system lookup (matching reqwest's default behaviour).
+#[derive(Debug, Clone, Copy)]
+struct PinningResolver;
+
+impl reqwest::dns::Resolve for PinningResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            if let Some(ips) = pinned_ips(&host) {
+                // Port 0 — reqwest substitutes the URL/scheme port per the
+                // `Resolve` trait contract.
+                let addrs: reqwest::dns::Addrs =
+                    Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+                return Ok(addrs);
+            }
+            // Not pinned: ordinary system resolution.
+            let resolved: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0u16)).await?.collect();
+            let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
 /// True if a non-blocking `connect()` returned the platform's "in progress"
 /// indicator (Unix: EINPROGRESS, Windows: WSAEWOULDBLOCK → ErrorKind::WouldBlock).
 /// Used to distinguish a real connect failure from the expected async-pending
@@ -40,9 +123,22 @@ fn is_in_progress(e: &std::io::Error) -> bool {
 /// target. Mass-scan / random-IP / file-list targets are intentionally not
 /// passed in here — those have their own per-IP gates downstream.
 pub async fn assert_dos_target_authorized(target: &str) -> anyhow::Result<()> {
-    // Reuse the API-side blocklist: cloud metadata + IPv6 link-local
-    // unconditionally; loopback/RFC1918 only when running in production.
-    if !crate::api::is_blocked_target(target) {
+    // Resolve the target and inspect every resolved address, not just the
+    // literal string. `is_blocked_target` alone misses a hostname (or an
+    // encoded-IP literal like the decimal form of 127.0.0.1) that *resolves*
+    // to a loopback/RFC1918/metadata address — the warning text even says
+    // "resolves to", so the check must actually resolve.
+    //
+    // `resolve_and_check` returns Ok when the target resolves with no blocked
+    // addresses, an Err containing "blocked" when the literal target or any
+    // resolved address is blocked, and a DNS-failure Err otherwise. A transient
+    // DNS failure is NOT treated as authorization-required: the flood cannot
+    // reach an unresolvable host, so gating on it would only false-positive.
+    let blocked = match crate::api::resolve_and_check(target).await {
+        Ok(_) => false,
+        Err(e) => e.contains("blocked"),
+    };
+    if !blocked {
         return Ok(());
     }
     crate::mprintln!(
@@ -528,6 +624,10 @@ pub fn build_http_client_with(
         builder = builder.pool_max_idle_per_host(cap);
     }
 
+    // Honour SSRF DNS pins (anti-rebinding). For unpinned hosts this falls back
+    // to a standard system lookup, so behaviour is unchanged outside API mode.
+    builder = builder.dns_resolver(PinningResolver);
+
     builder.build()
 }
 
@@ -629,8 +729,9 @@ pub async fn http_get_status_body(
         .await
         .with_context(|| format!("GET {} failed", url))?;
     let status = resp.status().as_u16();
-    let body = resp
-        .text()
+    // OOM-safe: cap the body so a hostile/large response can't exhaust memory
+    // (reqwest has no built-in response-size limit). See DEFAULT_BODY_CAP.
+    let body = read_http_body_text_capped(resp, DEFAULT_BODY_CAP)
         .await
         .with_context(|| format!("decode body of {}", url))?;
     Ok((status, body))
@@ -650,11 +751,41 @@ pub async fn http_get_status_headers_body(
         .with_context(|| format!("GET {} failed", url))?;
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let body = resp
-        .text()
+    // OOM-safe: cap the body so a hostile/large response can't exhaust memory
+    // (reqwest has no built-in response-size limit). See DEFAULT_BODY_CAP.
+    let body = read_http_body_text_capped(resp, DEFAULT_BODY_CAP)
         .await
         .with_context(|| format!("decode body of {}", url))?;
     Ok((status, headers, body))
+}
+
+/// Default maximum number of bytes any single HTTP response body read through
+/// the helpers in this module should buffer into memory.
+///
+/// reqwest has **no** built-in response-size limit: `Response::text()` /
+/// `Response::bytes()` buffer the *entire* body, so a malicious or misbehaving
+/// server can stream gigabytes and OOM-kill the scanner — especially during a
+/// mass /16 sweep with high concurrency. The OOM-safe primitive itself lives in
+/// [`crate::utils::safe_io::read_http_body_capped`]; this re-export keeps a
+/// single default cap value next to the HTTP client builder so call sites in
+/// this module (and modules that prefer the `network::` path) don't hardcode a
+/// magic number.
+pub use crate::utils::safe_io::DEFAULT_BODY_CAP;
+
+/// Lossy-UTF-8 convenience wrapper over
+/// [`crate::utils::safe_io::read_http_body_capped`] — the OOM-safe analogue of
+/// `resp.text().await`. Streams the body chunk-by-chunk, rejecting an oversized
+/// advertised `Content-Length` up front and bailing as soon as the running
+/// total would exceed `max_bytes`, then decodes via [`String::from_utf8_lossy`]
+/// so non-UTF-8 bodies don't error (matching the permissiveness most detection
+/// heuristics expect). Exploit/scanner modules that need the response as text
+/// SHOULD adopt this instead of raw `resp.text().await`.
+pub async fn read_http_body_text_capped(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let bytes = crate::utils::safe_io::read_http_body_capped(resp, max_bytes).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read a HTTP response header as an owned `String`.

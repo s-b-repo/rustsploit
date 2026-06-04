@@ -290,7 +290,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Save results
     if save_results {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "redis_scan_results.txt").await?;
+        let default_name = format!("redis_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
         let content = report_lines.join("\n");
         tokio::fs::write(&output_path, content).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;

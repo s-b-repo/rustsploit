@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
+use crate::module_info::{ModuleInfo, ModuleRank };
 use crate::utils::{
     cfg_prompt_default,
     cfg_prompt_int_range,
@@ -66,23 +66,6 @@ pub fn info() -> ModuleInfo {
         rank: ModuleRank::Great,
         default_port: None,
     }
-}
-
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("iusb_virtualmedia_probe requires a single-host target".to_string()),
-    };
-    let host = sanitize_host(target);
-    for &port in DEFAULT_PORTS {
-        if probe_one(&host, port, false).await.unwrap_or(false) {
-            return CheckResult::Vulnerable(format!("IUSB virtual-media accepted on {}:{} (plaintext)", host, port));
-        }
-        if probe_one(&host, port, true).await.unwrap_or(false) {
-            return CheckResult::Vulnerable(format!("IUSB virtual-media accepted on {}:{} (TLS)", host, port));
-        }
-    }
-    CheckResult::NotVulnerable("No IUSB-speaking port among the default set".into())
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
@@ -165,10 +148,6 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-async fn probe_one(host: &str, port: u16, tls: bool) -> Result<bool> {
-    probe_one_with_timeout(host, port, tls, PROBE_TIMEOUT_MS).await
-}
-
 async fn probe_one_with_timeout(host: &str, port: u16, tls: bool, timeout_ms: u64) -> Result<bool> {
     let timeout = Duration::from_millis(timeout_ms);
     let addr = format!("{}:{}", host, port);
@@ -236,4 +215,4 @@ fn sanitize_host(target: &str) -> String {
     t
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "iusb_virtualmedia_probe", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "iusb_virtualmedia_probe", native);

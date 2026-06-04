@@ -108,39 +108,86 @@ impl CredStore {
     /// Maximum length for credential fields to prevent memory abuse.
     const MAX_FIELD_LEN: usize = 4096;
 
+    /// Runaway-entry cap (mirrors loot's `MAX_LOOT_ENTRIES`) so a buggy loop
+    /// can't grow the store unbounded.
+    const MAX_CRED_ENTRIES: usize = 100_000;
+
     /// Add a credential. Returns `Some(id)` on success, `None` on validation failure.
     pub async fn add(&self, cred: NewCred<'_>) -> Option<String> {
-        // Input validation
+        // Input validation. Bound EVERY free-text field, not just host/secret/
+        // username — `service` and `source_module` can carry attacker-influenced
+        // banner text, and leaving them unbounded defeats the memory-abuse guard
+        // this cap is here to provide.
         if cred.host.is_empty() || cred.host.len() > Self::MAX_FIELD_LEN {
             return None;
         }
-        if cred.secret.len() > Self::MAX_FIELD_LEN || cred.username.len() > Self::MAX_FIELD_LEN {
+        if cred.secret.len() > Self::MAX_FIELD_LEN
+            || cred.username.len() > Self::MAX_FIELD_LEN
+            || cred.service.len() > Self::MAX_FIELD_LEN
+            || cred.source_module.len() > Self::MAX_FIELD_LEN
+        {
             return None;
         }
-        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-        let entry = CredEntry {
-            id: id.clone(),
-            host: cred.host.to_string(),
-            port: cred.port,
-            service: cred.service.to_string(),
-            username: cred.username.to_string(),
-            secret: cred.secret.to_string(),
-            cred_type: cred.cred_type,
-            source_module: cred.source_module.to_string(),
-            timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            valid: true,
-        };
+        // Scrub control/ANSI bytes from host + non-secret metadata before
+        // storage so a credential captured from a hostile banner can't inject
+        // terminal escapes on `creds list` / CSV export — matching loot and the
+        // workspace. `username`/`secret` are kept verbatim so the stored
+        // credential stays an exact match for the real one.
+        let host = crate::utils::scrub_stored_text(cred.host);
+        let service = crate::utils::scrub_stored_text(cred.service);
+        let source_module = crate::utils::scrub_stored_text(cred.source_module);
+        let username = cred.username.to_string();
+        let secret = cred.secret.to_string();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         // P1-1: hold the write lock across the disk save. Previous code
         // released the lock before calling `save_locked`, letting two
         // concurrent writers land disk writes in the wrong order — disk
         // and in-memory state could diverge after restart.
         {
             let mut entries = self.entries.write().await;
-            entries.push(entry);
+            // Dedup: re-running a brute against the same target shouldn't append
+            // an identical row each time. If the exact same credential tuple
+            // already exists, refresh its timestamp + valid flag and return its
+            // id instead of pushing a duplicate.
+            if let Some(existing) = entries.iter_mut().find(|e| {
+                e.host == host
+                    && e.port == cred.port
+                    && e.service == service
+                    && e.username == username
+                    && e.secret == secret
+            }) {
+                existing.timestamp = now;
+                existing.valid = true;
+                let id = existing.id.clone();
+                let snapshot = entries.clone();
+                self.save_locked(&snapshot).await;
+                return Some(id);
+            }
+            // Runaway-entry cap, re-checked under the write lock.
+            if entries.len() >= Self::MAX_CRED_ENTRIES {
+                eprintln!(
+                    "[!] Credential store full ({} entries) — clear creds before adding more",
+                    Self::MAX_CRED_ENTRIES
+                );
+                return None;
+            }
+            let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+            entries.push(CredEntry {
+                id: id.clone(),
+                host,
+                port: cred.port,
+                service,
+                username,
+                secret,
+                cred_type: cred.cred_type,
+                source_module,
+                timestamp: now,
+                valid: true,
+            });
             let snapshot = entries.clone();
             self.save_locked(&snapshot).await;
+            Some(id)
         }
-        Some(id)
     }
 
     /// List all credentials.
@@ -172,6 +219,21 @@ impl CredStore {
             return true;
         }
         false
+    }
+
+    /// Mark a credential valid/invalid by id (e.g. after a re-test shows the
+    /// password was rotated). Returns true if the id was found. This is what
+    /// makes the valid/invalid column shown by `display`/CSV actually settable.
+    pub async fn set_valid(&self, id: &str, valid: bool) -> bool {
+        let mut entries = self.entries.write().await;
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.valid = valid;
+            let snapshot = entries.clone();
+            self.save_locked(&snapshot).await;
+            true
+        } else {
+            false
+        }
     }
 
     /// Clear all credentials.

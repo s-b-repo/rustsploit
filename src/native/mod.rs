@@ -9,3 +9,6 @@ pub mod async_tls;
 
 // Shared low-level FFI helpers (raw sockets, ...).
 pub mod network;
+
+// Shared raw-packet DoS infrastructure (FastRng, Internet checksum).
+pub mod dos_utils;

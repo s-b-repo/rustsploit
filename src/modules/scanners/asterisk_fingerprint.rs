@@ -13,7 +13,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::{cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port, tcp_port_open};
 
 const HTTP_TIMEOUT_SECS: u64 = 8;
@@ -62,34 +62,6 @@ pub fn info() -> ModuleInfo {
         disclosure_date: None,
         rank: ModuleRank::Excellent,
         default_port: None,
-    }
-}
-
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = ctx.target.as_single().unwrap_or("");
-    let host = sanitize_host(target);
-    let ip = match resolve_first_ip(&host).await {
-        Some(ip) => ip,
-        None => return CheckResult::Error(format!("Could not resolve {}", host)),
-    };
-    if !tcp_port_open(ip, 8089, Duration::from_secs(TCP_PROBE_TIMEOUT_SECS)).await {
-        return CheckResult::NotVulnerable(format!("{}:8089 closed/filtered", host));
-    }
-    match fetch_server_header(&host, 8089, HTTP_TIMEOUT_SECS).await {
-        Ok(server) => {
-            if !server.to_ascii_lowercase().contains("asterisk") {
-                return CheckResult::Unknown(format!(
-                    "8089 reachable but Server header is not Asterisk: '{}'",
-                    server
-                ));
-            }
-            if is_eol_version(&server) {
-                CheckResult::Vulnerable(format!("EOL Asterisk fingerprint: {}", server))
-            } else {
-                CheckResult::NotVulnerable(format!("Asterisk in supported branch: {}", server))
-            }
-        }
-        Err(e) => CheckResult::Error(e.to_string()),
     }
 }
 
@@ -233,4 +205,4 @@ fn sanitize_host(target: &str) -> String {
     t.to_string()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "asterisk_fingerprint", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "asterisk_fingerprint", native);

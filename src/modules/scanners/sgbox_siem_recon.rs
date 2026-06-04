@@ -4,7 +4,7 @@ use colored::*;
 use std::time::Duration;
 
 use crate::module::{FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
+use crate::module_info::{ModuleInfo, ModuleRank };
 use crate::utils::network::{ build_http_client_with, HttpClientOpts };
 use crate::utils::cfg_prompt_yes_no;
 
@@ -48,53 +48,6 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("sgbox_siem_recon requires a single-host target".to_string()),
-    };
-    let host = strip_scheme(target);
-    let client = match build_http_client_with(
-        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        HttpClientOpts::permissive(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return CheckResult::Error(format!("Failed to build HTTP client: {}", e)),
-    };
-
-    let url = format!("https://{}/sgbox/", host);
-    let body = match client.get(&url).send().await {
-        Ok(resp) => match resp.text().await {
-            Ok(b) => b,
-            Err(e) => return CheckResult::Unknown(format!("Failed to read body: {}", e)),
-        },
-        Err(e) => return CheckResult::Unknown(format!("Could not reach {}: {e}", url)),
-    };
-
-    if !body.contains("SGFrame") && !body.contains("window._vars") && !body.contains("sgbox") {
-        return CheckResult::NotVulnerable("No SGBox markers in response".to_string());
-    }
-
-    let version = extract_version_from_html(&body);
-    let owner = extract_license_owner_from_vars(&body);
-    match (version, owner) {
-        (Some(v), Some(o)) => CheckResult::Vulnerable(format!(
-            "SGBox {} pre-auth disclosure (license owner: {})",
-            v, o
-        )),
-        (Some(v), None) => {
-            CheckResult::Vulnerable(format!("SGBox {} pre-auth version disclosure", v))
-        }
-        (None, Some(o)) => CheckResult::Vulnerable(format!(
-            "SGBox pre-auth license owner disclosure: {}",
-            o
-        )),
-        (None, None) => CheckResult::NotVulnerable(
-            "SGBox console reachable but no version/owner disclosure found".to_string(),
-        ),
-    }
-}
-
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let target = ctx
         .target
@@ -116,7 +69,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let url = format!("https://{}/sgbox/", host);
     ctx.rate_limit(&host).await;
     let body = match client.get(&url).send().await {
-        Ok(resp) => match resp.text().await {
+        Ok(resp) => match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(b) => b,
             Err(e) => {
                 crate::meprintln!("[!] {}: failed to read body: {e:#}", host);
@@ -379,7 +332,7 @@ async fn enumerate_modules(
         let url = format!("{}/sgbox/{}/pages/dashboard.php", base, code);
         if let Ok(resp) = client.get(&url).send().await {
             let status = resp.status().as_u16();
-            let body = match resp.text().await {
+            let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
                 Ok(b) => b,
                 Err(e) => {
                     crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
@@ -569,4 +522,4 @@ fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "sgbox_siem_recon", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "sgbox_siem_recon", native);

@@ -66,7 +66,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut reachable = false;
     if let Ok(r) = get {
         let s = r.status().as_u16();
-        let body = match r.text().await {
+        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);
@@ -107,7 +107,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if let Ok(r) = resp {
         let s = r.status().as_u16();
-        let body = match r.text().await {
+        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);

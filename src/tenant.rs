@@ -83,7 +83,14 @@ impl TenantRegistry {
         if tenants.len() >= MAX_TENANTS {
             let before = tenants.len();
             tenants.retain(|name, data| {
-                let active = Arc::strong_count(data) > 1;
+                // Keep a tenant that still has a live reference OR a running
+                // background job. Without the job check, a tenant whose WS
+                // connection has dropped (Arc count back to 1) but whose
+                // detached job is still running would be evicted — orphaning the
+                // job (invisible to list()/kill()) and re-routing its loot/
+                // findings into a freshly-created store on the next resolve().
+                let active = Arc::strong_count(data) > 1
+                    || data.job_manager.running_count() > 0;
                 if !active {
                     tracing::info!("Evicting idle tenant '{}' to make room", name);
                 }

@@ -114,10 +114,13 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
 
     let module: Arc<dyn Module> = module_box.into();
     let mut opts = ModuleOptions::default();
-    // Populate ModuleOptions from global options so native modules can read
-    // them via ctx.options (e.g. port, source_port, threads, etc.).
-    let global_opts = crate::global_options::GLOBAL_OPTIONS.all().await;
-    for (k, v) in &global_opts {
+    // Populate ModuleOptions from the *tenant-scoped* options so native modules
+    // reading ctx.options (port, source_port, threads, etc.) see the requesting
+    // tenant's values — not the process-global singleton, which would leak a
+    // shell/MCP operator's `setg` values into other tenants' runs.
+    // `resolve()` falls back to the global store when there is no tenant (CLI).
+    let scoped_opts = crate::tenant::resolve().global_options().all().await;
+    for (k, v) in &scoped_opts {
         opts.set(k.clone(), v.clone());
     }
     let result = scheduler::run(module, target, opts, verbose).await;
@@ -159,40 +162,8 @@ pub fn categories() -> &'static [&'static str] {
     &["scanners", "exploits", "creds", "osint", "plugins"]
 }
 
-/// True if the module advertises a `check()` function.
-pub fn has_check(module_path: &str) -> bool {
-    module::find(module_path).map(|m| m.has_check()).unwrap_or(false)
-}
-
 pub fn module_info(module_path: &str) -> Option<crate::module_info::ModuleInfo> {
     module::find(module_path).map(|m| m.info())
-}
-
-/// Run a non-destructive vulnerability check if the module supports it.
-pub async fn check_module(
-    module_path: &str,
-    target: &str,
-) -> Option<crate::module_info::CheckResult> {
-    let m = module::find(module_path)?;
-    let target_parsed = match Target::parse(target) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("check_module: invalid target '{}': {}", target, e);
-            return None;
-        }
-    };
-    // Reject mass targets for check
-    if !matches!(&target_parsed, Target::Single(_)) {
-        tracing::warn!("check_module: mass targets not supported for check, use a single host");
-        return None;
-    }
-    let mut ctx = crate::module::ModuleCtx::new(target_parsed);
-    ctx.module_path = module_path.to_string();
-    ctx.tenant_id = crate::context::current_tenant_id();
-    if let Some(tok) = crate::context::cancellation_token() {
-        ctx.cancel = tok;
-    }
-    m.check(&ctx).await
 }
 
 // ============================================================
@@ -201,7 +172,7 @@ pub async fn check_module(
 
 /// Find the canonical `category/name` form of a module if the user supplied
 /// just the short name. Returns `None` for an unknown module.
-fn resolve_full_path(module_path: &str) -> Option<String> {
+pub fn resolve_full_path(module_path: &str) -> Option<String> {
     if module_path.contains('/') {
         // Already qualified; verify it exists.
         return module::registered()

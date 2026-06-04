@@ -108,7 +108,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             Err(e) => { crate::mprintln!("{}", format!("[-] {} -> {}", label, e).dimmed()); continue; }
         };
         let status = resp.status().as_u16();
-        let body = match resp.text().await {
+        let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);

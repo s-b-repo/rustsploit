@@ -49,6 +49,22 @@ impl FastRng {
     #[inline(always)]
     pub fn next_u16(&mut self) -> u16 { self.next_u64() as u16 }
 
+    /// Fill a buffer with pseudo-random bytes (8 at a time, remainder copied).
+    #[inline]
+    pub fn fill_bytes(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i + 8 <= buf.len() {
+            let val = self.next_u64().to_le_bytes();
+            buf[i..i + 8].copy_from_slice(&val);
+            i += 8;
+        }
+        if i < buf.len() {
+            let val = self.next_u64().to_le_bytes();
+            let remaining = buf.len() - i;
+            buf[i..].copy_from_slice(&val[..remaining]);
+        }
+    }
+
     /// Generate a random public IPv4 address, avoiding private/reserved/multicast ranges.
     #[inline(always)]
     pub fn gen_ipv4_public(&mut self) -> Ipv4Addr {
@@ -95,29 +111,22 @@ pub fn sum_16(data: &[u8], init: u32) -> u32 {
     let mut sum = init;
     let mut i = 0;
     let len = data.len();
+    // Fold the carry into the low 16 bits every iteration so `sum` stays bounded
+    // (< 2^17). The previous plain `+=` let the accumulator grow unbounded and
+    // overflow u32 once the buffer exceeded ~128 KiB — a debug-build panic and a
+    // silently-wrong checksum in release.
     while i + 3 < len {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        sum += u16::from_be_bytes([data[i + 2], data[i + 3]]) as u32;
+        sum = sum.wrapping_add(u16::from_be_bytes([data[i], data[i + 1]]) as u32);
+        sum = sum.wrapping_add(u16::from_be_bytes([data[i + 2], data[i + 3]]) as u32);
+        sum = (sum & 0xFFFF) + (sum >> 16);
         i += 4;
     }
     if i + 1 < len {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        sum = sum.wrapping_add(u16::from_be_bytes([data[i], data[i + 1]]) as u32);
         i += 2;
     }
     if i < len {
-        sum += u16::from_be_bytes([data[i], 0]) as u32;
+        sum = sum.wrapping_add(u16::from_be_bytes([data[i], 0]) as u32);
     }
     sum
-}
-
-// ============================================================================
-// GLOBAL SPOOF OPTION
-// ============================================================================
-
-/// Check if the global `spoof_ip` option is enabled (`setg spoof_ip true`).
-/// Returns false if not set or set to anything other than true/1/yes.
-pub fn is_spoof_enabled() -> bool {
-    crate::tenant::resolve().global_options().try_get("spoof_ip")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false)
 }

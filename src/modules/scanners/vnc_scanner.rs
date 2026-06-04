@@ -319,7 +319,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     if save_results && !results.is_empty() {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "vnc_scan_results.txt").await?;
+        let default_name = format!("vnc_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
         let content = results.iter()
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
