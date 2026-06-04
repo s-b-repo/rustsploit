@@ -6,10 +6,12 @@
     pub mod ftp_anonymous;
     pub mod ftp_bruteforce;
     pub mod h3c_oem_kvm_bruteforce;
+    pub mod h3c_redfish_session_spray;
     pub mod http_basic_bruteforce;
     pub mod imap_bruteforce;
     pub mod l2tp_bruteforce;
     pub mod memcached_bruteforce;
+    pub mod m365_activesync_spray;
     pub mod mqtt_bruteforce;
     pub mod mysql_bruteforce;
     pub mod pop3_bruteforce;

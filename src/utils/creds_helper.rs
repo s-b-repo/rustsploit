@@ -18,8 +18,9 @@ use colored::*;
 use crate::module::{Finding, FindingKind, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_yes_no, generate_combos_mode, load_lines, normalize_target,
-    parse_combo_mode, run_bruteforce, BruteforceConfig, LoginResult,
+    cfg_prompt_yes_no, file_size, generate_combos_mode, load_lines, normalize_target,
+    parse_combo_mode, run_bruteforce, run_bruteforce_streaming, BruteforceConfig,
+    LoginResult, STREAMING_THRESHOLD,
 };
 
 /// `read_exact` with a wall-clock timeout, flattened to a single
@@ -107,9 +108,11 @@ where
     };
     let password_path =
         cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+    // `cartesian` = full cross-product (every user × every password);
+    // `paired` = user[i] with pass[i]. (cred-file mode is not implemented here.)
     let combo_input = cfg_prompt_default(
         "combo_mode",
-        "Combo mode (cartesian / paired / cred-file:<path>)",
+        "Combo mode (cartesian / paired)",
         "cartesian",
     )
     .await?;
@@ -125,22 +128,36 @@ where
         Some(p) => load_lines(p)?,
         None => vec![String::new()],
     };
-    let passwords: Vec<String> = load_lines(&password_path)?;
+
+    // Large password lists must NOT go through `load_lines` — its 100 MB
+    // `MAX_FILE_SIZE` cap turns a big rockyou-class list into a hard error.
+    // Instead, route them into the streaming brute-force engine, which reads
+    // the file in bounded batches. Small files keep the exact eager path.
+    let stream_passwords = file_size(&password_path) > STREAMING_THRESHOLD;
+
+    // For the small-file path we load eagerly so we can validate emptiness and
+    // preserve the historical "defaults first" combo ordering.
+    let passwords: Vec<String> = if stream_passwords {
+        Vec::new()
+    } else {
+        load_lines(&password_path)?
+    };
 
     if !cfg.password_only && usernames.is_empty() {
         return Err(anyhow!("Username wordlist is empty"));
     }
-    if passwords.is_empty() {
+    if !stream_passwords && passwords.is_empty() {
         return Err(anyhow!("Password wordlist is empty"));
     }
 
-    // Defaults first — common cred lists are the highest-yield rows.
-    let mut combos: Vec<(String, String)> = cfg
+    // Defaults are the highest-yield rows. In the eager path they go first; in
+    // the streaming path they're passed as `extra_combos` (the engine runs them
+    // after the streamed batches).
+    let defaults: Vec<(String, String)> = cfg
         .defaults
         .iter()
         .map(|(u, p)| (u.to_string(), p.to_string()))
         .collect();
-    combos.extend(generate_combos_mode(&usernames, &passwords, mode));
 
     let bf_config = BruteforceConfig {
         target: host.clone(),
@@ -173,7 +190,23 @@ where
         }
     };
 
-    let result = run_bruteforce(&bf_config, combos, probe_for_engine).await?;
+    let result = if stream_passwords {
+        run_bruteforce_streaming(
+            &bf_config,
+            usernames,
+            Some(password_path.as_str()),
+            passwords,
+            mode,
+            defaults,
+            probe_for_engine,
+        )
+        .await?
+    } else {
+        // Defaults first — common cred lists are the highest-yield rows.
+        let mut combos = defaults;
+        combos.extend(generate_combos_mode(&usernames, &passwords, mode));
+        run_bruteforce(&bf_config, combos, probe_for_engine).await?
+    };
     result.print_found();
 
     // Auto-store every found credential as loot — operators don't have to
@@ -256,7 +289,14 @@ async fn is_port_open(host: &str, port: u16) -> bool {
         Ok(ip) => ip,
         Err(e) => {
             tracing::debug!("parse IP failed: {e}");
-            let lookup = format!("{}:{}", host, port);
+            // An unbracketed IPv6 literal (e.g. `::1`) would produce an
+            // unparseable `::1:port` and fail every lookup. Bracket
+            // colon-containing hosts so `lookup_host` sees `[::1]:port`.
+            let lookup = if host.contains(':') && !host.starts_with('[') {
+                format!("[{}]:{}", host, port)
+            } else {
+                format!("{}:{}", host, port)
+            };
             match tokio::net::lookup_host(&lookup).await {
                 Ok(mut iter) => match iter.next() {
                     Some(sa) => sa.ip(),

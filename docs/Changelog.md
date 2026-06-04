@@ -4,6 +4,43 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
+## 2026-06-04 — WhisperPair (Fast Pair ECDH) re-implemented in `exploits/bluetooth/wpair`
+
+The Fast Pair ECDH exploitation flow (CVE-2025-36911) that had been reduced to
+discovery-only during the v0.5.0 module rewrite is **restored and rebuilt** as a
+`wpair/` submodule (`crypto` · `protocol` · `db` · `gatt` · `mod`):
+
+- **ECDH Key-Based Pairing handshake (§3.3.2)** — ephemeral secp256r1 ↔ the
+  Provider's Anti-Spoofing public key → `K = SHA-256(z)[0..16]` → AES-128-ECB
+  encrypted 80-byte KBP write (`p256` + `aes` + `sha2`).
+- **Interactive sub-shell** — `scan` (with PAIRING vs SteadyState classification),
+  `info`, `select`, `exploit`, `testall`, `exploitall`, `pair`, `rename` (§3.3.5),
+  `switch` (§5.3.3), `harvest`, plus passkey + account-key planting.
+- **Conformance tests** — `nonce` (replay / freshness §4.3) and `curve`
+  (off-curve point validation §4.5).
+- **Keyless detection** — `testall` / `exploit` detect the bypass with no
+  Anti-Spoofing key by classifying on whether the Provider accepts the KBP write
+  out of pairing mode (a patched device rejects it at the GATT layer); the key is
+  only needed to *complete* crypto pairing. SteadyState model IDs are read over GATT.
+- **Device dataset** — the KU Leuven COSIC WhisperPair `model_ids.csv` (~2,900
+  registered Fast Pair models: name, manufacturer, type, Find-Hub tracking flag)
+  is embedded via `include_str!` and parsed lazily; `info` resolves friendly names
+  and `harvest` sweeps the full set. No anti-spoofing keys exist in any public
+  dataset, so the table is names-only.
+- **Anti-Spoofing key resolution** — operator override (`setg antispoofing_key`)
+  and a configurable Google Nearby Devices metadata API fetch (`setg
+  gfp_metadata_url` / `gfp_api_key`).
+- **Protocol verified** against the Fast Pair spec + Python/Android reference PoCs:
+  characteristic UUIDs `fe2c1233`–`fe2c1238`, request flags `0x11`, and the
+  Additional-Data HMAC-SHA256 + Fast-Pair AES-CTR construction.
+- **Tests** — 16 unit tests (AES FIPS-197 KAT, ECDH symmetry, HMAC RFC-4231, CTR,
+  KBP/passkey/account-key/Additional-Data layouts, advert classification, key
+  extraction). Builds clean with and without `--features bluetooth`; clippy clean.
+
+See the [Fast Pair / WhisperPair Guide](Fast-Pair-WhisperPair-Guide.md).
+
+---
+
 ## v0.5.0-dev (2026-05-24) — Universal source port, probe timeout passthrough, inter-feature integration
 
 Full integration sweep ensuring all features work together across all modules.

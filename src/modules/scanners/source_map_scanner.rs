@@ -123,7 +123,7 @@ async fn check_map(client: &reqwest::Client, url: &str) -> Option<(u16, usize, S
     if status >= 400 { return None; }
     let ct = r.headers().get("content-type")
         .and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-    let body = r.text().await.ok()?;
+    let body = crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await.ok()?;
     let trimmed = body.trim_start();
     let looks_like_map = trimmed.starts_with('{')
         && body.contains("\"version\":")
@@ -158,7 +158,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     crate::mprintln!("{}", format!("[*] Fetching {} ...", url).cyan());
     let resp = client.get(&url).send().await.context("fetch")?;
-    let html = match resp.text().await {
+    let html = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);

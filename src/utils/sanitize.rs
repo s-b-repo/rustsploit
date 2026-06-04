@@ -38,6 +38,21 @@ pub fn sanitize_string_input(input: &str) -> Result<String> {
     Ok(sanitized)
 }
 
+/// Best-effort scrub of free-text scan data (host notes, service banners,
+/// loot descriptions, etc.) for safe storage, export, and terminal display.
+/// Drops ALL control characters — including newlines, CR, and the ESC byte
+/// used for ANSI terminal-escape injection — and caps length. Unlike
+/// [`sanitize_string_input`], this never fails: a junk byte in a captured
+/// banner is silently dropped rather than rejecting the whole record.
+pub fn scrub_stored_text(input: &str) -> String {
+    const MAX_STORED_FIELD: usize = 4096;
+    input
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STORED_FIELD)
+        .collect()
+}
+
 /// Validate a file path for safety: rejects path traversal, null bytes,
 /// control characters, symlinks, and excessively long paths.
 pub fn validate_safe_file_path(path: &str) -> Result<String> {

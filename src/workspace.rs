@@ -152,9 +152,17 @@ impl Workspace {
     /// on-disk file always matches a real in-memory state.
     async fn save(&self) {
         let _save_guard = self.save_mutex.lock().await;
-        let name = self.current_name().await;
+        // Snapshot name and data while holding BOTH locks (name before data,
+        // the same order `load()` acquires its write locks). Reading them under
+        // two separate lock acquisitions let a concurrent `switch()`/`load()`
+        // swap the pair in between, so we could write one workspace's data to
+        // another workspace's file.
+        let (name, data_snapshot) = {
+            let name_g = self.name.read().await;
+            let data_g = self.data.read().await;
+            (name_g.clone(), data_g.clone())
+        };
         let path = self.file_path(&name);
-        let data_snapshot = self.data.read().await.clone();
         let tmp = path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(&data_snapshot) {
             Ok(j) => j,
@@ -219,15 +227,35 @@ impl Workspace {
                 return names;
             }
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(fname) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                names.push(fname.to_string());
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    // Only real `<name>.json` workspaces — skip `.json.bak` /
+                    // `.json.tmp` / `.json.unreadable` backups (which `file_stem`
+                    // would otherwise surface as phantom `default.json` names).
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Some(fname) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(fname.to_string());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // A transient read error must be distinguishable from
+                    // end-of-directory — don't silently return a partial list as
+                    // if it were complete.
+                    eprintln!("[!] Error while listing workspaces in {}: {}", self.base_dir.display(), e);
+                    break;
+                }
             }
         }
         if names.is_empty() {
             names.push("default".to_string());
         }
         names.sort();
+        names.dedup();
         names
     }
 
@@ -238,6 +266,16 @@ impl Workspace {
     /// IpAddr parse and the conservative hostname charset (alphanum + `.-_`)
     /// is rejected so junk like `not_an_ip` cannot land in the tracked-host
     /// list.
+    /// Canonicalise a host key. An IP literal is normalised to its canonical
+    /// form (so `192.168.001.1` and `::1` vs `0:0:0:0:0:0:0:1` collapse to one
+    /// host/service entry instead of duplicating); a hostname is returned
+    /// unchanged. Used by every host-keyed mutator so add/find/delete agree.
+    fn normalize_host_key(host: &str) -> String {
+        host.parse::<std::net::IpAddr>()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| host.to_string())
+    }
+
     pub async fn add_host(&self, ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
         // Input validation
         if ip.is_empty() || ip.len() > 256 {
@@ -254,22 +292,24 @@ impl Workspace {
             tracing::debug!(ip, "workspace add_host rejected: not a valid IP or hostname shape");
             return;
         }
+        let ip = Self::normalize_host_key(ip);
+        let ip = ip.as_str();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         {
             let mut data = self.data.write().await;
             if let Some(existing) = data.hosts.iter_mut().find(|h| h.ip == ip) {
                 existing.last_seen = now;
                 if let Some(hn) = hostname {
-                    existing.hostname = Some(hn.to_string());
+                    existing.hostname = Some(crate::utils::scrub_stored_text(hn));
                 }
                 if let Some(os) = os_guess {
-                    existing.os_guess = Some(os.to_string());
+                    existing.os_guess = Some(crate::utils::scrub_stored_text(os));
                 }
             } else {
                 data.hosts.push(HostEntry {
                     ip: ip.to_string(),
-                    hostname: hostname.map(|s| s.to_string()),
-                    os_guess: os_guess.map(|s| s.to_string()),
+                    hostname: hostname.map(crate::utils::scrub_stored_text),
+                    os_guess: os_guess.map(crate::utils::scrub_stored_text),
                     first_seen: now.clone(),
                     last_seen: now,
                     notes: Vec::new(),
@@ -281,10 +321,12 @@ impl Workspace {
 
     /// Add a note to a host.
     pub async fn add_note(&self, ip: &str, note: &str) -> bool {
+        let ip = Self::normalize_host_key(ip);
+        let ip = ip.as_str();
         let found = {
             let mut data = self.data.write().await;
             if let Some(host) = data.hosts.iter_mut().find(|h| h.ip == ip) {
-                host.notes.push(note.to_string());
+                host.notes.push(crate::utils::scrub_stored_text(note));
                 true
             } else {
                 false
@@ -299,22 +341,28 @@ impl Workspace {
     /// Add or update a service. Updates service_name and version if the
     /// host:port/protocol already exists.
     pub async fn add_service(&self, host: &str, port: u16, protocol: &str, service_name: &str, version: Option<&str>) {
+        let host = Self::normalize_host_key(host);
+        let host = host.as_str();
+        // Scrub the protocol ONCE up front and compare against the scrubbed
+        // value: the entry stores the scrubbed protocol, so dedup must match on
+        // the scrubbed form too (else a control-char protocol inserts a dup).
+        let protocol = crate::utils::scrub_stored_text(protocol);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         {
             let mut data = self.data.write().await;
             if let Some(existing) = data.services.iter_mut().find(|s| s.host == host && s.port == port && s.protocol == protocol) {
                 // Update service name and version on re-discovery
-                existing.service_name = service_name.to_string();
+                existing.service_name = crate::utils::scrub_stored_text(service_name);
                 if version.is_some() {
-                    existing.version = version.map(|s| s.to_string());
+                    existing.version = version.map(crate::utils::scrub_stored_text);
                 }
             } else {
                 data.services.push(ServiceEntry {
                     host: host.to_string(),
                     port,
-                    protocol: protocol.to_string(),
-                    service_name: service_name.to_string(),
-                    version: version.map(|s| s.to_string()),
+                    protocol,
+                    service_name: crate::utils::scrub_stored_text(service_name),
+                    version: version.map(crate::utils::scrub_stored_text),
                     first_seen: now,
                 });
             }
@@ -324,6 +372,8 @@ impl Workspace {
 
     /// Delete a host by IP. Returns true if found and removed.
     pub async fn delete_host(&self, ip: &str) -> bool {
+        let ip = Self::normalize_host_key(ip);
+        let ip = ip.as_str();
         let removed = {
             let mut data = self.data.write().await;
             let before = data.hosts.len();
@@ -339,11 +389,24 @@ impl Workspace {
     }
 
     /// Delete a service by host and port. Returns true if found and removed.
-    pub async fn delete_service(&self, host: &str, port: u16) -> bool {
+    /// Delete service(s) on `host:port`. `add_service` keys uniqueness on
+    /// host+port+protocol, so tcp/80 and udp/80 are distinct records; pass
+    /// `Some(proto)` to remove just that protocol. `None` preserves the legacy
+    /// behaviour of removing every protocol on the port.
+    pub async fn delete_service(&self, host: &str, port: u16, protocol: Option<&str>) -> bool {
+        let host = Self::normalize_host_key(host);
+        let host = host.as_str();
+        // Compare against the scrubbed protocol the entry was stored with.
+        let protocol = protocol.map(crate::utils::scrub_stored_text);
         let removed = {
             let mut data = self.data.write().await;
             let before = data.services.len();
-            data.services.retain(|s| !(s.host == host && s.port == port));
+            data.services.retain(|s| {
+                let matches = s.host == host
+                    && s.port == port
+                    && protocol.as_deref().is_none_or(|p| s.protocol == p);
+                !matches
+            });
             data.services.len() < before
         };
         if removed {
@@ -436,6 +499,9 @@ pub static WORKSPACE: Lazy<Workspace> = Lazy::new(Workspace::new);
 pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
     let s = crate::tenant::resolve();
     s.workspace().add_host(ip, hostname, os_guess).await;
+    // Typed event so subscribers get machine-readable fields, plus the legacy
+    // Finding (human string) for backward compatibility.
+    crate::events::emit(crate::events::ModuleEvent::HostUp { host: ip.to_string() });
     crate::events::emit(crate::events::ModuleEvent::Finding {
         module: emitting_module(),
         target: ip.to_string(),
@@ -459,6 +525,13 @@ pub async fn track_service(
     let s = crate::tenant::resolve();
     s.workspace().add_service(host, port, protocol, service_name, version).await;
     let version_str = version.map(|v| format!(" {v}")).unwrap_or_default();
+    // Typed event (machine-readable fields) + legacy Finding for compatibility.
+    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+        host: host.to_string(),
+        port,
+        service: service_name.to_string(),
+        version: version.map(|v| v.to_string()),
+    });
     crate::events::emit(crate::events::ModuleEvent::Finding {
         module: emitting_module(),
         target: format!("{host}:{port}"),

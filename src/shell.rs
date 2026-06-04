@@ -34,8 +34,9 @@ const SHELL_COMMANDS: &[&str] = &[
     "set port", "set source_port", "set concurrency", "set timeout",
     "set threads", "set wordlist", "set verbose",
     "show_target", "clear_target", "run", "back", "exit", "quit",
-    "info", "check", "setg", "unsetg", "unset", "show options",
-    "creds", "creds add", "creds search", "creds delete", "creds clear",
+    "info", "subnet", "setg", "unsetg", "unset", "show options",
+    "creds", "creds add", "creds search", "creds delete",
+    "creds invalidate", "creds validate", "creds clear",
     "spool", "spool off", "resource", "makerc",
     "hosts", "hosts add", "hosts delete", "hosts clear",
     "services", "services add", "services delete", "notes", "workspace",
@@ -76,7 +77,7 @@ impl Completer for RsfCompleter {
         } else if let Some(rest) = line_up_to_cursor.strip_prefix("info ") {
             Some(rest)
         } else {
-            line_up_to_cursor.strip_prefix("check ")
+            None
         };
 
         if let Some(prefix) = module_prefix {
@@ -426,6 +427,12 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         if utils::module_exists(&safe_path) {
                             ctx.current_module = Some(safe_path.clone());
                             println!("{}", format!("Module '{}' selected.", safe_path).green());
+                        } else if let Some(canonical) = crate::commands::resolve_full_path(&safe_path) {
+                            // Accept a bare short name (e.g. `use proxy_scanner`),
+                            // matching what `run`/`-m` already resolve, instead of
+                            // requiring the full category/name path.
+                            ctx.current_module = Some(canonical.clone());
+                            println!("{}", format!("Module '{}' selected.", canonical).green());
                         } else {
                             println!("{}", format!("Module '{}' not found.", rest).red());
                         }
@@ -461,8 +468,11 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     if skey == "port" || skey == "source_port" {
                                         match sval.parse::<u16>() {
                                             Ok(p) if p > 0 => {
-                                                crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
-                                                println!("{} => {}", skey.green(), sval);
+                                                if crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await {
+                                                    println!("{} => {}", skey.green(), sval);
+                                                } else {
+                                                    println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
+                                                }
                                             }
                                             _ if skey == "source_port" && (sval == "0" || sval.is_empty()) => {
                                                 crate::global_options::GLOBAL_OPTIONS.unset("source_port").await;
@@ -470,12 +480,13 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                             }
                                             _ => println!("{}", format!("Invalid {}. Must be 1-65535.", skey).yellow()),
                                         }
-                                    } else {
-                                        crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                    } else if crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await {
                                         println!("{} => {}", skey.green(), sval);
                                         if skey == "verbose" {
                                             ctx.verbose = matches!(sval.as_str(), "y" | "yes" | "true" | "1" | "on");
                                         }
+                                    } else {
+                                        println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
                                     }
                                 }
                                 (Err(e), _) | (_, Err(e)) => {
@@ -585,35 +596,6 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 }
 
                 // ═══════════════════════════════════════════════
-                // CHECK command (Feature 6)
-                // ═══════════════════════════════════════════════
-                "check" => {
-                    let module_path = ctx.current_module.clone();
-                    if let Some(ref path) = module_path {
-                        let target = config::GLOBAL_CONFIG.get_target();
-                        if let Some(ref t) = target {
-                            println!("{}", format!("[*] Checking {} against {}...", path, t).cyan());
-                            match commands::check_module(path, t).await {
-                                Some(result) => {
-                                    use crate::module_info::CheckResult;
-                                    match &result {
-                                        CheckResult::Vulnerable(msg) => println!("{}", format!("[+] VULNERABLE: {}", msg).green().bold()),
-                                        CheckResult::NotVulnerable(msg) => println!("{}", format!("[-] Not vulnerable: {}", msg).red()),
-                                        CheckResult::Unknown(msg) => println!("{}", format!("[?] Unknown: {}", msg).yellow()),
-                                        CheckResult::Error(msg) => println!("{}", format!("[!] Error: {}", msg).red()),
-                                    }
-                                }
-                                None => println!("{}", format!("Module '{}' does not support the check method.", path).dimmed()),
-                            }
-                        } else {
-                            println!("{}", "No target set. Use 'set target <value>' first.".yellow());
-                        }
-                    } else {
-                        println!("{}", "No module selected. Use 'use <module>' first.".yellow());
-                    }
-                }
-
-                // ═══════════════════════════════════════════════
                 // GLOBAL OPTIONS (Feature 2)
                 // ═══════════════════════════════════════════════
                 "setg" => {
@@ -634,16 +616,29 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     if skey == "port" || skey == "source_port" {
                                         match sval.parse::<u16>() {
                                             Ok(p) if p > 0 => {
-                                                crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
-                                                println!("{} => {}", skey.green(), sval);
+                                                if crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await {
+                                                    println!("{} => {}", skey.green(), sval);
+                                                } else {
+                                                    println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
+                                                }
+                                            }
+                                            // Mirror `set`: source_port 0/empty clears it.
+                                            _ if skey == "source_port" && (sval == "0" || sval.is_empty()) => {
+                                                crate::global_options::GLOBAL_OPTIONS.unset("source_port").await;
+                                                println!("{}", "Source port cleared (will use OS-assigned).".green());
                                             }
                                             _ => {
                                                 println!("{}", format!("[!] Invalid port value: {}", sval).red());
                                             }
                                         }
-                                    } else {
-                                        crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await;
+                                    } else if crate::global_options::GLOBAL_OPTIONS.set(&skey, &sval).await {
                                         println!("{} => {}", skey.green(), sval);
+                                        // Mirror `set`: keep the live shell verbose flag in sync.
+                                        if skey == "verbose" {
+                                            ctx.verbose = matches!(sval.as_str(), "y" | "yes" | "true" | "1" | "on");
+                                        }
+                                    } else {
+                                        println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
                                     }
                                 }
                                 (Err(e), _) | (_, Err(e)) => {
@@ -716,11 +711,23 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         } else {
                             println!("{}", format!("[-] Credential '{}' not found.", id.trim()).red());
                         }
+                    } else if let Some(id) = rest.strip_prefix("invalidate ") {
+                        if crate::cred_store::CRED_STORE.set_valid(id.trim(), false).await {
+                            println!("{}", format!("[+] Credential '{}' marked invalid.", id.trim()).green());
+                        } else {
+                            println!("{}", format!("[-] Credential '{}' not found.", id.trim()).red());
+                        }
+                    } else if let Some(id) = rest.strip_prefix("validate ") {
+                        if crate::cred_store::CRED_STORE.set_valid(id.trim(), true).await {
+                            println!("{}", format!("[+] Credential '{}' marked valid.", id.trim()).green());
+                        } else {
+                            println!("{}", format!("[-] Credential '{}' not found.", id.trim()).red());
+                        }
                     } else if rest == "clear" {
                         crate::cred_store::CRED_STORE.clear().await;
                         println!("{}", "[+] All credentials cleared.".green());
                     } else {
-                        println!("{}", "Usage: creds [add|search <query>|delete <id>|clear]".yellow());
+                        println!("{}", "Usage: creds [add|search <query>|delete <id>|invalidate <id>|validate <id>|clear]".yellow());
                     }
                 }
 
@@ -739,7 +746,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     } else {
                         match crate::utils::sanitize::validate_safe_file_path(&rest) {
                             Ok(safe_path) => {
-                                match crate::spool::SPOOL.start(&safe_path) {
+                                match crate::spool::SPOOL.start(&safe_path, None) {
                                     Ok(()) => println!("{}", format!("[+] Spooling output to '{}'", safe_path).green()),
                                     Err(e) => println!("{}", format!("[!] Failed to start spool: {}", e).red()),
                                 }
@@ -840,14 +847,17 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         crate::workspace::WORKSPACE.add_service(&host, port, &proto, &svc, version).await;
                         println!("{}", format!("[+] Service {}:{}/{} added.", host, port, svc).green());
                     } else if let Some(args) = rest.strip_prefix("delete ") {
-                        let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+                        let parts: Vec<&str> = args.split_whitespace().collect();
                         if parts.len() < 2 {
-                            println!("{}", "Usage: services delete <host> <port>".yellow());
+                            println!("{}", "Usage: services delete <host> <port> [protocol]".yellow());
                         } else {
                             let host = parts[0].trim();
+                            // Optional protocol scopes the delete to e.g. just tcp/80;
+                            // omit it to remove every protocol on the port.
+                            let protocol = parts.get(2).map(|s| s.trim());
                             match parts[1].trim().parse::<u16>() {
                                 Ok(port) if port > 0 => {
-                                    if crate::workspace::WORKSPACE.delete_service(host, port).await {
+                                    if crate::workspace::WORKSPACE.delete_service(host, port, protocol).await {
                                         println!("{}", format!("[+] Service {}:{} removed.", host, port).green());
                                     } else {
                                         println!("{}", format!("[-] Service {}:{} not found.", host, port).red());
@@ -857,7 +867,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                             }
                         }
                     } else {
-                        println!("{}", "Usage: services [add|delete <host> <port>]".yellow());
+                        println!("{}", "Usage: services [add|delete <host> <port> [protocol]]".yellow());
                     }
                 }
                 "notes" => {
@@ -1078,7 +1088,18 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     module_path.clone(),
                                     t.clone(),
                                     ctx.verbose,
-                                    None,
+                                    // Run the backgrounded module in api_mode so its
+                                    // `cfg_prompt_*` calls resolve from global options /
+                                    // defaults instead of blocking on stdin from the
+                                    // detached task (which would race the foreground
+                                    // shell's readline and corrupt input). A module that
+                                    // lacks a required option now fails fast as a
+                                    // JobEvent::Failed rather than silently stealing
+                                    // stdin. The Some(_) config still installs a
+                                    // RUN_CONTEXT carrying the job's cancel token, so
+                                    // cooperative cancellation via `jobs -k <id>` is
+                                    // unchanged.
+                                    Some(crate::config::ModuleConfig { api_mode: true, ..Default::default() }),
                                 ) {
                                     Ok((job_id, _progress)) => {
                                         println!("{}", format!("[*] Job {} started: {} against {}", job_id, module_path, t).cyan());
@@ -1208,7 +1229,6 @@ pub fn resolve_command(cmd: &str) -> String {
 
         // New commands
         "info" | "i" => "info",
-        "check" | "ch" => "check",
         "setg" | "sg" => "setg",
         "unsetg" | "ug" | "unset" => "unsetg",
         "show_options" | "showoptions" | "so" => "show_options",
@@ -1426,7 +1446,7 @@ fn render_help() {
     println!("    {:<20} {:<24} Search modules by keyword", "find <kw>".green(), "f1 <kw>".dimmed());
     println!("    {:<20} {:<24} Select a module to load", "use <path>".green(), "u <path>".dimmed());
     println!("    {:<20} {:<24} Show module metadata (CVE, author, rank)", "info [path]".green(), "i".dimmed());
-    println!("    {:<20} {:<24} Deselect current module and target", "back".green(), "b | clear".dimmed());
+    println!("    {:<20} {:<24} Deselect the current module (target preserved)", "back".green(), "b | clear".dimmed());
     println!();
 
     // --- Targeting ---
@@ -1445,7 +1465,6 @@ fn render_help() {
     println!();
     println!("    {:<20} {:<24} Execute the selected module", "run".green(), "go, ra".dimmed());
     println!("    {:<20} {:<24} Run module as background job", "run -j".green(), "".dimmed());
-    println!("    {:<20} {:<24} Non-destructive vulnerability check", "check".green(), "ch".dimmed());
     println!();
 
     // --- Global Options ---
@@ -1516,7 +1535,7 @@ fn render_help() {
         MAX_COMMAND_CHAIN_LENGTH);
     println!("{}", "└──────────────────────────────────────────────────────────────────────────┘".dimmed());
     println!();
-    println!("  {} {}", "Topics:".bold(), "use info run check set setg target mass-scan jobs creds hosts services loot workspace resource spool export".dimmed());
+    println!("  {} {}", "Topics:".bold(), "use info run set setg target mass-scan jobs creds hosts services loot workspace resource spool export".dimmed());
     println!();
 }
 
@@ -1537,7 +1556,6 @@ fn render_help_topic(topic: &str) {
         "ct" | "clear_target" => "clear_target",
         "go" | "exec" => "run",
         "ra" => "run",
-        "ch" => "check",
         "sg" => "setg",
         "ug" => "unsetg",
         "so" | "show_options" | "showoptions" => "show_options",
@@ -1556,7 +1574,7 @@ fn render_help_topic(topic: &str) {
             "Select a module to work with.",
             &["use <category>/<path>", "use <short_name>   # fuzzy-match on final segment"],
             "Loads the named module into the shell. The prompt changes to show the selected module. \
-             Subsequent `run`, `check`, and `info` commands target it. Use `back` to deselect.",
+             Subsequent `run` and `info` commands target it. Use `back` to deselect.",
             &[
                 ("use scanners/proxy_scanner",           "Load the open-proxy scanner"),
                 ("use proxy_scanner",                    "Same thing — short-name fuzzy match"),
@@ -1668,18 +1686,7 @@ fn render_help_topic(topic: &str) {
                 ("setg concurrency 200 & run",             "Raise parallelism for the next run"),
                 ("setg module_timeout 30 & run",           "Cap per-host time at 30s"),
             ],
-            &["check", "mass-scan", "jobs", "setg"],
-        ),
-        "check" => man_page(
-            "check",
-            "Run a non-destructive vulnerability check for the selected module.",
-            &["check", "ch"],
-            "Only modules that define a `check()` entry point support this. Output categorizes each \
-             target as Vulnerable, NotVulnerable, Unknown, or Error. Safe for production networks.",
-            &[
-                ("use exploits/frameworks/wsus/cve_2025_59287_wsus_rce & t 10.0.0.5 & ch", "Confirm before exploiting"),
-            ],
-            &["run", "info"],
+            &["mass-scan", "jobs", "setg"],
         ),
         "set" => man_page(
             "set",
@@ -1898,10 +1905,10 @@ fn render_help_topic(topic: &str) {
         ),
         "back" => man_page(
             "back",
-            "Deselect the current module (and optionally clear the target).",
+            "Deselect the current module (the target is preserved).",
             &["back", "b", "clear", "reset"],
-            "Returns to the top-level prompt. The last-used target is preserved unless you use \
-             `clear_target`.",
+            "Returns to the top-level prompt. The last-used target is preserved; use \
+             `clear_target` to drop it.",
             &[("b", "Drop back to the root prompt")],
             &["use", "clear_target"],
         ),
@@ -1932,7 +1939,7 @@ fn render_help_topic(topic: &str) {
             println!();
             println!("{} {}",
                 "Available topics:".bold(),
-                "use info modules find target subnet show_target clear_target run check setg unsetg show_options mass-scan jobs creds hosts services notes loot workspace resource makerc spool export back exit help".dimmed());
+                "use info modules find target subnet show_target clear_target run setg unsetg show_options mass-scan jobs creds hosts services notes loot workspace resource makerc spool export back exit help".dimmed());
             println!();
         }
     }

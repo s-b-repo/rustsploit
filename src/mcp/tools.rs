@@ -48,18 +48,6 @@ fn build_tool_definitions() -> Vec<Tool> {
                 "required": ["module_path"]
             }),
         },
-        Tool {
-            name: "check_module".into(),
-            description: "Run a non-destructive vulnerability check against a target".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "module_path": { "type": "string", "description": "Full module path" },
-                    "target": { "type": "string", "description": "Target IP, hostname, or CIDR" }
-                },
-                "required": ["module_path", "target"]
-            }),
-        },
         // ── Target tools ──────────────────────────────────────────────
         Tool {
             name: "set_target".into(),
@@ -85,14 +73,15 @@ fn build_tool_definitions() -> Vec<Tool> {
         // ── Execution ─────────────────────────────────────────────────
         Tool {
             name: "run_module".into(),
-            description: "Execute a module against a target, returning captured output".into(),
+            description: "Execute a module against a target, returning captured output. For mass scans (CIDR / `random` / comma-separated lists) set background:true to run as a job and return immediately (avoids the tool-call timeout); poll list_jobs and read hosts/loot/creds for results.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "module_path": { "type": "string", "description": "Full module path" },
-                    "target": { "type": "string", "description": "Target IP, hostname, or CIDR" },
+                    "target": { "type": "string", "description": "Target IP, hostname, CIDR, comma-list, or 'random'" },
                     "port": { "type": "integer", "description": "Optional port override" },
                     "verbose": { "type": "boolean", "description": "Enable verbose output" },
+                    "background": { "type": "boolean", "description": "Run as a background job and return a job_id immediately (recommended for mass scans)" },
                     "prompts": {
                         "type": "object",
                         "description": "Key-value prompt overrides (e.g. {\"port\": \"8080\", \"timeout\": \"5\"})",
@@ -333,7 +322,6 @@ pub async fn call_tool(name: &str, args: Value) -> ToolResult {
         "list_modules" => handle_list_modules(&args),
         "search_modules" => handle_search_modules(&args),
         "module_info" => handle_module_info(&args),
-        "check_module" => handle_check_module(&args).await,
 
         // ── Target tools ──────────────────────────────────────────
         "set_target" => handle_set_target(&args).await,
@@ -427,6 +415,86 @@ fn prompts_param(args: &Value) -> HashMap<String, String> {
     map
 }
 
+/// Reduce an attacker-supplied prompt value to a bare host suitable for the
+/// SSRF block-check chain (`is_blocked_target` / `ssrf_gate`), which expect an
+/// IP/hostname rather than a full URL. Returns None when the value can't yield
+/// a host to check.
+fn extract_ssrf_candidate(raw: &str) -> Option<String> {
+    let val = raw.trim();
+    if val.is_empty() {
+        return None;
+    }
+    // Strip a scheme (e.g. http://, https://, ftp://, gopher://) if present.
+    let after_scheme = match val.find("://") {
+        Some(idx) => &val[idx + 3..],
+        None => val,
+    };
+    // Strip any userinfo (user:pass@host).
+    let after_userinfo = match after_scheme.rsplit_once('@') {
+        Some((_, host_part)) => host_part,
+        None => after_scheme,
+    };
+    // Cut off path / query / fragment.
+    let authority = after_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_userinfo);
+    // Strip a trailing :port. Handle bracketed IPv6 literals separately.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // [ipv6]:port or [ipv6]
+        stripped.split(']').next().unwrap_or(stripped)
+    } else if authority.matches(':').count() > 1 {
+        // Bare IPv6 literal (e.g. `::1`, `fe80::1`) — there is no port to strip;
+        // keep the whole authority. Without this, `rsplit_once(':')` on `::1`
+        // yields host `":"`, which sails past the loopback/link-local SSRF
+        // filters (mirrors the single-colon guard in api::is_blocked_target).
+        authority
+    } else if let Some((h, _port)) = authority.rsplit_once(':') {
+        // Only treat the suffix as a port if it is all digits; otherwise the
+        // colon is part of the host (shouldn't happen for unbracketed) — keep
+        // the whole authority.
+        let port_part = &authority[h.len() + 1..];
+        if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    } else {
+        authority
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Heuristic: does this prompt value look like a URL or a host:port pair?
+/// Used so we only apply the SSRF check to non-destination keys when the value
+/// is plausibly a network destination, avoiding false rejection of unrelated
+/// string options.
+fn looks_like_url_or_hostport(raw: &str) -> bool {
+    let val = raw.trim();
+    if val.is_empty() {
+        return false;
+    }
+    if val.contains("://") {
+        return true;
+    }
+    // host:port form (e.g. 169.254.169.254:80) — digits after the last colon.
+    if let Some((host, port)) = val.rsplit_once(':') {
+        if !host.is_empty()
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+            && !host.contains(' ')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 // ===========================================================================
 // Individual tool handlers
 // ===========================================================================
@@ -466,27 +534,6 @@ fn handle_module_info(args: &Value) -> ToolResult {
     }
 }
 
-async fn handle_check_module(args: &Value) -> ToolResult {
-    let path = require_str!(args, "module_path");
-    let target = require_str!(args, "target");
-    if !crate::api::validate_module_name(path) {
-        return ToolResult::error("Invalid module name".into());
-    }
-    if !crate::api::validate_target(target) {
-        return ToolResult::error("Invalid target format".into());
-    }
-    if crate::api::is_blocked_target(target) {
-        return ToolResult::error("Target matches blocked address range".into());
-    }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return ToolResult::error("Target resolves to a blocked metadata/link-local address".into());
-    }
-    match crate::commands::check_module(path, target).await {
-        Some(result) => ToolResult::json(&result),
-        None => ToolResult::error(format!("Module '{}' does not support check", path)),
-    }
-}
-
 // ── Target tools ──────────────────────────────────────────────────────────
 
 async fn handle_set_target(args: &Value) -> ToolResult {
@@ -497,8 +544,8 @@ async fn handle_set_target(args: &Value) -> ToolResult {
     if crate::api::is_blocked_target(target) {
         return ToolResult::error("Target matches blocked address range".into());
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return ToolResult::error("Target resolves to blocked address".into());
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return ToolResult::error(format!("[{}] {}", code, msg));
     }
     match crate::config::GLOBAL_CONFIG.set_target(target) {
         Ok(()) => ToolResult::text(format!("Target set to: {}", target)),
@@ -538,8 +585,8 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     if crate::api::is_blocked_target(&target) {
         return ToolResult::error("Target matches blocked address range".into());
     }
-    if crate::api::is_blocked_target_resolved(&target).await {
-        return ToolResult::error("Target resolves to a blocked metadata/link-local address".into());
+    if let Err((code, msg)) = crate::api::ssrf_gate(&target).await {
+        return ToolResult::error(format!("[{}] {}", code, msg));
     }
 
     if !crate::commands::discover_modules().contains(&module_path) {
@@ -554,10 +601,51 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     // Strip "target" from prompts to prevent SSRF bypass via prompt injection
     prompts.remove("target");
 
+    // SSRF guard: many modules read their actual connection destination from a
+    // prompt key other than `target` (e.g. url/host/endpoint/lhost). Run the
+    // same block-check chain we applied to `target` over every prompt value that
+    // looks like a URL or host so a benign `target` can't be used to smuggle a
+    // blocked metadata/link-local/loopback destination past the filter.
+    for (key, raw) in prompts.iter() {
+        let lkey = key.to_ascii_lowercase();
+        let is_dest_key = matches!(lkey.as_str(), "url" | "host" | "endpoint" | "lhost" | "rhost" | "remote_host" | "target_url" | "uri");
+        if let Some(candidate) = extract_ssrf_candidate(raw) {
+            // Always check explicit destination keys; for other keys only check
+            // values that actually parse as a URL or host:port to avoid false
+            // rejections of unrelated string options.
+            if is_dest_key || looks_like_url_or_hostport(raw) {
+                if crate::api::is_blocked_target(&candidate) {
+                    return ToolResult::error(format!(
+                        "Prompt '{}' targets a blocked address range",
+                        key
+                    ));
+                }
+                if let Err((code, msg)) = crate::api::ssrf_gate(&candidate).await {
+                    return ToolResult::error(format!("Prompt '{}' [{}]: {}", key, code, msg));
+                }
+            }
+        }
+    }
+
     let module_config = crate::config::ModuleConfig {
         api_mode: true,
         custom_prompts: prompts,
     };
+
+    // Background mode: spawn a job and return immediately. Essential for mass
+    // scans (CIDR / random / lists) whose fan-out can run far longer than the
+    // MCP tool-call timeout — running them inline would be cut off mid-scan.
+    if bool_param(args, "background").unwrap_or(false) {
+        let s = crate::tenant::resolve();
+        return match s.job_manager().spawn(module_path.clone(), target.clone(), verbose, Some(module_config)) {
+            Ok((job_id, _progress)) => ToolResult::json(&serde_json::json!({
+                "job_id": job_id,
+                "status": "started",
+                "note": "poll list_jobs for status; results land in hosts/loot/creds",
+            })),
+            Err(e) => ToolResult::error(format!("Failed to start job: {e}")),
+        };
+    }
 
     let output_buf = crate::output::OutputBuffer::new();
     let buf_clone = output_buf.clone();
@@ -735,7 +823,8 @@ async fn handle_delete_service(args: &Value) -> ToolResult {
         Some(v) => v,
         None => return ToolResult::error("Missing required parameter: port".into()),
     };
-    if crate::workspace::WORKSPACE.delete_service(host, port).await {
+    let protocol = args.get("protocol").and_then(|v| v.as_str());
+    if crate::workspace::WORKSPACE.delete_service(host, port, protocol).await {
         ToolResult::text(format!("Service {}:{} deleted", host, port))
     } else {
         ToolResult::error(format!("Service {}:{} not found", host, port))

@@ -224,23 +224,44 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
             body.push_str(&format!("{}={}", key, url_encode(val)));
         }
 
-        let res = client
+        // Treat a transient request failure as a retryable/transport error: skip
+        // this credential and continue, mirroring the FTP/SSH/Telnet loops above
+        // instead of `?`-aborting the whole HTTP service check.
+        let res = match client
             .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
             .send()
             .await
-            .context("[!] Failed to send HTTP form request")?;
-
-        let body = match res.text().await {
-            Ok(t) => t,
+        {
+            Ok(r) => r,
             Err(e) => {
-                tracing::debug!(target = %config.target, port = config.port, "HTTP form response body read failed: {}", e);
-                String::new()
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "HTTP form request failed: {}", e);
+                continue;
             }
         };
 
-        if !body.contains(">Password<") {
+        let status = res.status();
+
+        // A failed body read is a transport error, NOT evidence of valid creds.
+        // Previously this was mapped to an empty String, which trivially does not
+        // contain the login-form marker and was misreported as a successful login.
+        let body = match crate::utils::network::read_http_body_text_capped(res, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "HTTP form response body read failed: {}", e);
+                continue;
+            }
+        };
+
+        // Require a POSITIVE success signal rather than inferring success from the
+        // mere absence of the ">Password<" login-form token:
+        //  - HTTP status must indicate success/redirect (200 / 3xx login-redirect)
+        //  - the login form must NO LONGER be presented (no LOGIN_PASSWORD field
+        //    and no ">Password<" prompt — both are present on the re-served form)
+        let still_login_form =
+            body.contains(">Password<") || body.contains("LOGIN_PASSWORD");
+        if (status.is_success() || status.is_redirection()) && !still_login_form && !body.is_empty() {
             crate::mprintln!("{}", format!("[+] HTTP credentials valid: {}:{}", username, password).green().bold());
             return Ok(Some((ServiceType::Http, username.to_string(), password.to_string())));
         }

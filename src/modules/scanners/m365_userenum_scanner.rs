@@ -52,7 +52,7 @@ async fn probe_tenant(client: &reqwest::Client, tenant_label: &str) -> Result<bo
     let url = format!("https://login.microsoftonline.com/{}/.well-known/openid-configuration", tenant_label);
     let r = client.get(&url).send().await.context("OIDC config request failed")?;
     let s = r.status();
-    let body = match r.text().await {
+    let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);
@@ -94,7 +94,7 @@ async fn check_user(client: &reqwest::Client, username: &str) -> Result<i64> {
     .await
     .context("GetCredentialType request failed")?;
 
-    let txt = match r.text().await {
+    let txt = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);

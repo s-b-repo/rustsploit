@@ -267,7 +267,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
 
             // Limit response body to 128KB to prevent OOM
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_bytes = crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await.unwrap_or_default();
             let body = if body_bytes.len() > 128 * 1024 {
                 String::from_utf8_lossy(&body_bytes[..128 * 1024]).to_string()
             } else {
@@ -324,7 +324,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         headers.insert(key_str, val_str);
                     }
 
-                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    let body_bytes = crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await.unwrap_or_default();
                     let body = if body_bytes.len() > 128 * 1024 {
                         String::from_utf8_lossy(&body_bytes[..128 * 1024]).to_string()
                     } else {

@@ -64,7 +64,7 @@ All modules support mass scan universally — `random` / CIDR / file targets / c
 
 | Module | Description | Rank | Check |
 |---|---|---|---|
-| `exploits/bluetooth/wpair` | Discovers Bluetooth Low Energy accessories advertising the Google Fast Pair service UUID (0xfe2c). The full hijacking flow is interactive and requires approving the pairing on the attacker side; this module reports visible devices so the operator can pick a target. Requires `bluetooth` feature. | Excellent |  |
+| `exploits/bluetooth/wpair` | Google Fast Pair pairing-mode-bypass exploitation (WhisperPair, CVE-2025-36911). Discovers Fast Pair accessories (service 0xfe2c), then performs the secp256r1 ECDH Key-Based Pairing handshake against the target's Anti-Spoofing key to force-pair out of pairing mode. Interactive sub-shell: scan/info/exploit/testall/exploitall/nonce/curve/pair/rename/switch/harvest, with nonce-replay (§4.3) and invalid-curve (§4.5) conformance tests. Requires `bluetooth` feature + a local BLE adapter. See the [Fast Pair / WhisperPair Guide](Fast-Pair-WhisperPair-Guide.md). | Excellent |  |
 | `exploits/cameras/abus/abussecurity_camera_cve202326609variant1` | Probes ABUS security cameras for the path-traversal vulnerability in /webparam.cgi that allows reading /etc/passwd and similar local files. | Excellent |  |
 | `exploits/cameras/acti/acm_5611_rce` | Probes ACTi ACM-5611 IP cameras for command injection in the iperf parameter on /cgi-bin/test. Sends a benign echo-marker payload. | Excellent |  |
 | `exploits/cameras/avtech/cve_2024_7029_avtech_camera` | Exploits CVE-2024-7029 in AVTECH IP cameras for remote code execution. | Excellent |  |

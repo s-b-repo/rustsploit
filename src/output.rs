@@ -8,8 +8,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
-
 // ============================================================
 // OUTPUT BUFFER (task-local text capture)
 // ============================================================
@@ -204,7 +202,9 @@ pub fn _mprint_raw(text: &str) {
         if let Err(e) = std::io::stdout().flush() {
             eprintln!("[!] Flush failed: {}", e);
         }
-        if let Err(e) = crate::spool::SPOOL.write_line(text) {
+        // write_raw (not write_line): this is no-newline output, so appending a
+        // newline would split a single console line across multiple spool lines.
+        if let Err(e) = crate::spool::SPOOL.write_raw(text) {
             handle_spool_error(e);
         }
     }
@@ -263,86 +263,6 @@ pub fn _meprint_raw(text: &str) {
             eprintln!("[!] Flush failed: {}", e);
         }
     }
-}
-
-// ============================================================
-// STRUCTURED MODULE OUTPUT
-// ============================================================
-
-/// Classification of a finding.
-#[derive(Debug, Clone, Serialize)]
-pub enum FindingType {
-    Vulnerability,
-    Misconfiguration,
-    InfoDisclosure,
-    OpenPort,
-    ServiceDetected,
-    CredentialFound,
-    ExploitSuccess,
-}
-
-/// Severity of a finding.
-#[derive(Debug, Clone, Serialize)]
-pub enum Severity {
-    Critical,
-    High,
-    Medium,
-    Low,
-    Info,
-}
-
-/// A structured finding from module execution.
-#[derive(Debug, Clone, Serialize)]
-pub struct Finding {
-    pub finding_type: FindingType,
-    pub host: String,
-    pub port: Option<u16>,
-    pub detail: String,
-    pub severity: Severity,
-}
-
-/// Accumulated structured output from a module run.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ModuleOutput {
-    pub findings: Vec<Finding>,
-}
-
-/// Accumulator stored in RunContext for structured output.
-/// Modules call `output::add_finding()` to populate this.
-#[derive(Debug, Default)]
-pub struct OutputAccumulator {
-    inner: Mutex<ModuleOutput>,
-}
-
-impl OutputAccumulator {
-    const MAX_FINDINGS: usize = 10_000;
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_finding(&self, finding: Finding) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.findings.len() < Self::MAX_FINDINGS {
-            guard.findings.push(finding);
-        }
-    }
-
-    pub fn take(&self) -> ModuleOutput {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *guard)
-    }
-}
-
-// ============================================================
-// CONVENIENCE FUNCTIONS (use task-local RunContext)
-// ============================================================
-
-/// Record a structured finding. No-ops if no RunContext is active.
-pub fn add_finding(finding: Finding) {
-    let _ = crate::context::RUN_CONTEXT.try_with(|ctx| {
-        ctx.output.add_finding(finding);
-    });
 }
 
 // ============================================================

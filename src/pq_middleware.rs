@@ -69,15 +69,22 @@ pub async fn handshake_handler(
     axum::Extension(pq): axum::Extension<Arc<PqSharedState>>,
     axum::Json(request): axum::Json<HandshakeRequest>,
 ) -> Result<axum::Json<HandshakeResponse>, (StatusCode, String)> {
-    // P1-9: when the operator launched with --trust-proxy, prefer the
-    // leftmost X-Forwarded-For value over the TCP peer. Without the flag we
-    // ignore the header so a malicious client can't lie its way past the
-    // rate limit.
+    // P1-9: when the operator launched with --trust-proxy, attribute the
+    // request to the client IP recorded in X-Forwarded-For; otherwise ignore
+    // the header so a malicious client can't lie its way past the rate limit.
+    //
+    // A trusted reverse proxy APPENDS the real peer address to the RIGHT of any
+    // client-supplied X-Forwarded-For. The leftmost entry is therefore fully
+    // client-controlled — taking it (the old behaviour) let a caller prepend a
+    // fresh bogus IP per request to mint an unlimited number of rate-limit
+    // buckets. We take the RIGHTMOST entry, which is the hop our own trusted
+    // proxy added. (Assumes a single trusted proxy directly in front; deeper
+    // proxy chains would need a configurable trusted-hop count.)
     let client_ip = if crate::utils::network::get_global_trust_proxy() {
         let xff = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.split(',').next_back())
             .map(|s| s.trim())
             .and_then(|s| s.parse::<std::net::IpAddr>().ok());
         xff.unwrap_or_else(|| addr.ip())
@@ -157,17 +164,24 @@ pub async fn handshake_handler(
             .or_else(|| store.keys().next().copied().map(|id| (id, None)));
         if let Some((id, evicted_name)) = evict_pair {
             store.remove(&id);
-            crate::events::emit(crate::events::ModuleEvent::PqSessionEvicted {
-                client_name: evicted_name.unwrap_or_else(|| "<unknown>".to_string()),
-            });
+            let evicted = evicted_name.unwrap_or_else(|| "<unknown>".to_string());
+            // Route to the evicted client's own tenant, not every subscriber.
+            crate::events::emit_for(
+                Some(evicted.clone()),
+                crate::events::ModuleEvent::PqSessionEvicted { client_name: evicted },
+            );
         }
     }
     store.insert(session.session_id, Arc::new(tokio::sync::Mutex::new(session)));
     drop(store);
 
-    crate::events::emit(crate::events::ModuleEvent::PqHandshakeAccepted {
-        client_name: new_session_client_name,
-    });
+    // Route to the accepting client's own tenant only.
+    crate::events::emit_for(
+        Some(new_session_client_name.clone()),
+        crate::events::ModuleEvent::PqHandshakeAccepted {
+            client_name: new_session_client_name,
+        },
+    );
 
     Ok(axum::Json(response))
 }
@@ -180,8 +194,10 @@ pub struct RegisterKeyRequest {
     pub name: String,
     /// Base64-encoded X25519 long-lived public key (32 raw bytes).
     pub x25519_pub: String,
-    /// Base64-encoded ML-KEM-768 encapsulation key (1184 raw bytes).
+    /// Base64-encoded ML-KEM-1024 encapsulation key (1568 raw bytes).
     pub mlkem_ek: String,
+    /// Base64-encoded Classic McEliece 460896 public key (524160 raw bytes).
+    pub mceliece_pub: String,
 }
 
 #[derive(serde::Serialize)]
@@ -211,9 +227,18 @@ pub async fn register_key_handler(
         .map_err(|e: Vec<u8>| { tracing::debug!("x25519_pub must decode to 32 bytes (got {} bytes)", e.len()); (StatusCode::BAD_REQUEST, "x25519_pub must decode to 32 bytes".into()) })?;
     let mlkem_ek = B64.decode(&request.mlkem_ek)
         .map_err(|e| { tracing::debug!("mlkem_ek is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "mlkem_ek is not base64".into()) })?;
-    // ML-KEM-768 encapsulation key is exactly 1184 bytes.
-    if mlkem_ek.len() != 1184 {
-        return Err((StatusCode::BAD_REQUEST, format!("mlkem_ek must be 1184 bytes, got {}", mlkem_ek.len())));
+    // ML-KEM-1024 encapsulation key is exactly 1568 bytes.
+    if mlkem_ek.len() != 1568 {
+        return Err((StatusCode::BAD_REQUEST, format!("mlkem_ek must be 1568 bytes, got {}", mlkem_ek.len())));
+    }
+    let mceliece_public = B64.decode(&request.mceliece_pub)
+        .map_err(|e| { tracing::debug!("mceliece_pub is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "mceliece_pub is not base64".into()) })?;
+    // Classic McEliece 460896 public key is exactly 524160 bytes.
+    if mceliece_public.len() != classic_mceliece_rust::CRYPTO_PUBLICKEYBYTES {
+        return Err((StatusCode::BAD_REQUEST, format!(
+            "mceliece_pub must be {} bytes, got {}",
+            classic_mceliece_rust::CRYPTO_PUBLICKEYBYTES, mceliece_public.len()
+        )));
     }
 
     // Token check + atomic consume. Holding the lock across the persist
@@ -247,11 +272,18 @@ pub async fn register_key_handler(
     let token_ok = bytes_match && supplied.len() == expected_b.len();
     if !token_ok {
         // Reuse the handshake rate limiter so brute-forcers eat the same
-        // per-IP budget that hammering /pq/handshake would.
+        // per-IP budget that hammering /pq/handshake would — and actually
+        // ENFORCE it: once the budget is spent, reject with 429 instead of
+        // letting attempts continue unthrottled.
         let mut limiter = pq.handshake_rate_limiter.lock().await;
-        let timestamps = limiter.entry(addr.ip()).or_default();
         let now = Instant::now();
-        timestamps.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(HANDSHAKE_RATE_WINDOW_SECS));
+        let window = std::time::Duration::from_secs(HANDSHAKE_RATE_WINDOW_SECS);
+        let timestamps = limiter.entry(addr.ip()).or_default();
+        timestamps.retain(|t| now.duration_since(*t) < window);
+        if timestamps.len() >= HANDSHAKE_RATE_MAX_PER_IP {
+            tracing::warn!("Rate-limited /pq/register-key from {} (bad token, budget exhausted)", addr);
+            return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".into()));
+        }
         timestamps.push(now);
         tracing::warn!("Rejected /pq/register-key from {} (bad token)", addr);
         return Err((StatusCode::UNAUTHORIZED, "Invalid enrollment token".into()));
@@ -261,8 +293,13 @@ pub async fn register_key_handler(
         name: request.name.clone(),
         x25519_public: x25519_pub,
         mlkem_ek,
+        mceliece_public,
     };
-    let fp = crate::pq_channel::fingerprint(&new_key.x25519_public, &new_key.mlkem_ek);
+    let fp = crate::pq_channel::fingerprint(&[
+        &new_key.x25519_public,
+        &new_key.mlkem_ek,
+        &new_key.mceliece_public,
+    ]);
 
     // Persist to disk first so a restart doesn't lose the registration. If
     // persist fails, do NOT consume the token — the operator can retry.
@@ -571,11 +608,16 @@ pub async fn revoke_key_handler(
         terminated,
     );
 
-    crate::events::emit(crate::events::ModuleEvent::PqIdentityRevoked {
-        name: target.to_string(),
-        by: caller.client_name.clone(),
-        sessions_terminated: terminated,
-    });
+    // Route to the revoked identity's own tenant so they learn of the
+    // revocation, rather than broadcasting the name/revoker to all tenants.
+    crate::events::emit_for(
+        Some(target.to_string()),
+        crate::events::ModuleEvent::PqIdentityRevoked {
+            name: target.to_string(),
+            by: caller.client_name.clone(),
+            sessions_terminated: terminated,
+        },
+    );
 
     Ok(axum::Json(RevokeKeyResponse {
         revoked: true,

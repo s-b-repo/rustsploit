@@ -48,26 +48,6 @@ impl std::fmt::Display for ModuleRank {
     }
 }
 
-/// Result of a non-destructive vulnerability check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CheckResult {
-    Vulnerable(String),
-    NotVulnerable(String),
-    Unknown(String),
-    Error(String),
-}
-
-impl std::fmt::Display for CheckResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckResult::Vulnerable(msg) => write!(f, "Vulnerable: {}", msg),
-            CheckResult::NotVulnerable(msg) => write!(f, "Not Vulnerable: {}", msg),
-            CheckResult::Unknown(msg) => write!(f, "Unknown: {}", msg),
-            CheckResult::Error(msg) => write!(f, "Error: {}", msg),
-        }
-    }
-}
-
 /// Pretty-print module info to the console.
 pub fn display_module_info(module_path: &str, info: &ModuleInfo) {
     println!();

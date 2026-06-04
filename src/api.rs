@@ -28,6 +28,16 @@ pub(crate) fn validate_target(target: &str) -> bool {
 }
 
 pub(crate) fn is_blocked_target(target: &str) -> bool {
+    // Multi-target (comma-separated): block if ANY element is blocked, so a
+    // benign-looking list like "8.8.8.8,127.0.0.1" can't smuggle a blocked
+    // host past the filter. Mirrors Target::parse's multi-target handling.
+    if target.contains(',') {
+        return target
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(is_blocked_target);
+    }
     // Mass-scan keywords are deliberately allowed — this function exists for
     // SSRF mitigation, not for restricting scan scope. Modules that opt in
     // to mass-scan mode parse these keywords themselves.
@@ -196,7 +206,10 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
             if segs[0] == 0xfd00 && segs[1] == 0x0ec2 { return true; }
             if segs[0] & 0xfe00 == 0xfc00 { return true; }
             if segs[0] & 0xffc0 == 0xfe80 { return true; }
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // Use to_ipv4() (not to_ipv4_mapped()) so both IPv4-mapped
+            // (::ffff:a.b.c.d) and the deprecated IPv4-compatible (::a.b.c.d)
+            // forms are unwrapped — otherwise ::127.0.0.1 bypasses the filter.
+            if let Some(v4) = v6.to_ipv4() {
                 return is_blocked_ipv4(v4);
             }
             false
@@ -207,18 +220,29 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
 
 fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
     let o = v4.octets();
-    o == [0, 0, 0, 0]
-        || o[0] == 127
-        || o[0] == 10
-        || (o[0] == 172 && (o[1] & 0xf0) == 16)
-        || (o[0] == 192 && o[1] == 168)
-        || (o[0] == 169 && o[1] == 254)
-        || o == [168, 63, 129, 16]
-        || o == [100, 100, 100, 200]
+    o[0] == 0                                   // 0.0.0.0/8 ("this network"; routes to localhost on Linux)
+        || o[0] == 127                          // 127.0.0.0/8 loopback
+        || o[0] == 10                           // 10.0.0.0/8 RFC1918
+        || (o[0] == 172 && (o[1] & 0xf0) == 16) // 172.16.0.0/12 RFC1918
+        || (o[0] == 192 && o[1] == 168)         // 192.168.0.0/16 RFC1918
+        || (o[0] == 169 && o[1] == 254)         // 169.254.0.0/16 link-local
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+        || o == [168, 63, 129, 16]              // Azure wireserver metadata
+        || o == [100, 100, 100, 200]            // Alibaba metadata
 }
 
-pub(crate) async fn is_blocked_target_resolved(target: &str) -> bool {
-    resolve_and_check(target).await.is_err()
+/// SSRF/resolution gate: resolve `target` and verify no resolved IP is blocked.
+/// On failure, distinguishes a genuine SSRF block from a mere DNS failure so
+/// callers don't report an unresolvable/slow host as a 403 SSRF block (which
+/// violates "failures must be distinguishable from negatives" and makes real
+/// engagement failures undebuggable). Returns `(error_code, message)`:
+/// `SSRF_BLOCKED` for a real block, `TARGET_ERROR` for resolution failure.
+pub(crate) async fn ssrf_gate(target: &str) -> Result<(), (&'static str, String)> {
+    match resolve_and_check(target).await {
+        Ok(_) => Ok(()),
+        Err(msg) if msg.contains("blocked") => Err(("SSRF_BLOCKED", msg)),
+        Err(msg) => Err(("TARGET_ERROR", msg)),
+    }
 }
 
 /// Resolve a hostname and verify none of the returned IPs are blocked.
@@ -226,6 +250,17 @@ pub(crate) async fn is_blocked_target_resolved(target: &str) -> bool {
 /// Callers should connect to the returned addresses directly (not re-resolve)
 /// to prevent DNS rebinding attacks.
 pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    // Multi-target (comma-separated): resolve and SSRF-check each element
+    // individually; the whole list is rejected if any element is blocked or
+    // fails to resolve. Without this, the list is fed to lookup_host as one
+    // string, which always fails DNS and rejects even legitimate lists.
+    if target.contains(',') {
+        let mut all = Vec::new();
+        for part in target.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            all.extend(Box::pin(resolve_and_check(part)).await?);
+        }
+        return Ok(all);
+    }
     // M45: "0.0.0.0" alone resolves to localhost — must not be allowlisted.
     const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0/0"];
     if MASS_SCAN_KEYWORDS.contains(&target) {
@@ -257,6 +292,33 @@ pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::Sock
                     return Err(format!("resolved IP {} is blocked", addr.ip()));
                 }
             }
+            // Pin the validated IPs to the bare hostname so the subsequent module
+            // connect reuses exactly these addresses instead of re-resolving the
+            // name (which a rebinding attacker could point at a blocked IP after
+            // this check passes). reqwest clients built via build_http_client_with
+            // consult these pins. IP-literal targets are not resolved by reqwest,
+            // so pinning them is a harmless no-op.
+            // Strip a trailing numeric :port to get the bare hostname for pinning.
+            // Spelled out with explicit branches (no wildcard arm) so every case
+            // is handled visibly and nothing is folded away.
+            let host_only: &str = if let Some((host, port)) = host_part.rsplit_once(':') {
+                if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                    // "host:port" — pin the hostname, drop the numeric port.
+                    host
+                } else {
+                    // A ':' is present but the suffix is not a numeric port (e.g. an
+                    // IPv6 literal like "::1"); use the whole string. IP literals are
+                    // never resolved by reqwest, so pinning them is simply unused.
+                    host_part
+                }
+            } else {
+                // No ':' present — already a bare hostname.
+                host_part
+            };
+            crate::utils::network::pin_resolved_ips(
+                host_only,
+                &resolved.iter().map(|s| s.ip()).collect::<Vec<_>>(),
+            );
             Ok(resolved)
         }
         Ok(Err(e)) => {
@@ -308,22 +370,29 @@ async fn health_check() -> Json<serde_json::Value> {
 
 fn rpc_status(code: &str) -> StatusCode {
     match code {
-        "INVALID_INPUT" | "INVALID_OUTPUT_FILE" | "INVALID_JOB_ID" | "PARSE_ERROR" => {
+        "INVALID_INPUT" | "INVALID_OUTPUT_FILE" | "INVALID_JOB_ID" | "PARSE_ERROR"
+        | "INVALID_PORT" | "INVALID_CONCURRENCY" => {
             StatusCode::BAD_REQUEST
         }
         "NOT_FOUND" | "MODULE_NOT_FOUND" | "METHOD_NOT_FOUND" => StatusCode::NOT_FOUND,
         "SSRF_BLOCKED" | "SECURITY" => StatusCode::FORBIDDEN,
-        "JOB_LIMIT" | "STORE_ERROR" | "OPTION_ERROR" | "TARGET_ERROR" | "SUB_LIMIT" => {
+        "TENANT_REJECTED" => StatusCode::SERVICE_UNAVAILABLE,
+        // Genuine capacity/limit conflicts the caller can retry later.
+        "JOB_LIMIT" | "OPTION_LIMIT" | "SUB_LIMIT" | "SPOOL_BUSY" => {
             StatusCode::CONFLICT
         }
         "RATE_LIMIT" => StatusCode::TOO_MANY_REQUESTS,
-        // Module / IO / serialization errors are runtime failures, not server
-        // bugs. Map them explicitly so callers don't see "500 unknown".
-        "MOD_ERROR"
-        | "CHECK_ERROR"
+        // Module / IO / serialization / persistence failures are server-side
+        // runtime failures, not client conflicts. `OPTION_ERROR`/`TARGET_ERROR`/
+        // `STORE_ERROR` mean "failed to persist", so they belong here (500), not
+        // 409 — a 409 wrongly tells the client its request conflicts with state.
+        "MODULE_ERROR"
         | "EXPORT_ERROR"
         | "SPOOL_ERROR"
         | "IO_ERROR"
+        | "STORE_ERROR"
+        | "OPTION_ERROR"
+        | "TARGET_ERROR"
         | "SERIALIZE_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -438,17 +507,15 @@ async fn api_dispatcher(
             body_into_params!(params, body_obj);
             "run_module"
         }
-        ("POST", "run", Some("all"), _) => {
-            body_into_params!(params, body_obj);
-            "run_all"
-        }
-        ("POST", "run_all", None, _) => {
-            body_into_params!(params, body_obj);
-            "run_all"
-        }
-        ("POST", "check", None, _) => {
-            body_into_params!(params, body_obj);
-            "check_module"
+        ("POST", "run", Some("all"), _) | ("POST", "run_all", None, _) => {
+            // There is no multi-module runner; these routes previously aliased
+            // run_module (which needs a single `module`), so they advertised a
+            // capability that does not exist. Be explicit rather than misleading.
+            return err_resp(
+                StatusCode::NOT_IMPLEMENTED,
+                "NOT_IMPLEMENTED",
+                "Multi-module run is not implemented. POST /api/run with an explicit `module` per request (enumerate via GET /api/modules and loop client-side).",
+            );
         }
         ("POST", "honeypot-check", None, _) => {
             body_into_params!(params, body_obj);
@@ -472,6 +539,13 @@ async fn api_dispatcher(
         }
         ("DELETE", "options", None, _) => {
             let tenant_name = identity.client_name.clone();
+            // Fail closed, same as the main dispatcher.
+            if let Err(e) = crate::tenant::resolve_for(&tenant_name) {
+                return err_resp(StatusCode::SERVICE_UNAVAILABLE, "TENANT_REJECTED", &e);
+            }
+            if body_obj.is_empty() {
+                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "Request body must list at least one option key to delete");
+            }
             let mut deleted = Vec::new();
             let mut errors = Vec::new();
             for k in body_obj.keys() {
@@ -484,6 +558,15 @@ async fn api_dispatcher(
                     Ok(v) => deleted.push(v),
                     Err((code, msg)) => errors.push(json!({"key": k, "code": code, "error": msg})),
                 }
+            }
+            // If nothing was deleted and everything errored, surface a non-2xx
+            // so a client can't mistake an all-failed delete for success.
+            if deleted.is_empty() && !errors.is_empty() {
+                let all_not_found = errors
+                    .iter()
+                    .all(|e| e.get("code").and_then(|c| c.as_str()) == Some("NOT_FOUND"));
+                let status = if all_not_found { StatusCode::NOT_FOUND } else { StatusCode::CONFLICT };
+                return (status, Json(json!({ "data": { "deleted": deleted, "errors": errors } }))).into_response();
             }
             return ok(json!({
                 "data": { "deleted": deleted, "errors": errors }
@@ -674,6 +757,14 @@ async fn api_dispatcher(
         }
     };
 
+    // Fail closed, mirroring the WS dispatch guard (ws.rs): only run under a
+    // tenant that still resolves. `tenant::resolve()` silently falls back to the
+    // process-global stores when the registry rejects a tenant (e.g. the
+    // MAX_TENANTS cap is hit), which would otherwise let a REST caller read and
+    // write another tenant's loot/creds/options/jobs.
+    if let Err(e) = crate::tenant::resolve_for(&identity.client_name) {
+        return err_resp(StatusCode::SERVICE_UNAVAILABLE, "TENANT_REJECTED", &e);
+    }
     crate::tenant::CURRENT_TENANT
         .scope(
             identity.client_name,
@@ -719,7 +810,7 @@ pub async fn start_api_server(
     for key in &authorized_keys {
         println!("  {} ({})",
             key.name,
-            crate::pq_channel::fingerprint(&key.x25519_public, &key.mlkem_ek));
+            crate::pq_channel::fingerprint(&[&key.x25519_public, &key.mlkem_ek, &key.mceliece_public]));
     }
 
     // Generate a one-time enrollment token. Operators bootstrap remote

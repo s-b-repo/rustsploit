@@ -318,7 +318,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
-        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -336,7 +336,22 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 try_proxy_auth(proxy_type, &host, port, &user, &pass, 5000).await
             }
         }).await?;
-        return Ok(ModuleOutcome::ok());
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid proxy credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "proxy",
+                    "proxy_type": format!("{:?}", proxy_type),
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single target ---

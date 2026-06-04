@@ -726,7 +726,12 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
     if pos >= data.len() || data[pos] != 0x30 { return Err(anyhow!("Not a SEQUENCE")); }
     pos += 1;
     let seq_len = ber_read_len(data, &mut pos)?;
-    let seq_end = pos + seq_len;
+    // `ber_read_len` accepts up to 8 length octets, so on a malicious server
+    // response `seq_len`/`field_len` can be near `usize::MAX`. Without checked
+    // arithmetic `pos + len` overflows: in debug it panics, and in release it
+    // wraps small and defeats the `> data.len()` guard so the following slice
+    // panics — which, with `panic = "abort"`, takes down the whole scanner.
+    let seq_end = pos.checked_add(seq_len).map_or(data.len(), |e| e.min(data.len()));
 
     let mut result = TsRequestData {
         nego_tokens: None, auth_info: None, pub_key_auth: None, error_code: None,
@@ -735,8 +740,11 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
     while pos < data.len() && pos < seq_end {
         let tag = data[pos]; pos += 1;
         let field_len = ber_read_len(data, &mut pos)?;
-        if pos + field_len > data.len() { break; }
-        let field_data = &data[pos..pos + field_len];
+        let field_end = match pos.checked_add(field_len) {
+            Some(e) if e <= data.len() => e,
+            _ => break,
+        };
+        let field_data = &data[pos..field_end];
 
         match tag {
             0xA0 => { /* version - skip */ }
@@ -759,7 +767,7 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
             }
             _ => {}
         }
-        pos += field_len;
+        pos = field_end;
     }
     Ok(result)
 }
@@ -769,8 +777,11 @@ fn extract_octet(data: &[u8]) -> Result<Vec<u8>> {
     if pos < data.len() && data[pos] == 0x04 {
         pos += 1;
         let len = ber_read_len(data, &mut pos)?;
-        if pos + len <= data.len() {
-            return Ok(data[pos..pos + len].to_vec());
+        // checked_add: a server-controlled `len` near usize::MAX would otherwise
+        // overflow and slice-panic (abort).
+        if let Some(end) = pos.checked_add(len)
+            && end <= data.len() {
+            return Ok(data[pos..end].to_vec());
         }
     }
     Ok(data.to_vec())
@@ -803,7 +814,8 @@ fn extract_integer(data: &[u8]) -> Result<Option<i64>> {
     if pos < data.len() && data[pos] == 0x02 {
         pos += 1;
         let len = ber_read_len(data, &mut pos)?;
-        if len == 0 || pos + len > data.len() { return Ok(None); }
+        // checked_add guards against a server-controlled `len` overflowing `pos`.
+        if len == 0 || pos.checked_add(len).is_none_or(|e| e > data.len()) { return Ok(None); }
         // Sign-extend: if first byte has high bit set, the value is negative
         let mut val: i64 = if data[pos] & 0x80 != 0 { -1 } else { 0 };
         for i in 0..len {

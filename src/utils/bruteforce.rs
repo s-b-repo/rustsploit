@@ -270,17 +270,88 @@ pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr 
         }
     }
     // Exhausted attempts — exclusion set covers most of the IPv4 space.
-    // Return a best-effort candidate from a rarely-excluded range.
+    // Return a best-effort candidate from a rarely-excluded range, but still
+    // honour the exclusions: an unchecked return could hand the scanner an
+    // address the operator explicitly excluded (owned/Cloudflare/etc).
     tracing::warn!(
         "generate_random_public_ip: exhausted {} attempts; exclusion set may be too broad",
         MAX_ATTEMPTS
     );
-    IpAddr::V4(Ipv4Addr::new(
-        rng.random_range(44u8..46),
-        rng.random_range(0..=255),
-        rng.random_range(0..=255),
-        rng.random_range(1..=254),
-    ))
+    let mut last = Ipv4Addr::new(44, 0, 0, 1);
+    for _ in 0..1024 {
+        last = Ipv4Addr::new(
+            rng.random_range(44u8..46),
+            rng.random_range(0..=255),
+            rng.random_range(0..=255),
+            rng.random_range(1..=254),
+        );
+        let ip = IpAddr::V4(last);
+        if !exclusions.iter().any(|net| net.contains(ip)) {
+            return ip;
+        }
+    }
+    // Even the fallback range is fully excluded — the operator has excluded
+    // essentially the entire address space. Return the last public candidate
+    // (never loopback/private) so the caller never scans its own host.
+    IpAddr::V4(last)
+}
+
+/// Process-wide cache of the "already checked" IP set, keyed by state-file
+/// name. Loading the file once per state file (instead of re-reading the whole
+/// thing for every IP) turns the resume scan from O(n²) into O(n). The cached
+/// set reflects the on-disk resume state captured the first time the file is
+/// consulted in this run; IPs marked *during* the run aren't re-queried because
+/// each address appears exactly once in `network.iter()`.
+type CheckedSet = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+static CHECKED_IP_CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, CheckedSet>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Cap state-file size to keep a corrupted/runaway file from OOMing us.
+const MAX_STATE_FILE: u64 = 256 * 1024 * 1024;
+
+/// Load (and cache) the set of IPs recorded in `state_file`. Each line is of
+/// the form `checked: <ip>`; we store the `<ip>` token so lookups are exact
+/// full-token matches rather than substring scans. The file is parsed once per
+/// state file and the resulting set is reused for every subsequent IP, turning
+/// the resume scan from O(n²) (one full re-read per IP) into O(n).
+async fn checked_set_for(state_file: &str) -> CheckedSet {
+    {
+        let cache = CHECKED_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = cache.get(state_file) {
+            return set.clone();
+        }
+    }
+
+    let mut set = std::collections::HashSet::new();
+    match tokio::fs::metadata(state_file).await {
+        Ok(meta) if meta.len() > MAX_STATE_FILE => {
+            tracing::warn!("state file {state_file} exceeds size cap; treating as empty");
+        }
+        Ok(_) => match tokio::fs::read_to_string(state_file).await {
+            Ok(contents) => {
+                for line in contents.lines() {
+                    // Match the exact on-disk format `checked: <ip>` and pull
+                    // out the full IP token (no substring matching, so
+                    // `1.2.3.4` never matches `1.2.3.40` / `11.2.3.4`).
+                    if let Some(ip) = line.strip_prefix("checked: ") {
+                        let ip = ip.trim();
+                        if !ip.is_empty() {
+                            set.insert(ip.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("failed to read state file {state_file}: {e}"),
+        },
+        Err(e) => tracing::trace!("state file {state_file} not accessible: {e}"),
+    }
+
+    let set: CheckedSet = Arc::new(std::sync::Mutex::new(set));
+    let mut cache = CHECKED_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(state_file.to_string())
+        .or_insert_with(|| set.clone())
+        .clone()
 }
 
 pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
@@ -290,18 +361,9 @@ pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
     {
         return false;
     }
-    let needle = format!("checked: {}", ip.to_string());
-    // Cap state-file size to keep a corrupted/runaway file from OOMing us.
-    const MAX_STATE_FILE: u64 = 256 * 1024 * 1024;
-    match tokio::fs::metadata(state_file).await {
-        Ok(meta) if meta.len() > MAX_STATE_FILE => return false,
-        Ok(_) => {}
-        Err(e) => { tracing::trace!("state file {state_file} not accessible: {e}"); return false; }
-    }
-    match tokio::fs::read_to_string(state_file).await {
-        Ok(contents) => contents.lines().any(|line| line.contains(&needle)),
-        Err(e) => { tracing::debug!("failed to read state file {state_file}: {e}"); false }
-    }
+    let set = checked_set_for(state_file).await;
+    let guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    guard.contains(&ip.to_string())
 }
 
 pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
@@ -315,7 +377,8 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
         crate::meprintln!("[!] Invalid state file path (no directories allowed): {}", state_file);
         return;
     }
-    let data = format!("checked: {}\n", ip.to_string());
+    let ip_str = ip.to_string();
+    let data = format!("checked: {}\n", ip_str);
     match OpenOptions::new()
         .create(true)
         .append(true)
@@ -325,6 +388,14 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
         Ok(mut file) => {
             if let Err(e) = file.write_all(data.as_bytes()).await {
                 eprintln!("[!] Write failed: {}", e);
+            } else {
+                // Keep the in-memory checked-set cache consistent with the
+                // append so a later `is_ip_checked` for the same file/IP agrees
+                // with disk without re-reading.
+                let cache = CHECKED_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(set) = cache.get(state_file) {
+                    set.lock().unwrap_or_else(|e| e.into_inner()).insert(ip_str);
+                }
             }
         }
         Err(e) => {
@@ -366,11 +437,17 @@ pub fn subnet_host_count(net: &ipnetwork::IpNetwork) -> u128 {
 // ============================================================
 
 /// Check if a target triggers mass scan mode.
-/// Recognizes: "random", "0.0.0.0", "0.0.0.0/0", CIDR subnets, and file paths.
+/// Recognizes: "random", "0.0.0.0/0", CIDR subnets, and file paths.
+/// Bare "0.0.0.0" is intentionally excluded (M45): it is a normal single
+/// host, not a full-internet random-scan keyword.
 pub fn is_mass_scan_target(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
     target == "random"
-        || target == "0.0.0.0"
         || target == "0.0.0.0/0"
+        || lower == "seq"
+        || lower == "sequential"
+        || lower.starts_with("seq:")
+        || lower.starts_with("sequential:")
         || is_subnet_target(target)
         || std::path::Path::new(target).is_file()
 }
@@ -475,13 +552,35 @@ pub fn generate_combos_mode(
 pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
     let mut combos = Vec::new();
     if crate::utils::wordlist::should_stream(path) {
+        // The "streaming" branch still accumulates every parsed pair into a
+        // single in-memory Vec, so a multi-GB credential file would OOM the
+        // process. Enforce a hard entry cap: once we hit MAX_COMBOS, stop
+        // accumulating and warn, mirroring generate_combos_mode's behaviour.
+        let mut capped = false;
         crate::utils::load_lines_batched(path, crate::utils::wordlist::DEFAULT_BATCH_SIZE, |batch| {
+            if capped {
+                return;
+            }
             for line in batch {
+                if combos.len() >= MAX_COMBOS {
+                    capped = true;
+                    break;
+                }
                 if let Some((user, pass)) = line.split_once(':') {
                     combos.push((user.to_string(), pass.to_string()));
                 }
             }
         })?;
+        if capped {
+            crate::meprintln!(
+                "{}",
+                format!(
+                    "[!] Credential file cap reached: truncated to {} pairs. Split the file or use a smaller list.",
+                    MAX_COMBOS
+                )
+                .yellow()
+            );
+        }
     } else {
         let lines = crate::utils::load_lines(path)?;
         for line in lines {
@@ -494,10 +593,19 @@ pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// Parse combo mode from user input string.
+///
+/// Accepts both vocabularies in use across the codebase: the standalone
+/// bruteforce modules' `linear/combo/spray` and `creds_helper`'s
+/// `cartesian/paired`. `cartesian` is a synonym for `combo` (full cross-product)
+/// and `paired` for `linear` (user[i] with pass[i]). Previously only
+/// combo/cross/spray were recognized, so `creds_helper`'s default `cartesian`
+/// silently fell through to `Linear` — a 5×1000 run did 1000 attempts instead
+/// of 5000 across ~15 harness modules.
 pub fn parse_combo_mode(input: &str) -> ComboMode {
     match input.trim().to_lowercase().as_str() {
-        "combo" | "cross" => ComboMode::Combo,
+        "combo" | "cross" | "cartesian" => ComboMode::Combo,
         "spray" | "password_spray" => ComboMode::Spray,
+        "linear" | "paired" => ComboMode::Linear,
         _ => ComboMode::Linear,
     }
 }
@@ -664,8 +772,15 @@ where
         let delay_ms = config.delay_ms;
         let jitter_ms = config.jitter_ms;
 
+        // Re-establish the parent OUTPUT_BUFFER inside the worker: tokio::spawn
+        // does NOT inherit task-locals, so without this a bruteforce running as a
+        // background job (or under an API request) would leak per-attempt output
+        // to the real stdout / process-global spool instead of the captured
+        // per-job buffer.
+        let __task_buf = crate::output::OUTPUT_BUFFER.try_with(|b| b.clone()).ok();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
+            let __body = async move {
             if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
 
             // Respect global rate-limit pause
@@ -736,6 +851,11 @@ where
                 } else { 0 };
                 tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
             }
+            };
+            match __task_buf {
+                Some(b) => crate::output::OUTPUT_BUFFER.scope(b, __body).await,
+                None => __body.await,
+            }
         }));
 
     }
@@ -763,8 +883,9 @@ where
 }
 
 /// Run bruteforce with streaming wordlist support.
-/// If either wordlist file exceeds 250 MB, combos are generated and processed in
-/// batches rather than materializing the full cross product in memory.
+/// If the password wordlist file exceeds `STREAMING_THRESHOLD`, combos are
+/// generated and processed in batches rather than materializing the full cross
+/// product in memory (and without tripping the 100 MB `load_lines` hard cap).
 /// For normal-sized wordlists, falls back to the standard `run_bruteforce`.
 pub async fn run_bruteforce_streaming<F, Fut>(
     config: &BruteforceConfig,
@@ -885,7 +1006,7 @@ pub async fn run_subnet_bruteforce<F, Fut>(
     passwords: Vec<String>,
     config: &SubnetScanConfig,
     try_login: F,
-) -> Result<()>
+) -> Result<Vec<(String, String, String)>>
 where
     F: Fn(IpAddr, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
     Fut: Future<Output = LoginResult> + Send,
@@ -911,6 +1032,9 @@ where
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     let stats_checked = Arc::new(AtomicUsize::new(0));
     let stats_found = Arc::new(AtomicUsize::new(0));
+    // Collect discovered (host, user, pass) hits so the caller can surface them
+    // as Findings instead of them being silently dropped (only printed/stored).
+    let found_hits: BruteforceFoundList = Arc::new(Mutex::new(Vec::new()));
     let creds_pkg = Arc::new((usernames, passwords));
     let total = count;
     let service: &'static str = config.service_name;
@@ -976,6 +1100,7 @@ where
         let cp = creds_pkg.clone();
         let sc = stats_checked.clone();
         let sf = stats_found.clone();
+        let hits_c = found_hits.clone();
         let tx = tx.clone();
         let try_login = try_login.clone();
         let verbose = config.verbose;
@@ -983,7 +1108,12 @@ where
         let jitter_ms = config.jitter_ms;
         let state_file_task = state_file.clone();
 
+        // Re-establish the parent OUTPUT_BUFFER inside the worker (tokio::spawn
+        // drops task-locals) so per-host output is captured when the subnet
+        // bruteforce runs as a background job / API request.
+        let __task_buf = crate::output::OUTPUT_BUFFER.try_with(|b| b.clone()).ok();
         tokio::spawn(async move {
+            let __body = async move {
             // Quick TCP port check (skipped for UDP protocols).
             // Uses the helper so source-port (`setg src_port`) is honoured.
             if !skip_tcp {
@@ -1000,6 +1130,15 @@ where
                     return;
                 }
             }
+
+            // Track consecutive transient errors per host. A single
+            // connection-refused/timeout/reset on one credential is often
+            // transient (momentary packet loss, server hiccup, rate-limit
+            // blip) and must NOT abandon every remaining credential for the
+            // host. We only give up after a run of consecutive errors —
+            // matching the lockout threshold used by `run_bruteforce`.
+            const HOST_ERROR_THRESHOLD: u32 = 10;
+            let mut consecutive_errors: u32 = 0;
 
             let (users, passes) = &*cp;
             'outer: for user in users {
@@ -1029,10 +1168,19 @@ where
                             if let Err(e) = tx.send(format!("{}\n", msg)).await {
                                 eprintln!("[!] Channel send failed: {}", e);
                             }
+                            hits_c.lock().await.push((
+                                ip.to_string(),
+                                user.clone(),
+                                pass.clone(),
+                            ));
                             sf.fetch_add(1, Ordering::Relaxed);
                             break 'outer;
                         }
                         LoginResult::AuthFailed => {
+                            // A definitive auth response means the host is
+                            // reachable and responsive — clear the transient
+                            // error streak.
+                            consecutive_errors = 0;
                             if verbose {
                                 crate::mprintln!(
                                     "\r{}",
@@ -1041,18 +1189,30 @@ where
                             }
                         }
                         LoginResult::Error { message, .. } => {
-                            let lower = message.to_lowercase();
-                            if lower.contains("refused")
-                                || lower.contains("timeout")
-                                || lower.contains("reset")
-                            {
-                                break 'outer; // host unreachable, skip
-                            }
+                            // Don't abandon the host on a single transient
+                            // error. Count consecutive errors and only give up
+                            // once we've seen a sustained run of them (the host
+                            // is genuinely unreachable / down), matching how
+                            // `run_bruteforce` treats consecutive errors.
+                            consecutive_errors = consecutive_errors.saturating_add(1);
                             if verbose {
                                 crate::mprintln!(
                                     "\r{}",
                                     format!("[?] {}:{} -> {}:{} error: {}", ip, port, user, pass, message).yellow()
                                 );
+                            }
+                            if consecutive_errors >= HOST_ERROR_THRESHOLD {
+                                if verbose {
+                                    crate::mprintln!(
+                                        "\r{}",
+                                        format!(
+                                            "[!] {}:{} -> {} consecutive errors, abandoning host",
+                                            ip, port, consecutive_errors
+                                        )
+                                        .yellow()
+                                    );
+                                }
+                                break 'outer; // host genuinely unreachable, skip
                             }
                         }
                     }
@@ -1063,6 +1223,11 @@ where
                 mark_ip_checked(&ip, sf_name).await;
             }
             drop(permit);
+            };
+            match __task_buf {
+                Some(b) => crate::output::OUTPUT_BUFFER.scope(b, __body).await,
+                None => __body.await,
+            }
         });
     }
 
@@ -1091,5 +1256,6 @@ where
         .cyan()
         .bold()
     );
-    Ok(())
+    let hits = found_hits.lock().await.clone();
+    Ok(hits)
 }

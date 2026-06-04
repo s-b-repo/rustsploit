@@ -11,7 +11,7 @@ use colored::*;
 use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::{build_http_client, cfg_prompt_int_range, cfg_prompt_yes_no};
 
 const HTTP_TIMEOUT_SECS: u64 = 8;
@@ -63,29 +63,6 @@ pub fn info() -> ModuleInfo {
         rank: ModuleRank::Excellent,
         default_port: None,
     }
-}
-
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("php_version_eol requires a single-host target".to_string()),
-    };
-    let host = sanitize_host(target);
-    let client = match build_http_client(Duration::from_secs(HTTP_TIMEOUT_SECS)) {
-        Ok(c) => c,
-        Err(e) => return CheckResult::Error(format!("HTTP client build failed: {}", e)),
-    };
-
-    if let Some(banner) = peek_php_powered_by(&client, &host).await
-        && is_eol_php(&banner) {
-            return CheckResult::Vulnerable(format!("EOL PHP banner: {}", banner));
-        }
-    if peek_any_vicidial(&client, &host).await {
-        return CheckResult::Vulnerable(
-            "Vicidial install detected (legacy stack often runs EOL PHP)".into(),
-        );
-    }
-    CheckResult::NotVulnerable("No EOL PHP banner / Vicidial endpoint detected".into())
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
@@ -191,12 +168,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    if status.is_success() || status.as_u16() == 401 || status.as_u16() == 302 {
-                        vicidial_hit = true;
+                    if !(status.is_success() || status.as_u16() == 401 || status.as_u16() == 302) {
+                        continue;
+                    }
+                    // Read the body so we can require a Vicidial-specific fingerprint.
+                    // A bare success/401/302 status is returned by a huge fraction of
+                    // ordinary endpoints and is NOT proof of Vicidial.
+                    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::debug!("body read failed for {}: {}", url, redact_err(&e.to_string()));
+                            continue;
+                        }
+                    };
+                    let is_vicidial = is_vicidial_fingerprint(&body);
+                    vicidial_hit = true;
+                    if is_vicidial {
                         crate::mprintln!(
                             "{}",
                             format!(
-                                "[+] Vicidial endpoint reachable: {} (status={}, X-Powered-By='{}')",
+                                "[+] Vicidial install confirmed: {} (status={}, X-Powered-By='{}')",
                                 url, status, banner
                             )
                             .green()
@@ -205,7 +196,31 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         outcome.findings.push(Finding {
                             target: host.clone(),
                             kind: FindingKind::Vulnerable,
-                            message: format!("Vicidial endpoint reachable at {} (status {})", url, status),
+                            message: format!("Vicidial install confirmed at {} (status {})", url, status),
+                            data: Some(serde_json::json!({
+                                "host": host,
+                                "url": url,
+                                "status": status.as_u16(),
+                                "x_powered_by": banner,
+                                "fingerprint": "vicidial-marker-in-body",
+                            })),
+                        });
+                    } else {
+                        crate::mprintln!(
+                            "{}",
+                            format!(
+                                "[*] Vicidial path reachable but unconfirmed: {} (status={}, X-Powered-By='{}')",
+                                url, status, banner
+                            )
+                            .cyan()
+                        );
+                        outcome.findings.push(Finding {
+                            target: host.clone(),
+                            kind: FindingKind::Note,
+                            message: format!(
+                                "Vicidial path {} reachable (status {}) but no Vicidial fingerprint in body; unconfirmed",
+                                url, status
+                            ),
                             data: Some(serde_json::json!({
                                 "host": host,
                                 "url": url,
@@ -238,30 +253,15 @@ fn is_eol_php(banner: &str) -> bool {
         || rest.starts_with("7.")
 }
 
-async fn peek_php_powered_by(client: &reqwest::Client, host: &str) -> Option<String> {
-    for scheme in ["https", "http"] {
-        let url = format!("{}://{}/", scheme, host);
-        if let Ok(resp) = client.get(&url).send().await
-            && let Some(v) = resp.headers().get("x-powered-by").and_then(|v| v.to_str().ok()) {
-                return Some(v.to_string());
-            }
-    }
-    None
-}
-
-async fn peek_any_vicidial(client: &reqwest::Client, host: &str) -> bool {
-    for path in VICIDIAL_PATHS {
-        for scheme in ["http", "https"] {
-            let url = format!("{}://{}{}", scheme, host, path);
-            if let Ok(resp) = client.get(&url).send().await {
-                let s = resp.status();
-                if s.is_success() || s.as_u16() == 401 || s.as_u16() == 302 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Returns true only when the response body carries a Vicidial-specific
+/// fingerprint. A reachable path / success-or-redirect status alone is NOT
+/// sufficient — those are returned by countless unrelated endpoints.
+fn is_vicidial_fingerprint(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("vicidial")
+        || lower.contains("vicidial.org")
+        || lower.contains("vicidial group")
+        || lower.contains("astguiclient")
 }
 
 fn redact_err(s: &str) -> String {
@@ -279,4 +279,4 @@ fn sanitize_host(target: &str) -> String {
     t.to_string()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "php_version_eol", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "php_version_eol", native);

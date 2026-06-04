@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::cfg_prompt_default;
+use crate::utils::{cfg_prompt_default, cfg_prompt_int_range};
 
 const DEFAULT_PORTS: &str = "8080,3128,1080,8888,9050,80,3129,8118";
 const CONNECT_HOST: &str = "httpbin.org";
@@ -154,14 +154,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let ports_input = cfg_prompt_default("ports", "Ports to scan", DEFAULT_PORTS).await?;
     let ports = parse_ports(&ports_input);
-    let timeout_ms: u64 = cfg_prompt_default("timeout", "Timeout (ms)", "5000").await?.parse().unwrap_or(5000);
-    let dur = Duration::from_millis(timeout_ms);
+    // The `timeout` option is shared across modules and is interpreted in
+    // SECONDS everywhere else (http_title_scanner, ssl_scanner, snmp_scanner,
+    // redfish_unauth_enum, …). This module used to read it as milliseconds,
+    // so a global `setg timeout 10` (= 10s elsewhere) became 10ms here —
+    // every TCP probe timed out before it could connect and the scanner
+    // reported "no proxy detected" for every host. Read seconds, floor at 1s.
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout per probe (seconds)", 5, 1, 60).await? as u64;
+    let dur = Duration::from_secs(timeout_secs);
     let verbose = !crate::utils::is_batch_mode();
 
     if verbose {
         crate::mprintln!("[*] Target: {}", target.yellow());
         crate::mprintln!("[*] Ports: {:?}", ports);
-        crate::mprintln!("[*] Timeout: {}ms", timeout_ms);
+        crate::mprintln!("[*] Timeout: {}s", timeout_secs);
         crate::mprintln!();
     }
 
@@ -179,6 +185,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             crate::mprintln!("  {}", format!("[-] {}:{} — no proxy detected", ip, port).dimmed());
         }
         for h in &hits {
+            // Always print a found proxy, even under mass/batch scan — a live
+            // open proxy is exactly the high-value event the operator is here
+            // for, so it must never be suppressed alongside the routine
+            // "probing/no proxy" noise (which IS gated by `verbose`).
             crate::mprintln!("  {}", format!("[+] {}:{} — {} ({})", ip, h.port, h.kind, h.detail).green().bold());
             outcome.findings.push(Finding {
                 target: ip.to_string(),

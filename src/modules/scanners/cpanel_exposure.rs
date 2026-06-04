@@ -11,7 +11,7 @@ use colored::*;
 use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{CheckResult, ModuleInfo, ModuleRank};
+use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::{build_http_client, cfg_prompt_int_range, cfg_prompt_yes_no};
 
 const HTTP_TIMEOUT_SECS: u64 = 8;
@@ -69,32 +69,6 @@ pub fn info() -> ModuleInfo {
     }
 }
 
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("cpanel_exposure requires a single-host target".to_string()),
-    };
-    let host = sanitize_host(target);
-    let client = match build_http_client(Duration::from_secs(HTTP_TIMEOUT_SECS)) {
-        Ok(c) => c,
-        Err(e) => return CheckResult::Error(format!("HTTP client build failed: {}", e)),
-    };
-    let mut hits = Vec::new();
-    for &(port, label, https) in PANEL_PORTS {
-        if probe_panel(&client, &host, port, https).await {
-            hits.push(format!("{} on :{}", label, port));
-            if hits.len() >= 2 {
-                break;
-            }
-        }
-    }
-    if hits.is_empty() {
-        CheckResult::NotVulnerable("No cPanel/WHM/webmail panels reachable on standard ports".into())
-    } else {
-        CheckResult::Vulnerable(format!("Exposed panels: {}", hits.join(", ")))
-    }
-}
-
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let target = ctx
         .target
@@ -148,7 +122,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let body = match resp.text().await {
+                let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
                     Ok(b) => b,
                     Err(e) => {
                         crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
@@ -212,15 +186,6 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-async fn probe_panel(client: &reqwest::Client, host: &str, port: u16, https: bool) -> bool {
-    let scheme = if https { "https" } else { "http" };
-    let url = format!("{}://{}:{}/", scheme, host, port);
-    matches!(
-        client.get(&url).send().await,
-        Ok(r) if r.status().is_success() || r.status().is_redirection()
-    )
-}
-
 fn title_indicates_panel(title: &str) -> bool {
     let t = title.to_ascii_lowercase();
     t.contains("cpanel") || t.contains("whm") || t.contains("webmail")
@@ -252,4 +217,4 @@ fn sanitize_host(target: &str) -> String {
     t.to_string()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "cpanel_exposure", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "cpanel_exposure", native);

@@ -188,6 +188,20 @@ where
 }
 
 // ============================================================
+// PERSIST PROMPT ANSWERS FOR BATCH REUSE
+// ============================================================
+
+/// After prompting the user interactively, store the answer in global options
+/// so that batch-mode tasks (which skip interactive prompts) can find it.
+/// This enables the "configure once, run against all targets" pattern.
+async fn persist_prompt_answer(key: &str, value: &str) {
+    crate::tenant::resolve()
+        .global_options()
+        .set(key, value)
+        .await;
+}
+
+// ============================================================
 // CONFIG-AWARE PROMPT WRAPPERS
 // ============================================================
 
@@ -219,17 +233,24 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
             return Ok(sanitized);
         }
     }
-    if config.api_mode {
-        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    if config.api_mode || crate::context::is_batch_active() {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Set it with: setg {} <value>", key, msg, key));
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
     let msg_owned = msg.to_string();
     if let Some(result) = cached_prompt(key, || async move {
         prompt_required(&msg_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_required(msg).await
+    let result = prompt_required(msg).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }
 
 /// Config-aware prompt with default value.
@@ -249,7 +270,7 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
             return Ok(sanitized);
         }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default.to_string());
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -258,9 +279,16 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
     if let Some(result) = cached_prompt(key, || async move {
         prompt_default(&msg_owned, &default_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_default(msg, default).await
+    let result = prompt_default(msg, default).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }
 
 /// Config-aware yes/no prompt.
@@ -290,7 +318,7 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
             _ => {} // fall through
         }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default_yes);
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -299,9 +327,17 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
         let val = prompt_yes_no(&msg_owned, default_yes).await?;
         Ok(if val { "y".to_string() } else { "n".to_string() })
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result.map(|v| v == "y");
     }
-    prompt_yes_no(msg, default_yes).await
+    let result = prompt_yes_no(msg, default_yes).await;
+    if let Ok(val) = result {
+        persist_prompt_answer(key, if val { "y" } else { "n" }).await;
+        return Ok(val);
+    }
+    result
 }
 
 /// Config-aware port prompt.
@@ -335,7 +371,7 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
             }
         }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default);
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -344,10 +380,18 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
         let val = prompt_port(&msg_owned, default).await?;
         Ok(val.to_string())
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         let val = result?;
         return val.parse::<u16>().map_err(|e| anyhow!("Invalid cached port value for '{}': {e}", key));
     }
-    prompt_port(msg, default).await
+    let result = prompt_port(msg, default).await;
+    if let Ok(val) = result {
+        persist_prompt_answer(key, &val.to_string()).await;
+        return Ok(val);
+    }
+    result
 }
 
 /// Config-aware file path prompt (validates file exists).
@@ -372,17 +416,24 @@ pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
                 return Ok(safe_path);
             }
         }
-    if config.api_mode {
-        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply a valid file path in the 'prompts' field.", key, msg));
+    if config.api_mode || crate::context::is_batch_active() {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Set it with: setg {} <path>", key, msg, key));
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
     let msg_owned = msg.to_string();
     if let Some(result) = cached_prompt(key, || async move {
         prompt_existing_file(&msg_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_existing_file(msg).await
+    let result = prompt_existing_file(msg).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }
 
 /// Config-aware integer range prompt.
@@ -422,7 +473,7 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
                     return Ok(n);
                 }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default);
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -431,10 +482,18 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
         let val = prompt_int_range(&msg_owned, default, min, max).await?;
         Ok(val.to_string())
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         let val = result?;
         return val.parse::<i64>().map_err(|e| anyhow!("Invalid cached int value for '{}': {e}", key));
     }
-    prompt_int_range(msg, default, min, max).await
+    let result = prompt_int_range(msg, default, min, max).await;
+    if let Ok(val) = result {
+        persist_prompt_answer(key, &val.to_string()).await;
+        return Ok(val);
+    }
+    result
 }
 
 /// Config-aware output file prompt.
@@ -473,15 +532,22 @@ pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
                 && Path::new(&safe_path).is_file() {
                     return Ok(safe_path);
                 }
-    if config.api_mode {
-        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    if config.api_mode || crate::context::is_batch_active() {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Set it with: setg {} <path>", key, msg, key));
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
     let msg_owned = msg.to_string();
     if let Some(result) = cached_prompt(key, || async move {
         prompt_wordlist(&msg_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_wordlist(msg).await
+    let result = prompt_wordlist(msg).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }

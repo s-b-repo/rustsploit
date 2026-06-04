@@ -138,17 +138,33 @@ pub async fn discover_live(cidr: &IpNetwork, tool: Prescan) -> Result<Vec<String
         Prescan::None => unreachable!("prescan::None handled above"),
     };
 
-    match tokio::time::timeout(wall_timeout, run_capture_lines(cmd, tool, max_output)).await {
-        Ok(Ok(ips)) => Ok(ips),
-        Ok(Err(e)) => Err(e.context("prescan tool exited with error")),
-        Err(e) => {
+    // The wall-clock timeout is enforced *inside* run_capture_lines so it can
+    // explicitly kill the (root-privileged) child before returning. Wrapping
+    // the future in tokio::time::timeout here would merely drop the future on
+    // timeout; even with kill_on_drop that races the orphan-cleanup against
+    // network traffic, so we kill explicitly instead.
+    match run_capture_lines(cmd, tool, max_output, wall_timeout).await {
+        Ok(CaptureResult::Completed(ips)) => Ok(ips),
+        Ok(CaptureResult::TimedOut) => {
+            // Distinguishable from a genuine empty result: a timeout means the
+            // scan never finished, so callers should fall back to per-IP
+            // fan-out rather than trust an empty live-host list.
             crate::meprintln!(
-                "[!] prescan timed out after {}s ({e}) — falling back to per-IP fan-out.",
+                "[!] prescan timed out after {}s (child killed) — falling back to per-IP fan-out.",
                 wall_timeout.as_secs()
             );
             Ok(Vec::new())
         }
+        Err(e) => Err(e.context("prescan tool exited with error")),
     }
+}
+
+/// Outcome of a capture run. `TimedOut` is kept distinct from
+/// `Completed(vec![])` so the caller can tell "scan hit the wall clock and was
+/// killed" apart from "scan finished and found nothing live".
+enum CaptureResult {
+    Completed(Vec<String>),
+    TimedOut,
 }
 
 fn port_spec_from_options() -> String {
@@ -186,7 +202,11 @@ fn masscan_cmd(cidr: &IpNetwork, ports: &str, rate: u32) -> Command {
         .args(["-oG", "-"])
         .args(["--wait", "0"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Without this, dropping the future on the wall-clock timeout path
+        // leaves a root-privileged SYN flooder running orphaned at `--rate`
+        // pps. kill_on_drop ensures the child dies with the future.
+        .kill_on_drop(true);
     cmd
 }
 
@@ -198,17 +218,25 @@ fn zmap_cmd(cidr: &IpNetwork, ports: &str, rate: u32) -> Command {
         .args(["-r", &rate.to_string()])
         .args(["-o", "-"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // See masscan_cmd: kill the orphaned root scanner when the capturing
+        // future is dropped (e.g. wall-clock timeout).
+        .kill_on_drop(true);
     cmd
 }
 
 /// Run the prescan command, capture stdout, parse out live IPs. Bounded by
-/// `max_output` so a misconfigured run can't OOM us.
+/// `max_output` so a misconfigured run can't OOM us, and by `wall_timeout` so
+/// a hung/misconfigured tool can't run forever. The wall-clock timeout is
+/// enforced here (rather than via an outer tokio::time::timeout) so we own the
+/// `Child` and can explicitly kill the root-privileged scanner before
+/// returning, instead of relying on the future being dropped.
 async fn run_capture_lines(
     mut cmd: Command,
     tool: Prescan,
     max_output: usize,
-) -> Result<Vec<String>> {
+    wall_timeout: Duration,
+) -> Result<CaptureResult> {
     let mut child = cmd.spawn().context("spawn prescan tool")?;
     let stdout = child
         .stdout
@@ -218,18 +246,63 @@ async fn run_capture_lines(
 
     let mut ips: Vec<String> = Vec::new();
     let mut bytes_seen = 0usize;
-    while let Some(line) = reader.next_line().await.context("read prescan line")? {
-        bytes_seen = bytes_seen.saturating_add(line.len() + 1);
-        if bytes_seen > max_output {
-            crate::meprintln!(
-                "[!] prescan output exceeded {} MiB — truncating.",
-                max_output / (1024 * 1024)
-            );
-            break;
+    let mut truncated = false;
+    let mut timed_out = false;
+
+    // Drive the read loop under the wall-clock deadline. tokio::time::timeout
+    // around the whole loop lets us break out and kill the child explicitly.
+    let read_loop = async {
+        while let Some(line) = reader.next_line().await.context("read prescan line")? {
+            bytes_seen = bytes_seen.saturating_add(line.len() + 1);
+            if bytes_seen > max_output {
+                crate::meprintln!(
+                    "[!] prescan output exceeded {} MiB — truncating.",
+                    max_output / (1024 * 1024)
+                );
+                truncated = true;
+                break;
+            }
+            if let Some(ip) = parse_line(tool, &line) {
+                ips.push(ip);
+            }
         }
-        if let Some(ip) = parse_line(tool, &line) {
-            ips.push(ip);
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(wall_timeout, read_loop).await {
+        Ok(res) => res?,
+        Err(_) => timed_out = true,
+    }
+
+    // On the timeout *or* output-cap truncation path the child is still
+    // running (a misconfigured root scanner spewing output / SYNs at `--rate`
+    // pps). Explicitly start_kill() it, then reap with wait() so it cannot
+    // survive as an orphaned packet-blaster after rustsploit moves on.
+    if timed_out || truncated {
+        if let Err(e) = child.start_kill() {
+            // An already-exited child is fine; anything else is worth a
+            // breadcrumb so a failed kill of a packet-blasting scanner is not
+            // silently ignored.
+            tracing::debug!("prescan: start_kill on timed-out/truncated child failed: {e}");
         }
+        // Reap the killed child so it doesn't linger as a zombie; the kill
+        // signal makes this return promptly. kill_on_drop is also set as a
+        // belt-and-braces backstop on any early-return paths above.
+        if let Err(e) = child.wait().await {
+            tracing::debug!("prescan: reaping killed child failed: {e}");
+        }
+        if timed_out {
+            return Ok(CaptureResult::TimedOut);
+        }
+        // Truncated: return the partial live-host list we did manage to read.
+        ips.sort();
+        ips.dedup();
+        crate::mprintln!(
+            "[+] prescan: {} live host{} discovered (output truncated).",
+            ips.len(),
+            if ips.len() == 1 { "" } else { "s" }
+        );
+        return Ok(CaptureResult::Completed(ips));
     }
 
     // Capture stderr before waiting for exit
@@ -267,7 +340,7 @@ async fn run_capture_lines(
         ips.len(),
         if ips.len() == 1 { "" } else { "s" }
     );
-    Ok(ips)
+    Ok(CaptureResult::Completed(ips))
 }
 
 fn parse_line(tool: Prescan, line: &str) -> Option<String> {

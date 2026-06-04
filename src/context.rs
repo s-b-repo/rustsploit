@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::config::ModuleConfig;
-use crate::output::OutputAccumulator;
 
 const MAX_PROMPT_CACHE_ENTRIES: usize = 256;
 
@@ -93,6 +92,26 @@ tokio::task_local! {
     /// Modules don't need to reference this directly — the `cfg_prompt_*` functions
     /// check it automatically.
     pub static RUN_CONTEXT: Arc<RunContext>;
+
+    /// Optional per-target scan counters. The job manager scopes this around a
+    /// backgrounded run so the scheduler can publish live progress (total /
+    /// succeeded / failed targets) back into the job's `JobProgress`. Unset for
+    /// foreground/CLI runs, in which case the scheduler simply skips it.
+    pub static SCAN_COUNTERS: Arc<ScanCounters>;
+}
+
+/// Live per-target progress for a running scan, shared from the scheduler back
+/// to the job manager. All counters are monotonic for the lifetime of one run.
+#[derive(Default)]
+pub struct ScanCounters {
+    pub total: AtomicU64,
+    pub succeeded: AtomicU64,
+    pub failed: AtomicU64,
+}
+
+/// The active scan counters, if a job scoped them. `None` for foreground runs.
+pub fn scan_counters() -> Option<Arc<ScanCounters>> {
+    SCAN_COUNTERS.try_with(|c| c.clone()).ok()
 }
 
 /// Per-run context carrying module config, target, and structured output accumulator.
@@ -101,8 +120,6 @@ pub struct RunContext {
     pub config: ModuleConfig,
     /// Per-request target override (API mode). Shell mode leaves this None.
     pub target: Option<String>,
-    /// Accumulated structured findings from this module run.
-    pub output: OutputAccumulator,
     /// Shared prompt cache for concurrent dispatch modes.
     /// When set, `cfg_prompt_*` functions check this cache before prompting stdin.
     pub prompt_cache: Option<PromptCache>,
@@ -132,7 +149,6 @@ impl RunContext {
         Self {
             config,
             target: Some(target),
-            output: OutputAccumulator::new(),
             prompt_cache: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             tenant_id: None,
@@ -147,7 +163,6 @@ impl RunContext {
         Self {
             config,
             target: Some(target),
-            output: OutputAccumulator::new(),
             prompt_cache: Some(cache),
             cancel: tokio_util::sync::CancellationToken::new(),
             tenant_id: None,

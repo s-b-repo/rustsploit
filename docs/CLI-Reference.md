@@ -25,11 +25,13 @@ An optional positional argument (`exploit`, `scanner`, `creds`) can be used to s
 |------|--------|-------------|
 | `--module` / `-m` | module name or path | Module to execute (short name or qualified path) |
 | `--target` / `-t` | IP / hostname / CIDR | Target to run against |
-| `-o` | `key=value` | Set a module option (repeatable: `-o port=443 -o verbose=y`) |
+| `--set-target` | IP / hostname / CIDR | Persist a global target for all modules and exit |
 | *(positional)* | `exploit`, `scanner`, `creds` | Optional module category subcommand |
 
-Options set via `-o` are equivalent to `set key value` in the shell. Metasploit
-aliases are supported: `-o RPORT=443`, `-o LPORT=31337`, `-o THREADS=100`.
+> There is no `-o key=value` flag. Per-module options are configured
+> interactively, via `set`/`setg` in the shell, or through a resource script
+> (`-r`). Run the module without the option set and answer the prompt, or
+> pre-seed it with `setg <key> <value>` in a startup `.rc` file.
 
 ---
 
@@ -38,13 +40,18 @@ aliases are supported: `-o RPORT=443`, `-o LPORT=31337`, `-o THREADS=100`.
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--list-modules` | | Print all available modules and exit |
+| `--gen-module-catalog` | | Regenerate `docs/Module-Catalog.md` from the live registry and exit |
+| `--list-checkpoints` | | List on-disk scan checkpoints (`~/.rustsploit/checkpoints/`) and exit |
 | `--verbose` | `-v` | Enable detailed logging |
 | `--output-format` | | Control output: `text` (default) or `json` |
+| `--strict-tls` | | Verify TLS for all modules (default accepts self-signed certs) |
 | `--api` | | Start the PQ-encrypted REST + WebSocket API server |
 | `--mcp` | | Start as MCP (Model Context Protocol) server on stdio |
-| `--interface <addr:port>` | | Bind address for API server (default: `127.0.0.1:8080`) |
-| `--pq-host-key <path>` | | PQ host key file (default: `~/.rustsploit/pq_host_key`) |
-| `--pq-authorized-keys <path>` | | Authorized client keys file (default: `~/.rustsploit/pq_authorized_keys`) |
+| `--interface <addr:port>` | | Bind address for API server (default: `127.0.0.1`, port `:8080` appended) — requires `--api` |
+| `--pq-host-key <path>` | | PQ host key file (default: `~/.rustsploit/pq_host_key`) — requires `--api` |
+| `--pq-authorized-keys <path>` | | Authorized client keys file (default: `~/.rustsploit/pq_authorized_keys`) — requires `--api` |
+| `--pq-key-passphrase <pass>` | | Passphrase to encrypt the PQ host key at rest — requires `--api` |
+| `--trust-proxy` | | Trust `X-Forwarded-For` for client-IP attribution — requires `--api` |
 | `--resource` | `-r` | Execute a resource script file on startup |
 
 ---
@@ -75,6 +82,9 @@ cargo run -- -m port_scanner -t 10.0.0.1 --output-format json
 
 # Execute a resource script
 cargo run -- -r scripts/scan.rc
+
+# WhisperPair Fast Pair exploit — interactive BLE sub-shell (needs the bluetooth feature)
+cargo run --features bluetooth -- -m exploits/bluetooth/wpair
 ```
 
 ---

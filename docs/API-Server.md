@@ -78,9 +78,10 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/pq/handshake` | Establish PQ-encrypted session (mutual auth) |
+| `POST` | `/pq/register-key` | Enroll a client public key using the one-time enrollment token |
 | `GET` | `/pq/ws` | Upgrade to PQ-encrypted WebSocket transport |
 
-### Protected (26 endpoints — require active PQ session)
+### Protected (require active PQ session)
 
 **Modules**
 
@@ -91,11 +92,18 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 | `GET` | `/api/module/{category}/{name}` | Get module info/metadata |
 | `POST` | `/api/run` | Execute a module against a target |
 
+**Check**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/check` | Run a module's non-destructive vulnerability check |
+| `POST` | `/api/run/all` (alias `POST /api/run_all`) | Run the selected module against all stored hosts |
+
 **Shell**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/shell` | Execute any shell command (full parity with interactive shell) |
+| `POST` | `/api/shell` | **Disabled** — returns `501 NOT_IMPLEMENTED`. Use the individual RPC endpoints (`/api/run`, `/api/target`, `/api/check`, …) instead. |
 
 **Target**
 
@@ -165,11 +173,11 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 |--------|------|-------------|
 | `GET` | `/api/export?format=<json\|csv\|summary>` | Export engagement data |
 
-> **Note:** The `check` command (non-destructive vulnerability check) is available via `POST /api/shell` with `{"command": "check"}` when a module and target are set. There is no dedicated `/api/check` endpoint.
+> **Note:** Non-destructive vulnerability checks use the dedicated `POST /api/check` endpoint (a module and target must be set). The `POST /api/shell` endpoint is **disabled** and returns `501 NOT_IMPLEMENTED`.
 
 > All responses include `request_id`, `timestamp`, and `duration_ms` fields for observability.
 
-> **Total: 28 endpoints** (2 public + 26 protected) across 9 resource categories, plus WebSocket transport.
+> The route table above lists the most commonly used endpoints. The dispatcher (`src/api.rs`) also exposes additional sub-routes such as `GET /api/modules/enriched`, `GET /api/creds/search`, `POST /api/creds/clear`, `POST /api/hosts/notes`, `POST /api/hosts/clear`, `POST /api/loot/clear`, `GET /api/workspaces`, `POST /api/jobs/limit`, `GET /api/jobs/{id}`, and `GET`/`POST /api/spool`. Treat `src/api.rs` as the source of truth for the full route set.
 
 ### WebSocket Transport
 
@@ -190,61 +198,20 @@ WebSocket messages use the same JSON request/response format as REST endpoints. 
 
 ---
 
-### Shell Command Endpoint
+### Shell Command Endpoint (disabled)
 
-`POST /api/shell` provides **full parity** with the interactive shell. Every command
-available in the `rsf>` prompt works via this endpoint. Commands that require interactive
-prompts (like `creds add`, `services add`, `loot add`) accept inline arguments instead.
+`POST /api/shell` is **not implemented** and returns `501 NOT_IMPLEMENTED`. A
+generic "run any shell command" endpoint is intentionally withheld until an ACL
+design lands. Use the dedicated RPC endpoints instead:
 
-**Request format:**
-```json
-{
-  "command": "single command string",
-  "commands": ["cmd1", "cmd2", "cmd3"]
-}
-```
-
-Use `command` for a single command or `commands` (array, 1-20 entries) for batching.
-Shell metacharacters (`& | ; $ >`) are forbidden — use the `commands` array for chaining.
-
-**Supported commands:**
-
-| Category | Commands |
-|----------|----------|
-| Navigation | `help`, `modules`, `find <kw>`, `use <path>`, `info [path]`, `back` |
-| Targeting | `set target <ip>`, `set subnet <CIDR>`, `set port <n>`, `show_target`, `clear_target` |
-| Execution | `run [target]`, `run_all [target]`, `check` |
-| Global Options | `setg <key> <val>`, `unsetg <key>`, `show_options` |
-| Credentials | `creds`, `creds add <host> <port> <svc> <user> <secret> [type]`, `creds search <q>`, `creds delete <id>`, `creds clear` |
-| Hosts/Services | `hosts`, `hosts add <ip>`, `services`, `services add <host> <port> <proto> <name> [ver]`, `notes <ip> <text>` |
-| Workspace | `workspace [name]` |
-| Loot | `loot`, `loot add <host> <type> <desc> <data>`, `loot search <q>` |
-| Export | `export <json\|csv\|summary> <file>` |
-| Jobs | `jobs`, `jobs -k <id>`, `jobs clean` |
-| Logging | `spool [off\|file]` |
-
-**Not available in API mode:** `resource` (security — prevents server-side file execution), `makerc` (no shell history).
-
-**Response format:**
-```json
-{
-  "success": true,
-  "message": "N shell command(s) executed",
-  "data": {
-    "results": [
-      {
-        "command": "modules",
-        "success": true,
-        "output": "{\"total\": <dynamically generated>, ...}",
-        "duration_ms": 2
-      }
-    ]
-  }
-}
-```
-
-Commands returning structured data (modules, creds, hosts, services, loot, jobs, options, info, check)
-encode their output as JSON strings in the `output` field.
+| Want to… | Use |
+|----------|-----|
+| Select / inspect a module | `GET /api/modules`, `GET /api/module/{category}/{name}` |
+| Set / clear the target | `POST` / `DELETE /api/target` |
+| Run a module | `POST /api/run` (or `POST /api/run/all` for all stored hosts) |
+| Run a non-destructive check | `POST /api/check` |
+| Read / write global options | `GET` / `POST` / `DELETE /api/options` |
+| Manage creds / hosts / services / loot | the corresponding `/api/creds`, `/api/hosts`, `/api/services`, `/api/loot` routes |
 
 ---
 
@@ -254,24 +221,30 @@ encode their output as JSON strings in the `output` field.
 
 | Check | Detail |
 |-------|--------|
-| Request body limit | Max 1 MB (prevents DoS) |
-| API key validation | Must be printable ASCII, max 256 chars |
+| Request body limit | Max 2 MiB (`DefaultBodyLimit`, prevents DoS) |
 | Target validation | Length check, control char rejection, path traversal prevention |
+| SSRF target filtering | Targets resolving to loopback/RFC1918/link-local/CGNAT/cloud-metadata ranges are rejected (`is_blocked_target` / `resolve_and_check` in `src/api.rs`) |
 | Module path sanitization | Validated against injection and traversal attacks |
-| Resource limits | Auto-cleanup when tracked IPs or auth failures exceed 100,000 entries |
 
-### IP Whitelist
+> There is no API-key mechanism. Authentication is performed by the
+> post-quantum mutual handshake (enrollment token + client public key), not by
+> a bearer key.
 
-An optional IP whitelist can be configured at `~/.rustsploit/ip_whitelist.conf` (one IP per line, `#` for comments). When the file exists and contains entries, only listed IPs are allowed to access the API. All other IPs receive HTTP `403 Forbidden`. If the file is absent or empty, all IPs are allowed.
+### Access Control
+
+Access is gated by the PQ handshake: a client must complete `/pq/handshake`
+with an authorized key (bootstrapped via an enrollment token) before any
+`/api/*` route is reachable. There is **no** `ip_whitelist.conf` file or
+IP-allowlist mechanism.
 
 ### Rate Limiting
 
-- **10 requests per second** per IP (general rate limit)
-- **3 failed auth attempts** → IP blocked for **30 seconds**
-- Blocked IPs receive HTTP `429 Too Many Requests`
-- Failure counter resets automatically after the block expires
-- Successful auth resets the failure counter for that IP
-- Expired blocks and entries older than **1 hour** are auto-pruned
+The only rate limiter is on the PQ handshake endpoint (`src/pq_middleware.rs`):
+
+- **10 handshake attempts per 60-second sliding window, per source IP.**
+- Over-limit handshakes are rejected; timestamps older than the window are pruned automatically.
+
+There is no general per-request-per-second limit and no failed-auth lockout on the `/api/*` routes themselves.
 
 ### Post-Quantum Host Key
 

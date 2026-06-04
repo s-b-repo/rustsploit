@@ -50,10 +50,6 @@ pub struct Cli {
     #[arg(long)]
     pub list_checkpoints: bool,
 
-    /// Output format (text, json)
-    #[arg(long, default_value = "text")]
-    pub output_format: Option<String>,
-
     /// Execute a resource script file on startup
     #[arg(short = 'r', long = "resource")]
     pub resource: Option<String>,

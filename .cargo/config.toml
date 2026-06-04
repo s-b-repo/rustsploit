@@ -1,0 +1,16 @@
+[build]
+# Sparse registry protocol — much faster index updates (default on 1.70+, set explicitly).
+# Set CARGO_TARGET_DIR in your shell to share build artifacts across projects.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+# Prefer mold if installed (`sudo apt install mold`); fall back to lld otherwise.
+# Swap "-fuse-ld=lld" -> "-fuse-ld=mold" after installing mold.
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[registries.crates-io]
+protocol = "sparse"

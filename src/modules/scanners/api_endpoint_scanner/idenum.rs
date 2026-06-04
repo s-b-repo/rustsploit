@@ -11,9 +11,11 @@ use std::path::Path;
 
 use reqwest::{Client, Method};
 
+use crate::module::{Finding, FindingKind};
 use crate::utils::load_lines;
 
 use super::config::ScanConfig;
+use super::scan::FindingSink;
 
 pub(super) async fn perform_id_enumeration(
     client: &Client,
@@ -21,6 +23,7 @@ pub(super) async fn perform_id_enumeration(
     method: Method,
     dir: &Path,
     config: &ScanConfig,
+    findings: &FindingSink,
 ) {
     let enum_dir = dir.join("enumeration");
     if let Err(e) = tokio::fs::create_dir_all(&enum_dir).await {
@@ -100,11 +103,28 @@ pub(super) async fn perform_id_enumeration(
                     version: Some(format!("status={}", status.as_u16())),
                 });
 
+                // An enumeration hit (non-404) is an interesting endpoint; record
+                // it so it reaches the outcome/export, not just the disk log.
+                findings.lock().await.push(Finding {
+                    target: target_url.clone(),
+                    kind: FindingKind::Note,
+                    message: format!(
+                        "ID enumeration hit ({}): {} returned status {}",
+                        payload, target_url, status
+                    ),
+                    data: Some(serde_json::json!({
+                        "url": target_url.clone(),
+                        "id": payload.clone(),
+                        "label": label.clone(),
+                        "status": status.as_u16(),
+                    })),
+                });
+
                 if status.is_success() {
                     let body_file = bodies_dir.join(format!("{}.txt", payload));
-                    let body = match resp.bytes().await {
+                    let body = match crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
                         Ok(b) => b,
-                        Err(e) => { tracing::debug!("read body failed: {e}"); bytes::Bytes::new() }
+                        Err(e) => { tracing::debug!("read body failed: {e}"); Vec::new() }
                     };
                     if let Ok(mut f) = File::create(&body_file) {
                         if let Err(e) = crate::utils::set_secure_permissions(&body_file, 0o600) {

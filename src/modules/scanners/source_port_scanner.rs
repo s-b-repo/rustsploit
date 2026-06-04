@@ -57,7 +57,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         print_banner();
     }
 
-    let settings = prompt_settings().await?;
+    let settings = prompt_settings(target).await?;
 
     let (ip_str, ip) = resolve_target(target)?;
 
@@ -255,7 +255,7 @@ fn print_banner() {
     );
 }
 
-async fn prompt_settings() -> Result<ScanSettings> {
+async fn prompt_settings(target: &str) -> Result<ScanSettings> {
     crate::mprintln!("{}", "\n=== Source Port Scanner Configuration ===".cyan().bold());
 
     let dest_port = cfg_prompt_port("dest_port", "Destination port to test against", 80).await?;
@@ -287,7 +287,8 @@ async fn prompt_settings() -> Result<ScanSettings> {
     let concurrency = cfg_prompt_int_range("concurrency", "Concurrency (parallel probes)", 500, 1, 10000).await? as usize;
     let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 3, 1, 60).await? as u64;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output (show denied/filtered)?", false).await?;
-    let output_file = cfg_prompt_output_file("output_file", "Output filename", "source_port_results.txt").await?;
+    let default_name = format!("source_port_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+    let output_file = cfg_prompt_output_file("output_file", "Output filename", &default_name).await?;
 
     Ok(ScanSettings {
         dest_port,

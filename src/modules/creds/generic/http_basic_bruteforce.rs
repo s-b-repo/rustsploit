@@ -203,7 +203,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
-        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -234,7 +234,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         }).await?;
-        return Ok(ModuleOutcome::ok());
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid HTTP Basic Auth credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "http-basic",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
@@ -479,6 +493,19 @@ async fn try_http_login(
     user: &str,
     pass: &str,
 ) -> Result<bool> {
+    // Baseline probe WITHOUT credentials. If the endpoint serves 2xx to an
+    // unauthenticated request it is not actually protected by Basic Auth, so a
+    // subsequent 2xx with credentials is meaningless — treating it as a valid
+    // login produces a false positive for every credential pair. Only when the
+    // server challenges (401) does a credentialed 2xx confirm a real login.
+    let baseline = client
+        .get(url)
+        .send()
+        .await
+        .context("HTTP baseline request failed")?;
+    let baseline_status = baseline.status().as_u16();
+    let server_enforces_basic_auth = baseline_status == 401;
+
     let response = client
         .get(url)
         .basic_auth(user, Some(pass))
@@ -488,7 +515,16 @@ async fn try_http_login(
 
     let status = response.status().as_u16();
     match status {
-        200..=299 => Ok(true),
+        200..=299 => {
+            if server_enforces_basic_auth {
+                Ok(true)
+            } else {
+                // Endpoint returns success without credentials too — cannot
+                // confirm these creds are valid. Report as a non-success
+                // rather than flooding loot with false positives.
+                Ok(false)
+            }
+        }
         401 => Ok(false),
         403 => {
             crate::mprintln!("{}", format!("[?] 403 Forbidden for {}:{} — authenticated but unauthorized", user, pass).yellow().dimmed());

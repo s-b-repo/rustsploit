@@ -428,7 +428,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if save_results
         && let Some(r) = &result {
-            let output_path = cfg_prompt_output_file("output_file", "Output file", "nbns_scan_results.txt").await?;
+            let default_name = format!("nbns_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+            let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
             let mut content = format!("NBNS Scan Results - {}\n\n", addr);
             content.push_str(&format!("MAC: {}\n", r.mac_address));
             if let Some(name) = r.get_computer_name() {

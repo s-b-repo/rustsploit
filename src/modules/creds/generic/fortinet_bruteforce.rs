@@ -86,8 +86,13 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         }
     };
     let status = resp.status().as_u16();
-    let txt = match resp.text().await {
-        Ok(t) => t,
+    // Cap the body we buffer: the logincheck response is tiny, but a hostile
+    // or misbehaving endpoint on :443 could stream an unbounded body. Reading
+    // the raw bytes with a sane cap avoids an OOM, and we only ever inspect a
+    // short prefix below.
+    const MAX_BODY: usize = 64 * 1024;
+    let bytes = match crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        Ok(b) => b,
         Err(e) => {
             return LoginResult::Error {
                 message: format!("read body: {e}"),
@@ -95,6 +100,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             }
         }
     };
+    let capped = &bytes[..bytes.len().min(MAX_BODY)];
+    let txt = String::from_utf8_lossy(capped).into_owned();
     // FortiOS replies with `ret=1,...` on success and `ret=0,error=...` on
     // failure. SAML / 2FA replies start with `redir=`.
     if txt.starts_with("ret=1") || txt.contains("redir=/sslvpn/") {
@@ -103,7 +110,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         LoginResult::AuthFailed
     } else {
         LoginResult::Error {
-            message: format!("unexpected response status={status} body={}", &txt[..txt.len().min(80)]),
+            message: format!("unexpected response status={status} body={}", txt.chars().take(80).collect::<String>()),
             retryable: false,
         }
     }

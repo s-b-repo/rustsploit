@@ -69,7 +69,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
-        run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -101,7 +101,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         }).await?;
-        return Ok(ModuleOutcome::ok());
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid SMTP credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "smtp",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
@@ -116,7 +130,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", true).await?;
     let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let output_file = cfg_prompt_output_file("output_file", "Output file for results", "smtp_results.txt").await?;
+    let default_name = format!("smtp_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+    let output_file = cfg_prompt_output_file("output_file", "Output file for results", &default_name).await?;
 
     let usernames = load_lines(&username_wordlist)?;
     let passwords = load_lines(&password_wordlist)?;

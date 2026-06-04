@@ -1,7 +1,15 @@
 //! Post-Quantum Encrypted Channel — Rustsploit Server Side
 //!
-//! SSH-style identity model with ML-KEM-768 + X25519 hybrid encryption.
-//! This is the SOLE transport security — no TLS, no API keys.
+//! SSH-style identity model with a TRIPLE-hybrid handshake chaining three
+//! independent key-agreement legs into one HKDF input:
+//!   1. X25519            — classical ECDH (hybrid safety net per IETF/NIST).
+//!   2. ML-KEM-1024       — FIPS 203 lattice KEM (NIST security category 5).
+//!   3. Classic McEliece 460896 — code-based KEM, algorithmically independent
+//!      of the lattice family, so a break in lattice cryptanalysis does not
+//!      compromise the session.
+//! All three shared secrets are concatenated into the IKM, so an attacker must
+//! break ALL THREE to recover the session key. ChaCha20-Poly1305 AEAD protects
+//! records. This is the SOLE transport security — no TLS, no API keys.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,14 +23,14 @@ use chacha20poly1305::{
     ChaCha20Poly1305,
 };
 use hkdf::Hkdf;
-use ml_kem::{Encapsulate, Generate, Key, KeyExport, MlKem768};
+use ml_kem::{Encapsulate, Generate, Key, KeyExport, MlKem1024};
 use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
-use rand_core::RngCore;
+use rand::RngExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-const PROTOCOL_VERSION: &str = "pqxdh-v2-identity";
+const PROTOCOL_VERSION: &str = "pqxdh-v3-x25519-mlkem1024-mceliece460896";
 // HKDF "labels" — these are the protocol-version domain separators that
 // get mixed with the server's long-term identity to produce per-deployment
 // salts. They are NOT used directly as HKDF salts; see `derive_salt`. This
@@ -80,7 +88,7 @@ fn derive_salt(
 pub struct HostIdentity {
     pub x25519_secret: StaticSecret,
     pub x25519_public: PublicKey,
-    /// ML-KEM-768 decapsulation key bytes. Wrapped in `Zeroizing` so the
+    /// ML-KEM-1024 decapsulation key bytes. Wrapped in `Zeroizing` so the
     /// secret material is wiped on drop — `Vec<u8>` does not zero its
     /// backing buffer, and ml-kem's `DecapsulationKey` zeroes only itself,
     /// not the serialized form we keep here.
@@ -93,13 +101,21 @@ pub struct ClientPublicIdentity {
     pub name: String,
     pub x25519_public: [u8; 32],
     pub mlkem_ek: Vec<u8>,
+    /// Classic McEliece 460896 public key (524160 bytes). Enrolled once; the
+    /// server encapsulates the code-based KEM leg to this key during handshake.
+    pub mceliece_public: Vec<u8>,
 }
 
-pub fn fingerprint(x25519_pub: &[u8], mlkem_pub: &[u8]) -> String {
+/// Identity fingerprint over an ordered list of public-key parts. The server's
+/// fingerprint covers `[x25519, mlkem]`; a client's covers
+/// `[x25519, mlkem, mceliece]`. Concatenation order is fixed, so this is just
+/// `SHA-256(part0 || part1 || ...)` truncated to 128 bits.
+pub fn fingerprint(parts: &[&[u8]]) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(x25519_pub);
-    hasher.update(mlkem_pub);
+    for p in parts {
+        hasher.update(p);
+    }
     let hash = hasher.finalize();
     format!("PQ256:{}", hex::encode(&hash[..16]))
 }
@@ -109,14 +125,15 @@ impl HostIdentity {
     /// — failure is rare but possible (RNG exhaustion, bad entropy source);
     /// propagate as `Result` instead of panicking the daemon at startup.
     pub fn generate() -> anyhow::Result<Self> {
-        let x25519_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+        let x25519_secret = {
+            let mut key_bytes = [0u8; 32];
+            rand::rng().fill(&mut key_bytes);
+            StaticSecret::from(key_bytes)
+        };
         let x25519_public = PublicKey::from(&x25519_secret);
-        // `rand::rng()` returns `ThreadRng` (ChaCha12 reseeded from `OsRng`),
-        // which is cryptographically secure. We can't pass `rand_core::OsRng`
-        // directly here because `ml-kem` requires `rand_core 0.10`'s
-        // `TryCryptoRng`, but the project pins `rand_core 0.6`'s `OsRng`
-        // (used by x25519-dalek above).
-        let dk = ml_kem::DecapsulationKey::<MlKem768>::try_generate_from_rng(&mut rand::rng())
+        // `rand::rng()` returns `ThreadRng` (ChaCha12 reseeded from `OsRng`)
+        // which satisfies `ml-kem`'s `TryCryptoRng` bound.
+        let dk = ml_kem::DecapsulationKey::<MlKem1024>::try_generate_from_rng(&mut rand::rng())
             .map_err(|e| anyhow::anyhow!("ML-KEM key generation failed: {e:?}"))?;
         let ek = dk.encapsulation_key().clone();
         // Serialize keys to bytes
@@ -145,13 +162,13 @@ impl HostIdentity {
 
                 let salt: [u8; 32] = {
                     let mut s = [0u8; 32];
-                    rand_core::OsRng.fill_bytes(&mut s);
+                    rand::rng().fill(&mut s);
                     s
                 };
                 let key = Self::derive_key_from_passphrase(pass, &salt)?;
                 let nonce_bytes: [u8; 12] = {
                     let mut n = [0u8; 12];
-                    rand_core::OsRng.fill_bytes(&mut n);
+                    rand::rng().fill(&mut n);
                     n
                 };
 
@@ -351,7 +368,9 @@ impl HostIdentity {
     }
 
     pub fn fingerprint(&self) -> String {
-        fingerprint(self.x25519_public.as_bytes(), &self.mlkem_ek)
+        // The server has no Classic McEliece keypair (it only encapsulates to the
+        // client's enrolled key), so its identity fingerprint covers x25519 + mlkem.
+        fingerprint(&[self.x25519_public.as_bytes(), self.mlkem_ek.as_slice()])
     }
 }
 
@@ -373,7 +392,24 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<ClientPublicIdent
             .map_err(|v: Vec<u8>| anyhow::anyhow!("Line {}: invalid x25519 pub length (got {} bytes)", i + 1, v.len()))?;
         let mlkem_ek = b64.decode(data["mlkem_ek"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Line {}: missing mlkem_ek", i + 1))?)?;
-        keys.push(ClientPublicIdentity { name, x25519_public: x25519_pub, mlkem_ek });
+        // Pre-v3 enrollments have no McEliece key. Rather than abort startup on a
+        // stale authorized_keys file, log and skip those entries — the affected
+        // client must re-enroll for the X25519 + ML-KEM-1024 + Classic McEliece
+        // protocol. (Visible warning, not a silent drop.)
+        let mceliece_b64 = match data["mceliece_pub"].as_str() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "authorized_keys line {}: client '{}' has no mceliece_pub (pre-v3 enrollment); \
+                     skipping — it must re-enroll to use the triple-hybrid PQ handshake",
+                    i + 1, name
+                );
+                continue;
+            }
+        };
+        let mceliece_public = b64.decode(mceliece_b64)
+            .map_err(|e| anyhow::anyhow!("Line {}: mceliece_pub is not valid base64: {}", i + 1, e))?;
+        keys.push(ClientPublicIdentity { name, x25519_public: x25519_pub, mlkem_ek, mceliece_public });
     }
     Ok(keys)
 }
@@ -421,6 +457,7 @@ pub fn upsert_authorized_key(path: &Path, key: &ClientPublicIdentity) -> anyhow:
             "name": key.name,
             "x25519_pub": b64.encode(key.x25519_public),
             "mlkem_ek": b64.encode(&key.mlkem_ek),
+            "mceliece_pub": b64.encode(&key.mceliece_public),
         })
         .to_string(),
     );
@@ -557,6 +594,21 @@ pub struct HandshakeRequest {
     pub client_identity_x25519_pub: String,
     pub client_mlkem_ek: String,
     pub protocol_version: String,
+    /// OPTIONAL backward-compatible mutual-PQ-authentication leg.
+    ///
+    /// A base64 ML-KEM-768 ciphertext that the client encapsulated to the
+    /// server's advertised `server_mlkem_ek` (returned in `HandshakeResponse`).
+    /// When present, the server decapsulates it with its enrolled long-term
+    /// `mlkem_dk` and mixes the resulting shared secret into the handshake IKM.
+    /// This makes the server's ML-KEM keypair load-bearing (it was previously
+    /// dead key material) and authenticates the server to clients that pin its
+    /// fingerprint — closing the "server side has no PQ identity" gap.
+    ///
+    /// Clients that omit it (the default) get the historical handshake with a
+    /// byte-identical IKM, so this is fully backward compatible in both
+    /// directions.
+    #[serde(default)]
+    pub client_mlkem_ct: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -566,6 +618,10 @@ pub struct HandshakeResponse {
     pub server_identity_x25519_pub: String,
     pub server_mlkem_ek: String,
     pub mlkem_ciphertext: String,
+    /// Base64 Classic McEliece 460896 ciphertext (156 bytes) encapsulated to the
+    /// client's enrolled McEliece public key. The client decapsulates it with its
+    /// McEliece secret key and mixes the recovered secret into its IKM.
+    pub mceliece_ciphertext: String,
     pub identity_proof: String,
     pub rekey_after: u64,
     pub server_version: String,
@@ -609,7 +665,11 @@ pub fn process_handshake(
         .ok_or_else(|| anyhow::anyhow!("Client not in authorized_keys"))?;
 
     // Ephemeral X25519 DH
-    let server_eph_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+    let server_eph_secret = {
+            let mut key_bytes = [0u8; 32];
+            rand::rng().fill(&mut key_bytes);
+            StaticSecret::from(key_bytes)
+        };
     let server_eph_public = PublicKey::from(&server_eph_secret);
     let ss_eph = server_eph_secret.diffie_hellman(&PublicKey::from(client_eph_arr));
 
@@ -617,21 +677,94 @@ pub fn process_handshake(
     let client_id_pub = PublicKey::from(client_id_arr);
     let ss_id = host_identity.x25519_secret.diffie_hellman(&client_id_pub);
 
-    // ML-KEM encapsulation
+    // ML-KEM encapsulation.
+    //
+    // SECURITY: the request carries a client-supplied ML-KEM encapsulation
+    // key, but the PQ leg only authenticates the peer if we bind the KEM to
+    // the *enrolled* key for this identity rather than to whatever the caller
+    // put in the request. Otherwise an attacker who can forge the classical
+    // X25519 identity DH (the very quantum threat the ML-KEM leg defends
+    // against) could supply any ek and the registered ML-KEM key would be
+    // decorative. So: constant-time compare the request key against the
+    // enrolled `authorized.mlkem_ek`, bail on mismatch, and encapsulate to the
+    // enrolled key.
     let client_mlkem_bytes = b64.decode(&request.client_mlkem_ek)?;
-    // Parse client's ML-KEM encapsulation key and encapsulate
-    let ek_key: Key<ml_kem::EncapsulationKey<MlKem768>> = client_mlkem_bytes.as_slice()
+    if client_mlkem_bytes.len() != authorized.mlkem_ek.len()
+        || !bool::from(client_mlkem_bytes.ct_eq(&authorized.mlkem_ek))
+    {
+        anyhow::bail!("Client ML-KEM encapsulation key does not match the enrolled key for this identity");
+    }
+    // Encapsulate to the *enrolled* key (proven equal to the request key above).
+    let ek_key: Key<ml_kem::EncapsulationKey<MlKem1024>> = authorized.mlkem_ek.as_slice()
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid ML-KEM encapsulation key length: {e:?}"))?;
-    let ek = ml_kem::EncapsulationKey::<MlKem768>::new(&ek_key)
+    let ek = ml_kem::EncapsulationKey::<MlKem1024>::new(&ek_key)
         .map_err(|e| anyhow::anyhow!("Invalid ML-KEM encapsulation key: {e:?}"))?;
     let (ct, ss_mlkem) = ek.encapsulate_with_rng(&mut rand::rng());
 
     // Combine 3 shared secrets
-    let mut ikm = Zeroizing::new(Vec::with_capacity(96));
+    let mut ikm = Zeroizing::new(Vec::with_capacity(128));
     ikm.extend_from_slice(ss_eph.as_bytes());
     ikm.extend_from_slice(ss_id.as_bytes());
     ikm.extend_from_slice(ss_mlkem.as_slice());
+
+    // OPTIONAL mutual ML-KEM leg (backward compatible). If the client encapsulated
+    // to our advertised `server_mlkem_ek` and sent the ciphertext, decapsulate it
+    // with our enrolled decapsulation key and mix the shared secret into the IKM.
+    // This makes the server's long-term ML-KEM key (`mlkem_dk`) load-bearing and
+    // proves server possession of it (server-side PQ authentication for clients
+    // that pin our fingerprint). Absent the field, the IKM is byte-identical to the
+    // legacy handshake, so existing clients are unaffected.
+    if let Some(ct_b64) = request.client_mlkem_ct.as_deref() {
+        use ml_kem::Decapsulate;
+        let ct_bytes = b64
+            .decode(ct_b64)
+            .map_err(|e| anyhow::anyhow!("client_mlkem_ct is not valid base64: {e:?}"))?;
+        let seed: ml_kem::Seed = host_identity
+            .mlkem_dk
+            .as_slice()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("stored ML-KEM decapsulation seed has wrong length: {e:?}"))?;
+        let server_dk = ml_kem::DecapsulationKey::<MlKem1024>::from_seed(seed);
+        let ct: ml_kem::Ciphertext<MlKem1024> = ct_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("client_mlkem_ct has wrong ML-KEM-1024 ciphertext length: {e:?}"))?;
+        let ss_mlkem_c2s = server_dk.decapsulate(&ct);
+        ikm.extend_from_slice(ss_mlkem_c2s.as_slice());
+    }
+
+    // Classic McEliece leg (code-based KEM — a hardness assumption independent of
+    // ML-KEM's lattice problem and of classical X25519). We encapsulate to the
+    // client's *enrolled* McEliece public key; only the holder of the matching
+    // secret key (the legitimate client) can decapsulate the ciphertext we return
+    // and recover this secret. Mixing it into the IKM both authenticates the client
+    // via a second, diverse PQ assumption and means an attacker must break ALL of
+    // X25519, ML-KEM-1024 AND Classic McEliece to recover the session key.
+    let mceliece_ciphertext_b64 = {
+        use classic_mceliece_rust::{encapsulate_boxed, PublicKey as McePublicKey, CRYPTO_PUBLICKEYBYTES};
+        if authorized.mceliece_public.len() != CRYPTO_PUBLICKEYBYTES {
+            anyhow::bail!(
+                "enrolled Classic McEliece public key for '{}' has wrong length {} (expected {})",
+                authorized.name,
+                authorized.mceliece_public.len(),
+                CRYPTO_PUBLICKEYBYTES
+            );
+        }
+        // Move the ~512 KiB key onto the heap as a fixed-size array (a stack array
+        // of that size would overflow), then build the crate's PublicKey from it.
+        let pk_boxed: Box<[u8; CRYPTO_PUBLICKEYBYTES]> = authorized
+            .mceliece_public
+            .clone()
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Classic McEliece public key failed fixed-size conversion"))?;
+        let pk = McePublicKey::from(pk_boxed);
+        // The crate is pinned to rand 0.8; supply its OsRng (CSPRNG, OS-seeded).
+        let (mce_ct, mce_ss) = encapsulate_boxed(&pk, &mut rand08::rngs::OsRng);
+        ikm.extend_from_slice(mce_ss.as_array());
+        b64.encode(mce_ct.as_array())
+    };
 
     // Derive per-(server, client) HKDF salts from the protocol label + BOTH
     // long-term identities + the X25519 identity DH. The handshake salt is
@@ -682,7 +815,11 @@ pub fn process_handshake(
     let mut session_id = [0u8; 16];
     { use rand::RngExt; rand::rng().fill(&mut session_id); }
 
-    let ratchet_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+    let ratchet_secret = {
+            let mut key_bytes = [0u8; 32];
+            rand::rng().fill(&mut key_bytes);
+            StaticSecret::from(key_bytes)
+        };
     let ratchet_public = PublicKey::from(&ratchet_secret);
 
     // Identity proof
@@ -722,6 +859,7 @@ pub fn process_handshake(
         server_identity_x25519_pub: b64.encode(host_identity.x25519_public.as_bytes()),
         server_mlkem_ek: b64.encode(&host_identity.mlkem_ek),
         mlkem_ciphertext: b64.encode(&ct_bytes),
+        mceliece_ciphertext: mceliece_ciphertext_b64,
         identity_proof: proof,
         rekey_after: DEFAULT_REKEY_AFTER,
         server_version: PROTOCOL_VERSION.to_string(),
@@ -801,7 +939,11 @@ fn dh_ratchet_receive(session: &mut PqSession, their_new_pub: PublicKey) -> anyh
 /// receive ratchet with our new public + its current secret — the two DHs are
 /// equal by X25519 commutativity, so both ends end up with the same new root.
 fn dh_ratchet_send(session: &mut PqSession) -> anyhow::Result<PublicKey> {
-    let new_secret = StaticSecret::random_from_rng(rand_core::OsRng);
+    let new_secret = {
+            let mut key_bytes = [0u8; 32];
+            rand::rng().fill(&mut key_bytes);
+            StaticSecret::from(key_bytes)
+        };
     let new_public = PublicKey::from(&new_secret);
     let dh_shared = new_secret.diffie_hellman(&session.their_x25519_public);
     let dh_bytes: [u8; 32] = *dh_shared.as_bytes();
@@ -814,6 +956,49 @@ fn dh_ratchet_send(session: &mut PqSession) -> anyhow::Result<PublicKey> {
 // ---------------------------------------------------------------------------
 // Encrypt / Decrypt
 // ---------------------------------------------------------------------------
+
+/// All receive-path mutable state of a `PqSession`, captured so a failed
+/// decrypt can be rolled back. Without this, `decrypt_request` advances the
+/// recv chain/counter (and, with `X-PQ-Rekey`, rolls the root key + peer
+/// pubkey) *before* the AEAD tag is verified — so any unauthenticated attacker
+/// who knows a (sniffable) session id can send one bogus ciphertext and
+/// permanently desync/brick the session ("mutate before verify").
+struct RecvStateSnapshot {
+    root_key: Zeroizing<Vec<u8>>,
+    send_chain_key: Zeroizing<Vec<u8>>,
+    recv_chain_key: Zeroizing<Vec<u8>>,
+    send_counter: u64,
+    recv_counter: u64,
+    their_x25519_public: PublicKey,
+    epoch: u64,
+    last_activity: Instant,
+}
+
+impl RecvStateSnapshot {
+    fn capture(s: &PqSession) -> Self {
+        Self {
+            root_key: s.root_key.clone(),
+            send_chain_key: s.send_chain_key.clone(),
+            recv_chain_key: s.recv_chain_key.clone(),
+            send_counter: s.send_counter,
+            recv_counter: s.recv_counter,
+            their_x25519_public: s.their_x25519_public,
+            epoch: s.epoch,
+            last_activity: s.last_activity,
+        }
+    }
+
+    fn restore(self, s: &mut PqSession) {
+        s.root_key = self.root_key;
+        s.send_chain_key = self.send_chain_key;
+        s.recv_chain_key = self.recv_chain_key;
+        s.send_counter = self.send_counter;
+        s.recv_counter = self.recv_counter;
+        s.their_x25519_public = self.their_x25519_public;
+        s.epoch = self.epoch;
+        s.last_activity = self.last_activity;
+    }
+}
 
 /// Decrypt an inbound message. The AAD is built by the caller-provided
 /// closure with the *post-ratchet* epoch so that, when a `rekey_pub` is
@@ -829,20 +1014,33 @@ pub fn decrypt_request<F>(
 where
     F: FnOnce(u64) -> Vec<u8>,
 {
-    if let Some(pub_bytes) = rekey_pub {
-        // Peer attached its new pub — advance our recv chain to match.
-        dh_ratchet_receive(session, PublicKey::from(*pub_bytes))?;
+    // Snapshot every receive-path field first; commit nothing unless the AEAD
+    // tag verifies. A DH ratchet (or chain step) that runs before verification
+    // would otherwise let a single bogus ciphertext — or a forged X-PQ-Rekey
+    // header — permanently desync the session.
+    let snapshot = RecvStateSnapshot::capture(session);
+    let result = (|| {
+        if let Some(pub_bytes) = rekey_pub {
+            // Peer attached its new pub — advance our recv chain to match.
+            dh_ratchet_receive(session, PublicKey::from(*pub_bytes))?;
+        }
+        let aad = aad_builder(session.epoch);
+        let (new_chain, msg_key) = ratchet_step(&session.recv_chain_key, session.recv_counter)?;
+        session.recv_chain_key = new_chain;
+        session.recv_counter += 1;
+        session.last_activity = Instant::now();
+        let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
+        let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+        cipher
+            .decrypt(nonce_bytes.into(), Payload { msg: ciphertext, aad: &aad })
+            .map_err(|e| anyhow::anyhow!("PQ decrypt failed: {e}"))
+    })();
+    if result.is_err() {
+        // Roll the session back to its pre-attempt state so a failed decrypt
+        // can't advance the ratchet or refresh liveness.
+        snapshot.restore(session);
     }
-    let aad = aad_builder(session.epoch);
-    let (new_chain, msg_key) = ratchet_step(&session.recv_chain_key, session.recv_counter)?;
-    session.recv_chain_key = new_chain;
-    session.recv_counter += 1;
-    session.last_activity = Instant::now();
-    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
-    cipher
-        .decrypt(nonce_bytes.into(), Payload { msg: ciphertext, aad: &aad })
-        .map_err(|e| anyhow::anyhow!("PQ decrypt failed: {e}"))
+    result
 }
 
 /// Result of encrypting an outbound message: (ciphertext, nonce, rekey_pub, effective_epoch).
@@ -1004,4 +1202,271 @@ pub fn decrypt_ws_frame(sub: &mut WsSubSession, frame: &[u8], aad: &[u8]) -> any
     sub.recv_chain_key = candidate_chain;
     sub.recv_counter += 1;
     Ok(plaintext)
+}
+
+#[cfg(test)]
+mod transactional_decrypt_tests {
+    use super::*;
+
+    fn aad(epoch: u64) -> Vec<u8> {
+        let mut v = b"test-aad/".to_vec();
+        v.extend_from_slice(&epoch.to_le_bytes());
+        v
+    }
+
+    fn rand_secret() -> StaticSecret {
+        let mut b = [0u8; 32];
+        rand::rng().fill(&mut b);
+        StaticSecret::from(b)
+    }
+
+    /// Build a matched server/client session pair sharing a root key, with
+    /// crossed send/recv chains and crossed x25519 identities so a DH ratchet
+    /// on either side derives the same new root.
+    fn session_pair(rekey_after: u64) -> (PqSession, PqSession) {
+        let server_sec = rand_secret();
+        let client_sec = rand_secret();
+        let server_pub = PublicKey::from(&server_sec);
+        let client_pub = PublicKey::from(&client_sec);
+
+        let root = vec![7u8; 32];
+        let s2c = derive_chain_key(&root, b"s2c").unwrap();
+        let c2s = derive_chain_key(&root, b"c2s").unwrap();
+        let session_id = [9u8; 16];
+        let salt = [3u8; 32];
+        let now = Instant::now();
+
+        let server = PqSession {
+            session_id,
+            client_name: "test".into(),
+            root_key: Zeroizing::new(root.clone()),
+            send_chain_key: s2c.clone(),
+            recv_chain_key: c2s.clone(),
+            send_counter: 0,
+            recv_counter: 0,
+            my_x25519_secret: server_sec,
+            my_x25519_public: server_pub,
+            their_x25519_public: client_pub,
+            rekey_after,
+            created_at: now,
+            last_activity: now,
+            epoch: 0,
+            ratchet_salt: salt,
+            ws_salt: salt,
+        };
+        let client = PqSession {
+            session_id,
+            client_name: "test".into(),
+            root_key: Zeroizing::new(root),
+            send_chain_key: c2s,
+            recv_chain_key: s2c,
+            send_counter: 0,
+            recv_counter: 0,
+            my_x25519_secret: client_sec,
+            my_x25519_public: client_pub,
+            their_x25519_public: server_pub,
+            rekey_after,
+            created_at: now,
+            last_activity: now,
+            epoch: 0,
+            ratchet_salt: salt,
+            ws_salt: salt,
+        };
+        (server, client)
+    }
+
+    fn server_to_client(server: &mut PqSession, msg: &[u8]) -> (Vec<u8>, [u8; 12], Option<PublicKey>) {
+        let (ct, nonce, rekey, _epoch) = encrypt_response(server, msg, aad).unwrap();
+        (ct, nonce, rekey)
+    }
+
+    #[test]
+    fn plain_roundtrip_succeeds() {
+        let (mut server, mut client) = session_pair(u64::MAX);
+        let (ct, nonce, rekey) = server_to_client(&mut server, b"hello");
+        assert!(rekey.is_none(), "no rekey expected below threshold");
+        let pt = decrypt_request(&mut client, &ct, &nonce, aad, rekey.as_ref().map(|p| p.as_bytes())).unwrap();
+        assert_eq!(pt, b"hello");
+        assert_eq!(client.recv_counter, 1);
+    }
+
+    // NOTE: a *successful* cross-role rekey round trip is intentionally not
+    // unit-tested here. `PqSession`/`ratchet_root` are server-oriented (the
+    // server's send chain is always `s2c`); the client side crosses the
+    // labels itself (see `derive_ws_subsession`'s WsRole handling). Since this
+    // crate only ever plays the server, simulating the client with the same
+    // server-side `ratchet_root` would mis-derive the client's chains — an
+    // artifact of the test, not the protocol. The server's receive-rekey path
+    // (`dh_ratchet_receive`) is still exercised by
+    // `forged_rekey_header_rolls_back_and_session_survives` below.
+
+    #[test]
+    fn tampered_ciphertext_rolls_back_and_session_survives() {
+        let (mut server, mut client) = session_pair(u64::MAX);
+        let (ct, nonce, _rekey) = server_to_client(&mut server, b"genuine");
+
+        // Snapshot the receive state the attacker would try to corrupt.
+        let ctr_before = client.recv_counter;
+        let chain_before = client.recv_chain_key.to_vec();
+        let epoch_before = client.epoch;
+
+        // Attacker flips a ciphertext byte → AEAD verification must fail.
+        let mut tampered = ct.clone();
+        tampered[0] ^= 0xff;
+        assert!(decrypt_request(&mut client, &tampered, &nonce, aad, None).is_err());
+
+        // Nothing advanced: the session is NOT desynced.
+        assert_eq!(client.recv_counter, ctr_before);
+        assert_eq!(client.recv_chain_key.to_vec(), chain_before);
+        assert_eq!(client.epoch, epoch_before);
+
+        // The genuine message still decrypts afterwards (no bricking).
+        let pt = decrypt_request(&mut client, &ct, &nonce, aad, None).unwrap();
+        assert_eq!(pt, b"genuine");
+        assert_eq!(client.recv_counter, ctr_before + 1);
+    }
+
+    #[test]
+    fn forged_rekey_header_rolls_back_and_session_survives() {
+        let (mut server, mut client) = session_pair(u64::MAX);
+
+        // Attacker injects a forged X-PQ-Rekey (32 random bytes) + garbage body.
+        let forged_pub = [0xABu8; 32];
+        let garbage = vec![0u8; 32];
+        let nonce = [0u8; 12];
+
+        let root_before = client.root_key.to_vec();
+        let their_pub_before = *client.their_x25519_public.as_bytes();
+        let epoch_before = client.epoch;
+        let ctr_before = client.recv_counter;
+
+        assert!(
+            decrypt_request(&mut client, &garbage, &nonce, aad, Some(&forged_pub)).is_err(),
+            "forged rekey + garbage body must fail AEAD verification"
+        );
+
+        // The DH ratchet must have been rolled back entirely.
+        assert_eq!(client.root_key.to_vec(), root_before, "root key must be unchanged");
+        assert_eq!(*client.their_x25519_public.as_bytes(), their_pub_before, "peer pubkey must be unchanged");
+        assert_eq!(client.epoch, epoch_before);
+        assert_eq!(client.recv_counter, ctr_before);
+
+        // A subsequent genuine message still decrypts — session not bricked.
+        let (ct, nonce, _rekey) = server_to_client(&mut server, b"still-alive");
+        let pt = decrypt_request(&mut client, &ct, &nonce, aad, None).unwrap();
+        assert_eq!(pt, b"still-alive");
+    }
+
+    #[test]
+    fn replayed_request_is_rejected_by_ratchet() {
+        // The HTTP path already has replay protection: the per-message key is
+        // derived from `recv_counter`, so once a message is consumed the
+        // server's recv chain advances and the *same* captured ciphertext no
+        // longer decrypts. No separate replay cache / counter-in-AAD needed.
+        let (mut server, mut client) = session_pair(u64::MAX);
+
+        // Client encrypts a request; the server decrypts it (counter 0 → 1).
+        let (ct, nonce, rekey, _e) = encrypt_response(&mut client, b"action", aad).unwrap();
+        assert!(rekey.is_none());
+        let pt = decrypt_request(&mut server, &ct, &nonce, aad, rekey.as_ref().map(|p| p.as_bytes())).unwrap();
+        assert_eq!(pt, b"action");
+        assert_eq!(server.recv_counter, 1);
+
+        // Replaying the exact captured request is rejected — the chain moved on.
+        assert!(
+            decrypt_request(&mut server, &ct, &nonce, aad, None).is_err(),
+            "a replayed (already-consumed) request must not decrypt"
+        );
+        // The rejected replay rolled back, so a genuine next request still works.
+        assert_eq!(server.recv_counter, 1);
+        let (ct2, nonce2, _r, _e) = encrypt_response(&mut client, b"action2", aad).unwrap();
+        let pt2 = decrypt_request(&mut server, &ct2, &nonce2, aad, None).unwrap();
+        assert_eq!(pt2, b"action2");
+        assert_eq!(server.recv_counter, 2);
+    }
+}
+
+#[cfg(test)]
+mod triple_hybrid_handshake_tests {
+    use super::*;
+    use base64::Engine;
+    use ml_kem::{Generate, KeyExport};
+
+    fn rand_x25519() -> StaticSecret {
+        let mut b = [0u8; 32];
+        rand::rng().fill(&mut b);
+        StaticSecret::from(b)
+    }
+
+    /// End-to-end server-side handshake exercising ALL THREE legs:
+    /// X25519 identity DH + ML-KEM-1024 encapsulation + Classic McEliece
+    /// encapsulation, feeding one HKDF. Proves the McEliece leg and the
+    /// triple-secret IKM actually run and yield a session + ciphertexts.
+    #[test]
+    fn full_triple_hybrid_handshake_succeeds() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let server = HostIdentity::generate().expect("server identity");
+
+        // Client long-term identity + ephemeral X25519.
+        let client_id_sec = rand_x25519();
+        let client_id_pub = PublicKey::from(&client_id_sec);
+        let client_eph_pub = PublicKey::from(&rand_x25519());
+
+        // Client ML-KEM-1024 keypair → enrolled encapsulation key.
+        let client_mlkem_dk =
+            ml_kem::DecapsulationKey::<MlKem1024>::try_generate_from_rng(&mut rand::rng())
+                .expect("ml-kem keygen");
+        let client_mlkem_ek = client_mlkem_dk.encapsulation_key().to_bytes().to_vec();
+
+        // Client Classic McEliece keypair → enrolled public key.
+        let (mce_pub, _mce_sec) = classic_mceliece_rust::keypair_boxed(&mut rand08::rngs::OsRng);
+        let client_mceliece_public = mce_pub.as_array().to_vec();
+
+        let enrolled = ClientPublicIdentity {
+            name: "test-client".into(),
+            x25519_public: *client_id_pub.as_bytes(),
+            mlkem_ek: client_mlkem_ek.clone(),
+            mceliece_public: client_mceliece_public,
+        };
+
+        let req = HandshakeRequest {
+            client_name: "test-client".into(),
+            client_x25519_pub: b64.encode(client_eph_pub.as_bytes()),
+            client_identity_x25519_pub: b64.encode(client_id_pub.as_bytes()),
+            client_mlkem_ek: b64.encode(&client_mlkem_ek),
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            client_mlkem_ct: None,
+        };
+
+        let (resp, session) =
+            process_handshake(&req, &server, std::slice::from_ref(&enrolled), "test-instance")
+                .expect("triple-hybrid handshake should succeed");
+
+        // ML-KEM-1024 ciphertext is 1568 bytes; McEliece-460896 ciphertext is 156.
+        assert_eq!(b64.decode(&resp.mlkem_ciphertext).unwrap().len(), 1568);
+        assert_eq!(
+            b64.decode(&resp.mceliece_ciphertext).unwrap().len(),
+            classic_mceliece_rust::CRYPTO_CIPHERTEXTBYTES
+        );
+        assert_eq!(session.client_name, "test-client");
+        assert!(!resp.session_id.is_empty());
+    }
+
+    /// An unenrolled client is rejected before any KEM work.
+    #[test]
+    fn handshake_rejects_unenrolled_client() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let server = HostIdentity::generate().unwrap();
+        let stranger_pub = PublicKey::from(&rand_x25519());
+        let req = HandshakeRequest {
+            client_name: "stranger".into(),
+            client_x25519_pub: b64.encode(PublicKey::from(&rand_x25519()).as_bytes()),
+            client_identity_x25519_pub: b64.encode(stranger_pub.as_bytes()),
+            client_mlkem_ek: b64.encode(vec![0u8; 1568]),
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            client_mlkem_ct: None,
+        };
+        assert!(process_handshake(&req, &server, &[], "i").is_err());
+    }
 }

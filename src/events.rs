@@ -152,6 +152,18 @@ pub fn emit(event: ModuleEvent) {
     }
 }
 
+/// Emit a structured event tagged with an explicit tenant. For events produced
+/// *outside* any `CURRENT_TENANT`/`RunContext` scope (e.g. the PQ handshake
+/// lifecycle in the middleware), pass the owning client's name so the event is
+/// routed to that tenant's subscribers only. `None` leaves it untagged, in
+/// which case subscribers drop it per the tenant-filtering contract — so it is
+/// never broadcast across tenants.
+pub fn emit_for(tenant_id: Option<String>, event: ModuleEvent) {
+    if let Err(e) = bus().send(TenantEvent { tenant_id, event }) {
+        tracing::trace!("Event bus: no active subscribers ({})", e);
+    }
+}
+
 /// Subscriber count, useful for debug logging.
 pub fn subscriber_count() -> usize {
     bus().receiver_count()

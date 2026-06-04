@@ -26,7 +26,7 @@ use colored::*;
 use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{ CheckResult, ModuleInfo, ModuleRank };
+use crate::module_info::{ModuleInfo, ModuleRank };
 use crate::utils::{
     build_http_client,
     cfg_prompt_default,
@@ -89,43 +89,6 @@ pub fn info() -> ModuleInfo {
         rank: ModuleRank::Great,
         default_port: None,
     }
-}
-
-/// Non-destructive check: does `/redfish/v1` respond, and does at least one
-/// sensitive endpoint return 200 unauthenticated?
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    let target = match ctx.target.as_single() {
-        Some(t) => t,
-        None => return CheckResult::Error("redfish_unauth_enum requires a single-host target".to_string()),
-    };
-    let host = sanitize_host(target);
-    let client = match build_http_client(Duration::from_secs(HTTP_TIMEOUT_SECS)) {
-        Ok(c) => c,
-        Err(e) => return CheckResult::Error(format!("HTTP client build failed: {}", e)),
-    };
-
-    // Try HTTPS first (BMCs usually default to it), then fall back to HTTP.
-    for scheme in &["https", "http"] {
-        let root_url = format!("{}://{}/redfish/v1", scheme, host);
-        if let Ok(resp) = client.get(&root_url).send().await {
-            if !resp.status().is_success() {
-                continue;
-            }
-            // Probe one cheap sensitive endpoint
-            let probe = format!("{}://{}/redfish/v1/Systems/1", scheme, host);
-            if let Ok(probe_resp) = client.get(&probe).send().await
-                && probe_resp.status().is_success()
-                    && let Ok(body) = probe_resp.text().await
-                        && (body.contains("SerialNumber") || body.contains("Manufacturer")) {
-                            return CheckResult::Vulnerable(format!(
-                                "Redfish Systems/1 returns identity data without auth on {}",
-                                scheme
-                            ));
-                        }
-            return CheckResult::Unknown(format!("Redfish reachable on {} but Systems/1 was not anonymous-readable", scheme));
-        }
-    }
-    CheckResult::NotVulnerable("Redfish endpoint not reachable".into())
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
@@ -193,7 +156,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    let body = match resp.text().await {
+                    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
                         Ok(b) => b,
                         Err(e) => {
                             crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
@@ -329,4 +292,4 @@ fn sanitize_host(target: &str) -> String {
     t
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "redfish_unauth_enum", native, has_check);
+crate::register_native_module!(crate::module::Category::Scanners, "redfish_unauth_enum", native);

@@ -227,13 +227,53 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     }
 }
 
+/// Per-tool-call execution budget. A single hung/slow tool must not be able to
+/// wedge the server's stdin read loop forever, so `tools/call` dispatch is
+/// bounded by this timeout and returns a JSON-RPC error on expiry. Override via
+/// the `RUSTSPLOIT_MCP_TIMEOUT_SECS` env var (0 disables the cap).
+fn module_timeout() -> Option<std::time::Duration> {
+    match std::env::var("RUSTSPLOIT_MCP_TIMEOUT_SECS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            // Unparseable override falls back to the default rather than panicking.
+            Err(_) => Some(std::time::Duration::from_secs(300)),
+        },
+        Err(_) => Some(std::time::Duration::from_secs(300)),
+    }
+}
+
 async fn handle_tools_call(id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
     let (name, arguments) = match extract_tool_call_params(&params) {
         Ok(pair) => pair,
         Err(msg) => return JsonRpcResponse::error(id, -32602, msg),
     };
 
-    let result = super::tools::call_tool(&name, arguments).await;
+    // Bound the tool execution so a single hung tool cannot block the read loop
+    // indefinitely. On expiry, surface a JSON-RPC error instead of hanging.
+    let result = match module_timeout() {
+        Some(dur) => match tokio::time::timeout(dur, super::tools::call_tool(&name, arguments)).await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!(
+                    "[MCP] tool '{}' exceeded {}s timeout — aborting call",
+                    name,
+                    dur.as_secs()
+                );
+                return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    format!(
+                        "Tool '{}' timed out after {} seconds",
+                        name,
+                        dur.as_secs()
+                    ),
+                );
+            }
+        },
+        None => super::tools::call_tool(&name, arguments).await,
+    };
     match serde_json::to_value(&result) {
         Ok(v) => JsonRpcResponse::success(id, v),
         Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),

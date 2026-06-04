@@ -80,6 +80,7 @@ pub use sanitize::{
     escape_js_command,
     escape_shell_command,
     sanitize_target_simple,
+    scrub_stored_text,
     validate_command_input,
     validate_file_path,
     validate_url,

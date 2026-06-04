@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::module_info::{CheckResult, ModuleInfo};
+use crate::module_info::ModuleInfo;
 
 // ============================================================
 // CATEGORY
@@ -73,7 +73,13 @@ pub enum Target {
     File(PathBuf),
     /// Random public-internet scan.
     Random,
+    /// Sequential public-internet sweep starting at the given IPv4 (as a u32),
+    /// running in order up to the last public address.
+    Sequential(u32),
 }
+
+/// First public IPv4 address (`1.0.0.0`) — `0.0.0.0/8` is reserved.
+pub const FIRST_PUBLIC_IPV4: u32 = 0x0100_0000;
 
 impl Target {
     /// Parse a raw user-supplied string into a `Target`. Delegates host/port
@@ -85,11 +91,29 @@ impl Target {
         if trimmed.is_empty() {
             anyhow::bail!("Target cannot be empty");
         }
-        // `Target::Random` is reserved for the explicit random / 0.0.0.0
-        // mass-scan markers. CIDR ranges and file paths are handled below
-        // as `Cidr` / `File` so the scheduler can iterate them correctly.
-        if trimmed == "random" || trimmed == "0.0.0.0" || trimmed == "0.0.0.0/0" {
+        // `Target::Random` is reserved for the explicit mass-scan markers
+        // `random` and `0.0.0.0/0`. Bare `0.0.0.0` is NOT a mass-scan keyword
+        // (M45): it resolves to a normal single host so `t 0.0.0.0` does not
+        // silently launch a full-internet random scan. CIDR ranges and file
+        // paths are handled below as `Cidr` / `File`.
+        if trimmed == "random" || trimmed == "0.0.0.0/0" {
             return Ok(Target::Random);
+        }
+        // Sequential full-public-IPv4 sweep: `seq`/`sequential` start at the
+        // first public address; `seq:<ip>`/`sequential:<ip>` start at <ip>.
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "seq" || lower == "sequential" {
+            return Ok(Target::Sequential(FIRST_PUBLIC_IPV4));
+        }
+        if let Some(rest) = lower
+            .strip_prefix("seq:")
+            .or_else(|| lower.strip_prefix("sequential:"))
+        {
+            let ip: std::net::Ipv4Addr = rest
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid sequential start IP '{}': {e}", rest.trim()))?;
+            return Ok(Target::Sequential(u32::from(ip)));
         }
         if trimmed.contains(',') {
             const MAX: usize = 4096;
@@ -127,7 +151,11 @@ impl Target {
     pub fn is_mass(&self) -> bool {
         matches!(
             self,
-            Target::Cidr(_) | Target::Multi(_) | Target::File(_) | Target::Random
+            Target::Cidr(_)
+                | Target::Multi(_)
+                | Target::File(_)
+                | Target::Random
+                | Target::Sequential(_)
         )
     }
 
@@ -140,7 +168,7 @@ impl Target {
     }
 
     /// Render back into the canonical string form modules expect.
-    /// `Multi` joins with `, `; `Random` becomes `"0.0.0.0"`; `File` becomes
+    /// `Multi` joins with `, `; `Random` becomes `"random"`; `File` becomes
     /// the file path. This is the value passed into legacy `run(&str)` shims.
     pub fn as_legacy_str(&self) -> String {
         match self {
@@ -151,7 +179,10 @@ impl Target {
                 .collect::<Vec<_>>()
                 .join(", "),
             Target::File(p) => p.to_string_lossy().into_owned(),
-            Target::Random => "0.0.0.0".to_string(),
+            Target::Random => "random".to_string(),
+            Target::Sequential(start) => {
+                format!("seq:{}", std::net::Ipv4Addr::from(*start))
+            }
         }
     }
 }
@@ -223,6 +254,9 @@ pub struct Capabilities {
     pub check_only: bool,
     /// Module makes outbound network connections.
     pub network: bool,
+    /// Module runs an interactive / long-lived session and manages its own
+    /// lifetime — the scheduler must NOT wrap it in the per-target timeout.
+    pub interactive: bool,
 }
 
 impl Default for Capabilities {
@@ -232,6 +266,7 @@ impl Default for Capabilities {
             requires_root: false,
             check_only: false,
             network: true,
+            interactive: false,
         }
     }
 }
@@ -364,6 +399,7 @@ impl ModuleCtx {
         };
         rc = rc.with_cancellation(self.cancel.clone());
         rc.tenant_id = self.tenant_id.clone();
+        rc.module_path = self.module_path.clone();
         rc
     }
 }
@@ -381,19 +417,6 @@ pub trait Module: Send + Sync {
     /// Capabilities — defaults to "single-target, network-bound module".
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
-    }
-
-    /// True if the module implements a non-destructive `check()`. Used by
-    /// the UI to decide whether to expose a "check" button. The
-    /// `register_native_module!` macro sets this from the optional
-    /// `has_check` token in the registration call.
-    fn has_check(&self) -> bool {
-        true
-    }
-
-    /// Optional non-destructive vulnerability check.
-    async fn check(&self, _ctx: &ModuleCtx) -> Option<CheckResult> {
-        None
     }
 
     /// Pre-flight validation, run by the scheduler **once** per CLI/API
@@ -519,14 +542,9 @@ pub fn render_catalog_markdown() -> String {
     for cat in ["scanners", "exploits", "creds", "osint", "plugins"] {
         let Some(entries) = by_cat.get(cat) else { continue };
         out.push_str(&format!("## {} ({})\n\n", cat, entries.len()));
-        let with_check = entries.iter().filter(|e| (e.factory)().has_check()).count();
-        out.push_str(&format!(
-            "- {} modules, {} with `check()`\n\n",
-            entries.len(),
-            with_check,
-        ));
-        out.push_str("| Module | Description | Rank | Check |\n");
-        out.push_str("|---|---|---|---|\n");
+        out.push_str(&format!("- {} modules\n\n", entries.len()));
+        out.push_str("| Module | Description | Rank |\n");
+        out.push_str("|---|---|---|\n");
         for e in entries {
             let inst = (e.factory)();
             let info = inst.info();
@@ -537,12 +555,11 @@ pub fn render_catalog_markdown() -> String {
                 .unwrap_or("")
                 .replace('|', "\\|");
             out.push_str(&format!(
-                "| `{}/{}` | {} | {} | {} |\n",
+                "| `{}/{}` | {} | {} |\n",
                 e.category.as_str(),
                 e.name,
                 desc,
                 info.rank,
-                if inst.has_check() { "✓" } else { "" },
             ));
         }
         out.push('\n');
@@ -555,19 +572,17 @@ pub fn render_catalog_markdown() -> String {
 // ============================================================
 
 /// Generate a per-module `Module` impl + inventory registration that calls
-/// the module file's local `pub fn info()`, `pub async fn run(...)`, and
-/// optional `pub async fn check(...)`. Used at the bottom of every module
-/// file.
+/// the module file's local `pub fn info()` and `pub async fn run(...)`. Used
+/// at the bottom of every module file.
 ///
 /// Two body shapes are supported, picked via the trailing `native` token:
 ///
 /// **Legacy shape (default — most existing modules):**
 /// ```ignore
 /// pub fn info() -> ModuleInfo { ... }
-/// pub async fn check(target: &str) -> CheckResult { ... }       // optional
 /// pub async fn run(target: &str) -> anyhow::Result<()> { ... }
 ///
-/// crate::register_native_module!(crate::module::Category::Scanners, "x", has_check);
+/// crate::register_native_module!(crate::module::Category::Scanners, "x");
 /// ```
 /// The macro translates `ctx.target → target_str` and discards return values
 /// into `ModuleOutcome::ok()`. No findings flow into the scheduler.
@@ -575,10 +590,9 @@ pub fn render_catalog_markdown() -> String {
 /// **Native shape (preferred for new modules and migrations):**
 /// ```ignore
 /// pub fn info() -> ModuleInfo { ... }
-/// pub async fn check(ctx: &ModuleCtx) -> CheckResult { ... }                 // optional
 /// pub async fn run(ctx: &ModuleCtx) -> anyhow::Result<ModuleOutcome> { ... }
 ///
-/// crate::register_native_module!(crate::module::Category::Scanners, "x", native, has_check);
+/// crate::register_native_module!(crate::module::Category::Scanners, "x", native);
 /// ```
 /// The module receives `&ModuleCtx` directly and returns `ModuleOutcome`
 /// with `Finding` records. The scheduler routes findings into LootStore /
@@ -591,14 +605,13 @@ macro_rules! register_native_module {
     ($category:expr, $name:expr) => {
         $crate::__register_native_module_impl!(@no_check $category, $name);
     };
-    ($category:expr, $name:expr, has_check) => {
-        $crate::__register_native_module_impl!(@with_check $category, $name);
-    };
     ($category:expr, $name:expr, native) => {
-        $crate::__register_native_module_impl!(@native $category, $name);
+        $crate::__register_native_module_impl!(@native $category, $name, false);
     };
-    ($category:expr, $name:expr, native, has_check) => {
-        $crate::__register_native_module_impl!(@native_with_check $category, $name);
+    // Interactive native module: the scheduler runs it without the per-target
+    // timeout (it owns its own REPL / long-lived session lifetime).
+    ($category:expr, $name:expr, native, interactive) => {
+        $crate::__register_native_module_impl!(@native $category, $name, true);
     };
 }
 
@@ -614,7 +627,6 @@ macro_rules! __register_native_module_impl {
         #[::async_trait::async_trait]
         impl $crate::module::Module for __ModuleImpl {
             fn info(&self) -> $crate::module_info::ModuleInfo { info() }
-            fn has_check(&self) -> bool { false }
             async fn run(&self, ctx: &$crate::module::ModuleCtx)
                 -> ::anyhow::Result<$crate::module::ModuleOutcome>
             {
@@ -640,7 +652,8 @@ macro_rules! __register_native_module_impl {
             }
         }
     };
-    (@with_check $category:expr, $name:expr) => {
+    // Native shape: `run(ctx) -> Result<ModuleOutcome>`.
+    (@native $category:expr, $name:expr, $interactive:expr) => {
         struct __ModuleImpl;
         impl ::std::default::Default for __ModuleImpl {
             fn default() -> Self { Self }
@@ -648,54 +661,12 @@ macro_rules! __register_native_module_impl {
         #[::async_trait::async_trait]
         impl $crate::module::Module for __ModuleImpl {
             fn info(&self) -> $crate::module_info::ModuleInfo { info() }
-            fn has_check(&self) -> bool { true }
-            async fn check(&self, ctx: &$crate::module::ModuleCtx)
-                -> ::std::option::Option<$crate::module_info::CheckResult>
-            {
-                let t = ctx.target.as_legacy_str();
-                let rc = ctx.build_run_context(t.clone());
-                let ctx_arc = ::std::sync::Arc::new(rc);
-                ::std::option::Option::Some(
-                    $crate::context::RUN_CONTEXT
-                        .scope(ctx_arc, check(&t))
-                        .await,
-                )
+            fn capabilities(&self) -> $crate::module::Capabilities {
+                $crate::module::Capabilities {
+                    interactive: $interactive,
+                    ..::core::default::Default::default()
+                }
             }
-            async fn run(&self, ctx: &$crate::module::ModuleCtx)
-                -> ::anyhow::Result<$crate::module::ModuleOutcome>
-            {
-                let t = ctx.target.as_legacy_str();
-                let rc = ctx.build_run_context(t.clone());
-                let ctx_arc = ::std::sync::Arc::new(rc);
-                let result = $crate::context::RUN_CONTEXT
-                    .scope(ctx_arc, async move {
-                        let r = run(&t).await;
-                        $crate::context::abort_all_spawned().await;
-                        r
-                    })
-                    .await;
-                result?;
-                ::std::result::Result::Ok($crate::module::ModuleOutcome::ok())
-            }
-        }
-        inventory::submit! {
-            $crate::module::ModuleEntry {
-                category: $category,
-                name: $name,
-                factory: || ::std::boxed::Box::new(__ModuleImpl),
-            }
-        }
-    };
-    // Native shape: `run(ctx) -> Result<ModuleOutcome>`, no `check`.
-    (@native $category:expr, $name:expr) => {
-        struct __ModuleImpl;
-        impl ::std::default::Default for __ModuleImpl {
-            fn default() -> Self { Self }
-        }
-        #[::async_trait::async_trait]
-        impl $crate::module::Module for __ModuleImpl {
-            fn info(&self) -> $crate::module_info::ModuleInfo { info() }
-            fn has_check(&self) -> bool { false }
             async fn run(&self, ctx: &$crate::module::ModuleCtx)
                 -> ::anyhow::Result<$crate::module::ModuleOutcome>
             {
@@ -703,52 +674,6 @@ macro_rules! __register_native_module_impl {
                 // helpers used inside the body still resolve. Pass the
                 // canonical target string for compatibility with helpers
                 // that read `RunContext.target`.
-                let t = ctx.target.as_legacy_str();
-                let rc = ctx.build_run_context(t);
-                let ctx_arc = ::std::sync::Arc::new(rc);
-                let outcome = $crate::context::RUN_CONTEXT
-                    .scope(ctx_arc, async move {
-                        let r = run(ctx).await;
-                        $crate::context::abort_all_spawned().await;
-                        r
-                    })
-                    .await?;
-                ::std::result::Result::Ok(outcome)
-            }
-        }
-        inventory::submit! {
-            $crate::module::ModuleEntry {
-                category: $category,
-                name: $name,
-                factory: || ::std::boxed::Box::new(__ModuleImpl),
-            }
-        }
-    };
-    // Native shape with `check`: both `run` and `check` take `&ModuleCtx`.
-    (@native_with_check $category:expr, $name:expr) => {
-        struct __ModuleImpl;
-        impl ::std::default::Default for __ModuleImpl {
-            fn default() -> Self { Self }
-        }
-        #[::async_trait::async_trait]
-        impl $crate::module::Module for __ModuleImpl {
-            fn info(&self) -> $crate::module_info::ModuleInfo { info() }
-            fn has_check(&self) -> bool { true }
-            async fn check(&self, ctx: &$crate::module::ModuleCtx)
-                -> ::std::option::Option<$crate::module_info::CheckResult>
-            {
-                let t = ctx.target.as_legacy_str();
-                let rc = ctx.build_run_context(t);
-                let ctx_arc = ::std::sync::Arc::new(rc);
-                ::std::option::Option::Some(
-                    $crate::context::RUN_CONTEXT
-                        .scope(ctx_arc, check(ctx))
-                        .await,
-                )
-            }
-            async fn run(&self, ctx: &$crate::module::ModuleCtx)
-                -> ::anyhow::Result<$crate::module::ModuleOutcome>
-            {
                 let t = ctx.target.as_legacy_str();
                 let rc = ctx.build_run_context(t);
                 let ctx_arc = ::std::sync::Arc::new(rc);

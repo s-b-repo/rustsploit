@@ -122,7 +122,13 @@ pub fn find_modules(keyword: &str) {
 }
 
 /// Streaming threshold: files larger than this use batched loading.
-pub const STREAMING_THRESHOLD: u64 = 250 * 1024 * 1024;
+///
+/// Canonically defined once in `crate::utils::wordlist` so every streaming
+/// decision (wordlist `should_stream`, `run_bruteforce_streaming`, the FTP
+/// module's pre-check) agrees on the same cutoff. Crucially this sits *below*
+/// `MAX_FILE_SIZE` (the 100 MB `load_lines` hard cap) so large password lists
+/// route into the streaming engine instead of hard-failing.
+pub const STREAMING_THRESHOLD: u64 = crate::utils::wordlist::STREAMING_THRESHOLD;
 
 /// Check file size for streaming decisions.
 pub fn file_size<P: AsRef<Path>>(path: P) -> u64 {

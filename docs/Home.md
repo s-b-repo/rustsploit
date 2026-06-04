@@ -21,6 +21,7 @@ Welcome to the Rustsploit documentation hub. Use the links below to navigate to 
 | [Security & Validation](Security-Validation.md) | Input validation constants, security patterns, honeypot detection |
 | [Credential Modules Guide](Credential-Modules-Guide.md) | Best practices for credential modules — creds_helper, source port, timeout passthrough |
 | [Exploit Modules Guide](Exploit-Modules-Guide.md) | Best practices for exploit modules — mass scan compat, batch guards, target-specific files |
+| [Fast Pair / WhisperPair Guide](Fast-Pair-WhisperPair-Guide.md) | Bluetooth Fast Pair exploitation (CVE-2025-36911) — ECDH Key-Based Pairing, anti-spoofing key sourcing, conformance tests, hardware runbook |
 | [Utilities & Helpers](Utilities-Helpers.md) | Network wrappers, creds_helper, exploit_helper, source port binding, cfg_prompt_* |
 | [Bad Patterns](BAD_PATTERNS.md) | Banned code patterns — 95+ regex checks for panics, error swallowing, network bypasses |
 | [Testing & QA](Testing-QA.md) | Build checks (0 errors, 0 warnings), smoke tests, wordlist validation |
