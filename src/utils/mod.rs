@@ -4,16 +4,19 @@
 
 pub mod bruteforce;
 pub mod creds_helper;
+pub mod cyclic;
 pub mod exploit_helper;
 pub mod modules;
 pub mod network;
 pub mod parallel;
 pub mod privilege;
 pub mod prompt;
+pub mod recog;
 pub mod safe_io;
 pub mod sanitize;
 pub mod target;
 pub mod throttle;
+pub mod tls_fingerprint;
 pub mod wordlist;
 
 use colored::*;

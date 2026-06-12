@@ -25500,3 +25500,157 @@ The implementation is complete across all files. The build is running in the bac
   I kept the no-error-swallowing discipline throughout (the new checkpoint helpers and the max_random_hosts parse
   log/warn rather than discard). I'll confirm the clean build result when it completes, then update the docs/memory.
   
+
+  - TTY console (the operator's real shell): a prompt held for 6s against a 2s deadline survived — answered normally
+  and ran to its natural network result. This is exactly the wpair/asyncssh scenario, now fixed.
+  - Piped/scripted stdin: the deadline still fires at 2s — the automation safety net is preserved.
+  
+  Let me clean up the test artifacts and finalize.
+  
+● Bash(rm -rf /tmp/rs_clean /tmp/rs_clean2 /tmp/pty_test.py /tmp/pty_test2.py; echo "cleaned"; echo "=== final diff
+      summary ==="; cd /home/kali/Downloads/rustpre2-main…)
+  ⎿  cleaned
+     === final diff summary ===
+     152:        if trimmed.contains('/')
+     … +5 lines (ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+     
+● All fixes are in and verified. Let me record the design decision in memory so it isn't regressed later, since it's
+  a non-obvious behavioral contract.
+
+  Read 1 file, recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+
+● All fixes are implemented, compiled, and verified. Here's what was wrong and what I changed.
+
+  Root causes
+
+  Three separate bugs were behind your reports — but two share one root cause: the per-target deadline was killing 
+  interactive operations.
+
+  1. wpair / asyncssh "timed out after 5s" + the lag — scheduler.rs::fanout_single wrapped modules in the per-host
+  deadline even for a single console target. asyncssh prompts for a username inside run(); when you take longer than
+  the deadline to type, the deadline fires. Worse: prompts read stdin via spawn_blocking, which cannot be cancelled
+  — so killing the run orphans the reader thread, which then fights the shell for your next keystrokes. That's the
+  "lag after this error." (wpair was already marked interactive, but your binary predated that wiring — it needed a
+  rebuild.)
+  2. target 0.0.0.0 → 0.0.0.0/32 — config.rs::set_target parsed a bare IP with IpNetwork, which silently widens it
+  to /32. Every single IP was being stored as a subnet, routing it through CIDR fan-out and tripping
+  is_mass_scan_target (which skips honeypot detection).
+
+  Fixes (in src/)
+
+  - config.rs::set_target — only treat a target as a subnet when it actually contains /. Bare IPs stay single hosts
+  (matches Target::parse).
+  - scheduler.rs::fanout_single — enforce the deadline only when there's no human at the console: !interactive && 
+  (api_mode || !stdin.is_terminal()). An interactive TTY is exempt (prompts/REPLs run unbounded, you Ctrl-C);
+  API/MCP/jobs and piped/scripted CLI stay bounded.
+  - scheduler.rs::pre_batch_prompt — bumped the prompt-collection dry-run timeout 5s→300s (same orphaned-stdin
+  class; 5s could cut you off mid-prompt during mass-scan setup).
+
+  Verified (cargo build clean, then runtime tests)
+  
+  ┌───────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+  │                         Test                          │                       Result                        │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ target 0.0.0.0 / 192.168.1.5                          │ stay single hosts, no /32; 10.0.0.0/24 still a /24  │
+  │                                                       │ subnet ✓                                            │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ asyncssh + wpair over a real PTY, prompt held 6s vs a │ no timeout — ran to natural network result ✓        │
+  │  2s deadline                                          │                                                     │
+  ├───────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+  │ Same over piped stdin (scripted)                      │ deadline still fires at 2s — automation safety net  │
+  │                                                       │ preserved ✓                                         │
+  └───────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+
+  Your rebuilt binary is at target/debug/rustsploit. The wpair REPL, asyncssh's username prompt, and any other
+  module that prompts mid-run will no longer be cut off (or leave the shell laggy) when you run them interactively,
+  while mass scans and API/automation runs keep their per-host time bounds.
+  
+  One note from testing: your environment has 54 persisted global options in ~/.rustsploit/global_options.json —
+  including a port that made asyncssh connect to :18080. If that's unintended, setg port 22 (or unset it) will fix
+  it.
+● Both of your requests are done, built clean, and verified.
+
+  1. Removed the error swallowing
+
+  - scheduler.rs — a bad setg port was silently dropped via .and_then(...ok()). Now it's an explicit match that
+  prints [!] Ignoring invalid 'setg port' value '<x>': <err> so you actually see why a different port got used.
+  - config.rs — the 0.0.0.0 handling used if let Ok(net) = "0.0.0.0/0".parse() which would silently fall through on
+  failure. Now it parses with .map_err(...)? and propagates.
+
+  2. Ported ZMap's mass-scanning to Rust
+  
+  The old random scanner sampled IPs and remembered every one in an unbounded HashSet — the codebase itself notes
+  that "does not scale to billions." That's exactly the problem ZMap solved.
+
+  src/utils/cyclic.rs (CyclicIp) — ported from ZMap's cyclic.c (Apache-2.0). It treats the IPv4 space as the
+  multiplicative group mod P = 4,294,967,311 (smallest prime > 2³²) and walks it by repeatedly multiplying by a
+  primitive root. That visits every address exactly once, in pseudo-random order, with O(1) memory and zero repeats
+  — no dedup table. Wired into fanout_random, replacing the sample-and-HashSet loop (generate_random_public_ip is
+  kept; the avtech module still uses it).
+
+  The number theory is unit-tested and passing (4/4): it verifies the prime factorization of P-1 is complete, that
+  the chosen generator really is a primitive root, and that a 200k-address prefix has no repeats.
+
+  Plus the earlier-turn work that shipped with it
+
+  - 0.0.0.0 now means the full-internet sweep (== 0.0.0.0/0 == random), with the interactive confirmation you chose.
+  Verified over a PTY: target 0.0.0.0 → normalizes to 0.0.0.0/0, prints the advisory, asks "Proceed with the
+  full-internet sweep? [n]", and declining aborts before any host is touched.
+  - Advisory before every full sweep showing all four you selected — effective port (defaults to the module's
+  default_port, with provenance when a global setg port overrides it), concurrency + host cap, per-host timeout, and
+  exclusion count.
+  - Automation safety: API/MCP and piped runs print the advisory but skip the confirm and proceed (verified
+  non-blocking).
+
+  Binary rebuilt at target/debug/rustsploit (zero warnings).
+
+  One scope note on the ZMap port: I implemented the address-selection algorithm (the cyclic permutation), which is
+  the part that makes internet-wide scanning efficient and fits rustsploit's existing async per-host fan-out. ZMap's
+  other half — stateless raw-packet SYN transmission with a separate receive thread — is a fundamentally different
+  paradigm from rustsploit's connect-based application-layer modules and would be a much larger rearchitecture. If
+  you want me to go there (raw AF_PACKET/pnet SYN engine, sharding across nodes), say the word and I'll scope it.
+
+oth of your requests are done, built clean, and verified.
+
+  1. Removed the error swallowing
+
+  - scheduler.rs — a bad setg port was silently dropped via .and_then(...ok()). Now it's an explicit match that
+  prints [!] Ignoring invalid 'setg port' value '<x>': <err> so you actually see why a different port got used.
+  - config.rs — the 0.0.0.0 handling used if let Ok(net) = "0.0.0.0/0".parse() which would silently fall through on
+  failure. Now it parses with .map_err(...)? and propagates.
+
+  2. Ported ZMap's mass-scanning to Rust
+  
+  The old random scanner sampled IPs and remembered every one in an unbounded HashSet — the codebase itself notes
+  that "does not scale to billions." That's exactly the problem ZMap solved.
+
+  src/utils/cyclic.rs (CyclicIp) — ported from ZMap's cyclic.c (Apache-2.0). It treats the IPv4 space as the
+  multiplicative group mod P = 4,294,967,311 (smallest prime > 2³²) and walks it by repeatedly multiplying by a
+  primitive root. That visits every address exactly once, in pseudo-random order, with O(1) memory and zero repeats
+  — no dedup table. Wired into fanout_random, replacing the sample-and-HashSet loop (generate_random_public_ip is
+  kept; the avtech module still uses it).
+
+  The number theory is unit-tested and passing (4/4): it verifies the prime factorization of P-1 is complete, that
+  the chosen generator really is a primitive root, and that a 200k-address prefix has no repeats.
+
+  Plus the earlier-turn work that shipped with it
+
+  - 0.0.0.0 now means the full-internet sweep (== 0.0.0.0/0 == random), with the interactive confirmation you chose.
+  Verified over a PTY: target 0.0.0.0 → normalizes to 0.0.0.0/0, prints the advisory, asks "Proceed with the
+  full-internet sweep? [n]", and declining aborts before any host is touched.
+  - Advisory before every full sweep showing all four you selected — effective port (defaults to the module's
+  default_port, with provenance when a global setg port overrides it), concurrency + host cap, per-host timeout, and
+  exclusion count.
+  - Automation safety: API/MCP and piped runs print the advisory but skip the confirm and proceed (verified
+  non-blocking).
+
+  Binary rebuilt at target/debug/rustsploit (zero warnings).
+
+  One scope note on the ZMap port: I implemented the address-selection algorithm (the cyclic permutation), which is
+  the part that makes internet-wide scanning efficient and fits rustsploit's existing async per-host fan-out. ZMap's
+  other half — stateless raw-packet SYN transmission with a separate receive thread — is a fundamentally different
+  paradigm from rustsploit's connect-based application-layer modules and would be a much larger rearchitecture. If
+  you want me to go there (raw AF_PACKET/pnet SYN engine, sharding across nodes), say the word and I'll scope it.
+
+

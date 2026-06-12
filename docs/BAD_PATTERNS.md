@@ -28,18 +28,18 @@ non-zero count as a hard failure.
 |---|---|---|---|
 | A1 | `\.unwrap\(\)` | Panics on `Err`/`None`, takes the whole shell down. | Match explicitly or use `?` with `anyhow::Context`. |
 | A2 | `\.expect\(` | Same as `.unwrap()` plus a static message. | `with_context(\|\| format!("...{}...", info))`. |
-| A3 | `\.unwrap_or_default\(\)` | Silently turns `Err` into `T::default()` — body becomes `""`, status becomes `0`. Lies about what happened on the wire. | Match arms returning `CheckResult::Error(...)` or propagate via `?` with `Context`. |
+| A3 | `\.unwrap_or_default\(\)` | Silently turns `Err` into `T::default()` — body becomes `""`, status becomes `0`. Lies about what happened on the wire. | Match arms returning `Err(anyhow!(...))` or propagate via `?` with `Context`. |
 | A4 | `\.unwrap_or\b` | Even on `Option`, hides the None case behind a magic literal (`"?"`, `""`). Use a self-documenting fallback. | `match opt { Some(x) => x, None => "<documented missing case>" }`. |
 | A5 | `\.unwrap_or_else\(` | Same shape as A4 with a closure. | Match arms with explicit None handling. |
 | A6 | `\.parse\(\)\.unwrap`, `\.parse::<[^>]+>\(\)\.unwrap` | Parse failures panic. | `parse().with_context(\|\| format!("parse {} as {}", input, "u16"))?`. |
 | A7 | `\.try_into\(\)\.unwrap` | TryFrom failures panic. | `try_into().with_context(\|\| ...)?`. |
-| A8 | `\.first\(\)\.unwrap`, `\.last\(\)\.unwrap`, `\.next\(\)\.unwrap`, `\.iter\(\)…\.unwrap` | Iterator end-of-stream panics. | `match it.next() { Some(x) => x, None => return CheckResult::Error("...".into()) }`. |
+| A8 | `\.first\(\)\.unwrap`, `\.last\(\)\.unwrap`, `\.next\(\)\.unwrap`, `\.iter\(\)…\.unwrap` | Iterator end-of-stream panics. | `match it.next() { Some(x) => x, None => return Err(anyhow!("...")) }`. |
 | A9 | `\.chars\(\)\.next\(\)\.unwrap`, `\.split\([^)]*\)\.next\(\)\.unwrap` | Empty-string panics. | Same as A8. |
 | A10 | `\.position\(.*\)\.unwrap`, `\.iter\(\)\.find\(.*\)\.unwrap` | Search-miss panics. | Match on `Option`. |
 | A11 | `\.read_to_string\(.*\)\.unwrap` | I/O failure panics. | `with_context(\|\| format!("read {}", path))?`. |
 | A12 | `\.lock\(\)\.unwrap` | Poison panics. | Use `tokio::sync::Mutex` (no poison) or match on the `PoisonError` and either reset or surface. |
 | A13 | `\.expect_err`, `\.unwrap_err` | Same panic shape, on the Err side. | Match the `Result` directly. |
-| A14 | `panic!\(`, `unreachable!\(`, `todo!\(`, `unimplemented!\(` | Unconditional crash. | Return `Result::Err` (or `CheckResult::Error`) with a descriptive message. |
+| A14 | `panic!\(`, `unreachable!\(`, `todo!\(`, `unimplemented!\(` | Unconditional crash. | Return `Result::Err` with a descriptive message. |
 | A15 | `\bassert!\(`, `\bassert_eq!\(`, `\bassert_ne!\(` | Production panic on bad input. | Validate at the boundary and return `Err`. Reserve assertions for tests under `#[cfg(test)]`. |
 
 ## B. Silent error swallowing — banned outright
@@ -49,7 +49,7 @@ non-zero count as a hard failure.
 | B1 | `Err\(_\)` (anonymous) | Drops the error value. Even on `tokio::time::error::Elapsed`, the `Display` impl ("deadline has elapsed") tells the operator *why* the call failed. | `Err(e) => mprintln!("{} timed out: {}", "[-]".red(), e)`. |
 | B2 | `Err\(_[a-zA-Z]\w*\)` (underscore-prefixed binding) | Same as B1 — the leading `_` is a "compiler shut up about unused" hack. | Bind without the underscore and `format!` it. |
 | B3 | `if let Err\(_` | Same as B1. | Capture the error. |
-| B4 | `if let Ok\(` (no `else`) | Drops `Err` silently — `check()` falls through to `NotVulnerable` even though the host was unreachable. | `match …` with explicit `Err(e) => CheckResult::Error(format!("{:#}", e))`. |
+| B4 | `if let Ok\(` (no `else`) | Drops `Err` silently — the module reports success even though the host was unreachable. | `match …` with explicit `Err(e) => return Err(anyhow!("{:#}", e))`. |
 | B5 | `let\s+_\s*=` | Discards a `Result`. The function "succeeded" because nothing checked. | `if let Err(e) = … { mprintln!(…) }` or `?`. |
 | B6 | `let\s+_[a-zA-Z]\w*\s*=.*\.await` | The `_<name>` prefix suppresses unused warnings on a side-effect call. The result is propagated via `?`, so the binding adds nothing. | Bare `func(...).await?;` (no `let`). |
 | B7 | `\.map_err\(\|_\|`, `\.or_else\(\|_\|` | Throws away the original error type. | Capture the error and wrap it: `.map_err(\|e\| anyhow!("...: {}", e))`. |

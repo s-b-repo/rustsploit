@@ -51,9 +51,51 @@ struct WordlistSpec {
 //
 // then paste the digest here. Until a list has a real checksum, leave it out
 // — there is no "TODO" placeholder, by design.
+// Curated subset of SecLists (https://github.com/danielmiessler/SecLists, MIT).
+// Each SHA-256 was computed over the exact raw bytes served from the pinned
+// `master` raw URL (the same bytes `verify_sha256` hashes after download).
+// Sizes are noted for reference; they are not enforced.
 const KNOWN_LISTS: &[WordlistSpec] = &[
-    // Catalogue entries are added by the maintainer after fetching + hashing
-    // each upstream artefact. Empty by design until verified.
+    // --- Passwords ---
+    WordlistSpec {
+        name: "passwords-top-1k",
+        url: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-1000.txt",
+        sha256: "9a648a4f30a399af3fed0ff097d7c4f98a73e2e043ba9748d84a1c49f23c0725",
+        local_name: "seclists-pwdb-top-1000.txt",
+    },
+    WordlistSpec {
+        name: "passwords-top-10k",
+        url: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/Pwdb_top-10000.txt",
+        sha256: "d9a018818f2357ac34c0534bdfd67826811859ae858bfd6398559085c7f4e925",
+        local_name: "seclists-pwdb-top-10000.txt",
+    },
+    // --- Usernames ---
+    WordlistSpec {
+        name: "usernames-short",
+        url: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Usernames/top-usernames-shortlist.txt",
+        sha256: "dc44775d12dcdb4027017623ffaa935a018944839ce4b204ccb0c6ef566db5dd",
+        local_name: "seclists-usernames-shortlist.txt",
+    },
+    // --- Web content discovery ---
+    WordlistSpec {
+        name: "web-common",
+        url: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt",
+        sha256: "fc320bacd30d93f5080029912b93667cd739401f81634579a7125fc0c027e6d5",
+        local_name: "seclists-web-common.txt",
+    },
+    WordlistSpec {
+        name: "web-raft-small-dirs",
+        url: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-directories.txt",
+        sha256: "06e1ac7b390c17eb9e0da416d0599c785a1541813daa95b01c676bc92d55185f",
+        local_name: "seclists-raft-small-directories.txt",
+    },
+    // --- Subdomains (DNS) ---
+    WordlistSpec {
+        name: "subdomains-top5k",
+        url: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt",
+        sha256: "e331367c140298cb179114fdeefa78f58f696219f0dec017a28bb79487cfcf19",
+        local_name: "seclists-subdomains-top5000.txt",
+    },
 ];
 
 /// Resolve a logical wordlist name to a path on disk, downloading from the
@@ -607,4 +649,58 @@ pub fn load_lines_uncapped<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
         .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
         .filter(|line| !line.is_empty())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{catalogue, KNOWN_LISTS};
+
+    /// Every catalogue entry must be structurally sound: a non-empty logical
+    /// name + local filename, an HTTPS raw URL, and a syntactically valid
+    /// SHA-256 (64 lowercase hex chars). This does NOT hit the network — it
+    /// guards against typos/placeholders that would make `resolve()` reject
+    /// every download for that entry.
+    #[test]
+    fn known_lists_are_well_formed() {
+        for spec in KNOWN_LISTS {
+            assert!(!spec.name.is_empty(), "entry has empty name");
+            assert!(
+                !spec.local_name.is_empty(),
+                "entry '{}' has empty local_name",
+                spec.name
+            );
+            assert!(
+                spec.url.starts_with("https://"),
+                "entry '{}' url is not https: {}",
+                spec.name,
+                spec.url
+            );
+            assert_eq!(
+                spec.sha256.len(),
+                64,
+                "entry '{}' sha256 is not 64 chars: {}",
+                spec.name,
+                spec.sha256
+            );
+            assert!(
+                spec.sha256
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+                "entry '{}' sha256 has non lowercase-hex chars: {}",
+                spec.name,
+                spec.sha256
+            );
+        }
+    }
+
+    /// Logical names are the public lookup key, so they must be unique.
+    #[test]
+    fn known_list_names_are_unique() {
+        let names = catalogue();
+        for (i, a) in names.iter().enumerate() {
+            for b in names.iter().skip(i + 1) {
+                assert_ne!(a, b, "duplicate wordlist name in catalogue: {a}");
+            }
+        }
+    }
 }

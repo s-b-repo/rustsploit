@@ -142,6 +142,7 @@ hex = "0.4"
 # Dependency overrides to address security advisories in transitive dependencies
 # RUSTSEC-2026-0009: time >=0.3.47 fixes DoS via stack exhaustion (used by reqwest via cookie/cookie_store)
 time = "0.3.47"
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-async-rw"] }
 # (ratatui 0.29 transitive advisories cleared when the TUI was replaced with rustyline.)
 
 # ============================================

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Vendored from Rapid7 Recog (https://github.com/rapid7/recog), BSD-2-Clause.
+  Trimmed subset of xml/smtp_banners.xml for rustsploit's recog matcher.
+-->
+<fingerprints matches="smtp.banner">
+
+  <fingerprint pattern="^220[- ].*ESMTP Exim\s+([\d.]+)">
+    <description>Exim mail transfer agent</description>
+    <example service.version="4.94.2" service.product="Exim">220 mail.example.com ESMTP Exim 4.94.2 Mon, 01 Jan 2024 00:00:00 +0000</example>
+    <param pos="0" name="service.vendor" value="Exim"/>
+    <param pos="0" name="service.family" value="Exim"/>
+    <param pos="0" name="service.product" value="Exim"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:exim:exim:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*ESMTP Postfix">
+    <description>Postfix mail transfer agent (version usually hidden)</description>
+    <example service.product="Postfix">220 mail.example.com ESMTP Postfix (Ubuntu)</example>
+    <param pos="0" name="service.vendor" value="Postfix"/>
+    <param pos="0" name="service.family" value="Postfix"/>
+    <param pos="0" name="service.product" value="Postfix"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*ESMTP Sendmail\s+([\d.]+(?:/[\d.]+)?)">
+    <description>Sendmail mail transfer agent</description>
+    <example service.version="8.15.2" service.product="Sendmail">220 mail.example.com ESMTP Sendmail 8.15.2/8.15.2; Mon, 1 Jan 2024 00:00:00 GMT</example>
+    <param pos="0" name="service.vendor" value="Sendmail"/>
+    <param pos="0" name="service.family" value="Sendmail"/>
+    <param pos="0" name="service.product" value="Sendmail"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:sendmail:sendmail:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*Microsoft ESMTP MAIL Service.*Version:\s*([\d.]+)">
+    <description>Microsoft Exchange / IIS SMTP service</description>
+    <example service.version="6.0.3790.4675">220 mail.example.com Microsoft ESMTP MAIL Service, Version: 6.0.3790.4675 ready</example>
+    <param pos="0" name="service.vendor" value="Microsoft"/>
+    <param pos="0" name="service.family" value="Exchange"/>
+    <param pos="0" name="service.product" value="Exchange"/>
+    <param pos="1" name="service.version"/>
+    <param pos="0" name="os.vendor" value="Microsoft"/>
+    <param pos="0" name="os.family" value="Windows"/>
+    <param pos="0" name="os.product" value="Windows"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*\bSMTP\b.*\bhMailServer\b">
+    <description>hMailServer for Windows</description>
+    <example service.product="hMailServer">220 mail ESMTP hMailServer</example>
+    <param pos="0" name="service.vendor" value="hMailServer"/>
+    <param pos="0" name="service.family" value="hMailServer"/>
+    <param pos="0" name="service.product" value="hMailServer"/>
+    <param pos="0" name="os.vendor" value="Microsoft"/>
+    <param pos="0" name="os.family" value="Windows"/>
+    <param pos="0" name="os.product" value="Windows"/>
+  </fingerprint>
+
+</fingerprints>

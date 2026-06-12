@@ -4,6 +4,20 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
+## 2026-06-04 — Sequential mass scan + interactive-module timeout fix
+
+- **Sequential mass scan** — new `Target::Sequential(start)` walks the public IPv4 space
+  `1.0.0.0 → 223.255.255.255` **in order** (random mode unchanged). Trigger with `t seq` /
+  `t seq:<start-ip>`, or flip `0.0.0.0/0`/`random` into order via `setg scan_order sequential`. Honors
+  the exclusion list, the service-port precheck, honeypot detection, and concurrency just like the random
+  sweep. **Unbounded by default** (Ctrl+C to stop) unless `max_random_hosts` is set; a **high-water-mark
+  checkpoint** (`crate::checkpoint::{read,write,clear}_seq_marker`) makes a killed scan resume from where
+  it stopped. (`src/scheduler.rs::fanout_sequential`, `src/module.rs`, `src/config.rs`.)
+- **Interactive modules no longer time out** — `Capabilities` gained `interactive`; `fanout_single` runs
+  interactive modules without the per-target `module_timeout`. Fixes `exploits/bluetooth/wpair`'s REPL
+  being killed with "Module timed out after 5s" when `setg timeout` is low. The `register_native_module!`
+  macro gained a `…, native, interactive)` arm.
+
 ## 2026-06-04 — WhisperPair (Fast Pair ECDH) re-implemented in `exploits/bluetooth/wpair`
 
 The Fast Pair ECDH exploitation flow (CVE-2025-36911) that had been reduced to

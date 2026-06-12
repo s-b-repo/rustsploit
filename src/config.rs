@@ -58,12 +58,25 @@ impl GlobalConfig {
             return Err(anyhow!("Target cannot contain control characters"));
         }
 
-        // Mass scan keyword: "random" — store as-is. Bare "0.0.0.0" is NOT a
-        // mass-scan keyword (M45); it falls through to normal single-host
-        // handling. "0.0.0.0/0" is handled below as a CIDR subnet.
+        // Mass scan keyword: "random" — store as-is. "0.0.0.0/0" is handled
+        // below as a CIDR subnet.
         if trimmed == "random" {
             let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+            return Ok(());
+        }
+
+        // Bare "0.0.0.0" is an operator alias for the full-internet sweep
+        // "0.0.0.0/0" (== "random"), added 2026-06-09 (reverses the earlier M45
+        // single-host rule). Store it as the /0 subnet so every consumer treats
+        // it as a mass scan; the scheduler still shows an advisory + an
+        // interactive confirmation before it actually sweeps.
+        if trimmed == "0.0.0.0" {
+            let net: IpNetwork = "0.0.0.0/0"
+                .parse()
+                .map_err(|e| anyhow!("internal: failed to parse 0.0.0.0/0 as a network: {e}"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Subnet(net));
             return Ok(());
         }
 
@@ -141,8 +154,17 @@ impl GlobalConfig {
             return Ok(());
         }
 
-        // Try to parse as CIDR subnet first
-        if let Ok(network) = trimmed.parse::<IpNetwork>() {
+        // Try to parse as CIDR subnet first — but ONLY when an explicit prefix
+        // is present. `IpNetwork::from_str` silently widens a bare address to a
+        // host route (`0.0.0.0` -> `0.0.0.0/32`, `10.0.0.1` -> `10.0.0.1/32`),
+        // which turned every single-IP target into a subnet: it surfaced as
+        // "Using target: 0.0.0.0/32", routed single hosts through CIDR fan-out,
+        // and tripped `is_mass_scan_target` (which then skips honeypot
+        // detection). A bare IP is a single host (M45) — require the '/' so it
+        // falls through to `TargetConfig::Single` below.
+        if trimmed.contains('/')
+            && let Ok(network) = trimmed.parse::<IpNetwork>()
+        {
             // No size limit enforced here - user can set 0.0.0.0/0 if they want.
             // Consumers (looping logic) must handle large subnets responsibly (e.g. via iterators).
             let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;

@@ -1,10 +1,17 @@
-use anyhow::Context;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
 
-use super::types::{
-    InitializeResult, JsonRpcRequest, JsonRpcResponse, ResourcesCapability, ServerCapabilities,
-    ServerInfo, ToolsCapability,
+use anyhow::Context;
+use serde_json::{Map, Value};
+
+use rmcp::{
+    ErrorData as McpError, ServerHandler, serve_server,
+    model::{
+        AnnotateAble, CallToolRequestParams, CallToolResult, Content, Implementation,
+        InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        ServerCapabilities, ServerInfo, Tool,
+    },
+    service::{RequestContext, RoleServer},
 };
 
 /// Read the libc errno value for the current thread, in a portable way.
@@ -77,160 +84,10 @@ fn isolate_protocol_stdout() -> anyhow::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(std_file))
 }
 
-/// Run the MCP server over newline-delimited JSON on stdio.
-///
-/// * **stdin**  — reads one JSON-RPC 2.0 request per line.
-/// * **stdout** — writes one JSON-RPC 2.0 response per line.
-/// * **stderr** — diagnostic logging (stdout is the protocol channel).
-pub async fn run_mcp_server() -> anyhow::Result<()> {
-    let mut protocol_out = isolate_protocol_stdout()
-        .context("Cannot isolate protocol stdout — aborting to prevent JSON-RPC corruption")?;
-
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut line_buf: Vec<u8> = Vec::new();
-
-    const MAX_LINE_BYTES: usize = 1024 * 1024;
-
-    eprintln!("[MCP] RustSploit MCP server started (stdio transport)");
-    eprintln!("[MCP] Protocol stdout isolated — module output is captured via OUTPUT_BUFFER only");
-
-    loop {
-        line_buf.clear();
-        let n = (&mut reader)
-            .take(MAX_LINE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut line_buf)
-            .await
-            .context("failed to read from stdin")?;
-        if n == 0 {
-            eprintln!("[MCP] stdin closed, shutting down");
-            break;
-        }
-        if line_buf.len() > MAX_LINE_BYTES {
-            eprintln!(
-                "[MCP] line exceeded {} bytes without newline — rejecting and closing",
-                MAX_LINE_BYTES
-            );
-            let resp = JsonRpcResponse::error(
-                None,
-                -32600,
-                format!("Request exceeds {} byte line limit", MAX_LINE_BYTES),
-            );
-            write_response(&mut protocol_out, &resp).await?;
-            break;
-        }
-
-        let line = match std::str::from_utf8(&line_buf) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[MCP] non-UTF-8 input on stdin: {}", e);
-                let resp = JsonRpcResponse::error(
-                    None,
-                    -32700,
-                    format!("Parse error: input is not valid UTF-8: {}", e),
-                );
-                write_response(&mut protocol_out, &resp).await?;
-                continue;
-            }
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[MCP] parse error: {}", e);
-                let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e));
-                write_response(&mut protocol_out, &resp).await?;
-                continue;
-            }
-        };
-
-        eprintln!("[MCP] <- method={}", request.method);
-
-        let response = handle_request(request).await;
-        if let Some(resp) = response {
-            write_response(&mut protocol_out, &resp).await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Serialize a response as a single JSON line on the protocol channel.
-async fn write_response(
-    out: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    resp: &JsonRpcResponse,
-) -> anyhow::Result<()> {
-    let mut json = serde_json::to_vec(resp).context("failed to serialize response")?;
-    json.push(b'\n');
-    out.write_all(&json).await.context("failed to write response")?;
-    out.flush().await.context("failed to flush protocol channel")?;
-    Ok(())
-}
-
-/// Route a parsed request to the appropriate handler.
-async fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
-    match req.method.as_str() {
-        "initialize" => Some(handle_initialize(req.id)),
-        "initialized" | "notifications/initialized" => {
-            // Notification — no response.
-            eprintln!("[MCP] Client initialized");
-            None
-        }
-        "tools/list" => Some(handle_tools_list(req.id)),
-        "tools/call" => Some(handle_tools_call(req.id, req.params).await),
-        "resources/list" => Some(handle_resources_list(req.id)),
-        "resources/read" => Some(handle_resources_read(req.id, req.params).await),
-        other if other.starts_with("notifications/") => {
-            eprintln!("[MCP] Ignoring notification: {}", other);
-            None
-        }
-        other => Some(JsonRpcResponse::error(
-            req.id,
-            -32601,
-            format!("Method not found: {}", other),
-        ))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Handler implementations
-// ---------------------------------------------------------------------------
-
-fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
-    let result = InitializeResult {
-        protocol_version: "2024-11-05".to_string(),
-        capabilities: ServerCapabilities {
-            tools: Some(ToolsCapability {}),
-            resources: Some(ResourcesCapability {}),
-        },
-        server_info: ServerInfo {
-            name: "rustsploit-mcp".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    };
-
-    match serde_json::to_value(&result) {
-        Ok(v) => JsonRpcResponse::success(id, v),
-        Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),
-    }
-}
-
-fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
-    let tools = super::tools::all_tools();
-    match serde_json::to_value(&tools) {
-        Ok(v) => JsonRpcResponse::success(id, serde_json::json!({ "tools": v })),
-        Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),
-    }
-}
-
 /// Per-tool-call execution budget. A single hung/slow tool must not be able to
-/// wedge the server's stdin read loop forever, so `tools/call` dispatch is
-/// bounded by this timeout and returns a JSON-RPC error on expiry. Override via
-/// the `RUSTSPLOIT_MCP_TIMEOUT_SECS` env var (0 disables the cap).
+/// wedge the server forever, so `tools/call` dispatch is bounded by this
+/// timeout and returns a JSON-RPC error on expiry. Override via the
+/// `RUSTSPLOIT_MCP_TIMEOUT_SECS` env var (0 disables the cap).
 fn module_timeout() -> Option<std::time::Duration> {
     match std::env::var("RUSTSPLOIT_MCP_TIMEOUT_SECS") {
         Ok(v) => match v.trim().parse::<u64>() {
@@ -243,104 +100,180 @@ fn module_timeout() -> Option<std::time::Duration> {
     }
 }
 
-async fn handle_tools_call(id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
-    let (name, arguments) = match extract_tool_call_params(&params) {
-        Ok(pair) => pair,
-        Err(msg) => return JsonRpcResponse::error(id, -32602, msg),
-    };
+/// Run the MCP server over the official `rmcp` SDK on a stdio transport.
+///
+/// The protocol channel (JSON-RPC over the original stdout) is isolated from
+/// fd 1 first, so stray `println!` from library code cannot corrupt the stream;
+/// fd 1 is redirected to `/dev/null` and the saved descriptor becomes the
+/// transport's writer. Module output is captured through `OUTPUT_BUFFER`.
+pub async fn run_mcp_server() -> anyhow::Result<()> {
+    let protocol_out = isolate_protocol_stdout()
+        .context("Cannot isolate protocol stdout — aborting to prevent JSON-RPC corruption")?;
 
-    // Bound the tool execution so a single hung tool cannot block the read loop
-    // indefinitely. On expiry, surface a JSON-RPC error instead of hanging.
-    let result = match module_timeout() {
-        Some(dur) => match tokio::time::timeout(dur, super::tools::call_tool(&name, arguments)).await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!(
-                    "[MCP] tool '{}' exceeded {}s timeout — aborting call",
-                    name,
-                    dur.as_secs()
-                );
-                return JsonRpcResponse::error(
-                    id,
-                    -32000,
-                    format!(
-                        "Tool '{}' timed out after {} seconds",
-                        name,
-                        dur.as_secs()
-                    ),
-                );
+    eprintln!("[MCP] RustSploit MCP server started (rmcp SDK, stdio transport)");
+    eprintln!("[MCP] Protocol stdout isolated — module output is captured via OUTPUT_BUFFER only");
+
+    // `(reader, writer)` is an rmcp async-RW transport. stdin is the request
+    // stream; the saved real-stdout file is the response sink.
+    let transport = (tokio::io::stdin(), protocol_out);
+
+    let service = serve_server(RustsploitHandler, transport)
+        .await
+        .context("MCP server initialization (initialize handshake) failed")?;
+
+    // Block until the client disconnects (stdin EOF) or the connection ends.
+    let quit_reason = service
+        .waiting()
+        .await
+        .context("MCP server task failed to join cleanly")?;
+
+    eprintln!("[MCP] server stopped: {quit_reason:?}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Handler — adapts the existing tool/resource registry to rmcp's traits.
+// ---------------------------------------------------------------------------
+
+/// Stateless MCP handler. All state lives behind the per-tenant stores reached
+/// inside `tools::call_tool` / `resources::read_resource`, so this is a unit.
+#[derive(Clone)]
+struct RustsploitHandler;
+
+impl ServerHandler for RustsploitHandler {
+    fn get_info(&self) -> ServerInfo {
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
+
+        InitializeResult::new(capabilities)
+            .with_server_info(Implementation::new(
+                "rustsploit-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "RustSploit offensive-security framework over MCP. Discover modules with \
+                 `list_modules` / `search_modules` / `module_info`, set a scope with \
+                 `set_target`, then execute with `run_module` (set `background: true` for \
+                 long-running scans and poll `list_jobs`). Live engagement state is exposed \
+                 as resources under the `rustsploit:///` URI scheme.",
+            )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let tools = super::tools::all_tools()
+            .into_iter()
+            .map(to_rmcp_tool)
+            .collect();
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = request.name.to_string();
+        // rmcp delivers arguments as `Option<JsonObject>`; the existing
+        // dispatcher expects a JSON `Value` (defaulting to `{}` when absent).
+        let arguments = match request.arguments {
+            Some(map) => Value::Object(map),
+            None => Value::Object(Map::new()),
+        };
+
+        // Bound execution so one hung tool cannot wedge the server. On expiry,
+        // surface a JSON-RPC error instead of blocking the connection.
+        let result = match module_timeout() {
+            Some(dur) => {
+                match tokio::time::timeout(dur, super::tools::call_tool(&name, arguments)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        eprintln!(
+                            "[MCP] tool '{}' exceeded {}s timeout — aborting call",
+                            name,
+                            dur.as_secs()
+                        );
+                        return Err(McpError::internal_error(
+                            format!("Tool '{}' timed out after {} seconds", name, dur.as_secs()),
+                            None,
+                        ));
+                    }
+                }
             }
-        },
-        None => super::tools::call_tool(&name, arguments).await,
-    };
-    match serde_json::to_value(&result) {
-        Ok(v) => JsonRpcResponse::success(id, v),
-        Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),
+            None => super::tools::call_tool(&name, arguments).await,
+        };
+
+        Ok(to_rmcp_tool_result(result))
     }
-}
 
-fn handle_resources_list(id: Option<Value>) -> JsonRpcResponse {
-    let resources = super::resources::all_resources();
-    match serde_json::to_value(&resources) {
-        Ok(v) => JsonRpcResponse::success(id, serde_json::json!({ "resources": v })),
-        Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let resources = super::resources::all_resources()
+            .into_iter()
+            .map(to_rmcp_resource)
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
     }
-}
 
-async fn handle_resources_read(id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
-    let uri = match extract_resource_uri(&params) {
-        Ok(u) => u,
-        Err(msg) => return JsonRpcResponse::error(id, -32602, msg),
-    };
-
-    let result = super::resources::read_resource(&uri).await;
-    // The MCP spec (2024-11-05) requires `resources/read` to return
-    // `{ contents: [ { uri, mimeType, text } ] }` — a list, not a bare content
-    // object. Claude's client rejects the bare shape silently.
-    match serde_json::to_value(&result) {
-        Ok(v) => JsonRpcResponse::success(id, serde_json::json!({ "contents": [v] })),
-        Err(e) => JsonRpcResponse::error(id, -32603, format!("Internal error: {}", e)),
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let content = super::resources::read_resource(&request.uri).await;
+        let contents = ResourceContents::TextResourceContents {
+            uri: content.uri,
+            mime_type: Some(content.mime_type),
+            text: content.text,
+            meta: None,
+        };
+        Ok(ReadResourceResult::new(vec![contents]))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Param extraction helpers
+// Mapping helpers: internal registry types -> rmcp model types.
 // ---------------------------------------------------------------------------
 
-/// Pull `name` (String) and `arguments` (Object) out of the `tools/call` params.
-fn extract_tool_call_params(params: &Option<Value>) -> Result<(String, Value), String> {
-    let obj = params
-        .as_ref()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| "Invalid params: expected object with 'name' and 'arguments'".to_string())?;
-
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing or invalid 'name' in params".to_string())?
-        .to_string();
-
-    let arguments = obj
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    Ok((name, arguments))
+/// Map an internal tool descriptor to an rmcp `Tool`. The hand-authored
+/// `inputSchema` JSON is reused verbatim (rmcp expects a JSON-Schema object).
+fn to_rmcp_tool(t: super::types::Tool) -> Tool {
+    let schema: Map<String, Value> = match t.input_schema {
+        Value::Object(map) => map,
+        // A non-object schema is malformed; advertise an empty object rather
+        // than panicking so the rest of the tool list still loads.
+        _ => Map::new(),
+    };
+    Tool::new(t.name, t.description, Arc::new(schema))
 }
 
-/// Pull `uri` (String) out of the `resources/read` params.
-fn extract_resource_uri(params: &Option<Value>) -> Result<String, String> {
-    let obj = params
-        .as_ref()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| "Invalid params: expected object with 'uri'".to_string())?;
+/// Map an internal tool result to rmcp's `CallToolResult`. All internal content
+/// blocks are text; `is_error` selects the error vs. success constructor.
+fn to_rmcp_tool_result(r: super::types::ToolResult) -> CallToolResult {
+    let content: Vec<Content> = r
+        .content
+        .into_iter()
+        .map(|c| Content::text(c.text))
+        .collect();
+    if r.is_error == Some(true) {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
 
-    let uri = obj
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Missing or invalid 'uri' in params".to_string())?
-        .to_string();
-
-    Ok(uri)
+/// Map an internal resource descriptor to an rmcp `Resource`.
+fn to_rmcp_resource(res: super::types::Resource) -> Resource {
+    RawResource::new(res.uri, res.name)
+        .with_description(res.description)
+        .with_mime_type(res.mime_type)
+        .no_annotation()
 }

@@ -175,6 +175,7 @@ pub fn _mprint_line(text: &str) {
         if let Err(e) = crate::spool::SPOOL.write_line(text) {
             handle_spool_error(e);
         }
+        crate::results_sink::write_line(text);
     }
 }
 
@@ -188,6 +189,7 @@ pub fn _mprint_newline() {
         if let Err(e) = crate::spool::SPOOL.write_line("") {
             handle_spool_error(e);
         }
+        crate::results_sink::write_line("");
     }
 }
 
@@ -207,6 +209,7 @@ pub fn _mprint_raw(text: &str) {
         if let Err(e) = crate::spool::SPOOL.write_raw(text) {
             handle_spool_error(e);
         }
+        crate::results_sink::write_raw(text);
     }
 }
 
@@ -226,6 +229,7 @@ pub fn _mprint_block(lines: &[&str]) {
             if let Err(e) = crate::spool::SPOOL.write_line(line) {
                 handle_spool_error(e);
             }
+            crate::results_sink::write_line(line);
         }
         drop(guard);
     }
@@ -238,6 +242,8 @@ pub fn _meprint_line(text: &str) {
     });
     if buffered.is_err() {
         eprintln!("{}", text);
+        // "all output" includes diagnostics: capture stderr in the per-run file too.
+        crate::results_sink::write_line(text);
     }
 }
 
@@ -248,6 +254,7 @@ pub fn _meprint_newline() {
     });
     if buffered.is_err() {
         eprintln!();
+        crate::results_sink::write_line("");
     }
 }
 
@@ -262,6 +269,7 @@ pub fn _meprint_raw(text: &str) {
         if let Err(e) = std::io::stderr().flush() {
             eprintln!("[!] Flush failed: {}", e);
         }
+        crate::results_sink::write_raw(text);
     }
 }
 

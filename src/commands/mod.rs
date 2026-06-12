@@ -123,7 +123,20 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
     for (k, v) in &scoped_opts {
         opts.set(k.clone(), v.clone());
     }
+    // Auto-save: append all of this run's console output to
+    // `~/.rustsploit/loot/<module> <time> results.txt`. Scoped to interactive
+    // console / CLI runs (sequential, so a single global sink is race-free);
+    // API / MCP runs return their captured output to the caller instead.
+    let autosave = !crate::config::get_module_config().api_mode;
+    if autosave {
+        crate::results_sink::begin(&resolved_path);
+    }
+
     let result = scheduler::run(module, target, opts, verbose).await;
+
+    if autosave {
+        crate::results_sink::end();
+    }
 
     crate::events::emit(crate::events::ModuleEvent::ModuleFinished {
         module: resolved_path,

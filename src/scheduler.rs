@@ -11,6 +11,7 @@
 // during migration; new code (CLI, shell, API, MCP) calls
 // `scheduler::run` directly.
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -285,6 +286,23 @@ async fn run_with_limits_shared(
         if l.precheck_port.is_none() {
             l.precheck_port = module.info().default_port;
         }
+        // Full-sweep cap consistency: a literal `0.0.0.0/0` / `random` target
+        // entered directly (e.g. `use <mod>; run`) never passes through the
+        // shell's `setg target` handler, so without this it would silently fall
+        // back to the scheduler default of 10_000 — while `setg target 0.0.0.0`
+        // auto-bumps to the full public-IPv4 count. Normalise both paths: when
+        // the operator has NOT explicitly set `max_random_hosts`, a full sweep
+        // means every reachable public host. An explicit `setg max_random_hosts`
+        // is always honoured. The advisory + confirmation gate still runs.
+        if matches!(target, Target::Random) {
+            let operator_set = crate::tenant::resolve()
+                .global_options()
+                .try_get("max_random_hosts")
+                .is_some();
+            if !operator_set {
+                l.max_random_hosts = crate::utils::cyclic::total_public_ipv4_count() as usize;
+            }
+        }
         l
     };
 
@@ -390,17 +408,38 @@ async fn fanout_single(
     ctx.tenant_id = tenant_id;
     ctx.verbose = verbose;
     ctx.module_path = module_path;
-    // Interactive modules (e.g. wpair's REPL) own their own lifetime — running
-    // them under the per-target deadline would kill the session the moment it
-    // waits for input. Everything else keeps the timeout.
-    let outcome = if module.capabilities().interactive {
-        module.run(&ctx).await?
-    } else {
+    // The per-target deadline is a MASS-SCAN safeguard: when fanning out across
+    // many hosts, one slow/hung host must not starve the scan. For a SINGLE,
+    // deliberately-chosen target it is actively harmful:
+    //   * interactive modules (wpair's REPL) own their own session lifetime, and
+    //   * any module that prompts the operator inside run() (e.g. asyncssh's
+    //     "Username to impersonate") gets killed the moment the human takes
+    //     longer than the deadline to type. Worse, that prompt is a blocking
+    //     `spawn_blocking` stdin read which cannot be cancelled — killing the
+    //     run orphans the reader thread, which then races the shell for the next
+    //     line (the "lag after error" + corrupted REPL input).
+    //
+    // Enforce the deadline only when there is NO human at the console to answer
+    // prompts or hit Ctrl-C — i.e. an API/MCP/background run (api_mode), or a
+    // scripted/piped CLI run whose stdin is not a terminal. In those contexts
+    // cfg_prompt_* resolves from options/defaults (it never blocks on a real
+    // keyboard) and the run must stay bounded so it can't hang a request or a
+    // script. An interactive console (stdin is a TTY) is exempt: the operator
+    // chose this single target, can watch it, and can interrupt it — and a
+    // prompt blocking on the keyboard must never count against a deadline.
+    // Interactive modules (wpair's REPL) are always exempt. Mass-scan fan-out
+    // paths keep their own per-host timeouts (fanout_cidr/_file/_random).
+    let no_console_operator =
+        crate::config::get_module_config().api_mode || !std::io::stdin().is_terminal();
+    let enforce_deadline = !module.capabilities().interactive && no_console_operator;
+    let outcome = if enforce_deadline {
         tokio::time::timeout(Duration::from_secs(limits.timeout_secs), module.run(&ctx))
             .await
             .map_err(|e| {
                 anyhow::anyhow!("Module timed out after {}s: {e}", limits.timeout_secs)
             })??
+    } else {
+        module.run(&ctx).await?
     };
     // Publish single-target progress to the job's scan counters (if any).
     if let Some(c) = crate::context::scan_counters() {
@@ -842,6 +881,20 @@ async fn fanout_random(
     module_path: String,
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
+    // Full-internet sweep advisory + interactive confirmation FIRST. Declining
+    // must abort before anything is touched — including the prompt-harvest
+    // dry-run below, which actually runs the module against a placeholder host.
+    if !full_sweep_advisory_and_confirm(
+        &module,
+        &limits,
+        Some(limits.max_random_hosts),
+        "Random mass scan",
+    )
+    .await?
+    {
+        return Ok(ModuleOutcome::ok());
+    }
+
     // --- Pre-batch interactive prompt phase ---
     // Run module prompts ONCE before batch mode so the user can configure
     // interactively. Answers are cached and reused for all targets.
@@ -878,22 +931,45 @@ async fn fanout_random(
     crate::mprintln!(
         "{}",
         format!(
-            "[*] Will scan up to {} random hosts with concurrency {}",
+            "[*] Will scan up to {} hosts with concurrency {} (ZMap-style stateless permutation — no repeats)",
             limits.max_random_hosts, limits.concurrency
         )
         .cyan()
     );
 
     let progress_step = progress_step_for(limits.max_random_hosts as u128);
-    let mut seen = std::collections::HashSet::<std::net::IpAddr>::new();
-    for _ in 0..limits.max_random_hosts {
+    // ZMap-style stateless permutation of the IPv4 space: every address is
+    // visited at most once with O(1) memory and no dedup table (see
+    // `crate::utils::cyclic`). This replaces the old random-sample + `HashSet`,
+    // which grew unboundedly and — as coverage rose — wasted an ever-larger
+    // share of samples re-drawing addresses it had already seen.
+    let mut cyclic = crate::utils::cyclic::CyclicIp::random()?;
+    let mut dispatched: usize = 0;
+    while dispatched < limits.max_random_hosts {
         if cancel.is_cancelled() || stats.abort.load(Ordering::Relaxed) {
             break;
         }
-        let ip = crate::utils::generate_random_public_ip(&exclusions);
-        if !seen.insert(ip) {
-            continue;
-        }
+        // Pull the next real, non-excluded address from the permutation.
+        // Reserved ranges and operator exclusions are skipped without counting
+        // against the host budget (they were never valid targets). `None` means
+        // the entire address space has been enumerated.
+        let ip = 'pick: loop {
+            match cyclic.next() {
+                Some(addr) => {
+                    if crate::utils::cyclic::is_reserved_ipv4(addr) {
+                        continue;
+                    }
+                    let ip = std::net::IpAddr::V4(addr);
+                    if exclusions.iter().any(|net| net.contains(ip)) {
+                        continue;
+                    }
+                    break 'pick Some(ip);
+                }
+                None => break 'pick None,
+            }
+        };
+        let Some(ip) = ip else { break };
+        dispatched += 1;
         let ip_str = ip.to_string();
         if let Some(cp) = checkpoint.as_ref()
             && cp.already_processed(&ip_str).await {
@@ -1019,16 +1095,6 @@ async fn fanout_sequential(
     const LAST_PUBLIC: u32 = 0xDFFF_FFFF; // 223.255.255.255 (end of Class A-C)
 
     let cfg = crate::config::get_module_config();
-    if !cfg.api_mode {
-        pre_batch_prompt(&module, &options, cancel.clone(), tenant_id.clone(), &module_path).await?;
-    }
-
-    let batch_guard = crate::context::enter_batch_mode();
-    let stats = Arc::new(ScanStats::default());
-    let sem = shared_sem.unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
-    let prompt_cache = crate::context::new_prompt_cache();
-    let exclusions = crate::exclusions::shared();
-    let module_err = Arc::new(AtomicUsize::new(0));
 
     // Optional operator cap. Unbounded unless `max_random_hosts` is explicitly set.
     let cap: Option<usize> = match crate::tenant::resolve()
@@ -1047,6 +1113,25 @@ async fn fanout_sequential(
         },
         None => None,
     };
+
+    // Full-internet sweep advisory + interactive confirmation FIRST. Declining
+    // must abort before anything is touched (the resume marker, and the
+    // prompt-harvest dry-run below which runs the module against a placeholder).
+    if !full_sweep_advisory_and_confirm(&module, &limits, cap, "Sequential mass scan").await? {
+        return Ok(ModuleOutcome::ok());
+    }
+
+    // Pre-batch interactive prompt phase (after confirmation).
+    if !cfg.api_mode {
+        pre_batch_prompt(&module, &options, cancel.clone(), tenant_id.clone(), &module_path).await?;
+    }
+
+    let batch_guard = crate::context::enter_batch_mode();
+    let stats = Arc::new(ScanStats::default());
+    let sem = shared_sem.unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
+    let prompt_cache = crate::context::new_prompt_cache();
+    let exclusions = crate::exclusions::shared();
+    let module_err = Arc::new(AtomicUsize::new(0));
 
     // High-water-mark resume: the per-IP set used by random/CIDR does not scale
     // to billions of addresses, so sequential stores the last dispatched IP and
@@ -1190,7 +1275,7 @@ async fn fanout_sequential(
         dispatched += 1;
         last_dispatched = ip;
         // Persist the high-water mark periodically (cheap; bounds resume granularity).
-        if dispatched % progress_step.max(1) == 0 {
+        if dispatched.is_multiple_of(progress_step.max(1)) {
             crate::checkpoint::write_seq_marker(&scan_id, ip);
         }
 
@@ -1252,15 +1337,37 @@ async fn pre_batch_prompt(
     ctx.cancel = cancel;
     ctx.tenant_id = tenant_id;
     ctx.batch_mode = false;
+    // Mark this as a prompt-harvest dry run: `cfg_prompt_*` still prompts
+    // (batch_mode is false), but a module that honours `prompt_only` will return
+    // immediately after gathering answers instead of doing real work against the
+    // placeholder host. Output is captured below as a belt-and-suspenders for
+    // modules that don't yet check the flag.
+    ctx.prompt_only = true;
     ctx.prompt_cache = None;
     ctx.module_path = module_path.to_string();
 
-    // Run with a short timeout — we expect it to fail on the network side,
-    // but prompts will have been answered by then.
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
+    // This dry-run exists ONLY to drive the module's `cfg_prompt_*` calls so a
+    // human can answer them once before the batch starts. The operator is
+    // typing at the console here, so the bound must be generous: a 5s deadline
+    // (the old value) would fire while the operator is still answering, and
+    // because each prompt is a blocking `spawn_blocking` stdin read that cannot
+    // be cancelled, killing the dry-run orphaned that reader thread — which then
+    // raced the next prompt / the shell for input. Keep a large backstop purely
+    // so a misbehaving module's post-prompt network work can't hang batch setup
+    // forever (the dummy target 0.0.0.1 normally fails fast); the operator can
+    // always Ctrl-C.
+    // Capture the dry-run's console output into a throwaway buffer so it never
+    // reaches the operator. This phase exists ONLY to drive the module's
+    // `cfg_prompt_*` calls; without this, a connect-based module (e.g.
+    // service_scanner) actually "scans" the placeholder host 0.0.0.1 and prints
+    // a confusing `Scanning 0.0.0.1 … 0 services detected` block. Interactive
+    // prompts use `print!` (real stdout) and stay visible; only `mprintln!` /
+    // `meprintln!` module output is suppressed.
+    let run_fut = crate::output::OUTPUT_BUFFER.scope(
+        crate::output::OutputBuffer::new(),
         module.run(&ctx),
-    ).await;
+    );
+    let result = tokio::time::timeout(Duration::from_secs(300), run_fut).await;
 
     // Regardless of success/failure, the prompts have been answered and
     // stored in global options by cfg_prompt_*. Swallow the error.
@@ -1278,6 +1385,95 @@ async fn pre_batch_prompt(
 
     crate::mprintln!();
     Ok(())
+}
+
+/// Print a one-time advisory before a full-internet sweep (`random` /
+/// `0.0.0.0` / `0.0.0.0/0`, random or sequential) showing the knobs an operator
+/// usually wants to set, then — on an interactive console only — ask for an
+/// explicit confirmation. Returns `false` when the operator declines (the
+/// caller aborts the sweep). API/MCP and piped/scripted runs are never prompted
+/// (they proceed), mirroring how the per-target deadline is gated.
+///
+/// `cap` is the host ceiling for this sweep: `Some(n)` (random, or sequential
+/// with `max_random_hosts` set) or `None` (an unbounded sequential sweep).
+async fn full_sweep_advisory_and_confirm(
+    module: &Arc<dyn Module>,
+    limits: &SchedulerLimits,
+    cap: Option<usize>,
+    sweep_label: &str,
+) -> Result<bool> {
+    // Effective service port for the per-host precheck. `limits.precheck_port`
+    // is already resolved to `setg port` if set, else the module's own
+    // `default_port` (see run_with_limits_shared) — exactly the "default to the
+    // module's port" behaviour. Surface where it came from so a stale global
+    // `setg port` that differs from the module default is visible.
+    let module_default = module.info().default_port;
+    let global_port = match crate::tenant::resolve().global_options().try_get("port") {
+        Some(v) => match v.trim().parse::<u16>() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // Surface, don't swallow: a bad `setg port` would otherwise be
+                // silently ignored and the operator would never know why the
+                // precheck used a different port.
+                crate::meprintln!(
+                    "[!] Ignoring invalid `setg port` value '{}': {e}",
+                    v.trim()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let port_line = match (limits.precheck_port, global_port, module_default) {
+        (Some(p), Some(_), Some(d)) if p != d => {
+            format!("{p}  (from `setg port`; this module's default is {d})")
+        }
+        (Some(p), Some(_), _) => format!("{p}  (from `setg port`)"),
+        (Some(p), None, _) => format!("{p}  (module default)"),
+        (None, _, _) => {
+            "none — this module declares no default port, so every host is probed".to_string()
+        }
+    };
+    let host_cap = match cap {
+        Some(n) => format!("{n} hosts"),
+        None => "unbounded (entire public IPv4 space)".to_string(),
+    };
+    let excl = crate::exclusions::shared().networks().len();
+
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[!] {sweep_label}: '{}' will probe public hosts across the whole Internet.",
+            module.info().name
+        )
+        .yellow()
+        .bold()
+    );
+    crate::mprintln!("{}", "    Settings for this sweep (override with `setg <key> <value>`):".yellow());
+    crate::mprintln!("      {:<17}{}", "port:", port_line);
+    crate::mprintln!("      {:<17}{}   {}", "concurrency:", limits.concurrency, "(setg concurrency <n>)".dimmed());
+    crate::mprintln!("      {:<17}{}   {}", "host cap:", host_cap, "(setg max_random_hosts <n>)".dimmed());
+    crate::mprintln!("      {:<17}{}s   {}", "per-host timeout:", limits.timeout_secs, "(setg timeout <n>)".dimmed());
+    crate::mprintln!(
+        "      {:<17}{} networks excluded (RFC1918/bogons/...)   {}",
+        "exclusions:",
+        excl,
+        "(setg exclusions ...)".dimmed()
+    );
+
+    // Only a human at an interactive console is asked to confirm. API/MCP runs
+    // (api_mode) and piped/scripted CLI runs (stdin not a TTY) proceed — they
+    // opted in by passing the target and there is no keyboard to answer.
+    let cfg = crate::config::get_module_config();
+    let interactive_console = !cfg.api_mode && std::io::stdin().is_terminal();
+    if !interactive_console {
+        return Ok(true);
+    }
+    let proceed = crate::utils::prompt_yes_no("Proceed with the full-internet sweep?", false).await?;
+    if !proceed {
+        crate::mprintln!("{}", "[*] Full-internet sweep aborted by operator.".yellow());
+    }
+    Ok(proceed)
 }
 
 // ============================================================
