@@ -14,6 +14,7 @@ mod context;
 mod modules;
 mod native;
 mod shell;
+mod tommy;
 mod utils;
 
 pub mod checkpoint;
@@ -35,6 +36,7 @@ pub mod prescan;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod spool;
+pub mod results_sink;
 pub mod workspace;
 pub mod ws;
 

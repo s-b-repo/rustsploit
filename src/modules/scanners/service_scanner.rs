@@ -120,6 +120,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         String::new()
     };
 
+    // Prompt-harvest dry run: every `cfg_prompt_*` answer above is now cached
+    // for the batch, so there's nothing more to do. Returning here means the
+    // placeholder host is never actually scanned and no results file is written.
+    if ctx.prompt_only {
+        return Ok(outcome);
+    }
+
     // --- Run scan ---
     crate::mprintln!();
     crate::mprintln!(
@@ -188,7 +195,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     print_results_table(&results);
 
     // --- Save to file ---
-    if save_results && !output_file.is_empty() {
+    // In a mass-scan fan-out (`batch_mode`), every host runs this module. A
+    // per-host file save would have all hosts racing to overwrite the same path,
+    // and the status lines would spam the console once per host. So restrict the
+    // file save + the per-host "scan complete" summary to interactive
+    // single-target runs; in a sweep, findings flow through `outcome` instead and
+    // only hosts that actually have services print their results table.
+    if save_results && !output_file.is_empty() && !crate::utils::is_batch_mode() {
         save_results_to_file(&results, &output_file, target)?;
         crate::mprintln!(
             "{}",
@@ -196,12 +209,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         );
     }
 
-    crate::mprintln!(
-        "\n{}",
-        format!("[*] Scan complete: {} services detected on {}", results.len(), target)
-            .green()
-            .bold()
-    );
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!(
+            "\n{}",
+            format!("[*] Scan complete: {} services detected on {}", results.len(), target)
+                .green()
+                .bold()
+        );
+    }
 
     Ok(outcome)
 }
@@ -233,7 +248,12 @@ fn display_banner() {
 
 fn print_results_table(results: &[ServiceResult]) {
     if results.is_empty() {
-        crate::mprintln!("{}", "[!] No services detected.".yellow());
+        // Don't print "no services" for every host of a mass sweep — that is the
+        // common case across millions of hosts and would bury the real hits.
+        // Keep it for interactive single-target runs where it's useful feedback.
+        if !crate::utils::is_batch_mode() {
+            crate::mprintln!("{}", "[!] No services detected.".yellow());
+        }
         return;
     }
 
@@ -308,6 +328,57 @@ fn sanitize_banner(raw: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Run the captured banner through the Recog fingerprint database `db_name`
+/// (e.g. "ssh", "ftp", "smtp", "http", "mysql") and, on a match, enrich the
+/// `ServiceResult` with the structured product/version/OS Recog extracted.
+///
+/// Recog's structured product+version takes precedence over the manual
+/// substring parse (which it supersedes); OS and vendor details are recorded in
+/// the `notes` field. Returns `true` when a Recog fingerprint matched.
+fn enrich_with_recog(r: &mut ServiceResult, db_name: &str, banner: &str) -> bool {
+    if banner.trim().is_empty() {
+        return false;
+    }
+    let m = crate::utils::recog::match_banner(db_name, banner);
+    if !m.matched {
+        return false;
+    }
+    tracing::debug!(
+        db = db_name,
+        port = r.port,
+        "service_scanner: recog fingerprint matched"
+    );
+
+    // Prefer Recog's product+version summary as the version label.
+    if let Some(summary) = m.summary() {
+        if !summary.is_empty() {
+            r.version = summary;
+        }
+    }
+
+    // Append vendor / OS detail to notes without clobbering existing notes.
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(vendor) = m.vendor() {
+        extra.push(format!("vendor={}", vendor));
+    }
+    if let Some(os) = m.os_product() {
+        extra.push(format!("os={}", os));
+    }
+    if let Some(cpe) = m.get("service.cpe23") {
+        extra.push(format!("cpe={}", cpe));
+    }
+    if !extra.is_empty() {
+        let detail = format!("recog: {}", extra.join(", "));
+        if r.notes.is_empty() {
+            r.notes = detail;
+        } else {
+            r.notes = format!("{}, {}", r.notes, detail);
+        }
+    }
+
+    true
 }
 
 fn save_results_to_file(
@@ -457,6 +528,11 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
         r.version = extract_version_after(&r.banner, "wu-");
     }
 
+    // Recog fingerprint pass — overrides/augments the manual parse above with a
+    // structured product/version and vendor/OS detail when a fingerprint hits.
+    let ftp_banner = r.banner.clone();
+    enrich_with_recog(&mut r, "ftp", &ftp_banner);
+
     // Check anonymous access — proper FTP handshake
     let anon_cmd = b"USER anonymous\r\n";
     if stream.write_all(anon_cmd).await.is_ok() {
@@ -512,6 +588,10 @@ async fn probe_ssh(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
             r.version = sw.to_string();
         }
     }
+
+    // Recog fingerprint pass — resolves OpenSSH/Dropbear/RouterOS etc. to a
+    // structured product + version, replacing the raw banner-prefix above.
+    enrich_with_recog(&mut r, "ssh", &banner);
 
     Some(r)
 }
@@ -589,6 +669,10 @@ async fn probe_smtp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<S
     if banner.starts_with("220") {
         r.notes = "Service ready".to_string();
     }
+
+    // Recog fingerprint pass — structured MTA product/version (Exim, Postfix,
+    // Sendmail, Exchange) plus OS detail when the banner reveals it.
+    enrich_with_recog(&mut r, "smtp", &banner);
 
     Some(r)
 }
@@ -673,6 +757,9 @@ async fn probe_https(target: &str, port: u16, dur: Duration) -> Option<ServiceRe
             if !server.is_empty() {
                 r.version = server.clone();
                 r.notes = format!("Server: {}", server);
+                // Recog fingerprint pass over the HTTP Server header — yields a
+                // structured web-server product/version and host-OS detail.
+                enrich_with_recog(&mut r, "http", &server);
             }
             if !powered_by.is_empty() {
                 if r.notes.is_empty() {
@@ -720,6 +807,9 @@ async fn probe_mysql(mut stream: TcpStream, port: u16, dur: Duration) -> Option<
             if version_str.to_lowercase().contains("mariadb") {
                 r.service = "MariaDB".to_string();
             }
+            // Recog fingerprint pass over the raw handshake version string —
+            // distinguishes MySQL vs MariaDB and pins the numeric version/CPE.
+            enrich_with_recog(&mut r, "mysql", &version_str);
         }
     }
 

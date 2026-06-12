@@ -437,13 +437,15 @@ pub fn subnet_host_count(net: &ipnetwork::IpNetwork) -> u128 {
 // ============================================================
 
 /// Check if a target triggers mass scan mode.
-/// Recognizes: "random", "0.0.0.0/0", CIDR subnets, and file paths.
-/// Bare "0.0.0.0" is intentionally excluded (M45): it is a normal single
-/// host, not a full-internet random-scan keyword.
+/// Recognizes: "random", "0.0.0.0/0", bare "0.0.0.0", CIDR subnets, and file
+/// paths. Bare "0.0.0.0" is an operator alias for the full-internet sweep
+/// (2026-06-09, reversing the earlier M45 single-host rule); the scheduler
+/// still gates the actual sweep behind an advisory + confirmation.
 pub fn is_mass_scan_target(target: &str) -> bool {
     let lower = target.trim().to_ascii_lowercase();
     target == "random"
         || target == "0.0.0.0/0"
+        || target == "0.0.0.0"
         || lower == "seq"
         || lower == "sequential"
         || lower.starts_with("seq:")

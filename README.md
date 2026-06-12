@@ -37,9 +37,9 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 
 ## Highlights
 
--  **Auto-discovered modules:** `build.rs` indexes `src/modules/**` — drop in new code, no manual registration needed
+-  **Self-registering modules:** modules register at compile time via the `inventory` crate — add the file, a `register_native_module!` call, and a `pub mod <name>;` line in the parent `mod.rs`; no build-script indexer
 -  **Interactive shell:** 40+ commands with shortcuts, command chaining (`&`), tab completion, and command history
--  **Module metadata:** Optional `info()` and `check()` functions per module — CVE references, author, rank, non-destructive vulnerability verification
+-  **Module metadata:** `info()` per module — CVE references, author, rank. The framework is exploitation-only: modules run an exploit and report findings (there is no `check()` / non-destructive verification phase)
 -  **Global options (`setg`):** Persistent key-value settings that apply across all modules — like Metasploit's datastore
 -  **Credential store:** Track discovered credentials across sessions with `creds` commands and JSON persistence
 -  **Host/service tracking:** Workspace-based engagement tracking with `hosts`, `services`, `notes` commands
@@ -53,7 +53,7 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 -  **Scanners & utilities:** Port scanner, ping sweep, SSDP, HTTP title grabber, DNS recursion tester, directory bruteforcer, sequential fuzzer, proxy scanner, reflect scanner, vulnerability checker
 -  **API server:** PQ-encrypted WebSocket transport — post-quantum cryptography, full CRUD for credentials, hosts, services, loot, jobs
 -  **MCP server:** 38-tool Model Context Protocol server for AI-assisted pentesting via stdio
--  **Plugin system:** Third-party modules via `src/modules/plugins/` with build-time discovery and startup safety warnings
+-  **Plugin system:** Third-party modules via `src/modules/plugins/` with compile-time `inventory` self-registration and startup safety warnings
 -  **Security hardened:** Input validation, path traversal protection, honeypot detection, root privilege checks, spool symlink protection, memory-safe operations
 -  **IPv4/IPv6 ready:** Both address families work out-of-the-box across all modules
 

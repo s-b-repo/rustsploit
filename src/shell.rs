@@ -30,7 +30,7 @@ const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
 
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
-    "help", "modules", "find", "use", "set target", "set subnet",
+    "help", "tommy", "modules", "find", "use", "set target", "set subnet",
     "set port", "set source_port", "set concurrency", "set timeout",
     "set threads", "set wordlist", "set verbose",
     "show_target", "clear_target", "run", "back", "exit", "quit",
@@ -409,6 +409,11 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         render_help();
                     } else {
                         render_help_topic(&rest);
+                    }
+                }
+                "tommy" => {
+                    if let Err(e) = crate::tommy::run_guide() {
+                        println!("{} {}", "tommy:".red(), e);
                     }
                 }
                 "modules" => utils::list_all_modules(),
@@ -1214,6 +1219,7 @@ fn split_command(input: &str) -> Option<(String, String)> {
 pub fn resolve_command(cmd: &str) -> String {
     match cmd {
         "?" | "help" | "h" => "help",
+        "tommy" | "guide" | "walkthrough" => "tommy",
         "modules" | "list" | "ls" | "m" => "modules",
         "find" | "search" | "f" | "f1" => "find",
 
@@ -1282,6 +1288,10 @@ async fn display_all_options(ctx: &ShellContext) {
         ("verbose",            "Verbose output (y/n)",           ""),
         ("honeypot_detection", "Skip honeypot hosts (y/n)",      ""),
         ("prescan",            "Pre-scan tool (auto/masscan/zmap/none)", ""),
+        ("scan_order",         "Full-sweep order (random/sequential)", ""),
+        ("exclusions",         "Extra networks to skip in mass scans (CIDR,CIDR,...)", ""),
+        ("target_rps",         "Per-target rate limit (req/s, 0 = unlimited)", ""),
+        ("module_rps",         "Global module rate limit (req/s, 0 = unlimited)", ""),
     ];
 
     let mut displayed = std::collections::HashSet::new();
@@ -1393,6 +1403,63 @@ async fn handle_set_target(raw_value: &str) {
                     println!("{}", format!("[!] Failed to set target: {}", e).red());
                 }
             }
+            // `0.0.0.0` is an alias for the full-internet sweep `0.0.0.0/0`
+            // (== `random`). Flag it so the operator isn't surprised that a
+            // bare `0.0.0.0` now sweeps every public host; the scan itself asks
+            // for an explicit confirmation before fanning out.
+            //
+            // When the operator switches to a full sweep we auto-bump
+            // `max_random_hosts` to the actual count of reachable public
+            // IPv4 addresses (after the reserved-range filter). Without this,
+            // the scheduler default of 10_000 would silently cap a "scan
+            // everything" target at 10k hosts.
+            //
+            // We only do this when `max_random_hosts` is currently UNSET — if
+            // the operator already chose a value we leave it alone.
+            if matches!(final_target.as_str(), "0.0.0.0" | "0.0.0.0/0" | "random") {
+                println!(
+                    "{}",
+                    "    ⚠ Full-internet sweep (every public host). You'll be asked to confirm at run time."
+                        .yellow()
+                );
+
+                if crate::global_options::GLOBAL_OPTIONS
+                    .get("max_random_hosts")
+                    .await
+                    .is_none()
+                {
+                    let total = crate::utils::cyclic::total_public_ipv4_count();
+                    if crate::global_options::GLOBAL_OPTIONS
+                        .set("max_random_hosts", &total.to_string())
+                        .await
+                    {
+                        println!(
+                            "{}",
+                            format!(
+                                "    [+] max_random_hosts auto-set to {} (every reachable public IPv4 — \
+                                 RFC1918/multicast/127.0.0.0/8/.0/.255 excluded). \
+                                 `setg max_random_hosts <n>` to lower it.",
+                                total
+                            )
+                            .green()
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            format!(
+                                "    [!] could not persist max_random_hosts={} — falling back to scheduler default",
+                                total
+                            )
+                            .yellow()
+                        );
+                    }
+                } else {
+                    println!(
+                        "{}",
+                        "    [*] max_random_hosts already set — leaving operator value alone.".dimmed()
+                    );
+                }
+            }
         }
         Err(reason) => {
             println!("{}", format!("[!] {}", reason).yellow());
@@ -1442,6 +1509,7 @@ fn render_help() {
     println!("  {}", "Navigation & Discovery".bold().underline());
     println!();
     println!("    {:<20} {:<24} Show this screen", "help".green(), "h | ?".dimmed());
+    println!("    {:<20} {:<24} Friendly walk-through guide (a/d to page)", "tommy".green(), "guide".dimmed());
     println!("    {:<20} {:<24} List all available modules", "modules".green(), "ls | m".dimmed());
     println!("    {:<20} {:<24} Search modules by keyword", "find <kw>".green(), "f1 <kw>".dimmed());
     println!("    {:<20} {:<24} Select a module to load", "use <path>".green(), "u <path>".dimmed());
@@ -1535,7 +1603,7 @@ fn render_help() {
         MAX_COMMAND_CHAIN_LENGTH);
     println!("{}", "└──────────────────────────────────────────────────────────────────────────┘".dimmed());
     println!();
-    println!("  {} {}", "Topics:".bold(), "use info run set setg target mass-scan jobs creds hosts services loot workspace resource spool export".dimmed());
+    println!("  {} {}", "Topics:".bold(), "tommy use info run set setg target mass-scan jobs creds hosts services loot workspace resource spool export".dimmed());
     println!();
 }
 
@@ -1546,6 +1614,7 @@ fn render_help_topic(topic: &str) {
 
     let canonical: &str = match key {
         "?" | "help" | "h" => "help",
+        "guide" | "walkthrough" => "tommy",
         "u" => "use",
         "i" => "info",
         "ls" | "list" | "m" => "modules",
@@ -1931,7 +2000,18 @@ fn render_help_topic(topic: &str) {
                 ("help mass-scan",                         "How mass-scan mode works"),
                 ("? setg",                                 "Alias"),
             ],
-            &["mass-scan", "setg", "run"],
+            &["mass-scan", "setg", "run", "tommy"],
+        ),
+        "tommy" => man_page(
+            "tommy",
+            "Friendly interactive walk-through guide for new users. Pages step you through every major rustsploit feature with examples you can copy and try.",
+            &["tommy", "guide", "walkthrough"],
+            "Navigate with single keys: `d` (or Enter) for the next page, `a` for the previous page, `q` to quit. Type a page number to jump directly to it. Type `h` inside the guide for the full key list. The guide is read-only — running it never changes any settings.",
+            &[
+                ("tommy",                                  "Start at page 1"),
+                ("guide",                                  "Alias"),
+            ],
+            &["help", "modules", "use", "run"],
         ),
         _ => {
             println!();
@@ -1939,7 +2019,7 @@ fn render_help_topic(topic: &str) {
             println!();
             println!("{} {}",
                 "Available topics:".bold(),
-                "use info modules find target subnet show_target clear_target run setg unsetg show_options mass-scan jobs creds hosts services notes loot workspace resource makerc spool export back exit help".dimmed());
+                "tommy use info modules find target subnet show_target clear_target run setg unsetg show_options mass-scan jobs creds hosts services notes loot workspace resource makerc spool export back exit help".dimmed());
             println!();
         }
     }

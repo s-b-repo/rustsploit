@@ -113,12 +113,27 @@ The framework-level dispatcher handles multiple target types transparently for a
 | CIDR range | `t 192.168.1.0/24` |
 | File of targets | `t /path/to/targets.txt` |
 | Random scanning | `t random` or `t 0.0.0.0/0` |
+| Sequential scanning | `t seq` (from `1.0.0.0`), `t seq:1.2.3.4` (explicit start) |
 
 All modules benefit from this automatically -- the dispatcher expands multi-target values and invokes the module once per resolved target.
 
 > **Note:** Only `random` and `0.0.0.0/0` trigger a full-internet random mass
 > scan. Bare `0.0.0.0` is treated as a normal single host, **not** a mass-scan
 > keyword, so `t 0.0.0.0` will not launch an internet-wide scan.
+
+### Mass-scan order: random vs. sequential
+
+A full-public-IPv4 sweep can run in two orders, both honoring the exclusion list
+(`setg exclusions …`):
+
+- **Random** (default) — `t random` / `t 0.0.0.0/0`: samples random public IPs up
+  to `max_random_hosts` (default 10,000).
+- **Sequential** — `t seq` / `t seq:<start-ip>`, or flip `0.0.0.0/0`/`random` into
+  order with `setg scan_order sequential`: walks `1.0.0.0 → 223.255.255.255` in
+  order, skipping excluded/reserved ranges. **Unbounded** by default (Ctrl+C to
+  stop) unless you set `max_random_hosts`; it checkpoints the high-water IP, so a
+  killed scan **resumes** from where it left off on the next run. Set
+  `setg scan_order random` to switch back.
 
 ---
 
@@ -184,6 +199,7 @@ The shell accepts Metasploit-style option names and maps them to Rustsploit keys
 | `target_rps` | `set target_rps 10` | Per-target rate limit |
 | `prescan` | `set prescan auto` | Pre-scan tool for CIDR (auto/masscan/zmap/none) |
 | `prescan_rate` | `set prescan_rate 1000` | Pre-scan packets per second |
+| `scan_order` | `set scan_order sequential` | Mass-scan order for `0.0.0.0/0`/`random`: `random` (default) or `sequential` |
 | `target_mac` | `setg target_mac AA:BB:CC:DD:EE:FF` | wpair: target a single Fast Pair device |
 | `adapter` | `setg adapter 1` | wpair: BLE adapter index |
 | `scan_secs` | `setg scan_secs 20` | wpair: BLE scan window (3–300 s) |

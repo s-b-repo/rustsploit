@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Vendored from Rapid7 Recog (https://github.com/rapid7/recog), BSD-2-Clause.
+  Trimmed subset of xml/mysql_banners.xml for rustsploit's recog matcher.
+  Input is the version string from the MySQL/MariaDB handshake greeting packet.
+-->
+<fingerprints matches="mysql.banner">
+
+  <fingerprint pattern="^([\d.]+)-MariaDB(?:-([\w.+~:-]+))?$">
+    <description>MariaDB database server, optionally with distro suffix</description>
+    <example service.version="10.5.12" service.product="MariaDB">10.5.12-MariaDB-1:10.5.12+maria~focal</example>
+    <param pos="0" name="service.vendor" value="MariaDB"/>
+    <param pos="0" name="service.family" value="MariaDB"/>
+    <param pos="0" name="service.product" value="MariaDB"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:mariadb:mariadb:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^([\d.]+)-(\d+(?:\.\d+)*)?-?Ubuntu">
+    <description>MySQL server on Ubuntu</description>
+    <example service.version="8.0.29" os.product="Ubuntu">8.0.29-0ubuntu0.20.04.3</example>
+    <param pos="0" name="service.vendor" value="Oracle"/>
+    <param pos="0" name="service.family" value="MySQL"/>
+    <param pos="0" name="service.product" value="MySQL"/>
+    <param pos="1" name="service.version"/>
+    <param pos="0" name="os.vendor" value="Canonical"/>
+    <param pos="0" name="os.family" value="Linux"/>
+    <param pos="0" name="os.product" value="Ubuntu"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:oracle:mysql:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^([\d.]+)-log$">
+    <description>MySQL server with binary logging enabled</description>
+    <example service.version="5.7.38">5.7.38-log</example>
+    <param pos="0" name="service.vendor" value="Oracle"/>
+    <param pos="0" name="service.family" value="MySQL"/>
+    <param pos="0" name="service.product" value="MySQL"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:oracle:mysql:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^([\d.]+)$">
+    <description>Generic MySQL server version string</description>
+    <example service.version="5.7.38">5.7.38</example>
+    <param pos="0" name="service.vendor" value="Oracle"/>
+    <param pos="0" name="service.family" value="MySQL"/>
+    <param pos="0" name="service.product" value="MySQL"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:oracle:mysql:{service.version}"/>
+  </fingerprint>
+
+</fingerprints>

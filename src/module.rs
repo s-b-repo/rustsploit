@@ -91,12 +91,14 @@ impl Target {
         if trimmed.is_empty() {
             anyhow::bail!("Target cannot be empty");
         }
-        // `Target::Random` is reserved for the explicit mass-scan markers
-        // `random` and `0.0.0.0/0`. Bare `0.0.0.0` is NOT a mass-scan keyword
-        // (M45): it resolves to a normal single host so `t 0.0.0.0` does not
-        // silently launch a full-internet random scan. CIDR ranges and file
-        // paths are handled below as `Cidr` / `File`.
-        if trimmed == "random" || trimmed == "0.0.0.0/0" {
+        // `Target::Random` is the full-internet random sweep. It is triggered by
+        // the markers `random`, `0.0.0.0/0`, and bare `0.0.0.0` (operator opt-in
+        // 2026-06-09 — reverses the earlier M45 rule that made `0.0.0.0` a single
+        // host). The scheduler shows a per-sweep advisory and, on an interactive
+        // console, an explicit confirmation before it actually fans out (see
+        // `fanout_random` / `fanout_sequential`). CIDR ranges and file paths are
+        // handled below as `Cidr` / `File`.
+        if trimmed == "random" || trimmed == "0.0.0.0/0" || trimmed == "0.0.0.0" {
             return Ok(Target::Random);
         }
         // Sequential full-public-IPv4 sweep: `seq`/`sequential` start at the
@@ -333,6 +335,14 @@ pub struct ModuleCtx {
     pub options: ModuleOptions,
     pub cancel: tokio_util::sync::CancellationToken,
     pub batch_mode: bool,
+    /// Prompt-harvest dry run. Before a mass-scan batch the scheduler runs the
+    /// module once against a placeholder host purely to gather the operator's
+    /// `cfg_prompt_*` answers (which get cached for the whole batch). When this
+    /// is set, a module should answer its prompts and then return EARLY without
+    /// any network work or file writes — the run exists only to populate the
+    /// prompt cache, so any real effect against the placeholder host is wasted
+    /// and misleading.
+    pub prompt_only: bool,
     pub verbose: bool,
     /// Tenant identity (multi-tenant API isolation). `None` in CLI/shell mode.
     pub tenant_id: Option<String>,
@@ -354,6 +364,7 @@ impl ModuleCtx {
             options: ModuleOptions::default(),
             cancel: tokio_util::sync::CancellationToken::new(),
             batch_mode: false,
+            prompt_only: false,
             verbose: false,
             tenant_id: None,
             prompt_cache: None,

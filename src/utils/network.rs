@@ -488,6 +488,12 @@ pub struct HttpClientOpts {
     /// modules and high-concurrency scanners can pass a smaller cap, or
     /// `Some(0)` to fully disable the connection pool.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Override `pool_idle_timeout` (reqwest default: ~90s) — how long an idle
+    /// keep-alive connection is retained before being reaped. The cached
+    /// permissive client sets a shorter timeout so a long full-internet sweep
+    /// doesn't accumulate idle connections to huge numbers of distinct hosts.
+    /// `None` keeps reqwest's default.
+    pub pool_idle_timeout: Option<Duration>,
 }
 
 impl HttpClientOpts {
@@ -564,7 +570,53 @@ pub fn get_global_trust_proxy() -> bool {
 /// no cookies, no redirects). Prints a one-time info notice if source_port is
 /// set (reqwest doesn't support it).
 pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
-    build_http_client_with(timeout, HttpClientOpts::permissive())
+    // Hot-path cache. The permissive client is rebuilt on essentially every HTTP
+    // module run, and each `reqwest::Client::builder().build()` re-initialises the
+    // TLS config and a brand-new connection pool. reqwest clients are `Arc`
+    // internally and share their pool across clones, so we keep one per
+    // (timeout, accept_invalid_certs) and hand out cheap clones instead — reusing
+    // warm connections across runs in the common scan loop.
+    //
+    // The key includes `accept_invalid_certs` because `permissive()` derives it
+    // from the live `strict_tls` global; without it, toggling `setg strict_tls`
+    // would be ignored once a client was cached. Custom-opts clients (cookies,
+    // headers, redirects, …) go through `build_http_client_with` and are NOT
+    // cached, since those options can't be shared safely or keyed cheaply.
+    static CACHE: once_cell::sync::Lazy<
+        std::sync::Mutex<std::collections::HashMap<(u64, bool), reqwest::Client>>,
+    > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let mut opts = HttpClientOpts::permissive();
+    // This client is long-lived and shared across the whole process, so bound
+    // how long idle keep-alives linger. Short enough to reap stale hosts during
+    // a sweep, long enough to reuse connections within a single run.
+    opts.pool_idle_timeout = Some(Duration::from_secs(30));
+    let key = (timeout.as_millis() as u64, opts.accept_invalid_certs);
+
+    // A poisoned lock here is recoverable: the map holds only cloneable clients,
+    // so a prior panic cannot have left it logically inconsistent. Recover rather
+    // than propagate a panic into every HTTP caller.
+    {
+        let cache = match CACHE.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+    }
+
+    // Build outside the lock so a slow `build()` can't serialise other callers.
+    let client = build_http_client_with(timeout, opts)?;
+
+    let mut cache = match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // A concurrent caller may have inserted an equivalent client meanwhile; last
+    // writer wins and both are interchangeable, so just overwrite.
+    cache.insert(key, client.clone());
+    Ok(client)
 }
 
 /// Build a reqwest HTTP client with extended options. Every exploit module
@@ -622,6 +674,10 @@ pub fn build_http_client_with(
 
     if let Some(cap) = opts.pool_max_idle_per_host {
         builder = builder.pool_max_idle_per_host(cap);
+    }
+
+    if let Some(idle) = opts.pool_idle_timeout {
+        builder = builder.pool_idle_timeout(idle);
     }
 
     // Honour SSRF DNS pins (anti-rebinding). For unpinned hosts this falls back
