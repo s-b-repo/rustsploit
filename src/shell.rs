@@ -1318,6 +1318,7 @@ async fn display_all_options(ctx: &ShellContext) {
         ("bruteforce_jitter_ms","Random extra delay added to bruteforce_delay_ms (ms)", ""),
         ("bruteforce_mask",    "Mask brute (hydra -x) MIN:MAX:CHARSET, e.g. 1:4:a1", ""),
         ("bruteforce_resume",  "Resume large streamed wordlist from last batch (y/n)", ""),
+        ("bruteforce_retries", "Retries on transient/connection error per combo (medusa -r, default 1)", ""),
     ];
 
     let mut displayed = std::collections::HashSet::new();

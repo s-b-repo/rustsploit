@@ -259,6 +259,12 @@ where
     let delay_ms = opt_u64("bruteforce_delay_ms");
     let jitter_ms = opt_u64("bruteforce_jitter_ms");
 
+    // medusa `-r`-style connection retries: `setg bruteforce_retries N` re-tries a
+    // retryable (transient/connection) error up to N times before giving up on a
+    // combo. Defaults to 1 when unset or zero (the historical behaviour).
+    let retries = opt_u64("bruteforce_retries");
+    let max_retries = if retries == 0 { 1 } else { retries as usize };
+
     let bf_config = BruteforceConfig {
         target: host.clone(),
         port,
@@ -267,7 +273,7 @@ where
         verbose: false,
         delay_ms,
         jitter_ms,
-        max_retries: 1,
+        max_retries,
         service_name: cfg.service_name,
         source_module: cfg.source_module,
     };
