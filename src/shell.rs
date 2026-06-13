@@ -1308,6 +1308,9 @@ async fn display_all_options(ctx: &ShellContext) {
         ("exclusions",         "Extra networks to skip in mass scans (CIDR,CIDR,...)", ""),
         ("target_rps",         "Per-target rate limit (req/s, 0 = unlimited)", ""),
         ("module_rps",         "Global module rate limit (req/s, 0 = unlimited)", ""),
+        ("username_wordlist",  "Bruteforce username wordlist path", ""),
+        ("password_wordlist",  "Bruteforce password wordlist path", ""),
+        ("cred_extras",        "Bruteforce extra creds: hydra-style n/s/r (null/same/reversed), e.g. nsr", ""),
     ];
 
     let mut displayed = std::collections::HashSet::new();
