@@ -493,6 +493,38 @@ const MAX_COMBOS: usize = 10_000_000;
 /// before the engine gives up on a host instead of pausing-and-grinding forever.
 const MAX_LOCKOUT_PAUSES: u64 = 3;
 
+/// When to stop a host's bruteforce on a successful login. Controlled by
+/// `setg cred_stop_mode` (host | user | all); defaults from `stop_on_success`.
+#[derive(Clone, Copy, PartialEq)]
+enum StopMode {
+    /// Stop the whole host after the first valid credential (hydra `-f` / the
+    /// historical default).
+    Host,
+    /// Stop trying a username once ITS password is found, but keep going for
+    /// other usernames (medusa default).
+    User,
+    /// Never stop on success — find every valid credential (hydra default).
+    All,
+}
+
+/// Resolve the stop mode from `setg cred_stop_mode`, falling back to the config's
+/// `stop_on_success` (true => Host, false => All) when unset/unknown.
+fn resolve_stop_mode(default_stop_on_success: bool) -> StopMode {
+    let fallback = if default_stop_on_success { StopMode::Host } else { StopMode::All };
+    match crate::tenant::resolve().global_options().try_get("cred_stop_mode") {
+        Some(v) => match v.trim().to_lowercase().as_str() {
+            "host" | "first" => StopMode::Host,
+            "user" | "peruser" | "per_user" => StopMode::User,
+            "all" | "findall" | "find_all" | "none" => StopMode::All,
+            other => {
+                tracing::debug!("unknown cred_stop_mode '{other}'; using default");
+                fallback
+            }
+        },
+        None => fallback,
+    }
+}
+
 /// Generate credential pairs with full combo mode control.
 /// - Linear: pairs user\[i\] with pass\[i\], cycling the shorter list.
 /// - Combo: full cross product (user × pass).
@@ -707,6 +739,23 @@ where
     F: Fn(String, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
     Fut: Future<Output = LoginResult> + Send,
 {
+    run_bruteforce_with_abort(config, combos, try_login, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Like [`run_bruteforce`] but with a caller-supplied `abort` flag so a
+/// multi-batch driver (the streaming path) can give up ACROSS batches: when the
+/// engine trips `abort` (host blocking/dead, no success), the driver stops
+/// feeding it the rest of the wordlist instead of re-pausing every batch.
+pub async fn run_bruteforce_with_abort<F, Fut>(
+    config: &BruteforceConfig,
+    combos: Vec<(String, String)>,
+    try_login: F,
+    abort: Arc<AtomicBool>,
+) -> Result<BruteforceResult>
+where
+    F: Fn(String, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
+    Fut: Future<Output = LoginResult> + Send,
+{
     // Deduplicate combos preserving order
     let combos = {
         let mut seen = std::collections::HashSet::new();
@@ -731,11 +780,18 @@ where
     let errors: BruteforceErrorList = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
-    // Medusa-style "give up on this host": set when repeated lockout pauses make
-    // no progress. Unlike `stop` (which is gated on stop_on_success), `abort`
-    // always halts the run so a dead/blocking host can't grind the whole wordlist.
-    let abort = Arc::new(AtomicBool::new(false));
+    // Medusa-style "give up on this host": `abort` (caller-supplied) is set when
+    // repeated lockout pauses make no progress. Unlike `stop` (gated on
+    // stop_on_success), `abort` always halts the run so a dead/blocking host
+    // can't grind the whole wordlist — and the streaming driver reuses the same
+    // flag across batches.
     let lockout_pauses = Arc::new(AtomicU64::new(0));
+    // Stop granularity (host / per-user / find-all). `found_users` backs per-user
+    // mode: once a username's password is found, further attempts for that user
+    // are skipped while other users keep going.
+    let stop_mode = resolve_stop_mode(config.stop_on_success);
+    let found_users: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
 
     // Progress reporter
@@ -757,7 +813,7 @@ where
         if abort.load(Ordering::Relaxed) {
             break;
         }
-        if config.stop_on_success && stop.load(Ordering::Relaxed) {
+        if stop_mode == StopMode::Host && stop.load(Ordering::Relaxed) {
             break;
         }
 
@@ -783,7 +839,7 @@ where
         let stats_c = stats.clone();
         let try_login_c = try_login.clone();
         let verbose = config.verbose;
-        let stop_on_success = config.stop_on_success;
+        let found_users_c = found_users.clone();
         let max_retries = config.max_retries;
         let delay_ms = config.delay_ms;
         let jitter_ms = config.jitter_ms;
@@ -798,7 +854,9 @@ where
             let _permit = permit;
             let __body = async move {
             if abort_c.load(Ordering::Relaxed) { return; }
-            if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
+            if stop_mode == StopMode::Host && stop_c.load(Ordering::Relaxed) { return; }
+            // Per-user mode: skip a username once its password has been found.
+            if stop_mode == StopMode::User && found_users_c.lock().await.contains(&user) { return; }
 
             // Respect global rate-limit pause
             while paused_c.load(Ordering::Acquire) {
@@ -821,8 +879,16 @@ where
                         }
                         found_c.lock().await.push((display.clone(), user.clone(), pass.clone()));
                         stats_c.record_success();
-                        if stop_on_success {
-                            stop_c.store(true, Ordering::Relaxed);
+                        match stop_mode {
+                            // Stop the whole host on the first valid credential.
+                            StopMode::Host => stop_c.store(true, Ordering::Relaxed),
+                            // Remember this user so other workers skip it, but keep
+                            // testing the remaining usernames.
+                            StopMode::User => {
+                                found_users_c.lock().await.insert(user.clone());
+                            }
+                            // Find-all: keep going.
+                            StopMode::All => {}
                         }
                         break;
                     }
@@ -983,24 +1049,37 @@ where
         })
     });
 
+    // Shared across batches so a host the engine gives up on (medusa-style) is
+    // not re-attempted batch after batch — the give-up propagates the whole run.
+    let abort = Arc::new(AtomicBool::new(false));
+    // Honour the stop mode for the cross-batch early-out: only Host mode stops
+    // streaming after the first success; user/all modes keep streaming.
+    let stop_after_first = resolve_stop_mode(config_ref.stop_on_success) == StopMode::Host;
     let mut batch_idx = 0usize;
     while let Some(pass_batch) = batch_rx.recv().await {
         batch_idx += 1;
         crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", batch_idx, pass_batch.len()).cyan());
         let combos = generate_combos_mode(&usernames, &pass_batch, mode_val);
-        let result = run_bruteforce(config_ref, combos, try_login_ref.clone()).await?;
+        let result = run_bruteforce_with_abort(config_ref, combos, try_login_ref.clone(), abort.clone()).await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
-        if config_ref.stop_on_success && !aggregate.found.is_empty() {
+        if abort.load(Ordering::Relaxed) {
+            crate::mprintln!(
+                "{}",
+                format!("[!] Stopping streamed bruteforce of {} — host gave up (no progress)", config_ref.target).yellow()
+            );
+            break;
+        }
+        if stop_after_first && !aggregate.found.is_empty() {
             return Ok(aggregate);
         }
     }
 
     reader_handle.await.context("batch reader task panicked")??;
 
-    if !extra_combos.is_empty() {
+    if !extra_combos.is_empty() && !abort.load(Ordering::Relaxed) {
         crate::mprintln!("{}", format!("[*] Processing {} extra combos from credential file", extra_combos.len()).cyan());
-        let result = run_bruteforce(config_ref, extra_combos, try_login_ref.clone()).await?;
+        let result = run_bruteforce_with_abort(config_ref, extra_combos, try_login_ref.clone(), abort.clone()).await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
     }
