@@ -101,13 +101,32 @@ where
 
     // Prompt for wordlists. cfg_prompt_* answers are cached across the
     // batch via the prompt cache, so a /16 scan asks once.
-    let username_path = if cfg.password_only {
+    // Wordlists are OPTIONAL when the module ships built-in defaults. A missing
+    // wordlist (e.g. an unattended mass scan with no `setg password_wordlist`)
+    // falls back to defaults-only instead of erroring on every host — which is
+    // what made bruteforce mass-scans look stuck/broken. If the module has no
+    // defaults, a wordlist is still required.
+    let have_defaults = !cfg.defaults.is_empty();
+    let username_path: Option<String> = if cfg.password_only {
         None
     } else {
-        Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?)
+        match cfg_prompt_existing_file("username_wordlist", "Username wordlist").await {
+            Ok(p) => Some(p),
+            Err(e) if have_defaults => {
+                tracing::debug!("{}: no username wordlist ({e}); using built-in defaults only", cfg.service_name);
+                None
+            }
+            Err(e) => return Err(e),
+        }
     };
-    let password_path =
-        cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+    let password_path: Option<String> = match cfg_prompt_existing_file("password_wordlist", "Password wordlist").await {
+        Ok(p) => Some(p),
+        Err(e) if have_defaults => {
+            tracing::debug!("{}: no password wordlist ({e}); using built-in defaults only", cfg.service_name);
+            None
+        }
+        Err(e) => return Err(e),
+    };
     // `cartesian` = full cross-product (every user × every password);
     // `paired` = user[i] with pass[i]. (cred-file mode is not implemented here.)
     let combo_input = cfg_prompt_default(
@@ -133,21 +152,33 @@ where
     // `MAX_FILE_SIZE` cap turns a big rockyou-class list into a hard error.
     // Instead, route them into the streaming brute-force engine, which reads
     // the file in bounded batches. Small files keep the exact eager path.
-    let stream_passwords = file_size(&password_path) > STREAMING_THRESHOLD;
+    let stream_passwords = password_path
+        .as_deref()
+        .map(|p| file_size(p) > STREAMING_THRESHOLD)
+        .unwrap_or(false);
 
     // For the small-file path we load eagerly so we can validate emptiness and
-    // preserve the historical "defaults first" combo ordering.
+    // preserve the historical "defaults first" combo ordering. No password
+    // wordlist (defaults-only mode) yields an empty list — the defaults below
+    // still run.
     let passwords: Vec<String> = if stream_passwords {
         Vec::new()
     } else {
-        load_lines(&password_path)?
+        match password_path.as_deref() {
+            Some(p) => load_lines(p)?,
+            None => Vec::new(),
+        }
     };
 
     if !cfg.password_only && usernames.is_empty() {
         return Err(anyhow!("Username wordlist is empty"));
     }
-    if !stream_passwords && passwords.is_empty() {
-        return Err(anyhow!("Password wordlist is empty"));
+    // An empty password set is only an error when there are no built-in defaults
+    // to fall back on; otherwise defaults-only is a valid run.
+    if !stream_passwords && passwords.is_empty() && !have_defaults {
+        return Err(anyhow!(
+            "Password wordlist is empty and module has no built-in defaults"
+        ));
     }
 
     // Defaults are the highest-yield rows. In the eager path they go first; in
@@ -194,7 +225,7 @@ where
         run_bruteforce_streaming(
             &bf_config,
             usernames,
-            Some(password_path.as_str()),
+            password_path.as_deref(),
             passwords,
             mode,
             defaults,
