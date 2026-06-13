@@ -382,14 +382,20 @@ async fn try_login(
 
     match status {
         201 => {
-            // Success — extract X-Auth-Token from response headers.
-            let token = resp
-                .headers()
-                .get("X-Auth-Token")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "(header-missing)".to_string());
-            LoginResult::Success(token)
+            // A genuine Redfish session-create returns 201 + X-Auth-Token. Without
+            // that header it is NOT a usable session — don't store a credential on
+            // a bare 201 (e.g. from a proxy/load-balancer). Previously a missing
+            // token was stored as the literal "(header-missing)".
+            match resp.headers().get("X-Auth-Token").map(|v| v.to_str()) {
+                Some(Ok(tok)) if !tok.is_empty() => LoginResult::Success(tok.to_string()),
+                Some(Err(e)) => {
+                    tracing::debug!("X-Auth-Token header not UTF-8: {e}");
+                    LoginResult::Error("X-Auth-Token header not readable".to_string())
+                }
+                _ => LoginResult::Error(
+                    "201 Created without X-Auth-Token — not a valid session".to_string(),
+                ),
+            }
         }
         429 => {
             let wait = resp
@@ -401,7 +407,10 @@ async fn try_login(
                 .min(60);
             LoginResult::RateLimited(wait)
         }
-        401 | 403 => LoginResult::Denied,
+        // Definitive negatives from a responding BMC (incl. 400/404/422 for a
+        // malformed/missing-endpoint login) — Denied, not Error, so per-account
+        // lockout tracking stays correct.
+        400 | 401 | 403 | 404 | 422 => LoginResult::Denied,
         _ => LoginResult::Error(format!("unexpected HTTP {}", status)),
     }
 }

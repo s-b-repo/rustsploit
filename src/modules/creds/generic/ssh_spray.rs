@@ -145,24 +145,65 @@ pub struct SprayResult {
 
 /// Try SSH authentication
 fn try_ssh_auth(host: &str, port: u16, username: &str, password: &str, timeout_secs: u64) -> Result<bool> {
-    let addr = format!("{}:{}", host, port);
-    
+    // Resolve hostnames too — `"host:port".parse::<SocketAddr>()` only accepts
+    // IP literals, so a hostname target previously errored out and never sprayed.
+    let socket_addr = resolve_socket_addr(host, port)?;
+
     let tcp = crate::utils::blocking_tcp_connect(
-        &addr.parse()?,
+        &socket_addr,
         Duration::from_secs(timeout_secs),
     )?;
-    
+
     tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs)))?;
-    
+
     let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);
     sess.handshake()?;
-    
+
     match sess.userauth_password(username, password) {
         Ok(_) => Ok(sess.authenticated()),
-        Err(e) => { tracing::debug!("SSH auth failed: {e}"); Ok(false) }
+        Err(e) => {
+            // Only a genuine auth rejection (libssh2 -18/-19) is a clean Ok(false).
+            // Transport/method errors propagate so the caller's retry loop engages
+            // rather than recording a possibly-valid password as "wrong".
+            if is_ssh_auth_rejection(&e) {
+                tracing::debug!("SSH auth rejected: {e}");
+                Ok(false)
+            } else {
+                Err(anyhow!("SSH auth transport error: {e}"))
+            }
+        }
     }
+}
+
+/// Resolve `host:port` to a `SocketAddr`, accepting both IP literals and
+/// hostnames (the latter via DNS).
+fn resolve_socket_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let hostport = format!("{host}:{port}");
+    match hostport.parse::<std::net::SocketAddr>() {
+        Ok(sa) => Ok(sa),
+        Err(parse_err) => {
+            tracing::trace!("{hostport} not an IP literal ({parse_err}); resolving via DNS");
+            let mut addrs = hostport
+                .to_socket_addrs()
+                .with_context(|| format!("resolve {hostport}"))?;
+            addrs
+                .next()
+                .ok_or_else(|| anyhow!("no addresses resolved for {hostport}"))
+        }
+    }
+}
+
+/// True only for a genuine SSH auth rejection — libssh2
+/// LIBSSH2_ERROR_AUTHENTICATION_FAILED (-18) / PUBLICKEY_UNVERIFIED (-19). Every
+/// other code is a transport/negotiation fault to be retried, not a wrong cred.
+fn is_ssh_auth_rejection(e: &ssh2::Error) -> bool {
+    matches!(
+        e.code(),
+        ssh2::ErrorCode::Session(-18) | ssh2::ErrorCode::Session(-19)
+    )
 }
 
 /// Parse targets from string (CIDR, range, single IP)

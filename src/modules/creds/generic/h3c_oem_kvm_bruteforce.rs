@@ -388,17 +388,29 @@ async fn try_login(
         // 401/403/etc. — a definitive authentication rejection.
         return AttemptResult::Denied;
     }
+    // Capture the token from the response HEADER before consuming the body —
+    // Redfish-style BMCs return X-Auth-Token as a header, not (only) in the JSON.
+    let header_token = match resp.headers().get("X-Auth-Token").map(|v| v.to_str()) {
+        Some(Ok(s)) if !s.is_empty() => Some(s.to_string()),
+        Some(Err(e)) => {
+            tracing::debug!("X-Auth-Token header not UTF-8: {e}");
+            None
+        }
+        _ => None,
+    };
     let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
         Ok(b) => b,
         // Body read failed mid-stream: transient, not a denial.
         Err(e) => return AttemptResult::Transient(format!("read body: {e}")),
     };
-    if !body.contains("X-Auth-Token") {
-        return AttemptResult::Denied;
+    // Require an actual token VALUE (header or parsed from the body). The old check
+    // accepted the bare field NAME "X-Auth-Token" appearing anywhere in the body
+    // and fell back to a "(present)" placeholder — both could store a
+    // non-credential lifted from an error page.
+    match header_token.or_else(|| extract_token(&body)) {
+        Some(tok) if !tok.is_empty() => AttemptResult::Hit(tok),
+        _ => AttemptResult::Denied,
     }
-    // Surface the token if we can extract it; otherwise mark hit with a
-    // placeholder so the caller still records the credential.
-    AttemptResult::Hit(extract_token(&body).unwrap_or_else(|| "(present)".into()))
 }
 
 fn extract_token(body: &str) -> Option<String> {

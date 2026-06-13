@@ -1184,9 +1184,17 @@ where
 
     let pass_path_owned = pass_path.to_string();
     let reader_handle = tokio::task::spawn_blocking(move || {
-        crate::utils::load_lines_batched(&pass_path_owned, BATCH_SIZE, |batch| {
-            if let Err(e) = batch_tx.blocking_send(batch) {
-                tracing::debug!("Batch send failed (receiver dropped?): {}", e);
+        // `_until`: stop reading the moment the receiver is gone. With the old
+        // `load_lines_batched` an early return from the loop below (e.g. stop on
+        // first success) dropped the receiver but the reader kept scanning the
+        // whole multi-GB file, firing a failed `blocking_send` per batch.
+        crate::utils::load_lines_batched_until(&pass_path_owned, BATCH_SIZE, |batch| {
+            match batch_tx.blocking_send(batch) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!("Batch send failed (receiver dropped?): {}", e);
+                    false
+                }
             }
         })
     });
