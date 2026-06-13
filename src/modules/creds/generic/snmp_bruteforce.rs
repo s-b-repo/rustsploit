@@ -111,13 +111,66 @@ async fn probe(host: &str, port: u16, community: &str, timeout: Duration) -> Log
             return LoginResult::AuthFailed;
         }
     };
-    // Quick sanity check: response must be a SEQUENCE (0x30) and contain
-    // GetResponse PDU (context-specific tag 0xa2).
-    if n >= 2 && buf[0] == 0x30 && buf[..n].contains(&0xa2) {
+    // A valid community elicits a GetResponse PDU; a wrong one is silently
+    // dropped (→ timeout → AuthFailed above). The old check accepted any packet
+    // whose bytes merely *contained* 0xa2 anywhere (request-id, a length, payload
+    // data) — a false positive. Walk the structure and require the PDU tag to be
+    // GetResponse (0xa2) at its proper position.
+    if snmp_is_get_response(&buf[..n]) {
         LoginResult::Success
     } else {
         LoginResult::AuthFailed
     }
+}
+
+/// Structurally confirm an SNMP datagram is a GetResponse PDU
+/// (`SEQUENCE { version, community, [2] GetResponse {...} }`). Returns false on
+/// any parse failure, so an unparseable or non-GetResponse reply is treated as a
+/// rejection rather than a (false-positive) success.
+fn snmp_is_get_response(buf: &[u8]) -> bool {
+    // Minimal BER TLV reader: returns (tag, value, rest-after-this-tlv).
+    fn tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        if b.len() < 2 {
+            return None;
+        }
+        let tag = b[0];
+        let first = b[1];
+        let (len, hdr) = if first & 0x80 == 0 {
+            (first as usize, 2usize)
+        } else {
+            let num = (first & 0x7f) as usize;
+            if num == 0 || num > 4 || b.len() < 2 + num {
+                return None;
+            }
+            let mut l = 0usize;
+            for byte in &b[2..2 + num] {
+                l = (l << 8) | *byte as usize;
+            }
+            (l, 2 + num)
+        };
+        let end = hdr.checked_add(len)?;
+        if b.len() < end {
+            return None;
+        }
+        Some((tag, &b[hdr..end], &b[end..]))
+    }
+    // Outer SEQUENCE.
+    let seq = match tlv(buf) {
+        Some((0x30, val, _)) => val,
+        _ => return false,
+    };
+    // version INTEGER, then community OCTET STRING — skip their values.
+    let after_version = match tlv(seq) {
+        Some((_, _, rest)) => rest,
+        None => return false,
+    };
+    let after_community = match tlv(after_version) {
+        Some((_, _, rest)) => rest,
+        None => return false,
+    };
+    // PDU: GetResponse is context-specific constructed tag 0xa2. Reject a
+    // GetRequest echo (0xa0), Report (0xa8), Trap, etc.
+    matches!(tlv(after_community), Some((0xa2, _, _)))
 }
 
 /// Minimal hand-rolled SNMPv2c GetRequest builder.

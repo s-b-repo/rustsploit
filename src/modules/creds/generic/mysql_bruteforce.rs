@@ -252,16 +252,24 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
                 if p2.len() >= 3 {
                     let err_code = u16::from_le_bytes([p2[1], p2[2]]);
                     match err_code {
-                        1044 | 1045 => LoginResult::AuthFailed,
+                        // Access/auth denials — definitive negatives.
+                        // 1044 db-access, 1045 access-denied, 1698 auth-plugin
+                        // denied, 1862 password-expired, 1226/1227 resource/priv,
+                        // 1130 host-not-privileged.
+                        1044 | 1045 | 1130 | 1226 | 1227 | 1698 | 1862 => LoginResult::AuthFailed,
                         _ => {
                             let msg = if p2.len() > 9 {
                                 String::from_utf8_lossy(&p2[9..]).to_string()
                             } else {
                                 format!("MySQL error {err_code}")
                             };
+                            // The server sent an ERR packet, so it DID respond —
+                            // not a transient/connection fault. Mark non-retryable
+                            // so an unexpected error code doesn't burn retries and
+                            // trip the consecutive-error lockout on a live server.
                             LoginResult::Error {
                                 message: msg,
-                                retryable: true,
+                                retryable: false,
                             }
                         }
                     }

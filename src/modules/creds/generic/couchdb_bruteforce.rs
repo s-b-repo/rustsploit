@@ -82,9 +82,26 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             }
         }
     };
-    match resp.status().as_u16() {
-        200 => LoginResult::Success,
+    let status = resp.status().as_u16();
+    match status {
+        200 => {
+            // CouchDB POST /_session returns 200 + {"ok":true,...} on a real login.
+            // Require the body to confirm it, so a non-CouchDB service (or an HTML
+            // page) that answers 200 isn't recorded as a valid credential.
+            match resp.text().await {
+                Ok(body) if body.contains("\"ok\":true") => LoginResult::Success,
+                Ok(_) => LoginResult::AuthFailed,
+                Err(e) => LoginResult::Error {
+                    message: format!("body: {e}"),
+                    retryable: e.is_timeout(),
+                },
+            }
+        }
         401 | 403 => LoginResult::AuthFailed,
+        429 | 500..=599 => LoginResult::Error {
+            message: format!("transient status {status}"),
+            retryable: true,
+        },
         other => LoginResult::Error {
             message: format!("unexpected status {other}"),
             retryable: false,

@@ -66,18 +66,44 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         .basic_auth(user, Some(pass))
         .send()
         .await;
-    match resp {
-        Ok(r) => match r.status().as_u16() {
-            200 => LoginResult::Success,
-            401 | 403 => LoginResult::AuthFailed,
-            other => LoginResult::Error {
-                message: format!("unexpected status {other}"),
-                retryable: false,
-            },
+    let status = match resp {
+        Ok(r) => r.status().as_u16(),
+        Err(e) => {
+            return LoginResult::Error {
+                message: format!("get: {e}"),
+                retryable: e.is_timeout() || e.is_connect(),
+            }
+        }
+    };
+    match status {
+        200 => {
+            // An Elasticsearch node with security DISABLED returns 200 to every
+            // request and ignores the credentials, so a credentialed 200 alone is
+            // not proof — without this guard every password is a false positive on
+            // an open node. Confirm an UNauthenticated GET is rejected (401) first.
+            match client.get(&url).send().await {
+                Ok(r) if r.status().as_u16() == 401 => LoginResult::Success,
+                Ok(r) => {
+                    tracing::debug!(
+                        "elasticsearch {host}:{port}: unauthenticated GET returned {} — node not secured, not a credential",
+                        r.status()
+                    );
+                    LoginResult::AuthFailed
+                }
+                Err(e) => LoginResult::Error {
+                    message: format!("baseline get: {e}"),
+                    retryable: e.is_timeout() || e.is_connect(),
+                },
+            }
+        }
+        401 | 403 => LoginResult::AuthFailed,
+        429 | 500..=599 => LoginResult::Error {
+            message: format!("transient status {status}"),
+            retryable: true,
         },
-        Err(e) => LoginResult::Error {
-            message: format!("get: {e}"),
-            retryable: e.is_timeout() || e.is_connect(),
+        other => LoginResult::Error {
+            message: format!("unexpected status {other}"),
+            retryable: false,
         },
     }
 }

@@ -109,10 +109,11 @@ async fn detect(host: &str, port: u16, timeout: Duration) -> LoginResult {
         }
         Err(e) => { tracing::debug!("timeout: {e}"); return LoginResult::AuthFailed }
     };
-    // L2TPv2 control packet: first byte's top bit (T) = 1, length bit = 1.
-    // Type byte after length bytes ≥ AVP "Message Type" with value SCCRP(2)
-    // or StopCCN(4) means reachable.
-    if n >= 12 && (buf[0] & 0xC0) == 0xC0 {
+    // L2TPv2 control packet: byte 0 has T (control) + L (length present) bits set
+    // (0xC0), and byte 1's low nibble is the protocol version (2). Requiring the
+    // version stops an unrelated UDP responder whose first byte merely has the top
+    // bits set from being reported as a live L2TP tunnel.
+    if n >= 12 && (buf[0] & 0xC0) == 0xC0 && (buf[1] & 0x0F) == 2 {
         LoginResult::Success
     } else {
         LoginResult::AuthFailed

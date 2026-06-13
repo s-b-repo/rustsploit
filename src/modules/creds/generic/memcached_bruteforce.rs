@@ -114,11 +114,27 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         };
     }
 
+    // Confirm this is a RESPONSE (magic 0x81) to our SASL-Auth (opcode 0x21)
+    // before trusting the status field — otherwise an unrelated/error frame whose
+    // status bytes happen to be 0x0000 would be read as a successful login.
+    if header[0] != 0x81 || header[1] != 0x21 {
+        return LoginResult::Error {
+            message: format!("unexpected memcached frame magic=0x{:02x} opcode=0x{:02x}", header[0], header[1]),
+            retryable: false,
+        };
+    }
+
     // status @ bytes 6..8.
     let status = u16::from_be_bytes([header[6], header[7]]);
     match status {
         0x0000 => LoginResult::Success,
-        0x0020 | 0x0008 | 0x0021 => LoginResult::AuthFailed, // auth error / not supported / further auth required
+        0x0020 | 0x0021 => LoginResult::AuthFailed, // auth error / further auth step required
+        0x0008 => LoginResult::Error {
+            // 0x0008 is "out of memory" — a transient server condition, not a
+            // credential rejection; retry rather than recording a clean failure.
+            message: "memcached out of memory".to_string(),
+            retryable: true,
+        },
         other => LoginResult::Error {
             message: format!("unexpected status 0x{other:04x}"),
             retryable: false,
