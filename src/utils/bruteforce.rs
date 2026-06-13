@@ -489,6 +489,10 @@ pub enum ComboMode {
 /// `run_bruteforce_streaming` so we don't OOM on a 10⁷×10⁵ wordlist combo.
 const MAX_COMBOS: usize = 10_000_000;
 
+/// Number of 10-consecutive-error lockout pauses tolerated (with no success)
+/// before the engine gives up on a host instead of pausing-and-grinding forever.
+const MAX_LOCKOUT_PAUSES: u64 = 3;
+
 /// Generate credential pairs with full combo mode control.
 /// - Linear: pairs user\[i\] with pass\[i\], cycling the shorter list.
 /// - Combo: full cross product (user × pass).
@@ -727,6 +731,11 @@ where
     let errors: BruteforceErrorList = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
+    // Medusa-style "give up on this host": set when repeated lockout pauses make
+    // no progress. Unlike `stop` (which is gated on stop_on_success), `abort`
+    // always halts the run so a dead/blocking host can't grind the whole wordlist.
+    let abort = Arc::new(AtomicBool::new(false));
+    let lockout_pauses = Arc::new(AtomicU64::new(0));
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
 
     // Progress reporter
@@ -745,6 +754,9 @@ where
     let mut tasks = FuturesUnordered::new();
 
     for (user, pass) in combos {
+        if abort.load(Ordering::Relaxed) {
+            break;
+        }
         if config.stop_on_success && stop.load(Ordering::Relaxed) {
             break;
         }
@@ -766,6 +778,8 @@ where
         let errors_c = errors.clone();
         let stop_c = stop.clone();
         let paused_c = paused.clone();
+        let abort_c = abort.clone();
+        let lockout_pauses_c = lockout_pauses.clone();
         let stats_c = stats.clone();
         let try_login_c = try_login.clone();
         let verbose = config.verbose;
@@ -783,6 +797,7 @@ where
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
             let __body = async move {
+            if abort_c.load(Ordering::Relaxed) { return; }
             if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
 
             // Respect global rate-limit pause
@@ -833,7 +848,29 @@ where
                         }
                         stats_c.record_error(message.clone()).await;
                         if stats_c.is_lockout_likely(10) && !paused_c.swap(true, Ordering::AcqRel) {
-                            crate::meprintln!("\n{}", "[!] WARNING: 10+ consecutive errors — possible rate limiting. Pausing 30s...".red().bold());
+                            let pauses = lockout_pauses_c.fetch_add(1, Ordering::Relaxed) + 1;
+                            // Give up (medusa-style) once repeated pauses make no
+                            // progress: a dead host / wrong protocol / hard block
+                            // shouldn't pause-and-grind the whole wordlist forever.
+                            if pauses >= MAX_LOCKOUT_PAUSES && found_c.lock().await.is_empty() {
+                                crate::meprintln!(
+                                    "\n{}",
+                                    format!(
+                                        "[!] Giving up on {} — {} lockout pauses, no success (host blocking/down?)",
+                                        display, pauses
+                                    ).red().bold()
+                                );
+                                abort_c.store(true, Ordering::Relaxed);
+                                paused_c.store(false, Ordering::Release);
+                                break;
+                            }
+                            crate::meprintln!(
+                                "\n{}",
+                                format!(
+                                    "[!] WARNING: 10+ consecutive errors — possible rate limiting. Pausing 30s... (pause {}/{})",
+                                    pauses, MAX_LOCKOUT_PAUSES
+                                ).red().bold()
+                            );
                             tokio::time::sleep(Duration::from_secs(30)).await;
                             stats_c.consecutive_errors.store(0, Ordering::Relaxed);
                             paused_c.store(false, Ordering::Release);

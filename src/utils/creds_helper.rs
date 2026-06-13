@@ -18,10 +18,15 @@ use colored::*;
 use crate::module::{Finding, FindingKind, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_yes_no, file_size, generate_combos_mode, load_lines, normalize_target,
-    parse_combo_mode, run_bruteforce, run_bruteforce_streaming, BruteforceConfig,
-    LoginResult, STREAMING_THRESHOLD,
+    cfg_prompt_yes_no, file_size, generate_combos_mode, load_credential_file, load_lines,
+    normalize_target, parse_combo_mode, run_bruteforce, run_bruteforce_streaming,
+    BruteforceConfig, LoginResult, STREAMING_THRESHOLD,
 };
+
+/// Per-host bruteforce concurrency cap when running inside a mass-scan fan-out.
+/// The scheduler already parallelises across hosts, so this keeps the total open
+/// socket count (scheduler_hosts x this) well under typical RLIMIT_NOFILE.
+const BATCH_PER_HOST_CONCURRENCY: usize = 4;
 
 /// `read_exact` with a wall-clock timeout, flattened to a single
 /// `io::Result<()>`. Avoids the nested-match `Ok(Ok(_)) / Ok(Err) / Err(_)`
@@ -136,8 +141,15 @@ where
     )
     .await?;
     let mode = parse_combo_mode(&combo_input);
-    let concurrency =
+    let mut concurrency =
         cfg_prompt_int_range("concurrency", "Concurrency", 16, 1, 256).await? as usize;
+    // In a mass-scan fan-out the scheduler already runs many hosts concurrently,
+    // so a high PER-HOST bruteforce concurrency multiplies into the total open
+    // socket count (e.g. 50 hosts x 16 = 800) and can blow past RLIMIT_NOFILE.
+    // Cap per-host concurrency in batch mode; the scheduler supplies the breadth.
+    if crate::utils::is_batch_mode() {
+        concurrency = concurrency.min(BATCH_PER_HOST_CONCURRENCY);
+    }
     let timeout_secs =
         cfg_prompt_int_range("timeout", "Per-attempt timeout (seconds)", 5, 1, 60).await? as u64;
     let stop_on_success =
@@ -215,14 +227,36 @@ where
         }
     }
 
+    // Hydra `-C`: a colon-separated user:pass credential file, if provided via
+    // `setg credential_file`, is loaded and tried alongside the defaults.
+    if let Some(cred_file) = opt_str("credential_file") {
+        match load_credential_file(&cred_file) {
+            Ok(pairs) => {
+                tracing::debug!(
+                    "{}: loaded {} credential pair(s) from {}",
+                    cfg.service_name,
+                    pairs.len(),
+                    cred_file
+                );
+                defaults.extend(pairs);
+            }
+            Err(e) => return Err(anyhow!("credential_file '{}': {}", cred_file, e)),
+        }
+    }
+
+    // Hydra `-w`-style throttle to dodge account lockout: `setg bruteforce_delay_ms`
+    // (fixed delay after each attempt) + `setg bruteforce_jitter_ms` (random extra).
+    let delay_ms = opt_u64("bruteforce_delay_ms");
+    let jitter_ms = opt_u64("bruteforce_jitter_ms");
+
     let bf_config = BruteforceConfig {
         target: host.clone(),
         port,
         concurrency,
         stop_on_success,
         verbose: false,
-        delay_ms: 0,
-        jitter_ms: 0,
+        delay_ms,
+        jitter_ms,
         max_retries: 1,
         service_name: cfg.service_name,
         source_module: cfg.source_module,
@@ -394,5 +428,29 @@ fn cred_extras() -> CredExtras {
         null: raw.contains('n'),
         same: raw.contains('s'),
         reversed: raw.contains('r'),
+    }
+}
+
+/// Read a non-empty global option (`setg <key>`), or `None` if unset/blank.
+fn opt_str(key: &str) -> Option<String> {
+    crate::tenant::resolve()
+        .global_options()
+        .try_get(key)
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Read a `u64` global option (`setg <key>`), defaulting to 0 when unset or
+/// unparseable (the error is surfaced at debug, not silently dropped).
+fn opt_u64(key: &str) -> u64 {
+    let raw = match crate::tenant::resolve().global_options().try_get(key) {
+        Some(v) => v,
+        None => return 0,
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::debug!("{key} is not a valid u64 ('{}'): {e}; using 0", raw.trim());
+            0
+        }
     }
 }

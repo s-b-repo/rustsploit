@@ -1311,6 +1311,9 @@ async fn display_all_options(ctx: &ShellContext) {
         ("username_wordlist",  "Bruteforce username wordlist path", ""),
         ("password_wordlist",  "Bruteforce password wordlist path", ""),
         ("cred_extras",        "Bruteforce extra creds: hydra-style n/s/r (null/same/reversed), e.g. nsr", ""),
+        ("credential_file",    "Bruteforce user:pass combo file (hydra -C)", ""),
+        ("bruteforce_delay_ms","Per-attempt delay to dodge lockout (ms, hydra -w)", ""),
+        ("bruteforce_jitter_ms","Random extra delay added to bruteforce_delay_ms (ms)", ""),
     ];
 
     let mut displayed = std::collections::HashSet::new();
