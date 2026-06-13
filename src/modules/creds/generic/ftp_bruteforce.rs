@@ -314,7 +314,21 @@ async fn try_ftp_login(addr: &str, target: &str, user: &str, pass: &str, verbose
                                 sleep(Duration::from_secs(1)).await;
                                 return Err(anyhow!("Connection limit exceeded (421)"));
                             }
-                            _ => return Err(anyhow!("FTP login error: {}", msg)),
+                            // A connection drop DURING login (after a successful
+                            // handshake) is genuinely transient → retryable Error.
+                            FtpErrorType::ConnectionFailed => {
+                                return Err(anyhow!("FTP connection error during login: {}", msg));
+                            }
+                            // Any other post-handshake login error means the server
+                            // completed the handshake and then rejected the login
+                            // with unusual wording (e.g. 430/532 or a localized
+                            // message). That's a definitive auth result, not a
+                            // transient fault — returning it as a retryable Error
+                            // tripped the consecutive-error lockout on healthy hosts.
+                            FtpErrorType::Unknown => {
+                                tracing::debug!("FTP login rejected ({}): treating as auth failure", msg);
+                                return Ok(false);
+                            }
                         }
                     }
                 }

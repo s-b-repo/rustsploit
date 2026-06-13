@@ -531,6 +531,12 @@ async fn try_http_login(
             Ok(false)
         }
         301 | 302 | 303 | 307 | 308 => {
+            // A redirect only signals success when the endpoint actually enforced
+            // auth (baseline 401). Apps that redirect ALL anonymous users to a
+            // dashboard would otherwise mark every credential valid.
+            if !server_enforces_basic_auth {
+                return Ok(false);
+            }
             // Only count redirect as success if it doesn't point to a login/auth page
             if let Some(location) = response.headers().get("location") {
                 let loc = location.to_str().unwrap_or("").to_lowercase();
@@ -543,6 +549,11 @@ async fn try_http_login(
                 Err(anyhow!("HTTP {} redirect with no Location header", status))
             }
         }
+        // Definitive non-auth negatives from a responding server: treat as a clean
+        // failure (resets the consecutive-error counter) instead of a retryable
+        // Error that burns retries and trips the lockout give-up. 429/5xx fall
+        // through to the Err path below, where classify_error marks them retryable.
+        400 | 404 | 405 | 406 | 410 | 422 => Ok(false),
         _ => Err(anyhow!("HTTP {}", status)),
     }
 }

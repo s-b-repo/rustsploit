@@ -122,13 +122,27 @@ async fn try_http_connect_auth(
     };
 
     let resp = String::from_utf8_lossy(&buf[..n]);
-    if resp.contains("200") {
-        LoginResult::Success
-    } else if resp.contains("407") || resp.contains("401") || resp.contains("403") {
-        LoginResult::AuthFailed
-    } else {
-        LoginResult::Error { message: format!("Unexpected: {}", resp.lines().next().unwrap_or("")), retryable: false }
+    // Parse the HTTP status line. Matching the bare string "200" anywhere in the
+    // response (e.g. `Content-Length: 200`, a Date, or a Via header) produced
+    // false-positive "valid proxy" results — only the status code counts.
+    match http_status_code(&resp) {
+        Some(c) if (200..=299).contains(&c) => LoginResult::Success,
+        Some(407) | Some(401) | Some(403) => LoginResult::AuthFailed,
+        Some(c) => LoginResult::Error { message: format!("HTTP {c}"), retryable: false },
+        None => LoginResult::Error { message: format!("non-HTTP response: {}", resp.lines().next().unwrap_or("")), retryable: false },
     }
+}
+
+/// Extract the numeric status code from an HTTP response's status line
+/// (`HTTP/1.1 200 ...`). Returns None when the first line isn't an HTTP status
+/// line, so a "200" appearing elsewhere in the response can't be mistaken for a
+/// 200 OK.
+fn http_status_code(resp: &str) -> Option<u16> {
+    let first = resp.lines().next()?;
+    if !first.starts_with("HTTP/") {
+        return None;
+    }
+    first.split_whitespace().nth(1).and_then(|tok| tok.parse::<u16>().ok())
 }
 
 /// Try SOCKS5 proxy with username/password auth (RFC 1929).
@@ -200,7 +214,10 @@ async fn try_socks5_auth(
         _ => return LoginResult::Error { message: "Auth response timeout".to_string(), retryable: true },
     }
 
-    if resp[1] == 0x00 {
+    // RFC 1929: reply is [version=0x01, status]; status 0x00 == success. Require
+    // the auth-subnegotiation version byte so a server echoing garbage like
+    // [0x05,0x00] can't be read as a successful auth.
+    if resp[0] == 0x01 && resp[1] == 0x00 {
         LoginResult::Success
     } else {
         LoginResult::AuthFailed
@@ -244,9 +261,13 @@ async fn try_http_forward_auth(
     };
 
     let resp = String::from_utf8_lossy(&buf[..n]);
-    if resp.contains("200") && resp.contains("origin") {
+    // Status code from the status line, not a substring scan (a `200` in a header
+    // value would false-positive). httpbin echoes the client IP in an "origin"
+    // field, so a genuine forward succeeds with 2xx + that marker.
+    let code = http_status_code(&resp);
+    if matches!(code, Some(c) if (200..=299).contains(&c)) && resp.contains("origin") {
         LoginResult::Success
-    } else if resp.contains("407") || resp.contains("401") || resp.contains("403") {
+    } else if matches!(code, Some(407) | Some(401) | Some(403)) {
         LoginResult::AuthFailed
     } else {
         LoginResult::Error { message: format!("HTTP {}", resp.lines().next().unwrap_or("")), retryable: false }

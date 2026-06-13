@@ -86,7 +86,11 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     params.extend_from_slice(user.as_bytes());
     params.push(0);
     params.extend_from_slice(b"database\0");
-    params.extend_from_slice(user.as_bytes()); // db = user (PG default)
+    // Connect to the conventional "postgres" maintenance DB, NOT a DB named after
+    // the user. `database=user` made a valid superuser whose own DB doesn't exist
+    // fail startup with ErrorResponse 3D000 (database does not exist), which we
+    // read as a login failure — a false negative on otherwise-correct credentials.
+    params.extend_from_slice(b"postgres");
     params.push(0);
     params.push(0); // trailing null
 

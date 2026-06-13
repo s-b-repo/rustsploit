@@ -49,9 +49,22 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .send()
         .await
         .context("Failed to send login request")?;
+    let authed_ok = resp.status().is_success();
+
+    // A bare 2xx on /login is usually just the login page rendering — it does NOT
+    // prove the credentials worked. Confirm an UNauthenticated request is rejected
+    // before reporting admin:admin as valid, so this template doesn't flood loot
+    // with false positives on any host that serves a /login page. (This baseline
+    // pattern is the correct way to verify a credential — copy it, not a bare 2xx.)
+    let baseline = client
+        .post(&url)
+        .send()
+        .await
+        .context("Failed to send baseline request")?;
+    let creds_valid = authed_ok && !baseline.status().is_success();
 
     let mut outcome = ModuleOutcome::ok();
-    if resp.status().is_success() {
+    if creds_valid {
         crate::mprintln!("{}", "[+] Default credentials admin:admin are valid!".green().bold());
         // Persist discovered credential to the framework's credential store.
         // The scheduler also routes the Finding below into LootStore.
