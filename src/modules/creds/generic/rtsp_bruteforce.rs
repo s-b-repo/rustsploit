@@ -116,19 +116,32 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             retryable: true,
         };
     }
-    let line: &str = std::str::from_utf8(&buf[..n.min(64)]).unwrap_or("");
-    if line.starts_with("RTSP/1.0 200") || line.starts_with("RTSP/2.0 200") {
-        LoginResult::Success
-    } else if line.starts_with("RTSP/1.0 401")
-        || line.starts_with("RTSP/2.0 401")
-        || line.starts_with("RTSP/1.0 403")
-    {
-        LoginResult::AuthFailed
-    } else {
-        LoginResult::Error {
-            message: format!("unexpected status line: {}", line.trim()),
-            retryable: false,
+    // Parse the RTSP status line. A well-formed `RTSP/x.x <code>` response means
+    // the server ANSWERED: 200 is a hit; any other code (401/403 auth reject, 404
+    // wrong path, 3xx/5xx, …) is a definitive negative for THIS credential — not a
+    // connection error. Classifying these as AuthFailed (not Error) keeps them out
+    // of the retry path and the consecutive-error lockout/give-up heuristics, so a
+    // live-but-rejecting host isn't mistaken for a dead/erroring one. Only a reply
+    // that isn't an RTSP status line at all (wrong service, garbage) is an error.
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let status_line = text.split("\r\n").next().unwrap_or("").trim();
+    let code = status_line
+        .strip_prefix("RTSP/1.0 ")
+        .or_else(|| status_line.strip_prefix("RTSP/2.0 "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|c| c.parse::<u16>().ok());
+    match code {
+        Some(200) => LoginResult::Success,
+        Some(other) => {
+            // 404 for every credential usually means `setg rtsp_path` is wrong, not
+            // that the creds are — surfaced at debug so -v shows it without spamming.
+            tracing::debug!("rtsp {addr}: status {other} ({status_line})");
+            LoginResult::AuthFailed
         }
+        None => LoginResult::Error {
+            message: format!("non-RTSP response: {status_line}"),
+            retryable: false,
+        },
     }
 }
 
