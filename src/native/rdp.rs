@@ -220,11 +220,11 @@ fn build_x224_cr(cookie: &str, protocols: u32) -> Result<Vec<u8>> {
     let mut pdu = Vec::with_capacity(tpkt_len);
     // TPKT header
     let tpkt_u16 = u16::try_from(tpkt_len)
-        .map_err(|_| anyhow!("X.224 connection request too large ({} bytes); max cookie length ~500 bytes", tpkt_len))?;
+        .map_err(|e| anyhow!("X.224 connection request too large ({} bytes); max cookie length ~500 bytes: {e}", tpkt_len))?;
     pdu.extend_from_slice(&[TPKT_VERSION, 0, (tpkt_u16 >> 8) as u8, tpkt_u16 as u8]);
     // X.224 CR
     let x224_len_u8 = u8::try_from(x224_payload_len)
-        .map_err(|_| anyhow!("X.224 payload length too large ({} bytes); max cookie length ~500 bytes", x224_payload_len))?;
+        .map_err(|e| anyhow!("X.224 payload length too large ({} bytes); max cookie length ~500 bytes: {e}", x224_payload_len))?;
     pdu.push(x224_len_u8); // length indicator
     pdu.push(X224_TYPE_CR);
     pdu.extend_from_slice(&[0, 0, 0, 0, 0]); // dst-ref(2) + src-ref(2) + class(1)

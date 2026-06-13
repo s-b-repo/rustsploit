@@ -29,7 +29,7 @@ All commands are **case-insensitive** and support aliases:
 | `check` | `ch` | Non-destructive vulnerability check |
 | `setg <key> <val>` | `sg` | Set a global option (persists across modules) |
 | `unsetg <key>` | `ug` | Remove a global option |
-| `show options` | `so` | Display all global options |
+| `show options` | `so` | Display all global options (now includes `scan_order`, `exclusions`, `target_rps`, `module_rps`) |
 | `creds` | | List stored credentials |
 | `creds add` | | Add a credential interactively |
 | `creds search <q>` | | Search credentials by host/service/user |
@@ -200,6 +200,7 @@ The shell accepts Metasploit-style option names and maps them to Rustsploit keys
 | `prescan` | `set prescan auto` | Pre-scan tool for CIDR (auto/masscan/zmap/none) |
 | `prescan_rate` | `set prescan_rate 1000` | Pre-scan packets per second |
 | `scan_order` | `set scan_order sequential` | Mass-scan order for `0.0.0.0/0`/`random`: `random` (default) or `sequential` |
+| `exclusions` | `set exclusions 10.0.0.0/8,@/path/file` | CIDRs/ranges to skip in mass scans (`""`=defaults, `none`/`internal`=no filtering) |
 | `target_mac` | `setg target_mac AA:BB:CC:DD:EE:FF` | wpair: target a single Fast Pair device |
 | `adapter` | `setg adapter 1` | wpair: BLE adapter index |
 | `scan_secs` | `setg scan_secs 20` | wpair: BLE scan window (3–300 s) |
@@ -258,6 +259,16 @@ Rustsploit tracks engagement data across sessions:
 - **Workspaces** (`workspace`): Isolate data per engagement
 
 Export all data with `export json report.json`, `export csv report.csv`, or `export summary report.txt`.
+
+### Per-run output auto-save
+
+Every shell / CLI module run also auto-appends its full console output (stdout + stderr) to a per-run file under the loot directory:
+
+```text
+~/.rustsploit/loot/<module> <YYYY-MM-DD_HH-MM-SS> results.txt
+```
+
+Files are opened in **append** mode, so a multi-host mass scan accumulates into one run file instead of racing to overwrite it. This is automatic and independent of `spool` (which logs the whole session) and of any module's own `save_results` option. API / MCP runs are not duplicated to disk — their output is returned to the caller.
 
 ---
 

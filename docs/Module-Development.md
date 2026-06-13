@@ -56,8 +56,8 @@ rustsploit/
 │   ├── jobs.rs               # Background job management
 │   ├── mcp/
 │   │   ├── mod.rs            # MCP server entry point (--mcp flag)
-│   │   ├── server.rs         # JSON-RPC stdio transport with binary-safe reads
-│   │   └── tools.rs          # 38 MCP tool implementations
+│   │   ├── server.rs         # rmcp ServerHandler adapter (official MCP SDK owns transport)
+│   │   └── tools.rs          # 29 MCP tool implementations
 │   ├── commands/
 │   │   └── mod.rs            # Single dispatcher: module::find → scheduler::run
 │   ├── module.rs             # Module trait, ModuleCtx, register_native_module! macro
@@ -207,13 +207,22 @@ The `info` shell command and `GET /api/module/{category}/{name}` endpoint displa
 
 **Rank values:** `Excellent` (reliable, no crash risk), `Great`, `Good` (default), `Normal`, `Low`, `Manual`.
 
-### Vulnerability Check (`check`)
+### Vulnerability Check (`check`) — historical
+
+> **Rustsploit is exploitation-only.** The dedicated `check()` / `CheckResult`
+> non-destructive-verification subsystem was removed; modules run an exploit and
+> report findings, and you should **not** reintroduce a check phase. The
+> `check`-related material in this and the next few sections is retained for
+> readers maintaining older modules — author new work against `run(&ModuleCtx)`
+> and emit `Finding`s. The `register_native_module!` `has_check` arm and the
+> `check` shell command / `POST /api/check` endpoint are vestigial and may be
+> retired.
 
 ```rust
 use crate::module_info::CheckResult;
 
 pub async fn check(target: &str) -> CheckResult {
-    // Non-destructive verification — do NOT exploit
+    // (historical) — do NOT add a check phase to new modules
     match test_vulnerability(target).await {
         Ok(true) => CheckResult::Vulnerable("Version 1.2.3 is affected".to_string()),
         Ok(false) => CheckResult::NotVulnerable("Patched version detected".to_string()),
@@ -221,8 +230,6 @@ pub async fn check(target: &str) -> CheckResult {
     }
 }
 ```
-
-The `check` shell command and `POST /api/check` endpoint run this without exploitation.
 
 ### Auto-Store Credentials and Loot
 
@@ -674,7 +681,20 @@ if crate::utils::is_batch_mode() {
 
 ## Wordlists & Resources
 
-Store under `lists/` and document them in `lists/readme.md`. Reference paths relative to the working directory.
+Store bundled lists under `lists/` and document them in `lists/readme.md`. Reference paths relative to the working directory.
+
+For canonical lists, prefer the checksum-pinned resolver `crate::utils::wordlist::resolve(name)` over shipping a copy: it downloads + SHA-256-verifies into `~/.rustsploit/wordlists/` on first use and reuses the cache after. As of the 2026-06-13 release the catalog is seeded with 6 curated SecLists entries (`passwords-top-1k`, `passwords-top-10k`, `usernames-short`, `web-common`, `web-raft-small-dirs`, `subdomains-top5k`); `wordlist::catalogue()` lists every name this build knows. See [`Utilities-Helpers.md`](Utilities-Helpers.md).
+
+## Service / TLS Fingerprinting Helpers
+
+Two shared fingerprinting surfaces are available to scanner modules (added 2026-06-13):
+
+- **`crate::utils::recog`** — a Rapid7-Recog-style banner matcher. Feed it a banner (SSH/FTP/SMTP/MySQL/HTTP `Server:` header) and it returns structured fields (`service.product` / `.version` / `.vendor`, `os.product`, `service.cpe23`). `scanners/service_scanner` already uses it to enrich detected versions with a product/version + CPE; new banner-reading scanners should reuse it rather than hand-rolling regex.
+- **`crate::utils::tls_fingerprint`** — JARM (canonical 62-char hash), JA3, and JA3S over a raw `TcpStream`. The reference consumer is `scanners/jarm_scan`. Parsing is fully bounds-checked and degrades to the all-zero JARM hash on a down host / TLS alert / truncated response.
+
+## Per-Run Output Auto-Save
+
+Console / CLI module runs auto-append all of their output (stdout + stderr, captured through the `mprintln!` / `meprintln!` routing) to `~/.rustsploit/loot/<module> <YYYY-MM-DD_HH-MM-SS> results.txt` via `src/results_sink.rs` (append mode, begun/ended per run in `commands::run_module`). You do not need to add your own "save results to file" logic for this — append mode also means a multi-host mass scan accumulates into one run file instead of racing to overwrite. API / MCP runs return their output to the caller via `OUTPUT_BUFFER` and are not duplicated to disk.
 
 ---
 
@@ -742,7 +762,9 @@ Active workstreams (snapshot — see `docs/Legacy.md` for the running ledger):
   pattern when the failure really is recoverable.
 - **Wordlist consolidation.** Module-level `WORDLIST.lines()` / `include_str!` blocks
   are being moved into `crate::utils::wordlist` so every brute-forcer reads through
-  the same loader (with caching, size caps, and the `--strict-wordlist` toggle).
+  the same loader (with caching, size caps, and the `--strict-wordlist` toggle). The
+  checksum-pinned catalog is now seeded with 6 SecLists entries (2026-06-13) — new
+  brute-forcers should `wordlist::resolve(name)` a catalog list rather than embed one.
 - **Helper consolidation.** TLS helpers in `src/native/async_tls.rs`,
   `read_async_capped` / `DEFAULT_BODY_CAP` in `src/utils/network.rs`, and the
   `cancellation_token()` accessor in `src/context.rs` are the canonical entry

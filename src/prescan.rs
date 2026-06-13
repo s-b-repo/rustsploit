@@ -271,7 +271,10 @@ async fn run_capture_lines(
 
     match tokio::time::timeout(wall_timeout, read_loop).await {
         Ok(res) => res?,
-        Err(_) => timed_out = true,
+        Err(elapsed) => {
+            tracing::trace!("prescan read loop hit wall_timeout: {elapsed}");
+            timed_out = true;
+        }
     }
 
     // On the timeout *or* output-cap truncation path the child is still

@@ -60,8 +60,9 @@ impl Bucket {
             return;
         }
         // forget() the permit so it's only refilled by the ticker.
-        if let Ok(p) = self.sem.clone().acquire_owned().await {
-            p.forget();
+        match self.sem.clone().acquire_owned().await {
+            Ok(p) => p.forget(),
+            Err(e) => tracing::debug!("rate limiter semaphore closed during acquire: {e}"),
         }
     }
 }

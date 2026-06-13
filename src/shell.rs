@@ -67,6 +67,15 @@ impl Completer for RsfCompleter {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // rustyline's cursor `pos` is a raw byte offset. Clamp it to the line
+        // length and snap it back to a UTF-8 char boundary before slicing — a
+        // cursor landing mid-multibyte-codepoint would otherwise panic here and
+        // crash the entire interactive shell. Byte 0 is always a boundary, so
+        // this terminates.
+        let mut pos = pos.min(line.len());
+        while pos > 0 && !line.is_char_boundary(pos) {
+            pos -= 1;
+        }
         let line_up_to_cursor = &line[..pos];
 
         // After "use " or "u ", complete module paths

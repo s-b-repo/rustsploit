@@ -339,6 +339,57 @@ fourth was investigated and intentionally deferred with a precise finding.
 
 
 ================================================================================
+ 6d. FRAMEWORK HARDENING (error-safety, retry-then-continue, wiring)
+================================================================================
+A two-agent audit of the framework (non-module) .rs files (it found the core
+"unusually disciplined" already) plus fixes for every genuine issue surfaced:
+
+  Panic / crash paths:
+  * src/shell.rs — the rustyline completer sliced the input line at a raw byte
+    offset; a cursor landing mid-UTF-8 codepoint crashed the whole shell. Now
+    snaps to a char boundary first.
+  * src/scheduler.rs — three `unreachable!(...)` in the fan-out dispatch are now
+    `anyhow::bail!(...)` (internal-error surfaced, never a panic).
+
+  Retry-then-continue (transient errors retry, then the scan continues):
+  * New `run_host_with_retry` in scheduler.rs wraps every per-host module
+    dispatch across all four mass-scan fan-outs (CIDR / file / random /
+    sequential): a transient failure (timeout, connection reset/aborted, broken
+    pipe, unexpected EOF) is retried once with a short backoff; a terminal error
+    (closed port, "not affected") returns immediately. A single host never
+    aborts the loop.
+  * The "first 10 dispatches errored -> abort the whole sweep" heuristic in the
+    random + sequential sweeps is softened to a one-time warning that KEEPS
+    GOING (Ctrl+C still stops it) — error -> retry -> continue, not auto-abort.
+  * Confirmed already-correct (left as-is): throttle back-off, tcp_connect
+    address-iteration, bruteforce per-host error tolerance, job catch_unwind.
+
+  Wiring / protocol bugs:
+  * src/ws.rs — an oversize WS frame was `continue`-skipped, but the PQ AEAD
+    ratchet's nonce embeds the receive counter and only advances on a successful
+    decrypt, so a skipped frame permanently desynced (bricked) the connection.
+    Now closes cleanly instead (axum's max_frame_size already caps upstream).
+  * src/mcp/tools.rs — background jobs spawn under the tenant job-manager but
+    list/kill read the process-global one, so tenant jobs were invisible and
+    unkillable. list/kill now use the tenant job-manager too.
+  * src/mcp/tools.rs — an out-of-range `port` argument was silently dropped (and
+    the module fell back to its default); now rejected with a clear error.
+  * src/ws.rs — a non-string option value was coerced to "" and stored; now
+    rejected with a clear error.
+
+  No silent error-swallowing:
+  * Swept the framework (non-module) files for the banned swallow patterns
+    (`Err(_)`, `if let Ok(...)` with no else, bare `.ok();`, `let _ = <result>`,
+    `.map_err(|_| ...)`) and bound + surfaced every one via `tracing`
+    (debug for benign fallbacks, warn for lost data/replies) — semantics
+    unchanged, errors no longer dropped. Legitimate poison-recovery and
+    deliberate Result->Option conversions were left intact.
+
+  Verified: clean build (0 warnings), 40/40 targeted tests green, bad-patterns
+  audit clean on the changed files.
+
+
+================================================================================
  7. LICENSES (PORTED COMPONENTS)
 ================================================================================
   Recog (Rapid7)               BSD-2-Clause

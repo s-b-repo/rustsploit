@@ -758,7 +758,12 @@ pub fn process_handshake(
             .clone()
             .into_boxed_slice()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Classic McEliece public key failed fixed-size conversion"))?;
+            .map_err(|e: Box<[u8]>| {
+                anyhow::anyhow!(
+                    "Classic McEliece public key failed fixed-size conversion: got {} bytes",
+                    e.len()
+                )
+            })?;
         let pk = McePublicKey::from(pk_boxed);
         // The crate is pinned to rand 0.8; supply its OsRng (CSPRNG, OS-seeded).
         let (mce_ct, mce_ss) = encapsulate_boxed(&pk, &mut rand08::rngs::OsRng);

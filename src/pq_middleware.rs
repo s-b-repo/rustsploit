@@ -443,8 +443,9 @@ pub async fn pq_middleware(
     // Restore the original semantic HTTP method so the inner router matches
     // GET/PUT/DELETE handlers — the wire request was always POST so without
     // this restore, only POST routes would dispatch.
-    if let Ok(restored) = semantic_method.parse::<axum::http::Method>() {
-        parts.method = restored;
+    match semantic_method.parse::<axum::http::Method>() {
+        Ok(restored) => parts.method = restored,
+        Err(e) => tracing::debug!("X-PQ-Method {:?} is not a valid HTTP method, keeping wire method: {e}", semantic_method),
     }
 
     let mut new_req = Request::from_parts(parts, Body::from(inner_body));

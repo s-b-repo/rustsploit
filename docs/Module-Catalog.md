@@ -1,6 +1,8 @@
 # Module Catalog
 
 > Auto-generated from the inventory registry by `rustsploit --gen-module-catalog`. Do not edit by hand.
+>
+> **Stale snapshot.** This file last reflects 363 modules; the current build has **389** (the 2026-06-13 release added `scanners/jarm_scan` and others). Re-run `rustsploit --gen-module-catalog > docs/Module-Catalog.md` to regenerate the live list.
 
 **Total registered modules: 363**
 
