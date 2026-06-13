@@ -184,11 +184,36 @@ where
     // Defaults are the highest-yield rows. In the eager path they go first; in
     // the streaming path they're passed as `extra_combos` (the engine runs them
     // after the streamed batches).
-    let defaults: Vec<(String, String)> = cfg
+    let mut defaults: Vec<(String, String)> = cfg
         .defaults
         .iter()
         .map(|(u, p)| (u.to_string(), p.to_string()))
         .collect();
+
+    // Hydra-style `-e nsr`: for each username also try an empty password (null),
+    // the username as its own password (same), and the reversed username. Opt in
+    // via `setg cred_extras <subset of n/s/r>` (e.g. "nsr"); default off. Appended
+    // to the high-yield "defaults first" rows so they run before the wordlist.
+    // Skipped for password-only services (no username to derive from).
+    if !cfg.password_only {
+        let extras = cred_extras();
+        if extras.any() {
+            for u in &usernames {
+                if u.is_empty() {
+                    continue;
+                }
+                if extras.null {
+                    defaults.push((u.clone(), String::new()));
+                }
+                if extras.same {
+                    defaults.push((u.clone(), u.clone()));
+                }
+                if extras.reversed {
+                    defaults.push((u.clone(), u.chars().rev().collect::<String>()));
+                }
+            }
+        }
+    }
 
     let bf_config = BruteforceConfig {
         target: host.clone(),
@@ -338,4 +363,36 @@ async fn is_port_open(host: &str, port: u16) -> bool {
         }
     };
     crate::utils::tcp_port_open(ip, port, Duration::from_secs(2)).await
+}
+
+/// Hydra-style `-e` extra-credential flags: null password, password == login
+/// (same), and reversed login.
+struct CredExtras {
+    null: bool,
+    same: bool,
+    reversed: bool,
+}
+
+impl CredExtras {
+    fn any(&self) -> bool {
+        self.null || self.same || self.reversed
+    }
+}
+
+/// Parse `setg cred_extras` (a hydra-style subset of `n`/`s`/`r`, e.g. "nsr").
+/// Empty / "none" / "off" / "no" disables it (the default when unset).
+fn cred_extras() -> CredExtras {
+    let none = CredExtras { null: false, same: false, reversed: false };
+    let raw = match crate::tenant::resolve().global_options().try_get("cred_extras") {
+        Some(s) => s.to_lowercase(),
+        None => return none,
+    };
+    if matches!(raw.trim(), "" | "none" | "off" | "no" | "0") {
+        return none;
+    }
+    CredExtras {
+        null: raw.contains('n'),
+        same: raw.contains('s'),
+        reversed: raw.contains('r'),
+    }
 }
