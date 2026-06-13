@@ -254,7 +254,14 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
     rl.set_helper(Some(RsfCompleter::new()));
     let hist = history_path();
     if let Err(e) = rl.load_history(&hist) {
-        eprintln!("[!] Failed to load history: {}", e);
+        // A missing history file is normal on first run (or after a clean
+        // ~/.rustsploit) — don't alarm the operator. Only surface real failures
+        // (permissions, corruption) loudly.
+        if matches!(&e, rustyline::error::ReadlineError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
+            tracing::debug!("no command history yet at {}", hist.display());
+        } else {
+            eprintln!("[!] Failed to load history: {}", e);
+        }
     }
 
     // Auto-load startup.rc if it exists
