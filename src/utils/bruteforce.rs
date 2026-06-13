@@ -630,6 +630,148 @@ pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
     Ok(combos)
 }
 
+/// Generate brute-force candidate passwords from a hydra `-x`-style mask spec
+/// `MIN:MAX:CHARSET`. CHARSET placeholders mirror hydra: `a` → a-z, `A` → A-Z,
+/// `1` → 0-9; any other character is taken literally (and added to the set).
+/// Every string of length `MIN..=MAX` over the (deduplicated) charset is
+/// enumerated with an odometer counter. Output is hard-capped at `MAX_COMBOS`
+/// with a warning so a wide mask can't OOM the process.
+///
+/// Examples: `1:4:a1` = 1–4 chars of [a-z0-9]; `6:8:A1!@#` = 6–8 chars of
+/// [A-Z0-9] plus the literals `!`, `@`, `#`.
+pub fn generate_mask_passwords(spec: &str) -> Result<Vec<String>> {
+    let mut it = spec.splitn(3, ':');
+    let (min_s, max_s, charset_s) = match (it.next(), it.next(), it.next()) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => anyhow::bail!("bruteforce_mask must be MIN:MAX:CHARSET (e.g. 1:4:a1); got '{spec}'"),
+    };
+    let min: usize = min_s
+        .trim()
+        .parse()
+        .with_context(|| format!("mask MIN '{min_s}' is not a number"))?;
+    let max: usize = max_s
+        .trim()
+        .parse()
+        .with_context(|| format!("mask MAX '{max_s}' is not a number"))?;
+    if min == 0 || max == 0 {
+        anyhow::bail!("mask MIN/MAX must be >= 1 (got {min}:{max})");
+    }
+    if min > max {
+        anyhow::bail!("mask MIN ({min}) is greater than MAX ({max})");
+    }
+    if max > 32 {
+        anyhow::bail!("mask MAX ({max}) too large (>32) — refusing to enumerate");
+    }
+
+    // Expand the charset placeholders into concrete characters, deduplicating
+    // while preserving the operator's ordering.
+    let mut charset: Vec<char> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for c in charset_s.chars() {
+        match c {
+            'a' => {
+                for ch in b'a'..=b'z' {
+                    let ch = ch as char;
+                    if seen.insert(ch) {
+                        charset.push(ch);
+                    }
+                }
+            }
+            'A' => {
+                for ch in b'A'..=b'Z' {
+                    let ch = ch as char;
+                    if seen.insert(ch) {
+                        charset.push(ch);
+                    }
+                }
+            }
+            '1' => {
+                for ch in b'0'..=b'9' {
+                    let ch = ch as char;
+                    if seen.insert(ch) {
+                        charset.push(ch);
+                    }
+                }
+            }
+            other => {
+                if seen.insert(other) {
+                    charset.push(other);
+                }
+            }
+        }
+    }
+    if charset.is_empty() {
+        anyhow::bail!("mask CHARSET '{charset_s}' expanded to nothing");
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut capped = false;
+    'lengths: for len in min..=max {
+        // Odometer over `len` positions, each indexing into `charset`. Start at
+        // all-zero and increment the least-significant position with carry.
+        let mut idx = vec![0usize; len];
+        loop {
+            if out.len() >= MAX_COMBOS {
+                capped = true;
+                break 'lengths;
+            }
+            out.push(idx.iter().map(|&i| charset[i]).collect());
+            // Increment the odometer; `carry` stays true while a position wraps.
+            let mut carry = true;
+            let mut pos = len;
+            while carry && pos > 0 {
+                pos -= 1;
+                idx[pos] += 1;
+                if idx[pos] == charset.len() {
+                    idx[pos] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+            // A carry that survives past position 0 means this length is done.
+            if carry {
+                break;
+            }
+        }
+    }
+    if capped {
+        crate::meprintln!(
+            "{}",
+            format!(
+                "[!] Mask cap reached: truncated to {} candidates. Narrow the charset or length range.",
+                MAX_COMBOS
+            )
+            .yellow()
+        );
+    }
+    Ok(out)
+}
+
+/// Whether streaming-bruteforce batch resume is enabled (`setg bruteforce_resume y`).
+fn bruteforce_resume_enabled() -> bool {
+    match crate::tenant::resolve().global_options().try_get("bruteforce_resume") {
+        Some(v) => matches!(
+            v.trim().to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Stable per-run resume key: changing the target, port, wordlist file, its
+/// size, or the combo mode starts a fresh run rather than resuming a stale one.
+fn bruteforce_resume_key(target: &str, port: u16, pass_path: &str, mode: ComboMode) -> String {
+    let size = crate::utils::file_size(pass_path);
+    let fname = match std::path::Path::new(pass_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+    {
+        Some(f) => f,
+        None => pass_path,
+    };
+    format!("bf_{target}_{port}_{fname}_{size}_{mode:?}")
+}
+
 /// Parse combo mode from user input string.
 ///
 /// Accepts both vocabularies in use across the codebase: the standalone
@@ -1055,9 +1197,44 @@ where
     // Honour the stop mode for the cross-batch early-out: only Host mode stops
     // streaming after the first success; user/all modes keep streaming.
     let stop_after_first = resolve_stop_mode(config_ref.stop_on_success) == StopMode::Host;
+
+    // Optional batch-level resume (`setg bruteforce_resume y`): skip the batches
+    // a prior interrupted run already completed. The reader still streams every
+    // batch in order (the file is read sequentially); we just don't re-attempt
+    // batches at or below the recorded high-water index.
+    let resume_key = if bruteforce_resume_enabled() {
+        Some(bruteforce_resume_key(
+            config_ref.target.as_str(),
+            config_ref.port,
+            pass_path,
+            mode_val,
+        ))
+    } else {
+        None
+    };
+    let resume_from = match &resume_key {
+        Some(k) => crate::checkpoint::read_bruteforce_marker(k),
+        None => 0,
+    };
+    if resume_from > 0 {
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Resuming streamed bruteforce of {} from batch {} (setg bruteforce_resume)",
+                config_ref.target,
+                resume_from + 1
+            )
+            .cyan()
+        );
+    }
+
     let mut batch_idx = 0usize;
     while let Some(pass_batch) = batch_rx.recv().await {
         batch_idx += 1;
+        if batch_idx <= resume_from {
+            // Already attempted in a prior run — skip without re-trying.
+            continue;
+        }
         crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", batch_idx, pass_batch.len()).cyan());
         let combos = generate_combos_mode(&usernames, &pass_batch, mode_val);
         let result = run_bruteforce_with_abort(config_ref, combos, try_login_ref.clone(), abort.clone()).await?;
@@ -1070,7 +1247,15 @@ where
             );
             break;
         }
+        // Batch fully attempted — record it so an interrupted run resumes here.
+        if let Some(k) = &resume_key {
+            crate::checkpoint::write_bruteforce_marker(k, batch_idx);
+        }
         if stop_after_first && !aggregate.found.is_empty() {
+            // Host is done — drop the marker so a later run starts fresh.
+            if let Some(k) = &resume_key {
+                crate::checkpoint::clear_bruteforce_marker(k);
+            }
             return Ok(aggregate);
         }
     }
@@ -1082,6 +1267,14 @@ where
         let result = run_bruteforce_with_abort(config_ref, extra_combos, try_login_ref.clone(), abort.clone()).await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
+    }
+
+    // Clean completion (not aborted): the wordlist is exhausted, so drop the
+    // resume marker — a fresh run should start from the top.
+    if !abort.load(Ordering::Relaxed)
+        && let Some(k) = &resume_key
+    {
+        crate::checkpoint::clear_bruteforce_marker(k);
     }
 
     Ok(aggregate)

@@ -320,6 +320,61 @@ pub fn clear_seq_marker(scan_id: &str) {
     }
 }
 
+// ---- Streaming-bruteforce batch resume ----------------------------------
+//
+// A streaming bruteforce of a large password wordlist processes the file in
+// fixed-size batches. With `setg bruteforce_resume y` the engine records the
+// index of the last fully-completed batch, keyed by (target, port, wordlist,
+// size), so an interrupted run skips already-tried batches on restart.
+
+fn bruteforce_marker_path(key: &str) -> PathBuf {
+    checkpoints_base_dir().join(format!("{}.bfr", sanitize(key)))
+}
+
+/// Read the last fully-completed batch index for a streaming bruteforce, or 0
+/// when there is no marker (start from the beginning).
+pub fn read_bruteforce_marker(key: &str) -> usize {
+    let path = bruteforce_marker_path(key);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("bruteforce marker {} unparseable: {e}", path.display());
+                0
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            tracing::debug!("bruteforce marker read {} failed: {e}", path.display());
+            0
+        }
+    }
+}
+
+/// Persist the last fully-completed batch index (best-effort; logs at debug).
+pub fn write_bruteforce_marker(key: &str, batch_idx: usize) {
+    let path = bruteforce_marker_path(key);
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::debug!("bruteforce marker mkdir {} failed: {e}", parent.display());
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, batch_idx.to_string()) {
+        tracing::debug!("bruteforce marker write {} failed: {e}", path.display());
+    }
+}
+
+/// Remove the bruteforce batch marker on clean completion (best-effort).
+pub fn clear_bruteforce_marker(key: &str) {
+    let path = bruteforce_marker_path(key);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::debug!("bruteforce marker remove {} failed: {e}", path.display()),
+    }
+}
+
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
