@@ -1316,6 +1316,8 @@ async fn display_all_options(ctx: &ShellContext) {
         ("cred_stop_mode",     "Stop granularity on success: host / user / all (default host)", ""),
         ("bruteforce_delay_ms","Per-attempt delay to dodge lockout (ms, hydra -w)", ""),
         ("bruteforce_jitter_ms","Random extra delay added to bruteforce_delay_ms (ms)", ""),
+        ("bruteforce_mask",    "Mask brute (hydra -x) MIN:MAX:CHARSET, e.g. 1:4:a1", ""),
+        ("bruteforce_resume",  "Resume large streamed wordlist from last batch (y/n)", ""),
     ];
 
     let mut displayed = std::collections::HashSet::new();

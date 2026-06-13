@@ -143,6 +143,7 @@ pub use bruteforce::{
     BruteforceConfig,
     EXCLUDED_RANGES,
     generate_combos_mode,
+    generate_mask_passwords,
     generate_random_public_ip,
     is_mass_scan_target,
     is_subnet_target,

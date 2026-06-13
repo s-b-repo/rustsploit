@@ -18,9 +18,9 @@ use colored::*;
 use crate::module::{Finding, FindingKind, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_yes_no, file_size, generate_combos_mode, load_credential_file, load_lines,
-    normalize_target, parse_combo_mode, run_bruteforce, run_bruteforce_streaming,
-    BruteforceConfig, LoginResult, STREAMING_THRESHOLD,
+    cfg_prompt_yes_no, file_size, generate_combos_mode, generate_mask_passwords,
+    load_credential_file, load_lines, normalize_target, parse_combo_mode, run_bruteforce,
+    run_bruteforce_streaming, BruteforceConfig, LoginResult, STREAMING_THRESHOLD,
 };
 
 /// Per-host bruteforce concurrency cap when running inside a mass-scan fan-out.
@@ -290,24 +290,59 @@ where
         }
     };
 
+    // Hydra `-x`-style mask brute force: `setg bruteforce_mask MIN:MAX:CHARSET`
+    // enumerates candidate passwords (e.g. "1:4:a1" = 1–4 chars of [a-z0-9];
+    // `a`→a-z, `A`→A-Z, `1`→0-9, other chars literal). These are the lowest-yield
+    // rows, so they run AFTER the wordlist. Generated up-front (needs `usernames`
+    // before it's moved into the streaming call). Skipped in credential_file_only
+    // mode, where the combo file is the sole credential source.
+    let mask_combos: Vec<(String, String)> = if cred_file_only {
+        Vec::new()
+    } else {
+        match opt_str("bruteforce_mask") {
+            Some(spec) => {
+                let masks = generate_mask_passwords(&spec)?;
+                if !crate::utils::is_batch_mode() {
+                    crate::mprintln!(
+                        "{}",
+                        format!(
+                            "[*] Mask '{}' generated {} candidate password(s)",
+                            spec,
+                            masks.len()
+                        )
+                        .cyan()
+                    );
+                }
+                generate_combos_mode(&usernames, &masks, mode)
+            }
+            None => Vec::new(),
+        }
+    };
+
     let result = if stream_passwords {
+        // Streamed wordlist runs first; defaults + mask combos run afterwards as
+        // `extra_combos` (the engine processes them once the stream is drained).
+        let mut extra = defaults;
+        extra.extend(mask_combos);
         run_bruteforce_streaming(
             &bf_config,
             usernames,
             password_path.as_deref(),
             passwords,
             mode,
-            defaults,
+            extra,
             probe_for_engine,
         )
         .await?
     } else {
         // Defaults first — common cred lists are the highest-yield rows. In
         // credential_file_only mode `defaults` already holds the file's pairs and
-        // the user/pass wordlists are intentionally ignored.
+        // the user/pass wordlists are intentionally ignored. The mask brute is
+        // appended last (lowest yield).
         let mut combos = defaults;
         if !cred_file_only {
             combos.extend(generate_combos_mode(&usernames, &passwords, mode));
+            combos.extend(mask_combos);
         }
         run_bruteforce(&bf_config, combos, probe_for_engine).await?
     };
