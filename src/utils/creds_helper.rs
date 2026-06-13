@@ -164,10 +164,15 @@ where
     // `MAX_FILE_SIZE` cap turns a big rockyou-class list into a hard error.
     // Instead, route them into the streaming brute-force engine, which reads
     // the file in bounded batches. Small files keep the exact eager path.
-    let stream_passwords = password_path
-        .as_deref()
-        .map(|p| file_size(p) > STREAMING_THRESHOLD)
-        .unwrap_or(false);
+    // Hydra `-C` exclusive mode: when `setg credential_file_only y`, the combo
+    // file replaces the user/pass lists, so the password wordlist (and its
+    // streaming path) is ignored entirely.
+    let cred_file_only = opt_bool("credential_file_only");
+    let stream_passwords = !cred_file_only
+        && password_path
+            .as_deref()
+            .map(|p| file_size(p) > STREAMING_THRESHOLD)
+            .unwrap_or(false);
 
     // For the small-file path we load eagerly so we can validate emptiness and
     // preserve the historical "defaults first" combo ordering. No password
@@ -238,7 +243,12 @@ where
                     pairs.len(),
                     cred_file
                 );
-                defaults.extend(pairs);
+                if cred_file_only {
+                    // Exact hydra -C: the file is the ONLY credential source.
+                    defaults = pairs;
+                } else {
+                    defaults.extend(pairs);
+                }
             }
             Err(e) => return Err(anyhow!("credential_file '{}': {}", cred_file, e)),
         }
@@ -292,9 +302,13 @@ where
         )
         .await?
     } else {
-        // Defaults first — common cred lists are the highest-yield rows.
+        // Defaults first — common cred lists are the highest-yield rows. In
+        // credential_file_only mode `defaults` already holds the file's pairs and
+        // the user/pass wordlists are intentionally ignored.
         let mut combos = defaults;
-        combos.extend(generate_combos_mode(&usernames, &passwords, mode));
+        if !cred_file_only {
+            combos.extend(generate_combos_mode(&usernames, &passwords, mode));
+        }
         run_bruteforce(&bf_config, combos, probe_for_engine).await?
     };
     result.print_found();
@@ -428,6 +442,17 @@ fn cred_extras() -> CredExtras {
         null: raw.contains('n'),
         same: raw.contains('s'),
         reversed: raw.contains('r'),
+    }
+}
+
+/// Read a boolean-ish global option (`setg <key> y`); false when unset.
+fn opt_bool(key: &str) -> bool {
+    match crate::tenant::resolve().global_options().try_get(key) {
+        Some(v) => matches!(
+            v.trim().to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1" | "on"
+        ),
+        None => false,
     }
 }
 
