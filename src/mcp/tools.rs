@@ -594,9 +594,17 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     }
 
     let mut prompts = prompts_param(args);
-    // Inject port into prompts if provided as a top-level parameter
-    if let Some(port) = u16_param(args, "port") {
-        prompts.entry("port".into()).or_insert_with(|| port.to_string());
+    // Port is optional: absent or null means "use the module default". If it IS
+    // present it must be a valid 1-65535 integer — reject an out-of-range value
+    // explicitly rather than silently dropping it (which would fall back to the
+    // default and hide the operator's typo).
+    if args.get("port").is_some_and(|v| !v.is_null()) {
+        match u16_param(args, "port") {
+            Some(port) => {
+                prompts.entry("port".into()).or_insert_with(|| port.to_string());
+            }
+            None => return ToolResult::error("Invalid 'port': must be an integer 1-65535".into()),
+        }
     }
     // Strip "target" from prompts to prevent SSRF bypass via prompt injection
     prompts.remove("target");
@@ -907,7 +915,10 @@ async fn handle_unset_option(args: &Value) -> ToolResult {
 // ── Jobs ──────────────────────────────────────────────────────────────────
 
 fn handle_list_jobs() -> ToolResult {
-    let jobs = crate::jobs::JOB_MANAGER.list();
+    // Use the tenant-scoped job manager — the same one `run_module` spawns into
+    // (line ~639) — so a job started under a non-default tenant is visible here
+    // instead of vanishing into the process-global manager.
+    let jobs = crate::tenant::resolve().job_manager().list();
     let entries: Vec<Value> = jobs
         .into_iter()
         .map(|(id, module, target, started, status)| {
@@ -928,7 +939,8 @@ fn handle_kill_job(args: &Value) -> ToolResult {
         Some(v) => v,
         None => return ToolResult::error("Missing required parameter: id (integer)".into()),
     };
-    if crate::jobs::JOB_MANAGER.kill(id) {
+    // Tenant-scoped (matches spawn + list) so tenant jobs are killable.
+    if crate::tenant::resolve().job_manager().kill(id) {
         ToolResult::text(format!("Job {} killed", id))
     } else {
         ToolResult::error(format!("Job {} not found", id))

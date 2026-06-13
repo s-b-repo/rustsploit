@@ -4,6 +4,85 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
+## 2026-06-13 — Upstream ports (rmcp / Recog / JARM / SecLists), mass-scan fixes, HTTP pooling, per-run auto-save
+
+**389 self-registering native modules.** Build clean (0 errors, 0 warnings).
+
+### New capabilities (upstream ports)
+
+- **MCP server now runs on the official `rmcp` SDK (Apache-2.0, v1.7).** The hand-rolled
+  JSON-RPC-over-stdio server (`src/mcp/server.rs`) is replaced by a thin adapter implementing
+  rmcp's `ServerHandler` trait; protocol framing, transport, and spec compliance are owned by the
+  SDK. The existing tool/resource logic (`tools.rs`, `resources.rs`, `types.rs`) is unchanged — all
+  **29 tools and 7 resources** are retained, along with the per-call timeout
+  (`RUSTSPLOIT_MCP_TIMEOUT_SECS`, default 300s) and the fd-1 stdout-isolation guard. See
+  [`MCP-Integration.md`](MCP-Integration.md).
+- **Recog fingerprint engine** (Rapid7, BSD-2-Clause) — new `src/utils/recog.rs`: an XML
+  fingerprint-database loader + matcher (quick-xml, regexes pre-compiled behind `once_cell::Lazy`)
+  that resolves a banner to structured fields (`service.product` / `.version` / `.vendor`,
+  `os.product`, `service.cpe23`, …). Vendored DBs under `src/utils/recog_db/` (ssh / ftp / smtp /
+  http / mysql banners) are embedded via `include_str!`. Wired into
+  `scanners/service_scanner` so each banner read (FTP, SSH, SMTP, MySQL, HTTPS `Server:` header) is
+  enriched with a structured product/version + CPE. The vendored DBs are a curated, internally
+  consistent subset; the full Rapid7 DBs are staged for a future input-normalisation pass.
+- **JARM + JA3 / JA3S TLS fingerprinting** (Salesforce, BSD-3-Clause) — new
+  `src/utils/tls_fingerprint.rs`: 10 hand-crafted JARM ClientHello probes over a raw tokio
+  `TcpStream` assembled into the canonical 62-char JARM hash, plus JA3/JA3S string builders + MD5
+  (GREASE stripped per spec). Parsing is fully bounds-checked and degrades to the all-zero JARM hash
+  on a down host / TLS alert / truncated response. New module **`scanners/jarm_scan`** (default port
+  443) reports the JARM hash, JA3S, and client JA3 as findings. `ssl_scanner` is intentionally
+  unchanged (rustls hides the raw ServerHello bytes JA3S needs).
+- **SecLists wordlist catalog** (MIT) — the previously-empty, checksum-pinned catalog in
+  `src/utils/wordlist.rs` is seeded with 6 curated SecLists entries (`passwords-top-1k`,
+  `passwords-top-10k`, `usernames-short`, `web-common`, `web-raft-small-dirs`, `subdomains-top5k`).
+  Each SHA-256 is pinned over the exact upstream bytes; `wordlist::resolve(name)` downloads +
+  verifies on first use into `~/.rustsploit/wordlists/`, rejecting any checksum mismatch.
+
+### Mass-scan / full-internet-sweep fixes (`src/scheduler.rs`)
+
+- **Full-sweep host-cap consistency** — a literal `0.0.0.0/0` typed into `use <mod>; run` no longer
+  falls back to the 10,000-host scheduler default. When `max_random_hosts` is not explicitly set, a
+  full sweep means every reachable public host on both entry paths; an explicit
+  `setg max_random_hosts <n>` is still honored.
+- **Confirm BEFORE harvest** — the full-sweep advisory + interactive confirmation now runs *first*
+  on both the random and sequential paths; declining aborts with nothing touched. The pre-batch
+  prompt-harvest run (against placeholder host `0.0.0.1`) is wrapped in a throwaway `OUTPUT_BUFFER`
+  scope so its module output no longer leaks.
+- **`ModuleCtx.prompt_only`** — new per-module "prompt-only" mode. The scheduler sets it on the
+  harvest dry-run; a module that honours it answers its prompts and returns immediately (no network,
+  no file writes against the placeholder). `service_scanner` is the reference implementation.
+- **`service_scanner` batch-mode output gating** — in a mass-scan fan-out the per-host results
+  table, file save, and "No services / Results saved / Scan complete" status lines are now gated on
+  `!is_batch_mode()`, fixing cross-task output spam and the concurrent same-file overwrite race.
+  Interactive single-target runs are unchanged.
+- **`show options`** — the shell table now includes the four previously-missing global keys:
+  `scan_order`, `exclusions`, `target_rps`, `module_rps`.
+
+### Performance
+
+- **HTTP client connection-pool reuse** — `utils::network::build_http_client(timeout)` now caches
+  the permissive client keyed by `(timeout, accept_invalid_certs)` and returns cheap `Arc` clones, so
+  warm connections and TLS setup are reused across runs instead of rebuilt per call. The cached
+  client sets a bounded `pool_idle_timeout` (30s) so a full-internet sweep reaps idle keep-alives.
+  Toggling `setg strict_tls` is still honored (it is part of the cache key). Custom-opts clients
+  (cookies / headers / redirects) are unchanged.
+
+### New: per-run output auto-save
+
+- Every interactive console / CLI module run now auto-appends all of its output (stdout + stderr) to
+  a per-run file `~/.rustsploit/loot/<module> <YYYY-MM-DD_HH-MM-SS> results.txt` (append mode, via
+  new `src/results_sink.rs`). Append mode means multi-host mass-scan output accumulates into one run
+  file instead of racing to overwrite. Scoped to console/CLI (sequential) runs; API / MCP runs
+  return their output to the caller via `OUTPUT_BUFFER` and are not duplicated to disk.
+
+### Docs
+
+- README and `docs/BAD_PATTERNS.md` prose corrected to the exploitation-only model (no
+  `check()` / `CheckResult` verification phase) and compile-time `inventory` self-registration (no
+  `build.rs` module indexer). The BAD_PATTERNS regex matrix is untouched.
+
+---
+
 ## 2026-06-04 — Sequential mass scan + interactive-module timeout fix
 
 - **Sequential mass scan** — new `Target::Sequential(start)` walks the public IPv4 space

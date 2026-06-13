@@ -369,13 +369,16 @@ pub fn list_checkpoints() -> Result<Vec<Checkpoint>> {
     // Per-tenant namespaces.
     let tenants_dir = dir.join("tenants");
     if tenants_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&tenants_dir) {
-            for entry in entries.flatten() {
-                let tpath = entry.path();
-                if tpath.is_dir() {
-                    collect_checkpoints_in(&tpath, &mut out);
+        match std::fs::read_dir(&tenants_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let tpath = entry.path();
+                    if tpath.is_dir() {
+                        collect_checkpoints_in(&tpath, &mut out);
+                    }
                 }
             }
+            Err(e) => tracing::debug!("read tenants checkpoint dir {} failed: {e}", tenants_dir.display()),
         }
     }
     out.sort_by(|a, b| a.started.cmp(&b.started));

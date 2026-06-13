@@ -149,7 +149,6 @@ curl http://localhost:8080/health
 | API change | `cargo check` clean, endpoint documented in [API Server](API-Server.md) |
 | Utils change | All prompt helpers still compile, no dead code warnings |
 | Module with `info()` | `info` command displays metadata |
-| Module with `check()` | `check` command runs verification |
 | Source port | Connections use `tcp_connect_str`/`udp_bind`, not raw socket calls |
 | Batch mode | Interactive/REPL modules bail with `is_batch_mode()` guard |
 | Global options change | JSON file updated atomically, `cfg_prompt_*` respects priority chain |

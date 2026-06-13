@@ -32,10 +32,12 @@ Use subfolders for vendor families (e.g., `exploits/cisco/`, `exploits/cameras/`
 
 ### Recommended: Add Module Metadata
 
-Consider adding `info()` and/or `check()` functions to your module:
+Add an `info()` function describing your module. Rustsploit is **exploitation-only**
+— do not add a `check()` / `CheckResult` verification phase; modules run an exploit
+and report `Finding`s (see _Auto-Store Findings_ below).
 
 ```rust
-use crate::module_info::{ModuleInfo, ModuleRank, CheckResult};
+use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -47,11 +49,6 @@ pub fn info() -> ModuleInfo {
         rank: ModuleRank::Good,
         default_port: Some(8080),
     }
-}
-
-pub async fn check(ctx: &ModuleCtx) -> CheckResult {
-    // Non-destructive verification only
-    CheckResult::Unknown("Not implemented".to_string())
 }
 ```
 

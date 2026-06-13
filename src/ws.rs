@@ -340,18 +340,21 @@ async fn handle_ws(
         };
 
         if frame_bytes.len() > MAX_WS_FRAME_SIZE {
-            // Drop the oversized frame and keep the connection alive — a
-            // single bad frame should not disconnect a long-running session.
-            // The peer can retry with a smaller frame; if they keep sending
-            // oversize frames, the noise is bounded by `MAX_TOTAL_CONNECTIONS`
-            // and will surface as repeated warnings in the trace log.
+            // Close the connection on an oversize frame. The AEAD ratchet's
+            // nonce embeds the receive counter and only advances on a SUCCESSFUL
+            // decrypt, so skipping a frame (the old `continue`) permanently
+            // desynced the channel and bricked every subsequent frame anyway —
+            // "keep the connection alive" was unachievable. axum's
+            // `max_frame_size` already rejects oversize at the framing layer, so
+            // reaching here means a misbehaving peer; close cleanly (matching the
+            // decrypt-failure path below) instead of silently wedging.
             tracing::warn!(
-                "WS frame too large from {}: {} bytes (cap {}); dropping frame, connection kept alive",
+                "WS frame too large from {}: {} bytes (cap {}); closing connection",
                 addr,
                 frame_bytes.len(),
                 MAX_WS_FRAME_SIZE
             );
-            continue;
+            break;
         }
 
         let plaintext = {
@@ -369,11 +372,14 @@ async fn handle_ws(
             Ok(v) => v,
             Err(e) => {
                 let err_resp = json!({"error": {"code": "PARSE_ERROR", "message": format!("Invalid JSON: {}", e)}});
-                if let Ok(bytes) = serde_json::to_vec(&err_resp) {
-                    if let Err(e) = reader_tx.send(bytes).await {
-                        tracing::trace!("RPC response channel closed: {e}");
-                        break;
+                match serde_json::to_vec(&err_resp) {
+                    Ok(bytes) => {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
                     }
+                    Err(e) => tracing::warn!("failed to serialize parse-error response: {e}"),
                 }
                 continue;
             }
@@ -390,11 +396,14 @@ async fn handle_ws(
                     Err(e) => {
                         tracing::debug!("jobId exceeds u32 range: {e}");
                         let resp = json!({"id": req_id, "error": {"code": "INVALID_JOB_ID", "message": "jobId exceeds u32 range"}});
-                        if let Ok(bytes) = serde_json::to_vec(&resp) {
-                            if let Err(e) = reader_tx.send(bytes).await {
-                                tracing::trace!("RPC response channel closed: {e}");
-                                break;
+                        match serde_json::to_vec(&resp) {
+                            Ok(bytes) => {
+                                if let Err(e) = reader_tx.send(bytes).await {
+                                    tracing::trace!("RPC response channel closed: {e}");
+                                    break;
+                                }
                             }
+                            Err(e) => tracing::warn!("failed to serialize INVALID_JOB_ID response: {e}"),
                         }
                         continue;
                     }
@@ -402,11 +411,14 @@ async fn handle_ws(
                 let mut jobs = reader_jobs.lock().await;
                 if jobs.len() >= 100 {
                     let resp = json!({"id": req_id, "error": {"code": "SUB_LIMIT", "message": "Max 100 job subscriptions per connection"}});
-                    if let Ok(bytes) = serde_json::to_vec(&resp) {
-                        if let Err(e) = reader_tx.send(bytes).await {
-                            tracing::trace!("RPC response channel closed: {e}");
-                            break;
+                    match serde_json::to_vec(&resp) {
+                        Ok(bytes) => {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
                         }
+                        Err(e) => tracing::warn!("failed to serialize SUB_LIMIT response: {e}"),
                     }
                 } else {
                     // Send the ack BEFORE inserting: if the send fails the
@@ -428,11 +440,14 @@ async fn handle_ws(
                 // Missing/non-numeric jobId: a JSON-RPC client keyed by req_id
                 // would hang forever without an ack or error, so emit one.
                 let resp = json!({"id": req_id, "error": {"code": "INVALID_INPUT", "message": "jobId must be a number"}});
-                if let Ok(bytes) = serde_json::to_vec(&resp) {
-                    if let Err(e) = reader_tx.send(bytes).await {
-                        tracing::trace!("RPC response channel closed: {e}");
-                        break;
+                match serde_json::to_vec(&resp) {
+                    Ok(bytes) => {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
                     }
+                    Err(e) => tracing::warn!("failed to serialize INVALID_INPUT response: {e}"),
                 }
             }
             continue;
@@ -443,20 +458,26 @@ async fn handle_ws(
                 Some(job_id) => {
                     reader_jobs.lock().await.remove(&job_id);
                     let resp = json!({"id": req_id, "result": {"unsubscribed": job_id}});
-                    if let Ok(bytes) = serde_json::to_vec(&resp) {
-                        if let Err(e) = reader_tx.send(bytes).await {
-                            tracing::trace!("RPC response channel closed: {e}");
-                            break;
+                    match serde_json::to_vec(&resp) {
+                        Ok(bytes) => {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
                         }
+                        Err(e) => tracing::warn!("failed to serialize unsubscribe response: {e}"),
                     }
                 }
                 None => {
                     let resp = json!({"id": req_id, "error": {"code": "INVALID_INPUT", "message": "jobId must be a number"}});
-                    if let Ok(bytes) = serde_json::to_vec(&resp) {
-                        if let Err(e) = reader_tx.send(bytes).await {
-                            tracing::trace!("RPC response channel closed: {e}");
-                            break;
+                    match serde_json::to_vec(&resp) {
+                        Ok(bytes) => {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
                         }
+                        Err(e) => tracing::warn!("failed to serialize INVALID_INPUT response: {e}"),
                     }
                 }
             }
@@ -479,11 +500,14 @@ async fn handle_ws(
                 Err(e) => json!({"id": req_id, "error": {"code": e.0, "message": e.1}}),
             }
         };
-        if let Ok(bytes) = serde_json::to_vec(&response) {
-            if let Err(e) = reader_tx.send(bytes).await {
-                tracing::trace!("RPC response channel closed: {e}");
-                break;
+        match serde_json::to_vec(&response) {
+            Ok(bytes) => {
+                if let Err(e) = reader_tx.send(bytes).await {
+                    tracing::trace!("RPC response channel closed: {e}");
+                    break;
+                }
             }
+            Err(e) => tracing::warn!("failed to serialize RPC response: {e}"),
         }
     }
 
@@ -647,7 +671,10 @@ async fn rpc_get_target() -> RpcResult {
                 let sz = crate::utils::subnet_host_count(&net).min(u64::MAX as u128) as u64;
                 (sz > 1, sz.max(1))
             }
-            Err(_) => (false, 1),
+            Err(e) => {
+                tracing::debug!("subnet size estimate: parse failed for {:?}: {}", t, e);
+                (false, 1)
+            }
         },
         Some(_) => (false, 1),
     };
@@ -894,7 +921,15 @@ async fn rpc_set_option(params: &Value) -> RpcResult {
     }
     let mut set_count = 0usize;
     for (key, val) in obj {
-        let value = val.as_str().unwrap_or("");
+        let value = match val.as_str() {
+            Some(v) => v,
+            None => {
+                return Err(rpc_err(
+                    "INVALID_INPUT",
+                    format!("Option '{}' value must be a string", key),
+                ));
+            }
+        };
         if key.is_empty() || key.len() > 256 {
             return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' invalid (1-256 chars)", key)));
         }

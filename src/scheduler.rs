@@ -367,6 +367,68 @@ fn current_module_path(module: &dyn Module) -> String {
     info_name
 }
 
+/// One initial attempt plus a single retry per host. Bounded so a transient
+/// blip is absorbed without doubling the wall-clock of a full sweep.
+const MAX_HOST_ATTEMPTS: usize = 2;
+
+/// Classify an error as a transient network condition worth one retry. A closed
+/// port (`ConnectionRefused`) or a non-IO module error (e.g. "target not
+/// affected") is terminal, so a mass scan never wastes a retry on a host that
+/// simply does not run the service.
+fn is_transient_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind;
+            if matches!(
+                io.kind(),
+                ErrorKind::TimedOut
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+    }
+    // The per-host deadline wrapper produces an anyhow error (not an io::Error)
+    // whose message starts with "timed out".
+    err.to_string().contains("timed out")
+}
+
+/// Run a module against one host with bounded retry on transient failures, then
+/// return the outcome for the caller to record. A transient error is retried up
+/// to `MAX_HOST_ATTEMPTS` with a short backoff; any other error returns
+/// immediately. Either way a single host never aborts the surrounding mass-scan
+/// loop — the caller records the outcome and continues to the next host.
+async fn run_host_with_retry(
+    module: &Arc<dyn Module>,
+    ctx: &ModuleCtx,
+    per_host_timeout: Option<Duration>,
+) -> Result<ModuleOutcome> {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let res = match per_host_timeout {
+            Some(d) => match tokio::time::timeout(d, module.run(ctx)).await {
+                Ok(r) => r,
+                Err(e) => Err(anyhow::anyhow!("timed out: {e}")),
+            },
+            None => module.run(ctx).await,
+        };
+        match res {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                if attempt < MAX_HOST_ATTEMPTS && !ctx.is_cancelled() && is_transient_error(&e) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 // ============================================================
 // FAN-OUT
 // ============================================================
@@ -461,7 +523,9 @@ async fn fanout_cidr(
     let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
     let cidr = match &target {
         Target::Cidr(s) => s.clone(),
-        _ => unreachable!("fanout_cidr called with non-Cidr target"),
+        // Reachable only via an internal dispatch bug; surface it as a clean
+        // error rather than panicking the process (and it clears the no-panic gate).
+        _ => anyhow::bail!("internal error: fanout_cidr called with non-Cidr target"),
     };
     let network = crate::utils::parse_subnet(&cidr)?;
     let host_count = crate::utils::subnet_host_count(&network);
@@ -646,13 +710,12 @@ async fn fanout_cidr(
             ctx.batch_mode = true;
             ctx.prompt_cache = Some(cache);
             ctx.module_path = mp;
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(limits.timeout_secs),
-                module_clone.run(&ctx),
+            let outcome = run_host_with_retry(
+                &module_clone,
+                &ctx,
+                Some(Duration::from_secs(limits.timeout_secs)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("timed out: {e}"))
-            .and_then(|r| r);
+            .await;
             stats_clone.record(outcome);
             record_checkpoint(&cp_clone, &ip_str).await;
         });
@@ -674,7 +737,7 @@ async fn fanout_file(
     let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
     let path = match &target {
         Target::File(p) => p.clone(),
-        _ => unreachable!("fanout_file called with non-File target"),
+        _ => anyhow::bail!("internal error: fanout_file called with non-File target"),
     };
     let content = crate::utils::safe_read_to_string_async(
         path.to_str().unwrap_or(""),
@@ -772,7 +835,10 @@ async fn fanout_file(
             // hostname entries keep the honeypot-only check.
             let skip = match host.parse::<std::net::IpAddr>() {
                 Ok(ip) => !crate::utils::network::mass_scan_precheck(ip, precheck_port, honeypot).await,
-                Err(_) => honeypot && crate::utils::network::quick_honeypot_check(&host).await,
+                Err(e) => {
+                    tracing::trace!("'{host}' is not an IP literal ({e}); honeypot-only precheck");
+                    honeypot && crate::utils::network::quick_honeypot_check(&host).await
+                }
             };
             if skip {
                 stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
@@ -787,13 +853,12 @@ async fn fanout_file(
             ctx.batch_mode = true;
             ctx.prompt_cache = Some(cache);
             ctx.module_path = mp;
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(limits.timeout_secs),
-                module_clone.run(&ctx),
+            let outcome = run_host_with_retry(
+                &module_clone,
+                &ctx,
+                Some(Duration::from_secs(limits.timeout_secs)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("timed out: {e}"))
-            .and_then(|r| r);
+            .await;
             stats_clone.record(outcome);
             record_checkpoint(&cp_clone, &host).await;
         });
@@ -819,7 +884,7 @@ async fn fanout_multi(
 ) -> Result<ModuleOutcome> {
     let parts = match target {
         Target::Multi(p) => p,
-        _ => unreachable!("fanout_multi called with non-Multi target"),
+        _ => anyhow::bail!("internal error: fanout_multi called with non-Multi target"),
     };
     let total = parts.len();
     if let Some(ref tid) = tenant_id {
@@ -1025,27 +1090,25 @@ async fn fanout_random(
             ctx.batch_mode = true;
             ctx.prompt_cache = Some(cache);
             ctx.module_path = mp;
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(limits.timeout_secs),
-                module_clone.run(&ctx),
+            let outcome = run_host_with_retry(
+                &module_clone,
+                &ctx,
+                Some(Duration::from_secs(limits.timeout_secs)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("timed out: {e}"))
-            .and_then(|r| r);
+            .await;
             let was_err = stats_clone.record(outcome);
             record_checkpoint(&cp_clone, &ip.to_string()).await;
             if was_err {
                 let n = module_err_clone.fetch_add(1, Ordering::Relaxed) + 1;
                 let ok_so_far = stats_clone.success.load(Ordering::Relaxed);
-                if n >= 10
-                    && ok_so_far == 0
-                    && !stats_clone.abort.swap(true, Ordering::Relaxed)
-                {
+                // Warn once if the run looks misconfigured, but keep going:
+                // transient failures are already retried, and the operator asked
+                // for error -> retry -> continue rather than an automatic abort.
+                if n == 10 && ok_so_far == 0 {
                     crate::meprintln!(
                         "{}",
-                        "[!] First 10 module dispatches all errored with no successes — aborting random mass scan."
-                            .red()
-                            .bold()
+                        "[!] First 10 dispatches errored with no successes — continuing anyway (check module/target config if this persists; Ctrl+C to stop)."
+                            .yellow()
                     );
                 }
             }
@@ -1250,23 +1313,24 @@ async fn fanout_sequential(
             ctx.batch_mode = true;
             ctx.prompt_cache = Some(cache);
             ctx.module_path = mp;
-            let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), module_clone.run(&ctx))
-                .await
-                .map_err(|e| anyhow::anyhow!("timed out: {e}"))
-                .and_then(|r| r);
+            let outcome = run_host_with_retry(
+                &module_clone,
+                &ctx,
+                Some(Duration::from_secs(timeout_secs)),
+            )
+            .await;
             let was_err = stats_clone.record(outcome);
             if was_err {
                 let n = module_err_clone.fetch_add(1, Ordering::Relaxed) + 1;
                 let ok_so_far = stats_clone.success.load(Ordering::Relaxed);
-                if n >= 10
-                    && ok_so_far == 0
-                    && !stats_clone.abort.swap(true, Ordering::Relaxed)
-                {
+                // Warn once if the run looks misconfigured, but keep going:
+                // transient failures are already retried, and the operator asked
+                // for error -> retry -> continue rather than an automatic abort.
+                if n == 10 && ok_so_far == 0 {
                     crate::meprintln!(
                         "{}",
-                        "[!] First 10 module dispatches all errored with no successes — aborting sequential mass scan."
-                            .red()
-                            .bold()
+                        "[!] First 10 dispatches errored with no successes — continuing anyway (check module/target config if this persists; Ctrl+C to stop)."
+                            .yellow()
                     );
                 }
             }
@@ -1369,18 +1433,17 @@ async fn pre_batch_prompt(
     );
     let result = tokio::time::timeout(Duration::from_secs(300), run_fut).await;
 
-    // Regardless of success/failure, the prompts have been answered and
-    // stored in global options by cfg_prompt_*. Swallow the error.
+    // The prompts have already been answered and stored by cfg_prompt_*. The
+    // dry-run's outcome is not actionable (it exists only to harvest prompts),
+    // so each arm binds and logs it at debug — NOT propagated, because
+    // propagating an expected dry-run error would abort the whole batch.
     match result {
-        Ok(Ok(_)) => {
-            tracing::debug!("pre_batch_prompt: module dry-run succeeded (unexpected)");
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("pre_batch_prompt: module dry-run errored (expected): {e:#}");
-        }
-        Err(_) => {
-            tracing::debug!("pre_batch_prompt: module dry-run timed out (expected)");
-        }
+        Ok(Ok(outcome)) => tracing::debug!(
+            "pre_batch_prompt: dry-run completed with {} finding(s) (ignored — placeholder host)",
+            outcome.findings.len()
+        ),
+        Ok(Err(e)) => tracing::warn!("pre_batch_prompt: config dry-run errored (prompts may be incomplete): {e:#}"),
+        Err(elapsed) => tracing::warn!("pre_batch_prompt: config dry-run timed out (prompts may be incomplete): {elapsed}"),
     }
 
     crate::mprintln!();

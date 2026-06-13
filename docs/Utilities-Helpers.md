@@ -5,7 +5,10 @@ Rustsploit provides several utility modules that every module developer should k
 | Module | Import Path | Purpose |
 |--------|-------------|---------|
 | **Core Utils** | `crate::utils` | Target normalization, file loading, config-aware prompts, input validation |
-| **Network Utils** | `crate::utils::network` | HTTP client builders, TCP/UDP connect helpers, honeypot check |
+| **Network Utils** | `crate::utils::network` | HTTP client builders (cached, pooled), TCP/UDP connect helpers, honeypot check |
+| **Recog** | `crate::utils::recog` | Rapid7-Recog banner matcher — resolves a banner to structured `service.product`/`.version`/`.cpe23`, `os.product` (used by `service_scanner`) |
+| **TLS Fingerprint** | `crate::utils::tls_fingerprint` | JARM (62-char hash), JA3, JA3S over a raw `TcpStream` (used by `jarm_scan`) |
+| **Wordlist** | `crate::utils::wordlist` | Checksum-pinned `resolve(name)` (SecLists catalog) + streaming `BatchedReader` |
 | **Privilege Utils** | `crate::utils::privilege` | Root privilege check for raw-socket modules |
 | **Creds Helper** | `crate::utils::creds_helper` | Single-target credential brute-force harness (prompt, engine, loot, findings) |
 | **Exploit Helper** | `crate::utils::exploit_helper` | HTTP probe helpers for single-target CVE exploit modules |
@@ -709,7 +712,9 @@ use crate::utils::network::{
 
 ### `build_http_client(timeout) → Result<Client>`
 
-Creates a standard `reqwest::Client` with sensible defaults (danger-accept invalid certs, no redirect limit). Use this instead of hand-rolling `reqwest::Client::builder()`.
+Returns the shared permissive `reqwest::Client` (danger-accept invalid certs, no redirect limit). Use this instead of hand-rolling `reqwest::Client::builder()`.
+
+As of the 2026-06-13 release this client is **cached and reused** — it is keyed by `(timeout, accept_invalid_certs)` and returned as a cheap `Arc` clone, so warm connections and TLS setup are shared across runs (reqwest clients are `Arc` internally and share their connection pool across clones) instead of rebuilt per call. `accept_invalid_certs` is part of the key, so toggling `setg strict_tls` is honored rather than pinned to the first build. The cached client also sets a bounded `pool_idle_timeout` (30s) so a long mass scan reaps idle keep-alives. Custom-opts clients from `build_http_client_with` (cookies / headers / redirects) are *not* cached.
 
 ```rust
 use crate::utils::network::build_http_client;
@@ -868,13 +873,18 @@ Failure modes: unknown name (suggests close matches via Levenshtein), HTTP error
 
 Returns the names of every wordlist this build knows about. Useful for `--list-wordlists`-style introspection.
 
-The catalogue is **intentionally empty by default**. Entries get added by maintainers after fetching + hashing each upstream artefact:
+As of the 2026-06-13 release the catalogue (`KNOWN_LISTS`) is seeded with 6 curated SecLists entries (MIT):
 
-```bash
-curl -L <url> | sha256sum
-```
+| Name | SecLists path |
+|------|---------------|
+| `passwords-top-1k` | `Passwords/Common-Credentials/Pwdb_top-1000.txt` |
+| `passwords-top-10k` | `Passwords/Common-Credentials/Pwdb_top-10000.txt` |
+| `usernames-short` | `Usernames/top-usernames-shortlist.txt` |
+| `web-common` | `Discovery/Web-Content/common.txt` |
+| `web-raft-small-dirs` | `Discovery/Web-Content/raft-small-directories.txt` |
+| `subdomains-top5k` | `Discovery/DNS/subdomains-top1million-5000.txt` |
 
-There is no TODO placeholder — placeholder hashes that look real but aren't are an integrity hole, so the slot stays empty until verified. To request a wordlist be added, open a PR adding a `WordlistSpec { name, url, sha256, local_name }` tuple to `KNOWN_LISTS`.
+Each entry's SHA-256 is pinned over the exact upstream bytes `resolve()` hashes after download — placeholder hashes that look real but aren't are an integrity hole, so a slot stays empty until verified. To add a wordlist, fetch + hash the upstream artefact (`curl -L <url> | sha256sum`) and add a `WordlistSpec { name, url, sha256, local_name }` tuple to `KNOWN_LISTS`.
 
 ### `BatchedReader` — streaming reader
 

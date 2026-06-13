@@ -25,7 +25,7 @@ Welcome to the Rustsploit documentation hub. Use the links below to navigate to 
 | [Utilities & Helpers](Utilities-Helpers.md) | Network wrappers, creds_helper, exploit_helper, source port binding, cfg_prompt_* |
 | [Bad Patterns](BAD_PATTERNS.md) | Banned code patterns — 95+ regex checks for panics, error swallowing, network bypasses |
 | [Testing & QA](Testing-QA.md) | Build checks (0 errors, 0 warnings), smoke tests, wordlist validation |
-| [Changelog](Changelog.md) | Release notes and version history (current: v0.5.0) |
+| [Changelog](Changelog.md) | Release notes and version history (latest: 2026-06-13 — rmcp / Recog / JARM / SecLists ports, mass-scan fixes, per-run auto-save) |
 | [Contributing](Contributing.md) | Fork guide, PR checklist, code style |
 | [Credits](Credits.md) | Authors, acknowledgements, legal notice |
 | [Future Features](Future-Features.md) | Roadmap and completed features (plugins, metadata, global options, etc.) |

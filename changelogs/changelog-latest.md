@@ -1,3 +1,48 @@
+## June 2026 (2026-06-13) — Upstream ports + mass-scan fixes + HTTP pooling + per-run auto-save
+
+**389 self-registering native modules.** `cargo build --bin rustsploit`: clean (0 errors, 0 warnings). New-port + core test suites green (`recog tls_fingerprint jarm wordlist cyclic ja3` → 40 passed, 0 failed).
+
+This release ports four well-known upstream projects into Rustsploit, fixes a cluster of mass-scan / full-internet-sweep usability bugs, lands a framework-wide HTTP performance improvement, and adds per-run output auto-save to loot. All ported components are permissively licensed (BSD-2 / BSD-3 / Apache-2.0 / MIT).
+
+### 1. New capabilities (upstream ports)
+
+- **MCP server migrated to the official `rmcp` SDK (Apache-2.0).** `src/mcp/server.rs` is rewritten as a thin adapter implementing rmcp's `ServerHandler` trait; the SDK now owns protocol framing, transport, and spec compliance. The tool/resource logic (`tools.rs`, `resources.rs`, `types.rs`) is preserved unchanged — **all 29 tools and 7 resources** retained, plus the per-call execution timeout (`RUSTSPLOIT_MCP_TIMEOUT_SECS`, default 300s) and the stdout-isolation guard (protocol channel dup'd off fd 1, fd 1 redirected to `/dev/null`). Validated end-to-end over stdio: `initialize` returns `serverInfo = rustsploit-mcp 0.5.0`, negotiates `protocolVersion` to the client's `2024-11-05`, and `tools/list` advertises all 29 tools. `Cargo.toml`: `rmcp = { version = "1.7", features = ["server", "transport-io", "transport-async-rw"] }`.
+- **Recog fingerprint engine (Rapid7, BSD-2-Clause).** New `src/utils/recog.rs` — an XML fingerprint-DB loader + matcher (quick-xml; regexes pre-compiled behind `once_cell::Lazy`) that resolves a banner to structured fields (`service.product` / `.version` / `.vendor`, `os.product`, `service.cpe23`, …). Matcher semantics follow real Recog: a `<param>` with a non-empty `value` is a literal/interpolated assignment; a `<param>` with no value reads regex capture group `pos`. Capture params resolve in a first pass so `{field}` templates always bind. Vendored DBs under `src/utils/recog_db/` (ssh / ftp / smtp / http / mysql banners), embedded via `include_str!`. Wired into `scanners/service_scanner`: each banner read (FTP, SSH, SMTP, MySQL, HTTPS `Server:` header) is enriched with a structured product/version + CPE; findings still flow through the existing `FindingKind::Banner` path. 19 unit tests against real example banners. The vendored DBs are a curated, internally-consistent subset — the full Rapid7 DBs are staged but require a per-DB input-normalisation layer before adoption (they anchor on the version comment, not the raw banner line, and use different field names/values).
+- **JARM + JA3 / JA3S TLS fingerprinting (Salesforce, BSD-3-Clause).** New `src/utils/tls_fingerprint.rs` — JARM: 10 hand-crafted ClientHello probes (TLS 1.2/1.3, cipher orderings, GREASE on/off, ALPN/extension permutations) sent over a raw tokio `TcpStream`; each ServerHello is bounds-checked and assembled into the canonical 62-char JARM hash. JA3 / JA3S string builders + MD5 (GREASE stripped per spec). Robust failure handling: a down host / TLS alert / truncated response degrades to the all-zero JARM hash; the parser returns `None` on garbage and never panics. New module `src/modules/scanners/jarm_scan.rs` (default port 443) reports JARM hash, JA3S, and client JA3 as findings. `ssl_scanner` intentionally unchanged (rustls hides the raw ServerHello bytes JA3S needs; JA3S is exposed via `tls_fingerprint` for callers holding raw bytes). 14 unit tests.
+- **SecLists wordlist catalog (MIT).** Seeded the previously-empty, checksum-pinned catalog in `src/utils/wordlist.rs` with 6 curated SecLists entries — `passwords-top-1k`, `passwords-top-10k`, `usernames-short`, `web-common`, `web-raft-small-dirs`, `subdomains-top5k` — each SHA-256 pinned over the exact upstream bytes. `resolve(name)` downloads + SHA-256-verifies on first use into `~/.rustsploit/wordlists/`, rejecting any checksum mismatch. 2 no-network tests assert every catalog entry is well-formed and uniquely named.
+
+### 2. Bug fixes (mass-scan / full-internet sweep, `src/scheduler.rs`)
+
+- **Full-internet sweep host-cap consistency.** A literal `0.0.0.0/0` typed into `use <mod>; run` previously fell back to the scheduler default of 10,000 hosts (only `setg target 0.0.0.0` auto-raised the cap). Fixed at the single `Target::Random` dispatch chokepoint: when `max_random_hosts` is not explicitly set, a full sweep means every reachable public host on both entry paths. An explicit `setg max_random_hosts <n>` is still honored; the advisory + interactive confirmation gate is unchanged.
+- **Confirm BEFORE harvest, and silence the placeholder.** The pre-batch prompt phase runs the module once against placeholder host `0.0.0.1` to harvest answers for the whole batch. (a) Order: the full-sweep advisory + confirmation now runs *first* on both the random and sequential paths; declining aborts with nothing touched. (b) Noise: the harvest run is wrapped in a throwaway `OUTPUT_BUFFER` scope so its `mprintln!`/`meprintln!` output is suppressed while interactive prompts stay visible.
+- **`ModuleCtx.prompt_only` (new).** A per-module "prompt-only" mode set on the harvest dry-run ctx. A module that honours the flag answers its `cfg_prompt_*` calls and returns immediately — no network, no file writes against the placeholder. `service_scanner` is the reference implementation; the output-capture guard remains as belt-and-suspenders for modules that don't yet check the flag.
+- **`service_scanner` mass-scan output spam + file-save race.** In a fan-out the per-host results table, the per-host file save, and the redundant "No services / Results saved / Scan complete" status lines are now gated on `!is_batch_mode()`. Only hosts with services print; per-host saves are skipped in batch mode (findings flow through the module outcome instead, avoiding the concurrent-overwrite race). Interactive single-target runs are unchanged.
+- **`show options` completeness.** Added the four missing global keys to the shell's `show options` table: `scan_order`, `exclusions`, `target_rps`, `module_rps`.
+
+### 3. Performance
+
+- **HTTP client connection-pool reuse (framework-wide).** `src/utils/network.rs::build_http_client(timeout)` now caches the permissive client keyed by `(timeout, accept_invalid_certs)` and returns cheap `Arc` clones — reqwest clients are `Arc` internally and share their connection pool across clones, so warm connections and TLS setup are reused across runs instead of rebuilt per call (once per host in an HTTP mass scan). `accept_invalid_certs` is part of the key so toggling `setg strict_tls` is still honored. The client is built outside the lock; a poisoned lock is recovered rather than panicking. The cached client sets `pool_idle_timeout = 30s` so a full-internet sweep reaps idle keep-alives. Custom-opts clients (cookies / headers / redirects via `build_http_client_with`) are unchanged.
+
+### 4. New: per-run output auto-save
+
+- Every interactive console / CLI module run now auto-appends all of its output (stdout + stderr) to a per-run file `~/.rustsploit/loot/<module> <YYYY-MM-DD_HH-MM-SS> results.txt`. Files are opened in append mode so multi-host mass-scan output accumulates into one run file instead of racing to overwrite. New module `src/results_sink.rs` — a global append sink mirroring the spool's write pattern (so spawned per-host task output is captured), hooked into the console branches of `mprintln!`/`meprintln!` routing in `src/output.rs` and begun/ended per run in `commands::run_module`. Scoped to console/CLI (sequential) runs; API / MCP runs return their output to the caller via `OUTPUT_BUFFER` and are not duplicated to disk.
+
+### 5. Docs
+
+- README and `docs/BAD_PATTERNS.md` prose corrected to the exploitation-only model (no `check()` / `CheckResult` verification phase) and compile-time `inventory` self-registration via `register_native_module!` + a `pub mod` line (no `build.rs` module indexer). The BAD_PATTERNS regex matrix (driven by hardcoded bash arrays in the audit script) is untouched.
+
+### Licenses (ported components)
+
+| Component | License |
+|---|---|
+| Recog (Rapid7) | BSD-2-Clause |
+| JARM / JA3 / JA3S (Salesforce) | BSD-3-Clause |
+| rmcp (MCP Rust SDK) | Apache-2.0 |
+| SecLists | MIT |
+| ZMap address iterator (previously ported) | Apache-2.0 |
+
+---
+
 ## May 2026 — v0.5.0 Module-System Rewrite
 
 **Module totals: 363 (45 scanners, 284 exploits, 30 creds, 3 osint, 1 plugin)**

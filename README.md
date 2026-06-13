@@ -1,6 +1,8 @@
 # Rustsploit 
 
-Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
+Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. One binary exposes the same module library through **four interfaces** — an interactive shell, a command-line runner, a post-quantum-encrypted REST/WebSocket API, and an MCP server — over an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services, with **Recog** service fingerprinting and **JARM/JA3** TLS fingerprinting built in.
+
+> **Latest release:** see [`RELEASE_NOTES.txt`](RELEASE_NOTES.txt) — official `rmcp` MCP SDK, Recog + JARM/JA3/JA3S fingerprinting, a SecLists wordlist catalog, per-run output auto-save, HTTP connection pooling, and mass-scan fixes.
 
 
 ![Rustsploit Interactive Shell Demo](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
@@ -47,12 +49,15 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 -  **Resource scripts:** Automate workflows from files, auto-load startup scripts, save command history with `makerc`
 -  **Background jobs:** Run modules asynchronously with `run -j`, manage with `jobs` commands
 -  **Export/reporting:** Export all engagement data to JSON, CSV, or human-readable summary reports
--  **Console logging:** `spool` command captures all output to file for documentation
+-  **Console logging & auto-save:** `spool` captures all output to a file on demand; in addition, **every console/CLI module run is auto-saved** (append mode) to `~/.rustsploit/loot/<module> <time> results.txt` — stdout and stderr both captured, multi-host sweeps accumulate into one per-run file
 -  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, IMAP, RDP, RTSP, SNMP, L2TP, MQTT, VNC, MySQL, PostgreSQL, Redis, CouchDB, Elasticsearch, Memcached, HTTP Basic, Proxy, Fortinet — with IPv6 and TLS support
 -  **Exploit coverage:** CVEs for VNC (LibVNC, TigerVNC, TightVNC, x11vnc), honeypots (Cowrie, Dionaea, HoneyTrap, SNARE), WAFs (SafeLine), Apache Camel, Kubernetes ingress-nginx, Commvault, MISP, Zimbra, Next.js, Vite, and 100+ more
 -  **Scanners & utilities:** Port scanner, ping sweep, SSDP, HTTP title grabber, DNS recursion tester, directory bruteforcer, sequential fuzzer, proxy scanner, reflect scanner, vulnerability checker
+-  **Service & TLS fingerprinting:** Rapid7 **Recog** banner → product/version/CPE matching folded into service detection, plus Salesforce **JARM** + **JA3/JA3S** active TLS server fingerprinting (`scanners/jarm_scan`)
+-  **Wordlist catalog:** checksum-pinned **SecLists** wordlists fetched + SHA-256-verified on demand into `~/.rustsploit/wordlists/` (`utils::wordlist::resolve`)
+-  **Performance:** shared, cached HTTP client — TLS config + connection pool reused across runs instead of rebuilt per request, with a bounded idle timeout for internet-scale sweeps
 -  **API server:** PQ-encrypted WebSocket transport — post-quantum cryptography, full CRUD for credentials, hosts, services, loot, jobs
--  **MCP server:** 38-tool Model Context Protocol server for AI-assisted pentesting via stdio
+-  **MCP server:** Model Context Protocol server on the **official `rmcp` SDK (v1.7)** — 29 tools + 7 resources for AI-assisted pentesting via stdio
 -  **Plugin system:** Third-party modules via `src/modules/plugins/` with compile-time `inventory` self-registration and startup safety warnings
 -  **Security hardened:** Input validation, path traversal protection, honeypot detection, root privilege checks, spool symlink protection, memory-safe operations
 -  **IPv4/IPv6 ready:** Both address families work out-of-the-box across all modules

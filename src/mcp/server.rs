@@ -94,9 +94,17 @@ fn module_timeout() -> Option<std::time::Duration> {
             Ok(0) => None,
             Ok(secs) => Some(std::time::Duration::from_secs(secs)),
             // Unparseable override falls back to the default rather than panicking.
-            Err(_) => Some(std::time::Duration::from_secs(300)),
+            Err(e) => {
+                tracing::debug!("RUSTSPLOIT_MCP_TIMEOUT_SECS is not a valid u64, using 300s default: {e}");
+                Some(std::time::Duration::from_secs(300))
+            }
         },
-        Err(_) => Some(std::time::Duration::from_secs(300)),
+        // The variable is normally unset (use the default); a NotUnicode read
+        // error is the only surprising case, so trace it rather than drop it.
+        Err(e) => {
+            tracing::trace!("RUSTSPLOIT_MCP_TIMEOUT_SECS unreadable ({e}); using 300s default");
+            Some(std::time::Duration::from_secs(300))
+        }
     }
 }
 
@@ -192,7 +200,8 @@ impl ServerHandler for RustsploitHandler {
             Some(dur) => {
                 match tokio::time::timeout(dur, super::tools::call_tool(&name, arguments)).await {
                     Ok(r) => r,
-                    Err(_) => {
+                    Err(elapsed) => {
+                        tracing::debug!("MCP tool '{}' timed out: {elapsed}", name);
                         eprintln!(
                             "[MCP] tool '{}' exceeded {}s timeout — aborting call",
                             name,
