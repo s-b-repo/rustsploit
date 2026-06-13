@@ -260,10 +260,20 @@ where
     let jitter_ms = opt_u64("bruteforce_jitter_ms");
 
     // medusa `-r`-style connection retries: `setg bruteforce_retries N` re-tries a
-    // retryable (transient/connection) error up to N times before giving up on a
-    // combo. Defaults to 1 when unset or zero (the historical behaviour).
-    let retries = opt_u64("bruteforce_retries");
-    let max_retries = if retries == 0 { 1 } else { retries as usize };
+    // retryable (transient/connection) error up to N times per combo. Unset → 1
+    // (historical default); explicit 0 → no retries; clamped to a sane ceiling so
+    // a fat-fingered huge value can't turn one combo into a billion attempts.
+    const MAX_BRUTEFORCE_RETRIES: usize = 10;
+    let max_retries = match opt_str("bruteforce_retries") {
+        None => 1,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(n) => n.min(MAX_BRUTEFORCE_RETRIES),
+            Err(e) => {
+                tracing::debug!("bruteforce_retries '{}' invalid ({e}); using 1", s.trim());
+                1
+            }
+        },
+    };
 
     let bf_config = BruteforceConfig {
         target: host.clone(),

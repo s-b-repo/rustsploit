@@ -637,6 +637,47 @@ where
     Ok(total)
 }
 
+/// Like [`load_lines_batched`] but the callback returns `true` to continue or
+/// `false` to STOP reading the file. Lets a consumer (e.g. the streaming
+/// bruteforce driver whose channel receiver was dropped) halt the read instead
+/// of scanning a multi-GB wordlist to the end for nothing.
+pub fn load_lines_batched_until<P, F>(
+    path: P,
+    batch_size: usize,
+    mut on_batch: F,
+) -> Result<usize>
+where
+    P: AsRef<Path>,
+    F: FnMut(Vec<String>) -> bool,
+{
+    let file = fs::File::open(path.as_ref())
+        .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let mut total = 0usize;
+    let mut batch = Vec::with_capacity(batch_size);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l.trim().to_string(),
+            Err(e) => { tracing::trace!("skipping non-UTF-8 wordlist line: {e}"); continue; }
+        };
+        if line.is_empty() {
+            continue;
+        }
+        batch.push(line);
+        if batch.len() >= batch_size {
+            total += batch.len();
+            if !on_batch(std::mem::replace(&mut batch, Vec::with_capacity(batch_size))) {
+                return Ok(total);
+            }
+        }
+    }
+    if !batch.is_empty() {
+        total += batch.len();
+        on_batch(batch);
+    }
+    Ok(total)
+}
+
 /// Load lines from a file without the 100 MB cap.
 /// For wordlists that may be very large.
 pub fn load_lines_uncapped<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {

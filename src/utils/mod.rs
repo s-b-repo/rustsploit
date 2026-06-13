@@ -131,6 +131,7 @@ pub use modules::{
 pub use wordlist::{
     load_lines,
     load_lines_batched,
+    load_lines_batched_until,
     load_lines_cached,
     load_lines_uncapped,
 };

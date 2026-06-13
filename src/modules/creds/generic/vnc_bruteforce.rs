@@ -92,51 +92,90 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
             retryable: false,
         };
     }
-    if let Err(e) = stream.write_all(b"RFB 003.008\n").await {
+    // Reply with min(server, 3.8) floored at 3.3 — NOT a hardcoded 003.008.
+    // Forcing 3.8 against a 3.3-only server desyncs the stream: the security
+    // negotiation differs by version, and a misaligned 4-byte SecurityResult read
+    // of 0x00000000 was reported as a (false-positive) Success.
+    let nego_minor = rfb_minor(&banner).clamp(3, 8);
+    let reply = format!("RFB 003.{nego_minor:03}\n");
+    if let Err(e) = stream.write_all(reply.as_bytes()).await {
         return LoginResult::Error {
             message: format!("write banner: {e}"),
             retryable: true,
         };
     }
 
-    // Server: 1-byte security-type count, then count bytes of types.
-    let mut nsec = [0u8; 1];
-    if let Err(e) =
-        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut nsec, timeout).await
-    {
-        return LoginResult::Error {
-            message: format!("read sec count: {e}"),
-            retryable: true,
-        };
-    }
-    if nsec[0] == 0 {
-        // Failure reason follows (4-byte len + string). Treat as auth fail.
-        return LoginResult::AuthFailed;
-    }
-    let mut sec_types = vec![0u8; nsec[0] as usize];
-    if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-        &mut stream,
-        &mut sec_types,
-        timeout,
-    )
-    .await
-    {
-        return LoginResult::Error {
-            message: format!("read sec types: {e}"),
-            retryable: true,
-        };
-    }
-    if !sec_types.contains(&2u8) {
-        return LoginResult::Error {
-            message: "server doesn't offer VNC auth (type 2)".to_string(),
-            retryable: false,
-        };
-    }
-    if let Err(e) = stream.write_all(&[2u8]).await {
-        return LoginResult::Error {
-            message: format!("write sec choice: {e}"),
-            retryable: true,
-        };
+    // Security-type negotiation differs by RFB version.
+    if nego_minor >= 7 {
+        // RFB 3.7/3.8: 1-byte count, then `count` type bytes; client selects one.
+        let mut nsec = [0u8; 1];
+        if let Err(e) =
+            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut nsec, timeout).await
+        {
+            return LoginResult::Error {
+                message: format!("read sec count: {e}"),
+                retryable: true,
+            };
+        }
+        if nsec[0] == 0 {
+            // Failure reason follows (4-byte len + string). Definitive rejection.
+            return LoginResult::AuthFailed;
+        }
+        let mut sec_types = vec![0u8; nsec[0] as usize];
+        if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
+            &mut stream,
+            &mut sec_types,
+            timeout,
+        )
+        .await
+        {
+            return LoginResult::Error {
+                message: format!("read sec types: {e}"),
+                retryable: true,
+            };
+        }
+        if !sec_types.contains(&2u8) {
+            let msg = if sec_types.contains(&1u8) {
+                "VNC requires no authentication (open access)".to_string()
+            } else {
+                format!("server doesn't offer VNC auth (type 2); offered {sec_types:?}")
+            };
+            return LoginResult::Error { message: msg, retryable: false };
+        }
+        if let Err(e) = stream.write_all(&[2u8]).await {
+            return LoginResult::Error {
+                message: format!("write sec choice: {e}"),
+                retryable: true,
+            };
+        }
+    } else {
+        // RFB 3.3: server dictates a SINGLE 4-byte security type — no client
+        // selection. The challenge (for type 2) follows directly.
+        let mut sec = [0u8; 4];
+        if let Err(e) =
+            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut sec, timeout).await
+        {
+            return LoginResult::Error {
+                message: format!("read sec type: {e}"),
+                retryable: true,
+            };
+        }
+        match u32::from_be_bytes(sec) {
+            2 => {} // VNC auth — fall through to the challenge below.
+            1 => {
+                return LoginResult::Error {
+                    message: "VNC requires no authentication (open access)".to_string(),
+                    retryable: false,
+                }
+            }
+            0 => return LoginResult::AuthFailed, // invalid/refused; reason follows
+            other => {
+                return LoginResult::Error {
+                    message: format!("unexpected RFB 3.3 security type {other}"),
+                    retryable: false,
+                }
+            }
+        }
     }
 
     // 16-byte challenge.
@@ -213,6 +252,18 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
             message: format!("unknown SecurityResult {other}"),
             retryable: false,
         },
+    }
+}
+
+/// Parse the minor version from an `RFB 003.008\n` banner (digits at [8..11]).
+/// Falls back to 8 (the newest we speak) on any malformed banner.
+fn rfb_minor(banner: &[u8; 12]) -> u32 {
+    match std::str::from_utf8(&banner[8..11]) {
+        Ok(s) => s.trim().parse::<u32>().unwrap_or(8),
+        Err(e) => {
+            tracing::debug!("RFB banner minor not UTF-8: {e}");
+            8
+        }
     }
 }
 

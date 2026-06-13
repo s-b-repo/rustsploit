@@ -443,8 +443,17 @@ async fn try_ssh_login(
             let authed = match sess.userauth_password(&user_owned, &pass_owned) {
                 Ok(_) => sess.authenticated(),
                 Err(e) => {
-                    tracing::trace!("SSH auth rejected: {e}");
-                    false
+                    // Only a genuine auth REJECTION is a definitive Ok(false).
+                    // Transport/method errors (socket recv/send, timeout, KEX,
+                    // "method not supported") must propagate so the engine retries
+                    // instead of recording a possibly-valid password as "wrong".
+                    if is_ssh_auth_rejection(&e) {
+                        tracing::trace!("SSH auth rejected: {e}");
+                        false
+                    } else {
+                        if let Err(d) = sess.disconnect(None, "", None) { tracing::trace!("SSH disconnect: {d}"); }
+                        return Err(anyhow!("SSH auth transport error: {e}"));
+                    }
                 }
             };
 
@@ -457,6 +466,19 @@ async fn try_ssh_login(
         .map_err(|e| anyhow!("Connection timeout: {e}"))?;
 
     join_result.context("Join error")?
+}
+
+/// True only for a genuine SSH authentication rejection (a wrong password),
+/// which is a definitive negative. libssh2 surfaces this as
+/// LIBSSH2_ERROR_AUTHENTICATION_FAILED (-18) or PUBLICKEY_UNVERIFIED (-19);
+/// every other code (socket recv/send -7/-43, timeout -30, disconnect -13,
+/// method-not-supported -12, KEX failures, …) is a transport/negotiation fault
+/// that should be retried, not recorded as a wrong credential.
+fn is_ssh_auth_rejection(e: &ssh2::Error) -> bool {
+    matches!(
+        e.code(),
+        ssh2::ErrorCode::Session(-18) | ssh2::ErrorCode::Session(-19)
+    )
 }
 
 crate::register_native_module!(crate::module::Category::Creds, "generic/ssh_bruteforce", native);

