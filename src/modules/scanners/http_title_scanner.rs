@@ -7,36 +7,25 @@ use std::collections::HashSet;
 use std::fs;
 
 use std::time::{Duration, Instant};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
     safe_read_to_string,
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
-pub async fn run(initial_target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let initial_target = ctx
+        .target
+        .as_single()
+        .context("http_title_scanner requires a single-host target")?;
+
     if crate::utils::get_global_source_port().await.is_some() {
         crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
     }
-    if is_mass_scan_target(initial_target) {
-        return run_mass_scan(initial_target, MassScanConfig {
-            protocol_name: "HTTP-Title",
-            default_port: 80,
-            state_file: "http_title_scanner_mass_state.log",
-            default_output: "http_title_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} HTTP-Title open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
 
     banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     let mut targets = collect_initial_targets(initial_target);
 
@@ -56,7 +45,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
 
     if !check_http && !check_https {
         crate::mprintln!("[!] Neither HTTP nor HTTPS selected; nothing to scan.");
-        return Ok(());
+        return Ok(outcome);
     }
 
     let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false).await?;
@@ -86,7 +75,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
     normalized.sort();
 
     let client = Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
         .user_agent("RustSploit-HTTP-Title-Scanner/1.0")
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::limited(5))
@@ -104,22 +93,42 @@ pub async fn run(initial_target: &str) -> Result<()> {
     crate::mprintln!();
 
     for (idx, url) in normalized.iter().enumerate() {
+        if ctx.is_cancelled() { break; }
         // Progress indicator
         if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
-            crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)", 
+            crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)",
                 idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
         }
 
+        ctx.rate_limit(url).await;
         match fetch_title(&client, url, &title_re).await {
             Ok(result) => {
                 if let Some(title) = &result.title {
                     crate::mprintln!("\r{}", format!("[+] {} -> {}", url, title).green());
                     success_count += 1;
+                    outcome.findings.push(Finding {
+                        target: url.clone(),
+                        kind: FindingKind::Banner,
+                        message: format!("HTTP title for {}: {}", url, title),
+                        data: Some(serde_json::json!({
+                            "url": url,
+                            "title": title,
+                        })),
+                    });
                 } else if let Some(status) = result.status {
                     if status.is_success() {
                         crate::mprintln!("\r{}", format!("[+] {} -> <no title> (status: {})", url, status).green());
                         success_count += 1;
+                        outcome.findings.push(Finding {
+                            target: url.clone(),
+                            kind: FindingKind::Banner,
+                            message: format!("HTTP {} {} (no title)", status.as_u16(), url),
+                            data: Some(serde_json::json!({
+                                "url": url,
+                                "status": status.as_u16(),
+                            })),
+                        });
                     } else {
                         crate::mprintln!("\r{}", format!("[~] {} -> <no title> (status: {})", url, status).yellow());
                     }
@@ -172,7 +181,7 @@ pub async fn run(initial_target: &str) -> Result<()> {
     }
 
     crate::mprintln!("\n[*] Scan complete.");
-    Ok(())
+    Ok(outcome)
 }
 
 struct TitleResult {
@@ -248,7 +257,7 @@ fn collect_initial_targets(initial_target: &str) -> Vec<String> {
 
 fn split_targets(input: &str) -> Vec<String> {
     input
-        .split(|c| c == ',' || c == '\n' || c == ';')
+        .split([',', '\n', ';'])
         .map(|item| item.trim().trim_end_matches('/').to_string())
         .filter(|item| !item.is_empty())
         .collect()
@@ -372,5 +381,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "http_title_scanner", native);

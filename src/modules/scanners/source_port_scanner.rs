@@ -1,4 +1,5 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::{
     fs::File,
@@ -15,7 +16,6 @@ use crate::utils::{
     cfg_prompt_port,
 };
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 /// Module metadata for `info` command.
 pub fn info() -> ModuleInfo {
@@ -33,6 +33,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -49,72 +50,20 @@ struct ScanSettings {
 }
 
 /// Main module entrypoint.
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan support: CIDR subnets, random IPs, file-based target lists
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SrcPortScan",
-            default_port: 80,
-            state_file: "source_port_scanner_mass_state.log",
-            default_output: "source_port_scanner_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip, port| {
-            async move {
-                // Quick TCP connect probe from a few well-known bypass source ports
-                let bypass_ports: &[u16] = &[20, 53, 67, 80, 88, 443, 500, 8080];
-                let mut hits = Vec::new();
-                for &src in bypass_ports {
-                    let dest = SocketAddr::new(ip, port);
-                    let bind = if ip.is_ipv4() {
-                        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), src)
-                    } else {
-                        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), src)
-                    };
-                    let domain = if ip.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
-                    if let Ok(sock) = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP)) {
-                        let _ = sock.set_reuse_address(true);
-                        let _ = sock.set_nonblocking(true);
-                        if sock.bind(&bind.into()).is_ok() {
-                            let _ = sock.connect(&dest.into());
-                            let std_stream: std::net::TcpStream = sock.into();
-                            if let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) {
-                                if let Ok(Ok(())) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(3), stream.writable()
-                                ).await {
-                                    if let Ok(None) = stream.take_error() {
-                                        hits.push(src);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if hits.is_empty() {
-                    None
-                } else {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let ports_str: Vec<String> = hits.iter().map(|p| p.to_string()).collect();
-                    Some(format!("[{}] {}:{} SrcPortScan allowed_src_ports=[{}]\n",
-                        ts, ip, port, ports_str.join(",")))
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
-            print_banner();
-        }
+        print_banner();
     }
 
-    let settings = prompt_settings().await?;
+    let settings = prompt_settings(target).await?;
 
     let (ip_str, ip) = resolve_target(target)?;
 
     // Warn about privileged ports requiring root
-    if settings.source_start < 1024 {
-        let is_root = unsafe { libc::geteuid() } == 0;
-        if !is_root {
+    if settings.source_start < 1024
+        && !crate::utils::is_root() {
             let priv_end = std::cmp::min(settings.source_end, 1023);
             crate::mprintln!("{}", format!(
                 "[!] Warning: Source ports {}-{} are privileged (< 1024). \
@@ -123,7 +72,6 @@ pub async fn run(target: &str) -> Result<()> {
                 settings.source_start, priv_end
             ).yellow().bold());
         }
-    }
 
     let source_ports: Vec<u16> = (settings.source_start..=settings.source_end).collect();
     let total = source_ports.len();
@@ -143,6 +91,7 @@ pub async fn run(target: &str) -> Result<()> {
     let mut tasks = Vec::with_capacity(total);
 
     for src_port in source_ports {
+        if crate::context::is_cancelled() { break; }
         let permit = semaphore.clone().acquire_owned().await?;
         let allowed = allowed_ports.clone();
         let prog = progress.clone();
@@ -154,6 +103,7 @@ pub async fn run(target: &str) -> Result<()> {
 
         let handle = tokio::spawn(async move {
             let _permit = permit;
+            if crate::context::is_cancelled() { return; }
 
             let result = if scan_udp {
                 probe_udp(ip, dest_port, src_port, timeout_secs).await
@@ -177,6 +127,12 @@ pub async fn run(target: &str) -> Result<()> {
                             proto, src_port, ip_str, dest_port, "ALLOWED".green().bold(), banner.trim().bright_black())
                     };
                     crate::mprintln!("{}", line);
+                    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                        host: ip_str.clone(),
+                        port: dest_port,
+                        service: format!("src-port-bypass:{}/{}", proto.to_lowercase(), src_port),
+                        version: if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
+                    });
                 }
                 ProbeResult::Denied => {
                     if verbose {
@@ -205,7 +161,9 @@ pub async fn run(target: &str) -> Result<()> {
     }
 
     for task in tasks {
-        let _ = task.await;
+        if let Err(e) = task.await {
+            eprintln!("[!] Task join failed: {}", e);
+        }
     }
 
     let elapsed = start_time.elapsed();
@@ -238,6 +196,29 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
+    // Build structured findings for each allowed source port (firewall bypass)
+    let mut outcome = ModuleOutcome::ok();
+    for r in &results {
+        let well_known = well_known_source_port(r.source_port);
+        outcome = outcome.with(Finding {
+            target: ip_str.clone(),
+            kind: FindingKind::Vulnerable,
+            message: format!(
+                "Source port bypass: {}:{} allows traffic from src port {} {}",
+                ip_str, settings.dest_port, r.source_port,
+                if well_known.is_empty() { String::new() } else { format!("({})", well_known) }
+            ),
+            data: Some(serde_json::json!({
+                "host": ip_str,
+                "dest_port": settings.dest_port,
+                "source_port": r.source_port,
+                "protocol": protocol_label,
+                "well_known_service": well_known,
+                "banner": if r.banner.is_empty() { None } else { Some(r.banner.trim().to_string()) },
+            })),
+        });
+    }
+
     // Save results
     if !settings.output_file.is_empty() {
         let file = File::create(&settings.output_file)?;
@@ -264,7 +245,7 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("\n{}", format!("[*] Results saved to {}", settings.output_file).cyan());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn print_banner() {
@@ -274,7 +255,7 @@ fn print_banner() {
     );
 }
 
-async fn prompt_settings() -> Result<ScanSettings> {
+async fn prompt_settings(target: &str) -> Result<ScanSettings> {
     crate::mprintln!("{}", "\n=== Source Port Scanner Configuration ===".cyan().bold());
 
     let dest_port = cfg_prompt_port("dest_port", "Destination port to test against", 80).await?;
@@ -306,7 +287,8 @@ async fn prompt_settings() -> Result<ScanSettings> {
     let concurrency = cfg_prompt_int_range("concurrency", "Concurrency (parallel probes)", 500, 1, 10000).await? as usize;
     let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 3, 1, 60).await? as u64;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output (show denied/filtered)?", false).await?;
-    let output_file = cfg_prompt_output_file("output_file", "Output filename", "source_port_results.txt").await?;
+    let default_name = format!("source_port_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+    let output_file = cfg_prompt_output_file("output_file", "Output filename", &default_name).await?;
 
     Ok(ScanSettings {
         dest_port,
@@ -338,9 +320,9 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
         Err(e) => return ProbeResult::Error(e.to_string()),
     };
 
-    let _ = socket.set_reuse_address(true);
-    let _ = socket.set_nonblocking(true);
-    let _ = socket.set_tcp_nodelay(true);
+    if let Err(e) = socket.set_reuse_address(true) { eprintln!("[!] Failed to set reuse address: {}", e); }
+    if let Err(e) = socket.set_nonblocking(true) { eprintln!("[!] Failed to set nonblocking: {}", e); }
+    if let Err(e) = socket.set_tcp_nodelay(true) { eprintln!("[!] Failed to set TCP nodelay: {}", e); }
 
     // Bind to the specific source port
     let bind_addr = if ip.is_ipv4() {
@@ -359,7 +341,7 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(_) => return ProbeResult::Denied,
+        Err(e) => { tracing::debug!("connect failed: {e}"); return ProbeResult::Denied; }
     }
 
     // Convert to tokio TcpStream and wait for writable
@@ -375,15 +357,15 @@ async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
                             let banner = quick_banner(&stream, timeout_secs).await;
                             ProbeResult::Allowed { banner }
                         }
-                        Ok(Some(_)) => ProbeResult::Denied,
-                        Err(_) => ProbeResult::Denied,
+                        Ok(Some(e)) => { tracing::debug!("socket error: {e}"); ProbeResult::Denied }
+                        Err(e) => { tracing::debug!("take_error failed: {e}"); ProbeResult::Denied }
                     }
                 }
-                Ok(Err(_)) => ProbeResult::Denied,
-                Err(_) => ProbeResult::Timeout,
+                Ok(Err(e)) => { tracing::debug!("writable failed: {e}"); ProbeResult::Denied }
+                Err(e) => { tracing::debug!("timeout: {e}"); ProbeResult::Timeout }
             }
         }
-        Err(_) => ProbeResult::Denied,
+        Err(e) => { tracing::debug!("from_std failed: {e}"); ProbeResult::Denied }
     }
 }
 
@@ -417,8 +399,8 @@ async fn probe_udp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
             };
             ProbeResult::Allowed { banner }
         }
-        Ok(Err(_)) => ProbeResult::Denied,
-        Err(_) => ProbeResult::Timeout,
+        Ok(Err(e)) => { tracing::debug!("UDP recv error: {e}"); ProbeResult::Denied }
+        Err(e) => { tracing::debug!("timeout: {e}"); ProbeResult::Timeout }
     }
 }
 
@@ -526,7 +508,7 @@ impl ProgressTracker {
             "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
             self.current, self.total, pct, rate, eta
         ).cyan());
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
         if self.current == self.total {
             crate::mprintln!();
@@ -534,3 +516,5 @@ impl ProgressTracker {
         self.last_print = self.current;
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "source_port_scanner", native);

@@ -1,11 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
-use std::net::IpAddr;
 use suppaftp::async_native_tls::TlsConnector;
 use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
 use tokio::time::{timeout, Duration};
 
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::cfg_prompt_yes_no;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
@@ -18,6 +17,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(21),
     }
 }
 
@@ -44,9 +44,9 @@ fn display_banner() {
 
 /// Format IPv4 or IPv6 addresses with port
 fn format_addr(target: &str, port: u16) -> String {
-    if target.starts_with('[') && target.contains("]:") {
-        target.to_string()
-    } else if target.matches(':').count() == 1 && !target.contains('[') {
+    if (target.starts_with('[') && target.contains("]:"))
+        || (target.matches(':').count() == 1 && !target.contains('['))
+    {
         target.to_string()
     } else {
         let clean = if target.starts_with('[') && target.ends_with(']') {
@@ -63,61 +63,13 @@ fn format_addr(target: &str, port: u16) -> String {
 }
 
 /// Anonymous FTP/FTPS login test with IPv6 support
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("ftp_anonymous requires a single-host target")?;
     display_banner();
-
-    // Check for Mass Scan Mode conditions (also handles CIDR subnets concurrently)
-    if is_mass_scan_target(target) {
-        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-
-        return run_mass_scan(
-            target,
-            MassScanConfig {
-                protocol_name: "FTP Anonymous",
-                default_port: 21,
-                state_file: "ftp_hose_state.log",
-                default_output: "ftp_mass_results.txt",
-                default_concurrency: 500,
-            },
-            |ip: IpAddr, port: u16| async move {
-                // Quick connect check
-                if !crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    return None;
-                }
-
-                // Plain FTP anonymous login
-                let addr_str = format!("{}:{}", ip, port);
-                match timeout(
-                    Duration::from_millis(5000),
-                    AsyncFtpStream::connect(&addr_str),
-                )
-                .await
-                {
-                    Ok(Ok(mut ftp)) => {
-                        if ftp.login("anonymous", "anonymous").await.is_ok() {
-                            match timeout(Duration::from_secs(5), ftp.list(None)).await {
-                                Ok(Ok(_)) => {
-                                    let msg = format!("{}:{}:anonymous:anonymous", ip, port);
-                                    crate::mprintln!(
-                                        "\r{}",
-                                        format!("[+] FOUND: {}", msg).green().bold()
-                                    );
-                                    let _ = ftp.quit().await;
-                                    return Some(format!("{}\n", msg));
-                                }
-                                _ => {}
-                            }
-                            let _ = ftp.quit().await;
-                        }
-                    }
-                    _ => {}
-                }
-                None
-            },
-        )
-        .await;
-    }
+    let mut outcome = ModuleOutcome::ok();
 
     // --- Standard Single Target Logic ---
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
@@ -143,97 +95,119 @@ pub async fn run(target: &str) -> Result<()> {
             format!("[VERBOSE] Attempting plain FTP connection to {}...", addr).dimmed()
         );
     }
-    match timeout(
+    let tcp_result = timeout(
         Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        AsyncFtpStream::connect(&addr),
+        crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
     )
-    .await
-    {
-        Ok(Ok(mut ftp)) => {
-            if verbose {
-                crate::mprintln!(
-                    "{}",
-                    format!("[VERBOSE] FTP connection established to {}", addr).dimmed()
-                );
-                crate::mprintln!(
-                    "{}",
-                    "[VERBOSE] Sending USER anonymous / PASS anonymous ...".dimmed()
-                );
-            }
-            let result = ftp.login("anonymous", "anonymous").await;
-            if result.is_ok() {
-                crate::mprintln!("{}", "[+] Anonymous login successful (FTP)".green().bold());
-                match ftp.list(None).await {
-                    Ok(entries) => {
+    .await;
+    match tcp_result {
+        Ok(Ok(tcp_stream)) => match AsyncFtpStream::connect_with_stream(tcp_stream).await {
+            Ok(mut ftp) => {
+                if verbose {
+                    crate::mprintln!(
+                        "{}",
+                        format!("[VERBOSE] FTP connection established to {}", addr).dimmed()
+                    );
+                    crate::mprintln!(
+                        "{}",
+                        "[VERBOSE] Sending USER anonymous / PASS anonymous ...".dimmed()
+                    );
+                }
+                let result = ftp.login("anonymous", "anonymous").await;
+                if result.is_ok() {
+                    crate::mprintln!("{}", "[+] Anonymous login successful (FTP)".green().bold());
+                    match ftp.list(None).await {
+                        Ok(entries) => {
+                            crate::mprintln!(
+                                "{}",
+                                "[+] LIST command successful - Read Access Confirmed".green()
+                            );
+                            if verbose {
+                                crate::mprintln!(
+                                    "{}",
+                                    format!("[VERBOSE] LIST returned {} entries", entries.len())
+                                        .dimmed()
+                                );
+                                for entry in entries.iter().take(20) {
+                                    crate::mprintln!("{}", format!("[VERBOSE]   {}", entry).dimmed());
+                                }
+                                if entries.len() > 20 {
+                                    crate::mprintln!(
+                                        "{}",
+                                        format!(
+                                            "[VERBOSE]   ... and {} more entries",
+                                            entries.len() - 20
+                                        )
+                                        .dimmed()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => crate::mprintln!(
+                            "{}",
+                            format!("[-] Login worked but LIST failed: {}", e).yellow()
+                        ),
+                    }
+                    // Persist credential to framework credential store
+                    if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                        host: domain,
+                        port: 21,
+                        service: "ftp",
+                        username: "anonymous",
+                        secret: "anonymous@",
+                        cred_type: crate::cred_store::CredType::Password,
+                        source_module: "creds/generic/ftp_anonymous",
+                    })
+                    .await.is_none() { eprintln!("[!] Failed to store credential"); }
+                    outcome.findings.push(Finding {
+                        target: domain.to_string(),
+                        kind: FindingKind::Credential,
+                        message: format!("FTP anonymous login at {}:21", domain),
+                        data: Some(serde_json::json!({
+                            "service": "ftp", "host": domain, "port": 21,
+                            "username": "anonymous", "password": "anonymous@",
+                            "tls": false,
+                        })),
+                    });
+                    if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
+                    return Ok(outcome);
+                } else if let Err(e) = result {
+                    if e.to_string().contains("530") {
+                        crate::mprintln!("{}", "[-] Anonymous login rejected (FTP)".yellow());
+                        if verbose {
+                            crate::mprintln!(
+                                "{}",
+                                format!("[VERBOSE] Server response: {}", e).dimmed()
+                            );
+                        }
+                        if let Err(e) = ftp.quit().await { tracing::debug!("FTP quit failed: {e}"); }
+                        return Ok(outcome);
+                    } else if e.to_string().contains("550 SSL") {
                         crate::mprintln!(
                             "{}",
-                            "[+] LIST command successful - Read Access Confirmed".green()
+                            "[*] FTP server requires TLS — upgrading to FTPS...".cyan()
                         );
                         if verbose {
                             crate::mprintln!(
                                 "{}",
-                                format!("[VERBOSE] LIST returned {} entries", entries.len())
-                                    .dimmed()
+                                format!("[VERBOSE] SSL required response: {}", e).dimmed()
                             );
-                            for entry in entries.iter().take(20) {
-                                crate::mprintln!("{}", format!("[VERBOSE]   {}", entry).dimmed());
-                            }
-                            if entries.len() > 20 {
-                                crate::mprintln!(
-                                    "{}",
-                                    format!(
-                                        "[VERBOSE]   ... and {} more entries",
-                                        entries.len() - 20
-                                    )
-                                    .dimmed()
-                                );
-                            }
                         }
+                    } else {
+                        return Err(anyhow!("FTP error: {}", e));
                     }
-                    Err(e) => crate::mprintln!(
-                        "{}",
-                        format!("[-] Login worked but LIST failed: {}", e).yellow()
-                    ),
-                }
-                // Persist credential to framework credential store
-                let _ = crate::cred_store::store_credential(
-                    domain,
-                    21,
-                    "ftp",
-                    "anonymous",
-                    "anonymous@",
-                    crate::cred_store::CredType::Password,
-                    "creds/generic/ftp_anonymous",
-                )
-                .await;
-                let _ = ftp.quit().await;
-                return Ok(());
-            } else if let Err(e) = result {
-                if e.to_string().contains("530") {
-                    crate::mprintln!("{}", "[-] Anonymous login rejected (FTP)".yellow());
-                    if verbose {
-                        crate::mprintln!(
-                            "{}",
-                            format!("[VERBOSE] Server response: {}", e).dimmed()
-                        );
-                    }
-                    return Ok(());
-                } else if e.to_string().contains("550 SSL") {
-                    crate::mprintln!(
-                        "{}",
-                        "[*] FTP server requires TLS — upgrading to FTPS...".cyan()
-                    );
-                    if verbose {
-                        crate::mprintln!(
-                            "{}",
-                            format!("[VERBOSE] SSL required response: {}", e).dimmed()
-                        );
-                    }
-                } else {
-                    return Err(anyhow!("FTP error: {}", e));
                 }
             }
-        }
+            Err(e) => {
+                crate::mprintln!("{}", format!("[!] FTP handshake error: {}", e).red());
+                if verbose {
+                    crate::mprintln!(
+                        "{}",
+                        format!("[VERBOSE] FTP handshake error details: {:?}", e).dimmed()
+                    );
+                }
+            }
+        },
         Ok(Err(e)) => {
             crate::mprintln!("{}", format!("[!] FTP connection error: {}", e).red());
             if verbose {
@@ -243,7 +217,8 @@ pub async fn run(target: &str) -> Result<()> {
                 );
             }
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("timeout: {e}");
             crate::mprintln!("{}", "[-] FTP connection timed out".yellow());
             if verbose {
                 crate::mprintln!(
@@ -267,9 +242,17 @@ pub async fn run(target: &str) -> Result<()> {
         );
     }
 
-    let mut ftps = AsyncNativeTlsFtpStream::connect(&addr)
+    let tcp_stream = timeout(
+        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    )
+    .await
+    .map_err(|e| anyhow!("FTPS connection timed out: {e}"))?
+    .context("FTPS TCP connect failed")?;
+
+    let ftp_plain = AsyncNativeTlsFtpStream::connect_with_stream(tcp_stream)
         .await
-        .map_err(|e| anyhow!("FTPS connect failed: {}", e))?;
+        .context("FTPS FTP handshake failed")?;
 
     if verbose {
         crate::mprintln!(
@@ -280,14 +263,14 @@ pub async fn run(target: &str) -> Result<()> {
 
     let connector = AsyncNativeTlsConnector::from(
         TlsConnector::new()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
             .danger_accept_invalid_hostnames(true),
     );
 
-    ftps = ftps
+    let mut ftps = ftp_plain
         .into_secure(connector, domain)
         .await
-        .map_err(|e| anyhow!("FTPS TLS upgrade failed: {}", e))?;
+        .context("FTPS TLS upgrade failed")?;
 
     if verbose {
         crate::mprintln!(
@@ -328,17 +311,27 @@ pub async fn run(target: &str) -> Result<()> {
                 ),
             }
             // Persist credential to framework credential store
-            let _ = crate::cred_store::store_credential(
-                domain,
-                21,
-                "ftp",
-                "anonymous",
-                "anonymous@",
-                crate::cred_store::CredType::Password,
-                "creds/generic/ftp_anonymous",
-            )
-            .await;
-            let _ = ftps.quit().await;
+            if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                host: domain,
+                port: 21,
+                service: "ftp",
+                username: "anonymous",
+                secret: "anonymous@",
+                cred_type: crate::cred_store::CredType::Password,
+                source_module: "creds/generic/ftp_anonymous",
+            })
+            .await.is_none() { eprintln!("[!] Failed to store credential"); }
+            outcome.findings.push(Finding {
+                target: domain.to_string(),
+                kind: FindingKind::Credential,
+                message: format!("FTPS anonymous login at {}:21", domain),
+                data: Some(serde_json::json!({
+                    "service": "ftp", "host": domain, "port": 21,
+                    "username": "anonymous", "password": "anonymous@",
+                    "tls": true,
+                })),
+            });
+            if let Err(e) = ftps.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
         }
         Err(e) if e.to_string().contains("530") => {
             crate::mprintln!("{}", "[-] Anonymous login rejected (FTPS)".yellow());
@@ -349,5 +342,7 @@ pub async fn run(target: &str) -> Result<()> {
         Err(e) => return Err(anyhow!("FTPS login error: {}", e)),
     }
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/ftp_anonymous", native);

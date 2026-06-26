@@ -32,10 +32,12 @@ Use subfolders for vendor families (e.g., `exploits/cisco/`, `exploits/cameras/`
 
 ### Recommended: Add Module Metadata
 
-Consider adding `info()` and/or `check()` functions to your module:
+Add an `info()` function describing your module. Rustsploit is **exploitation-only**
+— do not add a `check()` / `CheckResult` verification phase; modules run an exploit
+and report `Finding`s (see _Auto-Store Findings_ below).
 
 ```rust
-use crate::module_info::{ModuleInfo, ModuleRank, CheckResult};
+use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -45,24 +47,33 @@ pub fn info() -> ModuleInfo {
         references: vec!["CVE-XXXX-YYYY".to_string()],
         disclosure_date: Some("2025-01-15".to_string()),
         rank: ModuleRank::Good,
+        default_port: Some(8080),
     }
-}
-
-pub async fn check(target: &str) -> CheckResult {
-    // Non-destructive verification only
-    CheckResult::Unknown("Not implemented".to_string())
 }
 ```
 
 ### Auto-Store Findings
 
-If your module discovers credentials, hosts, or services, use the framework helpers:
+**Native modules (preferred):** Emit `Finding` structs in `ModuleOutcome` — the
+scheduler routes them to LootStore, Workspace, and the events bus automatically:
 
 ```rust
-crate::cred_store::store_credential(host, port, "ssh", user, pass,
-    crate::cred_store::CredType::Password, "my_module");
-crate::workspace::track_host(ip, Some("hostname"), None);
-crate::workspace::track_service(ip, 22, "tcp", "ssh", Some("OpenSSH 8.9"));
+outcome.findings.push(Finding {
+    target: target.to_string(),
+    kind: FindingKind::Credential,
+    message: format!("Valid SSH creds: {}:{}", user, pass),
+    data: Some(serde_json::json!({"username": user, "password": pass})),
+});
+```
+
+**Legacy modules:** Can still call framework helpers directly:
+
+```rust
+crate::cred_store::store_credential(crate::cred_store::NewCred {
+    host, port: 22, service: "ssh", username: &user, secret: &pass,
+    cred_type: crate::cred_store::CredType::Password,
+    source_module: "creds/generic/ssh_bruteforce",
+}).await;
 ```
 
 ---
@@ -71,9 +82,12 @@ crate::workspace::track_service(ip, 22, "tcp", "ssh", Some("OpenSSH 8.9"));
 
 These rules are enforced across the entire codebase:
 
-- **No `unsafe` blocks.** Do not use `unsafe` Rust anywhere in this codebase.
-- **No dead code.** All code must be intentional and used. Do not leave unused functions, imports, or variables.
-- **All prompts must use `cfg_prompt_*()` variants** (from `src/utils/prompt.rs`), not raw `prompt_*()` functions. The `cfg_prompt_*` functions check API custom_prompts and global options before falling back to interactive stdin, which is required for API compatibility. Using raw prompt functions will cause modules to block when called via the API.
+- **No `unsafe` blocks.** Do not use `unsafe` Rust anywhere in module code (framework FFI in `src/native/` is the only exception).
+- **No dead code.** All code must be intentional and used. Do not leave unused functions, imports, or variables. No `#[allow(dead_code)]` or `_variable` suppression.
+- **All prompts must use `cfg_prompt_*()` variants** (from `src/utils/prompt.rs`), not raw `prompt_*()` functions. The `cfg_prompt_*` functions check API custom_prompts and global options before falling back to interactive stdin, which is required for API compatibility.
+- **All network connections must use framework wrappers** (`tcp_connect_str`, `tcp_connect_addr`, `blocking_tcp_connect`, `udp_bind`) — never raw `TcpStream::connect` or `UdpSocket::bind`. Third-party libraries must receive pre-connected streams.
+- **No error swallowing.** Every `Err(_)` must capture the error variable and log/display it. No `let _ = <result>`.
+- See [`BAD_PATTERNS.md`](BAD_PATTERNS.md) for the complete 95+ pattern audit checklist.
 
 ## Code Style
 
@@ -86,12 +100,18 @@ These rules are enforced across the entire codebase:
 
 ---
 
-## Mass-Scan Modules
+## Mass-Scan Compatibility
 
-If adding a module with 0.0.0.0/0 support:
-- Copy the `EXCLUDED_RANGES` pattern from an existing mass-scan module
-- Disable honeypot detection in scan-loop mode
-- Default to a sane concurrency limit (mention it in output)
+All modules automatically support mass scan via the scheduler's fan-out
+(CIDR, file, random, comma-separated targets). **Do NOT implement your own
+target iteration or `EXCLUDED_RANGES`.** The scheduler handles exclusions,
+concurrency, and honeypot detection.
+
+Module-level requirements for mass-scan compatibility:
+- **Use target-specific filenames** — `format!("results_{}.txt", safe_target)`
+- **Guard interactive/REPL code** — `if is_batch_mode() { bail!("..."); }`
+- **Use framework network wrappers** — never raw `TcpStream::connect`
+- **No hardcoded timeouts in probes** — accept the user-configured timeout
 
 ---
 

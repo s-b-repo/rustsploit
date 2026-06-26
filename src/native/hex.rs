@@ -1,23 +1,52 @@
 // Vendored from hex 0.4.3 (MIT/Apache-2.0). Maintained in-tree.
 
 const HEX_CHARS_LOWER: &[u8; 16] = b"0123456789abcdef";
+const HEX_CHARS_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Encode a single byte as a lowercase hex pair (e.g. `0xab` -> `[b'a', b'b']`).
+/// Avoids the `format!("{:02x}", b)` allocation in tight loops.
+#[inline]
+pub fn byte_to_lower(b: u8) -> [u8; 2] {
+    [
+        HEX_CHARS_LOWER[(b >> 4) as usize],
+        HEX_CHARS_LOWER[(b & 0x0f) as usize],
+    ]
+}
+
+/// Encode a single byte as an uppercase hex pair (e.g. `0xab` -> `[b'A', b'B']`).
+#[inline]
+pub fn byte_to_upper(b: u8) -> [u8; 2] {
+    [
+        HEX_CHARS_UPPER[(b >> 4) as usize],
+        HEX_CHARS_UPPER[(b & 0x0f) as usize],
+    ]
+}
 
 /// Encode bytes as a lowercase hex string.
 #[inline]
 pub fn encode(data: &[u8]) -> String {
-    let mut s = String::with_capacity(data.len().saturating_mul(2));
-    for &byte in data {
-        s.push(HEX_CHARS_LOWER[(byte >> 4) as usize] as char);
-        s.push(HEX_CHARS_LOWER[(byte & 0x0f) as usize] as char);
+    let mut buf = vec![0u8; data.len().saturating_mul(2)];
+    encode_into(data, &mut buf);
+    // SAFETY: `encode_into` only writes bytes from `HEX_CHARS_LOWER`, all of
+    // which are valid ASCII (and therefore valid UTF-8).
+    unsafe { String::from_utf8_unchecked(buf) }
+}
+
+/// Encode `data` into the start of `out`. Caller must ensure `out.len() >= data.len() * 2`.
+#[inline]
+fn encode_into(data: &[u8], out: &mut [u8]) {
+    debug_assert!(out.len() >= data.len() * 2);
+    for (i, &byte) in data.iter().enumerate() {
+        out[i * 2] = HEX_CHARS_LOWER[(byte >> 4) as usize];
+        out[i * 2 + 1] = HEX_CHARS_LOWER[(byte & 0x0f) as usize];
     }
-    s
 }
 
 /// Decode a hex string into bytes. Accepts uppercase and lowercase.
 /// Returns `Err` on odd-length input or invalid hex characters.
 pub fn decode(hex: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = hex.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(DecodeError::OddLength);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

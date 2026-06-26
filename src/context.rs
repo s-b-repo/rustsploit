@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::config::ModuleConfig;
-use crate::output::OutputAccumulator;
 
 const MAX_PROMPT_CACHE_ENTRIES: usize = 256;
 
@@ -93,6 +92,26 @@ tokio::task_local! {
     /// Modules don't need to reference this directly — the `cfg_prompt_*` functions
     /// check it automatically.
     pub static RUN_CONTEXT: Arc<RunContext>;
+
+    /// Optional per-target scan counters. The job manager scopes this around a
+    /// backgrounded run so the scheduler can publish live progress (total /
+    /// succeeded / failed targets) back into the job's `JobProgress`. Unset for
+    /// foreground/CLI runs, in which case the scheduler simply skips it.
+    pub static SCAN_COUNTERS: Arc<ScanCounters>;
+}
+
+/// Live per-target progress for a running scan, shared from the scheduler back
+/// to the job manager. All counters are monotonic for the lifetime of one run.
+#[derive(Default)]
+pub struct ScanCounters {
+    pub total: AtomicU64,
+    pub succeeded: AtomicU64,
+    pub failed: AtomicU64,
+}
+
+/// The active scan counters, if a job scoped them. `None` for foreground runs.
+pub fn scan_counters() -> Option<Arc<ScanCounters>> {
+    SCAN_COUNTERS.try_with(|c| c.clone()).ok()
 }
 
 /// Per-run context carrying module config, target, and structured output accumulator.
@@ -101,11 +120,27 @@ pub struct RunContext {
     pub config: ModuleConfig,
     /// Per-request target override (API mode). Shell mode leaves this None.
     pub target: Option<String>,
-    /// Accumulated structured findings from this module run.
-    pub output: OutputAccumulator,
     /// Shared prompt cache for concurrent dispatch modes.
     /// When set, `cfg_prompt_*` functions check this cache before prompting stdin.
     pub prompt_cache: Option<PromptCache>,
+    /// Cooperative cancellation signal for this run. `Job::kill` triggers
+    /// `.cancel()` on this token; modules can check `crate::context::is_cancelled()`
+    /// in their loops to terminate gracefully. Default is an unfired token, so
+    /// modules that don't check it behave exactly as before.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Tenant identity for multi-tenant isolation. Set from the PQ session's
+    /// `client_name` in API mode; `None` in shell mode (falls back to "local").
+    pub tenant_id: Option<String>,
+    /// `category/name` path of the module being run. Set by the scheduler
+    /// before invoking the module so `events::emit` and finding helpers
+    /// can attribute output to the right module without each module
+    /// passing the path manually. Empty when called outside a scheduled
+    /// run (e.g. utility code invoked from the shell).
+    pub module_path: String,
+    /// Tracked task spawns. Modules call `crate::context::spawn(...)` to
+    /// register a `tokio::spawn`; the scheduler aborts every handle here
+    /// in `Module::cleanup` so cancelled runs don't leak orphan tasks.
+    pub spawned: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl RunContext {
@@ -114,8 +149,11 @@ impl RunContext {
         Self {
             config,
             target: Some(target),
-            output: OutputAccumulator::new(),
             prompt_cache: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            tenant_id: None,
+            module_path: String::new(),
+            spawned: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -125,9 +163,112 @@ impl RunContext {
         Self {
             config,
             target: Some(target),
-            output: OutputAccumulator::new(),
             prompt_cache: Some(cache),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            tenant_id: None,
+            module_path: String::new(),
+            spawned: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
+    }
+
+    /// Attach an externally-managed cancellation token (e.g. one owned by
+    /// `JobManager` so `kill` can trigger it).
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
+    }
+
+    /// Attach the module path so finding-emission helpers can attribute
+    /// output to the right module.
+    pub fn with_module_path(mut self, module_path: String) -> Self {
+        self.module_path = module_path;
+        self
+    }
+}
+
+// ============================================================
+// COOPERATIVE CANCELLATION HELPERS
+// ============================================================
+
+/// Returns `true` if the current run has been cancelled.
+///
+/// Module loops that want to be interruptible should call this each iteration:
+///
+/// ```ignore
+/// for target in targets {
+///     if crate::context::is_cancelled() { break; }
+///     ...
+/// }
+/// ```
+///
+/// Returns `false` if called outside of a `RUN_CONTEXT` scope (e.g. in tests
+/// or top-level CLI code), so it's always safe to call.
+pub fn is_cancelled() -> bool {
+    RUN_CONTEXT.try_with(|ctx| ctx.cancel.is_cancelled()).unwrap_or(false)
+}
+
+/// Returns a clone of the current run's cancellation token, suitable for
+/// passing to `tokio::select!` or `child.cancelled().await`.
+///
+/// Returns `None` if called outside of a `RUN_CONTEXT` scope.
+pub fn cancellation_token() -> Option<tokio_util::sync::CancellationToken> {
+    RUN_CONTEXT.try_with(|ctx| ctx.cancel.clone()).ok()
+}
+
+/// Returns the tenant_id for the current run, or `None` if not in a
+/// tenant-scoped context (shell mode / no RunContext).
+pub fn current_tenant_id() -> Option<String> {
+    RUN_CONTEXT.try_with(|ctx| ctx.tenant_id.clone()).ok().flatten()
+}
+
+/// Returns the `category/name` path of the module currently running in
+/// this task. Empty when called outside a `RUN_CONTEXT` scope.
+pub fn current_module_path() -> String {
+    RUN_CONTEXT
+        .try_with(|ctx| ctx.module_path.clone())
+        .unwrap_or_default()
+}
+
+/// Spawn a tracked tokio task that will be aborted when the current run
+/// finishes (via `Module::cleanup` or cancellation). Falls back to a
+/// plain `tokio::spawn` if called outside a `RUN_CONTEXT` scope.
+pub fn spawn<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let attached = RUN_CONTEXT
+        .try_with(|ctx| ctx.clone())
+        .ok();
+    if let Some(ctx) = attached {
+        // Acquire the lock synchronously via `try_lock` first to avoid a
+        // race where `abort_all_spawned` fires before the deferred
+        // `tokio::spawn` acquires the lock.  If contention prevents
+        // `try_lock`, fall back to a spawned acquire — the worst that
+        // happens is the future misses an `abort_all` that fires in the
+        // narrow window (same as the old code).
+        if let Ok(mut joinset) = ctx.spawned.try_lock() {
+            joinset.spawn(future);
+        } else {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let mut joinset = ctx.spawned.lock().await;
+                joinset.spawn(future);
+            });
+        }
+    } else {
+        tokio::spawn(future);
+    }
+}
+
+/// Abort every tracked spawn registered during the current run. Called by
+/// the scheduler in `Module::cleanup` and on cancellation paths.
+pub async fn abort_all_spawned() {
+    if let Ok(ctx) = RUN_CONTEXT.try_with(|ctx| ctx.clone()) {
+        let mut joinset = ctx.spawned.lock().await;
+        joinset.abort_all();
+        // Drain — abort_all only marks; we want to await so handles drop
+        // before we return.
+        while joinset.join_next().await.is_some() {}
     }
 }
 
@@ -137,12 +278,41 @@ impl RunContext {
 
 /// Execute an async closure inside a task-local `RUN_CONTEXT` with a target.
 /// Returns the closure's result plus the `RunContext`.
+/// Automatically inherits the tenant identity from `CURRENT_TENANT` if set.
 pub async fn run_with_context_target<F, Fut, T>(config: crate::config::ModuleConfig, target: String, f: F) -> (T, std::sync::Arc<RunContext>)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let ctx = std::sync::Arc::new(RunContext::with_target(config, target));
+    let mut rc = RunContext::with_target(config, target);
+    if let Ok(tid) = crate::tenant::CURRENT_TENANT.try_with(|t| t.clone()) {
+        rc.tenant_id = Some(tid);
+    }
+    let ctx = std::sync::Arc::new(rc);
+    let ctx_clone = ctx.clone();
+    let result = RUN_CONTEXT.scope(ctx_clone, f()).await;
+    (result, ctx)
+}
+
+/// Same as `run_with_context_target`, but threads an externally-managed
+/// `CancellationToken` into the `RunContext`. Used by the job manager so that
+/// `Job::kill` can signal cooperative cancellation to module code via
+/// `crate::context::is_cancelled()`.
+pub async fn run_with_context_target_and_cancel<F, Fut, T>(
+    config: crate::config::ModuleConfig,
+    target: String,
+    cancel: tokio_util::sync::CancellationToken,
+    f: F,
+) -> (T, std::sync::Arc<RunContext>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut rc = RunContext::with_target(config, target).with_cancellation(cancel);
+    if let Ok(tid) = crate::tenant::CURRENT_TENANT.try_with(|t| t.clone()) {
+        rc.tenant_id = Some(tid);
+    }
+    let ctx = std::sync::Arc::new(rc);
     let ctx_clone = ctx.clone();
     let result = RUN_CONTEXT.scope(ctx_clone, f()).await;
     (result, ctx)

@@ -15,10 +15,15 @@ pub struct GlobalOptions {
 
 impl GlobalOptions {
     fn new() -> Self {
-        let file_path = home::home_dir()
+        let base = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".rustsploit")
-            .join("global_options.json");
+            .join(".rustsploit");
+        Self::with_base_dir(base)
+    }
+
+    /// Create a global options store under a custom base directory.
+    pub(crate) fn with_base_dir(base: PathBuf) -> Self {
+        let file_path = base.join("global_options.json");
 
         let options = if file_path.exists() {
             match std::fs::read_to_string(&file_path) {
@@ -58,27 +63,27 @@ impl GlobalOptions {
         if key.is_empty() || key.len() > Self::MAX_KEY_LEN || value.len() > Self::MAX_VALUE_LEN {
             return false;
         }
-        let snapshot = {
-            let mut opts = self.options.write().await;
-            if opts.len() >= Self::MAX_ENTRIES && !opts.contains_key(key) {
-                return false;
-            }
-            opts.insert(key.to_string(), value.to_string());
-            opts.clone()
-        };
+        // P1-1: hold the lock across the disk save. Previous code released
+        // the lock before persisting, allowing two concurrent setters to
+        // disagree on what the on-disk file contains.
+        let mut opts = self.options.write().await;
+        if opts.len() >= Self::MAX_ENTRIES && !opts.contains_key(key) {
+            return false;
+        }
+        opts.insert(key.to_string(), value.to_string());
+        let snapshot = opts.clone();
         self.save_locked(&snapshot).await;
         true
     }
 
     /// Remove a global option. Persists to disk.
     pub async fn unset(&self, key: &str) -> bool {
-        let snapshot = {
-            let mut opts = self.options.write().await;
-            let removed = opts.remove(key).is_some();
-            if removed { Some(opts.clone()) } else { None }
-        };
-        if let Some(data) = snapshot {
-            self.save_locked(&data).await;
+        // P1-1: same lock-during-save fix as `set()`.
+        let mut opts = self.options.write().await;
+        let removed = opts.remove(key).is_some();
+        if removed {
+            let snapshot = opts.clone();
+            self.save_locked(&snapshot).await;
             return true;
         }
         false
@@ -92,6 +97,9 @@ impl GlobalOptions {
     /// Synchronous blocking get for use in non-async contexts.
     /// Spins briefly if a writer holds the lock, so user-set values
     /// are never silently replaced by defaults during a concurrent save.
+    /// If all retries are exhausted (only possible if a long-running writer
+    /// holds the lock), logs a debug warning so the silent-default fallback
+    /// is observable in tracing.
     pub fn try_get(&self, key: &str) -> Option<String> {
         for _ in 0..50 {
             if let Ok(guard) = self.options.try_read() {
@@ -99,6 +107,10 @@ impl GlobalOptions {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        tracing::debug!(
+            key,
+            "global_options try_get gave up after 50ms — caller will fall back to default"
+        );
         None
     }
 
@@ -109,12 +121,11 @@ impl GlobalOptions {
 
     /// Save to disk using atomic write (write to temp, then rename).
     async fn save_locked(&self, opts: &HashMap<String, String>) {
-        if let Some(parent) = self.file_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        if let Some(parent) = self.file_path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await {
                 eprintln!("[!] Failed to create options directory: {}", e);
                 return;
             }
-        }
         let tmp = self.file_path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(opts) {
             Ok(j) => j,
@@ -124,14 +135,14 @@ impl GlobalOptions {
             }
         };
         {
-            let file = match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .await
+            // P1-7: O_NOFOLLOW + create-with-mode atomically.
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            #[cfg(unix)]
             {
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = match opts.open(&tmp).await {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[!] Failed to write temp options file: {}", e);

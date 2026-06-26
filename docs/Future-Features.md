@@ -29,10 +29,13 @@ Currently, modules are configured interactively or via API JSON payloads. We pla
 - **Goal:** Allow users to save their favorite scan parameters (wordlists, threads, timeouts) to a `.toml` or `.yaml` file and load them instantly.
 - **Usage Idea:** `run exploits/tomcat_rce --config profiles/aggressive.toml` or `set config profiles/aggressive.toml` in the shell.
 
-### 2. Dynamic Source Port Modification
-While we currently support advanced networking like IP spoofing in specific flood modules, we plan to bring dynamic source port control to the framework level.
-- **Goal:** Allow scanners and exploit modules to bind to specific source ports (e.g., source port 53) to bypass poorly configured firewalls that trust traffic originating from privileged ports.
-- **Implementation:** Extending the global configuration and socket helpers to accept an optional `bind_port` parameter.
+### ~~2. Dynamic Source Port Modification~~ ✅ Completed (v0.5.0)
+Source port binding is now framework-level. `setg source_port 53` binds all
+outbound TCP/UDP connections to port 53 via `socket2` with `SO_REUSEADDR` /
+`SO_REUSEPORT`. All network wrappers (`tcp_connect_str`, `tcp_connect_addr`,
+`blocking_tcp_connect`, `udp_bind`) honour this setting. Third-party library
+connections (FTP via suppaftp, Telnet) receive pre-connected streams from
+these wrappers so they also respect the source port.
 
 ### 3. Session/Handler Management
 Add Metasploit-style session management with reverse/bind shell handlers.
@@ -42,7 +45,7 @@ Add Metasploit-style session management with reverse/bind shell handlers.
 ### 4. Post-Exploitation Modules
 Add a `post/` module category for post-exploitation tasks.
 - **Goal:** Privilege escalation checks, persistence mechanisms, credential extraction, lateral movement.
-- **Implementation:** New module category auto-discovered by build.rs.
+- **Implementation:** New module category auto-discovered by `register_native_module!` + `inventory`.
 
 ### 5. Network Pivoting
 Route traffic through compromised hosts.

@@ -2,9 +2,9 @@
 //
 // Input sanitization, validation, and shell escaping utilities.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use url::Url;
 
 /// Maximum length for command inputs to prevent DoS
@@ -38,6 +38,21 @@ pub fn sanitize_string_input(input: &str) -> Result<String> {
     Ok(sanitized)
 }
 
+/// Best-effort scrub of free-text scan data (host notes, service banners,
+/// loot descriptions, etc.) for safe storage, export, and terminal display.
+/// Drops ALL control characters — including newlines, CR, and the ESC byte
+/// used for ANSI terminal-escape injection — and caps length. Unlike
+/// [`sanitize_string_input`], this never fails: a junk byte in a captured
+/// banner is silently dropped rather than rejecting the whole record.
+pub fn scrub_stored_text(input: &str) -> String {
+    const MAX_STORED_FIELD: usize = 4096;
+    input
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STORED_FIELD)
+        .collect()
+}
+
 /// Validate a file path for safety: rejects path traversal, null bytes,
 /// control characters, symlinks, and excessively long paths.
 pub fn validate_safe_file_path(path: &str) -> Result<String> {
@@ -49,18 +64,20 @@ pub fn validate_safe_file_path(path: &str) -> Result<String> {
     if trimmed.len() > MAX_PATH_LENGTH {
         return Err(anyhow!("File path too long (max {} chars)", MAX_PATH_LENGTH));
     }
-    if trimmed.contains("..") {
+    let p = Path::new(trimmed);
+    // Reject `..` as a path component (ParentDir), not as a substring.
+    // The substring check rejects legitimate filenames like `myapp..backup`.
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(anyhow!("Path traversal detected: '..' is not allowed in file paths"));
     }
-    if trimmed.contains("//") {
-        return Err(anyhow!("Invalid path: double slashes are not allowed"));
-    }
-    let p = Path::new(trimmed);
-    if let Ok(m) = p.symlink_metadata() {
-        if m.file_type().is_symlink() {
+    // Fast-fail TOCTOU check: a symlink visible at this point in time. The
+    // consumer is still responsible for opening with O_NOFOLLOW (or the
+    // platform equivalent) since the path could be replaced between this
+    // check and any subsequent open() call.
+    if let Ok(m) = p.symlink_metadata()
+        && m.file_type().is_symlink() {
             return Err(anyhow!("Symlinks are not allowed: {}", trimmed));
         }
-    }
     Ok(trimmed.to_string())
 }
 
@@ -96,14 +113,13 @@ pub fn validate_command_input(command: &str) -> Result<String> {
             trimmed.len()
         ));
     }
-    let sanitized: String = trimmed
-        .chars()
-        .filter(|c| *c != '\0')
-        .collect();
-    if sanitized.is_empty() {
-        return Err(anyhow!("Command contains only invalid characters"));
+    if trimmed.contains('\0') {
+        return Err(anyhow!("Command input contains null bytes"));
     }
-    Ok(sanitized)
+    if trimmed.chars().any(|c| c.is_control() && c != '\t' && c != '\n') {
+        return Err(anyhow!("Command input contains control characters"));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Validates file path to prevent path traversal attacks.
@@ -119,20 +135,18 @@ pub fn validate_file_path(path: &str, allow_absolute: bool) -> Result<String> {
             trimmed.len()
         ));
     }
-    if trimmed.contains("..") {
+    // Reject `..` as a path component (ParentDir), not as a substring.
+    // Substring check would also reject legitimate filenames like `foo..bar`.
+    if Path::new(trimmed).components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(anyhow!("Path traversal detected: '..' not allowed"));
-    }
-    if trimmed.contains("//") {
-        return Err(anyhow!("Invalid path format: double slashes not allowed"));
     }
     if trimmed.chars().any(|c| c.is_control()) {
         return Err(anyhow!("File path cannot contain control characters"));
     }
-    if !allow_absolute {
-        if trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':')) {
+    if !allow_absolute
+        && (trimmed.starts_with('/') || (cfg!(windows) && trimmed.chars().nth(1) == Some(':'))) {
             return Err(anyhow!("Absolute paths not allowed"));
         }
-    }
     if trimmed.contains('\x00') {
         return Err(anyhow!("File path cannot contain null bytes"));
     }
@@ -160,10 +174,10 @@ pub fn validate_url(url: &str, allowed_schemes: Option<&[&str]>) -> Result<Strin
         ));
     }
     let parsed_url = Url::parse(trimmed)
-        .map_err(|e| anyhow!("Invalid URL format: {}", e))?;
+        .context("Invalid URL format")?;
     if let Some(schemes) = allowed_schemes {
         let scheme = parsed_url.scheme();
-        if !schemes.iter().any(|&s| s == scheme) {
+        if !schemes.contains(&scheme) {
             return Err(anyhow!(
                 "URL scheme '{}' not allowed. Allowed schemes: {:?}",
                 scheme,

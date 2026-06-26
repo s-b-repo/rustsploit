@@ -5,7 +5,6 @@
 // for reliable operation regardless of CWD.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -26,8 +25,7 @@ pub fn module_exists(module_path: &str) -> bool {
     if module_path.contains("..") || module_path.contains("//") {
         return false;
     }
-    let modules = crate::commands::discover_modules();
-    modules.iter().any(|m| m == module_path)
+    crate::commands::discover_modules_cached().iter().any(|m| m == module_path)
 }
 
 /// Helper to get a random color for module display.
@@ -52,7 +50,7 @@ pub fn list_all_modules() {
     let mut grouped = std::collections::BTreeMap::new();
     for module in &modules {
         let parts: Vec<&str> = module.split('/').collect();
-        let category = parts.get(0).unwrap_or(&"Other").to_string();
+        let category = parts.first().unwrap_or(&"Other").to_string();
         grouped.entry(category).or_insert_with(Vec::new).push(module.clone());
     }
     crate::mprintln!();
@@ -101,7 +99,7 @@ pub fn find_modules(keyword: &str) {
     let mut grouped = std::collections::BTreeMap::new();
     for module in filtered {
         let parts: Vec<&str> = module.split('/').collect();
-        let category = parts.get(0).unwrap_or(&"Other").to_string();
+        let category = parts.first().unwrap_or(&"Other").to_string();
         grouped.entry(category).or_insert_with(Vec::new).push(module.clone());
     }
     for (category, paths) in grouped {
@@ -123,82 +121,14 @@ pub fn find_modules(keyword: &str) {
     }
 }
 
-/// Helper to load lines from a file.
-pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
-    let metadata = fs::metadata(path.as_ref())
-        .with_context(|| format!("Failed to stat file '{}'", path.as_ref().display()))?;
-    if metadata.len() > MAX_FILE_SIZE {
-        bail!(
-            "File '{}' is too large ({:.1} MB, max {} MB)",
-            path.as_ref().display(),
-            metadata.len() as f64 / (1024.0 * 1024.0),
-            MAX_FILE_SIZE / (1024 * 1024)
-        );
-    }
-    let file = fs::File::open(path.as_ref())
-        .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
-    let reader = BufReader::new(file);
-    Ok(reader
-        .lines()
-        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
-        .filter(|line| !line.is_empty())
-        .collect())
-}
-
-/// Load lines from a wordlist of any size.
-/// Files <= 250 MB are loaded into memory. Larger files are streamed in
-/// batches of `batch_size` lines, calling `on_batch` for each chunk.
-/// Returns the total number of lines processed.
-pub fn load_lines_batched<P, F>(
-    path: P,
-    batch_size: usize,
-    mut on_batch: F,
-) -> Result<usize>
-where
-    P: AsRef<Path>,
-    F: FnMut(Vec<String>),
-{
-    let file = fs::File::open(path.as_ref())
-        .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
-    let reader = BufReader::with_capacity(256 * 1024, file);
-    let mut total = 0usize;
-    let mut batch = Vec::with_capacity(batch_size);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l.trim().to_string(),
-            Err(_) => continue,
-        };
-        if line.is_empty() {
-            continue;
-        }
-        batch.push(line);
-        if batch.len() >= batch_size {
-            total += batch.len();
-            on_batch(std::mem::replace(&mut batch, Vec::with_capacity(batch_size)));
-        }
-    }
-    if !batch.is_empty() {
-        total += batch.len();
-        on_batch(batch);
-    }
-    Ok(total)
-}
-
 /// Streaming threshold: files larger than this use batched loading.
-pub const STREAMING_THRESHOLD: u64 = 250 * 1024 * 1024;
-
-/// Load lines from a file without the 100 MB cap.
-/// For wordlists that may be very large.
-pub fn load_lines_uncapped<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
-    let file = fs::File::open(path.as_ref())
-        .with_context(|| format!("Failed to open file '{}'", path.as_ref().display()))?;
-    let reader = BufReader::with_capacity(256 * 1024, file);
-    Ok(reader
-        .lines()
-        .filter_map(|line| line.ok().map(|s| s.trim().to_string()))
-        .filter(|line| !line.is_empty())
-        .collect())
-}
+///
+/// Canonically defined once in `crate::utils::wordlist` so every streaming
+/// decision (wordlist `should_stream`, `run_bruteforce_streaming`, the FTP
+/// module's pre-check) agrees on the same cutoff. Crucially this sits *below*
+/// `MAX_FILE_SIZE` (the 100 MB `load_lines` hard cap) so large password lists
+/// route into the streaming engine instead of hard-failing.
+pub const STREAMING_THRESHOLD: u64 = crate::utils::wordlist::STREAMING_THRESHOLD;
 
 /// Check file size for streaming decisions.
 pub fn file_size<P: AsRef<Path>>(path: P) -> u64 {

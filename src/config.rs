@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ipnetwork::IpNetwork;
 use regex::Regex;
 
@@ -58,11 +58,42 @@ impl GlobalConfig {
             return Err(anyhow!("Target cannot contain control characters"));
         }
 
-        // Mass scan keywords: "random", "0.0.0.0" — store as-is
-        if trimmed == "random" || trimmed == "0.0.0.0" {
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+        // Mass scan keyword: "random" — store as-is. "0.0.0.0/0" is handled
+        // below as a CIDR subnet.
+        if trimmed == "random" {
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
             return Ok(());
+        }
+
+        // Bare "0.0.0.0" is an operator alias for the full-internet sweep
+        // "0.0.0.0/0" (== "random"), added 2026-06-09 (reverses the earlier M45
+        // single-host rule). Store it as the /0 subnet so every consumer treats
+        // it as a mass scan; the scheduler still shows an advisory + an
+        // interactive confirmation before it actually sweeps.
+        if trimmed == "0.0.0.0" {
+            let net: IpNetwork = "0.0.0.0/0"
+                .parse()
+                .map_err(|e| anyhow!("internal: failed to parse 0.0.0.0/0 as a network: {e}"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Subnet(net));
+            return Ok(());
+        }
+
+        // Sequential mass-scan keywords: `seq`/`sequential` (whole public range)
+        // or `seq:<ip>`/`sequential:<ip>` (explicit start). Stored verbatim;
+        // `module::Target::parse` turns it into `Target::Sequential`.
+        {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower == "seq"
+                || lower == "sequential"
+                || lower.starts_with("seq:")
+                || lower.starts_with("sequential:")
+            {
+                let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+                *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+                return Ok(());
+            }
         }
 
         // File-based target list: resolve canonical path to prevent traversal,
@@ -72,7 +103,7 @@ impl GlobalConfig {
         if path.exists() && path.is_file() {
             // Resolve to canonical path (eliminates .., symlinks, etc.)
             let canonical = path.canonicalize()
-                .map_err(|e| anyhow!("Failed to resolve file path '{}': {}", trimmed, e))?;
+                .with_context(|| format!("Failed to resolve file path '{}'", trimmed))?;
             let canonical_str = canonical.to_string_lossy().to_string();
             if canonical_str.len() > MAX_TARGET_LENGTH {
                 return Err(anyhow!(
@@ -80,7 +111,7 @@ impl GlobalConfig {
                     MAX_TARGET_LENGTH
                 ));
             }
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(canonical_str));
             return Ok(());
         }
@@ -105,7 +136,7 @@ impl GlobalConfig {
                 return self.set_target(&targets[0]);
             }
             // Validate each individual target
-            const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0", "0.0.0.0/0"];
+            const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0/0"];
             for t in &targets {
                 // Allow mass scan keywords, CIDRs, file paths, and hostnames/IPs
                 if MASS_SCAN_KEYWORDS.contains(&t.as_str()) {
@@ -118,16 +149,25 @@ impl GlobalConfig {
                     Self::validate_hostname_or_ip(t)?;
                 }
             }
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Multi(targets));
             return Ok(());
         }
 
-        // Try to parse as CIDR subnet first
-        if let Ok(network) = trimmed.parse::<IpNetwork>() {
+        // Try to parse as CIDR subnet first — but ONLY when an explicit prefix
+        // is present. `IpNetwork::from_str` silently widens a bare address to a
+        // host route (`0.0.0.0` -> `0.0.0.0/32`, `10.0.0.1` -> `10.0.0.1/32`),
+        // which turned every single-IP target into a subnet: it surfaced as
+        // "Using target: 0.0.0.0/32", routed single hosts through CIDR fan-out,
+        // and tripped `is_mass_scan_target` (which then skips honeypot
+        // detection). A bare IP is a single host (M45) — require the '/' so it
+        // falls through to `TargetConfig::Single` below.
+        if trimmed.contains('/')
+            && let Ok(network) = trimmed.parse::<IpNetwork>()
+        {
             // No size limit enforced here - user can set 0.0.0.0/0 if they want.
             // Consumers (looping logic) must handle large subnets responsibly (e.g. via iterators).
-            let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Subnet(network));
             return Ok(());
         }
@@ -136,7 +176,7 @@ impl GlobalConfig {
         Self::validate_hostname_or_ip(trimmed)?;
 
         // Otherwise, treat as single IP or hostname
-        let mut target_guard = self.target.write().map_err(|_| anyhow!("Config lock poisoned"))?;
+        let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
         *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
         Ok(())
     }
@@ -153,19 +193,19 @@ impl GlobalConfig {
         
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
-        static VALID_CHARS: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
-            Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$").expect("hardcoded regex must compile")
-        });
-        let valid_chars = &*VALID_CHARS;
+        // Use OnceCell::get_or_try_init so a (theoretically impossible)
+        // regex compile failure surfaces as a clean error instead of a
+        // panic on first input. The literal pattern is hardcoded and has
+        // never failed to compile in test, but proper plumbing matters.
+        static VALID_CHARS: once_cell::sync::OnceCell<Regex> = once_cell::sync::OnceCell::new();
+        let valid_chars = VALID_CHARS.get_or_try_init(|| {
+            Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$")
+                .map_err(|e| anyhow!("internal error: VALID_CHARS regex failed to compile: {e}"))
+        })?;
         if !valid_chars.is_match(target) {
             return Err(anyhow!(
                 "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"
             ));
-        }
-        
-        // Check for spaces
-        if target.contains(' ') {
-            return Err(anyhow!("Target cannot contain spaces"));
         }
         
         // Basic hostname format check (not starting/ending with special chars)
@@ -173,10 +213,8 @@ impl GlobalConfig {
             return Err(anyhow!("Target cannot start with '.' or '-'"));
         }
         
-        if target.ends_with('.') && !target.ends_with("..") {
-            // Allow trailing dot for FQDN, but not double dots
-        }
-        
+        // A single trailing dot (FQDN root label, e.g. "example.com.") is
+        // allowed implicitly; consecutive dots are rejected just below.
         // Check for consecutive dots (invalid in hostnames)
         if target.contains("..") {
             return Err(anyhow!("Target cannot contain consecutive dots"));
@@ -187,7 +225,7 @@ impl GlobalConfig {
 
     /// Get the global target as a single string (for display)
     pub fn get_target(&self) -> Option<String> {
-        let guard = self.target.read().ok()?;
+        let guard = self.target.read().unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|t| match t {
             TargetConfig::Single(ip) => ip.clone(),
             TargetConfig::Subnet(net) => net.to_string(),
@@ -209,7 +247,7 @@ impl GlobalConfig {
     /// For single IPs, returns 1
     /// For subnets, returns the subnet size without expanding
     pub fn get_target_size(&self) -> Option<u64> {
-        let target_guard = self.target.read().ok()?;
+        let target_guard = self.target.read().unwrap_or_else(|e| e.into_inner());
         match target_guard.as_ref() {
             Some(TargetConfig::Single(_)) => Some(1),
             Some(TargetConfig::Subnet(net)) => {
@@ -220,6 +258,22 @@ impl GlobalConfig {
                 for t in targets {
                     if let Ok(net) = t.parse::<IpNetwork>() {
                         total = total.saturating_add(Self::network_size(&net));
+                    } else if std::path::Path::new(t).is_file() {
+                        // A file member contributes its real target count (one per
+                        // non-empty, non-comment line), not a flat 1 — otherwise a
+                        // comma-list containing a host file wildly under-estimates
+                        // the scan size used for ETA/throttling.
+                        let lines = std::fs::read_to_string(t)
+                            .map(|s| {
+                                s.lines()
+                                    .filter(|l| {
+                                        let l = l.trim();
+                                        !l.is_empty() && !l.starts_with('#')
+                                    })
+                                    .count() as u64
+                            })
+                            .unwrap_or(1);
+                        total = total.saturating_add(lines.max(1));
                     } else {
                         total = total.saturating_add(1);
                     }
@@ -251,16 +305,14 @@ impl GlobalConfig {
 
     /// Clear the global target
     pub fn clear_target(&self) {
-        if let Ok(mut target_guard) = self.target.write() {
-             *target_guard = None;
-        }
+        *self.target.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
 /// Global configuration instance
 use once_cell::sync::Lazy;
 
-pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new());
+pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(GlobalConfig::new);
 
 /// Module-level configuration for API-driven execution
 /// This is set by the API before running a module and read by modules
@@ -334,7 +386,7 @@ pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(|| GlobalConfig::new())
 ///
 /// ### Sample Scanner (`scanners/sample_scanner`)
 /// `check_http`, `check_https`
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ModuleConfig {
     pub custom_prompts: HashMap<String, String>,
     pub api_mode: bool,
@@ -343,15 +395,6 @@ pub struct ModuleConfig {
 impl ModuleConfig {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-impl Default for ModuleConfig {
-    fn default() -> Self {
-        Self {
-            custom_prompts: HashMap::new(),
-            api_mode: false,
-        }
     }
 }
 

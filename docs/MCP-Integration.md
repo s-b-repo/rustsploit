@@ -2,6 +2,8 @@
 
 Rustsploit includes a built-in MCP (Model Context Protocol) server that enables integration with Claude Desktop and other MCP-compatible clients. The server communicates via JSON-RPC 2.0 over stdio (stdin/stdout), with no network listener.
 
+> **As of the 2026-06-13 release the server runs on the official MCP Rust SDK, [`rmcp`](https://crates.io/crates/rmcp) (v1.7, Apache-2.0).** `src/mcp/server.rs` is now a thin adapter implementing rmcp's `ServerHandler` trait — protocol framing, transport, and spec compliance are owned by the SDK (with correct resources/prompts/progress support). The tool and resource logic (`tools.rs`, `resources.rs`, `types.rs`) is unchanged, so the **29 tools and 7 resources** below, the per-call timeout, and the stdout-isolation guard all carry over.
+
 ---
 
 ## Starting the MCP Server
@@ -34,7 +36,7 @@ The server reads one JSON-RPC 2.0 request per line from stdin and writes one res
 
 ---
 
-## Tools (42)
+## Tools (29)
 
 ### Module Tools
 
@@ -43,7 +45,7 @@ The server reads one JSON-RPC 2.0 request per line from stdin and writes one res
 | `list_modules` | List all available modules, optionally filtered by category | -- |
 | `search_modules` | Search modules by keyword (case-insensitive substring match) | `query` |
 | `module_info` | Get metadata for a specific module (name, description, authors, references, rank) | `module_path` |
-| `check_module` | Run a non-destructive vulnerability check against a target | `module_path`, `target` |
+| `check_module` | Run a module's `check` entry point against a target | `module_path`, `target` |
 
 ### Target Tools
 
@@ -169,10 +171,12 @@ Replace `/path/to/rustsploit` with the absolute path to your compiled binary (e.
 
 - **Stdio transport only** -- no network listener, no authentication needed (single-user process)
 - **Target injection prevention** -- `run_module` strips any `target` key from the `prompts` object to prevent SSRF via prompt injection
-- **Module validation** -- module paths are verified against the build-time discovered module list before execution
+- **Module validation** -- module paths are verified against the compile-time `inventory` module registry before execution
 - **Credential redaction** -- the `rustsploit:///credentials` resource shows only the first 3 characters of each secret
-- **No file system writes** -- MCP tools return data inline; no direct file read/write operations are exposed
+- **No file system writes** -- MCP tools return data inline; no direct file read/write operations are exposed. (Unlike the console / CLI, MCP runs are not duplicated to the per-run loot auto-save file — their output is returned inline to the caller.)
 - **Concurrency bounded** -- module execution is limited by the framework's semaphore (CPU count, minimum 4 concurrent)
+- **Per-call timeout** -- each tool call is bounded by `RUSTSPLOIT_MCP_TIMEOUT_SECS` (default 300s)
+- **Stdout isolation** -- the JSON-RPC protocol channel is dup'd off fd 1 and fd 1 is redirected to `/dev/null`, so a stray `println!` from a module can never corrupt the JSON-RPC stream
 
 ---
 
@@ -181,21 +185,20 @@ Replace `/path/to/rustsploit` with the absolute path to your compiled binary (e.
 ```
 src/mcp/
   mod.rs         -- Module re-exports
-  types.rs       -- JSON-RPC 2.0 types, MCP capability structs, Tool/Resource/ToolResult types
-  server.rs      -- Stdio event loop, request routing, response serialization
-  tools.rs       -- 42 tool definitions and dispatch handlers
+  types.rs       -- MCP capability structs, Tool/Resource/ToolResult types
+  server.rs      -- rmcp `ServerHandler` adapter (SDK owns transport + JSON-RPC framing)
+  tools.rs       -- 29 tool definitions and dispatch handlers
   resources.rs   -- 7 resource definitions and read handlers
   client.rs      -- MCP client implementation (for connecting to external MCP servers)
 ```
 
 ### Request Flow
 
-1. `server.rs` reads a JSON line from stdin
-2. Parses it as a `JsonRpcRequest`
-3. Routes by method name: `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`
-4. Handler extracts typed parameters from `params`
-5. Calls framework APIs (same functions used by the REST API and interactive shell)
-6. Returns a `JsonRpcResponse` serialized as a single JSON line on stdout
+1. The `rmcp` SDK reads and frames each JSON-RPC message off the stdio transport
+2. The SDK dispatches to the `ServerHandler` adapter in `server.rs` by method (`initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`)
+3. The handler extracts typed parameters and dispatches to `tools.rs` / `resources.rs`
+4. Those call framework APIs (the same functions used by the REST API and interactive shell)
+5. The SDK serializes the result back onto the stdio transport
 
 ---
 
@@ -203,7 +206,7 @@ src/mcp/
 
 ```
 -> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-<- {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"rustsploit-mcp","version":"0.4.8"}}}
+<- {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"rustsploit-mcp","version":"0.5.0"}}}
 
 -> {"jsonrpc":"2.0","method":"initialized","params":{}}
 

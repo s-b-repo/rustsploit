@@ -8,8 +8,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
-
 // ============================================================
 // OUTPUT BUFFER (task-local text capture)
 // ============================================================
@@ -28,6 +26,7 @@ impl OutputBuffer {
     }
 
     const MAX_BUFFER_LINES: usize = 100_000;
+    const MAX_LINE_BYTES: usize = 10_240; // 10 KB per line
 
     /// Warn once when a buffer hits capacity.
     fn warn_truncated(label: &str) {
@@ -42,10 +41,26 @@ impl OutputBuffer {
         }
     }
 
+    fn cap_line(text: String) -> String {
+        if text.len() <= Self::MAX_LINE_BYTES {
+            text
+        } else {
+            let mut truncated = text;
+            // Find the last valid UTF-8 char boundary at or before MAX_LINE_BYTES
+            let mut boundary = Self::MAX_LINE_BYTES;
+            while boundary > 0 && !truncated.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            truncated.truncate(boundary);
+            truncated.push_str(" [truncated]");
+            truncated
+        }
+    }
+
     pub fn push_stdout(&self, text: String) {
         let mut guard = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() < Self::MAX_BUFFER_LINES {
-            guard.push(text);
+            guard.push(Self::cap_line(text));
         } else {
             Self::warn_truncated("stdout");
         }
@@ -54,7 +69,7 @@ impl OutputBuffer {
     pub fn push_stderr(&self, text: String) {
         let mut guard = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() < Self::MAX_BUFFER_LINES {
-            guard.push(text);
+            guard.push(Self::cap_line(text));
         } else {
             Self::warn_truncated("stderr");
         }
@@ -62,7 +77,8 @@ impl OutputBuffer {
 
     pub fn drain_stdout(&self) -> String {
         let mut guard = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
-        let mut result = String::new();
+        let total: usize = guard.iter().map(|s| s.len()).sum();
+        let mut result = String::with_capacity(total);
         for line in guard.drain(..) {
             result.push_str(&line);
         }
@@ -71,7 +87,8 @@ impl OutputBuffer {
 
     pub fn drain_stderr(&self) -> String {
         let mut guard = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-        let mut result = String::new();
+        let total: usize = guard.iter().map(|s| s.len()).sum();
+        let mut result = String::with_capacity(total);
         for line in guard.drain(..) {
             result.push_str(&line);
         }
@@ -158,6 +175,7 @@ pub fn _mprint_line(text: &str) {
         if let Err(e) = crate::spool::SPOOL.write_line(text) {
             handle_spool_error(e);
         }
+        crate::results_sink::write_line(text);
     }
 }
 
@@ -171,6 +189,7 @@ pub fn _mprint_newline() {
         if let Err(e) = crate::spool::SPOOL.write_line("") {
             handle_spool_error(e);
         }
+        crate::results_sink::write_line("");
     }
 }
 
@@ -182,10 +201,15 @@ pub fn _mprint_raw(text: &str) {
     if buffered.is_err() {
         use std::io::Write;
         print!("{}", text);
-        let _ = std::io::stdout().flush();
-        if let Err(e) = crate::spool::SPOOL.write_line(text) {
+        if let Err(e) = std::io::stdout().flush() {
+            eprintln!("[!] Flush failed: {}", e);
+        }
+        // write_raw (not write_line): this is no-newline output, so appending a
+        // newline would split a single console line across multiple spool lines.
+        if let Err(e) = crate::spool::SPOOL.write_raw(text) {
             handle_spool_error(e);
         }
+        crate::results_sink::write_raw(text);
     }
 }
 
@@ -199,13 +223,15 @@ pub fn _mprint_block(lines: &[&str]) {
         }
     });
     if buffered.is_err() {
-        let _guard = STDOUT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = STDOUT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         for line in lines {
             println!("{}", line);
             if let Err(e) = crate::spool::SPOOL.write_line(line) {
                 handle_spool_error(e);
             }
+            crate::results_sink::write_line(line);
         }
+        drop(guard);
     }
 }
 
@@ -216,6 +242,8 @@ pub fn _meprint_line(text: &str) {
     });
     if buffered.is_err() {
         eprintln!("{}", text);
+        // "all output" includes diagnostics: capture stderr in the per-run file too.
+        crate::results_sink::write_line(text);
     }
 }
 
@@ -226,6 +254,7 @@ pub fn _meprint_newline() {
     });
     if buffered.is_err() {
         eprintln!();
+        crate::results_sink::write_line("");
     }
 }
 
@@ -237,88 +266,11 @@ pub fn _meprint_raw(text: &str) {
     if buffered.is_err() {
         use std::io::Write;
         eprint!("{}", text);
-        let _ = std::io::stderr().flush();
-    }
-}
-
-// ============================================================
-// STRUCTURED MODULE OUTPUT
-// ============================================================
-
-/// Classification of a finding.
-#[derive(Debug, Clone, Serialize)]
-pub enum FindingType {
-    Vulnerability,
-    Misconfiguration,
-    InfoDisclosure,
-    OpenPort,
-    ServiceDetected,
-    CredentialFound,
-    ExploitSuccess,
-}
-
-/// Severity of a finding.
-#[derive(Debug, Clone, Serialize)]
-pub enum Severity {
-    Critical,
-    High,
-    Medium,
-    Low,
-    Info,
-}
-
-/// A structured finding from module execution.
-#[derive(Debug, Clone, Serialize)]
-pub struct Finding {
-    pub finding_type: FindingType,
-    pub host: String,
-    pub port: Option<u16>,
-    pub detail: String,
-    pub severity: Severity,
-}
-
-/// Accumulated structured output from a module run.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ModuleOutput {
-    pub findings: Vec<Finding>,
-}
-
-/// Accumulator stored in RunContext for structured output.
-/// Modules call `output::add_finding()` to populate this.
-#[derive(Debug, Default)]
-pub struct OutputAccumulator {
-    inner: Mutex<ModuleOutput>,
-}
-
-impl OutputAccumulator {
-    const MAX_FINDINGS: usize = 10_000;
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_finding(&self, finding: Finding) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.findings.len() < Self::MAX_FINDINGS {
-            guard.findings.push(finding);
+        if let Err(e) = std::io::stderr().flush() {
+            eprintln!("[!] Flush failed: {}", e);
         }
+        crate::results_sink::write_raw(text);
     }
-
-    pub fn take(&self) -> ModuleOutput {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *guard)
-    }
-}
-
-// ============================================================
-// CONVENIENCE FUNCTIONS (use task-local RunContext)
-// ============================================================
-
-/// Record a structured finding. Silently no-ops if no RunContext is active.
-pub fn add_finding(finding: Finding) {
-    let _ = crate::context::RUN_CONTEXT.try_with(|ctx| {
-        ctx.output.add_finding(finding);
-    });
 }
 
 // ============================================================

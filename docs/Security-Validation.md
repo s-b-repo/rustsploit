@@ -116,12 +116,16 @@ When reading files:
 
 The API server (`api.rs`) implements:
 
-- **`RequestBodyLimitLayer`** — prevents DoS via oversized payloads (1 MB max)
-- **Rate limiting** — 3 failed auth attempts → 30 s block per IP
-- **Auto-cleanup** — old entries purged at 100,000 entries
-- **IP tracking + key rotation** — suspicious activity triggers auto-rotation in hardening mode
-- **Secure defaults** — by default, considers `127.0.0.1` as the intended private bind
-- **WebSocket limits** — max 100 concurrent connections, 1 MiB frame cap, 30s heartbeat
+- **PQ-only transport.** All `/api/*` traffic is encrypted with the post-quantum hybrid (ML-KEM-768 + X25519 → ChaCha20-Poly1305 AEAD with a Double Ratchet). No TLS — the PQ channel IS the transport.
+- **Per-(server, client) HKDF salts.** As of v0.4.9, salts are NOT hardcoded protocol constants. They're derived at handshake time via `derive_salt(label, server_pubs, client_pubs, identity_dh)` — the `identity_dh` input requires possession of one identity private key to compute, so a passive observer who sees the four public keys still cannot reconstruct the salt. Different (server, client) pairs derive different salt domains; key material from one session never leaks into another.
+- **SSH-style allowlist.** A client's identity public key MUST appear in `~/.rustsploit/pq_authorized_keys` for the handshake to succeed (`pq_channel.rs::process_handshake`).
+- **Token-bound enrollment.** `POST /pq/register-key` is the only network path that can add a new entry to the allowlist. The token is generated fresh at every `--api` startup (24 random bytes, URL-safe base64), printed to the console once, held only in memory, compared in constant time, and zeroized on first successful use. Subsequent key changes require the established PQ session.
+- **Bind-address-agnostic safety.** `--interface` accepts any address (including `0.0.0.0`). Safety doesn't come from refusing public binds — it comes from the token gating the allowlist. There is no `--insecure-bind` escape hatch.
+- **`RequestBodyLimitLayer`** — prevents DoS via oversized payloads (1 MB max).
+- **Handshake rate limiting** — `HANDSHAKE_RATE_MAX_PER_IP` (10 / 60s) on `/pq/handshake` and `/pq/register-key`. Auto-cleanup of stale entries every 5 min.
+- **WebSocket limits** — max 100 concurrent connections, 1 MiB frame cap, 30s heartbeat.
+- **Per-session mutex on the server** — `SessionStore` is `RwLock<HashMap<_, Arc<Mutex<PqSession>>>>` so the global map lock isn't held across the inner handler. Different tenants don't serialize through one lock.
+- **AAD covers everything.** Every encrypted message authenticates `method | path?query | epoch | session_id` (request) or `status | epoch | session_id` (response). The AAD is built using the post-ratchet epoch on both sides so rekey transitions don't break verification.
 
 ---
 
@@ -176,9 +180,14 @@ basic_honeypot_check(&ip).await;
 
 ---
 
-## IP Exclusion Ranges (`EXCLUDED_RANGES`)
+## IP Exclusion Ranges (`crate::exclusions::ExclusionSet`)
 
-Standard across mass-scan capable modules (e.g., `camxploit`, `telnet_hose`, `telnet_bruteforce`, exploit modules with 0.0.0.0/0 support):
+IP exclusions are handled by `crate::exclusions::shared()` (v0.5.2+), a
+per-tenant pluggable exclusion set. **Modules do NOT implement their own
+`EXCLUDED_RANGES` constants** — the scheduler enforces exclusions during
+random fan-out.
+
+Default exclusions (applied when `setg exclusions ""` or not set):
 
 | CIDR | Category |
 |------|----------|
@@ -197,6 +206,16 @@ Standard across mass-scan capable modules (e.g., `camxploit`, `telnet_hose`, `te
 | `255.255.255.255/32` | Broadcast |
 | Public DNS | 1.1.1.1, 8.8.8.8, etc. |
 
+### Configuration via `setg`
+
+```text
+setg exclusions ""                  # defaults (above)
+setg exclusions internal            # no filtering (pentesting internal networks)
+setg exclusions none                # no filtering
+setg exclusions 10.0.0.0/8,172.16.0.0/12  # defaults + extra CIDRs
+setg exclusions @/path/to/file      # defaults + CIDRs from file (one per line)
+```
+
 Uses the `ipnetwork` crate for proper CIDR matching.
 
 ---
@@ -214,5 +233,41 @@ All persistent data uses atomic write-to-temp-then-rename to prevent corruption:
 | `~/.rustsploit/loot/` | Loot files | **High — may contain sensitive data** |
 | `~/.rustsploit/results/` | Module output files | Medium |
 | `~/.rustsploit/history.txt` | Shell command history | Medium |
+| `~/.rustsploit/pq_host_key` | Server X25519 + ML-KEM-768 long-term private keys | **Critical — file mode 0600 enforced** |
+| `~/.rustsploit/pq_authorized_keys` | SSH-style allowlist of client identity public keys (one JSON per line) | High — file mode 0600 enforced; symlink-safe writes |
+| `~/.rustsploit/wordlists/` | Pinned wordlist cache (mode 0700) | Low |
 
 **Important:** The `creds.json` and `loot/` files may contain sensitive data. Protect `~/.rustsploit/` with appropriate file permissions (e.g., `chmod 700`).
+
+---
+
+## Panic-free guarantee (v0.4.9+)
+
+The Rust source tree (`src/`) contains zero panicking patterns. CI policy:
+
+```bash
+grep -rnE "\.unwrap\(\)|\.expect\(|panic!\(|unreachable!\(|unimplemented!\(|todo!\(" src/
+# Must return zero matches.
+```
+
+This applies to module code as well — historical `.expect("slice of length N was checked")` patterns are converted to `try_into().map_err(|_| anyhow!(...))?` even when the invariant truly held, so a future reader doesn't need to verify by hand. The `_or(default)` / `_or_default()` / `_or_else(|| ...)` family is fine — those provide values, not panics.
+
+---
+
+## Supply-chain (v0.4.9 audit)
+
+Scope: 393 unique crates / 427 locked package versions.
+
+| Check | Result |
+|-------|--------|
+| `cargo audit` (RUSTSEC active vulns) | 0 |
+| Cross-ref vs. `categories=["malicious"]` advisories | 0 hits |
+| Non-crates.io sources (git / path / alt registry) | 0 |
+| Locked checksums present | 427 / 427 |
+| `build.rs` scripts grep'd for `TcpStream` / `reqwest` / `curl` / `wget` / `/dev/tcp` / `base64::decode` / `exec` / `eval` / `spawn sh` | 0 hits across 35 build scripts |
+
+**Hygiene notes** (informational):
+
+- `rustls-pemfile` 2.2.0 unmaintained (RUSTSEC-2025-0134) — rustls upstream recommends `rustls-pki-types::pem`; tracked for migration.
+- 7 pre-release crypto deps locked (`aead`/`aes-gcm`/`chacha20poly1305`/`poly1305` -rc, `ml-kem` -rc, `hickory-*` -alpha) — all from trusted orgs (RustCrypto, hickory-dns); re-pin to stable when each lands.
+- `time` is overridden at `Cargo.toml:133` to `>=0.3.47` to absorb RUSTSEC-2026-0009 from the transitive cookie store.

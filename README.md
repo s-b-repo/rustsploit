@@ -1,6 +1,8 @@
 # Rustsploit 
 
-Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. Rustsploit ships an interactive shell, a command-line runner, and an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services.
+Modular offensive tooling for embedded targets, written in Rust and inspired by RouterSploit/Metasploit. One binary exposes the same module library through **four interfaces** — an interactive shell, a command-line runner, a post-quantum-encrypted REST/WebSocket API, and an MCP server — over an ever-growing library of exploits, scanners, and credential modules for routers, cameras, appliances, and general network services, with **Recog** service fingerprinting and **JARM/JA3** TLS fingerprinting built in.
+
+> **Latest release:** see [`RELEASE_NOTES.txt`](RELEASE_NOTES.txt) — official `rmcp` MCP SDK, Recog + JARM/JA3/JA3S fingerprinting, a SecLists wordlist catalog, per-run output auto-save, HTTP connection pooling, and mass-scan fixes.
 
 
 ![Rustsploit Interactive Shell Demo](https://github.com/s-b-repo/rustsploit/raw/main/preview.png)
@@ -22,6 +24,8 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 | [API Usage Examples](docs/API-Usage-Examples.md) | Practical curl workflows, request/response samples |
 | [Module Catalog](docs/Module-Catalog.md) | All modules by category — exploits, scanners, creds |
 | [Module Development](docs/Module-Development.md) | How to author new modules, lifecycle, dispatcher |
+| [Bad Patterns Catalogue](docs/BAD_PATTERNS.md) | 133-regex `grep` matrix every module must pass — banned `.unwrap`, swallow, panic, blocking-IO, lossy casts, crypto, injection, etc. Re-runnable via `scripts/audit-bad-patterns.sh` |
+| [Bad Patterns Audit Report](docs/audit-report.md) | Latest whole-tree snapshot — strict-mode result on the 100 authored modules (zero hits) and observational counts on the rest of the framework |
 | [Security & Validation](docs/Security-Validation.md) | Input validation, security patterns, honeypot detection |
 | [Credential Modules Guide](docs/Credential-Modules-Guide.md) | Best practices for brute-force / cred modules |
 | [Exploit Modules Guide](docs/Exploit-Modules-Guide.md) | Best practices for exploit modules |
@@ -35,9 +39,9 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 
 ## Highlights
 
--  **Auto-discovered modules:** `build.rs` indexes `src/modules/**` — drop in new code, no manual registration needed
+-  **Self-registering modules:** modules register at compile time via the `inventory` crate — add the file, a `register_native_module!` call, and a `pub mod <name>;` line in the parent `mod.rs`; no build-script indexer
 -  **Interactive shell:** 40+ commands with shortcuts, command chaining (`&`), tab completion, and command history
--  **Module metadata:** Optional `info()` and `check()` functions per module — CVE references, author, rank, non-destructive vulnerability verification
+-  **Module metadata:** `info()` per module — CVE references, author, rank. The framework is exploitation-only: modules run an exploit and report findings (there is no `check()` / non-destructive verification phase)
 -  **Global options (`setg`):** Persistent key-value settings that apply across all modules — like Metasploit's datastore
 -  **Credential store:** Track discovered credentials across sessions with `creds` commands and JSON persistence
 -  **Host/service tracking:** Workspace-based engagement tracking with `hosts`, `services`, `notes` commands
@@ -45,13 +49,16 @@ Full documentation lives in the **[Rustsploit Wiki](docs/Home.md)**. Below is a 
 -  **Resource scripts:** Automate workflows from files, auto-load startup scripts, save command history with `makerc`
 -  **Background jobs:** Run modules asynchronously with `run -j`, manage with `jobs` commands
 -  **Export/reporting:** Export all engagement data to JSON, CSV, or human-readable summary reports
--  **Console logging:** `spool` command captures all output to file for documentation
+-  **Console logging & auto-save:** `spool` captures all output to a file on demand; in addition, **every console/CLI module run is auto-saved** (append mode) to `~/.rustsploit/loot/<module> <time> results.txt` — stdout and stderr both captured, multi-host sweeps accumulate into one per-run file
 -  **Comprehensive credential tooling:** FTP(S), SSH, Telnet, POP3(S), SMTP, IMAP, RDP, RTSP, SNMP, L2TP, MQTT, VNC, MySQL, PostgreSQL, Redis, CouchDB, Elasticsearch, Memcached, HTTP Basic, Proxy, Fortinet — with IPv6 and TLS support
 -  **Exploit coverage:** CVEs for VNC (LibVNC, TigerVNC, TightVNC, x11vnc), honeypots (Cowrie, Dionaea, HoneyTrap, SNARE), WAFs (SafeLine), Apache Camel, Kubernetes ingress-nginx, Commvault, MISP, Zimbra, Next.js, Vite, and 100+ more
 -  **Scanners & utilities:** Port scanner, ping sweep, SSDP, HTTP title grabber, DNS recursion tester, directory bruteforcer, sequential fuzzer, proxy scanner, reflect scanner, vulnerability checker
+-  **Service & TLS fingerprinting:** Rapid7 **Recog** banner → product/version/CPE matching folded into service detection, plus Salesforce **JARM** + **JA3/JA3S** active TLS server fingerprinting (`scanners/jarm_scan`)
+-  **Wordlist catalog:** checksum-pinned **SecLists** wordlists fetched + SHA-256-verified on demand into `~/.rustsploit/wordlists/` (`utils::wordlist::resolve`)
+-  **Performance:** shared, cached HTTP client — TLS config + connection pool reused across runs instead of rebuilt per request, with a bounded idle timeout for internet-scale sweeps
 -  **API server:** PQ-encrypted WebSocket transport — post-quantum cryptography, full CRUD for credentials, hosts, services, loot, jobs
--  **MCP server:** 38-tool Model Context Protocol server for AI-assisted pentesting via stdio
--  **Plugin system:** Third-party modules via `src/modules/plugins/` with build-time discovery and startup safety warnings
+-  **MCP server:** Model Context Protocol server on the **official `rmcp` SDK (v1.7)** — 29 tools + 7 resources for AI-assisted pentesting via stdio
+-  **Plugin system:** Third-party modules via `src/modules/plugins/` with compile-time `inventory` self-registration and startup safety warnings
 -  **Security hardened:** Input validation, path traversal protection, honeypot detection, root privilege checks, spool symlink protection, memory-safe operations
 -  **IPv4/IPv6 ready:** Both address families work out-of-the-box across all modules
 
@@ -107,6 +114,54 @@ For other distros (Arch, Gentoo, Fedora), Docker deployment, and one-liner insta
 - **Using the API?** → [API Server](docs/API-Server.md) + [API Usage Examples](docs/API-Usage-Examples.md)
 - **Running from CLI?** → [CLI Reference](docs/CLI-Reference.md)
 - **Full module list?** → [Module Catalog](docs/Module-Catalog.md)
+
+---
+
+## API server quick start
+
+The PQ-encrypted API is what external integrations and web panels talk to.
+Bind it to whichever interface you want — the bootstrap path is gated by a
+one-time enrollment token printed at startup, **not** by the bind address.
+
+```bash
+# Local-only (default, useful for development)
+cargo run --release -- --api
+
+# Reachable on a LAN
+cargo run --release -- --api --interface 192.0.2.10:8080
+
+# Reachable from anywhere (bind to all interfaces)
+cargo run --release -- --api --interface 0.0.0.0:8080
+```
+
+On startup the server prints something like:
+
+```
+═══════════════════════════════════════════════════════════════
+ENROLLMENT TOKEN (one-time, prints once): tWQ9sIz3kZGdHc4w7g8hPxJrAaPN1c0v
+Bootstrap a client by POSTing its PQ public keys + this
+token to POST /pq/register-key:
+  { token, name, x25519_pub, mlkem_ek }
+After first successful registration the token is consumed; further
+key changes must go through the established PQ session.
+═══════════════════════════════════════════════════════════════
+```
+
+Hand that token to whichever client you want to enroll. The client POSTs
+its X25519 + ML-KEM-768 public keys to `/pq/register-key` over the
+network — no shared filesystem required, client and server can be on
+different hosts. The token is consumed on first use; restart the server
+to issue a new one.
+
+Endpoints exposed by `--api`:
+
+| Path | Auth | Purpose |
+|------|------|---------|
+| `GET /health` | none | Liveness |
+| `POST /pq/handshake` | identity allowlist | PQXDH session establishment |
+| `POST /pq/register-key` | enrollment token (one-time) | Bootstrap a new client identity |
+| `GET /pq/ws` | PQ session | Bi-directional event/RPC channel |
+| `ALL /api/*` | PQ session | REST surface (auto-generated from JSON-RPC dispatcher) |
 
 ---
 

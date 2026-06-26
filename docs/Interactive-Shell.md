@@ -24,13 +24,12 @@ All commands are **case-insensitive** and support aliases:
 | `set subnet <CIDR>` | `sn <CIDR>` | Set target to a CIDR subnet |
 | `show_target` | `st`, `showtarget` | Display current target |
 | `clear_target` | `ct`, `cleartarget` | Clear target |
-| `run` | `go`, `exec` | Execute the selected module |
+| `run` | `go`, `exec`, `ra` | Execute the selected module |
 | `run -j` | | Run module as background job |
-| `run_all` | `runall`, `ra` | Run module against all IPs in subnet |
 | `check` | `ch` | Non-destructive vulnerability check |
 | `setg <key> <val>` | `sg` | Set a global option (persists across modules) |
 | `unsetg <key>` | `ug` | Remove a global option |
-| `show options` | `so` | Display all global options |
+| `show options` | `so` | Display all global options (now includes `scan_order`, `exclusions`, `target_rps`, `module_rps`) |
 | `creds` | | List stored credentials |
 | `creds add` | | Add a credential interactively |
 | `creds search <q>` | | Search credentials by host/service/user |
@@ -72,14 +71,19 @@ rsf> go
 
 ## Command Chaining
 
-Execute multiple commands on one line using the `&` separator:
+Execute multiple commands on one line using the `&` or `;` separator (both are
+sequential — there is no parallel/background semantics implied by `&`):
 
 ```text
 rsf> u creds/generic/ssh_bruteforce & set target 10.10.10.10 & go
-rsf> f1 ssh & u creds/generic/ssh_bruteforce & set target 192.168.1.1
+rsf> f1 ssh ; u creds/generic/ssh_bruteforce ; set target 192.168.1.1
 ```
 
 Commands are parsed and executed left-to-right. Useful for scripting quick workflows.
+
+To run a module against every host in a subnet, just `set target <CIDR>` (or
+`random`) and `run` — the dispatcher fans out automatically; there is no
+separate `run_all` command.
 
 ---
 
@@ -109,8 +113,27 @@ The framework-level dispatcher handles multiple target types transparently for a
 | CIDR range | `t 192.168.1.0/24` |
 | File of targets | `t /path/to/targets.txt` |
 | Random scanning | `t random` or `t 0.0.0.0/0` |
+| Sequential scanning | `t seq` (from `1.0.0.0`), `t seq:1.2.3.4` (explicit start) |
 
 All modules benefit from this automatically -- the dispatcher expands multi-target values and invokes the module once per resolved target.
+
+> **Note:** Only `random` and `0.0.0.0/0` trigger a full-internet random mass
+> scan. Bare `0.0.0.0` is treated as a normal single host, **not** a mass-scan
+> keyword, so `t 0.0.0.0` will not launch an internet-wide scan.
+
+### Mass-scan order: random vs. sequential
+
+A full-public-IPv4 sweep can run in two orders, both honoring the exclusion list
+(`setg exclusions …`):
+
+- **Random** (default) — `t random` / `t 0.0.0.0/0`: samples random public IPs up
+  to `max_random_hosts` (default 10,000).
+- **Sequential** — `t seq` / `t seq:<start-ip>`, or flip `0.0.0.0/0`/`random` into
+  order with `setg scan_order sequential`: walks `1.0.0.0 → 223.255.255.255` in
+  order, skipping excluded/reserved ranges. **Unbounded** by default (Ctrl+C to
+  stop) unless you set `max_random_hosts`; it checkpoints the high-water IP, so a
+  killed scan **resumes** from where it left off on the next run. Set
+  `setg scan_order random` to switch back.
 
 ---
 
@@ -118,43 +141,90 @@ All modules benefit from this automatically -- the dispatcher expands multi-targ
 
 After a target is set, Rustsploit automatically runs a honeypot check before module execution:
 
-- Scans **200 common ports** with a 250 ms timeout each.
+- Scans **30 common ports** with a 200 ms timeout each.
 - If **11 or more** ports are open, it warns that the target is likely a honeypot.
 - Runs automatically on every `run`/`go` invocation.
 
-Manual call (from module code): `utils::basic_honeypot_check(&ip).await`
+Manual call (from module code): `crate::utils::network::quick_honeypot_check(ip)`
 
 ---
 
-## Global Options
+## Global Options (`set` / `setg`)
 
-Use `setg` to set options that persist across all module executions. These are checked by `cfg_prompt_*` functions after API custom_prompts but before interactive stdin:
+`set` and `setg` both write to the persistent global options store
+(`~/.rustsploit/global_options.json`). They are functionally identical — `set`
+is the shorter form, `setg` is kept for Metasploit muscle memory. Both are
+checked by `cfg_prompt_*` functions after API custom_prompts but before
+interactive stdin.
 
 ```text
-rsf> setg port 8080
+rsf> set port 8080
 rsf> setg concurrency 50
 rsf> show options
-rsf> unsetg port
+rsf> unset port
+rsf> unsetg concurrency
 ```
 
-Global options are saved to `~/.rustsploit/global_options.json` and loaded on startup.
+### Metasploit Aliases
+
+The shell accepts Metasploit-style option names and maps them to Rustsploit keys:
+
+| Metasploit name | Rustsploit key | Example |
+|-----------------|----------------|---------|
+| `RHOST` / `RHOSTS` | `target` | `set RHOST 10.0.0.1` |
+| `RPORT` | `port` | `set RPORT 443` |
+| `LPORT` | `source_port` | `set LPORT 31337` |
+| `THREADS` | `concurrency` | `set THREADS 100` |
+| `MODULE_TIMEOUT` | `timeout` | `set MODULE_TIMEOUT 30` |
 
 ### Common Global Options
 
 | Option | Example | Effect |
 |--------|---------|--------|
-| `port` | `setg port 443` | Default port for all modules |
-| `source_port` | `setg source_port 31337` | Outbound source port |
-| `honeypot_detection` | `setg honeypot_detection n` | Disable honeypot checks before `run` |
-| `timeout` | `setg timeout 30` | Connection timeout (seconds) |
-| `concurrency` | `setg concurrency 50` | Default thread count |
-| `verbose` | `setg verbose y` | Verbose output |
-| `username_wordlist` | `setg username_wordlist users.txt` | Default username wordlist |
-| `password_wordlist` | `setg password_wordlist pass.txt` | Default password wordlist |
-| `stop_on_success` | `setg stop_on_success y` | Stop on first valid credential |
-| `save_results` | `setg save_results y` | Auto-save results to file |
-| `combo_mode` | `setg combo_mode y` | Full user x pass combination mode |
-| Any custom key | `setg my_key value` | Modules read via `cfg_prompt_*` |
+| `port` | `set port 443` | Default port for all modules |
+| `source_port` | `set source_port 31337` | Outbound source port for all TCP/UDP connections |
+| `honeypot_detection` | `set honeypot_detection n` | Disable honeypot checks before `run` |
+| `timeout` | `set timeout 30` | Connection/probe timeout (seconds) — passed through to probe functions |
+| `concurrency` | `set concurrency 50` | Default thread/task count for brute-force and fan-out |
+| `verbose` | `set verbose y` | Verbose output |
+| `username_wordlist` | `set username_wordlist users.txt` | Default username wordlist |
+| `password_wordlist` | `set password_wordlist pass.txt` | Default password wordlist |
+| `stop_on_success` | `set stop_on_success y` | Stop on first valid credential |
+| `save_results` | `set save_results y` | Auto-save results to file |
+| `combo_mode` | `set combo_mode y` | Full user x pass combination mode |
+| `module_timeout` | `set module_timeout 60` | Per-target deadline in scheduler |
+| `max_random_hosts` | `set max_random_hosts 10000` | Cap for random mass scan |
+| `global_rps` | `set global_rps 100` | Process-wide rate limit (requests/sec) |
+| `module_rps` | `set module_rps 50` | Per-module rate limit |
+| `target_rps` | `set target_rps 10` | Per-target rate limit |
+| `prescan` | `set prescan auto` | Pre-scan tool for CIDR (auto/masscan/zmap/none) |
+| `prescan_rate` | `set prescan_rate 1000` | Pre-scan packets per second |
+| `scan_order` | `set scan_order sequential` | Mass-scan order for `0.0.0.0/0`/`random`: `random` (default) or `sequential` |
+| `exclusions` | `set exclusions 10.0.0.0/8,@/path/file` | CIDRs/ranges to skip in mass scans (`""`=defaults, `none`/`internal`=no filtering) |
+| `target_mac` | `setg target_mac AA:BB:CC:DD:EE:FF` | wpair: target a single Fast Pair device |
+| `adapter` | `setg adapter 1` | wpair: BLE adapter index |
+| `scan_secs` | `setg scan_secs 20` | wpair: BLE scan window (3–300 s) |
+| `model_id` | `setg model_id 0x0582FD` | wpair: Fast Pair model ID when not in the advert |
+| `antispoofing_key` | `setg antispoofing_key <base64>` | wpair: Provider Anti-Spoofing public key |
+| `gfp_metadata_url` | `setg gfp_metadata_url <tmpl>` | wpair: metadata API URL template (`{model_id}`/`{api_key}`) |
+| `gfp_api_key` | `setg gfp_api_key <key>` | wpair: metadata API key |
+| Any custom key | `set my_key value` | Modules read via `cfg_prompt_*` |
+
+### Source Port Binding
+
+`set source_port <port>` binds all outbound TCP and UDP connections to the
+specified source port. This is enforced at the framework level through the
+network wrappers (`tcp_connect_str`, `tcp_connect_addr`, `blocking_tcp_connect`,
+`udp_bind`) — including connections made through third-party libraries (FTP,
+Telnet) that receive pre-connected streams from these wrappers.
+
+```text
+rsf> set source_port 31337
+rsf> use creds/generic/ssh_bruteforce
+rsf> set target 10.0.0.1
+rsf> run
+[*] All connections will originate from source port 31337
+```
 
 ---
 
@@ -189,6 +259,16 @@ Rustsploit tracks engagement data across sessions:
 - **Workspaces** (`workspace`): Isolate data per engagement
 
 Export all data with `export json report.json`, `export csv report.csv`, or `export summary report.txt`.
+
+### Per-run output auto-save
+
+Every shell / CLI module run also auto-appends its full console output (stdout + stderr) to a per-run file under the loot directory:
+
+```text
+~/.rustsploit/loot/<module> <YYYY-MM-DD_HH-MM-SS> results.txt
+```
+
+Files are opened in **append** mode, so a multi-host mass scan accumulates into one run file instead of racing to overwrite it. This is automatic and independent of `spool` (which logs the whole session) and of any module's own `save_results` option. API / MCP runs are not duplicated to disk — their output is returned to the caller.
 
 ---
 
