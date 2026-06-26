@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use colored::*;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// A tracked host discovered during an engagement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,7 @@ pub struct Workspace {
     name: RwLock<String>,
     data: RwLock<WorkspaceData>,
     base_dir: PathBuf,
+    save_mutex: Mutex<()>,
 }
 
 impl Workspace {
@@ -46,10 +47,16 @@ impl Workspace {
     /// File I/O here uses std::fs since this runs during lazy initialization
     /// before the tokio runtime may be fully available for blocking.
     fn new() -> Self {
-        let base_dir = home::home_dir()
+        let base = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".rustsploit")
-            .join("workspaces");
+            .join(".rustsploit");
+        Self::with_base_dir(base)
+    }
+
+    /// Create a workspace rooted under a custom base directory.
+    /// Used by the tenant registry for per-tenant isolation.
+    pub(crate) fn with_base_dir(base: PathBuf) -> Self {
+        let base_dir = base.join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
         if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) {
             eprintln!("[!] Failed to create workspaces directory {}: {}", base_dir.display(), e);
@@ -60,6 +67,7 @@ impl Workspace {
             name: RwLock::new("default".to_string()),
             data: RwLock::new(data),
             base_dir,
+            save_mutex: Mutex::new(()),
         }
     }
 
@@ -68,7 +76,7 @@ impl Workspace {
     }
 
     /// Sync load used only during initial construction (Lazy init).
-    fn load_sync(base_dir: &PathBuf, name: &str) -> WorkspaceData {
+    fn load_sync(base_dir: &Path, name: &str) -> WorkspaceData {
         let path = base_dir.join(format!("{}.json", name));
         if path.exists() {
             match std::fs::read_to_string(&path) {
@@ -84,7 +92,11 @@ impl Workspace {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Failed to read workspace '{}': {}", name, e);
+                    eprintln!("[!] Failed to read workspace '{}': {}. Preserving original.", name, e);
+                    let backup = path.with_extension("json.unreadable");
+                    if let Err(e) = std::fs::rename(&path, &backup) {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     WorkspaceData::default()
                 }
             }
@@ -113,7 +125,14 @@ impl Workspace {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Starting empty.", name, e);
+                    // Read errors (EACCES/EIO) leave the original file
+                    // intact. Move it aside so a subsequent successful
+                    // start doesn't silently overwrite the original.
+                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Preserving original.", name, e);
+                    let backup = path.with_extension("json.unreadable");
+                    if let Err(e) = tokio::fs::rename(&path, &backup).await {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     WorkspaceData::default()
                 }
             }
@@ -127,30 +146,62 @@ impl Workspace {
     }
 
     /// Save current workspace to disk.
-    /// Clones data before releasing lock to avoid holding lock during I/O.
+    /// P1-1: serialize disk writes via `save_mutex` so concurrent mutators
+    /// cannot land their saves out of order. The snapshot is taken under
+    /// the read lock *while holding* the save mutex, guaranteeing the
+    /// on-disk file always matches a real in-memory state.
     async fn save(&self) {
-        let name = self.current_name().await;
+        let _save_guard = self.save_mutex.lock().await;
+        // Snapshot name and data while holding BOTH locks (name before data,
+        // the same order `load()` acquires its write locks). Reading them under
+        // two separate lock acquisitions let a concurrent `switch()`/`load()`
+        // swap the pair in between, so we could write one workspace's data to
+        // another workspace's file.
+        let (name, data_snapshot) = {
+            let name_g = self.name.read().await;
+            let data_g = self.data.read().await;
+            (name_g.clone(), data_g.clone())
+        };
         let path = self.file_path(&name);
-        // Clone data to release lock before file I/O
-        let data_snapshot = self.data.read().await.clone();
         let tmp = path.with_extension("json.tmp");
-        match serde_json::to_string_pretty(&data_snapshot) {
-            Ok(json) => {
-                if let Err(e) = tokio::fs::write(&tmp, &json).await {
-                    eprintln!("[!] Failed to write workspace tmp file: {}", e);
-                    return;
-                }
-                if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-                    eprintln!("[!] Failed to save workspace: {}", e);
-                } else {
-                    if let Err(e) = crate::utils::set_secure_permissions_async(&path, 0o600).await {
-                        eprintln!("[!] Workspace {} saved but chmod 0o600 failed: {} — file may be world-readable", path.display(), e);
-                    }
-                }
-            }
+        let json = match serde_json::to_string_pretty(&data_snapshot) {
+            Ok(j) => j,
             Err(e) => {
                 eprintln!("[!] Failed to serialize workspace data: {}", e);
+                return;
             }
+        };
+        // P1-7: open the temp file atomically with mode 0o600 + O_NOFOLLOW so
+        // (a) the file is never visible at world-readable mode (no
+        // truncate-then-chmod window), and (b) a symlink raced into place
+        // between create and write can't redirect the write to a privileged
+        // path.
+        use tokio::fs::OpenOptions;
+        use tokio::io::AsyncWriteExt;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        #[cfg(unix)]
+        {
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = match opts.open(&tmp).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[!] Failed to open workspace tmp file: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = file.write_all(json.as_bytes()).await {
+            eprintln!("[!] Failed to write workspace tmp file: {}", e);
+            return;
+        }
+        if let Err(e) = file.flush().await {
+            eprintln!("[!] Failed to flush workspace tmp file: {}", e);
+            return;
+        }
+        drop(file);
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            eprintln!("[!] Failed to save workspace: {}", e);
         }
     }
 
@@ -176,19 +227,55 @@ impl Workspace {
                 return names;
             }
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(fname) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                names.push(fname.to_string());
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    // Only real `<name>.json` workspaces — skip `.json.bak` /
+                    // `.json.tmp` / `.json.unreadable` backups (which `file_stem`
+                    // would otherwise surface as phantom `default.json` names).
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Some(fname) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(fname.to_string());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // A transient read error must be distinguishable from
+                    // end-of-directory — don't silently return a partial list as
+                    // if it were complete.
+                    eprintln!("[!] Error while listing workspaces in {}: {}", self.base_dir.display(), e);
+                    break;
+                }
             }
         }
         if names.is_empty() {
             names.push("default".to_string());
         }
         names.sort();
+        names.dedup();
         names
     }
 
     /// Add or update a host.
+    ///
+    /// `ip` may be a bare IPv4/IPv6 address or a hostname (the same shapes
+    /// that `extract_ip_from_target` produces). Anything that fails both an
+    /// IpAddr parse and the conservative hostname charset (alphanum + `.-_`)
+    /// is rejected so junk like `not_an_ip` cannot land in the tracked-host
+    /// list.
+    /// Canonicalise a host key. An IP literal is normalised to its canonical
+    /// form (so `192.168.001.1` and `::1` vs `0:0:0:0:0:0:0:1` collapse to one
+    /// host/service entry instead of duplicating); a hostname is returned
+    /// unchanged. Used by every host-keyed mutator so add/find/delete agree.
+    fn normalize_host_key(host: &str) -> String {
+        host.parse::<std::net::IpAddr>()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| host.to_string())
+    }
+
     pub async fn add_host(&self, ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
         // Input validation
         if ip.is_empty() || ip.len() > 256 {
@@ -197,22 +284,32 @@ impl Workspace {
         if ip.chars().any(|c| c.is_control()) {
             return;
         }
+        let is_ip = ip.parse::<std::net::IpAddr>().is_ok();
+        let is_hostname = !is_ip
+            && ip.contains('.')
+            && ip.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+        if !is_ip && !is_hostname {
+            tracing::debug!(ip, "workspace add_host rejected: not a valid IP or hostname shape");
+            return;
+        }
+        let ip = Self::normalize_host_key(ip);
+        let ip = ip.as_str();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         {
             let mut data = self.data.write().await;
             if let Some(existing) = data.hosts.iter_mut().find(|h| h.ip == ip) {
                 existing.last_seen = now;
                 if let Some(hn) = hostname {
-                    existing.hostname = Some(hn.to_string());
+                    existing.hostname = Some(crate::utils::scrub_stored_text(hn));
                 }
                 if let Some(os) = os_guess {
-                    existing.os_guess = Some(os.to_string());
+                    existing.os_guess = Some(crate::utils::scrub_stored_text(os));
                 }
             } else {
                 data.hosts.push(HostEntry {
                     ip: ip.to_string(),
-                    hostname: hostname.map(|s| s.to_string()),
-                    os_guess: os_guess.map(|s| s.to_string()),
+                    hostname: hostname.map(crate::utils::scrub_stored_text),
+                    os_guess: os_guess.map(crate::utils::scrub_stored_text),
                     first_seen: now.clone(),
                     last_seen: now,
                     notes: Vec::new(),
@@ -224,10 +321,12 @@ impl Workspace {
 
     /// Add a note to a host.
     pub async fn add_note(&self, ip: &str, note: &str) -> bool {
+        let ip = Self::normalize_host_key(ip);
+        let ip = ip.as_str();
         let found = {
             let mut data = self.data.write().await;
             if let Some(host) = data.hosts.iter_mut().find(|h| h.ip == ip) {
-                host.notes.push(note.to_string());
+                host.notes.push(crate::utils::scrub_stored_text(note));
                 true
             } else {
                 false
@@ -242,22 +341,28 @@ impl Workspace {
     /// Add or update a service. Updates service_name and version if the
     /// host:port/protocol already exists.
     pub async fn add_service(&self, host: &str, port: u16, protocol: &str, service_name: &str, version: Option<&str>) {
+        let host = Self::normalize_host_key(host);
+        let host = host.as_str();
+        // Scrub the protocol ONCE up front and compare against the scrubbed
+        // value: the entry stores the scrubbed protocol, so dedup must match on
+        // the scrubbed form too (else a control-char protocol inserts a dup).
+        let protocol = crate::utils::scrub_stored_text(protocol);
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         {
             let mut data = self.data.write().await;
             if let Some(existing) = data.services.iter_mut().find(|s| s.host == host && s.port == port && s.protocol == protocol) {
                 // Update service name and version on re-discovery
-                existing.service_name = service_name.to_string();
+                existing.service_name = crate::utils::scrub_stored_text(service_name);
                 if version.is_some() {
-                    existing.version = version.map(|s| s.to_string());
+                    existing.version = version.map(crate::utils::scrub_stored_text);
                 }
             } else {
                 data.services.push(ServiceEntry {
                     host: host.to_string(),
                     port,
-                    protocol: protocol.to_string(),
-                    service_name: service_name.to_string(),
-                    version: version.map(|s| s.to_string()),
+                    protocol,
+                    service_name: crate::utils::scrub_stored_text(service_name),
+                    version: version.map(crate::utils::scrub_stored_text),
                     first_seen: now,
                 });
             }
@@ -267,6 +372,8 @@ impl Workspace {
 
     /// Delete a host by IP. Returns true if found and removed.
     pub async fn delete_host(&self, ip: &str) -> bool {
+        let ip = Self::normalize_host_key(ip);
+        let ip = ip.as_str();
         let removed = {
             let mut data = self.data.write().await;
             let before = data.hosts.len();
@@ -282,11 +389,24 @@ impl Workspace {
     }
 
     /// Delete a service by host and port. Returns true if found and removed.
-    pub async fn delete_service(&self, host: &str, port: u16) -> bool {
+    /// Delete service(s) on `host:port`. `add_service` keys uniqueness on
+    /// host+port+protocol, so tcp/80 and udp/80 are distinct records; pass
+    /// `Some(proto)` to remove just that protocol. `None` preserves the legacy
+    /// behaviour of removing every protocol on the port.
+    pub async fn delete_service(&self, host: &str, port: u16, protocol: Option<&str>) -> bool {
+        let host = Self::normalize_host_key(host);
+        let host = host.as_str();
+        // Compare against the scrubbed protocol the entry was stored with.
+        let protocol = protocol.map(crate::utils::scrub_stored_text);
         let removed = {
             let mut data = self.data.write().await;
             let before = data.services.len();
-            data.services.retain(|s| !(s.host == host && s.port == port));
+            data.services.retain(|s| {
+                let matches = s.host == host
+                    && s.port == port
+                    && protocol.as_deref().is_none_or(|p| s.protocol == p);
+                !matches
+            });
             data.services.len() < before
         };
         if removed {
@@ -371,10 +491,75 @@ impl Workspace {
 pub static WORKSPACE: Lazy<Workspace> = Lazy::new(Workspace::new);
 
 /// Convenience functions for modules to auto-populate workspace data.
+/// Routes through the tenant registry when in a tenant context (API mode),
+/// otherwise uses the global singleton (shell mode). Also emits a
+/// `ModuleEvent::Finding` so panel / MCP / WS subscribers see the
+/// discovery in real time without each module having to call
+/// `events::emit` itself.
 pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>) {
-    WORKSPACE.add_host(ip, hostname, os_guess).await;
+    let s = crate::tenant::resolve();
+    s.workspace().add_host(ip, hostname, os_guess).await;
+    // Typed event so subscribers get machine-readable fields, plus the legacy
+    // Finding (human string) for backward compatibility.
+    crate::events::emit(crate::events::ModuleEvent::HostUp { host: ip.to_string() });
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: emitting_module(),
+        target: ip.to_string(),
+        kind: "host".to_string(),
+        message: match (hostname, os_guess) {
+            (Some(h), Some(o)) => format!("host up — hostname={h} os={o}"),
+            (Some(h), None) => format!("host up — hostname={h}"),
+            (None, Some(o)) => format!("host up — os={o}"),
+            (None, None) => "host up".to_string(),
+        },
+    });
 }
 
-pub async fn track_service(host: &str, port: u16, protocol: &str, service_name: &str, version: Option<&str>) {
-    WORKSPACE.add_service(host, port, protocol, service_name, version).await;
+pub async fn track_service(
+    host: &str,
+    port: u16,
+    protocol: &str,
+    service_name: &str,
+    version: Option<&str>,
+) {
+    let s = crate::tenant::resolve();
+    s.workspace().add_service(host, port, protocol, service_name, version).await;
+    let version_str = version.map(|v| format!(" {v}")).unwrap_or_default();
+    // Typed event (machine-readable fields) + legacy Finding for compatibility.
+    crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+        host: host.to_string(),
+        port,
+        service: service_name.to_string(),
+        version: version.map(|v| v.to_string()),
+    });
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: emitting_module(),
+        target: format!("{host}:{port}"),
+        kind: "service".to_string(),
+        message: format!("{protocol}/{service_name}{version_str}"),
+    });
+}
+
+pub async fn add_note(host: &str, note: &str) {
+    let s = crate::tenant::resolve();
+    s.workspace().add_note(host, note).await;
+    crate::events::emit(crate::events::ModuleEvent::Finding {
+        module: emitting_module(),
+        target: host.to_string(),
+        kind: "note".to_string(),
+        message: note.to_string(),
+    });
+}
+
+/// The module path that produced this finding. Resolved from the active
+/// `RunContext` set by the scheduler before invoking the module. Falls
+/// back to a generic `"workspace"` when called outside a scheduled run
+/// (CLI / shell utility paths).
+fn emitting_module() -> String {
+    let path = crate::context::current_module_path();
+    if path.is_empty() {
+        "workspace".to_string()
+    } else {
+        path
+    }
 }

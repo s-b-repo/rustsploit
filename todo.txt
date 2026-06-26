@@ -1,0 +1,412 @@
+grep for bad error hadnling like this   .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?; and this   let _
+
+/home/kali/Documents/bugbounty/
+
+
+grep recusively remove #[allow(dead_code)]     and then implement everything giving warnings and also grep remove other ignore and allow warnings then implement them in properly
+
+full clippy audit all rs files recusively
+
+looking for bugs and feature regression and security flaws
+
+  Remaining (MEDIUM/LOW — not regressions from phases, mostly hardening):
+
+  ┌───────┬────────────────────────────────────┬──────────┬───────────────────────────────────────────┐
+  │   #   │              Finding               │ Severity │                   Notes                   │
+  ├───────┼────────────────────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ M1    │ Tenant name "unknown" collision    │ MEDIUM   │ Fixed alongside C1                        │
+  ├───────┼────────────────────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ M2    │ No tenant eviction / memory growth │ MEDIUM   │ Design decision — needs LRU + persistence │
+  ├───────┼────────────────────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ M3    │ std::sync::RwLock may block tokio  │ MEDIUM   │ Acceptable (<1μs hold time)               │
+  ├───────┼────────────────────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ M4    │ Argon2 params conservative         │ MEDIUM   │ Fixed — bumped to 128MiB/4iter/2lanes     │
+  ├───────┼────────────────────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ M5-M7 │ Minor crypto/concurrency hardening │ MEDIUM   │ Low practical risk                        │
+  ├───────┼────────────────────────────────────┼──────────┼───────────────────────────────────────────┤
+  │ L1-L4 │ Path validation, empty vec, etc.   │ LOW      │ Cosmetic / correctness                    │
+  └───────┴────────────────────────────────────┴──────────┴───────────────────────────────────────────┘
+migrate load lines to be part of wordlist rs make sure this is sed every where   1. TLS helpers → use in http2_rapid_reset.rs
+
+    2. read_async_capped/DEFAULT_BODY_CAP → use in sshpwn_session.rs
+
+    3. cancellation_token() → use in DoS modules
+
+    4. IPv6 network helpers → add IPv6 support to a DoS module
+
+    5. set_secure_permissions_async → convert async callers
+
+    6. Wordlist module → wire into a brute-force module
+
+                                                            async_tls.rs  hex.rs  network.rs
+  payload_engine.rs  url_encoding.rs
+  dos_utils.rs  mod.rs  obfuscator_engine.rs  rdp.rs
+                                                         bruteforce.rs  modules.rs  privilege.rs  safe_io.rs
+  target.rs
+  mod.rs         network.rs  prompt.rs     sanitize.rs  wordlist.rs
+
+
+  add these bug bounty tuff _analysis
+
+  divide api scanner into multiable module
+
+
+  learn a way to improve build times
+
+
+    New scanner modules (src/modules/scanners/):
+  - cors_reflection_scanner.rs — battery of Origin: payloads + OPTIONS preflight; flags reflection / null / wildcard+credentials.
+  - security_headers_scanner.rs — HSTS, CSP presence, XFO, COOP/COEP, banners, cookie attrs.
+  - csp_audit_scanner.rs — extracts CSP from header or <meta>, flags unfilled __NONCE__, unsafe-inline, wildcard sources, missing frame-ancestors.
+  - subdomain_takeover_scanner.rs — CNAME-chain resolve + 29-provider fingerprint table (CloudFront, Heroku, GitHub Pages, Azure, Netlify, WPEngine, Vercel, Shopify, Statuspage, Zendesk, etc.).
+  - source_map_scanner.rs — <script src> discovery + 18 bundler-convention paths; reports valid sourcemaps.
+  - wellknown_scanner.rs — ~50 paths: .well-known/*, autodiscover, swagger/openapi, actuator, .git/config, .env.
+  - wp_xmlrpc_scanner.rs — xmlrpc.php detection + system.listMethods/multicall/pingback.ping.
+  - wp_user_enum.rs — wp-json/wp/v2/users + ?author=N redirect + oembed disclosure.
+  - s3_bucket_scanner.rs — vhost+path style, ?list-type=2, ?acl, ?policy; tags PublicList/AccessDenied/NoSuchBucket.
+  - m365_userenum_scanner.rs — OIDC tenant probe + GetCredentialType IfExistsResult mapping with rate-limit pacing.
+
+  New osint modules (src/modules/osint/):
+  - cname_chain.rs — recursive CNAME → A follower with provider tagging and dangling-CNAME detection (file or single host).
+  - jwks_inspector.rs — JWKS discovery, per-key audit, optional RSA→PEM export for jwt_tool alg-confusion.
+
+  Verification: cargo build succeeds; --list-modules shows all 12. Build script auto-discovers them — no dispatch boilerplate needed.
+
+  Each module is a one-shot pub async fn run(target: &str) and ships with info() metadata (description, references, rank). Run via rustsploit -m scanners/cors_reflection_scanner -t target.com or interactively via the shell.
+
+    Bug list:
+  1. cors_reflection_scanner — trailing comma in format! (line 125), data:// origin missed in null/file check
+  2. security_headers_scanner — bad XCTO value silently dropped (no print), cookie attr matching uses substring not token, Permissions-Policy missing not pushed to findings
+  3. csp_audit_scanner — extract_meta_csp brittle (single quotes / attribute order), CSP wildcard hosts (https://*.example.com) not detected
+  4. subdomain_takeover_scanner — Azure CDN + Beanstalk fingerprints too generic ("404"), CloudFront fingerprint generic ("Bad request"), doesn't follow redirects so misses provider error pages
+  5. source_map_scanner — appending .map to URL with query string produces invalid URL; SPA fallback HTML reported as hit
+  6. wellknown_scanner — SPA returns 200+HTML for everything; no baseline detection
+  7. wp_user_enum — builds raw reqwest::Client bypassing framework's TLS posture; reinvents url_encode
+  8. s3_bucket_scanner — "policy disclosed" flagged on any 200 to ?policy even with empty body
+  9. jwks_inspector — der_int panics on empty byte vec; security_headers redirect-following missing
+  10. csp_audit_scanner — should follow redirects for header audit too
+
+
+    Functional bugs fixed
+
+  ┌───────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │             File              │                                             Bug                                              │                                                 Fix                                                  │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ cors_reflection_scanner.rs    │ Trailing-comma format!("...", ) and data:// origin missed in null/file trust check           │ Use matches!(label, "null"|"file"|"data")                                                            │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ security_headers_scanner.rs   │ Cookie attribute matching used substring (name=secureguid falsely satisfies Secure)          │ Split by ;, match attribute name token                                                               │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ security_headers_scanner.rs   │ XCTO bad value silently dropped from console output; Permissions-Policy missing not pushed   │ Added missing mprintln/findings.push                                                                 │
+  │                               │ to findings                                                                                  │                                                                                                      │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ security_headers_scanner.rs   │ Did not follow redirects → audited the 301 instead of the canonical page                     │ build_http_client_with(.. follow_redirects: true ..)                                                 │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ csp_audit_scanner.rs          │ extract_meta_csp brittle to single quotes / attribute reordering                             │ Walk every <meta>, accept both quote styles, any attribute order                                     │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ csp_audit_scanner.rs          │ CDN whitelist matched only bare hosts, not https://*.googleapis.com                          │ Strip scheme prefix before comparison                                                                │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ subdomain_takeover_scanner.rs │ "Bad request" / "404" / "404 Not Found" fingerprints far too generic — every 404 page would  │ Replaced with provider-specific phrases (Resource Not Found, Environment is not Found, etc.); added  │
+  │                               │ match                                                                                        │ <Code>NoSuchBucket</Code> for stricter S3 match                                                      │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ subdomain_takeover_scanner.rs │ Did not follow redirects, masking provider error pages reached via 302                       │ follow_redirects: true                                                                               │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ source_map_scanner.rs         │ format!("{}.map", url) produced main.js?v=1.map for assets with query strings                │ Strip query/fragment first via map_url_for                                                           │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ source_map_scanner.rs         │ SPA index.html fallback (any path → 200 + HTML) reported as a "hit"                          │ Strict shape check: must start with {, contain "version": + "sources"/"mappings", and not be HTML    │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ wellknown_scanner.rs          │ Same SPA-fallback issue → ~50 false positives on any SPA                                     │ Baseline probe to nonexistent path; suppress same-shape responses                                    │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ wp_user_enum.rs               │ Built raw reqwest::Client with danger_accept_invalid_certs(true) — bypassed framework's      │ build_http_client_with(.. follow_redirects: false ..); honours permissive() defaults                 │
+  │                               │ --strict-tls toggle and source-port logic                                                    │                                                                                                      │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ wp_user_enum.rs               │ Reinvented urlencoding_lite                                                                  │ Use crate::utils::url_encode                                                                         │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ s3_bucket_scanner.rs          │ ?policy flagged as "disclosed" on any 200, even with empty body                              │ Require "Statement" / "Effect" / <PolicyDocument> content                                            │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ jwks_inspector.rs             │ der_int indexed bytes[0] after empty input could panic                                       │ Early-return None when n or e decodes empty                                                          │
+  └───────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Other correctness/style touch-ups
+
+  - wellknown_scanner — (x as isize).abs() as usize → unsigned_abs() (avoids overflow at INT_MAX).
+  - wellknown_scanner — combined consecutive replace('\n')…replace('\r').
+  - cname_chain — useless format!("[!!] DANGLING") on a literal; redundant |l| sanitize(l) closure.
+  - security_headers_scanner — to_ascii_lowercase() == "nosniff" → eq_ignore_ascii_case.
+
+
+
+Big gaps found
+
+  Module entry-point system
+
+  What it is now: build.rs greps for pub async fn run(target: &str) in every src/modules/**/*.rs and codegens an enum match dispatcher per category. Optional info() and check() are also grepped.
+
+  Gaps:
+  1. String-typed everything. target: &str is the only input. Modules that need ports, creds, options, wordlists either parse args: &str ad-hoc (jenkins_2_441_lfi.rs) or hardcode (opensshserver_9_8p1race_condition.rs uses target_info).
+  No structured options surface.
+  2. No trait, no contract. Build-time regex is the only "interface." A typo'd signature = silently un-dispatchable module. No compile-time check for info()/check() existence — only 363/372 have info(), 154/372 have check().
+  3. Mass-scan capability is regex-detected (is_mass_scan_target(, run_mass_scan(, MassScanConfig {). Modules that handle mass targets but don't use these literal strings get wrongly flagged as non-capable and run in the slow per-IP
+  loop.
+  4. Three parallel dispatch paths: CLI (commands/mod.rs:163 dispatch_with_cidr), shell (shell.rs REPL), API/MCP (registry::dispatch_by_category). All eventually converge but each does its own CIDR/multi-target expansion.
+  5. No lifecycle hooks. No pre-flight validation, no post-run cleanup, no cancellation token. Modules tokio::spawn freely; abort = leaked tasks.
+
+  Mass scan
+
+  What it is now: utils/bruteforce.rs::run_mass_scan() is a decent shared engine (semaphore + mpsc + file writer), but only ~half the scanners use it. port_scanner builds its own semaphore, ping_sweep rejects mass targets entirely and
+  rolls its own IpNetwork loop.
+
+  Gaps:
+  1. No global rate limiter. Two modules running concurrently each take their own concurrency budget. A /8 scan at concurrency=10000 queues 16M permits in memory.
+  2. Unbounded spawn before gating. rustsploit_audit.md H3/H4: tasks are allocated, then gated by semaphore — OOM risk on large CIDRs.
+  3. Results bypass the system. Mass output → stdout + flat file only. Doesn't hit JobProgress, LootStore, workspace::track_host(). Only honeypot_scanner integrates; port/http/ssl scanners do not.
+  4. Hardcoded exclusion lists in bruteforce.rs:19-51 (Cloudflare, Google, RFC1918). Not pluggable per-module/per-tenant.
+  5. No masscan/zmap fast path. Pure tokio for SYN-scan-equivalent work. For /16+ ranges this is 100-1000× slower than masscan handing off live targets.
+  6. No checkpoint/resume. 5s progress ticks but no persisted cursor. Crash mid-/16 → restart from zero.
+
+  Doc/code drift
+
+  - Module counts: Home.md says 240, Catalog says 350, build.rs generates ~372.
+  - API-Server.md documents 28 REST endpoints; src/api.rs exposes only /pq/handshake + /pq/ws. The "API" lives inside the WS RPC tunnel.
+  - Module-Development.md:356 says "framework handles multi-target, modules don't"; Module-Catalog.md shows 29 cred modules hardcoding subnet loops.
+  - PQ rekey deadlock (audit P0-1/P0-2) and SSRF bypass (P0-3) marked fixed in wiring-audit, still present in code.
+
+  ---
+  Better implementation (breaking-change ok)
+
+  Want me to do this? Here's what I'd propose, in order of payoff:
+
+  1. Module trait replaces regex codegen
+
+  #[async_trait]
+  pub trait Module: Send + Sync {
+      fn info(&self) -> &'static ModuleInfo;
+      async fn check(&self, ctx: &ModuleCtx) -> CheckResult { CheckResult::NotApplicable }
+      async fn run(&self, ctx: &ModuleCtx) -> Result<ModuleOutcome>;
+      fn capabilities(&self) -> Capabilities { Capabilities::default() }
+  }
+
+  pub struct ModuleCtx<'a> {
+      pub target: Target,            // enum Single/Cidr/Multi/File/Random
+      pub options: ModuleOptions,    // typed key-value
+      pub creds: &'a CredStore,
+      pub workspace: &'a Workspace,
+      pub loot: &'a LootStore,
+      pub events: EventEmitter,
+      pub cancel: CancellationToken,
+      pub batch_mode: bool,
+      pub rate_limiter: Arc<GlobalLimiter>,
+  }
+
+  Each module becomes a static MODULE: SomeName = SomeName; with inventory::submit!. Drop the build.rs codegen entirely. Compile-time verified, IDE-discoverable, no string regex.
+
+  2. Unified mass-scan scheduler
+
+  One global Scheduler owns:
+  - Target expansion (lazy iterator, no upfront materialization)
+  - Hierarchical rate limit: global RPS → per-module RPS → per-target RPS
+  - Bounded task pool with backpressure (FuturesUnordered + semaphore around next())
+  - Optional masscan/zmap pre-flight: hand it the CIDR, ingest live IPs into the iterator, run modules only on hits
+  - Checkpoint file every N targets (resume on restart)
+  - Auto-route results into LootStore/Workspace/JobProgress — modules just ctx.report(finding), never touch stdout
+
+  Modules don't see "mass" vs "single" anymore; they get one Target and the scheduler handles fan-out.
+
+  3. Single dispatch path
+
+  Delete the three CLI/shell/API expansion paths. They all funnel into:
+  Scheduler::run(module: &dyn Module, ctx: ModuleCtx) -> Stream<Outcome>
+  CLI/shell/API/MCP just construct ModuleCtx differently and consume the stream.
+
+  4. Doc regen
+
+  Drop hand-maintained module counts. Have a cargo xtask gen-docs that walks the inventory registry and writes Module-Catalog.md.
+
+  ---
+  Want me to start? I'd suggest doing it in this order so each step compiles:
+  1. Add ModuleCtx + Module trait alongside existing system, migrate scanners first (smallest category, ~35 modules)
+  2. Build the new Scheduler, port run_mass_scan callers
+  3. Migrate creds → osint → exploits
+  4. Delete build.rs codegen + old dispatchers
+  5. Regen docs
+
+  Say the word and I'll start with step 1.
+
+
+  ● Gap audit — what's still there after v0.5.0/v0.5.1
+
+  Module entry-point system
+
+  ┌─────┬────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │          Gap           │                                                                                                Status                                                                                                │
+  ├─────┼────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1   │ String-typed           │ Partially fixed. Module trait + ModuleCtx + typed Target/ModuleOptions/Capabilities all exist (src/module.rs). But every one of the 363 modules is still bridged through LegacyAdapter → pub async   │
+  │     │ everything             │ fn run(target: &str). Zero native trait impls written. The string-typed surface is hidden by the adapter, not gone.                                                                                  │
+  ├─────┼────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 2   │ No trait, no contract  │ Fixed for the dispatch contract. Module trait is the contract. BUT build.rs still regex-greps for info() / check() to wire the LegacyAdapter. A typo in a legacy module's signature still silently   │
+  │     │                        │ un-dispatches it (although the new Module trait would compile-fail if anyone wrote a native impl).                                                                                                   │
+  ├─────┼────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 3   │ Mass-scan regex        │ Fixed. Capabilities::native_mass_scan and the build-time grep are gone. Scheduler fans out for every module unconditionally.                                                                         │
+  │     │ detection              │                                                                                                                                                                                                      │
+  ├─────┼────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 4   │ Three parallel         │ Fixed. CLI / shell / API / MCP all funnel through commands::run_module → module::find → scheduler::run. Single dispatcher.                                                                           │
+  │     │ dispatch paths         │                                                                                                                                                                                                      │
+  ├─────┼────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ No lifecycle hooks     │ Partially fixed. ModuleCtx::cancel is a real CancellationToken. No pre-flight validation hook, no post-run cleanup hook. Modules can still tokio::spawn without registering with the scheduler —     │
+  │     │                        │ orphan-task risk on abort remains.                                                                                                                                                                   │
+  └─────┴────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Mass scan
+
+  ┌─────┬──────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │           Gap            │                                                                                               Status                                                                                               │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1   │ No global rate limiter   │ Still present. SchedulerLimits.concurrency is per-invocation. Two concurrent runs each take their own budget. The Arc<GlobalLimiter> from the proposal was never built.                            │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 2   │ Unbounded spawn before   │ Partially fixed. Scheduler does sem.acquire_owned().await before tokio::spawn, so spawn rate ≤ concurrency. But fanout_multi's recursive run_with_limits doesn't share the parent semaphore —      │
+  │     │ gating                   │ multi-target runs can multiply task count.                                                                                                                                                         │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 3   │ Results bypass the       │ Partially fixed. Scheduler's route_findings routes Finding entries into LootStore / Workspace / events. Trouble: legacy modules return Ok(()) and never produce Findings — they print to stdout.   │
+  │     │ system                   │ Only future native trait impls benefit. So the routing exists; the data feeding it doesn't.                                                                                                        │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 4   │ Hardcoded exclusion      │ Still present. EXCLUDED_RANGES in utils/bruteforce.rs:19-51 is still a global const. Not pluggable per-module/per-tenant.                                                                          │
+  │     │ lists                    │                                                                                                                                                                                                    │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ No masscan/zmap fast     │ Still present. Pure tokio fan-out. /16+ ranges remain slow.                                                                                                                                        │
+  │     │ path                     │                                                                                                                                                                                                    │
+  ├─────┼──────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 6   │ No checkpoint/resume     │ Still present. Progress prints, no persisted cursor.                                                                                                                                               │
+  └─────┴──────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Doc/code drift
+
+  ┌───────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                       Issue                                       │                                                                     Status                                                                      │
+  ├───────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Module count discrepancy (240 vs 350 vs 372)                                      │ Fixed. docs/Module-Catalog.md is now auto-generated by rustsploit --gen-module-catalog. All three sources read 363.                             │
+  ├───────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ API-Server.md documents 28 REST endpoints; src/api.rs ships only /pq/handshake +  │ Still present. Documented as out-of-scope in docs/Legacy.md § "out-of-scope by design".                                                         │
+  │ /pq/ws                                                                            │                                                                                                                                                 │
+  ├───────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Module-Development.md claims "framework handles multi-target, modules don't"      │ Now actually true at the dispatch layer (scheduler always fans out). The doc text itself I haven't reviewed — may still cite the old            │
+  │                                                                                   │ MassScanConfig pattern.                                                                                                                         │
+  ├───────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ PQ rekey deadlock (P0-1/P0-2) + SSRF bypass (P0-3)                                │ Still present. Out-of-scope of the module-system rewrite. Documented in docs/Legacy.md.                                                         │
+  └───────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  New gaps introduced by the migration
+
+  ┌───────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────┐
+  │                         Issue                         │                                          Status                                          │
+  ├───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 37 modules with stub run() returning Ok(()) + warning │ Listed in docs/Legacy.md, listed below. Each needs a single-target run reimplementation. │
+  ├───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ LegacyAdapter shim still exists                       │ All 363 modules use it. No native trait impls yet.                                       │
+  ├───────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┤
+  │ build.rs still emits module_inventory.rs from regex   │ Slimmed but not deleted.                                                                 │
+  └───────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Net "Big gaps remaining"
+
+  If I were redoing the original "Better implementation" list, what's left:
+
+  1. Native trait impls. Port the 363 LegacyAdapter-wrapped modules to direct impl Module for X. Then delete build.rs, LegacyAdapter, synthesize_info. The biggest remaining work item.
+  2. Global rate limiter. Add Arc<GlobalLimiter> to ModuleCtx, share across concurrent scheduler invocations. Per-tenant + per-module + per-target tiers.
+  3. Findings instead of stdout. Every legacy module currently prints to stdout. To make route_findings useful, modules need to emit Finding records. This is part of (1).
+  4. Masscan/zmap pre-flight. New optional Scheduler::with_prescan that hands a CIDR to masscan, ingests live IPs back, runs modules only on hits. Big perf win for /16+ scans.
+  5. Checkpoint/resume. Scheduler writes a state file with the cursor every N targets. Restart loads and resumes.
+  6. Pluggable exclusion lists. Per-tenant config: tenant.set_exclusions(...). Default falls back to EXCLUDED_RANGES const.
+  7. Lifecycle hooks. Module::pre_check(&ctx) (validate options before fan-out), Module::cleanup(&ctx, outcome) (release resources). Owned task spawns via ctx.spawn(...) so abort is clean.
+  8. Reimplement the 37 stubbed modules. Each one is a half-day reimplementation of a single-host probe. Listed in docs/Legacy.md.
+  9. Out-of-scope cleanup. Wire arcticalopex/ REST routes in src/api.rs. Fix PQ rekey + SSRF (P0 audit findings).
+
+  Items 1, 4, 5 are the largest. Items 2, 3, 6, 7 are each ~1-day projects. Item 8 is finite labor (37 × ~30min). Item 9 is out-of-scope of the module-system rewrite proper.
+
+  Want me to pick up any of these? The most impactful next step is (1) native trait migration — it unlocks (3) findings-routing for free and lets us delete LegacyAdapter + build.rs codegen entirely.
+
+
+cargo run
+src/modules/creds/camxploit/camxploit.rs:6:20: warning: unused import: `generate_random_public_ip`
+src/modules/creds/camxploit/camxploit.rs:7:25: warning: unused imports: `AtomicU64` and `Ordering`
+src/modules/creds/camxploit/camxploit.rs:10:27: warning: unused import: `Instant`
+src/modules/creds/generic/ftp_anonymous.rs:3:5: warning: unused import: `std::net::IpAddr`
+src/modules/creds/generic/imap_bruteforce.rs:27:5: warning: unused import: `backoff_delay`
+src/modules/creds/generic/pop3_bruteforce.rs:25:5: warning: unused import: `backoff_delay`
+src/modules/creds/generic/proxy_bruteforce.rs:11:5: warning: unused import: `std::sync::Arc`
+src/modules/creds/generic/smtp_bruteforce.rs:5:5: warning: unused import: `std::sync::Arc`
+src/modules/exploits/cameras/reolink/reolink_rce_cve_2019_11001.rs:2:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/network_infra/apache_modssl_bypass_cve_2025_23048.rs:7:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/routers/tenda/tenda_cp3_rce_cve_2023_30353.rs:2:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/routers/tplink/tplink_archer_c2_c20i_rce.rs:2:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/routers/tplink/tplink_wdr740n_backdoor.rs:2:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/routers/tplink/tplink_wdr740n_path_traversal.rs:2:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:6:5: warning: unused import: `std::sync::Arc`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:7:26: warning: unused imports: `AtomicUsize` and `Ordering`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:10:5: warning: unused import: `tokio::sync::Semaphore`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:11:5: warning: unused import: `tokio::sync::mpsc`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:12:5: warning: unused import: `tokio::fs::OpenOptions`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:13:5: warning: unused import: `chrono::Local`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:15:59: warning: unused import: `cfg_prompt_port`
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:16:21: warning: unused imports: `EXCLUDED_RANGES` and `generate_random_public_ip`
+src/modules/exploits/vnc/libvnc_checkrect_overflow.rs:12:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/vnc/libvnc_ultrazip.rs:12:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/vnc/libvnc_zrle_tile.rs:11:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/vnc/tigervnc_rre_overflow.rs:11:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/vnc/tightvnc_rect_overflow.rs:13:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/vnc/x11vnc_dns_injection.rs:12:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/vnc/x11vnc_env_injection.rs:12:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/webapps/flowise/cve_2024_31621.rs:15:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/webapps/drupal11_pathdisclose_cve_2024_45440.rs:8:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/webapps/magento_session_reaper_cve_2025_54236.rs:8:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/webapps/phpmyadmin_sqli.rs:7:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/exploits/webapps/wfentlm_disclose.rs:11:21: warning: unused imports: `FindingKind` and `Finding`
+src/modules/scanners/sgbox_siem_recon.rs:4:5: warning: unused import: `std::fs::File`
+src/modules/scanners/sgbox_siem_recon.rs:5:5: warning: unused import: `std::io::Write`
+src/modules/scanners/sgbox_siem_recon.rs:6:28: warning: unused import: `Instant`
+src/modules/scanners/sgbox_siem_recon.rs:11:5: warning: unused imports: `cfg_prompt_int_range`, `cfg_prompt_output_file`, `cfg_prompt_port`, and `cfg_prompt_yes_no`
+src/utils/bruteforce.rs:15:5: warning: unused import: `crate::utils::cfg_prompt_int_range`
+src/utils/bruteforce.rs:16:5: warning: unused import: `crate::utils::cfg_prompt_output_file`
+src/utils/mod.rs:136:5: warning: unused imports: `BruteforceResult`, `ComboMode`, and `parse_exclusions`
+src/modules/exploits/cameras/reolink/reolink_rce_cve_2019_11001.rs:22:9: warning: variable does not need to be mutable
+src/modules/exploits/network_infra/apache_modssl_bypass_cve_2025_23048.rs:49:9: warning: variable does not need to be mutable
+src/modules/exploits/routers/tenda/tenda_cp3_rce_cve_2023_30353.rs:17:9: warning: variable does not need to be mutable
+src/modules/exploits/routers/tplink/tplink_archer_c2_c20i_rce.rs:9:9: warning: variable does not need to be mutable
+src/modules/exploits/routers/tplink/tplink_wdr740n_backdoor.rs:9:9: warning: variable does not need to be mutable
+src/modules/exploits/routers/tplink/tplink_wdr740n_path_traversal.rs:9:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/libvnc_checkrect_overflow.rs:46:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/libvnc_ultrazip.rs:45:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/libvnc_zrle_tile.rs:46:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/tigervnc_rre_overflow.rs:44:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/tightvnc_rect_overflow.rs:47:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/x11vnc_dns_injection.rs:34:9: warning: variable does not need to be mutable
+src/modules/exploits/vnc/x11vnc_env_injection.rs:35:9: warning: variable does not need to be mutable
+src/modules/exploits/webapps/flowise/cve_2024_31621.rs:25:9: warning: variable does not need to be mutable
+src/modules/exploits/webapps/drupal11_pathdisclose_cve_2024_45440.rs:52:9: warning: variable does not need to be mutable
+src/modules/exploits/webapps/magento_session_reaper_cve_2025_54236.rs:53:9: warning: variable does not need to be mutable
+src/modules/exploits/webapps/phpmyadmin_sqli.rs:50:9: warning: variable does not need to be mutable
+src/modules/exploits/webapps/wfentlm_disclose.rs:32:9: warning: variable does not need to be mutable
+src/modules/exploits/payloadgens/obfuscator.rs:89:18: warning: unused variable: `target`: help: if this is intentional, prefix it with an underscore: `_target`
+src/modules/creds/camxploit/camxploit.rs:24:7: warning: constant `IGNORED_SERVICE_PORTS` is never used
+src/modules/creds/camxploit/camxploit.rs:729:4: warning: function `build_exclusion_list` is never used
+src/modules/creds/camxploit/camxploit.rs:739:4: warning: function `is_only_ignored_services` is never used
+src/modules/creds/generic/redis_bruteforce.rs:435:4: warning: function `redis_ping` is never used
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:18:7: warning: constant `DEFAULT_TIMEOUT_SECS` is never used
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:19:7: warning: constant `MASS_SCAN_CONCURRENCY` is never used
+src/modules/exploits/telnet/telnet_auth_bypass_cve_2026_24061.rs:22:7: warning: constant `COMMON_TELNET_PORTS` is never used
+src/modules/scanners/service_scanner.rs:374:10: warning: function `mass_scan_probe` is never used
+src/modules/scanners/sgbox_siem_recon.rs:356:6: warning: enum `Severity` is never used
+src/modules/scanners/sgbox_siem_recon.rs:363:8: warning: struct `Finding` is never constructed
+src/modules/scanners/sgbox_siem_recon.rs:371:8: warning: associated functions `high`, `medium`, `low`, and `info` are never used
+src/modules/scanners/sgbox_siem_recon.rs:405:8: warning: struct `ReportBuilder` is never constructed
+src/modules/scanners/sgbox_siem_recon.rs:417:8: warning: associated items `new` and `to_markdown` are never used
+src/modules/scanners/sgbox_siem_recon.rs:476:4: warning: function `sanitize_filename` is never used
+src/native/hex.rs:37:8: warning: function `encode_upper` is never used
+src/native/hex.rs:55:4: warning: function `encode_upper_into` is never used
+src/native/hex.rs:65:8: warning: function `decode` is never used
+src/native/hex.rs:80:4: warning: function `nibble` is never used
+src/native/hex.rs:90:10: warning: enum `DecodeError` is never used
+src/shell.rs:60:8: warning: function `is_interactive_shell` is never used
+src/utils/bruteforce.rs:292:14: warning: function `is_ip_checked` is never used
+src/utils/bruteforce.rs:313:14: warning: function `mark_ip_checked` is never used
+src/utils/bruteforce.rs:335:8: warning: function `parse_exclusions` is never used
+src/utils/network.rs:416:12: warning: associated function `pentest_session` is never used
+warning: `rustsploit` (bin "rustsploit") generated 84 warnings (run `cargo fix --bin "rustsploit" -p rustsploit` to apply 60 suggestions)

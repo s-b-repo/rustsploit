@@ -5,14 +5,14 @@
 //!
 //! FOR AUTHORIZED SECURITY TESTING ONLY.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use std::net::IpAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
 
-use crate::utils::cfg_prompt_default;
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::{cfg_prompt_default, cfg_prompt_int_range};
 
 const DEFAULT_PORTS: &str = "8080,3128,1080,8888,9050,80,3129,8118";
 const CONNECT_HOST: &str = "httpbin.org";
@@ -26,6 +26,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
 
@@ -140,48 +141,33 @@ fn display_banner() {
     crate::mprintln!();
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    // --- Mass scan ---
-    if is_mass_scan_target(target) {
-        let ports_input = cfg_prompt_default("ports", "Ports to scan", DEFAULT_PORTS).await?;
-        let ports = parse_ports(&ports_input);
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "ProxyScan",
-            default_port: 8080,
-            state_file: "proxy_scan_mass_state.log",
-            default_output: "proxy_scan_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip: IpAddr, _port: u16| {
-            let ports = ports.clone();
-            async move {
-                let dur = Duration::from_secs(5);
-                let mut lines = Vec::new();
-                for &p in &ports {
-                    let hits = probe_port(ip, p, dur).await;
-                    for h in hits {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        lines.push(format!("[{}] {}:{} {} ({})", ts, ip, h.port, h.kind, h.detail));
-                        crate::mprintln!("\r{}", format!("[+] {}:{} {} — {}", ip, h.port, h.kind, h.detail).green().bold());
-                    }
-                }
-                if lines.is_empty() { None } else { Some(lines.join("\n") + "\n") }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("proxy_scanner requires a single-host target")?;
 
     // --- Single target ---
     display_banner();
 
+    let mut outcome = ModuleOutcome::ok();
+
     let ports_input = cfg_prompt_default("ports", "Ports to scan", DEFAULT_PORTS).await?;
     let ports = parse_ports(&ports_input);
-    let timeout_ms: u64 = cfg_prompt_default("timeout", "Timeout (ms)", "5000").await?.parse().unwrap_or(5000);
-    let dur = Duration::from_millis(timeout_ms);
+    // The `timeout` option is shared across modules and is interpreted in
+    // SECONDS everywhere else (http_title_scanner, ssl_scanner, snmp_scanner,
+    // redfish_unauth_enum, …). This module used to read it as milliseconds,
+    // so a global `setg timeout 10` (= 10s elsewhere) became 10ms here —
+    // every TCP probe timed out before it could connect and the scanner
+    // reported "no proxy detected" for every host. Read seconds, floor at 1s.
+    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout per probe (seconds)", 5, 1, 60).await? as u64;
+    let dur = Duration::from_secs(timeout_secs);
     let verbose = !crate::utils::is_batch_mode();
 
     if verbose {
         crate::mprintln!("[*] Target: {}", target.yellow());
         crate::mprintln!("[*] Ports: {:?}", ports);
-        crate::mprintln!("[*] Timeout: {}ms", timeout_ms);
+        crate::mprintln!("[*] Timeout: {}s", timeout_secs);
         crate::mprintln!();
     }
 
@@ -189,15 +175,32 @@ pub async fn run(target: &str) -> Result<()> {
     let mut found = Vec::new();
 
     for &port in &ports {
+        if ctx.is_cancelled() { break; }
         if verbose {
             crate::mprintln!("[*] Probing {}:{}...", ip, port);
         }
+        ctx.rate_limit(target).await;
         let hits = probe_port(ip, port, dur).await;
         if hits.is_empty() && verbose {
             crate::mprintln!("  {}", format!("[-] {}:{} — no proxy detected", ip, port).dimmed());
         }
         for h in &hits {
+            // Always print a found proxy, even under mass/batch scan — a live
+            // open proxy is exactly the high-value event the operator is here
+            // for, so it must never be suppressed alongside the routine
+            // "probing/no proxy" noise (which IS gated by `verbose`).
             crate::mprintln!("  {}", format!("[+] {}:{} — {} ({})", ip, h.port, h.kind, h.detail).green().bold());
+            outcome.findings.push(Finding {
+                target: ip.to_string(),
+                kind: FindingKind::Vulnerable,
+                message: format!("Open proxy {}:{} ({}) — {}", ip, h.port, h.kind, h.detail),
+                data: Some(serde_json::json!({
+                    "host": ip.to_string(),
+                    "port": h.port,
+                    "kind": h.kind,
+                    "detail": h.detail,
+                })),
+            });
         }
         found.extend(hits);
     }
@@ -217,7 +220,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
         crate::mprintln!();
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn parse_ports(input: &str) -> Vec<u16> {
@@ -231,9 +234,11 @@ fn resolve_target(target: &str) -> Result<IpAddr> {
     target.parse::<IpAddr>().or_else(|_| {
         use std::net::ToSocketAddrs;
         format!("{}:0", target).to_socket_addrs()
-            .map_err(|e| anyhow!("Cannot resolve {}: {}", target, e))?
+            .with_context(|| format!("Cannot resolve {}", target))?
             .next()
             .map(|sa| sa.ip())
             .ok_or_else(|| anyhow!("No addresses for {}", target))
     })
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "proxy_scanner", native);

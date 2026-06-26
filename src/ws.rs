@@ -12,11 +12,14 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::pq_channel::{decrypt_ws_frame, derive_ws_subsession, encrypt_ws_frame, WsSubSession};
+use crate::pq_channel::{decrypt_ws_frame, derive_ws_subsession, encrypt_ws_frame, WsRole, WsSubSession};
 use crate::pq_middleware::PqSharedState;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const MAX_WS_FRAME_SIZE: usize = 1024 * 1024;
+// Cap on a fully-reassembled (possibly fragmented) message. Without this an
+// attacker could send many small frames and force unbounded reassembly.
+const MAX_WS_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_CONNECTIONS: usize = 100;
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
@@ -45,7 +48,8 @@ pub async fn ws_upgrade(
 
     let session_id_vec = match B64.decode(&session_b64) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("invalid session ID encoding: {e}");
             return axum::response::IntoResponse::into_response((
                 axum::http::StatusCode::BAD_REQUEST,
                 "Invalid session ID encoding",
@@ -55,7 +59,8 @@ pub async fn ws_upgrade(
 
     let session_id: [u8; 16] = match session_id_vec.try_into() {
         Ok(id) => id,
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("session ID wrong length: {} bytes", e.len());
             return axum::response::IntoResponse::into_response((
                 axum::http::StatusCode::BAD_REQUEST,
                 "Session ID must be 16 bytes",
@@ -63,48 +68,79 @@ pub async fn ws_upgrade(
         }
     };
 
-    let sub_session = {
-        let store = pq.sessions.read().await;
-        match store.get(&session_id) {
-            Some(session) => match derive_ws_subsession(session) {
-                Ok(sub) => sub,
-                Err(e) => {
-                    tracing::warn!("WS sub-session derivation failed for {}: {}", addr, e);
-                    return axum::response::IntoResponse::into_response((
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "Sub-session derivation failed",
-                    ));
-                }
-            },
+    // Per-connection nonce: prevents two concurrent WS opens from the same
+    // parent session deriving identical chain keys. Sent in the clear as
+    // the first 16 bytes of the stream so the client can derive matching
+    // chains. The nonce is not a key — confidentiality and integrity come
+    // from the AEAD that follows.
+    let connection_nonce = {
+        let mut buf = [0u8; 16];
+        use rand::RngExt;
+        rand::rng().fill(&mut buf);
+        buf
+    };
+
+    let (sub_session, client_name) = {
+        let session_arc = {
+            let store = pq.sessions.read().await;
+            store.get(&session_id).cloned()
+        };
+        let session_arc = match session_arc {
+            Some(s) => s,
             None => {
                 return axum::response::IntoResponse::into_response((
                     axum::http::StatusCode::UNAUTHORIZED,
                     "Unknown PQ session",
                 ));
             }
+        };
+        let session = session_arc.lock().await;
+        let name = session.client_name.clone();
+        match derive_ws_subsession(&session, WsRole::Server, &connection_nonce) {
+            Ok(sub) => (sub, name),
+            Err(e) => {
+                tracing::warn!("WS sub-session derivation failed for {}: {}", addr, e);
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Sub-session derivation failed",
+                ));
+            }
         }
     };
 
-    let prev = TOTAL_WS_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
-    if prev >= MAX_TOTAL_CONNECTIONS {
-        TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
-        return axum::response::IntoResponse::into_response((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "WebSocket connection limit reached",
-        ));
+    // Atomically claim a connection slot via compare-exchange loop to
+    // avoid the TOCTOU where concurrent fetch_add + check can reject
+    // all connections or admit too many.
+    loop {
+        let current = TOTAL_WS_CONNECTIONS.load(Ordering::Acquire);
+        if current >= MAX_TOTAL_CONNECTIONS {
+            return axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "WebSocket connection limit reached",
+            ));
+        }
+        if TOTAL_WS_CONNECTIONS
+            .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
     }
 
     let pq_clone = pq.clone();
     ws.max_frame_size(MAX_WS_FRAME_SIZE)
-        .on_upgrade(move |socket| handle_ws(socket, sub_session, session_id, pq_clone, addr))
+        .max_message_size(MAX_WS_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_ws(socket, sub_session, connection_nonce, session_id, pq_clone, addr, client_name))
 }
 
 async fn handle_ws(
     socket: WebSocket,
     sub_session: WsSubSession,
+    connection_nonce: [u8; 16],
     parent_session_id: [u8; 16],
     pq: Arc<PqSharedState>,
     addr: SocketAddr,
+    client_name: String,
 ) {
     tracing::info!("WS connected: {}", addr);
 
@@ -115,14 +151,26 @@ async fn handle_ws(
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
+    // First frame on the wire: the per-connection nonce (16 bytes, plaintext).
+    // Future TS clients will read these bytes and feed them into their
+    // `derive_ws_subsession(role=Client, …)` call so both ends produce
+    // matching chain keys. If this send fails the peer is gone — bail out.
+    if let Err(e) = ws_tx
+        .send(Message::Binary(connection_nonce.to_vec().into()))
+        .await
+    {
+        tracing::debug!("WS connection-nonce send failed for {}: {}", addr, e);
+        TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+
     let writer_sub = sub.clone();
-    let writer_aad_prefix = session_id_b64.clone();
+    let writer_aad: Vec<u8> = format!("ws|s2c|{}", session_id_b64).into_bytes();
     let writer_handle = tokio::spawn(async move {
         while let Some(plaintext) = outbound_rx.recv().await {
-            let aad = format!("ws|s2c|{}", writer_aad_prefix);
             let frame = {
                 let mut s = writer_sub.lock().await;
-                match encrypt_ws_frame(&mut s, &plaintext, aad.as_bytes()) {
+                match encrypt_ws_frame(&mut s, &plaintext, &writer_aad) {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::warn!("WS encrypt error: {}", e);
@@ -137,7 +185,21 @@ async fn handle_ws(
         }
     });
 
-    let mut job_rx = crate::jobs::JOB_MANAGER.subscribe();
+    let tenant_stores = match crate::tenant::resolve_for(&client_name) {
+        Ok(s) => s,
+        Err(e) => {
+            // Fail closed: the connect-time tenant could not be resolved/validated,
+            // so we must not fall back to any process-global store. Tear down the
+            // already-spawned writer and release the connection slot we claimed in
+            // ws_upgrade — otherwise every tenant-rejected upgrade permanently
+            // consumes one of MAX_TOTAL_CONNECTIONS, a reachable DoS.
+            tracing::error!("Tenant rejected for '{}': {}", client_name, e);
+            writer_handle.abort();
+            TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+    };
+    let mut job_rx = tenant_stores.job_manager().subscribe();
     let event_tx = outbound_tx.clone();
     let event_jobs = subscribed_jobs.clone();
     let event_handle = tokio::spawn(async move {
@@ -175,12 +237,56 @@ async fn handle_ws(
                             continue;
                         }
                     };
-                    if event_tx.send(bytes).await.is_err() {
+                    if let Err(e) = event_tx.send(bytes).await {
+                        tracing::trace!("Event channel closed: {e}");
                         break;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::debug!("WS event subscriber lagged by {} events", n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Subscribe to the structured module-event bus and fan it out alongside
+    // job events. Modules opt into emitting; subscribers see whatever the
+    // current run produces. Lagged events are skipped (broadcast semantics).
+    let mut module_rx = crate::events::subscribe();
+    let module_event_tx = outbound_tx.clone();
+    let my_tenant = client_name.clone();
+    let module_event_handle = tokio::spawn(async move {
+        loop {
+            match module_rx.recv().await {
+                Ok(te) => {
+                    match te.tenant_id {
+                        // Deliver only events tagged for THIS tenant. PQ
+                        // lifecycle events are now tagged to their owning client
+                        // via `events::emit_for` (pq_middleware), so they arrive
+                        // here as `Some(my_tenant)`. Untagged (`None`) events are
+                        // dropped per the bus's tenant-filtering contract —
+                        // broadcasting them to every subscriber would leak one
+                        // tenant's client name / peer IP / revocation details to
+                        // all others.
+                        Some(ref tid) if tid == &my_tenant => { /* deliver */ }
+                        _ => continue,
+                    }
+                    let envelope = json!({"type": "event", "event": "module", "data": te.event});
+                    let bytes = match serde_json::to_vec(&envelope) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::debug!("WS module-event serialize error: {}", e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = module_event_tx.send(bytes).await {
+                        tracing::trace!("Module event channel closed: {e}");
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!("WS module-event subscriber lagged by {} events", n);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -200,9 +306,12 @@ async fn handle_ws(
                 break;
             }
             drop(store);
-            let pong = serde_json::to_vec(&json!({"type": "heartbeat"}))
-                .unwrap_or_default();
-            if heartbeat_tx.send(pong).await.is_err() {
+            let pong = match serde_json::to_vec(&json!({"type": "heartbeat"})) {
+                Ok(v) => v,
+                Err(e) => { tracing::warn!("Failed to serialize heartbeat: {e}"); continue; }
+            };
+            if let Err(e) = heartbeat_tx.send(pong).await {
+                tracing::trace!("Heartbeat channel closed: {e}");
                 break;
             }
         }
@@ -210,7 +319,7 @@ async fn handle_ws(
 
     let reader_sub = sub.clone();
     let reader_tx = outbound_tx.clone();
-    let reader_aad_prefix = session_id_b64.clone();
+    let reader_aad: Vec<u8> = format!("ws|c2s|{}", session_id_b64).into_bytes();
     let reader_jobs = subscribed_jobs.clone();
 
     loop {
@@ -231,14 +340,26 @@ async fn handle_ws(
         };
 
         if frame_bytes.len() > MAX_WS_FRAME_SIZE {
-            tracing::warn!("WS frame too large from {}: {} bytes", addr, frame_bytes.len());
+            // Close the connection on an oversize frame. The AEAD ratchet's
+            // nonce embeds the receive counter and only advances on a SUCCESSFUL
+            // decrypt, so skipping a frame (the old `continue`) permanently
+            // desynced the channel and bricked every subsequent frame anyway —
+            // "keep the connection alive" was unachievable. axum's
+            // `max_frame_size` already rejects oversize at the framing layer, so
+            // reaching here means a misbehaving peer; close cleanly (matching the
+            // decrypt-failure path below) instead of silently wedging.
+            tracing::warn!(
+                "WS frame too large from {}: {} bytes (cap {}); closing connection",
+                addr,
+                frame_bytes.len(),
+                MAX_WS_FRAME_SIZE
+            );
             break;
         }
 
         let plaintext = {
-            let aad = format!("ws|c2s|{}", reader_aad_prefix);
             let mut s = reader_sub.lock().await;
-            match decrypt_ws_frame(&mut s, &frame_bytes, aad.as_bytes()) {
+            match decrypt_ws_frame(&mut s, &frame_bytes, &reader_aad) {
                 Ok(pt) => pt,
                 Err(e) => {
                     tracing::warn!("WS decrypt failed from {}: {}", addr, e);
@@ -251,8 +372,14 @@ async fn handle_ws(
             Ok(v) => v,
             Err(e) => {
                 let err_resp = json!({"error": {"code": "PARSE_ERROR", "message": format!("Invalid JSON: {}", e)}});
-                if let Ok(bytes) = serde_json::to_vec(&err_resp) && reader_tx.send(bytes).await.is_err() {
-                    break;
+                match serde_json::to_vec(&err_resp) {
+                    Ok(bytes) => {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to serialize parse-error response: {e}"),
                 }
                 continue;
             }
@@ -266,10 +393,17 @@ async fn handle_ws(
             if let Some(job_id_u64) = params.get("jobId").and_then(|v| v.as_u64()) {
                 let job_id: u32 = match u32::try_from(job_id_u64) {
                     Ok(id) => id,
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::debug!("jobId exceeds u32 range: {e}");
                         let resp = json!({"id": req_id, "error": {"code": "INVALID_JOB_ID", "message": "jobId exceeds u32 range"}});
-                        if let Ok(bytes) = serde_json::to_vec(&resp) && reader_tx.send(bytes).await.is_err() {
-                            break;
+                        match serde_json::to_vec(&resp) {
+                            Ok(bytes) => {
+                                if let Err(e) = reader_tx.send(bytes).await {
+                                    tracing::trace!("RPC response channel closed: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => tracing::warn!("failed to serialize INVALID_JOB_ID response: {e}"),
                         }
                         continue;
                     }
@@ -277,48 +411,117 @@ async fn handle_ws(
                 let mut jobs = reader_jobs.lock().await;
                 if jobs.len() >= 100 {
                     let resp = json!({"id": req_id, "error": {"code": "SUB_LIMIT", "message": "Max 100 job subscriptions per connection"}});
-                    if let Ok(bytes) = serde_json::to_vec(&resp) && reader_tx.send(bytes).await.is_err() {
-                        break;
+                    match serde_json::to_vec(&resp) {
+                        Ok(bytes) => {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => tracing::warn!("failed to serialize SUB_LIMIT response: {e}"),
                     }
                 } else {
-                    jobs.insert(job_id);
+                    // Send the ack BEFORE inserting: if the send fails the
+                    // client never learns it's subscribed, so we must not
+                    // keep server-side state for a subscription it doesn't
+                    // know about.
                     let resp = json!({"id": req_id, "result": {"subscribed": job_id}});
-                    if let Ok(bytes) = serde_json::to_vec(&resp) && reader_tx.send(bytes).await.is_err() {
+                    let bytes = match serde_json::to_vec(&resp) {
+                        Ok(b) => b,
+                        Err(e) => { tracing::warn!("failed to serialize WS ack: {e}"); continue; }
+                    };
+                    if let Err(e) = reader_tx.send(bytes).await {
+                        tracing::trace!("RPC response channel closed: {e}");
                         break;
                     }
+                    jobs.insert(job_id);
+                }
+            } else {
+                // Missing/non-numeric jobId: a JSON-RPC client keyed by req_id
+                // would hang forever without an ack or error, so emit one.
+                let resp = json!({"id": req_id, "error": {"code": "INVALID_INPUT", "message": "jobId must be a number"}});
+                match serde_json::to_vec(&resp) {
+                    Ok(bytes) => {
+                        if let Err(e) = reader_tx.send(bytes).await {
+                            tracing::trace!("RPC response channel closed: {e}");
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to serialize INVALID_INPUT response: {e}"),
                 }
             }
             continue;
         }
         if method == "unsubscribe:output" {
-            if let Some(job_id_u64) = params.get("jobId").and_then(|v| v.as_u64()) {
-                if let Ok(job_id) = u32::try_from(job_id_u64) {
+            let job_id = params.get("jobId").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok());
+            match job_id {
+                Some(job_id) => {
                     reader_jobs.lock().await.remove(&job_id);
+                    let resp = json!({"id": req_id, "result": {"unsubscribed": job_id}});
+                    match serde_json::to_vec(&resp) {
+                        Ok(bytes) => {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => tracing::warn!("failed to serialize unsubscribe response: {e}"),
+                    }
+                }
+                None => {
+                    let resp = json!({"id": req_id, "error": {"code": "INVALID_INPUT", "message": "jobId must be a number"}});
+                    match serde_json::to_vec(&resp) {
+                        Ok(bytes) => {
+                            if let Err(e) = reader_tx.send(bytes).await {
+                                tracing::trace!("RPC response channel closed: {e}");
+                                break;
+                            }
+                        }
+                        Err(e) => tracing::warn!("failed to serialize INVALID_INPUT response: {e}"),
+                    }
                 }
             }
             continue;
         }
 
-        let result = dispatch_rpc(method, &params).await;
-        let response = match result {
-            Ok(data) => json!({"id": req_id, "result": data}),
-            Err(e) => json!({"id": req_id, "error": {"code": e.0, "message": e.1}}),
+        let cn = client_name.clone();
+        // Fail closed: only dispatch under the tenant that was validated at
+        // connect time. If the tenant can no longer be resolved (e.g. evicted
+        // mid-session), reject the request rather than letting a handler fall
+        // back to a process-global store and cross tenant boundaries.
+        let response = if crate::tenant::resolve_for(&cn).is_err() {
+            json!({"id": req_id, "error": {"code": "TENANT_REJECTED", "message": "Tenant no longer valid for this connection"}})
+        } else {
+            let result = crate::tenant::CURRENT_TENANT
+                .scope(cn, dispatch_rpc(method, &params))
+                .await;
+            match result {
+                Ok(data) => json!({"id": req_id, "result": data}),
+                Err(e) => json!({"id": req_id, "error": {"code": e.0, "message": e.1}}),
+            }
         };
-        if let Ok(bytes) = serde_json::to_vec(&response) && reader_tx.send(bytes).await.is_err() {
-            break;
+        match serde_json::to_vec(&response) {
+            Ok(bytes) => {
+                if let Err(e) = reader_tx.send(bytes).await {
+                    tracing::trace!("RPC response channel closed: {e}");
+                    break;
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize RPC response: {e}"),
         }
     }
 
     writer_handle.abort();
     event_handle.abort();
+    module_event_handle.abort();
     heartbeat_handle.abort();
     TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
     tracing::info!("WS disconnected: {}", addr);
 }
 
-type RpcResult = Result<Value, (String, String)>;
+pub(crate) type RpcResult = Result<Value, (String, String)>;
 
-fn rpc_err(code: &str, msg: impl Into<String>) -> (String, String) {
+pub(crate) fn rpc_err(code: &str, msg: impl Into<String>) -> (String, String) {
     (code.to_string(), msg.into())
 }
 
@@ -329,7 +532,7 @@ fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, Str
         .ok_or_else(|| rpc_err("INVALID_INPUT", format!("Missing required parameter: {}", key)))
 }
 
-async fn dispatch_rpc(method: &str, params: &Value) -> RpcResult {
+pub(crate) async fn dispatch_rpc(method: &str, params: &Value) -> RpcResult {
     match method {
         "health" => rpc_health().await,
         "list_modules" => rpc_list_modules().await,
@@ -340,8 +543,10 @@ async fn dispatch_rpc(method: &str, params: &Value) -> RpcResult {
         "set_target" => rpc_set_target(params).await,
         "clear_target" => rpc_clear_target().await,
         "run_module" => rpc_run_module(params).await,
-        "run_all" => rpc_run_module(params).await,
-        "check_module" => rpc_check_module(params).await,
+        // `run_all` (a real multi-module runner) is not implemented; it used to
+        // silently alias run_module, advertising a capability that didn't exist.
+        // Return METHOD_NOT_FOUND so callers loop client-side over run_module.
+        "run_all" => Err(rpc_err("METHOD_NOT_FOUND", "run_all is not implemented; call run_module per module (loop client-side)")),
         "honeypot_check" => rpc_honeypot_check(params).await,
         "list_options" => rpc_list_options().await,
         "set_option" => rpc_set_option(params).await,
@@ -384,10 +589,11 @@ async fn dispatch_rpc(method: &str, params: &Value) -> RpcResult {
 // ── Health ────────────────────────────────────────────────────────────
 
 async fn rpc_health() -> RpcResult {
+    let s = crate::tenant::resolve();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "active_jobs": crate::jobs::JOB_MANAGER.running_count(),
-        "max_jobs": crate::jobs::JOB_MANAGER.get_max_running(),
+        "active_jobs": s.job_manager().running_count(),
+        "max_jobs": s.job_manager().get_max_running(),
     }))
 }
 
@@ -409,6 +615,7 @@ async fn rpc_list_modules_enriched() -> RpcResult {
         let info = crate::commands::module_info(m).unwrap_or_else(|| crate::module_info::ModuleInfo {
             name: m.to_string(), description: String::new(), authors: vec![],
             references: vec![], disclosure_date: None, rank: crate::module_info::ModuleRank::Good,
+        default_port: None,
         });
         let category = m.split('/').next().unwrap_or("other");
         json!({
@@ -417,7 +624,6 @@ async fn rpc_list_modules_enriched() -> RpcResult {
             "description": info.description,
             "authors": info.authors,
             "category": category,
-            "has_check": crate::commands::has_check(m),
             "rank": format!("{:?}", info.rank),
         })
     }).collect();
@@ -450,12 +656,32 @@ async fn rpc_module_info(params: &Value) -> RpcResult {
 // ── Target ───────────────────────────────────────────────────────────
 
 async fn rpc_get_target() -> RpcResult {
-    let target = crate::config::GLOBAL_CONFIG.get_target();
-    let size = crate::config::GLOBAL_CONFIG.get_target_size().unwrap_or(0);
+    let s = crate::tenant::resolve();
+    let target = s.global_options().get("__target").await;
+    // Report the real subnet flag and host count instead of the old hardcoded
+    // is_subnet:false / size:1 (which mislabeled CIDRs and comma-lists).
+    let (is_subnet, size) = match target.as_deref() {
+        None | Some("") => (false, 0u64),
+        Some(t) if t.contains(',') => {
+            let n = t.split(',').filter(|p| !p.trim().is_empty()).count() as u64;
+            (n > 1, n.max(1))
+        }
+        Some(t) if t.contains('/') => match crate::utils::parse_subnet(t) {
+            Ok(net) => {
+                let sz = crate::utils::subnet_host_count(&net).min(u64::MAX as u128) as u64;
+                (sz > 1, sz.max(1))
+            }
+            Err(e) => {
+                tracing::debug!("subnet size estimate: parse failed for {:?}: {}", t, e);
+                (false, 1)
+            }
+        },
+        Some(_) => (false, 1),
+    };
     Ok(json!({
         "target": target,
         "size": size,
-        "is_subnet": size > 1,
+        "is_subnet": is_subnet,
     }))
 }
 
@@ -467,21 +693,20 @@ async fn rpc_set_target(params: &Value) -> RpcResult {
     if crate::api::is_blocked_target(target) {
         return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
     }
-    match crate::config::GLOBAL_CONFIG.set_target(target) {
-        Ok(_) => {
-            let t = crate::config::GLOBAL_CONFIG.get_target();
-            let size = crate::config::GLOBAL_CONFIG.get_target_size().unwrap_or(0);
-            Ok(json!({"target": t, "size": size}))
-        }
-        Err(e) => Err(rpc_err("TARGET_ERROR", e.to_string())),
+    let s = crate::tenant::resolve();
+    if !s.global_options().set("__target", target).await {
+        return Err(rpc_err("TARGET_ERROR", "Failed to store target in tenant options"));
     }
+    let stored = s.global_options().get("__target").await;
+    Ok(json!({"target": stored, "size": 1}))
 }
 
 async fn rpc_clear_target() -> RpcResult {
-    crate::config::GLOBAL_CONFIG.clear_target();
+    let s = crate::tenant::resolve();
+    s.global_options().unset("__target").await;
     Ok(json!({"cleared": true}))
 }
 
@@ -497,8 +722,13 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
     if !crate::api::validate_target(target) {
         return Err(rpc_err("INVALID_INPUT", "Invalid target"));
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+    // Static literal-range check first (not subject to DNS rebinding), then the
+    // resolving check.
+    if crate::api::is_blocked_target(target) {
+        return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
+    }
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
     }
     if !crate::commands::discover_modules().contains(&module.to_string()) {
         return Err(rpc_err("MODULE_NOT_FOUND", format!("Module '{}' not found", module)));
@@ -528,8 +758,11 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         return Err(rpc_err("INVALID_INPUT", "Shell metacharacters in combo_mode"));
     }
     if params.get("output_file").and_then(|v| v.as_str())
-        .is_some_and(|of| of.contains("..") || of.contains('/') || of.contains('\\') || of.contains('\0')) {
-        return Err(rpc_err("INVALID_OUTPUT_FILE", "Path traversal in output_file"));
+        .is_some_and(|of| of.contains("..") || of.contains('/') || of.contains('\\') || of.contains('\0') || of.starts_with('.')) {
+        // P2-X6: also reject leading-dot filenames so a client can't trick the
+        // module into writing to `.bashrc`, `.ssh/...`, or other dotfile names
+        // in the operator's CWD.
+        return Err(rpc_err("INVALID_OUTPUT_FILE", "Path traversal or dotfile in output_file"));
     }
 
     let verbose = params.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -547,6 +780,11 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         }
     }
     if let Some(port) = params.get("port").and_then(|v| v.as_u64()) {
+        // P2-A1: range-check port at the RPC boundary so 99999 / huge u64
+        // values can't slip into prompt strings and reach module parsers.
+        if !(1..=65535).contains(&port) {
+            return Err(rpc_err("INVALID_PORT", "port must be 1..=65535"));
+        }
         custom_prompts.entry("port".into()).or_insert_with(|| port.to_string());
     }
     if let Some(wl) = params.get("username_wordlist").and_then(|v| v.as_str()) {
@@ -556,6 +794,13 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         custom_prompts.entry("password_wordlist".into()).or_insert_with(|| wl.to_string());
     }
     if let Some(c) = params.get("concurrency").and_then(|v| v.as_u64()) {
+        // P2-A2 / P2-X5: range-check concurrency at the RPC boundary. 0 would
+        // create a `Semaphore::new(0)` and hang the bruteforcer forever; a
+        // huge value would spawn unbounded tasks. 4096 is generous for any
+        // realistic engagement.
+        if c == 0 || c > 4096 {
+            return Err(rpc_err("INVALID_CONCURRENCY", "concurrency must be 1..=4096"));
+        }
         custom_prompts.entry("concurrency".into()).or_insert_with(|| c.to_string());
     }
     if let Some(s) = params.get("stop_on_success").and_then(|v| v.as_bool()) {
@@ -573,8 +818,25 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         custom_prompts,
     };
 
+    // SSRF TOCTOU mitigation: the module (or background job) re-resolves
+    // `target` at connect time, which an attacker-controlled DNS name could
+    // rebind to a blocked address (loopback / link-local / RFC1918 / cloud
+    // metadata) after the initial validation above. Re-run both block-checks
+    // immediately before handing off to shrink the rebinding window to the
+    // minimum. Full address-pinning (passing resolved SocketAddrs into the
+    // module/job so it never re-resolves) would require cross-file signature
+    // changes to job_manager().spawn / commands::run_module, which are outside
+    // this handler's scope; this is the strongest in-handler guard available.
+    if crate::api::is_blocked_target(target) {
+        return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
+    }
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
+    }
+
     if background {
-        match crate::jobs::JOB_MANAGER.spawn(
+        let s = crate::tenant::resolve();
+        match s.job_manager().spawn(
             module.to_string(),
             target.to_string(),
             verbose,
@@ -591,7 +853,7 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         let output_buf = crate::output::OutputBuffer::new();
         let buf_clone = output_buf.clone();
 
-        let (result, _ctx) = crate::context::run_with_context_target(
+        let (result, run_ctx) = crate::context::run_with_context_target(
             module_config,
             target_owned.clone(),
             || async move {
@@ -606,6 +868,7 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
 
         let stdout = output_buf.drain_stdout();
         let stderr = output_buf.drain_stderr();
+        drop(run_ctx);
         match result {
             Ok(_) => Ok(json!({
                 "status": "completed",
@@ -619,31 +882,22 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
     }
 }
 
-async fn rpc_check_module(params: &Value) -> RpcResult {
-    let module = require_str(params, "module")?;
-    let target = require_str(params, "target")?;
-    if !crate::api::validate_module_name(module) {
-        return Err(rpc_err("INVALID_INPUT", "Invalid module name"));
-    }
-    if !crate::api::validate_target(target) {
-        return Err(rpc_err("INVALID_INPUT", "Invalid target"));
-    }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
-    }
-    match crate::commands::check_module(module, target).await {
-        Some(result) => Ok(json!({"module": module, "target": target, "result": result.to_string()})),
-        None => Err(rpc_err("CHECK_ERROR", "Module does not support check or was not found")),
-    }
-}
-
 async fn rpc_honeypot_check(params: &Value) -> RpcResult {
     let target = require_str(params, "target")?;
     if !crate::api::validate_target(target) {
         return Err(rpc_err("INVALID_INPUT", "Invalid target"));
     }
-    if crate::api::is_blocked_target_resolved(target).await {
-        return Err(rpc_err("SSRF_BLOCKED", "Target resolves to blocked address"));
+    // Static literal-range check first (not subject to DNS rebinding), then the
+    // resolving check.
+    if crate::api::is_blocked_target(target) {
+        return Err(rpc_err("SSRF_BLOCKED", "Target matches blocked cloud metadata range"));
+    }
+    // SSRF TOCTOU mitigation: quick_honeypot_check re-resolves `target`, so run
+    // the resolving block-check immediately before handoff to shrink the
+    // DNS-rebinding window. (A second identical pre-check added nothing — the
+    // only meaningful window is right before quick_honeypot_check.)
+    if let Err((code, msg)) = crate::api::ssrf_gate(target).await {
+        return Err(rpc_err(code, msg));
     }
     let is_honeypot = crate::utils::network::quick_honeypot_check(target).await;
     Ok(json!({"target": target, "is_honeypot": is_honeypot}))
@@ -652,22 +906,43 @@ async fn rpc_honeypot_check(params: &Value) -> RpcResult {
 // ── Options ──────────────────────────────────────────────────────────
 
 async fn rpc_list_options() -> RpcResult {
-    let opts = crate::global_options::GLOBAL_OPTIONS.all().await;
+    let s = crate::tenant::resolve();
+    let opts = s.global_options().all().await;
     Ok(json!({"options": opts}))
 }
 
 async fn rpc_set_option(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let obj = params.as_object().ok_or_else(|| rpc_err("INVALID_INPUT", "params must be an object"))?;
+    const MAX_OPTIONS: usize = 256;
+    let current_count = s.global_options().all().await.len();
+    if current_count + obj.len() > MAX_OPTIONS {
+        return Err(rpc_err("OPTION_LIMIT", format!("Options cap exceeded ({} existing + {} new > {} max)", current_count, obj.len(), MAX_OPTIONS)));
+    }
     let mut set_count = 0usize;
     for (key, val) in obj {
-        let value = val.as_str().unwrap_or("");
+        let value = match val.as_str() {
+            Some(v) => v,
+            None => {
+                return Err(rpc_err(
+                    "INVALID_INPUT",
+                    format!("Option '{}' value must be a string", key),
+                ));
+            }
+        };
         if key.is_empty() || key.len() > 256 {
             return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' invalid (1-256 chars)", key)));
+        }
+        // Reserved keys (e.g. `__target`) must only be written through their
+        // dedicated validated RPC (set_target runs SSRF/format checks); allowing
+        // them here would let a caller set the target bypassing those checks.
+        if key.starts_with("__") {
+            return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' is reserved; use the dedicated RPC", key)));
         }
         if value.len() > 4096 {
             return Err(rpc_err("INVALID_INPUT", format!("Value for '{}' too long (max 4096)", key)));
         }
-        if !crate::global_options::GLOBAL_OPTIONS.set(key, value).await {
+        if !s.global_options().set(key, value).await {
             return Err(rpc_err("OPTION_ERROR", format!("Failed to set '{}'", key)));
         }
         set_count += 1;
@@ -676,8 +951,12 @@ async fn rpc_set_option(params: &Value) -> RpcResult {
 }
 
 async fn rpc_delete_option(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let key = require_str(params, "key")?;
-    if crate::global_options::GLOBAL_OPTIONS.unset(key).await {
+    if key.starts_with("__") {
+        return Err(rpc_err("INVALID_INPUT", format!("Option key '{}' is reserved; use the dedicated RPC", key)));
+    }
+    if s.global_options().unset(key).await {
         Ok(json!({"deleted": key}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Option '{}' not found", key)))
@@ -687,7 +966,8 @@ async fn rpc_delete_option(params: &Value) -> RpcResult {
 // ── Credentials ──────────────────────────────────────────────────────
 
 async fn rpc_list_creds(params: &Value) -> RpcResult {
-    let all = crate::cred_store::CRED_STORE.list().await;
+    let s = crate::tenant::resolve();
+    let all = s.cred_store().list().await;
 
     let filter_host = params.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let filter_service = params.get("service").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
@@ -714,8 +994,12 @@ async fn rpc_list_creds(params: &Value) -> RpcResult {
         serde_json::to_value(&page).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?
     } else {
         let redacted: Vec<Value> = page.iter().map(|c| {
-            let masked = if c.secret.len() <= 2 { "****".to_string() }
-            else { format!("{}****", &c.secret[..2]) };
+            // P3-5: do not leak any prefix of the secret. Previous code
+            // returned the first 2 chars, which is up to 50% of a 4-char
+            // password and a meaningful credential-stuffing oracle. The
+            // unredacted value is still available to authorized callers via
+            // `reveal=true`.
+            let masked = "********".to_string();
             json!({
                 "id": c.id, "host": c.host, "port": c.port,
                 "service": c.service, "username": c.username,
@@ -753,7 +1037,8 @@ async fn rpc_add_cred(params: &Value) -> RpcResult {
         other => return Err(rpc_err("INVALID_INPUT", format!("Unknown cred_type '{}' (valid: password, hash, key, token)", other))),
     };
 
-    let id = match crate::cred_store::CRED_STORE.add(host, port, service, username, secret, cred_type, source).await {
+    let s = crate::tenant::resolve();
+    let id = match s.cred_store().add(crate::cred_store::NewCred { host, port, service, username, secret, cred_type, source_module: source }).await {
         Some(id) => id,
         None => return Err(rpc_err("STORE_ERROR", "Credential add failed (store limit or validation)")),
     };
@@ -761,8 +1046,9 @@ async fn rpc_add_cred(params: &Value) -> RpcResult {
 }
 
 async fn rpc_delete_cred(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let id = require_str(params, "id")?;
-    if crate::cred_store::CRED_STORE.delete(id).await {
+    if s.cred_store().delete(id).await {
         Ok(json!({"deleted": id}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Credential '{}' not found", id)))
@@ -770,24 +1056,42 @@ async fn rpc_delete_cred(params: &Value) -> RpcResult {
 }
 
 async fn rpc_search_creds(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let query = require_str(params, "q")?;
     if query.len() > 256 {
         return Err(rpc_err("INVALID_INPUT", "Search query too long (max 256)"));
     }
-    let results = crate::cred_store::CRED_STORE.search(query).await;
-    let results_json = serde_json::to_value(&results).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?;
-    Ok(json!({"results": results_json, "total": results.len()}))
+    let reveal = params.get("reveal").and_then(|v| v.as_bool()).unwrap_or(false);
+    let results = s.cred_store().search(query).await;
+    let total = results.len();
+    let results_json = if reveal {
+        serde_json::to_value(&results).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?
+    } else {
+        let redacted: Vec<Value> = results.iter().map(|c| {
+            let masked = "********".to_string();
+            json!({
+                "id": c.id, "host": c.host, "port": c.port,
+                "service": c.service, "username": c.username,
+                "secret": masked, "cred_type": format!("{:?}", c.cred_type),
+                "valid": c.valid, "source_module": c.source_module,
+            })
+        }).collect();
+        serde_json::to_value(redacted).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?
+    };
+    Ok(json!({"results": results_json, "total": total}))
 }
 
 async fn rpc_clear_creds() -> RpcResult {
-    crate::cred_store::CRED_STORE.clear().await;
+    let s = crate::tenant::resolve();
+    s.cred_store().clear().await;
     Ok(json!({"cleared": true}))
 }
 
 // ── Hosts ────────────────────────────────────────────────────────────
 
 async fn rpc_list_hosts(params: &Value) -> RpcResult {
-    let all = crate::workspace::WORKSPACE.hosts().await;
+    let s = crate::tenant::resolve();
+    let all = s.workspace().hosts().await;
     let filter_os = params.get("os").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let filter_search = params.get("search").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
@@ -831,13 +1135,15 @@ async fn rpc_add_host(params: &Value) -> RpcResult {
     if os_guess.is_some_and(|o| o.len() > 256 || o.chars().any(|c| c.is_control())) {
         return Err(rpc_err("INVALID_INPUT", "os_guess too long or contains control chars"));
     }
-    crate::workspace::WORKSPACE.add_host(ip, hostname, os_guess).await;
+    let s = crate::tenant::resolve();
+    s.workspace().add_host(ip, hostname, os_guess).await;
     Ok(json!({"added": ip}))
 }
 
 async fn rpc_delete_host(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let ip = require_str(params, "ip")?;
-    if crate::workspace::WORKSPACE.delete_host(ip).await {
+    if s.workspace().delete_host(ip).await {
         Ok(json!({"deleted": ip}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Host '{}' not found", ip)))
@@ -850,7 +1156,8 @@ async fn rpc_add_host_note(params: &Value) -> RpcResult {
     if note.len() > 4096 {
         return Err(rpc_err("INVALID_INPUT", "Note too long (max 4096)"));
     }
-    if crate::workspace::WORKSPACE.add_note(ip, note).await {
+    let s = crate::tenant::resolve();
+    if s.workspace().add_note(ip, note).await {
         Ok(json!({"added": true}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Host '{}' not found or note limit reached", ip)))
@@ -858,16 +1165,18 @@ async fn rpc_add_host_note(params: &Value) -> RpcResult {
 }
 
 async fn rpc_clear_hosts() -> RpcResult {
-    crate::workspace::WORKSPACE.clear_hosts().await;
+    let s = crate::tenant::resolve();
+    s.workspace().clear_hosts().await;
     Ok(json!({"cleared": true}))
 }
 
 // ── Services ─────────────────────────────────────────────────────────
 
 async fn rpc_list_services(params: &Value) -> RpcResult {
-    let all = crate::workspace::WORKSPACE.services().await;
+    let s = crate::tenant::resolve();
+    let all = s.workspace().services().await;
     let filter_host = params.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-    let filter_port = params.get("port").and_then(|v| v.as_u64()).map(|p| p as u16);
+    let filter_port = params.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok());
     let filter_search = params.get("search").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
 
     let filtered: Vec<_> = all.into_iter().filter(|s| {
@@ -913,7 +1222,8 @@ async fn rpc_add_service(params: &Value) -> RpcResult {
         return Err(rpc_err("INVALID_INPUT", "version too long or contains control chars"));
     }
 
-    crate::workspace::WORKSPACE.add_service(host, port, protocol, service_name, version).await;
+    let s = crate::tenant::resolve();
+    s.workspace().add_service(host, port, protocol, service_name, version).await;
     Ok(json!({"added": format!("{}:{}", host, port)}))
 }
 
@@ -924,7 +1234,10 @@ async fn rpc_delete_service(params: &Value) -> RpcResult {
         return Err(rpc_err("INVALID_INPUT", "port must be 1-65535"));
     }
     let port = port_raw as u16;
-    if crate::workspace::WORKSPACE.delete_service(host, port).await {
+    // Optional protocol scoping: omit to delete every protocol on the port.
+    let protocol = params.get("protocol").and_then(|v| v.as_str());
+    let s = crate::tenant::resolve();
+    if s.workspace().delete_service(host, port, protocol).await {
         Ok(json!({"deleted": format!("{}:{}", host, port)}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Service {}:{} not found", host, port)))
@@ -934,7 +1247,8 @@ async fn rpc_delete_service(params: &Value) -> RpcResult {
 // ── Loot ─────────────────────────────────────────────────────────────
 
 async fn rpc_list_loot(params: &Value) -> RpcResult {
-    let all = crate::loot::LOOT_STORE.list().await;
+    let s = crate::tenant::resolve();
+    let all = s.loot_store().list().await;
     let filter_host = params.get("host").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let filter_type = params.get("loot_type").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let filter_search = params.get("search").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
@@ -976,15 +1290,17 @@ async fn rpc_add_loot(params: &Value) -> RpcResult {
         return Err(rpc_err("INVALID_INPUT", format!("Data too large ({} bytes, max {} MB)", data.len(), MAX_LOOT_DATA / 1024 / 1024)));
     }
 
-    match crate::loot::LOOT_STORE.add_text(host, loot_type, description, data, source).await {
+    let s = crate::tenant::resolve();
+    match s.loot_store().add_text(host, loot_type, description, data, source).await {
         Some(id) => Ok(json!({"id": id})),
         None => Err(rpc_err("STORE_ERROR", "Failed to store loot (limit or I/O error)")),
     }
 }
 
 async fn rpc_delete_loot(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let id = require_str(params, "id")?;
-    if crate::loot::LOOT_STORE.delete(id).await {
+    if s.loot_store().delete(id).await {
         Ok(json!({"deleted": id}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Loot '{}' not found", id)))
@@ -992,26 +1308,29 @@ async fn rpc_delete_loot(params: &Value) -> RpcResult {
 }
 
 async fn rpc_search_loot(params: &Value) -> RpcResult {
+    let s = crate::tenant::resolve();
     let query = require_str(params, "q")?;
     if query.len() > 256 {
         return Err(rpc_err("INVALID_INPUT", "Search query too long (max 256)"));
     }
-    let results = crate::loot::LOOT_STORE.search(query).await;
+    let results = s.loot_store().search(query).await;
     let results_json = serde_json::to_value(&results).map_err(|e| rpc_err("SERIALIZE_ERROR", e.to_string()))?;
     Ok(json!({"results": results_json, "total": results.len()}))
 }
 
 async fn rpc_clear_loot() -> RpcResult {
-    crate::loot::LOOT_STORE.clear().await;
+    let s = crate::tenant::resolve();
+    s.loot_store().clear().await;
     Ok(json!({"cleared": true}))
 }
 
 // ── Workspace ────────────────────────────────────────────────────────
 
 async fn rpc_get_workspace() -> RpcResult {
-    let name = crate::workspace::WORKSPACE.current_name().await;
-    let hosts = crate::workspace::WORKSPACE.hosts().await;
-    let services = crate::workspace::WORKSPACE.services().await;
+    let s = crate::tenant::resolve();
+    let name = s.workspace().current_name().await;
+    let hosts = s.workspace().hosts().await;
+    let services = s.workspace().services().await;
     Ok(json!({
         "name": name,
         "host_count": hosts.len(),
@@ -1024,36 +1343,42 @@ async fn rpc_switch_workspace(params: &Value) -> RpcResult {
     if name.len() > 64 || name.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-') {
         return Err(rpc_err("INVALID_INPUT", "Workspace name must be 1-64 alphanumeric chars, dashes, or underscores"));
     }
-    crate::workspace::WORKSPACE.switch(name).await;
+    let s = crate::tenant::resolve();
+    s.workspace().switch(name).await;
     Ok(json!({"workspace": name}))
 }
 
 async fn rpc_list_workspaces() -> RpcResult {
-    let workspaces = crate::workspace::WORKSPACE.list_workspaces().await;
+    let s = crate::tenant::resolve();
+    let workspaces = s.workspace().list_workspaces().await;
     Ok(json!({"workspaces": workspaces}))
 }
 
 // ── Jobs ─────────────────────────────────────────────────────────────
 
 async fn rpc_list_jobs() -> RpcResult {
-    let jobs = crate::jobs::JOB_MANAGER.list();
+    let s = crate::tenant::resolve();
+    let jobs = s.job_manager().list();
     let items: Vec<Value> = jobs.iter().map(|(id, module, target, started, status)| {
         json!({"id": id, "module": module, "target": target, "started": started, "status": status})
     }).collect();
     Ok(json!({
         "jobs": items,
         "total": items.len(),
-        "running": crate::jobs::JOB_MANAGER.running_count(),
-        "max_running": crate::jobs::JOB_MANAGER.get_max_running(),
+        "running": s.job_manager().running_count(),
+        "max_running": s.job_manager().get_max_running(),
     }))
 }
 
 async fn rpc_get_job(params: &Value) -> RpcResult {
-    let id = params.get("id").and_then(|v| v.as_u64())
-        .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: id"))? as u32;
+    let id_u64 = params.get("id").and_then(|v| v.as_u64())
+        .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: id"))?;
+    let id = u32::try_from(id_u64)
+        .map_err(|e| rpc_err("INVALID_INPUT", format!("id exceeds u32 range: {e}")))?;
     let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-    match crate::jobs::JOB_MANAGER.get_detail(id) {
+    let s = crate::tenant::resolve();
+    match s.job_manager().get_detail(id) {
         Some((module, target, started, status, progress)) => {
             let output = progress.get_output(from);
             Ok(json!({
@@ -1074,9 +1399,12 @@ async fn rpc_get_job(params: &Value) -> RpcResult {
 }
 
 async fn rpc_kill_job(params: &Value) -> RpcResult {
-    let id = params.get("id").and_then(|v| v.as_u64())
-        .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: id"))? as u32;
-    if crate::jobs::JOB_MANAGER.kill(id) {
+    let id_u64 = params.get("id").and_then(|v| v.as_u64())
+        .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: id"))?;
+    let id = u32::try_from(id_u64)
+        .map_err(|e| rpc_err("INVALID_INPUT", format!("id exceeds u32 range: {e}")))?;
+    let s = crate::tenant::resolve();
+    if s.job_manager().kill(id) {
         Ok(json!({"killed": id}))
     } else {
         Err(rpc_err("NOT_FOUND", format!("Job {} not found", id)))
@@ -1084,21 +1412,31 @@ async fn rpc_kill_job(params: &Value) -> RpcResult {
 }
 
 async fn rpc_set_job_limit(params: &Value) -> RpcResult {
-    let limit = params.get("limit").and_then(|v| v.as_u64())
-        .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: limit"))? as u32;
+    let limit_u64 = params.get("limit").and_then(|v| v.as_u64())
+        .ok_or_else(|| rpc_err("INVALID_INPUT", "Missing required parameter: limit"))?;
+    let limit = u32::try_from(limit_u64)
+        .map_err(|e| rpc_err("INVALID_INPUT", format!("limit exceeds u32 range: {e}")))?;
     if limit == 0 || limit > 100 {
         return Err(rpc_err("INVALID_INPUT", "limit must be 1-100"));
     }
-    crate::jobs::JOB_MANAGER.set_max_running(limit);
+    let s = crate::tenant::resolve();
+    s.job_manager().set_max_running(limit);
     Ok(json!({"max_running": limit}))
 }
 
 // ── Spool ────────────────────────────────────────────────────────────
 
 async fn rpc_spool_status() -> RpcResult {
-    let active = crate::spool::SPOOL.is_active();
-    let filename = crate::spool::SPOOL.current_file();
-    Ok(json!({"active": active, "filename": filename}))
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    // Only report active if the spool is owned by the requesting tenant
+    // (exact owner match, not a filename prefix that '_' could collide on).
+    let is_mine = crate::spool::SPOOL.owner().as_deref() == Some(tenant_id.as_str());
+    let filename = if is_mine { crate::spool::SPOOL.current_file() } else { None };
+    Ok(json!({"active": crate::spool::SPOOL.is_active() && is_mine, "filename": filename}))
 }
 
 async fn rpc_spool_start(params: &Value) -> RpcResult {
@@ -1117,13 +1455,44 @@ async fn rpc_spool_start(params: &Value) -> RpcResult {
     if !filename.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
         return Err(rpc_err("INVALID_INPUT", "Filename must be alphanumeric with _ - . only"));
     }
-    match crate::spool::SPOOL.start(filename) {
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    // The spool is a single process-global sink. Refuse to start over a spool
+    // that this tenant does not own (another tenant's, or a shell's) — otherwise
+    // this start would stop their spool (denial) and capture their output.
+    if crate::spool::SPOOL.is_active()
+        && crate::spool::SPOOL.owner().as_deref() != Some(tenant_id.as_str())
+    {
+        return Err(rpc_err(
+            "SPOOL_BUSY",
+            "Another session is currently spooling; try again later",
+        ));
+    }
+    // Keep the tenant prefix in the on-disk filename so different tenants' spool
+    // files never collide; ownership itself is tracked explicitly via `owner`.
+    let scoped_filename = format!("{}_{}", tenant_id, filename);
+    match crate::spool::SPOOL.start(&scoped_filename, Some(&tenant_id)) {
         Ok(_) => Ok(json!({"started": filename})),
-        Err(e) => Err(rpc_err("SPOOL_ERROR", e)),
+        Err(e) => Err(rpc_err("SPOOL_ERROR", format!("{:#}", e))),
     }
 }
 
 async fn rpc_spool_stop() -> RpcResult {
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    if !crate::spool::SPOOL.is_active() {
+        return Err(rpc_err("SPOOL_ERROR", "Spool is not active"));
+    }
+    // Exact owner match: a tenant may only stop its own spool.
+    if crate::spool::SPOOL.owner().as_deref() != Some(tenant_id.as_str()) {
+        return Err(rpc_err("SPOOL_ERROR", "Spool is not active for this tenant"));
+    }
     match crate::spool::SPOOL.stop() {
         Some(name) => Ok(json!({"stopped": name})),
         None => Err(rpc_err("SPOOL_ERROR", "Spool is not active")),
@@ -1133,21 +1502,27 @@ async fn rpc_spool_stop() -> RpcResult {
 // ── Results ──────────────────────────────────────────────────────────
 
 async fn rpc_list_results() -> RpcResult {
-    let results_dir = crate::config::results_dir();
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    let results_dir = crate::config::results_dir().join(&tenant_id);
     if !results_dir.exists() {
         return Ok(json!({"files": [], "total": 0}));
     }
     let mut files = Vec::new();
-    let entries = match std::fs::read_dir(&results_dir) {
+    let mut entries = match tokio::fs::read_dir(&results_dir).await {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!("Failed to read results directory: {}", e);
             return Ok(json!({"files": [], "total": 0}));
         }
     };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
             Err(e) => {
                 tracing::debug!("Skipping unreadable entry: {}", e);
                 continue;
@@ -1155,7 +1530,7 @@ async fn rpc_list_results() -> RpcResult {
         };
         let name = entry.file_name().to_string_lossy().to_string();
         if name.ends_with(".txt") && crate::api::validate_result_filename(&name) {
-            let meta = entry.metadata();
+            let meta = entry.metadata().await;
             files.push(json!({
                 "filename": name,
                 "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -1170,9 +1545,20 @@ async fn rpc_get_result(params: &Value) -> RpcResult {
     if !crate::api::validate_result_filename(filename) {
         return Err(rpc_err("INVALID_INPUT", "Invalid result filename"));
     }
-    let path = crate::config::results_dir().join(filename);
-    if !path.exists() {
-        return Err(rpc_err("NOT_FOUND", format!("Result file '{}' not found", filename)));
+    let tenant_id = crate::tenant::CURRENT_TENANT
+        .try_with(|t| t.clone())
+        .ok()
+        .or_else(crate::context::current_tenant_id)
+        .unwrap_or_default();
+    let tenant_results_dir = crate::config::results_dir().join(&tenant_id);
+    let path = tenant_results_dir.join(filename);
+    // Path traversal protection: verify resolved path stays within the tenant's results dir
+    let canonical_path = path.canonicalize()
+        .map_err(|e| rpc_err("NOT_FOUND", format!("Result file '{}' not found: {}", filename, e)))?;
+    let canonical_dir = tenant_results_dir.canonicalize()
+        .map_err(|e| rpc_err("IO_ERROR", format!("Results directory error: {}", e)))?;
+    if !canonical_path.starts_with(&canonical_dir) {
+        return Err(rpc_err("SECURITY", "Path traversal detected in result filename"));
     }
     let meta = std::fs::symlink_metadata(&path)
         .map_err(|e| rpc_err("IO_ERROR", e.to_string()))?;

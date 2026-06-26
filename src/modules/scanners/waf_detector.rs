@@ -7,11 +7,11 @@
 //! For authorized penetration testing only.
 
 use anyhow::{Result, Context};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use std::collections::HashMap;
 use crate::utils::{cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -30,6 +30,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -179,12 +180,11 @@ fn check_signatures(
     // Check headers
     for (header_name, header_value) in &sig.header_checks {
         let key = header_name.to_lowercase();
-        if let Some(val) = headers.get(&key) {
-            if header_value.is_empty() || val.to_lowercase().contains(&header_value.to_lowercase()) {
+        if let Some(val) = headers.get(&key)
+            && (header_value.is_empty() || val.to_lowercase().contains(&header_value.to_lowercase())) {
                 methods.push(format!("header '{}' = '{}'", header_name, val));
                 score += 3;
             }
-        }
     }
 
     // Check cookies
@@ -212,25 +212,8 @@ fn check_signatures(
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "WAF-Detect",
-            default_port: 80,
-            state_file: "waf_detector_mass_state.log",
-            default_output: "waf_detector_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} HTTP open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -284,7 +267,7 @@ pub async fn run(target: &str) -> Result<()> {
             }
 
             // Limit response body to 128KB to prevent OOM
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_bytes = crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await.unwrap_or_default();
             let body = if body_bytes.len() > 128 * 1024 {
                 String::from_utf8_lossy(&body_bytes[..128 * 1024]).to_string()
             } else {
@@ -341,7 +324,7 @@ pub async fn run(target: &str) -> Result<()> {
                         headers.insert(key_str, val_str);
                     }
 
-                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    let body_bytes = crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await.unwrap_or_default();
                     let body = if body_bytes.len() > 128 * 1024 {
                         String::from_utf8_lossy(&body_bytes[..128 * 1024]).to_string()
                     } else {
@@ -363,7 +346,8 @@ pub async fn run(target: &str) -> Result<()> {
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("WAF probe failed: {e}");
                     crate::mprintln!("{}", format!("  [-] Request blocked/failed for: {}", payload).dimmed());
                 }
             }
@@ -380,6 +364,16 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!();
         crate::mprintln!("{}", "[*] Note: Absence of detection does not mean no WAF is present.".yellow());
     } else {
+        // Surface every WAF detection to the structured event bus before
+        // printing the table, so subscribers see findings as they arrive.
+        for d in &detections {
+            crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                host: target.to_string(),
+                port: 443,
+                service: format!("waf:{}", d.name),
+                version: Some(d.confidence.to_string()),
+            });
+        }
         crate::mprintln!("  Detected WAF/CDN(s):");
         crate::mprintln!();
 
@@ -397,6 +391,23 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
+    let mut outcome = ModuleOutcome::ok();
+
+    // Add Banner findings for each detected WAF/CDN
+    for det in &detections {
+        outcome.findings.push(Finding {
+            target: target.to_string(),
+            kind: FindingKind::Banner,
+            message: format!("WAF/CDN detected: {} (confidence: {})", det.name, det.confidence),
+            data: Some(serde_json::json!({
+                "waf_name": det.name,
+                "confidence": det.confidence,
+                "detection_methods": det.methods,
+                "url": base_url,
+            })),
+        });
+    }
+
     if save_results && !detections.is_empty() {
         let output_path = cfg_prompt_output_file("output_file", "Output file", "waf_detect_results.txt").await?;
         let mut content = format!("WAF Detection Results - {}\n\n", base_url);
@@ -407,10 +418,15 @@ pub async fn run(target: &str) -> Result<()> {
             }
             content.push('\n');
         }
-        std::fs::write(&output_path, content)
+        tokio::fs::write(&output_path, content).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "waf_detector", native);

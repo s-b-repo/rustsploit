@@ -14,8 +14,8 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 /// Default ports to scan when the user accepts the default list.
@@ -39,6 +39,7 @@ pub fn info() -> ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -71,26 +72,15 @@ impl ServiceResult {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(target: &str) -> Result<()> {
-    // Mass scan support: TCP connect to port 80, extract HTTP server header.
-    if is_mass_scan_target(target) {
-        return run_mass_scan(
-            target,
-            MassScanConfig {
-                protocol_name: "ServiceScan",
-                default_port: 80,
-                state_file: "service_scanner_mass_state.log",
-                default_output: "service_scanner_mass_results.txt",
-                default_concurrency: 500,
-            },
-            move |ip: std::net::IpAddr, port: u16| async move {
-                mass_scan_probe(&ip.to_string(), port).await
-            },
-        )
-        .await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("service_scanner requires a single-host target")?;
 
     display_banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     // --- Prompts ---
     let port_list_str = cfg_prompt_default(
@@ -130,6 +120,13 @@ pub async fn run(target: &str) -> Result<()> {
         String::new()
     };
 
+    // Prompt-harvest dry run: every `cfg_prompt_*` answer above is now cached
+    // for the batch, so there's nothing more to do. Returning here means the
+    // placeholder host is never actually scanned and no results file is written.
+    if ctx.prompt_only {
+        return Ok(outcome);
+    }
+
     // --- Run scan ---
     crate::mprintln!();
     crate::mprintln!(
@@ -151,12 +148,15 @@ pub async fn run(target: &str) -> Result<()> {
 
     let mut handles = Vec::with_capacity(ports.len());
     for port in &ports {
+        if ctx.is_cancelled() { break; }
+        ctx.rate_limit(target).await;
         let permit = semaphore.clone().acquire_owned().await?;
         let tgt = target_str.clone();
         let p = *port;
         let to = timeout_secs;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
+            if crate::context::is_cancelled() { return None; }
             probe_service(&tgt, p, to).await
         }));
     }
@@ -164,9 +164,27 @@ pub async fn run(target: &str) -> Result<()> {
     let mut results: Vec<ServiceResult> = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok(Some(r)) => results.push(r),
+            Ok(Some(r)) => {
+                outcome.findings.push(Finding {
+                    target: target_str.clone(),
+                    kind: FindingKind::Banner,
+                    message: format!(
+                        "{}:{} {} {} {}",
+                        target_str, r.port, r.service, r.version, r.banner
+                    ),
+                    data: Some(serde_json::json!({
+                        "host": target_str,
+                        "port": r.port,
+                        "service": r.service,
+                        "version": r.version,
+                        "banner": r.banner,
+                        "notes": r.notes,
+                    })),
+                });
+                results.push(r);
+            }
             Ok(None) => {}
-            Err(_) => {}
+            Err(e) => { tracing::debug!("probe failed: {e}"); }
         }
     }
 
@@ -177,7 +195,13 @@ pub async fn run(target: &str) -> Result<()> {
     print_results_table(&results);
 
     // --- Save to file ---
-    if save_results && !output_file.is_empty() {
+    // In a mass-scan fan-out (`batch_mode`), every host runs this module. A
+    // per-host file save would have all hosts racing to overwrite the same path,
+    // and the status lines would spam the console once per host. So restrict the
+    // file save + the per-host "scan complete" summary to interactive
+    // single-target runs; in a sweep, findings flow through `outcome` instead and
+    // only hosts that actually have services print their results table.
+    if save_results && !output_file.is_empty() && !crate::utils::is_batch_mode() {
         save_results_to_file(&results, &output_file, target)?;
         crate::mprintln!(
             "{}",
@@ -185,14 +209,16 @@ pub async fn run(target: &str) -> Result<()> {
         );
     }
 
-    crate::mprintln!(
-        "\n{}",
-        format!("[*] Scan complete: {} services detected on {}", results.len(), target)
-            .green()
-            .bold()
-    );
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!(
+            "\n{}",
+            format!("[*] Scan complete: {} services detected on {}", results.len(), target)
+                .green()
+                .bold()
+        );
+    }
 
-    Ok(())
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +248,12 @@ fn display_banner() {
 
 fn print_results_table(results: &[ServiceResult]) {
     if results.is_empty() {
-        crate::mprintln!("{}", "[!] No services detected.".yellow());
+        // Don't print "no services" for every host of a mass sweep — that is the
+        // common case across millions of hosts and would bury the real hits.
+        // Keep it for interactive single-target runs where it's useful feedback.
+        if !crate::utils::is_batch_mode() {
+            crate::mprintln!("{}", "[!] No services detected.".yellow());
+        }
         return;
     }
 
@@ -283,7 +314,9 @@ fn truncate_display(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let end = max.saturating_sub(3);
+        let truncated: String = s.chars().take(end).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -295,6 +328,57 @@ fn sanitize_banner(raw: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Run the captured banner through the Recog fingerprint database `db_name`
+/// (e.g. "ssh", "ftp", "smtp", "http", "mysql") and, on a match, enrich the
+/// `ServiceResult` with the structured product/version/OS Recog extracted.
+///
+/// Recog's structured product+version takes precedence over the manual
+/// substring parse (which it supersedes); OS and vendor details are recorded in
+/// the `notes` field. Returns `true` when a Recog fingerprint matched.
+fn enrich_with_recog(r: &mut ServiceResult, db_name: &str, banner: &str) -> bool {
+    if banner.trim().is_empty() {
+        return false;
+    }
+    let m = crate::utils::recog::match_banner(db_name, banner);
+    if !m.matched {
+        return false;
+    }
+    tracing::debug!(
+        db = db_name,
+        port = r.port,
+        "service_scanner: recog fingerprint matched"
+    );
+
+    // Prefer Recog's product+version summary as the version label.
+    if let Some(summary) = m.summary() {
+        if !summary.is_empty() {
+            r.version = summary;
+        }
+    }
+
+    // Append vendor / OS detail to notes without clobbering existing notes.
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(vendor) = m.vendor() {
+        extra.push(format!("vendor={}", vendor));
+    }
+    if let Some(os) = m.os_product() {
+        extra.push(format!("os={}", os));
+    }
+    if let Some(cpe) = m.get("service.cpe23") {
+        extra.push(format!("cpe={}", cpe));
+    }
+    if !extra.is_empty() {
+        let detail = format!("recog: {}", extra.join(", "));
+        if r.notes.is_empty() {
+            r.notes = detail;
+        } else {
+            r.notes = format!("{}, {}", r.notes, detail);
+        }
+    }
+
+    true
 }
 
 fn save_results_to_file(
@@ -312,7 +396,7 @@ fn save_results_to_file(
     writeln!(f, "Service Version Scan Results for {}", target)?;
     writeln!(f, "Timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
     writeln!(f, "{}", "-".repeat(80))?;
-    writeln!(f, "{:<8} {:<16} {:<30} {}", "Port", "Service", "Version", "Notes")?;
+    writeln!(f, "{:<8} {:<16} {:<30} Notes", "Port", "Service", "Version")?;
     writeln!(f, "{}", "-".repeat(80))?;
 
     for r in results {
@@ -373,43 +457,6 @@ fn parse_port_list(input: &str) -> Result<Vec<u16>> {
 }
 
 // ---------------------------------------------------------------------------
-// Mass scan probe (HTTP server header extraction)
-// ---------------------------------------------------------------------------
-
-async fn mass_scan_probe(ip: &str, port: u16) -> Option<String> {
-    let addr = format!("{}:{}", ip, port);
-    let stream = timeout(Duration::from_secs(3), TcpStream::connect(&addr))
-        .await
-        .ok()?
-        .ok()?;
-
-    let mut stream = stream;
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        ip
-    );
-    stream.write_all(request.as_bytes()).await.ok()?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = timeout(Duration::from_secs(3), stream.read(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-
-    if n == 0 {
-        return None;
-    }
-
-    let response = String::from_utf8_lossy(&buf[..n]);
-    let server = extract_http_header(&response, "server").unwrap_or_default();
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    Some(format!(
-        "[{}] {}:{} ServiceScan server={}\n",
-        ts, ip, port, server
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // Core probe dispatcher
 // ---------------------------------------------------------------------------
 
@@ -417,12 +464,17 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
     let addr = format!("{}:{}", target, port);
     let dur = Duration::from_secs(timeout_secs);
 
-    let stream = match timeout(dur, TcpStream::connect(&addr)).await {
-        Ok(Ok(s)) => s,
-        _ => return None,
+    let stream = match crate::utils::network::tcp_connect_str(&addr, dur).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::trace!(target = %addr, port, "service probe connect failed: {}", e);
+            return None;
+        }
     };
 
-    let result = match port {
+    
+
+    match port {
         21 => probe_ftp(stream, port, dur).await,
         22 => probe_ssh(stream, port, dur).await,
         23 => probe_telnet(stream, port, dur).await,
@@ -439,9 +491,7 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
         11211 => probe_memcached(stream, port, dur).await,
         27017 => probe_mongodb(stream, port, dur).await,
         _ => probe_generic(stream, port, dur).await,
-    };
-
-    result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,12 +528,17 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
         r.version = extract_version_after(&r.banner, "wu-");
     }
 
+    // Recog fingerprint pass — overrides/augments the manual parse above with a
+    // structured product/version and vendor/OS detail when a fingerprint hits.
+    let ftp_banner = r.banner.clone();
+    enrich_with_recog(&mut r, "ftp", &ftp_banner);
+
     // Check anonymous access — proper FTP handshake
     let anon_cmd = b"USER anonymous\r\n";
     if stream.write_all(anon_cmd).await.is_ok() {
         let mut anon_buf = vec![0u8; 512];
-        if let Ok(Ok(an)) = timeout(dur, stream.read(&mut anon_buf)).await {
-            if an > 0 {
+        if let Ok(Ok(an)) = timeout(dur, stream.read(&mut anon_buf)).await
+            && an > 0 {
                 let resp = String::from_utf8_lossy(&anon_buf[..an]);
                 if resp.starts_with("230") {
                     // 230 = Logged in without password
@@ -492,8 +547,8 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
                     // 331 = Password required — send anonymous email
                     if stream.write_all(b"PASS anonymous@\r\n").await.is_ok() {
                         let mut pass_buf = vec![0u8; 512];
-                        if let Ok(Ok(pn)) = timeout(dur, stream.read(&mut pass_buf)).await {
-                            if pn > 0 {
+                        if let Ok(Ok(pn)) = timeout(dur, stream.read(&mut pass_buf)).await
+                            && pn > 0 {
                                 let pass_resp = String::from_utf8_lossy(&pass_buf[..pn]);
                                 if pass_resp.starts_with("230") {
                                     r.notes = "ANONYMOUS LOGIN ALLOWED".to_string();
@@ -501,13 +556,11 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
                                     r.notes = "Anonymous login denied".to_string();
                                 }
                             }
-                        }
                     }
                 } else if resp.starts_with("530") {
                     r.notes = "Anonymous login denied".to_string();
                 }
             }
-        }
     }
 
     Some(r)
@@ -535,6 +588,10 @@ async fn probe_ssh(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
             r.version = sw.to_string();
         }
     }
+
+    // Recog fingerprint pass — resolves OpenSSH/Dropbear/RouterOS etc. to a
+    // structured product + version, replacing the raw banner-prefix above.
+    enrich_with_recog(&mut r, "ssh", &banner);
 
     Some(r)
 }
@@ -612,6 +669,10 @@ async fn probe_smtp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<S
     if banner.starts_with("220") {
         r.notes = "Service ready".to_string();
     }
+
+    // Recog fingerprint pass — structured MTA product/version (Exim, Postfix,
+    // Sendmail, Exchange) plus OS detail when the banner reveals it.
+    enrich_with_recog(&mut r, "smtp", &banner);
 
     Some(r)
 }
@@ -696,6 +757,9 @@ async fn probe_https(target: &str, port: u16, dur: Duration) -> Option<ServiceRe
             if !server.is_empty() {
                 r.version = server.clone();
                 r.notes = format!("Server: {}", server);
+                // Recog fingerprint pass over the HTTP Server header — yields a
+                // structured web-server product/version and host-OS detail.
+                enrich_with_recog(&mut r, "http", &server);
             }
             if !powered_by.is_empty() {
                 if r.notes.is_empty() {
@@ -705,7 +769,8 @@ async fn probe_https(target: &str, port: u16, dur: Duration) -> Option<ServiceRe
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::debug!("TLS probe failed: {e}");
             r.notes = "TLS connection failed or timeout".to_string();
         }
     }
@@ -742,6 +807,9 @@ async fn probe_mysql(mut stream: TcpStream, port: u16, dur: Duration) -> Option<
             if version_str.to_lowercase().contains("mariadb") {
                 r.service = "MariaDB".to_string();
             }
+            // Recog fingerprint pass over the raw handshake version string —
+            // distinguishes MySQL vs MariaDB and pins the numeric version/CPE.
+            enrich_with_recog(&mut r, "mysql", &version_str);
         }
     }
 
@@ -765,13 +833,14 @@ async fn probe_postgres(
         0x04, 0xd2, 0x16, 0x2f, // SSL request code = 80877103
     ];
 
-    if stream.write_all(&ssl_request).await.is_err() {
+    if let Err(e) = stream.write_all(&ssl_request).await {
+        tracing::trace!("PostgreSQL SSL request write failed: {e}");
         return Some(r);
     }
 
     let mut buf = vec![0u8; 1024];
-    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await {
-        if n > 0 {
+    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await
+        && n > 0 {
             match buf[0] {
                 b'S' => {
                     r.notes = "SSL supported".to_string();
@@ -786,7 +855,6 @@ async fn probe_postgres(
                 }
             }
         }
-    }
 
     Some(r)
 }
@@ -796,7 +864,8 @@ async fn probe_redis(mut stream: TcpStream, port: u16, dur: Duration) -> Option<
     let mut r = ServiceResult::new(port);
     r.service = "Redis".to_string();
 
-    if stream.write_all(b"INFO\r\n").await.is_err() {
+    if let Err(e) = stream.write_all(b"INFO\r\n").await {
+        tracing::trace!("Redis INFO write failed: {e}");
         return Some(r);
     }
 
@@ -839,13 +908,14 @@ async fn probe_mongodb(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
     //   numberToReturn (4), query BSON document
     let is_master_bson: Vec<u8> = build_is_master_query();
 
-    if stream.write_all(&is_master_bson).await.is_err() {
+    if let Err(e) = stream.write_all(&is_master_bson).await {
+        tracing::trace!("MongoDB isMaster write failed: {e}");
         return Some(r);
     }
 
     let mut buf = vec![0u8; 4096];
-    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await {
-        if n > 0 {
+    if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await
+        && n > 0 {
             let data = &buf[..n];
             // Look for version string pattern in the BSON response.
             // MongoDB includes "version" : "x.y.z" in the isMaster reply.
@@ -856,7 +926,6 @@ async fn probe_mongodb(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
             r.banner = format!("MongoDB ({}B response)", n);
             r.notes = "Responded to isMaster".to_string();
         }
-    }
 
     Some(r)
 }
@@ -870,7 +939,8 @@ async fn probe_memcached(
     let mut r = ServiceResult::new(port);
     r.service = "Memcached".to_string();
 
-    if stream.write_all(b"version\r\n").await.is_err() {
+    if let Err(e) = stream.write_all(b"version\r\n").await {
+        tracing::trace!("Memcached version write failed: {e}");
         return Some(r);
     }
 
@@ -904,7 +974,13 @@ async fn probe_rdp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
     // X.224 CR: length=14, CR code=0xE0, dst-ref=0, src-ref=0, class=0
     // Cookie: "Cookie: mstshash=test\r\n"
     let cookie = b"Cookie: mstshash=test\r\n";
-    let x224_len: u8 = 6 + cookie.len() as u8; // CR header (6) + cookie
+    let x224_len = match u8::try_from(6 + cookie.len()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("X.224 payload too large for u8 length: {e}");
+            return None;
+        }
+    };
     let tpkt_len: u16 = 4 + 1 + x224_len as u16; // TPKT header (4) + x224 length byte + x224 payload
 
     let mut pkt = Vec::with_capacity(tpkt_len as usize);
@@ -920,7 +996,8 @@ async fn probe_rdp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
     pkt.push(0x00); // class option
     pkt.extend_from_slice(cookie);
 
-    if stream.write_all(&pkt).await.is_err() {
+    if let Err(e) = stream.write_all(&pkt).await {
+        tracing::trace!("RDP X.224 CR write failed: {e}");
         return Some(r);
     }
 
@@ -978,7 +1055,8 @@ async fn probe_elasticsearch(
     r.service = "Elasticsearch".to_string();
 
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    if stream.write_all(request).await.is_err() {
+    if let Err(e) = stream.write_all(request).await {
+        tracing::trace!("Elasticsearch HTTP request write failed: {e}");
         return Some(r);
     }
 
@@ -1022,22 +1100,19 @@ async fn probe_generic(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
 
     // First, try a passive read (many services send banners on connect).
     let short_dur = Duration::from_secs(dur.as_secs().min(2));
-    if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await {
-        if n > 0 {
+    if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await
+        && n > 0 {
             let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
             r.banner = banner.clone();
             detect_service_from_banner(&banner, &mut r);
             return Some(r);
         }
-    }
 
     // Fallback: send an HTTP GET and see if we get an HTTP response.
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    );
-    if stream.write_all(http_req.as_bytes()).await.is_ok() {
-        if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await {
-            if n > 0 {
+    let http_req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
+    if stream.write_all(http_req.as_bytes()).await.is_ok()
+        && let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await
+            && n > 0 {
                 let resp = String::from_utf8_lossy(&buf[..n]).to_string();
                 if resp.starts_with("HTTP/") {
                     r.service = "HTTP".to_string();
@@ -1049,8 +1124,6 @@ async fn probe_generic(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
                 r.banner = truncate_display(&r.banner, 120);
                 return Some(r);
             }
-        }
-    }
 
     // Port is open but no data -- still report it.
     r.notes = "Open, no banner".to_string();
@@ -1096,7 +1169,7 @@ fn extract_version_after(text: &str, keyword: &str) -> String {
         let rest = &text[start..];
         // Take until whitespace or end.
         let token = rest
-            .split(|c: char| c == '\r' || c == '\n')
+            .split(['\r', '\n'])
             .next()
             .unwrap_or("")
             .trim();
@@ -1127,7 +1200,7 @@ fn extract_http_header(response: &str, header: &str) -> Option<String> {
     for line in response.lines() {
         let line_lower = line.to_lowercase();
         if line_lower.starts_with(&header_lower) && line.contains(':') {
-            let value = line.splitn(2, ':').nth(1)?.trim().to_string();
+            let value = line.split_once(':')?.1.trim().to_string();
             return Some(value);
         }
     }
@@ -1223,3 +1296,5 @@ fn build_is_master_query() -> Vec<u8> {
 
     msg
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "service_scanner", native);

@@ -12,6 +12,10 @@ pub struct ModuleInfo {
     /// ISO date string, e.g. "2024-01-15"
     pub disclosure_date: Option<String>,
     pub rank: ModuleRank,
+    /// Default service port for this module (used by scheduler for mass-scan
+    /// pre-checks when the operator hasn't set `setg port`).
+    #[serde(default)]
+    pub default_port: Option<u16>,
 }
 
 /// Reliability/safety rank for modules (inspired by Metasploit ranking).
@@ -40,26 +44,6 @@ impl std::fmt::Display for ModuleRank {
             ModuleRank::Normal => write!(f, "Normal"),
             ModuleRank::Low => write!(f, "Low"),
             ModuleRank::Manual => write!(f, "Manual"),
-        }
-    }
-}
-
-/// Result of a non-destructive vulnerability check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CheckResult {
-    Vulnerable(String),
-    NotVulnerable(String),
-    Unknown(String),
-    Error(String),
-}
-
-impl std::fmt::Display for CheckResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckResult::Vulnerable(msg) => write!(f, "Vulnerable: {}", msg),
-            CheckResult::NotVulnerable(msg) => write!(f, "Not Vulnerable: {}", msg),
-            CheckResult::Unknown(msg) => write!(f, "Unknown: {}", msg),
-            CheckResult::Error(msg) => write!(f, "Error: {}", msg),
         }
     }
 }

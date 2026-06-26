@@ -12,9 +12,6 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-use crate::utils::cfg_prompt_int_range;
-use crate::utils::cfg_prompt_output_file;
-
 /// Standard IP exclusion ranges for mass scanning (private, reserved, CDN, DNS).
 pub const EXCLUDED_RANGES: &[&str] = &[
     "10.0.0.0/8",
@@ -171,7 +168,9 @@ impl BruteforceStats {
                 rate
             );
         }
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+            eprintln!("[!] Flush failed: {}", e);
+        }
     }
 
     pub async fn print_final(&self) {
@@ -248,45 +247,111 @@ pub fn backoff_delay(base_ms: u64, attempt: u32, max_multiplier: u64) -> Duratio
     } else {
         0
     };
-    Duration::from_millis(backoff + jitter)
+    Duration::from_millis(backoff.saturating_add(jitter))
 }
 
 pub fn generate_random_public_ip(exclusions: &[ipnetwork::IpNetwork]) -> IpAddr {
     let mut rng = rand::rng();
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        if attempts > 100_000 {
-            // Fallback: return a random non-excluded IP from common ranges
-            return IpAddr::V4(std::net::Ipv4Addr::new(
-                rng.random_range(1..224),
-                rng.random_range(0..256) as u8,
-                rng.random_range(0..256) as u8,
-                rng.random_range(1..255) as u8,
-            ));
-        }
-
-        let octets: [u8; 4] = rng.random();
-        let ip = Ipv4Addr::from(octets);
-        let ip_addr = IpAddr::V4(ip);
-
-        // Basic check first to avoid expensive loop
-        if octets[0] == 10 || octets[0] == 127 || octets[0] == 0 {
+    const MAX_ATTEMPTS: u32 = 500_000;
+    for _ in 0..MAX_ATTEMPTS {
+        let first = rng.random_range(1u8..224);
+        if first == 10 || first == 127 {
             continue;
         }
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            first,
+            rng.random_range(0..=255),
+            rng.random_range(0..=255),
+            rng.random_range(1..=254),
+        ));
 
-        let mut excluded = false;
-        for net in exclusions {
-            if net.contains(ip_addr) {
-                excluded = true;
-                break;
-            }
-        }
-
-        if !excluded {
-            return ip_addr;
+        if !exclusions.iter().any(|net| net.contains(ip)) {
+            return ip;
         }
     }
+    // Exhausted attempts — exclusion set covers most of the IPv4 space.
+    // Return a best-effort candidate from a rarely-excluded range, but still
+    // honour the exclusions: an unchecked return could hand the scanner an
+    // address the operator explicitly excluded (owned/Cloudflare/etc).
+    tracing::warn!(
+        "generate_random_public_ip: exhausted {} attempts; exclusion set may be too broad",
+        MAX_ATTEMPTS
+    );
+    let mut last = Ipv4Addr::new(44, 0, 0, 1);
+    for _ in 0..1024 {
+        last = Ipv4Addr::new(
+            rng.random_range(44u8..46),
+            rng.random_range(0..=255),
+            rng.random_range(0..=255),
+            rng.random_range(1..=254),
+        );
+        let ip = IpAddr::V4(last);
+        if !exclusions.iter().any(|net| net.contains(ip)) {
+            return ip;
+        }
+    }
+    // Even the fallback range is fully excluded — the operator has excluded
+    // essentially the entire address space. Return the last public candidate
+    // (never loopback/private) so the caller never scans its own host.
+    IpAddr::V4(last)
+}
+
+/// Process-wide cache of the "already checked" IP set, keyed by state-file
+/// name. Loading the file once per state file (instead of re-reading the whole
+/// thing for every IP) turns the resume scan from O(n²) into O(n). The cached
+/// set reflects the on-disk resume state captured the first time the file is
+/// consulted in this run; IPs marked *during* the run aren't re-queried because
+/// each address appears exactly once in `network.iter()`.
+type CheckedSet = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+static CHECKED_IP_CACHE: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, CheckedSet>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Cap state-file size to keep a corrupted/runaway file from OOMing us.
+const MAX_STATE_FILE: u64 = 256 * 1024 * 1024;
+
+/// Load (and cache) the set of IPs recorded in `state_file`. Each line is of
+/// the form `checked: <ip>`; we store the `<ip>` token so lookups are exact
+/// full-token matches rather than substring scans. The file is parsed once per
+/// state file and the resulting set is reused for every subsequent IP, turning
+/// the resume scan from O(n²) (one full re-read per IP) into O(n).
+async fn checked_set_for(state_file: &str) -> CheckedSet {
+    {
+        let cache = CHECKED_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = cache.get(state_file) {
+            return set.clone();
+        }
+    }
+
+    let mut set = std::collections::HashSet::new();
+    match tokio::fs::metadata(state_file).await {
+        Ok(meta) if meta.len() > MAX_STATE_FILE => {
+            tracing::warn!("state file {state_file} exceeds size cap; treating as empty");
+        }
+        Ok(_) => match tokio::fs::read_to_string(state_file).await {
+            Ok(contents) => {
+                for line in contents.lines() {
+                    // Match the exact on-disk format `checked: <ip>` and pull
+                    // out the full IP token (no substring matching, so
+                    // `1.2.3.4` never matches `1.2.3.40` / `11.2.3.4`).
+                    if let Some(ip) = line.strip_prefix("checked: ") {
+                        let ip = ip.trim();
+                        if !ip.is_empty() {
+                            set.insert(ip.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("failed to read state file {state_file}: {e}"),
+        },
+        Err(e) => tracing::trace!("state file {state_file} not accessible: {e}"),
+    }
+
+    let set: CheckedSet = Arc::new(std::sync::Mutex::new(set));
+    let mut cache = CHECKED_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(state_file.to_string())
+        .or_insert_with(|| set.clone())
+        .clone()
 }
 
 pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
@@ -296,11 +361,9 @@ pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
     {
         return false;
     }
-    let needle = format!("checked: {}", ip.to_string());
-    match tokio::fs::read_to_string(state_file).await {
-        Ok(contents) => contents.lines().any(|line| line.contains(&needle)),
-        Err(_) => false,
-    }
+    let set = checked_set_for(state_file).await;
+    let guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    guard.contains(&ip.to_string())
 }
 
 pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
@@ -314,26 +377,33 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
         crate::meprintln!("[!] Invalid state file path (no directories allowed): {}", state_file);
         return;
     }
-    let data = format!("checked: {}\n", ip.to_string());
-    if let Ok(mut file) = OpenOptions::new()
+    let ip_str = ip.to_string();
+    let data = format!("checked: {}\n", ip_str);
+    match OpenOptions::new()
         .create(true)
         .append(true)
         .open(state_file)
         .await
     {
-        let _ = file.write_all(data.as_bytes()).await;
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(data.as_bytes()).await {
+                eprintln!("[!] Write failed: {}", e);
+            } else {
+                // Keep the in-memory checked-set cache consistent with the
+                // append so a later `is_ip_checked` for the same file/IP agrees
+                // with disk without re-reading.
+                let cache = CHECKED_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(set) = cache.get(state_file) {
+                    set.lock().unwrap_or_else(|e| e.into_inner()).insert(ip_str);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[!] Could not open state file '{}': {}", state_file, e);
+        }
     }
 }
 
-pub fn parse_exclusions(min_ranges: &[&str]) -> Vec<ipnetwork::IpNetwork> {
-    let mut exclusion_subnets = Vec::new();
-    for cidr in min_ranges {
-        if let Ok(net) = cidr.parse::<ipnetwork::IpNetwork>() {
-            exclusion_subnets.push(net);
-        }
-    }
-    exclusion_subnets
-}
 
 /// Check if a target string is a CIDR subnet (e.g. "192.168.8.0/21").
 /// Any valid CIDR notation (including 0.0.0.0/0) is treated as a subnet target.
@@ -367,269 +437,27 @@ pub fn subnet_host_count(net: &ipnetwork::IpNetwork) -> u128 {
 // ============================================================
 
 /// Check if a target triggers mass scan mode.
-/// Recognizes: "random", "0.0.0.0", "0.0.0.0/0", CIDR subnets, and file paths.
+/// Recognizes: "random", "0.0.0.0/0", bare "0.0.0.0", CIDR subnets, and file
+/// paths. Bare "0.0.0.0" is an operator alias for the full-internet sweep
+/// (2026-06-09, reversing the earlier M45 single-host rule); the scheduler
+/// still gates the actual sweep behind an advisory + confirmation.
 pub fn is_mass_scan_target(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
     target == "random"
-        || target == "0.0.0.0"
         || target == "0.0.0.0/0"
+        || target == "0.0.0.0"
+        || lower == "seq"
+        || lower == "sequential"
+        || lower.starts_with("seq:")
+        || lower.starts_with("sequential:")
         || is_subnet_target(target)
         || std::path::Path::new(target).is_file()
 }
 
-/// Configuration for the shared mass scan engine.
-pub struct MassScanConfig {
-    pub protocol_name: &'static str,
-    pub default_port: u16,
-    pub state_file: &'static str,
-    pub default_output: &'static str,
-    pub default_concurrency: usize,
-}
+// MassScanConfig and run_mass_scan removed in v0.5.1 — universal mass-scan
+// fan-out is now handled by `crate::scheduler::run` for every module.
+// See docs/Legacy.md for migration history.
 
-/// Run a mass scan using the shared engine. Modules provide a `probe` closure
-/// that receives `(ip, port)` and returns `Option<String>` — `Some(log_line)` on
-/// a successful hit (appended to the output file), `None` on failure/skip.
-///
-/// Handles: IP generation, state tracking, concurrency, progress, output writing.
-pub async fn run_mass_scan<F, Fut>(target: &str, cfg: MassScanConfig, probe: F) -> Result<()>
-where
-    F: Fn(IpAddr, u16) -> Fut + Send + Sync + 'static + Clone,
-    Fut: Future<Output = Option<String>> + Send,
-{
-    crate::mprintln!(
-        "\n{}",
-        format!("=== {} Mass Scan ===", cfg.protocol_name)
-            .bold()
-            .cyan()
-    );
-
-    let port =
-        cfg_prompt_int_range("port", "Port", cfg.default_port as i64, 1, 65535).await? as u16;
-    let concurrency = cfg_prompt_int_range(
-        "concurrency",
-        "Concurrent hosts",
-        cfg.default_concurrency as i64,
-        1,
-        10000,
-    )
-    .await? as usize;
-    let output_file = cfg_prompt_output_file(
-        "output_file",
-        "Output file (append mode)",
-        cfg.default_output,
-    )
-    .await?;
-
-    let exclusions = Arc::new(parse_exclusions(EXCLUDED_RANGES));
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let checked = Arc::new(AtomicUsize::new(0));
-    let found = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    // Bounded channel → async file writer (append mode)
-    let (tx, mut rx) = mpsc::channel::<String>(1024);
-    let out = output_file.clone();
-    tokio::spawn(async move {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&out)
-            .await;
-        match file {
-            Ok(mut f) => {
-                while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
-                }
-            }
-            Err(e) => {
-                crate::meprintln!("[!] Cannot open output file '{}': {}", out, e);
-                // Drain the channel so senders don't block
-                while rx.recv().await.is_some() {}
-            }
-        }
-    });
-
-    // Progress reporter
-    let p_checked = checked.clone();
-    let p_found = found.clone();
-    let p_stop = stop.clone();
-    let p_name = cfg.protocol_name;
-    let progress_start = Instant::now();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if p_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let c = p_checked.load(Ordering::Relaxed);
-            let f = p_found.load(Ordering::Relaxed);
-            let elapsed = progress_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                c as f64 / elapsed
-            } else {
-                0.0
-            };
-            crate::mprintln!(
-                "[*] {} | Scanned: {} | Hits: {} | {:.1} hosts/s",
-                p_name,
-                c,
-                f.to_string().green().bold(),
-                rate
-            );
-        }
-    });
-
-    let is_random = target == "random" || target == "0.0.0.0" || target == "0.0.0.0/0";
-    let is_cidr = !is_random && is_subnet_target(target);
-    let state_file = cfg.state_file;
-
-    if is_random {
-        crate::mprintln!(
-            "{}",
-            "[*] Mode: Random Internet Scan (Ctrl+C to stop)".yellow()
-        );
-        let max_checks: usize = crate::global_options::GLOBAL_OPTIONS
-            .try_get("max_random_hosts")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000_000);
-
-        loop {
-            if checked.load(Ordering::Relaxed) >= max_checks {
-                crate::mprintln!("[*] Reached max scan limit ({}), stopping.", max_checks);
-                break;
-            }
-
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Semaphore closed")?;
-            let exc = exclusions.clone();
-            let sc = checked.clone();
-            let sf = found.clone();
-            let tx = tx.clone();
-            let probe = probe.clone();
-
-            tokio::spawn(async move {
-                let ip = generate_random_public_ip(&exc);
-                if !is_ip_checked(&ip, state_file).await {
-                    mark_ip_checked(&ip, state_file).await;
-                    if let Some(line) = probe(ip, port).await {
-                        sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
-                    }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-
-        // Drain barrier: wait until all in-flight tasks release their permits.
-        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
-            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
-        }
-    } else if is_cidr {
-        // CIDR subnet mode — iterate over every IP in the range
-        let network = parse_subnet(target)?;
-        let host_count = subnet_host_count(&network);
-        crate::mprintln!(
-            "{}",
-            format!("[*] Mode: Subnet scan — {} ({} hosts)", network, host_count).cyan()
-        );
-
-        for ip_addr in network.iter() {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Semaphore closed")?;
-            let sc = checked.clone();
-            let sf = found.clone();
-            let tx = tx.clone();
-            let probe = probe.clone();
-
-            tokio::spawn(async move {
-                if !is_ip_checked(&ip_addr, state_file).await {
-                    mark_ip_checked(&ip_addr, state_file).await;
-                    if let Some(line) = probe(ip_addr, port).await {
-                        sf.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(line).await;
-                    }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-
-        // Drain barrier: wait until all in-flight tasks release their permits.
-        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
-            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
-        }
-    } else {
-        // File mode
-        let content = match crate::utils::safe_read_to_string_async(target, None).await {
-            Ok(c) => c,
-            Err(e) => {
-                crate::meprintln!("[!] Failed to read target file '{}': {}", target, e);
-                return Ok(());
-            }
-        };
-        let targets: Vec<String> = content
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        crate::mprintln!(
-            "{}",
-            format!("[*] Mode: File scan — {} targets loaded", targets.len()).cyan()
-        );
-
-        for ip_str in &targets {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("Semaphore closed")?;
-            let sc = checked.clone();
-            let sf = found.clone();
-            let tx = tx.clone();
-            let probe = probe.clone();
-            let ip_str = ip_str.clone();
-
-            tokio::spawn(async move {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    if !is_ip_checked(&ip, state_file).await {
-                        mark_ip_checked(&ip, state_file).await;
-                        if let Some(line) = probe(ip, port).await {
-                            sf.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(line).await;
-                        }
-                    }
-                }
-                sc.fetch_add(1, Ordering::Relaxed);
-                drop(permit);
-            });
-        }
-
-        // Drain barrier: wait until all in-flight tasks release their permits.
-        if let Err(e) = semaphore.acquire_many(concurrency as u32).await {
-            crate::meprintln!("[!] Drain barrier failed (semaphore closed): {}", e);
-        }
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    drop(tx);
-    crate::mprintln!(
-        "\n[*] {} mass scan complete. Results saved to: {}",
-        cfg.protocol_name,
-        output_file
-    );
-    crate::mprintln!(
-        "[*] Total scanned: {} | Hits: {}",
-        checked.load(Ordering::Relaxed),
-        found.load(Ordering::Relaxed).to_string().green().bold()
-    );
-    Ok(())
-}
 
 // ============================================================
 // GENERIC BRUTEFORCE ENGINE
@@ -657,10 +485,53 @@ pub enum ComboMode {
     Spray,
 }
 
+/// Hard cap on materialized combos. Beyond this, callers should route through
+/// `run_bruteforce_streaming` so we don't OOM on a 10⁷×10⁵ wordlist combo.
+const MAX_COMBOS: usize = 10_000_000;
+
+/// Number of 10-consecutive-error lockout pauses tolerated (with no success)
+/// before the engine gives up on a host instead of pausing-and-grinding forever.
+const MAX_LOCKOUT_PAUSES: u64 = 3;
+
+/// When to stop a host's bruteforce on a successful login. Controlled by
+/// `setg cred_stop_mode` (host | user | all); defaults from `stop_on_success`.
+#[derive(Clone, Copy, PartialEq)]
+enum StopMode {
+    /// Stop the whole host after the first valid credential (hydra `-f` / the
+    /// historical default).
+    Host,
+    /// Stop trying a username once ITS password is found, but keep going for
+    /// other usernames (medusa default).
+    User,
+    /// Never stop on success — find every valid credential (hydra default).
+    All,
+}
+
+/// Resolve the stop mode from `setg cred_stop_mode`, falling back to the config's
+/// `stop_on_success` (true => Host, false => All) when unset/unknown.
+fn resolve_stop_mode(default_stop_on_success: bool) -> StopMode {
+    let fallback = if default_stop_on_success { StopMode::Host } else { StopMode::All };
+    match crate::tenant::resolve().global_options().try_get("cred_stop_mode") {
+        Some(v) => match v.trim().to_lowercase().as_str() {
+            "host" | "first" => StopMode::Host,
+            "user" | "peruser" | "per_user" => StopMode::User,
+            "all" | "findall" | "find_all" | "none" => StopMode::All,
+            other => {
+                tracing::debug!("unknown cred_stop_mode '{other}'; using default");
+                fallback
+            }
+        },
+        None => fallback,
+    }
+}
+
 /// Generate credential pairs with full combo mode control.
 /// - Linear: pairs user\[i\] with pass\[i\], cycling the shorter list.
 /// - Combo: full cross product (user × pass).
 /// - Spray: for each password, try all users (lockout-safe ordering).
+///
+/// Output is hard-capped at `MAX_COMBOS` entries; if the requested combo count
+/// exceeds the cap, a warning is printed and the remainder is dropped.
 pub fn generate_combos_mode(
     usernames: &[String],
     passwords: &[String],
@@ -669,59 +540,252 @@ pub fn generate_combos_mode(
     if usernames.is_empty() || passwords.is_empty() {
         return Vec::new();
     }
-    // Cap pre-allocation to avoid OOM on huge wordlists; Vec grows as needed beyond this.
-    const MAX_PREALLOC: usize = 10_000_000;
+    let requested = match mode {
+        ComboMode::Combo | ComboMode::Spray => {
+            usernames.len().saturating_mul(passwords.len())
+        }
+        ComboMode::Linear => std::cmp::max(usernames.len(), passwords.len()),
+    };
+    let cap = requested.min(MAX_COMBOS);
+    if requested > MAX_COMBOS {
+        crate::meprintln!(
+            "{}",
+            format!(
+                "[!] Combo cap reached: requested {} pairs, truncated to {}. Use streaming mode for large wordlists.",
+                requested, MAX_COMBOS
+            ).yellow()
+        );
+    }
+    let mut combos = Vec::with_capacity(cap);
     match mode {
         ComboMode::Combo => {
-            let hint = usernames.len().saturating_mul(passwords.len()).min(MAX_PREALLOC);
-            let mut combos = Vec::with_capacity(hint);
-            for u in usernames {
+            'outer: for u in usernames {
                 for p in passwords {
+                    if combos.len() >= cap { break 'outer; }
                     combos.push((u.clone(), p.clone()));
                 }
             }
-            combos
         }
         ComboMode::Spray => {
-            let hint = usernames.len().saturating_mul(passwords.len()).min(MAX_PREALLOC);
-            let mut combos = Vec::with_capacity(hint);
-            for p in passwords {
+            'outer: for p in passwords {
                 for u in usernames {
+                    if combos.len() >= cap { break 'outer; }
                     combos.push((u.clone(), p.clone()));
                 }
             }
-            combos
         }
         ComboMode::Linear => {
-            let max_len = std::cmp::max(usernames.len(), passwords.len());
-            let mut combos = Vec::with_capacity(max_len.min(MAX_PREALLOC));
-            for i in 0..max_len {
+            for i in 0..cap {
                 let u = &usernames[i % usernames.len()];
                 let p = &passwords[i % passwords.len()];
                 combos.push((u.clone(), p.clone()));
             }
-            combos
         }
     }
+    combos
 }
 
 /// Load user:pass credential pairs from a file (one pair per line, colon-separated).
+/// Uses streaming for large files to avoid OOM with huge credential lists.
 pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
-    let lines = crate::utils::load_lines(path)?;
     let mut combos = Vec::new();
-    for line in lines {
-        if let Some((user, pass)) = line.split_once(':') {
-            combos.push((user.to_string(), pass.to_string()));
+    if crate::utils::wordlist::should_stream(path) {
+        // The "streaming" branch still accumulates every parsed pair into a
+        // single in-memory Vec, so a multi-GB credential file would OOM the
+        // process. Enforce a hard entry cap: once we hit MAX_COMBOS, stop
+        // accumulating and warn, mirroring generate_combos_mode's behaviour.
+        let mut capped = false;
+        crate::utils::load_lines_batched(path, crate::utils::wordlist::DEFAULT_BATCH_SIZE, |batch| {
+            if capped {
+                return;
+            }
+            for line in batch {
+                if combos.len() >= MAX_COMBOS {
+                    capped = true;
+                    break;
+                }
+                if let Some((user, pass)) = line.split_once(':') {
+                    combos.push((user.to_string(), pass.to_string()));
+                }
+            }
+        })?;
+        if capped {
+            crate::meprintln!(
+                "{}",
+                format!(
+                    "[!] Credential file cap reached: truncated to {} pairs. Split the file or use a smaller list.",
+                    MAX_COMBOS
+                )
+                .yellow()
+            );
+        }
+    } else {
+        let lines = crate::utils::load_lines(path)?;
+        for line in lines {
+            if let Some((user, pass)) = line.split_once(':') {
+                combos.push((user.to_string(), pass.to_string()));
+            }
         }
     }
     Ok(combos)
 }
 
+/// Generate brute-force candidate passwords from a hydra `-x`-style mask spec
+/// `MIN:MAX:CHARSET`. CHARSET placeholders mirror hydra: `a` → a-z, `A` → A-Z,
+/// `1` → 0-9; any other character is taken literally (and added to the set).
+/// Every string of length `MIN..=MAX` over the (deduplicated) charset is
+/// enumerated with an odometer counter. Output is hard-capped at `MAX_COMBOS`
+/// with a warning so a wide mask can't OOM the process.
+///
+/// Examples: `1:4:a1` = 1–4 chars of [a-z0-9]; `6:8:A1!@#` = 6–8 chars of
+/// [A-Z0-9] plus the literals `!`, `@`, `#`.
+pub fn generate_mask_passwords(spec: &str) -> Result<Vec<String>> {
+    let mut it = spec.splitn(3, ':');
+    let (min_s, max_s, charset_s) = match (it.next(), it.next(), it.next()) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => anyhow::bail!("bruteforce_mask must be MIN:MAX:CHARSET (e.g. 1:4:a1); got '{spec}'"),
+    };
+    let min: usize = min_s
+        .trim()
+        .parse()
+        .with_context(|| format!("mask MIN '{min_s}' is not a number"))?;
+    let max: usize = max_s
+        .trim()
+        .parse()
+        .with_context(|| format!("mask MAX '{max_s}' is not a number"))?;
+    if min == 0 || max == 0 {
+        anyhow::bail!("mask MIN/MAX must be >= 1 (got {min}:{max})");
+    }
+    if min > max {
+        anyhow::bail!("mask MIN ({min}) is greater than MAX ({max})");
+    }
+    if max > 32 {
+        anyhow::bail!("mask MAX ({max}) too large (>32) — refusing to enumerate");
+    }
+
+    // Expand the charset placeholders into concrete characters, deduplicating
+    // while preserving the operator's ordering.
+    let mut charset: Vec<char> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for c in charset_s.chars() {
+        match c {
+            'a' => {
+                for ch in b'a'..=b'z' {
+                    let ch = ch as char;
+                    if seen.insert(ch) {
+                        charset.push(ch);
+                    }
+                }
+            }
+            'A' => {
+                for ch in b'A'..=b'Z' {
+                    let ch = ch as char;
+                    if seen.insert(ch) {
+                        charset.push(ch);
+                    }
+                }
+            }
+            '1' => {
+                for ch in b'0'..=b'9' {
+                    let ch = ch as char;
+                    if seen.insert(ch) {
+                        charset.push(ch);
+                    }
+                }
+            }
+            other => {
+                if seen.insert(other) {
+                    charset.push(other);
+                }
+            }
+        }
+    }
+    if charset.is_empty() {
+        anyhow::bail!("mask CHARSET '{charset_s}' expanded to nothing");
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut capped = false;
+    'lengths: for len in min..=max {
+        // Odometer over `len` positions, each indexing into `charset`. Start at
+        // all-zero and increment the least-significant position with carry.
+        let mut idx = vec![0usize; len];
+        loop {
+            if out.len() >= MAX_COMBOS {
+                capped = true;
+                break 'lengths;
+            }
+            out.push(idx.iter().map(|&i| charset[i]).collect());
+            // Increment the odometer; `carry` stays true while a position wraps.
+            let mut carry = true;
+            let mut pos = len;
+            while carry && pos > 0 {
+                pos -= 1;
+                idx[pos] += 1;
+                if idx[pos] == charset.len() {
+                    idx[pos] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+            // A carry that survives past position 0 means this length is done.
+            if carry {
+                break;
+            }
+        }
+    }
+    if capped {
+        crate::meprintln!(
+            "{}",
+            format!(
+                "[!] Mask cap reached: truncated to {} candidates. Narrow the charset or length range.",
+                MAX_COMBOS
+            )
+            .yellow()
+        );
+    }
+    Ok(out)
+}
+
+/// Whether streaming-bruteforce batch resume is enabled (`setg bruteforce_resume y`).
+fn bruteforce_resume_enabled() -> bool {
+    match crate::tenant::resolve().global_options().try_get("bruteforce_resume") {
+        Some(v) => matches!(
+            v.trim().to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Stable per-run resume key: changing the target, port, wordlist file, its
+/// size, or the combo mode starts a fresh run rather than resuming a stale one.
+fn bruteforce_resume_key(target: &str, port: u16, pass_path: &str, mode: ComboMode) -> String {
+    let size = crate::utils::file_size(pass_path);
+    let fname = match std::path::Path::new(pass_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+    {
+        Some(f) => f,
+        None => pass_path,
+    };
+    format!("bf_{target}_{port}_{fname}_{size}_{mode:?}")
+}
+
 /// Parse combo mode from user input string.
+///
+/// Accepts both vocabularies in use across the codebase: the standalone
+/// bruteforce modules' `linear/combo/spray` and `creds_helper`'s
+/// `cartesian/paired`. `cartesian` is a synonym for `combo` (full cross-product)
+/// and `paired` for `linear` (user[i] with pass[i]). Previously only
+/// combo/cross/spray were recognized, so `creds_helper`'s default `cartesian`
+/// silently fell through to `Linear` — a 5×1000 run did 1000 attempts instead
+/// of 5000 across ~15 harness modules.
 pub fn parse_combo_mode(input: &str) -> ComboMode {
     match input.trim().to_lowercase().as_str() {
-        "combo" | "cross" => ComboMode::Combo,
+        "combo" | "cross" | "cartesian" => ComboMode::Combo,
         "spray" | "password_spray" => ComboMode::Spray,
+        "linear" | "paired" => ComboMode::Linear,
         _ => ComboMode::Linear,
     }
 }
@@ -781,7 +845,9 @@ impl BruteforceResult {
             Ok(mut file) => {
                 use std::io::Write;
                 for (host, user, pass) in &self.found {
-                    let _ = writeln!(file, "{}:{}:{}", host, user, pass);
+                    if let Err(e) = writeln!(file, "{}:{}:{}", host, user, pass) {
+                        eprintln!("[!] Write failed: {}", e);
+                    }
                 }
                 crate::mprintln!("[+] Results saved to '{}'", file_path.display());
             }
@@ -792,6 +858,11 @@ impl BruteforceResult {
         Ok(())
     }
 }
+
+/// Shared list of successful credentials: (host, username, password).
+type BruteforceFoundList = Arc<Mutex<Vec<(String, String, String)>>>;
+/// Shared list of errors: (host, username, password, error_message).
+type BruteforceErrorList = Arc<Mutex<Vec<(String, String, String, String)>>>;
 
 /// Run the generic bruteforce engine against a single target.
 ///
@@ -810,6 +881,31 @@ where
     F: Fn(String, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
     Fut: Future<Output = LoginResult> + Send,
 {
+    run_bruteforce_with_abort(config, combos, try_login, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Like [`run_bruteforce`] but with a caller-supplied `abort` flag so a
+/// multi-batch driver (the streaming path) can give up ACROSS batches: when the
+/// engine trips `abort` (host blocking/dead, no success), the driver stops
+/// feeding it the rest of the wordlist instead of re-pausing every batch.
+pub async fn run_bruteforce_with_abort<F, Fut>(
+    config: &BruteforceConfig,
+    combos: Vec<(String, String)>,
+    try_login: F,
+    abort: Arc<AtomicBool>,
+) -> Result<BruteforceResult>
+where
+    F: Fn(String, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
+    Fut: Future<Output = LoginResult> + Send,
+{
+    // Deduplicate combos preserving order
+    let combos = {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = combos;
+        deduped.retain(|combo| seen.insert(combo.clone()));
+        deduped
+    };
+
     let total = combos.len();
     if total == 0 {
         anyhow::bail!("No credential combinations to test");
@@ -822,12 +918,23 @@ where
 
     let stats = Arc::new(BruteforceStats::new());
     stats.set_total(total as u64);
-    let found: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let errors: Arc<Mutex<Vec<(String, String, String, String)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let found: BruteforceFoundList = Arc::new(Mutex::new(Vec::new()));
+    let errors: BruteforceErrorList = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
-    let semaphore = Arc::new(Semaphore::new(config.concurrency));
+    // Medusa-style "give up on this host": `abort` (caller-supplied) is set when
+    // repeated lockout pauses make no progress. Unlike `stop` (gated on
+    // stop_on_success), `abort` always halts the run so a dead/blocking host
+    // can't grind the whole wordlist — and the streaming driver reuses the same
+    // flag across batches.
+    let lockout_pauses = Arc::new(AtomicU64::new(0));
+    // Stop granularity (host / per-user / find-all). `found_users` backs per-user
+    // mode: once a username's password is found, further attempts for that user
+    // are skipped while other users keep going.
+    let stop_mode = resolve_stop_mode(config.stop_on_success);
+    let found_users: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
 
     // Progress reporter
     let stats_p = stats.clone();
@@ -845,9 +952,20 @@ where
     let mut tasks = FuturesUnordered::new();
 
     for (user, pass) in combos {
-        if config.stop_on_success && stop.load(Ordering::Relaxed) {
+        if abort.load(Ordering::Relaxed) {
             break;
         }
+        if stop_mode == StopMode::Host && stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Acquire the permit BEFORE tokio::spawn so the spawn rate is gated by
+        // concurrency, not just runtime parallelism. Otherwise a 100M-combo
+        // wordlist would materialize 100M task structs immediately.
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => { tracing::debug!("bruteforce semaphore closed, stopping: {e}"); break; }
+        };
 
         let target = config.target.clone();
         let port = config.port;
@@ -858,24 +976,29 @@ where
         let errors_c = errors.clone();
         let stop_c = stop.clone();
         let paused_c = paused.clone();
+        let abort_c = abort.clone();
+        let lockout_pauses_c = lockout_pauses.clone();
         let stats_c = stats.clone();
-        let sem_c = semaphore.clone();
         let try_login_c = try_login.clone();
         let verbose = config.verbose;
-        let stop_on_success = config.stop_on_success;
+        let found_users_c = found_users.clone();
         let max_retries = config.max_retries;
         let delay_ms = config.delay_ms;
         let jitter_ms = config.jitter_ms;
 
+        // Re-establish the parent OUTPUT_BUFFER inside the worker: tokio::spawn
+        // does NOT inherit task-locals, so without this a bruteforce running as a
+        // background job (or under an API request) would leak per-attempt output
+        // to the real stdout / process-global spool instead of the captured
+        // per-job buffer.
+        let __task_buf = crate::output::OUTPUT_BUFFER.try_with(|b| b.clone()).ok();
         tasks.push(tokio::spawn(async move {
-            if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
-
-            let _permit = match sem_c.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-
-            if stop_on_success && stop_c.load(Ordering::Relaxed) { return; }
+            let _permit = permit;
+            let __body = async move {
+            if abort_c.load(Ordering::Relaxed) { return; }
+            if stop_mode == StopMode::Host && stop_c.load(Ordering::Relaxed) { return; }
+            // Per-user mode: skip a username once its password has been found.
+            if stop_mode == StopMode::User && found_users_c.lock().await.contains(&user) { return; }
 
             // Respect global rate-limit pause
             while paused_c.load(Ordering::Acquire) {
@@ -889,15 +1012,25 @@ where
                 match result {
                     LoginResult::Success => {
                         crate::mprintln!("\r{}", format!("[+] {} -> {}:{}", display, user, pass).green().bold());
-                        let _ = crate::cred_store::store_credential(
-                            &target, port, service, &user, &pass,
-                            crate::cred_store::CredType::Password,
-                            source,
-                        ).await;
+                        if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                            host: &target, port, service, username: &user, secret: &pass,
+                            cred_type: crate::cred_store::CredType::Password,
+                            source_module: source,
+                        }).await.is_none() {
+                            eprintln!("[!] Failed to store credential for {}:{}@{}", user, pass, target);
+                        }
                         found_c.lock().await.push((display.clone(), user.clone(), pass.clone()));
                         stats_c.record_success();
-                        if stop_on_success {
-                            stop_c.store(true, Ordering::Relaxed);
+                        match stop_mode {
+                            // Stop the whole host on the first valid credential.
+                            StopMode::Host => stop_c.store(true, Ordering::Relaxed),
+                            // Remember this user so other workers skip it, but keep
+                            // testing the remaining usernames.
+                            StopMode::User => {
+                                found_users_c.lock().await.insert(user.clone());
+                            }
+                            // Find-all: keep going.
+                            StopMode::All => {}
                         }
                         break;
                     }
@@ -923,8 +1056,31 @@ where
                         }
                         stats_c.record_error(message.clone()).await;
                         if stats_c.is_lockout_likely(10) && !paused_c.swap(true, Ordering::AcqRel) {
-                            crate::meprintln!("\n{}", "[!] WARNING: 10+ consecutive errors — possible rate limiting. Pausing 30s...".red().bold());
+                            let pauses = lockout_pauses_c.fetch_add(1, Ordering::Relaxed) + 1;
+                            // Give up (medusa-style) once repeated pauses make no
+                            // progress: a dead host / wrong protocol / hard block
+                            // shouldn't pause-and-grind the whole wordlist forever.
+                            if pauses >= MAX_LOCKOUT_PAUSES && found_c.lock().await.is_empty() {
+                                crate::meprintln!(
+                                    "\n{}",
+                                    format!(
+                                        "[!] Giving up on {} — {} lockout pauses, no success (host blocking/down?)",
+                                        display, pauses
+                                    ).red().bold()
+                                );
+                                abort_c.store(true, Ordering::Relaxed);
+                                paused_c.store(false, Ordering::Release);
+                                break;
+                            }
+                            crate::meprintln!(
+                                "\n{}",
+                                format!(
+                                    "[!] WARNING: 10+ consecutive errors — possible rate limiting. Pausing 30s... (pause {}/{})",
+                                    pauses, MAX_LOCKOUT_PAUSES
+                                ).red().bold()
+                            );
                             tokio::time::sleep(Duration::from_secs(30)).await;
+                            stats_c.consecutive_errors.store(0, Ordering::Relaxed);
                             paused_c.store(false, Ordering::Release);
                         }
                         errors_c.lock().await.push((display.clone(), user.clone(), pass.clone(), message.clone()));
@@ -942,6 +1098,11 @@ where
                 } else { 0 };
                 tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
             }
+            };
+            match __task_buf {
+                Some(b) => crate::output::OUTPUT_BUFFER.scope(b, __body).await,
+                None => __body.await,
+            }
         }));
 
     }
@@ -949,14 +1110,14 @@ where
     // Wait for remaining tasks
     while let Some(res) = tasks.next().await {
         if let Err(e) = res {
-            if config.verbose {
-                crate::mprintln!("\r{}", format!("[!] Task error: {}", e).red());
-            }
+            crate::meprintln!("[!] Task join error: {}", e);
         }
     }
 
     stop.store(true, Ordering::Relaxed);
-    let _ = progress_handle.await;
+    if let Err(e) = progress_handle.await {
+        eprintln!("[!] Task join failed: {}", e);
+    }
     stats.print_final().await;
 
     let found_creds = found.lock().await.clone();
@@ -969,8 +1130,9 @@ where
 }
 
 /// Run bruteforce with streaming wordlist support.
-/// If either wordlist file exceeds 250 MB, combos are generated and processed in
-/// batches rather than materializing the full cross product in memory.
+/// If the password wordlist file exceeds `STREAMING_THRESHOLD`, combos are
+/// generated and processed in batches rather than materializing the full cross
+/// product in memory (and without tripping the 100 MB `load_lines` hard cap).
 /// For normal-sized wordlists, falls back to the standard `run_bruteforce`.
 pub async fn run_bruteforce_streaming<F, Fut>(
     config: &BruteforceConfig,
@@ -1013,32 +1175,114 @@ where
     };
 
     const BATCH_SIZE: usize = 500_000;
-    let user_ref = &usernames;
     let config_ref = config;
     let mode_val = mode;
     let try_login_ref = &try_login;
 
-    let mut batches: Vec<Vec<String>> = Vec::new();
-    crate::utils::load_lines_batched(pass_path, BATCH_SIZE, |batch| {
-        batches.push(batch);
-    })?;
+    // Stream batches through a channel instead of collecting all into memory
+    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
 
-    for (i, pass_batch) in batches.into_iter().enumerate() {
-        crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", i + 1, pass_batch.len()).cyan());
-        let combos = generate_combos_mode(user_ref, &pass_batch, mode_val);
-        let result = run_bruteforce(config_ref, combos, try_login_ref.clone()).await?;
+    let pass_path_owned = pass_path.to_string();
+    let reader_handle = tokio::task::spawn_blocking(move || {
+        // `_until`: stop reading the moment the receiver is gone. With the old
+        // `load_lines_batched` an early return from the loop below (e.g. stop on
+        // first success) dropped the receiver but the reader kept scanning the
+        // whole multi-GB file, firing a failed `blocking_send` per batch.
+        crate::utils::load_lines_batched_until(&pass_path_owned, BATCH_SIZE, |batch| {
+            match batch_tx.blocking_send(batch) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!("Batch send failed (receiver dropped?): {}", e);
+                    false
+                }
+            }
+        })
+    });
+
+    // Shared across batches so a host the engine gives up on (medusa-style) is
+    // not re-attempted batch after batch — the give-up propagates the whole run.
+    let abort = Arc::new(AtomicBool::new(false));
+    // Honour the stop mode for the cross-batch early-out: only Host mode stops
+    // streaming after the first success; user/all modes keep streaming.
+    let stop_after_first = resolve_stop_mode(config_ref.stop_on_success) == StopMode::Host;
+
+    // Optional batch-level resume (`setg bruteforce_resume y`): skip the batches
+    // a prior interrupted run already completed. The reader still streams every
+    // batch in order (the file is read sequentially); we just don't re-attempt
+    // batches at or below the recorded high-water index.
+    let resume_key = if bruteforce_resume_enabled() {
+        Some(bruteforce_resume_key(
+            config_ref.target.as_str(),
+            config_ref.port,
+            pass_path,
+            mode_val,
+        ))
+    } else {
+        None
+    };
+    let resume_from = match &resume_key {
+        Some(k) => crate::checkpoint::read_bruteforce_marker(k),
+        None => 0,
+    };
+    if resume_from > 0 {
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Resuming streamed bruteforce of {} from batch {} (setg bruteforce_resume)",
+                config_ref.target,
+                resume_from + 1
+            )
+            .cyan()
+        );
+    }
+
+    let mut batch_idx = 0usize;
+    while let Some(pass_batch) = batch_rx.recv().await {
+        batch_idx += 1;
+        if batch_idx <= resume_from {
+            // Already attempted in a prior run — skip without re-trying.
+            continue;
+        }
+        crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", batch_idx, pass_batch.len()).cyan());
+        let combos = generate_combos_mode(&usernames, &pass_batch, mode_val);
+        let result = run_bruteforce_with_abort(config_ref, combos, try_login_ref.clone(), abort.clone()).await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
-        if config_ref.stop_on_success && !aggregate.found.is_empty() {
+        if abort.load(Ordering::Relaxed) {
+            crate::mprintln!(
+                "{}",
+                format!("[!] Stopping streamed bruteforce of {} — host gave up (no progress)", config_ref.target).yellow()
+            );
+            break;
+        }
+        // Batch fully attempted — record it so an interrupted run resumes here.
+        if let Some(k) = &resume_key {
+            crate::checkpoint::write_bruteforce_marker(k, batch_idx);
+        }
+        if stop_after_first && !aggregate.found.is_empty() {
+            // Host is done — drop the marker so a later run starts fresh.
+            if let Some(k) = &resume_key {
+                crate::checkpoint::clear_bruteforce_marker(k);
+            }
             return Ok(aggregate);
         }
     }
 
-    if !extra_combos.is_empty() {
+    reader_handle.await.context("batch reader task panicked")??;
+
+    if !extra_combos.is_empty() && !abort.load(Ordering::Relaxed) {
         crate::mprintln!("{}", format!("[*] Processing {} extra combos from credential file", extra_combos.len()).cyan());
-        let result = run_bruteforce(config_ref, extra_combos, try_login_ref.clone()).await?;
+        let result = run_bruteforce_with_abort(config_ref, extra_combos, try_login_ref.clone(), abort.clone()).await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
+    }
+
+    // Clean completion (not aborted): the wordlist is exhausted, so drop the
+    // resume marker — a fresh run should start from the top.
+    if !abort.load(Ordering::Relaxed)
+        && let Some(k) = &resume_key
+    {
+        crate::checkpoint::clear_bruteforce_marker(k);
     }
 
     Ok(aggregate)
@@ -1062,6 +1306,10 @@ pub struct SubnetScanConfig {
     /// Set to `true` for UDP-based protocols (SNMP, L2TP) where a TCP
     /// connect would always fail.
     pub skip_tcp_check: bool,
+    /// Optional CWD-relative checkpoint file (no path separators allowed).
+    /// When set, IPs already marked in the file are skipped, and successfully
+    /// processed IPs are appended on completion. Enables resume across runs.
+    pub state_file: Option<String>,
 }
 
 /// Run bruteforce against all IPs in a CIDR subnet.
@@ -1077,7 +1325,7 @@ pub async fn run_subnet_bruteforce<F, Fut>(
     passwords: Vec<String>,
     config: &SubnetScanConfig,
     try_login: F,
-) -> Result<()>
+) -> Result<Vec<(String, String, String)>>
 where
     F: Fn(IpAddr, u16, String, String) -> Fut + Send + Sync + 'static + Clone,
     Fut: Future<Output = LoginResult> + Send,
@@ -1100,9 +1348,12 @@ where
         format!("[*] Subnet {} — {} hosts to scan", target, count).cyan()
     );
 
-    let semaphore = Arc::new(Semaphore::new(config.concurrency));
+    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     let stats_checked = Arc::new(AtomicUsize::new(0));
     let stats_found = Arc::new(AtomicUsize::new(0));
+    // Collect discovered (host, user, pass) hits so the caller can surface them
+    // as Findings instead of them being silently dropped (only printed/stored).
+    let found_hits: BruteforceFoundList = Arc::new(Mutex::new(Vec::new()));
     let creds_pkg = Arc::new((usernames, passwords));
     let total = count;
     let service: &'static str = config.service_name;
@@ -1113,7 +1364,7 @@ where
     let s_found = stats_found.clone();
     let progress_stop = Arc::new(AtomicBool::new(false));
     let stop_flag = progress_stop.clone();
-    tokio::spawn(async move {
+    let progress_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if stop_flag.load(Ordering::Relaxed) {
@@ -1140,7 +1391,9 @@ where
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {
-                    let _ = f.write_all(line.as_bytes()).await;
+                    if let Err(e) = f.write_all(line.as_bytes()).await {
+                        eprintln!("[!] Write failed: {}", e);
+                    }
                 }
             }
             Err(e) => {
@@ -1150,7 +1403,14 @@ where
         }
     });
 
+    let state_file = config.state_file.clone();
     for ip in network.iter() {
+        // Resume support: skip IPs already recorded in the checkpoint file.
+        if let Some(ref sf_name) = state_file
+            && is_ip_checked(&ip, sf_name).await {
+                stats_checked.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -1159,28 +1419,45 @@ where
         let cp = creds_pkg.clone();
         let sc = stats_checked.clone();
         let sf = stats_found.clone();
+        let hits_c = found_hits.clone();
         let tx = tx.clone();
         let try_login = try_login.clone();
         let verbose = config.verbose;
         let skip_tcp = config.skip_tcp_check;
         let jitter_ms = config.jitter_ms;
+        let state_file_task = state_file.clone();
 
+        // Re-establish the parent OUTPUT_BUFFER inside the worker (tokio::spawn
+        // drops task-locals) so per-host output is captured when the subnet
+        // bruteforce runs as a background job / API request.
+        let __task_buf = crate::output::OUTPUT_BUFFER.try_with(|b| b.clone()).ok();
         tokio::spawn(async move {
-            // Quick TCP port check (skipped for UDP protocols)
+            let __body = async move {
+            // Quick TCP port check (skipped for UDP protocols).
+            // Uses the helper so source-port (`setg src_port`) is honoured.
             if !skip_tcp {
                 let sa = SocketAddr::new(ip, port);
-                if tokio::time::timeout(
-                    Duration::from_millis(3000),
-                    tokio::net::TcpStream::connect(&sa),
-                )
-                .await
-                .is_err()
+                if let Err(e) = crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
+                    .await
                 {
+                    tracing::trace!("Pre-check TCP connect to {} failed: {}", sa, e);
                     sc.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref sf_name) = state_file_task {
+                        mark_ip_checked(&ip, sf_name).await;
+                    }
                     drop(permit);
                     return;
                 }
             }
+
+            // Track consecutive transient errors per host. A single
+            // connection-refused/timeout/reset on one credential is often
+            // transient (momentary packet loss, server hiccup, rate-limit
+            // blip) and must NOT abandon every remaining credential for the
+            // host. We only give up after a run of consecutive errors —
+            // matching the lockout threshold used by `run_bruteforce`.
+            const HOST_ERROR_THRESHOLD: u32 = 10;
+            let mut consecutive_errors: u32 = 0;
 
             let (users, passes) = &*cp;
             'outer: for user in users {
@@ -1194,21 +1471,35 @@ where
                         LoginResult::Success => {
                             let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
                             crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                            let _ = crate::cred_store::store_credential(
-                                &ip.to_string(),
+                            if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                                host: &ip.to_string(),
                                 port,
                                 service,
-                                user,
-                                pass,
-                                crate::cred_store::CredType::Password,
-                                source,
-                            )
-                            .await;
-                            let _ = tx.send(format!("{}\n", msg)).await;
+                                username: user,
+                                secret: pass,
+                                cred_type: crate::cred_store::CredType::Password,
+                                source_module: source,
+                            })
+                            .await
+                            .is_none() {
+                                eprintln!("[!] Failed to store credential for {}:{}", user, ip);
+                            }
+                            if let Err(e) = tx.send(format!("{}\n", msg)).await {
+                                eprintln!("[!] Channel send failed: {}", e);
+                            }
+                            hits_c.lock().await.push((
+                                ip.to_string(),
+                                user.clone(),
+                                pass.clone(),
+                            ));
                             sf.fetch_add(1, Ordering::Relaxed);
                             break 'outer;
                         }
                         LoginResult::AuthFailed => {
+                            // A definitive auth response means the host is
+                            // reachable and responsive — clear the transient
+                            // error streak.
+                            consecutive_errors = 0;
                             if verbose {
                                 crate::mprintln!(
                                     "\r{}",
@@ -1217,36 +1508,63 @@ where
                             }
                         }
                         LoginResult::Error { message, .. } => {
-                            let lower = message.to_lowercase();
-                            if lower.contains("refused")
-                                || lower.contains("timeout")
-                                || lower.contains("reset")
-                            {
-                                break 'outer; // host unreachable, skip
-                            }
+                            // Don't abandon the host on a single transient
+                            // error. Count consecutive errors and only give up
+                            // once we've seen a sustained run of them (the host
+                            // is genuinely unreachable / down), matching how
+                            // `run_bruteforce` treats consecutive errors.
+                            consecutive_errors = consecutive_errors.saturating_add(1);
                             if verbose {
                                 crate::mprintln!(
                                     "\r{}",
                                     format!("[?] {}:{} -> {}:{} error: {}", ip, port, user, pass, message).yellow()
                                 );
                             }
+                            if consecutive_errors >= HOST_ERROR_THRESHOLD {
+                                if verbose {
+                                    crate::mprintln!(
+                                        "\r{}",
+                                        format!(
+                                            "[!] {}:{} -> {} consecutive errors, abandoning host",
+                                            ip, port, consecutive_errors
+                                        )
+                                        .yellow()
+                                    );
+                                }
+                                break 'outer; // host genuinely unreachable, skip
+                            }
                         }
                     }
                 }
             }
             sc.fetch_add(1, Ordering::Relaxed);
+            if let Some(ref sf_name) = state_file_task {
+                mark_ip_checked(&ip, sf_name).await;
+            }
             drop(permit);
+            };
+            match __task_buf {
+                Some(b) => crate::output::OUTPUT_BUFFER.scope(b, __body).await,
+                None => __body.await,
+            }
         });
     }
 
     // Drain barrier: wait until all in-flight tasks release their permits.
-    let _drain = semaphore.acquire_many(config.concurrency as u32).await.context("Semaphore closed")?;
+    // Use the same `.max(1)` as the Semaphore creation to stay consistent,
+    // and cap to u32::MAX to avoid truncation on exotic configs.
+    let drain_permits = (config.concurrency.max(1)).min(u32::MAX as usize) as u32;
+    let drain = semaphore.acquire_many(drain_permits).await.context("Semaphore closed")?;
+    drop(drain);
 
     // Shut down writer task
     drop(tx);
-    let _ = writer_handle.await;
+    if let Err(e) = writer_handle.await {
+        eprintln!("[!] Task join failed: {}", e);
+    }
 
     progress_stop.store(true, Ordering::Relaxed);
+    progress_handle.abort();
     crate::mprintln!(
         "\n{}",
         format!(
@@ -1257,5 +1575,6 @@ where
         .cyan()
         .bold()
     );
-    Ok(())
+    let hits = found_hits.lock().await.clone();
+    Ok(hits)
 }

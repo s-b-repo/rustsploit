@@ -41,9 +41,15 @@ async fn read_safe_input() -> Result<String> {
     sanitize_string_input(&trimmed)
 }
 
+/// Maximum number of times any interactive prompt will retry on invalid input
+/// before giving up. Prevents a closed/redirected stdin from pinning a worker
+/// in an infinite loop.
+const MAX_PROMPT_RETRIES: usize = 100;
+
 /// Prompts the user for input, ensuring it is not empty.
 pub async fn prompt_required(msg: &str) -> Result<String> {
-    loop {
+    // Bound the retry loop so a closed/looping stdin can't pin a worker.
+    for _ in 0..MAX_PROMPT_RETRIES {
         print!("{}", format!("{}: ", msg).cyan().bold());
         let input = read_safe_input().await?;
         if !input.is_empty() {
@@ -51,6 +57,7 @@ pub async fn prompt_required(msg: &str) -> Result<String> {
         }
         crate::mprintln!("{}", "This field is required.".yellow());
     }
+    Err(anyhow!("Prompt aborted after {} empty inputs", MAX_PROMPT_RETRIES))
 }
 
 /// Prompts the user for input, using a default value if empty.
@@ -67,7 +74,7 @@ pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
 /// Prompts the user for a yes/no answer.
 pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
         let input = read_safe_input().await?;
         match input.to_lowercase().as_str() {
@@ -77,32 +84,35 @@ pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
             _ => crate::mprintln!("{}", "Invalid input. Please enter 'y' or 'n'.".yellow()),
         }
     }
+    Err(anyhow!("Yes/no prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 pub async fn prompt_int_range(msg: &str, default: i64, min: i64, max: i64) -> Result<i64> {
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         let input = prompt_default(msg, &default.to_string()).await?;
         match input.trim().parse::<i64>() {
             Ok(n) if n >= min && n <= max => return Ok(n),
             _ => crate::mprintln!("{}", format!("Please enter a number between {} and {}.", min, max).yellow()),
         }
     }
+    Err(anyhow!("Integer range prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 pub async fn prompt_port(msg: &str, default: u16) -> Result<u16> {
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         let input = prompt_default(msg, &default.to_string()).await?;
         match input.parse::<u16>() {
             Ok(n) if n > 0 => return Ok(n),
             _ => crate::mprintln!("{}", "Please enter a valid port (1-65535).".yellow()),
         }
     }
+    Err(anyhow!("Port prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 /// Prompts for an existing file path.
 /// Validates against path traversal, symlinks, and control characters.
 pub async fn prompt_existing_file(msg: &str) -> Result<String> {
-    loop {
+    for _ in 0..MAX_PROMPT_RETRIES {
         let candidate = prompt_required(msg).await?;
         match validate_safe_file_path(&candidate) {
             Ok(safe_path) => {
@@ -117,6 +127,7 @@ pub async fn prompt_existing_file(msg: &str) -> Result<String> {
             }
         }
     }
+    Err(anyhow!("Existing-file prompt aborted after {} invalid inputs", MAX_PROMPT_RETRIES))
 }
 
 /// Prompts for a wordlist file path.
@@ -177,6 +188,20 @@ where
 }
 
 // ============================================================
+// PERSIST PROMPT ANSWERS FOR BATCH REUSE
+// ============================================================
+
+/// After prompting the user interactively, store the answer in global options
+/// so that batch-mode tasks (which skip interactive prompts) can find it.
+/// This enables the "configure once, run against all targets" pattern.
+async fn persist_prompt_answer(key: &str, value: &str) {
+    crate::tenant::resolve()
+        .global_options()
+        .set(key, value)
+        .await;
+}
+
+// ============================================================
 // CONFIG-AWARE PROMPT WRAPPERS
 // ============================================================
 
@@ -186,40 +211,46 @@ pub async fn cfg_prompt_required(key: &str, msg: &str) -> Result<String> {
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         if !sanitized.is_empty() {
             return Ok(sanitized);
         }
     }
     // For "target" key, check the per-request RunContext target (API mode)
-    if key == "target" {
-        if let Some(val) = crate::config::get_run_target() {
+    if key == "target"
+        && let Some(val) = crate::config::get_run_target() {
             let sanitized = sanitize_string_input(&val)
-                .map_err(|e| anyhow!("Invalid run target: {}", e))?;
+                .context("Invalid run target")?;
             if !sanitized.is_empty() {
                 return Ok(sanitized);
             }
         }
-    }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
-            .map_err(|e| anyhow!("Invalid global option for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid global option for '{}'", key))?;
         if !sanitized.is_empty() {
             return Ok(sanitized);
         }
     }
-    if config.api_mode {
-        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    if config.api_mode || crate::context::is_batch_active() {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Set it with: setg {} <value>", key, msg, key));
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
     let msg_owned = msg.to_string();
     if let Some(result) = cached_prompt(key, || async move {
         prompt_required(&msg_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_required(msg).await
+    let result = prompt_required(msg).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }
 
 /// Config-aware prompt with default value.
@@ -228,18 +259,18 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         return Ok(if sanitized.is_empty() { default.to_string() } else { sanitized });
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let sanitized = sanitize_string_input(&val)
-            .map_err(|e| anyhow!("Invalid global option for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid global option for '{}'", key))?;
         if !sanitized.is_empty() {
             return Ok(sanitized);
         }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default.to_string());
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -248,9 +279,16 @@ pub async fn cfg_prompt_default(key: &str, msg: &str, default: &str) -> Result<S
     if let Some(result) = cached_prompt(key, || async move {
         prompt_default(&msg_owned, &default_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_default(msg, default).await
+    let result = prompt_default(msg, default).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }
 
 /// Config-aware yes/no prompt.
@@ -259,7 +297,7 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         match sanitized.to_lowercase().trim() {
             "y" | "yes" | "true" | "1" => return Ok(true),
             "n" | "no" | "false" | "0" => return Ok(false),
@@ -273,14 +311,14 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         match val.to_lowercase().trim() {
             "y" | "yes" | "true" | "1" => return Ok(true),
             "n" | "no" | "false" | "0" => return Ok(false),
             _ => {} // fall through
         }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default_yes);
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -289,9 +327,17 @@ pub async fn cfg_prompt_yes_no(key: &str, msg: &str, default_yes: bool) -> Resul
         let val = prompt_yes_no(&msg_owned, default_yes).await?;
         Ok(if val { "y".to_string() } else { "n".to_string() })
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result.map(|v| v == "y");
     }
-    prompt_yes_no(msg, default_yes).await
+    let result = prompt_yes_no(msg, default_yes).await;
+    if let Ok(val) = result {
+        persist_prompt_answer(key, if val { "y" } else { "n" }).await;
+        return Ok(val);
+    }
+    result
 }
 
 /// Config-aware port prompt.
@@ -300,13 +346,14 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         let trimmed = sanitized.trim();
         if !trimmed.is_empty() {
             match trimmed.parse::<u16>() {
                 Ok(p) if p > 0 => return Ok(p),
                 Ok(_) => return Err(anyhow!("Invalid port for '{}': port cannot be 0", key)),
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("port parse error for '{key}': {e}");
                     if config.api_mode {
                         return Err(anyhow!("Invalid port value for '{}': '{}'", key, trimmed));
                     }
@@ -315,7 +362,7 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             match trimmed.parse::<u16>() {
@@ -324,7 +371,7 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
             }
         }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default);
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -333,47 +380,60 @@ pub async fn cfg_prompt_port(key: &str, msg: &str, default: u16) -> Result<u16> 
         let val = prompt_port(&msg_owned, default).await?;
         Ok(val.to_string())
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         let val = result?;
-        return val.parse::<u16>().map_err(|_| anyhow!("Invalid cached port value for '{}'", key));
+        return val.parse::<u16>().map_err(|e| anyhow!("Invalid cached port value for '{}': {e}", key));
     }
-    prompt_port(msg, default).await
+    let result = prompt_port(msg, default).await;
+    if let Ok(val) = result {
+        persist_prompt_answer(key, &val.to_string()).await;
+        return Ok(val);
+    }
+    result
 }
 
 /// Config-aware file path prompt (validates file exists).
 /// Priority: custom_prompts > global_options > interactive stdin
 pub async fn cfg_prompt_existing_file(key: &str, msg: &str) -> Result<String> {
     let config = crate::config::get_module_config();
-    if let Some(val) = config.custom_prompts.get(key) {
-        if !val.is_empty() {
+    if let Some(val) = config.custom_prompts.get(key)
+        && !val.is_empty() {
             let safe_path = validate_safe_file_path(val)
-                .map_err(|e| anyhow!("Invalid file path for '{}': {}", key, e))?;
+                .with_context(|| format!("Invalid file path for '{}'", key))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }
             return Err(anyhow!("File not found: {}", safe_path));
         }
-    }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
-        if !val.is_empty() {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await
+        && !val.is_empty() {
             let safe_path = validate_safe_file_path(&val)
-                .map_err(|e| anyhow!("Invalid global file path for '{}': {}", key, e))?;
+                .with_context(|| format!("Invalid global file path for '{}'", key))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }
         }
-    }
-    if config.api_mode {
-        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply a valid file path in the 'prompts' field.", key, msg));
+    if config.api_mode || crate::context::is_batch_active() {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Set it with: setg {} <path>", key, msg, key));
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
     let msg_owned = msg.to_string();
     if let Some(result) = cached_prompt(key, || async move {
         prompt_existing_file(&msg_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_existing_file(msg).await
+    let result = prompt_existing_file(msg).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }
 
 /// Config-aware integer range prompt.
@@ -382,7 +442,7 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
     let config = crate::config::get_module_config();
     if let Some(val) = config.custom_prompts.get(key) {
         let sanitized = sanitize_string_input(val)
-            .map_err(|e| anyhow!("Invalid value for '{}': {}", key, e))?;
+            .with_context(|| format!("Invalid value for '{}'", key))?;
         let trimmed = sanitized.trim();
         if !trimmed.is_empty() {
             match trimmed.parse::<i64>() {
@@ -395,7 +455,8 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
                         ));
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::debug!("numeric parse error for '{key}': {e}");
                     if config.api_mode {
                         return Err(anyhow!("Invalid numeric value for '{}': '{}'", key, trimmed));
                     }
@@ -404,17 +465,15 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
         }
     }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await {
         let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            if let Ok(n) = trimmed.parse::<i64>() {
-                if n >= min && n <= max {
+        if !trimmed.is_empty()
+            && let Ok(n) = trimmed.parse::<i64>()
+                && n >= min && n <= max {
                     return Ok(n);
                 }
-            }
-        }
     }
-    if config.api_mode {
+    if config.api_mode || crate::context::is_batch_active() {
         return Ok(default);
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
@@ -423,10 +482,18 @@ pub async fn cfg_prompt_int_range(key: &str, msg: &str, default: i64, min: i64, 
         let val = prompt_int_range(&msg_owned, default, min, max).await?;
         Ok(val.to_string())
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         let val = result?;
-        return val.parse::<i64>().map_err(|_| anyhow!("Invalid cached int value for '{}'", key));
+        return val.parse::<i64>().map_err(|e| anyhow!("Invalid cached int value for '{}': {e}", key));
     }
-    prompt_int_range(msg, default, min, max).await
+    let result = prompt_int_range(msg, default, min, max).await;
+    if let Ok(val) = result {
+        persist_prompt_answer(key, &val.to_string()).await;
+        return Ok(val);
+    }
+    result
 }
 
 /// Config-aware output file prompt.
@@ -449,35 +516,38 @@ pub async fn cfg_prompt_output_file(key: &str, msg: &str, default: &str) -> Resu
 /// Priority: custom_prompts > global_options > interactive stdin
 pub async fn cfg_prompt_wordlist(key: &str, msg: &str) -> Result<String> {
     let config = crate::config::get_module_config();
-    if let Some(val) = config.custom_prompts.get(key) {
-        if !val.is_empty() {
+    if let Some(val) = config.custom_prompts.get(key)
+        && !val.is_empty() {
             let safe_path = validate_safe_file_path(val)
-                .map_err(|e| anyhow!("Invalid wordlist path for '{}': {}", key, e))?;
+                .with_context(|| format!("Invalid wordlist path for '{}'", key))?;
             if Path::new(&safe_path).is_file() {
                 return Ok(safe_path);
             }
             return Err(anyhow!("Wordlist file not found: '{}'", val));
         }
-    }
     // Check global options (setg)
-    if let Some(val) = crate::global_options::GLOBAL_OPTIONS.get(key).await {
-        if !val.is_empty() {
-            if let Ok(safe_path) = validate_safe_file_path(&val) {
-                if Path::new(&safe_path).is_file() {
+    if let Some(val) = crate::tenant::resolve().global_options().get(key).await
+        && !val.is_empty()
+            && let Ok(safe_path) = validate_safe_file_path(&val)
+                && Path::new(&safe_path).is_file() {
                     return Ok(safe_path);
                 }
-            }
-        }
-    }
-    if config.api_mode {
-        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Supply it in the 'prompts' field of the API request.", key, msg));
+    if config.api_mode || crate::context::is_batch_active() {
+        return Err(anyhow!("Missing required prompt key '{}' (prompt: '{}'). Set it with: setg {} <path>", key, msg, key));
     }
     // Shared prompt cache: prompt once, reuse for all concurrent tasks
     let msg_owned = msg.to_string();
     if let Some(result) = cached_prompt(key, || async move {
         prompt_wordlist(&msg_owned).await
     }).await {
+        if let Ok(ref val) = result {
+            persist_prompt_answer(key, val).await;
+        }
         return result;
     }
-    prompt_wordlist(msg).await
+    let result = prompt_wordlist(msg).await;
+    if let Ok(ref val) = result {
+        persist_prompt_answer(key, val).await;
+    }
+    result
 }

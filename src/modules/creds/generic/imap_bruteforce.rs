@@ -1,20 +1,30 @@
-use anyhow::{anyhow, Result};
+use anyhow::{ anyhow, Context, Result };
 use colored::*;
 use native_tls::TlsConnector;
-use std::io::{Read, Write};
+use std::io::{ Read, Write };
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
 use crate::utils::{
-    load_lines, get_filename_in_current_dir,
-    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_existing_file, cfg_prompt_int_range,
+    load_lines,
+    get_filename_in_current_dir,
+    cfg_prompt_default,
+    cfg_prompt_yes_no,
+    cfg_prompt_existing_file,
+    cfg_prompt_int_range,
     cfg_prompt_output_file,
 };
 use crate::utils::{
-    BruteforceConfig, LoginResult, SubnetScanConfig,
-    generate_combos_mode, parse_combo_mode, load_credential_file,
-    run_bruteforce, run_subnet_bruteforce,
-    is_subnet_target, is_mass_scan_target, run_mass_scan, MassScanConfig,
+    BruteforceConfig,
+    LoginResult,
+    SubnetScanConfig,
+    generate_combos_mode,
+    parse_combo_mode,
+    load_credential_file,
+    run_bruteforce,
+    run_subnet_bruteforce,
+    is_subnet_target,
     backoff_delay,
 };
 
@@ -54,6 +64,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         ],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(143),
     }
 }
 
@@ -145,83 +156,13 @@ impl ImapError {
 // Module Entry Point
 // ============================================================================
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("imap_bruteforce requires a single-host target")?;
     crate::mprintln!("\n{}", "=== IMAP Bruteforce Module (RustSploit) ===".bold().cyan());
     crate::mprintln!();
-
-    // --- Mass Scan Mode ---
-    if is_mass_scan_target(target) {
-        crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-        crate::mprintln!("{}", "[*] Mode: Mass Scan / Hose".yellow());
-
-        let use_tls = cfg_prompt_yes_no("use_tls", "Use TLS/IMAPS?", false).await?;
-        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
-        let users = std::sync::Arc::new(load_lines(&usernames_file)?);
-        let passes = std::sync::Arc::new(load_lines(&passwords_file)?);
-        if users.is_empty() { return Err(anyhow!("User list empty")); }
-        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
-
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "IMAP",
-            default_port: if use_tls { DEFAULT_IMAPS_PORT } else { DEFAULT_IMAP_PORT },
-            state_file: "imap_hose_state.log",
-            default_output: "imap_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip: IpAddr, port: u16| {
-            let users = users.clone();
-            let passes = passes.clone();
-            async move {
-                if !crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    return None;
-                }
-
-                let target_str = ip.to_string();
-                for user in users.iter() {
-                    for pass in passes.iter() {
-                        let mut retry_attempt: u32 = 0;
-                        let max_retries: u32 = 3;
-                        let mut should_skip_host = false;
-                        loop {
-                            let t = target_str.clone();
-                            let u = user.clone();
-                            let p = pass.clone();
-                            let res = tokio::task::spawn_blocking(move || {
-                                attempt_imap_login(&t, port, &u, &p, use_tls, 5)
-                            }).await;
-                            match res {
-                                Ok(Ok(true)) => {
-                                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                    let line = format!("[{}] {}:{}:{}:{}\n", now, ip, port, user, pass);
-                                    crate::mprintln!("\r{}", format!("[+] FOUND: {}:{}:{}:{}", ip, port, user, pass).green().bold());
-                                    return Some(line);
-                                }
-                                Ok(Ok(false)) => break, // auth failed, try next
-                                Ok(Err(e)) => {
-                                    if e.error_type.is_retryable() && retry_attempt < max_retries {
-                                        retry_attempt += 1;
-                                        let delay = backoff_delay(500, retry_attempt, 8);
-                                        tokio::time::sleep(delay).await;
-                                        continue;
-                                    }
-                                    should_skip_host = true;
-                                    break;
-                                }
-                                Err(_) => {
-                                    should_skip_host = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if should_skip_host {
-                            return None;
-                        }
-                    }
-                }
-                None
-            }
-        }).await;
-    }
 
     // --- Subnet Scan Mode ---
     if is_subnet_target(target) {
@@ -243,7 +184,9 @@ pub async fn run(target: &str) -> Result<()> {
 
         let connection_timeout: u64 = 5;
 
-        return run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
             concurrency,
             verbose,
             output_file,
@@ -251,29 +194,52 @@ pub async fn run(target: &str) -> Result<()> {
             jitter_ms: 50,
             source_module: "creds/generic/imap_credcheck",
             skip_tcp_check: false,
+            state_file: None,
         }, move |ip: IpAddr, port: u16, user: String, pass: String| {
+            let limiter = limiter.clone();
+            let module_path = module_path.clone();
             async move {
                 let target_str = ip.to_string();
+                limiter.acquire(&module_path, &target_str).await;
                 let res = tokio::task::spawn_blocking(move || {
                     attempt_imap_login(&target_str, port, &user, &pass, use_tls, connection_timeout)
                 }).await;
                 match res {
                     Ok(Ok(true)) => LoginResult::Success,
                     Ok(Ok(false)) => LoginResult::AuthFailed,
-                    Ok(Err(e)) => LoginResult::Error {
-                        message: e.message,
-                        retryable: e.error_type.is_retryable(),
-                    },
+                    Ok(Err(e)) => {
+                        let retryable = e.error_type.is_retryable();
+                        if retryable {
+                            tokio::time::sleep(backoff_delay(250, 1, 4)).await;
+                        }
+                        LoginResult::Error { message: e.message, retryable }
+                    }
                     Err(e) => LoginResult::Error {
                         message: format!("Task panic: {}", e),
                         retryable: false,
                     },
                 }
             }
-        }).await;
+        }).await?;
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid IMAP credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "imap",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
     }
 
     // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
     let use_tls = cfg_prompt_yes_no("use_tls", "Use TLS/IMAPS?", false).await?;
     let default_port = if use_tls { DEFAULT_IMAPS_PORT } else { DEFAULT_IMAP_PORT };
     let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
@@ -363,18 +329,28 @@ pub async fn run(target: &str) -> Result<()> {
         combos.extend(load_credential_file(&cred_path)?);
     }
 
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
     let try_login = move |t: String, p: u16, user: String, pass: String| {
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
         async move {
+            limiter.acquire(&module_path, &t).await;
             let res = tokio::task::spawn_blocking(move || {
                 attempt_imap_login(&t, p, &user, &pass, use_tls, connection_timeout)
             }).await;
             match res {
                 Ok(Ok(true)) => LoginResult::Success,
                 Ok(Ok(false)) => LoginResult::AuthFailed,
-                Ok(Err(e)) => LoginResult::Error {
-                    message: e.message,
-                    retryable: e.error_type.is_retryable(),
-                },
+                Ok(Err(e)) => {
+                    let retryable = e.error_type.is_retryable();
+                    // Back off before returning a retryable error so the next attempt
+                    // doesn't hammer a rate-limiting/exhausted server immediately.
+                    if retryable {
+                        tokio::time::sleep(backoff_delay(250, 1, 4)).await;
+                    }
+                    LoginResult::Error { message: e.message, retryable }
+                }
                 Err(e) => LoginResult::Error {
                     message: format!("Task panic: {}", e),
                     retryable: false,
@@ -454,7 +430,20 @@ pub async fn run(target: &str) -> Result<()> {
         }
     }
 
-    Ok(())
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid IMAP credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "imap",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
 }
 
 // ============================================================================
@@ -483,7 +472,7 @@ fn attempt_imap_login(
 
     if use_tls {
         let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
             .build()
             .map_err(|e| ImapError {
                 error_type: ImapErrorType::TlsError,
@@ -589,3 +578,5 @@ fn attempt_imap_login(
         })
     }
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/imap_bruteforce", native);

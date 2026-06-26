@@ -9,10 +9,14 @@ fn safe_write(path: &str, data: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // Owner-only (0o600): the export aggregates every credential secret in
+        // cleartext plus hosts/loot, so it must never be created world-readable
+        // — matching the cred/loot/workspace stores which all write 0o600.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .context(format!("Failed to open '{}' (symlinks not allowed)", path))?;
@@ -43,15 +47,16 @@ struct EngagementExport {
 /// Workspace data is snapshotted in a single read to avoid mixing data
 /// across concurrent workspace switches.
 async fn gather_data() -> EngagementExport {
-    let workspace_name = crate::workspace::WORKSPACE.current_name().await;
-    let workspace_data = crate::workspace::WORKSPACE.get_data().await;
+    let s = crate::tenant::resolve();
+    let workspace_name = s.workspace().current_name().await;
+    let workspace_data = s.workspace().get_data().await;
     EngagementExport {
         workspace: workspace_name,
         exported_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         hosts: workspace_data.hosts,
         services: workspace_data.services,
-        credentials: crate::cred_store::CRED_STORE.list().await,
-        loot: crate::loot::LOOT_STORE.list().await,
+        credentials: s.cred_store().list().await,
+        loot: s.loot_store().list().await,
     }
 }
 
@@ -195,12 +200,14 @@ pub async fn export_summary(path: &str) -> Result<()> {
 
 fn csv_escape(s: &str) -> String {
     let mut val = s.to_string();
-    let needs_formula_guard = val.starts_with('=')
-        || val.starts_with('+')
-        || val.starts_with('@')
-        || val.starts_with('-')
-        || val.starts_with('\t')
-        || val.starts_with('\r');
+    // Spreadsheets trim leading whitespace before evaluating a cell, so check
+    // the first *non-whitespace* char — otherwise " =cmd|'/c calc'!A1" (note
+    // the leading space) slips past a naive `starts_with('=')` guard.
+    let needs_formula_guard = val
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '=' | '+' | '@' | '-' | '\t' | '\r'));
     if needs_formula_guard {
         val = format!("'{}", val);
     }

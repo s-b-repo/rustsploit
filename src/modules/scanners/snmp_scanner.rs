@@ -5,12 +5,12 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, Context};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
 use crate::utils::{cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -27,6 +27,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -180,6 +181,8 @@ fn is_valid_snmp_response(data: &[u8]) -> bool {
 
 /// Send SNMP GET and check for valid response
 async fn test_community(
+    ctx: &ModuleCtx,
+    target: &str,
     socket: &tokio::net::UdpSocket,
     addr: &str,
     community: &str,
@@ -190,6 +193,9 @@ async fn test_community(
     let request_id = rand::random::<u32>();
     let packet = build_snmp_get(community, oid, version, request_id);
 
+    // Honor the global/per-module/per-target rate limiter before every UDP probe
+    // (matches nbns_scanner / reflect_scanner) so fan-out scans don't flood targets.
+    ctx.rate_limit(target).await;
     socket.send_to(&packet, addr).await
         .context("Failed to send SNMP packet")?;
 
@@ -205,36 +211,16 @@ async fn test_community(
                 Ok(None)
             }
         }
-        Ok(Err(_)) => Ok(None),
-        Err(_) => Ok(None), // Timeout
+        Ok(Err(e)) => {
+            tracing::debug!("SNMP recv error: {e}");
+            Ok(None)
+        }
+        Err(e) => { tracing::debug!("timeout: {e}"); Ok(None) }
     }
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "SNMP",
-            default_port: 161,
-            state_file: "snmp_scanner_mass_state.log",
-            default_output: "snmp_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                let sock = crate::utils::udp_bind(None).await.ok()?;
-                let addr = format!("{}:{}", ip, port);
-                let packet = build_snmp_get("public", OID_SYS_DESCR, 0x00, rand::random());
-                sock.send_to(&packet, &addr).await.ok()?;
-                let mut buf = [0u8; 1024];
-                match tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await {
-                    Ok(Ok((n, _))) if is_valid_snmp_response(&buf[..n]) => {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        Some(format!("[{}] {}:{} SNMP community 'public' valid\n", ts, ip, port))
-                    }
-                    _ => None,
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx.target.as_single().context("module requires a single-host target")?;
 
     display_banner();
 
@@ -248,22 +234,40 @@ pub async fn run(target: &str) -> Result<()> {
 
     let timeout_dur = Duration::from_secs(timeout_secs);
 
-    // Determine communities to test
-    let communities: Vec<String> = if custom_wordlist.is_empty() {
-        DEFAULT_COMMUNITIES.iter().map(|s| s.to_string()).collect()
+    // Decide between in-memory load and streaming-batched load.
+    // Wordlists <= STREAM_THRESHOLD load fully; larger files stream in batches.
+    const STREAM_THRESHOLD: u64 = 10 * 1024 * 1024;
+    const BATCH_SIZE: usize = 100_000;
+
+    enum WordlistSource {
+        InMemory(Vec<String>),
+        Streaming(String),
+    }
+
+    let source = if custom_wordlist.is_empty() {
+        WordlistSource::InMemory(DEFAULT_COMMUNITIES.iter().map(|s| s.to_string()).collect())
     } else {
-        // Cap wordlist at 10MB to prevent OOM
-        let meta = std::fs::metadata(&custom_wordlist)
+        let meta = tokio::fs::metadata(&custom_wordlist).await
             .with_context(|| format!("Cannot stat wordlist: {}", custom_wordlist))?;
-        if meta.len() > 10 * 1024 * 1024 {
-            return Err(anyhow!("Wordlist too large ({:.1}MB, max 10MB)", meta.len() as f64 / (1024.0 * 1024.0)));
+        if meta.len() > STREAM_THRESHOLD {
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[*] Large wordlist ({:.1} MB) — streaming in batches of {}",
+                    meta.len() as f64 / (1024.0 * 1024.0),
+                    BATCH_SIZE
+                ).cyan()
+            );
+            WordlistSource::Streaming(custom_wordlist.clone())
+        } else {
+            let content = tokio::fs::read_to_string(&custom_wordlist).await
+                .with_context(|| format!("Failed to read wordlist: {}", custom_wordlist))?;
+            let v: Vec<String> = content.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            WordlistSource::InMemory(v)
         }
-        let content = std::fs::read_to_string(&custom_wordlist)
-            .with_context(|| format!("Failed to read wordlist: {}", custom_wordlist))?;
-        content.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
     };
 
     // Determine versions to test
@@ -278,51 +282,117 @@ pub async fn run(target: &str) -> Result<()> {
         .context("Failed to bind UDP socket")?;
 
     crate::mprintln!();
-    crate::mprintln!("{}", format!("[*] Testing {} communities across {} version(s) against {}",
-        communities.len(), versions.len(), addr).bold());
+    match &source {
+        WordlistSource::InMemory(v) => {
+            crate::mprintln!("{}", format!("[*] Testing {} communities across {} version(s) against {}",
+                v.len(), versions.len(), addr).bold());
+        }
+        WordlistSource::Streaming(_) => {
+            crate::mprintln!("{}", format!("[*] Streaming wordlist; testing across {} version(s) against {}",
+                versions.len(), addr).bold());
+        }
+    }
 
     let mut valid_communities = Vec::new();
+    let mut total_tested = 0usize;
 
-    for (ver_byte, ver_name) in &versions {
-        crate::mprintln!();
-        crate::mprintln!("{}", format!("[*] Testing SNMP {} ...", ver_name).cyan());
+    // Probe one batch sequentially across all configured SNMP versions.
+    async fn probe_batch(
+        ctx: &ModuleCtx,
+        target: &str,
+        batch: &[String],
+        socket: &tokio::net::UdpSocket,
+        addr: &str,
+        versions: &[(u8, &str)],
+        timeout_dur: Duration,
+        valid: &mut Vec<String>,
+    ) {
+        for (ver_byte, ver_name) in versions {
+            for community in batch {
+                if crate::context::is_cancelled() { return; }
+                crate::mprint!("  [*] {} '{}' ... ", ver_name, community);
+                if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
 
-        for community in &communities {
-            crate::mprint!("  [*] Testing '{}' ... ", community);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+                match test_community(ctx, target, socket, addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
+                    Ok(Some(sys_descr)) => {
+                        crate::mprintln!("{}", "VALID!".green().bold());
+                        crate::mprintln!("    {}", format!("[+] sysDescr: {}", sys_descr).green());
 
-            match test_community(&socket, &addr, community, OID_SYS_DESCR, *ver_byte, timeout_dur).await {
-                Ok(Some(sys_descr)) => {
-                    crate::mprintln!("{}", "VALID!".green().bold());
-                    crate::mprintln!("    {}", format!("[+] sysDescr: {}", sys_descr).green());
+                        if let Ok(Some(sys_name)) = test_community(ctx, target, socket, addr, community, OID_SYS_NAME, *ver_byte, timeout_dur).await {
+                            crate::mprintln!("    {}", format!("[+] sysName: {}", sys_name).green());
+                        }
+                        if let Ok(Some(sys_loc)) = test_community(ctx, target, socket, addr, community, OID_SYS_LOCATION, *ver_byte, timeout_dur).await {
+                            crate::mprintln!("    {}", format!("[+] sysLocation: {}", sys_loc).green());
+                        }
 
-                    // Try to get sysName
-                    if let Ok(Some(sys_name)) = test_community(&socket, &addr, community, OID_SYS_NAME, *ver_byte, timeout_dur).await {
-                        crate::mprintln!("    {}", format!("[+] sysName: {}", sys_name).green());
+                        let (ev_host, ev_port) = addr
+                            .rsplit_once(':')
+                            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(161)))
+                            .unwrap_or_else(|| (addr.to_string(), 161));
+                        crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
+                            host: ev_host,
+                            port: ev_port,
+                            service: format!("snmp/{}", ver_name),
+                            version: Some(format!("community={} sysDescr={}", community, sys_descr)),
+                        });
+
+                        valid.push(format!("{} ({}): {}", community, ver_name, sys_descr));
                     }
-
-                    // Try to get sysLocation
-                    if let Ok(Some(sys_loc)) = test_community(&socket, &addr, community, OID_SYS_LOCATION, *ver_byte, timeout_dur).await {
-                        crate::mprintln!("    {}", format!("[+] sysLocation: {}", sys_loc).green());
+                    Ok(None) => {
+                        crate::mprintln!("{}", "no response".dimmed());
                     }
-
-                    valid_communities.push(format!("{} ({}): {}", community, ver_name, sys_descr));
-                }
-                Ok(None) => {
-                    crate::mprintln!("{}", "no response".dimmed());
-                }
-                Err(e) => {
-                    crate::mprintln!("{}", format!("error: {}", e).red());
+                    Err(e) => {
+                        crate::mprintln!("{}", format!("error: {}", e).red());
+                    }
                 }
             }
         }
     }
 
+    match source {
+        WordlistSource::InMemory(communities) => {
+            total_tested = communities.len();
+            probe_batch(ctx, target, &communities, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
+        }
+        WordlistSource::Streaming(path) => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
+            let read_path = path.clone();
+            let reader_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+                crate::utils::load_lines_batched(&read_path, BATCH_SIZE, |raw_batch| {
+                    let cleaned: Vec<String> = raw_batch.into_iter()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .collect();
+                    if !cleaned.is_empty()
+                        && let Err(e) = tx.blocking_send(cleaned) { eprintln!("[!] Channel send failed: {}", e); }
+                })
+            });
+
+            let mut batch_idx = 0usize;
+            while let Some(batch) = rx.recv().await {
+                batch_idx += 1;
+                crate::mprintln!("{}", format!("[*] Batch {}: {} communities", batch_idx, batch.len()).cyan());
+                total_tested += batch.len();
+                probe_batch(ctx, target, &batch, &socket, &addr, &versions, timeout_dur, &mut valid_communities).await;
+            }
+
+            match reader_handle.await {
+                Ok(Ok(total_lines)) => {
+                    crate::mprintln!("{}", format!("[*] Streamed {} total lines from wordlist", total_lines).dimmed());
+                }
+                Ok(Err(e)) => crate::meprintln!("[!] Wordlist read error: {}", e),
+                Err(e) => crate::meprintln!("[!] Wordlist reader task panicked: {}", e),
+            }
+        }
+    }
+
+    let mut outcome = ModuleOutcome::ok();
+
     // Summary
     crate::mprintln!();
     crate::mprintln!("{}", "=== Scan Summary ===".bold());
     crate::mprintln!("  Target:               {}:{}", target, port);
-    crate::mprintln!("  Communities tested:    {}", communities.len() * versions.len());
+    crate::mprintln!("  Communities tested:    {}", total_tested * versions.len());
     crate::mprintln!("  Valid communities:     {}", if valid_communities.is_empty() {
         "0".dimmed().to_string()
     } else {
@@ -334,16 +404,34 @@ pub async fn run(target: &str) -> Result<()> {
         crate::mprintln!("{}", "[!] Valid community strings found:".red().bold());
         for vc in &valid_communities {
             crate::mprintln!("    - {}", vc);
+
+            // Each valid community string is a misconfiguration (default/guessable community)
+            outcome.findings.push(Finding {
+                target: format!("{}:{}", target, port),
+                kind: FindingKind::Note,
+                message: format!("SNMP community string accepted: {}", vc),
+                data: Some(serde_json::json!({
+                    "host": target,
+                    "port": port,
+                    "community": vc,
+                })),
+            });
         }
     }
 
     if save_results && !valid_communities.is_empty() {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "snmp_scan_results.txt").await?;
+        let default_name = format!("snmp_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
         let content = valid_communities.join("\n");
-        std::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content))
+        tokio::fs::write(&output_path, format!("SNMP Scan Results - {}:{}\n\n{}", target, port, content)).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "snmp_scanner", native);

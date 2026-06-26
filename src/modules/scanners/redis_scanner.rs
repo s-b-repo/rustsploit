@@ -10,8 +10,8 @@ use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
@@ -28,6 +28,7 @@ pub fn info() -> ModuleInfo {
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
+        default_port: None,
     }
 }
 
@@ -118,27 +119,15 @@ fn extract_dbsize(response: &str) -> Option<u64> {
     None
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "Redis",
-            default_port: 6379,
-            state_file: "redis_scanner_mass_state.log",
-            default_output: "redis_scanner_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} Redis open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("redis_scanner requires a single-host target")?;
 
     display_banner();
+
+    let mut outcome = ModuleOutcome::ok();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
@@ -152,25 +141,39 @@ pub async fn run(target: &str) -> Result<()> {
     crate::mprintln!();
     crate::mprintln!("{}", format!("[*] Connecting to {}...", addr).bold());
 
-    let mut stream = timeout(timeout_dur, tokio::net::TcpStream::connect(&addr))
+    // Canonical TCP connect — also honors `setg src_port` (operator-configured
+    // source port binding) which a raw TcpStream::connect would skip.
+    ctx.rate_limit(target).await;
+    let mut stream = crate::utils::network::tcp_connect_str(&addr, timeout_dur)
         .await
-        .context("Connection timed out")?
         .context("Failed to connect to Redis")?;
 
     // Step 1: PING
     crate::mprintln!("{}", "[*] Sending PING...".dimmed());
+    ctx.rate_limit(target).await;
     let ping_resp = redis_command(&mut stream, "PING\r\n", timeout_dur).await?;
     let ping_ok = ping_resp.trim().contains("+PONG");
 
     if ping_ok {
         crate::mprintln!("{}", "[+] PONG received - Redis has NO authentication!".green().bold());
+        outcome.findings.push(Finding {
+            target: target.to_string(),
+            kind: FindingKind::Vulnerable,
+            message: format!("Redis at {}:{} accepts unauthenticated commands", target, port),
+            data: Some(serde_json::json!({
+                "host": target,
+                "port": port,
+                "service": "redis",
+                "auth": "none",
+            })),
+        });
     } else if ping_resp.contains("-NOAUTH") || ping_resp.contains("-ERR") {
         crate::mprintln!("{}", "[-] Redis requires authentication.".yellow());
         crate::mprintln!("{}", format!("    Response: {}", ping_resp.trim()).dimmed());
-        return Ok(());
+        return Ok(outcome);
     } else {
         crate::mprintln!("{}", format!("[-] Unexpected PING response: {}", ping_resp.trim()).yellow());
-        return Ok(());
+        return Ok(outcome);
     }
 
     let mut report_lines: Vec<String> = Vec::new();
@@ -179,6 +182,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Step 2: INFO
     crate::mprintln!("{}", "[*] Gathering server info...".dimmed());
+    ctx.rate_limit(target).await;
     match redis_command(&mut stream, "INFO\r\n", timeout_dur).await {
         Ok(info_resp) => {
             let version = extract_info_field(&info_resp, "redis_version")
@@ -198,6 +202,19 @@ pub async fn run(target: &str) -> Result<()> {
             crate::mprintln!("{}", format!("[+] OS:                 {}", os).green());
             crate::mprintln!("{}", format!("[+] TCP port:           {}", tcp_port_val).green());
 
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Banner,
+                message: format!("Redis {} on {} (os={})", version, target, os),
+                data: Some(serde_json::json!({
+                    "host": target,
+                    "port": port,
+                    "version": version,
+                    "os": os,
+                    "memory": memory,
+                })),
+            });
+
             report_lines.push(format!("Version: {}", version));
             report_lines.push(format!("Clients: {}", clients));
             report_lines.push(format!("Memory: {}", memory));
@@ -210,6 +227,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Step 3: CONFIG GET requirepass
     crate::mprintln!("{}", "[*] Checking requirepass...".dimmed());
+    ctx.rate_limit(target).await;
     match redis_command(&mut stream, "CONFIG GET requirepass\r\n", timeout_dur).await {
         Ok(resp) => {
             let pass_val = extract_config_value(&resp).unwrap_or_default();
@@ -228,6 +246,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Step 4: CONFIG GET dir
     crate::mprintln!("{}", "[*] Checking working directory...".dimmed());
+    ctx.rate_limit(target).await;
     match redis_command(&mut stream, "CONFIG GET dir\r\n", timeout_dur).await {
         Ok(resp) => {
             let dir_val = extract_config_value(&resp).unwrap_or_else(|| "unknown".into());
@@ -246,6 +265,7 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Step 5: DBSIZE
     crate::mprintln!("{}", "[*] Checking database size...".dimmed());
+    ctx.rate_limit(target).await;
     match redis_command(&mut stream, "DBSIZE\r\n", timeout_dur).await {
         Ok(resp) => {
             if let Some(count) = extract_dbsize(&resp) {
@@ -270,12 +290,18 @@ pub async fn run(target: &str) -> Result<()> {
 
     // Save results
     if save_results {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "redis_scan_results.txt").await?;
+        let default_name = format!("redis_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
         let content = report_lines.join("\n");
-        std::fs::write(&output_path, content)
+        tokio::fs::write(&output_path, content).await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
         crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "redis_scanner", native);

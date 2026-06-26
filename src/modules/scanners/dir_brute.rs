@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
     cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist,
-    normalize_target, load_lines, cfg_prompt_existing_file, safe_read_to_string
+    normalize_target, load_lines_cached, cfg_prompt_existing_file, safe_read_to_string
 };
-use crate::utils::{is_mass_scan_target, run_mass_scan, MassScanConfig};
 use rand::seq::IndexedRandom;
 
 // --- Constants & Data ---
@@ -72,51 +72,36 @@ impl Default for DirBruteConfig {
 
 // --- Main Entry Point ---
 
-pub async fn run(target: &str) -> Result<()> {
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("dir_brute requires a single-host target")?;
+
     if crate::utils::get_global_source_port().await.is_some() {
         crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
     }
-    if is_mass_scan_target(target) {
-        return run_mass_scan(target, MassScanConfig {
-            protocol_name: "DirBrute",
-            default_port: 80,
-            state_file: "dir_brute_mass_state.log",
-            default_output: "dir_brute_mass_results.txt",
-            default_concurrency: 500,
-        }, move |ip, port| {
-            async move {
-                if crate::utils::tcp_port_open(ip, port, std::time::Duration::from_secs(3)).await {
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    Some(format!("[{}] {}:{} DirBrute open\n", ts, ip, port))
-                } else {
-                    None
-                }
-            }
-        }).await;
-    }
 
     if !crate::utils::is_batch_mode() {
-        if !crate::utils::is_batch_mode() {
-            print_banner();
-        }
+        print_banner();
+
+        // 1. Wizard Menu
+        crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
+        crate::mprintln!("1. Quick Attack (Default Settings)");
+        crate::mprintln!("2. Create Template (Wizard -> Save)");
+        crate::mprintln!("3. Load Template (Load -> Run)");
+        crate::mprintln!("4. Custom Attack (Wizard -> Run)");
     }
 
-    // 1. Wizard Menu
-    crate::mprintln!("{}", "Select Operation Mode:".cyan().bold());
-    crate::mprintln!("1. Quick Attack (Default Settings)");
-    crate::mprintln!("2. Create Template (Wizard -> Save)");
-    crate::mprintln!("3. Load Template (Load -> Run)");
-    crate::mprintln!("4. Custom Attack (Wizard -> Run)");
-    
     let choice = cfg_prompt_default("mode", "Selection", "1").await?;
-    
+
     let config = match choice.as_str() {
         "1" => setup_quick_attack(target).await?,
         "2" => {
             let cfg = setup_wizard(target).await?;
             save_template(&cfg).await?;
             crate::mprintln!("\n{}", "Template saved. Exiting module.".green());
-            return Ok(());
+            return Ok(ModuleOutcome::ok());
         },
         "3" => load_template().await?,
         "4" => setup_wizard(target).await?,
@@ -127,7 +112,7 @@ pub async fn run(target: &str) -> Result<()> {
     };
 
     // 2. Execution
-    execute_scan(config).await
+    execute_scan(ctx, config).await
 }
 
 fn print_banner() {
@@ -292,11 +277,16 @@ async fn load_template() -> Result<DirBruteConfig> {
     crate::mprintln!("Target: {}://{}:{}{}", config.protocol, config.target_host, config.port, config.base_path);
     crate::mprintln!("Mode: Level {}", config.scan_mode);
     crate::mprintln!("Wordlist: {}", config.wordlist_path);
-    
+
+    if config.scan_mode == 3 {
+        crate::mprintln!("\n{}", "[!] WARNING: This template uses DESTROY mode (scan_mode=3).".red().bold());
+        crate::mprintln!("{}", "    DELETE requests will be sent to discovered paths on the target.".red());
+    }
+
     if !cfg_prompt_yes_no("run_template", "Run this configuration?", true).await? {
         return Err(anyhow!("User cancelled after loading template."));
     }
-    
+
     Ok(config)
 }
 
@@ -309,8 +299,29 @@ struct ScanResult {
     len: u64,
 }
 
-async fn execute_scan(config: DirBruteConfig) -> Result<()> {
-    let lines = load_lines(&config.wordlist_path)?;
+async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleOutcome> {
+    let mut outcome = ModuleOutcome::ok();
+
+    // --- DESTROY mode (scan_mode=3) safety gate ---
+    // This runs regardless of how the config was constructed (wizard, template, quick attack).
+    if config.scan_mode == 3 {
+        if crate::utils::is_batch_mode() || crate::config::get_module_config().api_mode {
+            return Err(anyhow!(
+                "DESTROY mode (scan_mode=3) is not allowed in batch or API mode. \
+                 This mode sends HTTP DELETE requests and must be confirmed interactively."
+            ));
+        }
+
+        crate::mprintln!("\n{}", "[!] DESTROY mode will send DELETE requests to discovered paths on the target.".red().bold());
+        crate::mprintln!("{}", "    This can PERMANENTLY DESTROY data on the remote server.".red());
+        let confirm = cfg_prompt_required("destroy_exec_confirm", "Type 'DESTROY' to confirm execution").await?;
+        if confirm != "DESTROY" {
+            crate::mprintln!("{}", "Confirmation failed. Aborting scan.".yellow());
+            return Ok(outcome);
+        }
+    }
+
+    let lines = load_lines_cached(&config.wordlist_path)?;
     let total = lines.len();
     crate::mprintln!("\n{}", format!("Loaded {} words. Starting scan...", total).blue().bold());
     
@@ -324,7 +335,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
     
     let client = Client::builder()
         .default_headers(headers)
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
         .timeout(Duration::from_secs(10))
         .build()?;
 
@@ -341,7 +352,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
 
     let mut tasks = Vec::new();
 
-    for word in lines {
+    for word in lines.iter() {
         let sem = Arc::clone(&sem);
         let client = client.clone();
         let base = base_url.clone();
@@ -352,31 +363,39 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         let config_verbose = config.verbose;
         let random_agent = config.random_agent;
         
+        let target_host = config.target_host.clone();
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        let cancel = ctx.cancel.clone();
+        let word = word.clone();
+
         let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
             let _permit = sem.acquire().await.context("Semaphore acquisition failed")?;
-            
+            if cancel.is_cancelled() || crate::context::is_cancelled() { return Ok(()); }
+
             // Apply delay
             if delay.as_millis() > 0 {
                 tokio::time::sleep(delay).await;
             }
-            
+
             let url = format!("{}{}", base, word);
 
             for method in methods {
                 let mut req_builder = client.request(method.clone(), &url);
-                
+
                 if random_agent {
                      let agent = USER_AGENTS.choose(&mut rand::rng()).unwrap_or(&"RustSploit");
                      req_builder = req_builder.header(header::USER_AGENT, *agent);
                 } else {
                      req_builder = req_builder.header(header::USER_AGENT, "RustSploit/0.3");
                 }
-                
+
+                limiter.acquire(&module_path, &target_host).await;
                 match req_builder.send().await {
                     Ok(resp) => {
                          let status = resp.status().as_u16();
                          let len = resp.content_length().unwrap_or(0);
-                         
+
                          // Special handling for 403 Forbidden
                          if status == 403 {
                              f_count.fetch_add(1, Ordering::Relaxed);
@@ -388,11 +407,11 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
                          // Determine if "Interesting"
                          if COMMON_STATUS_CODES.contains(&status) {
                              let method_str = method.as_str();
-                             
+
                              // Enhanced Color Logic
-                             let status_display = if status >= 200 && status < 300 {
+                             let status_display = if (200..300).contains(&status) {
                                  format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
-                             } else if status >= 300 && status < 400 {
+                             } else if (300..400).contains(&status) {
                                  format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
                              } else if status >= 500 {
                                  format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
@@ -401,14 +420,14 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
                              } else {
                                  format!("[{}]", status).white().to_string()
                              };
-                             
-                             crate::mprintln!("{} Size: {} | Method: {} | {}", 
-                                 status_display, 
-                                 len.to_string().dimmed(), 
-                                 method_str.bold(), 
+
+                             crate::mprintln!("{} Size: {} | Method: {} | {}",
+                                 status_display,
+                                 len.to_string().dimmed(),
+                                 method_str.bold(),
                                  url
                              );
-                             
+
                              let res = ScanResult {
                                  path: url.clone(),
                                  method: method.to_string(),
@@ -418,7 +437,11 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
                              r_mutex.lock().await.push(res);
                          }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        if config_verbose {
+                            crate::meprintln!("[!] Request failed for {}: {}", url, e);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -428,7 +451,15 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
     
     // Await all
     for t in tasks {
-        let _ = t.await;
+        match t.await {
+            Err(e) => {
+                eprintln!("[!] Task join failed: {}", e);
+            }
+            Ok(Err(e)) => {
+                eprintln!("[!] Task inner error: {}", e);
+            }
+            Ok(Ok(())) => {}
+        }
     }
 
     crate::mprintln!("\n{}", "Scan Complete.".green().bold());
@@ -441,14 +472,29 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
 
     // Report & Save
     let final_results = results_mutex.lock().await;
+    for r in final_results.iter() {
+        if r.status >= 200 && r.status < 400 {
+            outcome.findings.push(Finding {
+                target: config.target_host.clone(),
+                kind: FindingKind::Note,
+                message: format!("dir_brute hit {} {} -> {} ({} bytes)", r.method, r.path, r.status, r.len),
+                data: Some(serde_json::json!({
+                    "url": r.path,
+                    "method": r.method,
+                    "status": r.status,
+                    "size": r.len,
+                })),
+            });
+        }
+    }
     if !final_results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
         let sort_choice = cfg_prompt_default("sort_by", "Sort by (1) Status or (2) Size", "1").await?;
         
         let mut sorted: Vec<&ScanResult> = final_results.iter().collect();
         if sort_choice == "2" {
-            sorted.sort_by(|a, b| b.len.cmp(&a.len)); // Size desc
+            sorted.sort_by_key(|b| std::cmp::Reverse(b.len)); // Size desc
         } else {
-            sorted.sort_by(|a, b| a.status.cmp(&b.status)); // Status asc
+            sorted.sort_by_key(|a| a.status); // Status asc
         }
         
         let filename = format!("scan_results_{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S"));
@@ -463,7 +509,7 @@ async fn execute_scan(config: DirBruteConfig) -> Result<()> {
         crate::mprintln!("Results saved to {}", filename.green());
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn get_methods_for_mode(mode: u8) -> Vec<Method> {
@@ -508,5 +554,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: None,
     }
 }
+
+crate::register_native_module!(crate::module::Category::Scanners, "dir_brute", native);

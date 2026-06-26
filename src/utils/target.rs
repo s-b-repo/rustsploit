@@ -2,7 +2,7 @@
 //
 // Target normalization, IPv6/hostname validation, and IP extraction.
 
-use std::net::ToSocketAddrs;
+use std::net::{Ipv6Addr, ToSocketAddrs};
 
 use anyhow::{Context, Result, anyhow};
 use colored::*;
@@ -37,9 +37,23 @@ pub fn normalize_target(raw: &str) -> Result<String> {
 
     // Comma-separated multi-target: normalize each individually
     if trimmed.contains(',') {
-        let parts: Vec<&str> = trimmed.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        // Cap the number of comma-separated entries to avoid huge Vec
+        // allocations from malformed/malicious input.
+        const MAX_TARGETS: usize = 4096;
+        let parts: Vec<&str> = trimmed
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .take(MAX_TARGETS + 1)
+            .collect();
         if parts.is_empty() {
             return Err(anyhow!("No valid targets in comma-separated list"));
+        }
+        if parts.len() > MAX_TARGETS {
+            return Err(anyhow!(
+                "Too many comma-separated targets (max {})",
+                MAX_TARGETS
+            ));
         }
         if parts.len() == 1 {
             return normalize_target(parts[0]);
@@ -51,15 +65,24 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         return Ok(normalized.join(", "));
     }
 
-    if trimmed.contains("..") || trimmed.contains("//") {
-        return Err(anyhow!(
-            "Invalid target format: contains path traversal characters"
-        ));
+    // Path-traversal guard. URL schemes contain a legitimate `//`, so strip a
+    // leading `http(s)://` before testing. The `..` check still catches
+    // `../etc/passwd`-style traversal in the host or path component.
+    {
+        let probe = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+            .unwrap_or(trimmed);
+        if probe.contains("..") || probe.contains("//") {
+            return Err(anyhow!(
+                "Invalid target format: contains path traversal characters"
+            ));
+        }
     }
 
     // Try to parse as URL first
-    if let Ok(url) = Url::parse(trimmed) {
-        if let Some(host) = url.host_str() {
+    if let Ok(url) = Url::parse(trimmed)
+        && let Some(host) = url.host_str() {
             let port = url.port().unwrap_or(0);
             let normalized = if port > 0 {
                 format!("{}:{}", host, port)
@@ -68,7 +91,6 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             };
             return normalize_target(&normalized);
         }
-    }
 
     // Basic sanitization
     let sanitized: String = trimmed
@@ -91,9 +113,9 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         }
         let network = parts[0].trim();
         let prefix_str = parts[1].trim();
-        let prefix: u8 = prefix_str.parse().map_err(|_| {
+        let prefix: u8 = prefix_str.parse().map_err(|e| {
             anyhow!(
-                "Invalid CIDR prefix: '{}' (must be 0-128 for IPv6, 0-32 for IPv4)",
+                "Invalid CIDR prefix: '{}' (must be 0-128 for IPv6, 0-32 for IPv4): {e}",
                 prefix_str
             )
         })?;
@@ -118,14 +140,14 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             if !is_valid_ipv6(ipv6_part) {
                 return Err(anyhow!("Invalid IPv6 address: '{}'", ipv6_part));
             }
-            if after_bracket.starts_with(':') {
-                let port_str = &after_bracket[1..].trim();
+            if let Some(port_part) = after_bracket.strip_prefix(':') {
+                let port_str = port_part.trim();
                 if port_str.is_empty() {
                     return Err(anyhow!("Invalid port format: missing port number"));
                 }
                 let port: u16 = port_str
                     .parse()
-                    .map_err(|_| anyhow!("Invalid port number: '{}'", port_str))?;
+                    .map_err(|e| anyhow!("Invalid port number: '{}': {e}", port_str))?;
                 if port == 0 {
                     return Err(anyhow!("Port cannot be 0"));
                 }
@@ -142,19 +164,29 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         }
     }
 
-    // IPv6 detection (multiple colons)
+    // IPv6 detection (multiple colons). Also recognise IPv4-mapped IPv6
+    // (`::ffff:192.0.2.1`) by attempting an Ipv6Addr parse — those contain
+    // dots and would otherwise fall through to the IPv4/host-with-port path
+    // and be misparsed (last-colon split treats `1` as a port).
     let colon_count = sanitized.matches(':').count();
     let has_dots = sanitized.contains('.');
-    let is_likely_ipv6 = colon_count >= 2 && !has_dots;
+    let parses_as_ipv6 = sanitized.parse::<Ipv6Addr>().is_ok();
+    let is_likely_ipv6 = parses_as_ipv6 || (colon_count >= 2 && !has_dots);
 
     if is_likely_ipv6 {
+        // If the full string is valid IPv6, prefer the full-address
+        // interpretation and skip port-splitting to avoid ambiguity
+        // (e.g. "::1" should not treat "1" as a port).
+        if parses_as_ipv6 {
+            return Ok(format!("[{}]", sanitized));
+        }
         if let Some(last_colon_pos) = sanitized.rfind(':') {
             let before_colon = &sanitized[..last_colon_pos];
             let after_colon = &sanitized[last_colon_pos + 1..];
             if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
                 let port: u16 = after_colon
                     .parse()
-                    .map_err(|_| anyhow!("Invalid port number: '{}'", after_colon))?;
+                    .map_err(|e| anyhow!("Invalid port number: '{}': {e}", after_colon))?;
                 if port == 0 {
                     return Err(anyhow!("Port cannot be 0"));
                 }
@@ -171,8 +203,8 @@ pub fn normalize_target(raw: &str) -> Result<String> {
     }
 
     // IPv4 or hostname with port
-    if sanitized.contains(':') {
-        if let Some(colon_pos) = sanitized.rfind(':') {
+    if sanitized.contains(':')
+        && let Some(colon_pos) = sanitized.rfind(':') {
             let host_part = &sanitized[..colon_pos];
             let port_str = &sanitized[colon_pos + 1..];
             if port_str.is_empty() {
@@ -180,7 +212,7 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             }
             let port: u16 = port_str
                 .parse()
-                .map_err(|_| anyhow!("Invalid port number: '{}'", port_str))?;
+                .map_err(|e| anyhow!("Invalid port number: '{}': {e}", port_str))?;
             if port == 0 {
                 return Err(anyhow!("Port cannot be 0"));
             }
@@ -192,7 +224,6 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             }
             return Ok(format!("{}:{}", host_part, port));
         }
-    }
 
     // No port
     if sanitized.contains(' ') {
@@ -213,62 +244,11 @@ pub fn normalize_target(raw: &str) -> Result<String> {
 // IPv6 / HOSTNAME VALIDATION
 // ============================================================
 
-/// Validate IPv6 address format (basic validation).
+/// Validate IPv6 address format using the standard library parser.
+/// `Ipv6Addr::from_str` correctly rejects malformed input like `:::::::::`
+/// that the previous regex+heuristic check accepted.
 fn is_valid_ipv6(addr: &str) -> bool {
-    if addr.is_empty() {
-        return false;
-    }
-    static IPV6_CHAR_RE: Lazy<Result<Regex, regex::Error>> =
-        Lazy::new(|| Regex::new(r"^[0-9a-fA-F:.]+$"));
-    let re = match &*IPV6_CHAR_RE {
-        Ok(re) => re,
-        Err(_) => return false,
-    };
-    if !re.is_match(addr) {
-        return false;
-    }
-    let double_colon_count = addr.matches("::").count();
-    if double_colon_count > 1 {
-        return false;
-    }
-    if addr == "::" || addr == "::1" {
-        return true;
-    }
-    // IPv4-mapped IPv6
-    if addr.contains('.') {
-        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-        if parts.len() == 2 {
-            let ipv4_part = parts[0];
-            let ipv4_parts: Vec<&str> = ipv4_part.split('.').collect();
-            if ipv4_parts.len() == 4 {
-                let is_valid_ipv4 = ipv4_parts.iter().all(|part| part.parse::<u8>().is_ok());
-                if is_valid_ipv4 {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    let segments: Vec<&str> = addr.split(':').collect();
-    if double_colon_count == 0 {
-        if segments.len() != 8 {
-            return false;
-        }
-    } else if segments.len() < 2 || segments.len() > 7 {
-        return false;
-    }
-    for segment in &segments {
-        if segment.is_empty() {
-            continue;
-        }
-        if segment.len() > 4 {
-            return false;
-        }
-        if !segment.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-    }
-    true
+    addr.parse::<Ipv6Addr>().is_ok()
 }
 
 /// Validate hostname or IPv4 address format.
@@ -280,7 +260,7 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
         Lazy::new(|| Regex::new(r"^[a-zA-Z0-9.\-_]+$"));
     let re = match &*HOST_RE {
         Ok(re) => re,
-        Err(_) => return false,
+        Err(e) => { tracing::error!("HOST_RE failed to compile: {e}"); return false; }
     };
     if !re.is_match(host) {
         return false;
@@ -441,8 +421,8 @@ pub async fn prompt_domain_target(domain: &str) -> Result<(String, String)> {
     let host = if use_ip {
         match resolve_domain(clean_domain) {
             Ok(ip) => ip,
-            Err(_) => {
-                crate::mprintln!("{}", "[!] Resolution failed, using domain name".yellow());
+            Err(e) => {
+                crate::mprintln!("{}", format!("[!] Resolution failed ({e}), using domain name").yellow());
                 clean_domain.to_string()
             }
         }

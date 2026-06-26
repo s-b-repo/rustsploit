@@ -2,7 +2,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// MCP client that communicates with an external MCP server over stdio JSON-RPC.
@@ -124,12 +124,12 @@ impl McpClient {
     pub async fn close(mut self) -> Result<()> {
         drop(self.stdin);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => return Ok(()),
+            Ok(Ok(status)) => { tracing::trace!("MCP server exited: {status}"); return Ok(()); }
             Ok(Err(e)) => {
                 eprintln!("[!] MCP server wait error: {}", e);
             }
-            Err(_) => {
-                eprintln!("[!] MCP server did not exit within 5s, killing");
+            Err(e) => {
+                eprintln!("[!] MCP server did not exit within 5s ({e}), killing");
             }
         }
         if let Err(e) = self.child.kill().await {
@@ -159,11 +159,10 @@ async fn send_request(
         "id": id,
         "method": method,
     });
-    if let Some(p) = params {
-        if let Some(obj) = request.as_object_mut() {
+    if let Some(p) = params
+        && let Some(obj) = request.as_object_mut() {
             obj.insert("params".to_string(), p);
         }
-    }
 
     // Serialize and send as a single line
     let line = serde_json::to_string(&request).context("Failed to serialize JSON-RPC request")?;
@@ -179,18 +178,33 @@ async fn send_request(
 
     // Read response lines until we get one with a matching id.
     // Servers may emit notifications (no id) interleaved with responses.
-    let mut buf = String::new();
+    // Bounded read: a malicious/buggy MCP server could otherwise stream an
+    // unterminated multi-GB line and force the client to buffer it all into
+    // memory (OOM). Cap each line like the server side does, and surface
+    // non-UTF-8 instead of lossy-decoding it.
+    const MAX_RESP_BYTES: usize = 16 * 1024 * 1024;
+    let mut raw: Vec<u8> = Vec::new();
     loop {
-        buf.clear();
-        let n = stdout
-            .read_line(&mut buf)
+        raw.clear();
+        let n = (&mut *stdout)
+            .take(MAX_RESP_BYTES as u64 + 1)
+            .read_until(b'\n', &mut raw)
             .await
             .context("Failed to read from child stdout")?;
         if n == 0 {
             anyhow::bail!("MCP server closed stdout before responding to request {}", id);
         }
+        if raw.len() > MAX_RESP_BYTES {
+            anyhow::bail!(
+                "MCP server response exceeded {} byte line limit",
+                MAX_RESP_BYTES
+            );
+        }
 
-        let trimmed = buf.trim();
+        let trimmed = match std::str::from_utf8(&raw) {
+            Ok(s) => s.trim(),
+            Err(e) => anyhow::bail!("MCP server sent a non-UTF-8 response: {e}"),
+        };
         if trimmed.is_empty() {
             continue;
         }
@@ -199,8 +213,8 @@ async fn send_request(
             serde_json::from_str(trimmed).context("Failed to parse JSON-RPC response")?;
 
         // Check if this is a response (has "id") matching our request
-        if let Some(resp_id) = response.get("id") {
-            if resp_id.as_u64() == Some(id) {
+        if let Some(resp_id) = response.get("id")
+            && resp_id.as_u64() == Some(id) {
                 // Check for error
                 if let Some(error) = response.get("error") {
                     let msg = error
@@ -213,7 +227,6 @@ async fn send_request(
                 // Return the result field
                 return Ok(response.get("result").cloned().unwrap_or(Value::Null));
             }
-        }
         // Not our response (notification or different id) -- skip and keep reading
     }
 }

@@ -14,19 +14,29 @@ mod context;
 mod modules;
 mod native;
 mod shell;
+mod tommy;
 mod utils;
 
+pub mod checkpoint;
 pub mod cred_store;
+pub mod events;
+pub mod exclusions;
+pub mod tenant;
 pub mod export;
 pub mod global_options;
 pub mod jobs;
 pub mod loot;
 pub mod mcp;
+pub mod module;
 pub mod module_info;
 pub mod output;
 pub mod pq_channel;
 pub mod pq_middleware;
+pub mod prescan;
+pub mod rate_limit;
+pub mod scheduler;
 pub mod spool;
+pub mod results_sink;
 pub mod workspace;
 pub mod ws;
 
@@ -57,7 +67,7 @@ fn validate_bind_address(addr: &str) -> Result<String> {
 
     with_port
         .parse::<SocketAddr>()
-        .map_err(|e| anyhow!("Invalid bind address '{}': {}", with_port, e))?;
+        .with_context(|| format!("Invalid bind address '{}'", with_port))?;
 
     Ok(with_port)
 }
@@ -67,10 +77,13 @@ fn pq_host_key_path(custom: Option<&str>) -> std::path::PathBuf {
     if let Some(p) = custom {
         std::path::PathBuf::from(p)
     } else {
-        home::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".rustsploit")
-            .join("pq_host_key")
+        // Refuse to fall back to CWD for security-sensitive key material —
+        // CWD may be world-readable or an attacker-controlled directory.
+        let home = home::home_dir().unwrap_or_else(|| {
+            eprintln!("[!] $HOME not set — PQ host key will use /tmp/.rustsploit (insecure fallback)");
+            std::path::PathBuf::from("/tmp")
+        });
+        home.join(".rustsploit").join("pq_host_key")
     }
 }
 
@@ -79,10 +92,11 @@ fn pq_authorized_keys_path(custom: Option<&str>) -> std::path::PathBuf {
     if let Some(p) = custom {
         std::path::PathBuf::from(p)
     } else {
-        home::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".rustsploit")
-            .join("pq_authorized_keys")
+        let home = home::home_dir().unwrap_or_else(|| {
+            eprintln!("[!] $HOME not set — PQ authorized keys will use /tmp/.rustsploit (insecure fallback)");
+            std::path::PathBuf::from("/tmp")
+        });
+        home.join(".rustsploit").join("pq_authorized_keys")
     }
 }
 
@@ -110,10 +124,54 @@ async fn run() -> Result<()> {
 
     tracing::debug!("CLI arguments parsed successfully");
 
+    // P0-2: propagate the strict-TLS flag to the framework's HTTP-client
+    // builder so `permissive()` callers automatically pick up the operator's
+    // policy. Modules that *legitimately* need to talk to self-signed
+    // devices still opt in explicitly via `HttpClientOpts {
+    // accept_invalid_certs: true, .. }`. P1-9: same plumbing for the
+    // proxy-trust flag used by the handshake rate limiter.
+    utils::network::set_global_strict_tls(cli_args.strict_tls);
+    utils::network::set_global_trust_proxy(cli_args.trust_proxy);
+    if !cli_args.strict_tls {
+        tracing::warn!(
+            "TLS verification permissive by default for HTTPS exploit modules. \
+             Pass --strict-tls to flip the default to strict."
+        );
+    }
+
     // Handle list_modules flag
     if cli_args.list_modules {
         tracing::debug!("Listing all modules...");
         utils::list_all_modules();
+        return Ok(());
+    }
+
+    // Regenerate docs/Module-Catalog.md from the live registry
+    if cli_args.gen_module_catalog {
+        let md = module::render_catalog_markdown();
+        let out = std::path::Path::new("docs/Module-Catalog.md");
+        tokio::fs::write(out, md).await.context("Failed to write docs/Module-Catalog.md")?;
+        println!("{} Wrote {} ({} modules)",
+            "✓".green(), out.display(), module::count());
+        return Ok(());
+    }
+
+    // List on-disk scan checkpoints
+    if cli_args.list_checkpoints {
+        match checkpoint::list_checkpoints() {
+            Ok(list) if list.is_empty() => {
+                println!("No checkpoints found.");
+            }
+            Ok(list) => {
+                println!("Active checkpoints (resume by re-running the same module + target):\n");
+                for cp in list {
+                    println!("  {}", cp);
+                }
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to enumerate checkpoints: {e:#}"));
+            }
+        }
         return Ok(());
     }
 
@@ -131,6 +189,7 @@ async fn run() -> Result<()> {
             cli_args.verbose,
             &host_key_path,
             &auth_keys_path,
+            cli_args.pq_key_passphrase.as_deref(),
         )
         .await?;
         return Ok(());
@@ -144,11 +203,10 @@ async fn run() -> Result<()> {
     }
 
     // Validate target if provided
-    if let Some(ref target) = cli_args.target {
-        if let Err(e) = utils::normalize_target(target) {
+    if let Some(ref target) = cli_args.target
+        && let Err(e) = utils::normalize_target(target) {
             return Err(anyhow!("Invalid target '{}': {}", target, e));
         }
-    }
 
     // Set global target if provided
     if let Some(ref target) = cli_args.set_target {

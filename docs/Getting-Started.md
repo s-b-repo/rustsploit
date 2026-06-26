@@ -10,8 +10,10 @@ Rustsploit is a modular offensive tooling framework for embedded targets, writte
 
 **Debian / Ubuntu / Kali:**
 ```bash
-sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev libdbus-1-dev cmake
+sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev libdbus-1-dev cmake clang lld mold
 ```
+
+> `clang`, `lld`, and `mold` are optional but strongly recommended — the repo's `.cargo/config.toml` is preconfigured to use a fast linker (see [Faster Builds](#faster-builds) below).
 
 **Arch Linux:**
 ```bash
@@ -52,6 +54,59 @@ For a release-optimized binary:
 cargo build --release
 # Binary written to target/release/rustsploit
 ```
+
+---
+
+## Faster Builds
+
+The repository ships with build-performance tuning already applied:
+
+- **`.cargo/config.toml`** — uses `clang` + `lld` as the linker on Linux and enables the sparse crates.io registry protocol.
+- **`Cargo.toml` `[profile.dev]`** — `debug = "line-tables-only"` and `codegen-units = 256` for fast incremental builds with usable backtraces.
+- **`[profile.dev.package."*"]`** — dependencies are still compiled at `opt-level = 2` so runtime stays fast.
+- **`[profile.fast-release]`** — `cargo build --profile fast-release` for release-like binaries with thin LTO and parallel codegen (much faster than `--release`).
+
+### Recommended optional tooling
+
+**1. Install `mold` (fastest linker on Linux).** It's already in the apt install line above. To switch from `lld` to `mold`, edit `.cargo/config.toml` and replace `-fuse-ld=lld` with `-fuse-ld=mold`.
+
+**2. `cargo check` instead of `cargo build`** during iteration — skips codegen entirely:
+```bash
+cargo check
+# or auto-rerun on save:
+cargo install cargo-watch
+cargo watch -x check
+```
+
+**3. `sccache` for cross-project caching:**
+```bash
+cargo install sccache
+export RUSTC_WRAPPER=sccache   # add to ~/.zshrc or ~/.bashrc
+```
+
+**4. Share a target directory across projects** to reuse compiled deps:
+```bash
+export CARGO_TARGET_DIR="$HOME/.cargo-target"
+```
+
+### Reducing memory / CPU usage
+
+If `cargo build` thrashes RAM or pegs all cores, cap parallelism:
+```bash
+cargo build -j 4                   # limit parallel compile jobs
+CARGO_BUILD_JOBS=4 cargo build     # or via env
+```
+A good rule of thumb: `-j $(($(nproc) / 2))` on memory-constrained machines. Each rustc job can use 1–2 GiB on heavy crates.
+
+### Quick reference
+
+| Goal | Command |
+|------|---------|
+| Type-check only (fastest) | `cargo check` |
+| Dev build | `cargo build` |
+| Release-like, fast to compile | `cargo build --profile fast-release` |
+| Fully optimized release | `cargo build --release` |
+| Limit RAM/CPU | `cargo build -j 4` |
 
 ---
 

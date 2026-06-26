@@ -3,12 +3,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use anyhow::{anyhow, Context, Result};
 use colored::*;
 use once_cell::sync::Lazy;
 
 /// Global spool state for console logging.
 pub struct SpoolState {
-    file: RwLock<Option<(File, String)>>, // (file handle, filename)
+    // (file handle, filename, owning tenant). The owner is tracked explicitly
+    // so cross-tenant ownership checks are exact equality, not a brittle
+    // filename-prefix match (`foo` must not be able to stop `foo_bar`'s spool).
+    file: RwLock<Option<(File, String, Option<String>)>>,
 }
 
 impl SpoolState {
@@ -18,32 +22,38 @@ impl SpoolState {
         }
     }
 
-    /// Start spooling to a file.
+    /// Start spooling to a file. `owner` is the tenant that owns this spool
+    /// (`None` in single-user shell mode); used for exact-match ownership checks.
     /// Path is validated against traversal, absolute paths, and symlinks.
-    pub fn start(&self, path: &str) -> Result<(), String> {
+    pub fn start(&self, path: &str, owner: Option<&str>) -> Result<()> {
         // Reject path traversal
         if path.contains("..") || path.contains('\0') {
-            return Err("Path traversal not allowed".to_string());
+            return Err(anyhow!("Path traversal not allowed in spool path {:?}", path));
         }
         // Reject absolute paths — spool files must be relative to CWD
         let p = Path::new(path);
         if p.is_absolute() {
-            return Err("Absolute paths not allowed for spool files. Use a relative path.".to_string());
+            return Err(anyhow!(
+                "Absolute paths not allowed for spool files. Use a relative path. Got: {:?}",
+                path
+            ));
         }
         // Reject paths with directory components to prevent writing outside CWD
-        if let Some(parent) = p.parent() {
-            if parent != Path::new("") {
+        if let Some(parent) = p.parent()
+            && parent != Path::new("") {
                 // Ensure parent directory exists
                 let resolved = resolve_spool_path(path)?;
-                return self.start_at_path(&resolved, path);
+                return self.start_at_path(&resolved, path, owner);
             }
-        }
         // Simple filename — write in CWD
-        self.start_at_path(&PathBuf::from(path), path)
+        self.start_at_path(&PathBuf::from(path), path, owner)
     }
 
-    fn start_at_path(&self, resolved: &Path, display_name: &str) -> Result<(), String> {
-        let mut guard = self.file.write().map_err(|_| "Failed to acquire spool lock".to_string())?;
+    fn start_at_path(&self, resolved: &Path, display_name: &str, owner: Option<&str>) -> Result<()> {
+        let mut guard = self
+            .file
+            .write()
+            .map_err(|e| anyhow!("Failed to acquire spool lock (poisoned): {e}"))?;
 
         use std::fs::OpenOptions;
         #[cfg(unix)]
@@ -57,65 +67,129 @@ impl SpoolState {
                 .open(resolved)
         };
         #[cfg(not(unix))]
-        let open_result = OpenOptions::new().write(true).create(true).truncate(true).open(resolved);
-        match open_result {
-            Ok(f) => {
-                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                let mut file = f;
-                if let Err(e) = writeln!(file, "# RustSploit Console Log - Started {}", ts) { eprintln!("[!] Spool write error: {}", e); }
-                if let Err(e) = writeln!(file, "# ==========================================") { eprintln!("[!] Spool write error: {}", e); }
-                if let Err(e) = writeln!(file) { eprintln!("[!] Spool write error: {}", e); }
-                if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
-                *guard = Some((file, display_name.to_string()));
-                Ok(())
-            }
-            Err(e) => Err(format!("Failed to create spool file: {}", e)),
+        let open_result = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(resolved);
+        let mut file = open_result
+            .with_context(|| format!("Failed to create spool file at {:?}", resolved))?;
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        if let Err(e) = writeln!(file, "# RustSploit Console Log - Started {}", ts) {
+            eprintln!("[!] Spool write error: {}", e);
         }
+        if let Err(e) = writeln!(file, "# ==========================================") {
+            eprintln!("[!] Spool write error: {}", e);
+        }
+        if let Err(e) = writeln!(file) {
+            eprintln!("[!] Spool write error: {}", e);
+        }
+        if let Err(e) = file.flush() {
+            eprintln!("[!] Flush error: {}", e);
+        }
+        *guard = Some((file, display_name.to_string(), owner.map(|s| s.to_string())));
+        Ok(())
     }
 
     /// Stop spooling.
     pub fn stop(&self) -> Option<String> {
-        if let Ok(mut guard) = self.file.write() {
-            if let Some((mut file, name)) = guard.take() {
-                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                if let Err(e) = writeln!(file) { eprintln!("[!] Spool write error: {}", e); }
-                if let Err(e) = writeln!(file, "# Spool ended {}", ts) { eprintln!("[!] Spool write error: {}", e); }
-                if let Err(e) = file.flush() { eprintln!("[!] Flush error: {}", e); }
-                return Some(name);
+        let mut guard = match self.file.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[!] Spool stop: lock poisoned: {}", e);
+                return None;
             }
+        };
+        let (mut file, name, _owner) = guard.take()?;
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        if let Err(e) = writeln!(file) {
+            eprintln!("[!] Spool write error: {}", e);
         }
-        None
+        if let Err(e) = writeln!(file, "# Spool ended {}", ts) {
+            eprintln!("[!] Spool write error: {}", e);
+        }
+        if let Err(e) = file.flush() {
+            eprintln!("[!] Flush error: {}", e);
+        }
+        Some(name)
     }
 
     /// Check if spooling is active.
     pub fn is_active(&self) -> bool {
-        self.file.read().map(|g| g.is_some()).unwrap_or(false)
+        match self.file.read() {
+            Ok(g) => g.is_some(),
+            Err(e) => {
+                eprintln!("[!] Spool is_active: lock poisoned: {}", e);
+                false
+            }
+        }
     }
 
     /// Get the current spool filename.
     pub fn current_file(&self) -> Option<String> {
-        self.file.read().ok()?.as_ref().map(|(_, name)| name.clone())
+        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|(_, name, _)| name.clone())
     }
 
-    /// Write a line to the spool file (if active). Flushes after write (BUG 11 fix).
-    /// Returns `Err` on write/flush failure so callers can react.
+    /// The tenant that owns the active spool, if any. Used for exact-match
+    /// cross-tenant ownership checks (a tenant may only stop/inspect its own).
+    pub fn owner(&self) -> Option<String> {
+        let g = self.file.read().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|(_, _, owner)| owner.clone())
+    }
+
+    /// Write a line to the spool file (if active).
+    /// Format the line outside the lock, then issue a single write_all under
+    /// the lock so we minimise lock-hold time (every console print routes
+    /// through here). `File::flush` is a no-op on `std::fs::File`; durability
+    /// comes from the write syscall itself.
     pub fn write_line(&self, msg: &str) -> Result<(), std::io::Error> {
-        if let Ok(mut guard) = self.file.write() {
-            if let Some((ref mut file, _)) = *guard {
-                writeln!(file, "{}", msg)?;
-                file.flush()?;
+        // Fast-path: skip lock entirely if no spool file is active.
+        if let Ok(g) = self.file.read()
+            && g.is_none() {
+                return Ok(());
             }
+        let mut buf = String::with_capacity(msg.len() + 1);
+        buf.push_str(msg);
+        buf.push('\n');
+        let mut guard = match self.file.write() {
+            Ok(g) => g,
+            Err(e) => { tracing::warn!("spool RwLock poisoned, dropping message: {e}"); return Ok(()); }
+        };
+        if let Some((ref mut file, _, _)) = *guard {
+            file.write_all(buf.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Write raw text to the spool WITHOUT appending a newline. Used for
+    /// no-newline console output (`mprint!`/`meprint!`) so a progress line
+    /// rendered as one terminal line is not split across multiple spool lines.
+    pub fn write_raw(&self, msg: &str) -> Result<(), std::io::Error> {
+        if let Ok(g) = self.file.read()
+            && g.is_none() {
+                return Ok(());
+            }
+        let mut guard = match self.file.write() {
+            Ok(g) => g,
+            Err(e) => { tracing::warn!("spool RwLock poisoned, dropping message: {e}"); return Ok(()); }
+        };
+        if let Some((ref mut file, _, _)) = *guard {
+            file.write_all(msg.as_bytes())?;
         }
         Ok(())
     }
 }
 
-fn resolve_spool_path(path: &str) -> Result<PathBuf, String> {
+fn resolve_spool_path(path: &str) -> Result<PathBuf> {
     let p = PathBuf::from(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty() {
             if !parent.exists() {
-                return Err(format!("Parent directory '{}' does not exist", parent.display()));
+                return Err(anyhow!(
+                    "Parent directory '{}' does not exist",
+                    parent.display()
+                ));
             }
             // Bug #96: O_NOFOLLOW on the target file is not enough — if the
             // parent directory is itself a symlink (e.g. `./logs` → /tmp/evil),
@@ -123,14 +197,14 @@ fn resolve_spool_path(path: &str) -> Result<PathBuf, String> {
             // symlinked parents so spool files stay in the intended CWD subtree.
             match std::fs::symlink_metadata(parent) {
                 Ok(md) if md.file_type().is_symlink() => {
-                    return Err(format!(
+                    return Err(anyhow!(
                         "Parent directory '{}' is a symlink — refusing to spool through it",
                         parent.display()
                     ));
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return Err(format!(
+                    return Err(anyhow!(
                         "Failed to stat parent directory '{}': {}",
                         parent.display(),
                         e
@@ -138,7 +212,6 @@ fn resolve_spool_path(path: &str) -> Result<PathBuf, String> {
                 }
             }
         }
-    }
     Ok(p)
 }
 

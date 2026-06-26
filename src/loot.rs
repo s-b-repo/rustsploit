@@ -29,7 +29,11 @@ impl LootStore {
         let base = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".rustsploit");
+        Self::with_base_dir(base)
+    }
 
+    /// Create a loot store under a custom base directory.
+    pub(crate) fn with_base_dir(base: PathBuf) -> Self {
         let loot_dir = base.join("loot");
         use std::os::unix::fs::DirBuilderExt;
         if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) {
@@ -51,7 +55,11 @@ impl LootStore {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Failed to read loot_index.json: {}", e);
+                    eprintln!("[!] Failed to read loot_index.json: {}. Preserving original.", e);
+                    let backup = index_path.with_extension("json.unreadable");
+                    if let Err(e) = std::fs::rename(&index_path, &backup) {
+                        eprintln!("[!] Rename failed: {}", e);
+                    }
                     Vec::new()
                 }
             }
@@ -68,6 +76,11 @@ impl LootStore {
 
     /// Maximum loot file size (100 MB).
     const MAX_LOOT_SIZE: usize = 100 * 1024 * 1024;
+    /// P2-A6: cap on the total number of loot entries to bound disk + index
+    /// growth. 10k entries × 100 MB max each = ~1 TB worst case, which is
+    /// well past any realistic engagement; the per-entry cap is the real
+    /// limit, this catches runaway-loop bugs.
+    const MAX_LOOT_ENTRIES: usize = 10_000;
 
     /// Store loot data and return the entry ID.
     pub async fn add(
@@ -85,6 +98,14 @@ impl LootStore {
         }
         // Validate inputs
         if host.is_empty() || host.len() > 256 {
+            return None;
+        }
+        // P2-A6: refuse to insert past the global entry cap.
+        if self.entries.read().await.len() >= Self::MAX_LOOT_ENTRIES {
+            eprintln!(
+                "[!] Loot store full ({} entries) — delete or clear loot before adding more",
+                Self::MAX_LOOT_ENTRIES
+            );
             return None;
         }
 
@@ -113,14 +134,15 @@ impl LootStore {
         }
 
         {
-            let file = match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&file_path)
-                .await
+            // P1-7: O_NOFOLLOW + create-with-mode atomically. A symlink raced
+            // into the loot dir would otherwise redirect the write outside it.
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            #[cfg(unix)]
             {
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = match opts.open(&file_path).await {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("[!] Failed to create loot file: {}", e);
@@ -135,21 +157,40 @@ impl LootStore {
         }
 
         let entry = LootEntry {
+            // Scrub host + source_module too (not just loot_type/description):
+            // both are printed raw by `loot` and could carry terminal-escape
+            // bytes from an attacker-controlled banner / module string.
             id: id.clone(),
-            host: host.to_string(),
-            loot_type: loot_type.to_string(),
+            host: crate::utils::scrub_stored_text(host),
+            loot_type: crate::utils::scrub_stored_text(loot_type),
             filename,
-            description: description.to_string(),
-            source_module: source_module.to_string(),
+            description: crate::utils::scrub_stored_text(description),
+            source_module: crate::utils::scrub_stored_text(source_module),
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         };
 
-        let snapshot = {
+        // P1-1: hold the write lock across the disk save.
+        {
             let mut entries = self.entries.write().await;
+            // Re-check the cap under the write lock. The earlier read-lock check
+            // is only a fast path: concurrent `add`s can each pass it and then
+            // all push, blowing past the cap. Re-checking here also handles the
+            // file we already wrote above — remove it so a rejected add doesn't
+            // leave an orphan loot file on disk.
+            if entries.len() >= Self::MAX_LOOT_ENTRIES {
+                eprintln!(
+                    "[!] Loot store full ({} entries) — discarding just-written loot file",
+                    Self::MAX_LOOT_ENTRIES
+                );
+                if let Err(e) = tokio::fs::remove_file(&file_path).await {
+                    tracing::debug!("failed to remove orphan loot file {}: {e}", file_path.display());
+                }
+                return None;
+            }
             entries.push(entry);
-            entries.clone()
-        };
-        self.save_locked(&snapshot).await;
+            let snapshot = entries.clone();
+            self.save_locked(&snapshot).await;
+        }
         Some(id)
     }
 
@@ -181,29 +222,47 @@ impl LootStore {
     }
 
     /// Delete a loot entry by ID. Also removes the loot file from disk.
+    /// File removal happens BEFORE the index is rewritten, so that a failed
+    /// `unlink` (EACCES, EBUSY, etc.) does not orphan the file on disk while
+    /// the index forgets about it.
     pub async fn delete(&self, id: &str) -> bool {
-        let (removed, filename) = {
-            let mut entries = self.entries.write().await;
-            let before = entries.len();
-            let fname = entries.iter().find(|e| e.id == id).map(|e| e.filename.clone());
-            entries.retain(|e| e.id != id);
-            if entries.len() < before {
-                let snapshot = entries.clone();
-                drop(entries);
-                self.save_locked(&snapshot).await;
-                (true, fname)
-            } else {
-                (false, None)
-            }
+        // Look up the filename without mutating the index yet.
+        let filename = {
+            let entries = self.entries.read().await;
+            entries.iter().find(|e| e.id == id).map(|e| e.filename.clone())
         };
-        if let Some(fname) = filename {
-            if let Some(path) = self.file_path(&fname) {
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
+        let Some(fname) = filename else {
+            return false;
+        };
+
+        // Try to remove the file first. ENOENT is fine — the index will be
+        // cleaned up either way. Any other error aborts the delete so the
+        // caller can see the entry is still present and retry.
+        if let Some(path) = self.file_path(&fname) {
+            match tokio::fs::remove_file(&path).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(path = %path.display(), "loot file already gone, removing index entry");
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to remove loot file {}: {} — index entry preserved", path.display(), e);
+                    return false;
                 }
             }
         }
-        removed
+
+        // File is gone (or the path was malformed) — now drop the index entry.
+        // P1-1: lock-during-save so the index file stays consistent with
+        // the in-memory entries under concurrent ops.
+        let mut entries = self.entries.write().await;
+        let before = entries.len();
+        entries.retain(|e| e.id != id);
+        if entries.len() == before {
+            return false;
+        }
+        let snapshot = entries.clone();
+        self.save_locked(&snapshot).await;
+        true
     }
 
     /// Clear all loot entries and remove loot files from disk.
@@ -212,15 +271,14 @@ impl LootStore {
             let mut entries = self.entries.write().await;
             let names: Vec<String> = entries.iter().map(|e| e.filename.clone()).collect();
             entries.clear();
+            self.save_locked(&entries).await;
             names
         };
-        self.save_locked(&[]).await;
         for fname in filenames {
-            if let Some(path) = self.file_path(&fname) {
-                if let Err(e) = tokio::fs::remove_file(&path).await {
+            if let Some(path) = self.file_path(&fname)
+                && let Err(e) = tokio::fs::remove_file(&path).await {
                     eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
                 }
-            }
         }
     }
 
@@ -251,14 +309,14 @@ impl LootStore {
                 return;
             }
         };
-        let file = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .await
+        // P1-7: O_NOFOLLOW + create-with-mode atomically.
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        #[cfg(unix)]
         {
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = match opts.open(&tmp).await {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[!] Failed to write loot index: {}", e);
@@ -289,8 +347,8 @@ impl LootStore {
             "ID".bold(), "Host".bold(), "Type".bold(), "Description".bold(), "Module".bold());
         println!("  {}", "-".repeat(90).dimmed());
         for e in &entries {
-            let desc = if e.description.len() > 28 {
-                format!("{}...", &e.description[..25])
+            let desc = if e.description.chars().count() > 28 {
+                format!("{}...", e.description.chars().take(25).collect::<String>())
             } else {
                 e.description.clone()
             };
@@ -304,6 +362,10 @@ impl LootStore {
 pub static LOOT_STORE: Lazy<LootStore> = Lazy::new(LootStore::new);
 
 /// Convenience function for modules to store loot.
+/// Routes through the tenant registry when in a tenant context (API mode).
+/// Also emits a `ModuleEvent::LootStored` and a `Finding` so panel / MCP /
+/// WS subscribers see the discovery without each module having to call
+/// `events::emit` manually.
 pub async fn store_loot(
     host: &str,
     loot_type: &str,
@@ -311,5 +373,22 @@ pub async fn store_loot(
     data: &[u8],
     source_module: &str,
 ) -> Option<String> {
-    LOOT_STORE.add(host, loot_type, description, data, source_module).await
+    let s = crate::tenant::resolve();
+    let id = s.loot_store().add(host, loot_type, description, data, source_module).await;
+    if let Some(id_str) = id.as_deref() {
+        crate::events::emit(crate::events::ModuleEvent::LootStored {
+            id: id_str.to_string(),
+            host: host.to_string(),
+            kind: loot_type.to_string(),
+        });
+    }
+    if id.is_some() {
+        crate::events::emit(crate::events::ModuleEvent::Finding {
+            module: source_module.to_string(),
+            target: host.to_string(),
+            kind: loot_type.to_string(),
+            message: description.to_string(),
+        });
+    }
+    id
 }

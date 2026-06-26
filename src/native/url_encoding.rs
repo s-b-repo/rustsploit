@@ -35,11 +35,16 @@ pub fn encode_binary(data: &[u8]) -> Cow<'_, str> {
 }
 
 fn append_string(data: &[u8], escaped: &mut String, may_skip: bool) -> bool {
-    encode_into(data, may_skip, |s| {
+    // The closure returns `Result<_, Infallible>`, so the only Err arm is
+    // uninhabited — the compiler verifies this match is exhaustive without
+    // any panic path. Cleaner than `.expect()` and provably no-panic.
+    match encode_into(data, may_skip, |s| {
         escaped.push_str(s);
         Ok::<_, std::convert::Infallible>(())
-    })
-    .expect("infallible: closure returns Ok with Infallible error type")
+    }) {
+        Ok(v) => v,
+        Err(never) => match never {},
+    }
 }
 
 fn encode_into<E>(
