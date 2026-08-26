@@ -92,19 +92,27 @@ const PAGES: &[Page] = &[
         body: SPOOL,
     },
     Page {
-        title: "17. The API + MCP server",
+        title: "17. Mass scanning (random / CIDR / file)",
+        body: MASS_SCAN,
+    },
+    Page {
+        title: "18. Exclusions & block_internal",
+        body: EXCLUSIONS_PAGE,
+    },
+    Page {
+        title: "19. The API + MCP server",
         body: API,
     },
     Page {
-        title: "18. Building & tests",
+        title: "20. Building & tests",
         body: BUILD,
     },
     Page {
-        title: "19. Writing your own module",
+        title: "21. Writing your own module",
         body: WRITE,
     },
     Page {
-        title: "20. Good-luck",
+        title: "22. Good-luck",
         body: GOODLUCK,
     },
 ];
@@ -128,7 +136,11 @@ pub fn run_guide() -> io::Result<()> {
         if n == 0 {
             // EOF — treat as quit so piped input doesn't loop forever
             println!();
-            println!("{} {}", "[*]".cyan(), "End of input — exiting tommy.".dimmed());
+            println!(
+                "{} {}",
+                "[*]".cyan(),
+                "End of input — exiting tommy.".dimmed()
+            );
             return Ok(());
         }
         let key = buf.trim().to_ascii_lowercase();
@@ -137,7 +149,10 @@ pub fn run_guide() -> io::Result<()> {
                 if idx + 1 < total {
                     idx += 1;
                 } else {
-                    println!("{}", "Already on the last page — press 'a' to go back or 'q' to quit.".yellow());
+                    println!(
+                        "{}",
+                        "Already on the last page — press 'a' to go back or 'q' to quit.".yellow()
+                    );
                     pause(&mut input, &mut buf)?;
                 }
             }
@@ -145,7 +160,11 @@ pub fn run_guide() -> io::Result<()> {
                 if idx > 0 {
                     idx -= 1;
                 } else {
-                    println!("{}", "Already on the first page — press 'd' to move forward or 'q' to quit.".yellow());
+                    println!(
+                        "{}",
+                        "Already on the first page — press 'd' to move forward or 'q' to quit."
+                            .yellow()
+                    );
                     pause(&mut input, &mut buf)?;
                 }
             }
@@ -206,7 +225,10 @@ fn clear_and_render(idx: usize, total: usize) -> io::Result<()> {
     println!();
     println!("{}", page.body);
     println!();
-    println!("{}", "  ╭─────────────────────────────────────────────────────────────────╮".dimmed());
+    println!(
+        "{}",
+        "  ╭─────────────────────────────────────────────────────────────────╮".dimmed()
+    );
     println!(
         "  {}  {} prev   {} next   {} quit   {} keys   {} jump to page",
         "│".dimmed(),
@@ -216,7 +238,10 @@ fn clear_and_render(idx: usize, total: usize) -> io::Result<()> {
         "[h]".cyan().bold(),
         "[1-N]".cyan().bold(),
     );
-    println!("{}", "  ╰─────────────────────────────────────────────────────────────────╯".dimmed());
+    println!(
+        "{}",
+        "  ╰─────────────────────────────────────────────────────────────────╯".dimmed()
+    );
     print!("  > ");
     io::stdout().flush()?;
     Ok(())
@@ -228,7 +253,10 @@ fn print_banner() {
 
 fn show_help_overlay() {
     println!();
-    println!("{}", "  ┌─ Navigation keys ─────────────────────────────────────────────┐".bold());
+    println!(
+        "{}",
+        "  ┌─ Navigation keys ─────────────────────────────────────────────┐".bold()
+    );
     println!(
         "  │  {}  next page          {}  previous page                  │",
         "d / n / Enter".cyan().bold(),
@@ -243,7 +271,10 @@ fn show_help_overlay() {
         "  │  {}        skip directly to page N (e.g. 7)          │",
         "<number>".cyan().bold()
     );
-    println!("{}", "  └──────────────────────────────────────────────────────────────┘".bold());
+    println!(
+        "{}",
+        "  └──────────────────────────────────────────────────────────────┘".bold()
+    );
 }
 
 fn pause<R: BufRead>(input: &mut R, buf: &mut String) -> io::Result<()> {
@@ -635,6 +666,63 @@ const API: &str = r#"
    Code or another MCP-capable agent.
 "#;
 
+const MASS_SCAN: &str = r#"
+   Mass scanning is rustsploit's killer feature. Every module supports it
+   automatically — the scheduler fans out your module across thousands or
+   millions of targets in parallel.
+
+   How to run a mass scan:
+       1. setg target 0.0.0.0            (full Internet sweep)
+       2. setg target 10.0.0.0/8         (CIDR subnet)
+       3. setg target random             (random public IPs)
+       4. setg target hosts.txt          (file with one IP per line)
+       5. setg target 1.2.3.4,5.6.7.8   (comma-separated list)
+
+   Key global options for mass scans:
+       setg concurrency 100              max simultaneous tasks (default 50)
+       setg timeout 5                    per-host timeout in seconds
+       setg max_random_hosts 1000000     cap the random sweep
+       setg port 8080                    override the module's default port
+       setg prescan zmap                 use masscan/zmap to find live hosts first
+       setg exclusions internal          scan EVERYTHING including RFC1918
+
+   Live feedback:
+       Progress lines update every ~1k hosts showing hits, successes,
+       errors, and skipped. Every finding (credential, vulnerability,
+       open port) is printed LIVE as it's discovered — you see results
+       in real time, not just at the final summary.
+
+   All findings are saved automatically to:
+       ~/.rustsploit/loot/<module> <timestamp> results.txt
+       ~/.rustsploit/workspace/         (hosts, services, notes)
+       ~/.rustsploit/loot/              (credentials, extracted files)
+
+   The scheduler handles CIDR expansion, random permutation (ZMap-style,
+   O(1) memory), checkpoint resumption, rate limiting, and Ctrl-C
+   cancellation. Just set a target and run.
+"#;
+
+const EXCLUSIONS_PAGE: &str = r#"
+   By default, rustsploit excludes RFC1918 private IPs, bogon networks,
+   multicast, and Cloudflare/DNS anycast ranges from mass scans. This
+   prevents accidental scanning of internal infrastructure.
+
+   To scan internal/private networks:
+       setg block_internal off
+
+   This removes all default exclusions. ONLY usable from the interactive
+   shell (not API/MCP/scripts) to prevent mistakes.
+
+   To add custom exclusions:
+       setg exclusions 1.2.3.0/24,5.6.7.0/24    comma-separated CIDRs
+       setg exclusions @/path/to/file.txt         load from file
+       setg exclusions internal                   no filtering at all
+
+   The advisory before every full-Internet sweep shows how many
+   networks are excluded and reminds you of the key knobs:
+       port, concurrency, host cap, timeout, exclusions.
+"#;
+
 const BUILD: &str = r#"
    Quick build / test recipes:
 
@@ -718,11 +806,7 @@ mod tests {
     #[test]
     fn every_page_has_body() {
         for p in PAGES {
-            assert!(
-                !p.body.trim().is_empty(),
-                "page {} has empty body",
-                p.title
-            );
+            assert!(!p.body.trim().is_empty(), "page {} has empty body", p.title);
         }
     }
 }

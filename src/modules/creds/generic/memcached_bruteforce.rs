@@ -1,12 +1,12 @@
 //! Memcached SASL PLAIN authentication probe over the binary protocol.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 11211;
 
@@ -21,10 +21,9 @@ const DEFAULTS: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "Memcached SASL Bruteforce".to_string(),
-        description:
-            "Probes Memcached SASL PLAIN auth via the binary protocol (cmd 0x21). \
+        description: "Probes Memcached SASL PLAIN auth via the binary protocol (cmd 0x21). \
              Single-target — scheduler does fan-out."
-                .to_string(),
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
             "https://github.com/memcached/memcached/wiki/SASLAuthProtocol".to_string(),
@@ -36,7 +35,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("memcached_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("memcached_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -61,7 +63,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("connect: {e}"),
                 retryable: true,
-            }
+            };
         }
     };
 
@@ -101,12 +103,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
 
     // Read 24-byte response header.
     let mut header = [0u8; 24];
-    if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-        &mut stream,
-        &mut header,
-        timeout,
-    )
-    .await
+    if let Err(e) =
+        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut header, timeout).await
     {
         return LoginResult::Error {
             message: format!("read: {e}"),
@@ -119,7 +117,10 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     // status bytes happen to be 0x0000 would be read as a successful login.
     if header[0] != 0x81 || header[1] != 0x21 {
         return LoginResult::Error {
-            message: format!("unexpected memcached frame magic=0x{:02x} opcode=0x{:02x}", header[0], header[1]),
+            message: format!(
+                "unexpected memcached frame magic=0x{:02x} opcode=0x{:02x}",
+                header[0], header[1]
+            ),
             retryable: false,
         };
     }
@@ -142,4 +143,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/memcached_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/memcached_bruteforce",
+    native
+);

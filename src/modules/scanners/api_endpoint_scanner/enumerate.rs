@@ -10,12 +10,12 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use colored::*;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use reqwest::Client;
 
 use crate::utils::{cfg_prompt_existing_file, cfg_prompt_yes_no, load_lines_cached};
@@ -44,7 +44,9 @@ pub(super) async fn configure_injection_payloads(
     )
     .await?
     {
-        return Ok(Some(default_payloads.iter().map(|&s| s.to_string()).collect()));
+        return Ok(Some(
+            default_payloads.iter().map(|&s| s.to_string()).collect(),
+        ));
     }
 
     let file_path = cfg_prompt_existing_file(
@@ -84,9 +86,16 @@ pub(super) fn parse_endpoint_file(path: &str) -> Result<Vec<Endpoint>> {
         } else {
             // Single-column file: synthesise a key from the path.
             let path_str = items[0];
-            let key = path_str.replace('/', "_").trim_start_matches('_').to_string();
+            let key = path_str
+                .replace('/', "_")
+                .trim_start_matches('_')
+                .to_string();
             endpoints.push(Endpoint {
-                key: if key.is_empty() { "root".to_string() } else { key },
+                key: if key.is_empty() {
+                    "root".to_string()
+                } else {
+                    key
+                },
                 path: path_str.to_string(),
             });
             // (No `else` branch is reachable here — `items.is_empty()` short-
@@ -178,7 +187,10 @@ pub(super) async fn enumerate_endpoints(
                             None
                         }
                     }
-                    Err(e) => { tracing::debug!("request failed: {e}"); None }
+                    Err(e) => {
+                        tracing::debug!("request failed: {e}");
+                        None
+                    }
                 }
             }
         })
@@ -193,7 +205,9 @@ pub(super) async fn enumerate_endpoints(
     } else {
         crate::mprintln!(
             "{}",
-            format!("[+] Discovered {} endpoints!", results.len()).green().bold()
+            format!("[+] Discovered {} endpoints!", results.len())
+                .green()
+                .bold()
         );
         for ep in &results {
             crate::mprintln!("    - {}", ep.path);

@@ -17,7 +17,7 @@ use reqwest::{Client, Method, Response};
 
 use crate::module::{Finding, FindingKind};
 
-use super::config::{GenericPayload, ScanConfig, CHROME_USER_AGENTS};
+use super::config::{CHROME_USER_AGENTS, GenericPayload, ScanConfig};
 use super::scan::FindingSink;
 
 pub(super) struct RequestSpec<'a> {
@@ -59,13 +59,11 @@ fn detect_injection_signature(injection_type: &str, body: &str) -> Option<&'stat
             SQL_ERRORS.iter().copied().find(|sig| lower.contains(*sig))
         }
         "NoSQLi" => {
-            const NOSQL_ERRORS: &[&str] = &[
-                "mongoerror",
-                "unexpected token",
-                "$where",
-                "bson",
-            ];
-            NOSQL_ERRORS.iter().copied().find(|sig| lower.contains(*sig))
+            const NOSQL_ERRORS: &[&str] = &["mongoerror", "unexpected token", "$where", "bson"];
+            NOSQL_ERRORS
+                .iter()
+                .copied()
+                .find(|sig| lower.contains(*sig))
         }
         "CMDi" => {
             // `id` output or /etc/passwd contents leaking into the response.
@@ -76,7 +74,10 @@ fn detect_injection_signature(injection_type: &str, body: &str) -> Option<&'stat
             // /etc/passwd or win.ini contents.
             const TRAVERSAL_SIGNS: &[&str] =
                 &["root:x:0:0:", "daemon:x:", "[fonts]", "[extensions]"];
-            TRAVERSAL_SIGNS.iter().copied().find(|sig| lower.contains(*sig))
+            TRAVERSAL_SIGNS
+                .iter()
+                .copied()
+                .find(|sig| lower.contains(*sig))
         }
         _ => None,
     }
@@ -88,7 +89,10 @@ pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
         None => "Mozilla/5.0",
     };
 
-    let mut req_builder = spec.client.request(spec.method.clone(), spec.url).header("User-Agent", user_agent);
+    let mut req_builder = spec
+        .client
+        .request(spec.method.clone(), spec.url)
+        .header("User-Agent", user_agent);
 
     if let Some((k, v)) = spec.header {
         req_builder = req_builder.header(k, v);
@@ -96,7 +100,9 @@ pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
 
     if let Some(json) = &spec.custom_json {
         req_builder = req_builder.json(json);
-    } else if spec.config.use_generic_payload && (spec.method == Method::POST || spec.method == Method::PUT) {
+    } else if spec.config.use_generic_payload
+        && (spec.method == Method::POST || spec.method == Method::PUT)
+    {
         req_builder = req_builder.json(&GenericPayload {
             name: "test_api_scanner".to_string(),
             description: "Automated scan".to_string(),
@@ -126,12 +132,12 @@ pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
             }
         }
         Err(e) => {
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(spec.result_file)
-                && let Err(write_err) = writeln!(
-                    file,
-                    "=== {} {} ===\nError: {}\n",
-                    full_label, spec.url, e
-                )
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(spec.result_file)
+                && let Err(write_err) =
+                    writeln!(file, "=== {} {} ===\nError: {}\n", full_label, spec.url, e)
             {
                 crate::meprintln!("[!] Failed to write error log: {}", write_err);
             }
@@ -139,7 +145,6 @@ pub(super) async fn perform_request(spec: &RequestSpec<'_>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn log_response(
     resp: Response,
     path: &Path,
@@ -179,7 +184,10 @@ async fn log_response(
                     break;
                 }
             }
-            Err(e) => { tracing::debug!("stream read error: {e}"); break; }
+            Err(e) => {
+                tracing::debug!("stream read error: {e}");
+                break;
+            }
         }
     }
     let body_bytes = bytes::Bytes::from(body_data);
@@ -192,11 +200,17 @@ async fn log_response(
         &body_bytes[..]
     };
 
-    writeln!(file, "=======================================================")?;
+    writeln!(
+        file,
+        "======================================================="
+    )?;
     writeln!(file, "Timestamp: {}", chrono::Local::now().to_rfc3339())?;
     writeln!(file, "Request: {} {}", method, url)?;
     writeln!(file, "User-Agent: {}", user_agent)?;
-    writeln!(file, "-------------------------------------------------------")?;
+    writeln!(
+        file,
+        "-------------------------------------------------------"
+    )?;
     writeln!(file, "Status: {}", status)?;
     writeln!(file, "Headers:")?;
 
@@ -204,7 +218,10 @@ async fn log_response(
         writeln!(file, "  {}: {:?}", k, v)?;
     }
     writeln!(file, "Body Length: {} bytes", body.len())?;
-    writeln!(file, "-------------------------------------------------------")?;
+    writeln!(
+        file,
+        "-------------------------------------------------------"
+    )?;
 
     if let Ok(body_str) = String::from_utf8(body.to_vec()) {
         writeln!(
@@ -245,7 +262,10 @@ async fn log_response(
     } else {
         writeln!(file, "Body is binary or non-UTF8")?;
     }
-    writeln!(file, "=======================================================\n")?;
+    writeln!(
+        file,
+        "=======================================================\n"
+    )?;
 
     Ok(())
 }

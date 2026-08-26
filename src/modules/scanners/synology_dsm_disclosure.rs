@@ -89,7 +89,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .as_single()
         .context("synology_dsm_disclosure requires a single-host target")?;
     let normalized = normalize_target(target)?;
-    let port = cfg_prompt_port("port", "DSM HTTP port (often 5000, 5001 HTTPS)", DEFAULT_PORT).await?;
+    let port = cfg_prompt_port(
+        "port",
+        "DSM HTTP port (often 5000, 5001 HTTPS)",
+        DEFAULT_PORT,
+    )
+    .await?;
     let scheme = cfg_prompt_default("scheme", "Scheme (http/https)", "http").await?;
     let base = format!("{}://{}:{}", scheme, normalized, port);
 
@@ -128,7 +133,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             if !status.is_success() {
                 continue;
             }
-            let body = match crate::utils::network::read_http_body_text_capped(r, DEFAULT_BODY_CAP).await {
+            let body = match crate::utils::network::read_http_body_text_capped(r, DEFAULT_BODY_CAP)
+                .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     crate::mprintln!("{} {} body read failed: {}", "[-]".yellow(), api_name, e);
@@ -140,7 +147,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 continue;
             }
             dsm_fingerprinted = true;
-            crate::mprintln!("{} {} reachable ({} bytes)", "[+]".green(), api_name, body.len());
+            crate::mprintln!(
+                "{} {} reachable ({} bytes)",
+                "[+]".green(),
+                api_name,
+                body.len()
+            );
             leaked_apis.push((*api_name).to_string());
 
             match *label {
@@ -303,7 +315,10 @@ mod tests {
     #[test]
     fn parses_string_value() {
         let body = r#"{"hostname":"ChenHome","other":"x"}"#;
-        assert_eq!(extract_string_value(body, "hostname"), Some("ChenHome".to_string()));
+        assert_eq!(
+            extract_string_value(body, "hostname"),
+            Some("ChenHome".to_string())
+        );
     }
 
     #[test]
@@ -314,8 +329,14 @@ mod tests {
 
     #[test]
     fn parses_bool_value() {
-        assert_eq!(extract_bool_value(r#"{"is_secure":false}"#, "is_secure"), Some(false));
-        assert_eq!(extract_bool_value(r#"{"is_secure":true}"#, "is_secure"), Some(true));
+        assert_eq!(
+            extract_bool_value(r#"{"is_secure":false}"#, "is_secure"),
+            Some(false)
+        );
+        assert_eq!(
+            extract_bool_value(r#"{"is_secure":true}"#, "is_secure"),
+            Some(true)
+        );
     }
 }
 

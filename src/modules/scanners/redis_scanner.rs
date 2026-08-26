@@ -5,14 +5,16 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context, anyhow};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{
+    cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port, cfg_prompt_yes_no,
+};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::time::Duration;
-use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::module_info::{ModuleInfo, ModuleRank};
+use tokio::time::timeout;
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -33,11 +35,25 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   Redis Unauthenticated Access Scanner                       ║".cyan());
-    crate::mprintln!("{}", "║   Detects open Redis instances and extracts server info       ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Redis Unauthenticated Access Scanner                       ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Detects open Redis instances and extracts server info       ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -47,7 +63,9 @@ async fn redis_command(
     cmd: &str,
     timeout_dur: Duration,
 ) -> Result<String> {
-    stream.write_all(cmd.as_bytes()).await
+    stream
+        .write_all(cmd.as_bytes())
+        .await
         .context("Failed to send Redis command")?;
     stream.flush().await?;
 
@@ -83,7 +101,8 @@ fn extract_info_field(info: &str, field: &str) -> Option<String> {
 /// CONFIG GET returns: *2\r\n$N\r\nKEY\r\n$M\r\nVALUE\r\n
 /// Lines: [0]="*2" [1]="$N" [2]="key" [3]="$M" [4]="value"
 fn extract_config_value(response: &str) -> Option<String> {
-    let lines: Vec<&str> = response.split("\r\n")
+    let lines: Vec<&str> = response
+        .split("\r\n")
         .chain(response.lines()) // handle both \r\n and \n endings
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
@@ -132,7 +151,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     let port = cfg_prompt_port("port", "Redis port", 6379).await?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 30).await? as u64;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 300).await? as u64;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
 
     let timeout_dur = Duration::from_secs(timeout_secs);
@@ -155,11 +175,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let ping_ok = ping_resp.trim().contains("+PONG");
 
     if ping_ok {
-        crate::mprintln!("{}", "[+] PONG received - Redis has NO authentication!".green().bold());
+        crate::mprintln!(
+            "{}",
+            "[+] PONG received - Redis has NO authentication!"
+                .green()
+                .bold()
+        );
         outcome.findings.push(Finding {
             target: target.to_string(),
             kind: FindingKind::Vulnerable,
-            message: format!("Redis at {}:{} accepts unauthenticated commands", target, port),
+            message: format!(
+                "Redis at {}:{} accepts unauthenticated commands",
+                target, port
+            ),
             data: Some(serde_json::json!({
                 "host": target,
                 "port": port,
@@ -172,7 +200,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         crate::mprintln!("{}", format!("    Response: {}", ping_resp.trim()).dimmed());
         return Ok(outcome);
     } else {
-        crate::mprintln!("{}", format!("[-] Unexpected PING response: {}", ping_resp.trim()).yellow());
+        crate::mprintln!(
+            "{}",
+            format!("[-] Unexpected PING response: {}", ping_resp.trim()).yellow()
+        );
         return Ok(outcome);
     }
 
@@ -185,22 +216,24 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     ctx.rate_limit(target).await;
     match redis_command(&mut stream, "INFO\r\n", timeout_dur).await {
         Ok(info_resp) => {
-            let version = extract_info_field(&info_resp, "redis_version")
-                .unwrap_or_else(|| "unknown".into());
+            let version =
+                extract_info_field(&info_resp, "redis_version").unwrap_or_else(|| "unknown".into());
             let clients = extract_info_field(&info_resp, "connected_clients")
                 .unwrap_or_else(|| "unknown".into());
             let memory = extract_info_field(&info_resp, "used_memory_human")
                 .unwrap_or_else(|| "unknown".into());
-            let os = extract_info_field(&info_resp, "os")
-                .unwrap_or_else(|| "unknown".into());
-            let tcp_port_val = extract_info_field(&info_resp, "tcp_port")
-                .unwrap_or_else(|| port.to_string());
+            let os = extract_info_field(&info_resp, "os").unwrap_or_else(|| "unknown".into());
+            let tcp_port_val =
+                extract_info_field(&info_resp, "tcp_port").unwrap_or_else(|| port.to_string());
 
             crate::mprintln!("{}", format!("[+] Redis version:      {}", version).green());
             crate::mprintln!("{}", format!("[+] Connected clients:  {}", clients).green());
             crate::mprintln!("{}", format!("[+] Memory usage:       {}", memory).green());
             crate::mprintln!("{}", format!("[+] OS:                 {}", os).green());
-            crate::mprintln!("{}", format!("[+] TCP port:           {}", tcp_port_val).green());
+            crate::mprintln!(
+                "{}",
+                format!("[+] TCP port:           {}", tcp_port_val).green()
+            );
 
             outcome.findings.push(Finding {
                 target: target.to_string(),
@@ -232,15 +265,24 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         Ok(resp) => {
             let pass_val = extract_config_value(&resp).unwrap_or_default();
             if pass_val.is_empty() {
-                crate::mprintln!("{}", "[+] requirepass is EMPTY - no password set!".red().bold());
+                crate::mprintln!(
+                    "{}",
+                    "[+] requirepass is EMPTY - no password set!".red().bold()
+                );
                 report_lines.push("requirepass: EMPTY (no password)".into());
             } else {
-                crate::mprintln!("{}", "[-] requirepass is set (but was bypassed via unauthenticated access)".yellow());
+                crate::mprintln!(
+                    "{}",
+                    "[-] requirepass is set (but was bypassed via unauthenticated access)".yellow()
+                );
                 report_lines.push(format!("requirepass: set (value: {})", pass_val));
             }
         }
         Err(e) => {
-            crate::mprintln!("{}", format!("[!] CONFIG GET requirepass failed: {}", e).yellow());
+            crate::mprintln!(
+                "{}",
+                format!("[!] CONFIG GET requirepass failed: {}", e).yellow()
+            );
         }
     }
 
@@ -272,7 +314,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 crate::mprintln!("{}", format!("[+] Database keys:      {}", count).green());
                 report_lines.push(format!("Database keys: {}", count));
             } else {
-                crate::mprintln!("{}", format!("[*] DBSIZE response: {}", resp.trim()).dimmed());
+                crate::mprintln!(
+                    "{}",
+                    format!("[*] DBSIZE response: {}", resp.trim()).dimmed()
+                );
             }
         }
         Err(e) => {
@@ -283,22 +328,36 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // Summary
     crate::mprintln!();
     crate::mprintln!("{}", "=== Exploitation Vectors ===".bold().red());
-    crate::mprintln!("  1. Write SSH key:     CONFIG SET dir /root/.ssh; SET key <pubkey>; CONFIG SET dbfilename authorized_keys; BGSAVE");
-    crate::mprintln!("  2. Write crontab:     CONFIG SET dir /var/spool/cron; CONFIG SET dbfilename root; SET key <cron payload>; BGSAVE");
-    crate::mprintln!("  3. Write webshell:    CONFIG SET dir /var/www/html; CONFIG SET dbfilename shell.php; SET key <php shell>; BGSAVE");
+    crate::mprintln!(
+        "  1. Write SSH key:     CONFIG SET dir /root/.ssh; SET key <pubkey>; CONFIG SET dbfilename authorized_keys; BGSAVE"
+    );
+    crate::mprintln!(
+        "  2. Write crontab:     CONFIG SET dir /var/spool/cron; CONFIG SET dbfilename root; SET key <cron payload>; BGSAVE"
+    );
+    crate::mprintln!(
+        "  3. Write webshell:    CONFIG SET dir /var/www/html; CONFIG SET dbfilename shell.php; SET key <php shell>; BGSAVE"
+    );
     crate::mprintln!("  4. Lua RCE (< 5.0):  EVAL \"os.execute('id')\" 0");
 
     // Save results
     if save_results {
-        let default_name = format!("redis_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
-        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
+        let default_name = format!(
+            "redis_scan_results_{}.txt",
+            target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+        );
+        let output_path =
+            cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
         let content = report_lines.join("\n");
-        tokio::fs::write(&output_path, content).await
+        tokio::fs::write(&output_path, content)
+            .await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
         if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
             crate::meprintln!("[!] Failed to set file permissions: {}", e);
         }
-        crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
+        crate::mprintln!(
+            "{}",
+            format!("[+] Results saved to '{}'", output_path).green()
+        );
     }
 
     Ok(outcome)

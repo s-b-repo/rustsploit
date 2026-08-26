@@ -18,7 +18,7 @@ Rustsploit provides several utility modules that every module developer should k
 | **Cred Store** | `crate::cred_store` | Store/query discovered credentials. Call `store_credential()` from modules |
 | **Workspace** | `crate::workspace` | Track hosts/services. Call `track_host()` / `track_service()` from modules |
 | **Loot** | `crate::loot` | Store collected evidence. Call `store_loot()` from modules |
-| **Module Info** | `crate::module_info` | `ModuleInfo`, `ModuleRank`, `CheckResult` types for `info()`/`check()` |
+|| **Module Info** | `crate::module_info` | `ModuleInfo`, `ModuleRank` types for `info()`; `CheckResult` is legacy (exploitation-only model, no `check()` phase) |
 | **Spool** | `crate::spool` | Console output logging. Call `spool::sprintln()` for spool-aware output |
 | **Jobs** | `crate::jobs` | Background job management via `JOB_MANAGER` |
 | **Export** | `crate::export` | Export engagement data to JSON/CSV/summary |

@@ -32,8 +32,8 @@
 //!   - `pos>=1` → the value comes from regex capture group N.
 
 use once_cell::sync::Lazy;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use regex::Regex;
 use std::collections::BTreeMap;
 
@@ -401,7 +401,10 @@ pub fn match_banner(db_name: &str, banner: &str) -> RecogMatch {
     match db(db_name) {
         Some(database) => database.match_banner(banner),
         None => {
-            tracing::warn!(db = db_name, "recog: requested unknown fingerprint database");
+            tracing::warn!(
+                db = db_name,
+                "recog: requested unknown fingerprint database"
+            );
             RecogMatch::default()
         }
     }
@@ -458,7 +461,10 @@ mod tests {
         assert!(m.matched, "expected ProFTPD banner to match");
         assert_eq!(m.product(), Some("ProFTPD"));
         assert_eq!(m.version(), Some("1.3.5b"));
-        assert_eq!(m.get("service.cpe23"), Some("cpe:/a:proftpd:proftpd:1.3.5b"));
+        assert_eq!(
+            m.get("service.cpe23"),
+            Some("cpe:/a:proftpd:proftpd:1.3.5b")
+        );
     }
 
     #[test]
@@ -583,7 +589,11 @@ mod tests {
             </fingerprint>
         </fingerprints>"#;
         let db = parse_db("test", xml);
-        assert_eq!(db.fingerprints.len(), 1, "broken fingerprint must be skipped");
+        assert_eq!(
+            db.fingerprints.len(),
+            1,
+            "broken fingerprint must be skipped"
+        );
         let m = db.match_banner("GOOD-1.2");
         assert!(m.matched);
         assert_eq!(m.product(), Some("Good"));

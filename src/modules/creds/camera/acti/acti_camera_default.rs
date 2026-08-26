@@ -1,21 +1,35 @@
-use anyhow::{Context, Result};
-use suppaftp::tokio::AsyncFtpStream;
-use colored::*;
-use ssh2::Session;
-use telnet::{Telnet, Event};
-use std::time::Duration;
-use tokio::{join, task};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::url_encode;
+use anyhow::{Context, Result};
+use colored::*;
+use ssh2::Session;
+use std::time::Duration;
+use suppaftp::tokio::AsyncFtpStream;
+use telnet::{Event, Telnet};
+use tokio::{join, task};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   ACTi Camera Default Credentials Checker                 ║".cyan());
-    crate::mprintln!("{}", "║   Multi-Protocol Scanner (FTP/SSH/Telnet/HTTP)            ║".cyan());
-    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   ACTi Camera Default Credentials Checker                 ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Multi-Protocol Scanner (FTP/SSH/Telnet/HTTP)            ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -61,15 +75,30 @@ fn normalize_target(target: &str, port: u16) -> String {
 
 /// FTP check (async)
 pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
-    crate::mprintln!("{}", format!("[*] Checking FTP credentials on {}:{}", config.target, config.port).cyan());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Checking FTP credentials on {}:{}",
+            config.target, config.port
+        )
+        .cyan()
+    );
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            crate::mprintln!("{}", format!("[*] Trying FTP: {}:{}", username, password).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Trying FTP: {}:{}", username, password).dimmed()
+            );
         }
 
         let address = normalize_target(&config.target, config.port);
-        let tcp_stream = match crate::utils::network::tcp_connect_str(&address, Duration::from_secs(DEFAULT_TIMEOUT_SECS)).await {
+        let tcp_stream = match crate::utils::network::tcp_connect_str(
+            &address,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::trace!(target = %config.target, port = config.port, user = %username, "TCP connect failed: {}", e);
@@ -79,9 +108,17 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
         match AsyncFtpStream::connect_with_stream(tcp_stream).await {
             Ok(mut ftp) => {
                 if ftp.login(username, password).await.is_ok() {
-                    crate::mprintln!("{}", format!("[+] FTP credentials valid: {}:{}", username, password).green().bold());
-                    if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
-                    let result = Some((ServiceType::Ftp, username.to_string(), password.to_string()));
+                    crate::mprintln!(
+                        "{}",
+                        format!("[+] FTP credentials valid: {}:{}", username, password)
+                            .green()
+                            .bold()
+                    );
+                    if let Err(e) = ftp.quit().await {
+                        crate::meprintln!("[!] FTP quit failed: {}", e);
+                    }
+                    let result =
+                        Some((ServiceType::Ftp, username.to_string(), password.to_string()));
                     // Respect stop_on_success: if true, stop after first valid credential
                     if config.stop_on_success {
                         return Ok(result);
@@ -89,7 +126,9 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
                     // If false, continue checking but still return first found (for consistency)
                     return Ok(result);
                 }
-                if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
+                if let Err(e) = ftp.quit().await {
+                    crate::meprintln!("[!] FTP quit failed: {}", e);
+                }
             }
             Err(e) => {
                 tracing::trace!(target = %config.target, port = config.port, user = %username, "FTP login attempt failed: {}", e);
@@ -98,17 +137,34 @@ pub async fn check_ftp(config: &Config) -> Result<Option<(ServiceType, String, S
         }
     }
 
-    crate::mprintln!("{}", format!("[-] No valid FTP credentials found on {}:{}", config.target, config.port).yellow());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[-] No valid FTP credentials found on {}:{}",
+            config.target, config.port
+        )
+        .yellow()
+    );
     Ok(None)
 }
 
 /// SSH check (blocking, so we use spawn_blocking)
 pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
-    crate::mprintln!("{}", format!("[*] Checking SSH credentials on {}:{}", config.target, config.port).cyan());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Checking SSH credentials on {}:{}",
+            config.target, config.port
+        )
+        .cyan()
+    );
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            crate::mprintln!("{}", format!("[*] Trying SSH: {}:{}", username, password).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Trying SSH: {}:{}", username, password).dimmed()
+            );
         }
 
         let address = normalize_target(&config.target, config.port);
@@ -121,29 +177,60 @@ pub fn check_ssh_blocking(config: &Config) -> Result<Option<(ServiceType, String
         };
         // libssh2 needs a blocking std stream — blocking_tcp_connect honors
         // `setg src_port` which the raw connect_timeout silently skipped.
-        if let Ok(stream) = crate::utils::network::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+        if let Ok(stream) = crate::utils::network::blocking_tcp_connect(
+            &socket_addr,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        ) {
             let mut session = Session::new().context("Failed to create SSH session")?;
             session.set_tcp_stream(stream);
             session.handshake().context("SSH handshake failed")?;
 
             if session.userauth_password(username, password).is_ok() && session.authenticated() {
-                crate::mprintln!("{}", format!("[+] SSH credentials valid: {}:{}", username, password).green().bold());
-                return Ok(Some((ServiceType::Ssh, username.to_string(), password.to_string())));
+                crate::mprintln!(
+                    "{}",
+                    format!("[+] SSH credentials valid: {}:{}", username, password)
+                        .green()
+                        .bold()
+                );
+                return Ok(Some((
+                    ServiceType::Ssh,
+                    username.to_string(),
+                    password.to_string(),
+                )));
             }
+        } else {
+            tracing::debug!("ACti SSH TCP connect to {socket_addr} failed");
         }
     }
 
-    crate::mprintln!("{}", format!("[-] No valid SSH credentials found on {}:{}", config.target, config.port).yellow());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[-] No valid SSH credentials found on {}:{}",
+            config.target, config.port
+        )
+        .yellow()
+    );
     Ok(None)
 }
 
 /// Telnet check (blocking)
 pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
-    crate::mprintln!("{}", format!("[*] Checking Telnet credentials on {}:{}", config.target, config.port).cyan());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Checking Telnet credentials on {}:{}",
+            config.target, config.port
+        )
+        .cyan()
+    );
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            crate::mprintln!("{}", format!("[*] Trying Telnet: {}:{}", username, password).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Trying Telnet: {}:{}", username, password).dimmed()
+            );
         }
 
         let address = normalize_target(&config.target, config.port);
@@ -161,10 +248,17 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
                 continue;
             }
         };
-        if let Ok(tcp_stream) = crate::utils::network::blocking_tcp_connect(&socket_addr, Duration::from_secs(DEFAULT_TIMEOUT_SECS)) {
+        if let Ok(tcp_stream) = crate::utils::network::blocking_tcp_connect(
+            &socket_addr,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        ) {
             let mut telnet = Telnet::from_stream(Box::new(tcp_stream), 500);
-            if let Err(e) = telnet.write(format!("{}\r\n", username).as_bytes()) { eprintln!("[!] Write failed: {}", e); }
-            if let Err(e) = telnet.write(format!("{}\r\n", password).as_bytes()) { eprintln!("[!] Write failed: {}", e); }
+            if let Err(e) = telnet.write(format!("{}\r\n", username).as_bytes()) {
+                crate::meprintln!("[!] Write failed: {}", e);
+            }
+            if let Err(e) = telnet.write(format!("{}\r\n", password).as_bytes()) {
+                crate::meprintln!("[!] Write failed: {}", e);
+            }
 
             // Give device time to respond
             std::thread::sleep(Duration::from_millis(500));
@@ -181,11 +275,19 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
                     || response.contains('#')
                     || response.contains('>')
                     || response.contains('~');
-                let has_welcome = response.contains("Welcome")
-                    || response.contains("Last login");
+                let has_welcome = response.contains("Welcome") || response.contains("Last login");
                 if has_shell_prompt || has_welcome {
-                    crate::mprintln!("{}", format!("[+] Telnet credentials valid: {}:{}", username, password).green().bold());
-                    return Ok(Some((ServiceType::Telnet, username.to_string(), password.to_string())));
+                    crate::mprintln!(
+                        "{}",
+                        format!("[+] Telnet credentials valid: {}:{}", username, password)
+                            .green()
+                            .bold()
+                    );
+                    return Ok(Some((
+                        ServiceType::Telnet,
+                        username.to_string(),
+                        password.to_string(),
+                    )));
                 }
                 // Otherwise the response is inconclusive (e.g. empty,
                 // connection-closed, re-prompt of "login:") -> treat as failed.
@@ -193,21 +295,42 @@ pub fn check_telnet_blocking(config: &Config) -> Result<Option<(ServiceType, Str
         }
     }
 
-    crate::mprintln!("{}", format!("[-] No valid Telnet credentials found on {}:{}", config.target, config.port).yellow());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[-] No valid Telnet credentials found on {}:{}",
+            config.target, config.port
+        )
+        .yellow()
+    );
     Ok(None)
 }
 
 /// HTTP Web Login check (async)
 pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, String, String)>> {
-    crate::mprintln!("{}", format!("[*] Checking HTTP Web Form credentials on {}:{}", config.target, config.port).cyan());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Checking HTTP Web Form credentials on {}:{}",
+            config.target, config.port
+        )
+        .cyan()
+    );
 
     let client = crate::utils::build_http_client(Duration::from_secs(DEFAULT_TIMEOUT_SECS))?;
 
-    let url = format!("http://{}:{}/video.htm", config.target.trim_matches(|c| c == '[' || c == ']'), config.port);
+    let url = format!(
+        "http://{}:{}/video.htm",
+        config.target.trim_matches(|c| c == '[' || c == ']'),
+        config.port
+    );
 
     for (username, password) in &config.credentials {
         if config.verbosity {
-            crate::mprintln!("{}", format!("[*] Trying HTTP: {}:{}", username, password).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Trying HTTP: {}:{}", username, password).dimmed()
+            );
         }
 
         let data = [
@@ -220,7 +343,9 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
         // Manual form construction
         let mut body = String::new();
         for (key, val) in &data {
-            if !body.is_empty() { body.push('&'); }
+            if !body.is_empty() {
+                body.push('&');
+            }
             body.push_str(&format!("{}={}", key, url_encode(val)));
         }
 
@@ -246,7 +371,12 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
         // A failed body read is a transport error, NOT evidence of valid creds.
         // Previously this was mapped to an empty String, which trivially does not
         // contain the login-form marker and was misreported as a successful login.
-        let body = match crate::utils::network::read_http_body_text_capped(res, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        let body = match crate::utils::network::read_http_body_text_capped(
+            res,
+            crate::utils::safe_io::DEFAULT_BODY_CAP,
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::trace!(target = %config.target, port = config.port, user = %username, "HTTP form response body read failed: {}", e);
@@ -259,15 +389,31 @@ pub async fn check_http_form(config: &Config) -> Result<Option<(ServiceType, Str
         //  - HTTP status must indicate success/redirect (200 / 3xx login-redirect)
         //  - the login form must NO LONGER be presented (no LOGIN_PASSWORD field
         //    and no ">Password<" prompt — both are present on the re-served form)
-        let still_login_form =
-            body.contains(">Password<") || body.contains("LOGIN_PASSWORD");
-        if (status.is_success() || status.is_redirection()) && !still_login_form && !body.is_empty() {
-            crate::mprintln!("{}", format!("[+] HTTP credentials valid: {}:{}", username, password).green().bold());
-            return Ok(Some((ServiceType::Http, username.to_string(), password.to_string())));
+        let still_login_form = body.contains(">Password<") || body.contains("LOGIN_PASSWORD");
+        if (status.is_success() || status.is_redirection()) && !still_login_form && !body.is_empty()
+        {
+            crate::mprintln!(
+                "{}",
+                format!("[+] HTTP credentials valid: {}:{}", username, password)
+                    .green()
+                    .bold()
+            );
+            return Ok(Some((
+                ServiceType::Http,
+                username.to_string(),
+                password.to_string(),
+            )));
         }
     }
 
-    crate::mprintln!("{}", format!("[-] No valid HTTP credentials found on {}:{}", config.target, config.port).yellow());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[-] No valid HTTP credentials found on {}:{}",
+            config.target, config.port
+        )
+        .yellow()
+    );
     Ok(None)
 }
 
@@ -300,25 +446,33 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         verbosity: true,
     };
 
-    let ftp_conf    = Config { port: 21, ..base_config.clone() };
-    let ssh_conf    = Config { port: 22, ..base_config.clone() };
-    let telnet_conf = Config { port: 23, ..base_config.clone() };
-    let http_conf   = Config { port: 80, ..base_config.clone() };
+    let ftp_conf = Config {
+        port: 21,
+        ..base_config.clone()
+    };
+    let ssh_conf = Config {
+        port: 22,
+        ..base_config.clone()
+    };
+    let telnet_conf = Config {
+        port: 23,
+        ..base_config.clone()
+    };
+    let http_conf = Config {
+        port: 80,
+        ..base_config.clone()
+    };
 
     let (ftp_res, ssh_res, telnet_res, http_res) = join!(
         check_ftp(&ftp_conf),
-        async {
-            task::spawn_blocking(move || check_ssh_blocking(&ssh_conf)).await?
-        },
-        async {
-            task::spawn_blocking(move || check_telnet_blocking(&telnet_conf)).await?
-        },
+        async { task::spawn_blocking(move || check_ssh_blocking(&ssh_conf)).await? },
+        async { task::spawn_blocking(move || check_telnet_blocking(&telnet_conf)).await? },
         check_http_form(&http_conf),
     );
 
     // Collect all successful results
     let mut found_credentials = Vec::new();
-    
+
     if let Ok(Some((service, user, pass))) = ftp_res {
         found_credentials.push((service, user, pass));
     }
@@ -337,7 +491,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         crate::mprintln!();
         crate::mprintln!("{}", "=== Summary ===".bold());
         for (service, user, pass) in &found_credentials {
-            crate::mprintln!("{}", format!("  {}: {}:{}", service.as_str(), user, pass).green());
+            crate::mprintln!(
+                "{}",
+                format!("  {}: {}:{}", service.as_str(), user, pass).green()
+            );
             let (svc_port, svc_name) = match service.as_str() {
                 "FTP" => (21u16, "ftp"),
                 "SSH" => (22, "ssh"),
@@ -346,14 +503,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 _ => (0, "unknown"),
             };
             if crate::cred_store::store_credential(crate::cred_store::NewCred {
-                host: target, port: svc_port, service: svc_name, username: user, secret: pass,
+                host: target,
+                port: svc_port,
+                service: svc_name,
+                username: user,
+                secret: pass,
                 cred_type: crate::cred_store::CredType::Password,
                 source_module: "creds/camera/acti/acti_camera_default",
-            }).await.is_none() { eprintln!("[!] Failed to store credential"); }
+            })
+            .await
+            .is_none()
+            {
+                crate::meprintln!("[!] Failed to store credential");
+            }
             outcome.findings.push(Finding {
                 target: target.to_string(),
                 kind: FindingKind::Credential,
-                message: format!("ACTi default credentials valid {}:{} on {} ({}:{})", user, pass, svc_name, target, svc_port),
+                message: format!(
+                    "ACTi default credentials valid {}:{} on {} ({}:{})",
+                    user, pass, svc_name, target, svc_port
+                ),
                 data: Some(serde_json::json!({
                     "service": svc_name,
                     "port": svc_port,
@@ -364,7 +533,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     } else {
         crate::mprintln!();
-        crate::mprintln!("{}", "[-] No valid credentials found on any service.".yellow());
+        crate::mprintln!(
+            "{}",
+            "[-] No valid credentials found on any service.".yellow()
+        );
     }
 
     Ok(outcome)
@@ -373,7 +545,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
         name: "ACTi Camera Default Credentials".to_string(),
-        description: "Tests default credentials across FTP, SSH, Telnet, and HTTP on ACTi IP cameras.".to_string(),
+        description:
+            "Tests default credentials across FTP, SSH, Telnet, and HTTP on ACTi IP cameras."
+                .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,
@@ -382,4 +556,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "camera/acti/acti_camera_default", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "camera/acti/acti_camera_default",
+    native
+);

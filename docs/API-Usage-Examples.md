@@ -16,7 +16,7 @@ curl http://localhost:8080/health
 
 **Response:**
 ```json
-{"status": "ok", "timestamp": "2026-03-17T14:00:00Z"}
+{"status": "ok", "timestamp": "2026-06-13T14:00:00Z"}
 ```
 
 ---
@@ -38,9 +38,9 @@ curl -H "Authorization: Bearer my-secret-key" \
     "scanners/dir_brute",
     "creds/generic/ssh_bruteforce"
   ],
-  "count": 363,
+  "count": 389,
   "request_id": "abc123",
-  "timestamp": "2026-03-17T14:01:00Z",
+  "timestamp": "2026-06-13T14:01:00Z",
   "duration_ms": 2
 }
 ```

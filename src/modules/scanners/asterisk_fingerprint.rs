@@ -66,7 +66,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
     display_banner();
     let mut outcome = ModuleOutcome::ok();
     let host = sanitize_host(target);
@@ -95,10 +98,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await
         .with_context(|| format!("Could not resolve {}", host))?;
     if !tcp_port_open(ip, port, Duration::from_secs(TCP_PROBE_TIMEOUT_SECS)).await {
-        crate::mprintln!(
-            "{}",
-            format!("[-] {}:{} closed/filtered", host, port).red()
-        );
+        crate::mprintln!("{}", format!("[-] {}:{} closed/filtered", host, port).red());
         return Ok(outcome);
     }
     crate::mprintln!(
@@ -160,11 +160,9 @@ fn is_eol_version(server: &str) -> bool {
 
 async fn fetch_server_header(host: &str, port: u16, timeout_secs: u64) -> Result<String> {
     let opts = crate::utils::network::HttpClientOpts::permissive();
-    let client = crate::utils::network::build_http_client_with(
-        Duration::from_secs(timeout_secs),
-        opts,
-    )
-    .context("HTTPS client init failed")?;
+    let client =
+        crate::utils::network::build_http_client_with(Duration::from_secs(timeout_secs), opts)
+            .context("HTTPS client init failed")?;
     let url = format!("https://{}:{}/", host, port);
     let resp = client
         .get(&url)
@@ -205,4 +203,8 @@ fn sanitize_host(target: &str) -> String {
     t.to_string()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "asterisk_fingerprint", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "asterisk_fingerprint",
+    native
+);

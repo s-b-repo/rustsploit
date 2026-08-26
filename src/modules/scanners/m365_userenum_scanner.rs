@@ -18,15 +18,32 @@ use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::throttle::{with_backoff, BackoffConfig};
-use crate::utils::{build_http_client, cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_yes_no, is_batch_mode};
+use crate::utils::throttle::{BackoffConfig, with_backoff};
+use crate::utils::{
+    build_http_client, cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_yes_no,
+    is_batch_mode,
+};
 
 fn banner() {
-    if is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   Microsoft 365 User Enumeration (GetCredentialType)         ║".cyan());
-    crate::mprintln!("{}", "║   Tenant existence + per-user IfExistsResult                 ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Microsoft 365 User Enumeration (GetCredentialType)         ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Tenant existence + per-user IfExistsResult                 ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -40,7 +57,8 @@ pub fn info() -> ModuleInfo {
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
             "https://github.com/dafthack/MSOLSpray".to_string(),
-            "https://posts.specterops.io/azure-ad-and-the-getcredentialtype-endpoint-77ddc91dc94d".to_string(),
+            "https://posts.specterops.io/azure-ad-and-the-getcredentialtype-endpoint-77ddc91dc94d"
+                .to_string(),
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
@@ -49,10 +67,22 @@ pub fn info() -> ModuleInfo {
 }
 
 async fn probe_tenant(client: &reqwest::Client, tenant_label: &str) -> Result<bool> {
-    let url = format!("https://login.microsoftonline.com/{}/.well-known/openid-configuration", tenant_label);
-    let r = client.get(&url).send().await.context("OIDC config request failed")?;
+    let url = format!(
+        "https://login.microsoftonline.com/{}/.well-known/openid-configuration",
+        tenant_label
+    );
+    let r = client
+        .get(&url)
+        .send()
+        .await
+        .context("OIDC config request failed")?;
     let s = r.status();
-    let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+    let body = match crate::utils::network::read_http_body_text_capped(
+        r,
+        crate::utils::safe_io::DEFAULT_BODY_CAP,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);
@@ -60,10 +90,27 @@ async fn probe_tenant(client: &reqwest::Client, tenant_label: &str) -> Result<bo
         }
     };
     if s.is_success() && body.contains("token_endpoint") {
-        crate::mprintln!("{}", format!("[+] Tenant '{}' exists ({} bytes OIDC config)", tenant_label, body.len()).green().bold());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[+] Tenant '{}' exists ({} bytes OIDC config)",
+                tenant_label,
+                body.len()
+            )
+            .green()
+            .bold()
+        );
         Ok(true)
     } else {
-        crate::mprintln!("{}", format!("[~] Tenant '{}' OIDC -> {} (likely does not exist)", tenant_label, s.as_u16()).dimmed());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[~] Tenant '{}' OIDC -> {} (likely does not exist)",
+                tenant_label,
+                s.as_u16()
+            )
+            .dimmed()
+        );
         Ok(false)
     }
 }
@@ -79,22 +126,34 @@ async fn check_user(client: &reqwest::Client, username: &str) -> Result<i64> {
         "isFidoSupported": false,
         "originalRequest": "",
         "flowToken": ""
-    }).to_string();
+    })
+    .to_string();
 
     // GetCredentialType throttles aggressively past ~5 rps. with_backoff
     // honours `Retry-After` from MS, falling back to jittered exponential
     // backoff when the header is absent.
-    let r = with_backoff(BackoffConfig::aggressive(), username.to_string(), || async {
-        client.post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .body(body.clone())
-            .send().await
-    })
+    let r = with_backoff(
+        BackoffConfig::aggressive(),
+        username.to_string(),
+        || async {
+            client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .body(body.clone())
+                .send()
+                .await
+        },
+    )
     .await
     .context("GetCredentialType request failed")?;
 
-    let txt = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+    let txt = match crate::utils::network::read_http_body_text_capped(
+        r,
+        crate::utils::safe_io::DEFAULT_BODY_CAP,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);
@@ -102,7 +161,10 @@ async fn check_user(client: &reqwest::Client, username: &str) -> Result<i64> {
         }
     };
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
-    let result = v.get("IfExistsResult").and_then(|x| x.as_i64()).unwrap_or(-1);
+    let result = v
+        .get("IfExistsResult")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(-1);
     Ok(result)
 }
 
@@ -130,8 +192,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         "tenant",
         "Tenant label (e.g. contoso → contoso.onmicrosoft.com), or full domain",
         target,
-    ).await?;
-    let tenant_label = if tenant.contains('.') { tenant.clone() } else { format!("{}.onmicrosoft.com", tenant) };
+    )
+    .await?;
+    let tenant_label = if tenant.contains('.') {
+        tenant.clone()
+    } else {
+        format!("{}.onmicrosoft.com", tenant)
+    };
 
     let client = build_http_client(Duration::from_secs(10))?;
     let mut outcome = ModuleOutcome::ok();
@@ -147,19 +214,36 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         data: None,
     });
 
-    let want_users = cfg_prompt_yes_no("enumerate", "Enumerate users via GetCredentialType?", true).await?;
+    let want_users =
+        cfg_prompt_yes_no("enumerate", "Enumerate users via GetCredentialType?", true).await?;
     if !want_users {
         return Ok(outcome);
     }
 
-    let path = cfg_prompt_existing_file("user_list", "Path to newline-separated user@domain list").await?;
-    let users = tokio::fs::read_to_string(&path).await.context("Failed to read user list")?;
-    let candidates: Vec<&str> = users.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
-    crate::mprintln!("{}", format!("[*] Probing {} users via GetCredentialType (paced)...", candidates.len()).cyan());
+    let path =
+        cfg_prompt_existing_file("user_list", "Path to newline-separated user@domain list").await?;
+    let users = tokio::fs::read_to_string(&path)
+        .await
+        .context("Failed to read user list")?;
+    let candidates: Vec<&str> = users
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Probing {} users via GetCredentialType (paced)...",
+            candidates.len()
+        )
+        .cyan()
+    );
 
     let mut hits: Vec<(String, i64)> = Vec::new();
     for u in candidates {
-        if ctx.is_cancelled() { break; }
+        if ctx.is_cancelled() {
+            break;
+        }
         ctx.rate_limit(&tenant_label).await;
         match check_user(&client, u).await {
             Ok(code) => {
@@ -191,8 +275,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     crate::mprintln!();
     crate::mprintln!("{}", "=== Summary ===".bold());
-    crate::mprintln!("  Confirmed users: {} (file as P3 user-enum primitive)", hits.len());
+    crate::mprintln!(
+        "  Confirmed users: {} (file as P3 user-enum primitive)",
+        hits.len()
+    );
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "m365_userenum_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "m365_userenum_scanner",
+    native
+);

@@ -18,8 +18,8 @@ use std::time::Duration;
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
-    cfg_prompt_output_file, normalize_target, build_http_client,
+    build_http_client, cfg_prompt_default, cfg_prompt_output_file, cfg_prompt_port,
+    cfg_prompt_yes_no, normalize_target,
 };
 
 /// Common SharePoint document library paths to probe.
@@ -131,8 +131,7 @@ pub fn info() -> ModuleInfo {
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
             "https://www.yourpentest.co.uk/blog/sharepoint-anonymous-access/".to_string(),
-            "https://learn.microsoft.com/en-us/sharepoint/change-external-sharing-site"
-                .to_string(),
+            "https://learn.microsoft.com/en-us/sharepoint/change-external-sharing-site".to_string(),
             "https://www.blackhillsinfosec.com/spoiling-sharepoint/".to_string(),
             "https://github.com/nyxgeek/o365recon".to_string(),
         ],
@@ -204,7 +203,9 @@ fn extract_emails(text: &str) -> Vec<String> {
     // Simple email regex-like extraction
     let words: Vec<&str> = text.split_whitespace().collect();
     for word in words {
-        let cleaned = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '-' && c != '_');
+        let cleaned = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '@' && c != '.' && c != '-' && c != '_'
+        });
         if cleaned.contains('@') && cleaned.contains('.') {
             let parts: Vec<&str> = cleaned.split('@').collect();
             if parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.') {
@@ -221,7 +222,11 @@ fn extract_emails(text: &str) -> Vec<String> {
 fn extract_form_digest(html: &str) -> Vec<String> {
     let mut digests = Vec::new();
     // Look for __REQUESTDIGEST or formDigestValue
-    for pattern in &["__REQUESTDIGEST\" value=\"", "formDigestValue\":\"", "FormDigestValue\":\""] {
+    for pattern in &[
+        "__REQUESTDIGEST\" value=\"",
+        "formDigestValue\":\"",
+        "FormDigestValue\":\"",
+    ] {
         for cap in html.split(pattern).skip(1) {
             let end_char = if pattern.ends_with("\"") { '"' } else { '"' };
             if let Some(end) = cap.find(end_char) {
@@ -256,7 +261,10 @@ fn extract_internal_hostnames(text: &str) -> Vec<String> {
     for prefix in prefixes {
         for cap in text.split(prefix).skip(1) {
             // Get the hostname portion (up to / or " or ' or space)
-            let end = cap.find(|c: char| c == '/' || c == '"' || c == '\'' || c == ' ' || c == '>' || c == '\\')
+            let end = cap
+                .find(|c: char| {
+                    c == '/' || c == '"' || c == '\'' || c == ' ' || c == '>' || c == '\\'
+                })
                 .unwrap_or(cap.len());
             let hostname = &cap[..end];
             // Filter for internal-looking hostnames (contain dots, not public CDNs)
@@ -278,11 +286,25 @@ fn extract_internal_hostnames(text: &str) -> Vec<String> {
 /// Check if a hostname is a common CDN/external service (not interesting).
 fn is_common_cdn(host: &str) -> bool {
     let cdns = &[
-        "googleapis.com", "gstatic.com", "cloudflare.com", "jquery.com",
-        "bootstrapcdn.com", "cdnjs.cloudflare.com", "maxcdn.com",
-        "fontawesome.com", "google.com", "microsoft.com", "azure.com",
-        "sharepoint.com", "office.com", "office365.com", "microsoftonline.com",
-        "akamai.net", "akamaized.net", "cloudfront.net", "amazonaws.com",
+        "googleapis.com",
+        "gstatic.com",
+        "cloudflare.com",
+        "jquery.com",
+        "bootstrapcdn.com",
+        "cdnjs.cloudflare.com",
+        "maxcdn.com",
+        "fontawesome.com",
+        "google.com",
+        "microsoft.com",
+        "azure.com",
+        "sharepoint.com",
+        "office.com",
+        "office365.com",
+        "microsoftonline.com",
+        "akamai.net",
+        "akamaized.net",
+        "cloudfront.net",
+        "amazonaws.com",
     ];
     let lower = host.to_lowercase();
     cdns.iter().any(|cdn| lower.ends_with(cdn) || lower == *cdn)
@@ -298,11 +320,26 @@ fn looks_internal(host: &str) -> bool {
     }
     // Non-public TLDs or single-label names with dots (e.g. server01.dept)
     let parts: Vec<&str> = lower.split('.').collect();
-    if parts.len() == 2 && parts[1].len() <= 4 && !["com", "org", "net", "edu", "gov", "io"].contains(&parts[1]) {
+    if parts.len() == 2
+        && parts[1].len() <= 4
+        && !["com", "org", "net", "edu", "gov", "io"].contains(&parts[1])
+    {
         return true;
     }
     // Names that look like internal servers
-    let internal_patterns = &["srv", "server", "dc", "fs", "app", "web", "db", "mail", "exchange", "sp", "sharepoint"];
+    let internal_patterns = &[
+        "srv",
+        "server",
+        "dc",
+        "fs",
+        "app",
+        "web",
+        "db",
+        "mail",
+        "exchange",
+        "sp",
+        "sharepoint",
+    ];
     if internal_patterns.iter().any(|p| lower.contains(p)) && !lower.ends_with(".com") {
         return true;
     }
@@ -329,7 +366,8 @@ fn extract_staff_names(text: &str) -> Vec<String> {
             // Extract the value
             let start = cap.find(|c: char| c.is_alphabetic()).unwrap_or(0);
             let after = &cap[start..];
-            let end = after.find(|c: char| c == '"' || c == '<' || c == ',' || c == '}')
+            let end = after
+                .find(|c: char| c == '"' || c == '<' || c == ',' || c == '}')
                 .unwrap_or(after.len().min(60));
             let name = after[..end].trim();
             if !name.is_empty()
@@ -364,9 +402,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         &build_base_url(&normalized, port, use_tls),
     )
     .await?;
-    let download_files = cfg_prompt_yes_no("download", "Download accessible documents?", true).await?;
+    let download_files =
+        cfg_prompt_yes_no("download", "Download accessible documents?", true).await?;
     let output_dir = if download_files {
-        cfg_prompt_output_file("output_dir", "Output directory for harvested files", "sp_harvest_output").await?
+        cfg_prompt_output_file(
+            "output_dir",
+            "Output directory for harvested files",
+            "sp_harvest_output",
+        )
+        .await?
     } else {
         String::new()
     };
@@ -390,7 +434,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // ================================================================
     // PHASE 1: Detect SharePoint version
     // ================================================================
-    crate::mprintln!("{}", "[Phase 1] Detecting SharePoint version...".bold().cyan());
+    crate::mprintln!(
+        "{}",
+        "[Phase 1] Detecting SharePoint version...".bold().cyan()
+    );
 
     ctx.rate_limit(&normalized).await;
     let mut sp_version = String::new();
@@ -444,7 +491,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     "{}",
                     format!("[+] /_api/web/RegionalSettings accessible ({})", status).green()
                 );
-                if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Note,
@@ -481,7 +533,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let vti_url = format!("{}/_vti_pvt/service.cnf", base_url);
     match client.get(&vti_url).send().await {
         Ok(resp) if resp.status().is_success() => {
-            if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                resp,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            {
                 crate::mprintln!(
                     "{}",
                     format!("[+] /_vti_pvt/service.cnf accessible").green()
@@ -492,10 +549,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         if sp_version.is_empty() {
                             sp_version = ver.clone();
                         }
-                        crate::mprintln!(
-                            "{}",
-                            format!("[+] Extender version: {}", ver).green()
-                        );
+                        crate::mprintln!("{}", format!("[+] Extender version: {}", ver).green());
                         outcome.findings.push(Finding {
                             target: target.to_string(),
                             kind: FindingKind::Banner,
@@ -529,11 +583,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
-                    crate::mprintln!(
-                        "{}",
-                        "[+] sitedata.asmx GetSiteAndWeb responded".green()
-                    );
+                if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
+                    crate::mprintln!("{}", "[+] sitedata.asmx GetSiteAndWeb responded".green());
                     // Extract GUID or site info
                     if body.contains("<strSite>") || body.contains("<strWeb>") {
                         outcome.findings.push(Finding {
@@ -555,10 +611,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
         }
         Err(e) => {
-            crate::mprintln!(
-                "{}",
-                format!("[-] sitedata.asmx error: {}", e).dimmed()
-            );
+            crate::mprintln!("{}", format!("[-] sitedata.asmx error: {}", e).dimmed());
         }
     }
 
@@ -589,10 +642,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                resp,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            {
                 crate::mprintln!(
                     "{}",
-                    "[+] /_api/web/lists accessible - full list enumeration!".green().bold()
+                    "[+] /_api/web/lists accessible - full list enumeration!"
+                        .green()
+                        .bold()
                 );
                 outcome.findings.push(Finding {
                     target: target.to_string(),
@@ -604,10 +664,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 for segment in body.split("\"Title\":\"").skip(1) {
                     if let Some(end) = segment.find('"') {
                         let title = &segment[..end];
-                        crate::mprintln!(
-                            "{}",
-                            format!("    [list] {}", title).green()
-                        );
+                        crate::mprintln!("{}", format!("    [list] {}", title).green());
                     }
                 }
                 // Also extract metadata from the response
@@ -649,7 +706,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 let status = resp.status();
                 if status.is_success() {
                     lib_accessible = true;
-                    if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                    if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                        resp,
+                        crate::utils::safe_io::DEFAULT_BODY_CAP,
+                    )
+                    .await
+                    {
                         page_content = body;
                     }
                     crate::mprintln!(
@@ -659,7 +721,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 } else if status.as_u16() == 401 || status.as_u16() == 403 {
                     crate::mprintln!(
                         "{}",
-                        format!("[*] {} AllItems.aspx: {} (will try direct file access)", lib_path, status).yellow()
+                        format!(
+                            "[*] {} AllItems.aspx: {} (will try direct file access)",
+                            lib_path, status
+                        )
+                        .yellow()
                     );
                 } else {
                     crate::mprintln!(
@@ -668,7 +734,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     );
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!("AllItems.aspx request failed: {e:#}");
+            }
         }
 
         // Try the library root directly
@@ -679,7 +747,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     let status = resp.status();
                     if status.is_success() {
                         lib_accessible = true;
-                        if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                        if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                            resp,
+                            crate::utils::safe_io::DEFAULT_BODY_CAP,
+                        )
+                        .await
+                        {
                             page_content = body;
                         }
                         crate::mprintln!(
@@ -688,7 +761,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         );
                     }
                 }
-                Err(_) => {}
+                Err(e) => {
+                    tracing::debug!("SharePoint library root request failed: {e:#}");
+                }
             }
         }
 
@@ -747,7 +822,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
                     if body.contains("<sListMetadata>") || body.contains("<GetListResult>") {
                         crate::mprintln!(
                             "{}",
@@ -814,11 +894,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
                     crate::mprintln!(
                         "{}",
-                        format!(
-                            "[+] ACCESSIBLE: {} ({} bytes)",
-                            doc_url, content_length
-                        )
-                        .green()
+                        format!("[+] ACCESSIBLE: {} ({} bytes)", doc_url, content_length).green()
                     );
 
                     // Download if requested
@@ -831,11 +907,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                                     .next()
                                     .unwrap_or("unknown")
                                     .replace("%20", "_");
-                                let filepath =
-                                    format!("{}/{}", output_dir, filename);
-                                if let Ok(bytes) = crate::utils::safe_io::read_http_body_capped(dl_resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
-                                    total_bytes = total_bytes
-                                        .saturating_sub(content_length)
+                                let filepath = format!("{}/{}", output_dir, filename);
+                                if let Ok(bytes) = crate::utils::safe_io::read_http_body_capped(
+                                    dl_resp,
+                                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                                )
+                                .await
+                                {
+                                    total_bytes = total_bytes.saturating_sub(content_length)
                                         + bytes.len() as u64;
                                     if let Err(e) = std::fs::write(&filepath, &bytes) {
                                         crate::mprintln!(
@@ -859,17 +938,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         }
                     }
                 } else {
-                    crate::mprintln!(
-                        "{}",
-                        format!("[*] {}: {}", doc_url, status).dimmed()
-                    );
+                    crate::mprintln!("{}", format!("[*] {}: {}", doc_url, status).dimmed());
                 }
             }
             Err(e) => {
-                crate::mprintln!(
-                    "{}",
-                    format!("[-] {}: {}", doc_url, e).dimmed()
-                );
+                crate::mprintln!("{}", format!("[-] {}: {}", doc_url, e).dimmed());
             }
         }
     }
@@ -915,11 +988,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
                     crate::mprintln!(
                         "{}",
-                        format!(
-                            "[+] FOUND: {} ({} bytes)",
-                            file_url, content_length
-                        )
-                        .green()
+                        format!("[+] FOUND: {} ({} bytes)", file_url, content_length).green()
                     );
 
                     if download_files && !output_dir.is_empty() {
@@ -927,7 +996,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         match client.get(&file_url).send().await {
                             Ok(dl_resp) if dl_resp.status().is_success() => {
                                 let filepath = format!("{}/{}", output_dir, filename);
-                                if let Ok(bytes) = crate::utils::safe_io::read_http_body_capped(dl_resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                                if let Ok(bytes) = crate::utils::safe_io::read_http_body_capped(
+                                    dl_resp,
+                                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                                )
+                                .await
+                                {
                                     if let Err(e) = std::fs::write(&filepath, &bytes) {
                                         crate::mprintln!(
                                             "{}",
@@ -955,10 +1029,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // ================================================================
     // PHASE 4: Extract metadata
     // ================================================================
-    crate::mprintln!(
-        "{}",
-        "[Phase 4] Extracting metadata...".bold().cyan()
-    );
+    crate::mprintln!("{}", "[Phase 4] Extracting metadata...".bold().cyan());
 
     // Scan additional pages for metadata if we haven't already
     let metadata_pages = &[
@@ -979,11 +1050,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let page_url = format!("{}{}", base_url, page);
         match client.get(&page_url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
-                    crate::mprintln!(
-                        "{}",
-                        format!("[+] {} accessible", page).green()
-                    );
+                if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
+                    crate::mprintln!("{}", format!("[+] {} accessible", page).green());
                     // Extract all metadata
                     let emails = extract_emails(&body);
                     for e in emails {
@@ -1096,12 +1169,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                resp,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            {
                 if body.contains("<GetSiteUrlResult>") || body.contains("<siteUrl>") {
-                    crate::mprintln!(
-                        "{}",
-                        "[+] SOAP GetSiteUrl accessible".green()
-                    );
+                    crate::mprintln!("{}", "[+] SOAP GetSiteUrl accessible".green());
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Note,
@@ -1136,12 +1211,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                resp,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            {
                 if body.contains("<WebUrlFromPageUrlResult>") {
-                    crate::mprintln!(
-                        "{}",
-                        "[+] SOAP WebUrlFromPageUrl accessible".green()
-                    );
+                    crate::mprintln!("{}", "[+] SOAP WebUrlFromPageUrl accessible".green());
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Note,
@@ -1157,10 +1234,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
         }
         _ => {
-            crate::mprintln!(
-                "{}",
-                "[*] SOAP WebUrlFromPageUrl: not accessible".dimmed()
-            );
+            crate::mprintln!("{}", "[*] SOAP WebUrlFromPageUrl: not accessible".dimmed());
         }
     }
 
@@ -1181,11 +1255,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                if let Ok(body) = crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
-                    crate::mprintln!(
-                        "{}",
-                        "[+] Authentication.asmx Mode accessible".green()
-                    );
+                if let Ok(body) = crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
+                    crate::mprintln!("{}", "[+] Authentication.asmx Mode accessible".green());
                     // Extract auth mode
                     let mode = if body.contains("Windows") {
                         "Windows"
@@ -1196,10 +1272,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     } else {
                         "Unknown"
                     };
-                    crate::mprintln!(
-                        "{}",
-                        format!("    Auth mode: {}", mode).green()
-                    );
+                    crate::mprintln!("{}", format!("    Auth mode: {}", mode).green());
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Note,
@@ -1248,16 +1321,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     );
     crate::mprintln!(
         "{}",
-        format!(
-            "  Accessible libraries: {}",
-            accessible_libraries.len()
-        )
-        .cyan()
+        format!("  Accessible libraries: {}", accessible_libraries.len()).cyan()
     );
-    crate::mprintln!(
-        "{}",
-        format!("  Documents found: {}", total_docs).cyan()
-    );
+    crate::mprintln!("{}", format!("  Documents found: {}", total_docs).cyan());
     crate::mprintln!(
         "{}",
         format!(
@@ -1271,18 +1337,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         "{}",
         format!("  Emails extracted: {}", all_emails.len()).cyan()
     );
-    crate::mprintln!(
-        "{}",
-        format!("  Staff names: {}", all_names.len()).cyan()
-    );
+    crate::mprintln!("{}", format!("  Staff names: {}", all_names.len()).cyan());
     crate::mprintln!(
         "{}",
         format!("  Internal hostnames: {}", all_hostnames.len()).cyan()
     );
-    crate::mprintln!(
-        "{}",
-        format!("  CSRF tokens: {}", all_digests.len()).cyan()
-    );
+    crate::mprintln!("{}", format!("  CSRF tokens: {}", all_digests.len()).cyan());
     crate::mprintln!();
 
     // Primary finding: document harvesting
@@ -1306,13 +1366,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     if accessible_libraries.is_empty() && total_docs == 0 && outcome.findings.is_empty() {
-        crate::mprintln!(
-            "{}",
-            "  No anonymous access detected.".green()
-        );
+        crate::mprintln!("{}", "  No anonymous access detected.".green());
     }
 
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "sharepoint_doc_harvest", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "sharepoint_doc_harvest",
+    native
+);

@@ -39,7 +39,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     outcome.findings.push(Finding {
         target: target.to_string(),
         kind: FindingKind::Note,
-        message: format!("sample_plugin executed action '{}' against {}", action, target),
+        message: format!(
+            "sample_plugin executed action '{}' against {}",
+            action, target
+        ),
         data: Some(serde_json::json!({
             "action": action,
             "target": target,

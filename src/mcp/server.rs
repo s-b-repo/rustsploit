@@ -4,85 +4,16 @@ use anyhow::Context;
 use serde_json::{Map, Value};
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler, serve_server,
+    ErrorData as McpError, ServerHandler,
     model::{
         AnnotateAble, CallToolRequestParams, CallToolResult, Content, Implementation,
-        InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams, RawResource,
-        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        RawResource, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
         ServerCapabilities, ServerInfo, Tool,
     },
+    serve_server,
     service::{RequestContext, RoleServer},
 };
-
-/// Read the libc errno value for the current thread, in a portable way.
-fn errno() -> i32 {
-    // SAFETY: `__errno_location` / `__error` return a valid pointer to a
-    // thread-local int that remains valid for the duration of the thread; a
-    // single `*ptr` read of a primitive `c_int` cannot violate any invariant.
-    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
-    unsafe { *libc::__error() }
-
-    #[cfg(target_os = "linux")]
-    // SAFETY: see comment above; `__errno_location` mirrors the BSD `__error`.
-    unsafe { *libc::__errno_location() }
-
-    // Fallback for other Unixes: errno isn't reliably accessible without a
-    // platform-specific symbol, so callers will see `0`.
-    #[cfg(not(any(target_os = "freebsd", target_os = "macos", target_os = "linux")))]
-    { 0 }
-}
-
-/// Save the original stdout (fd 1) into a new fd, then redirect fd 1 to
-/// `/dev/null`. The returned tokio file is the *only* remaining handle to the
-/// original stdout — used by the MCP server to emit JSON-RPC responses on a
-/// channel that user-mode `println!` calls can no longer corrupt.
-fn isolate_protocol_stdout() -> anyhow::Result<tokio::fs::File> {
-    use std::os::fd::FromRawFd;
-
-    // SAFETY: `dup(1)` is a no-arg syscall that returns either a fresh valid
-    // fd or -1. We immediately check the return value before doing anything
-    // that depends on its validity.
-    let saved_fd = unsafe { libc::dup(1) };
-    if saved_fd < 0 {
-        anyhow::bail!("dup(1) failed: errno {}", errno());
-    }
-
-    let null_path = b"/dev/null\0";
-    // SAFETY: `null_path` is a NUL-terminated, statically-allocated byte
-    // string with a pointer valid for the duration of the call; `O_WRONLY` is
-    // a libc-defined constant. `open` returns -1 on failure, checked below.
-    let null_fd = unsafe {
-        libc::open(null_path.as_ptr() as *const libc::c_char, libc::O_WRONLY)
-    };
-    if null_fd < 0 {
-        // SAFETY: `saved_fd` is a valid open fd we just received from `dup`.
-        unsafe { libc::close(saved_fd); }
-        anyhow::bail!("open(/dev/null) failed: errno {}", errno());
-    }
-
-    // SAFETY: `null_fd` and `1` are both valid open fds (1 is stdout; the
-    // dup above proved it is open and non-error). `dup2` either succeeds and
-    // installs `null_fd` as fd 1, or returns -1.
-    let dup2_ret = unsafe { libc::dup2(null_fd, 1) };
-    if dup2_ret < 0 {
-        // SAFETY: both fds are valid open descriptors at this point.
-        unsafe {
-            libc::close(null_fd);
-            libc::close(saved_fd);
-        }
-        anyhow::bail!("dup2(null, 1) failed: errno {}", errno());
-    }
-    // SAFETY: `null_fd` is a valid open fd; closing the source after a
-    // successful `dup2` is the standard idiom — fd 1 keeps the kernel-side
-    // open file description alive.
-    unsafe { libc::close(null_fd); }
-
-    // SAFETY: `saved_fd` is owned by us (returned by `dup`, never close()d
-    // here, never given to anyone else); transferring it into a `File` makes
-    // that file the sole owner so the eventual Drop closes it exactly once.
-    let std_file = unsafe { std::fs::File::from_raw_fd(saved_fd) };
-    Ok(tokio::fs::File::from_std(std_file))
-}
 
 /// Per-tool-call execution budget. A single hung/slow tool must not be able to
 /// wedge the server forever, so `tools/call` dispatch is bounded by this
@@ -95,7 +26,9 @@ fn module_timeout() -> Option<std::time::Duration> {
             Ok(secs) => Some(std::time::Duration::from_secs(secs)),
             // Unparseable override falls back to the default rather than panicking.
             Err(e) => {
-                tracing::debug!("RUSTSPLOIT_MCP_TIMEOUT_SECS is not a valid u64, using 300s default: {e}");
+                tracing::debug!(
+                    "RUSTSPLOIT_MCP_TIMEOUT_SECS is not a valid u64, using 300s default: {e}"
+                );
                 Some(std::time::Duration::from_secs(300))
             }
         },
@@ -115,7 +48,7 @@ fn module_timeout() -> Option<std::time::Duration> {
 /// fd 1 is redirected to `/dev/null` and the saved descriptor becomes the
 /// transport's writer. Module output is captured through `OUTPUT_BUFFER`.
 pub async fn run_mcp_server() -> anyhow::Result<()> {
-    let protocol_out = isolate_protocol_stdout()
+    let protocol_out = crate::native::io::isolate_protocol_stdout()
         .context("Cannot isolate protocol stdout — aborting to prevent JSON-RPC corruption")?;
 
     eprintln!("[MCP] RustSploit MCP server started (rmcp SDK, stdio transport)");

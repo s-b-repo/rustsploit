@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use once_cell::sync::Lazy;
 
 use crate::cred_store::CredStore;
@@ -51,6 +52,27 @@ impl TenantData {
             job_manager: JobManager::new(),
         }
     }
+
+    /// A throwaway, isolated store for a tenant whose registration was
+    /// REJECTED (name invalid after sanitization, or server at capacity).
+    /// Used by `resolve()` so a rejected tenant degrades to a private scratch
+    /// space instead of silently falling back to the process-global stores —
+    /// which would leak this caller's loot/creds/options into shared storage
+    /// visible outside their isolation boundary. Nothing written here is ever
+    /// registered in the registry, so it is unreachable from other tenants.
+    fn ephemeral_rejected(tenant_id: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "rustsploit-rejected-tenant-{}",
+            sanitize_tenant_name(tenant_id)
+        ));
+        tracing::warn!(
+            "tenant '{}' rejected by registry — using isolated ephemeral store at {} \
+             (writes will NOT persist to the real tenant store)",
+            tenant_id,
+            dir.display()
+        );
+        Self::new(dir)
+    }
 }
 
 struct TenantRegistry {
@@ -64,10 +86,10 @@ impl TenantRegistry {
         }
     }
 
-    fn get_or_create(&self, tenant_id: &str) -> Result<Arc<TenantData>, String> {
+    fn get_or_create(&self, tenant_id: &str) -> anyhow::Result<Arc<TenantData>> {
         let sanitized = sanitize_tenant_name(tenant_id);
         if sanitized.is_empty() {
-            return Err("tenant name is empty after sanitization".to_string());
+            anyhow::bail!("tenant name is empty after sanitization");
         }
         {
             let tenants = self.tenants.read().unwrap_or_else(|e| e.into_inner());
@@ -89,8 +111,7 @@ impl TenantRegistry {
                 // detached job is still running would be evicted — orphaning the
                 // job (invisible to list()/kill()) and re-routing its loot/
                 // findings into a freshly-created store on the next resolve().
-                let active = Arc::strong_count(data) > 1
-                    || data.job_manager.running_count() > 0;
+                let active = Arc::strong_count(data) > 1 || data.job_manager.running_count() > 0;
                 if !active {
                     tracing::info!("Evicting idle tenant '{}' to make room", name);
                 }
@@ -98,7 +119,11 @@ impl TenantRegistry {
             });
             let evicted = before - tenants.len();
             if evicted > 0 {
-                tracing::info!("Evicted {} idle tenant(s), {} remaining", evicted, tenants.len());
+                tracing::info!(
+                    "Evicted {} idle tenant(s), {} remaining",
+                    evicted,
+                    tenants.len()
+                );
             }
         }
         if tenants.len() >= MAX_TENANTS {
@@ -107,10 +132,10 @@ impl TenantRegistry {
                 MAX_TENANTS,
                 tenant_id
             );
-            return Err(format!(
+            anyhow::bail!(
                 "server at capacity ({} active tenants) — connection refused",
                 MAX_TENANTS
-            ));
+            );
         }
         let base_dir = tenant_base_dir_sanitized(&sanitized);
         let data = Arc::new(TenantData::new(base_dir));
@@ -197,20 +222,25 @@ impl Stores {
 /// 3. Falls back to global singletons (shell mode)
 ///
 /// If a tenant ID is present but the registry rejects it (cap reached,
-/// invalid name), logs a warning and falls back to global singletons
-/// rather than panicking — the caller is typically deep in module code
-/// where a hard error would be surprising. The PQ handshake layer is
-/// responsible for rejecting connections before they get this far.
+/// invalid name), the caller gets an ISOLATED EPHEMERAL store rather than
+/// the process-global singletons: silently routing a rejected tenant's
+/// writes into shared storage would break multi-tenant isolation. The PQ
+/// handshake layer is responsible for rejecting connections before they
+/// get this far, so this path is defence-in-depth.
 pub fn resolve() -> Stores {
     let tenant_id = CURRENT_TENANT
         .try_with(|t| t.clone())
         .ok()
         .or_else(crate::context::current_tenant_id);
-    let tenant = tenant_id.and_then(|id| match REGISTRY.get_or_create(&id) {
-        Ok(data) => Some(data),
+    let tenant = tenant_id.map(|id| match REGISTRY.get_or_create(&id) {
+        Ok(data) => data,
         Err(e) => {
-            tracing::warn!("tenant resolve failed for '{}': {}", id, e);
-            None
+            tracing::error!(
+                "tenant resolve failed for '{}': {} — isolating into an ephemeral store",
+                id,
+                e
+            );
+            Arc::new(TenantData::ephemeral_rejected(&id))
         }
     });
     Stores { tenant }
@@ -218,9 +248,9 @@ pub fn resolve() -> Stores {
 
 /// Resolve stores for a specific tenant by name. Returns `Err` if the
 /// tenant cannot be created (cap reached, invalid name after sanitization).
-pub fn resolve_for(tenant_id: &str) -> Result<Stores, String> {
-    let data = REGISTRY.get_or_create(tenant_id)?;
-    Ok(Stores {
-        tenant: Some(data),
-    })
+pub fn resolve_for(tenant_id: &str) -> anyhow::Result<Stores> {
+    let data = REGISTRY
+        .get_or_create(tenant_id)
+        .with_context(|| format!("resolving tenant '{tenant_id}'"))?;
+    Ok(Stores { tenant: Some(data) })
 }

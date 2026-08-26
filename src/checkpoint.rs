@@ -54,8 +54,7 @@ struct CheckpointHeader {
 /// the JSON header; each subsequent non-empty line is a processed target.
 /// Malformed lines (e.g. a torn final line after a crash) are skipped.
 fn load_from_path(path: &Path) -> Result<Checkpoint> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut lines = raw.lines();
     let header_line = lines.next().unwrap_or("");
     let header: CheckpointHeader = serde_json::from_str(header_line)
@@ -181,7 +180,8 @@ impl CheckpointWriter {
         let mut g = self.inner.lock().await;
         g.closed = true;
         if g.path.exists() {
-            tokio::fs::remove_file(&g.path).await
+            tokio::fs::remove_file(&g.path)
+                .await
                 .with_context(|| format!("rm {}", g.path.display()))?;
         }
         Ok(())
@@ -278,9 +278,13 @@ fn seq_marker_path(scan_id: &str) -> PathBuf {
 }
 
 /// Read the sequential resume point (last dispatched IPv4 as u32), if any.
-pub fn read_seq_marker(scan_id: &str) -> Option<u32> {
+///
+/// Async + `tokio::fs`: called from the scheduler's async sequential fan-out;
+/// blocking I/O there would stall a runtime worker (tiny file, but the rule
+/// holds).
+pub async fn read_seq_marker(scan_id: &str) -> Option<u32> {
     let path = seq_marker_path(scan_id);
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(s) => match s.trim().parse::<u32>() {
             Ok(v) => Some(v),
             Err(e) => {
@@ -297,23 +301,23 @@ pub fn read_seq_marker(scan_id: &str) -> Option<u32> {
 }
 
 /// Persist the sequential high-water IPv4 (best-effort; logs at debug on error).
-pub fn write_seq_marker(scan_id: &str, ip: u32) {
+pub async fn write_seq_marker(scan_id: &str, ip: u32) {
     let path = seq_marker_path(scan_id);
     if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
         tracing::debug!("seq marker mkdir {} failed: {e}", parent.display());
         return;
     }
-    if let Err(e) = std::fs::write(&path, ip.to_string()) {
+    if let Err(e) = tokio::fs::write(&path, ip.to_string()).await {
         tracing::debug!("seq marker write {} failed: {e}", path.display());
     }
 }
 
 /// Remove the sequential marker on clean completion (best-effort).
-pub fn clear_seq_marker(scan_id: &str) {
+pub async fn clear_seq_marker(scan_id: &str) {
     let path = seq_marker_path(scan_id);
-    match std::fs::remove_file(&path) {
+    match tokio::fs::remove_file(&path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::debug!("seq marker remove {} failed: {e}", path.display()),
@@ -333,9 +337,11 @@ fn bruteforce_marker_path(key: &str) -> PathBuf {
 
 /// Read the last fully-completed batch index for a streaming bruteforce, or 0
 /// when there is no marker (start from the beginning).
-pub fn read_bruteforce_marker(key: &str) -> usize {
+///
+/// Async + `tokio::fs`: callers are the async bruteforce engine.
+pub async fn read_bruteforce_marker(key: &str) -> usize {
     let path = bruteforce_marker_path(key);
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(s) => match s.trim().parse::<usize>() {
             Ok(v) => v,
             Err(e) => {
@@ -352,23 +358,23 @@ pub fn read_bruteforce_marker(key: &str) -> usize {
 }
 
 /// Persist the last fully-completed batch index (best-effort; logs at debug).
-pub fn write_bruteforce_marker(key: &str, batch_idx: usize) {
+pub async fn write_bruteforce_marker(key: &str, batch_idx: usize) {
     let path = bruteforce_marker_path(key);
     if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
         tracing::debug!("bruteforce marker mkdir {} failed: {e}", parent.display());
         return;
     }
-    if let Err(e) = std::fs::write(&path, batch_idx.to_string()) {
+    if let Err(e) = tokio::fs::write(&path, batch_idx.to_string()).await {
         tracing::debug!("bruteforce marker write {} failed: {e}", path.display());
     }
 }
 
 /// Remove the bruteforce batch marker on clean completion (best-effort).
-pub fn clear_bruteforce_marker(key: &str) {
+pub async fn clear_bruteforce_marker(key: &str) {
     let path = bruteforce_marker_path(key);
-    match std::fs::remove_file(&path) {
+    match tokio::fs::remove_file(&path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::debug!("bruteforce marker remove {} failed: {e}", path.display()),
@@ -391,7 +397,10 @@ fn sanitize(s: &str) -> String {
 fn collect_checkpoints_in(dir: &Path, out: &mut Vec<Checkpoint>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) => { tracing::debug!("skipping checkpoint dir {}: {e}", dir.display()); return; }
+        Err(e) => {
+            tracing::debug!("skipping checkpoint dir {}: {e}", dir.display());
+            return;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -400,7 +409,9 @@ fn collect_checkpoints_in(dir: &Path, out: &mut Vec<Checkpoint>) {
         }
         match load_from_path(&path) {
             Ok(cp) => out.push(cp),
-            Err(e) => { tracing::debug!("skipping unreadable checkpoint {}: {e}", path.display()); }
+            Err(e) => {
+                tracing::debug!("skipping unreadable checkpoint {}: {e}", path.display());
+            }
         }
     }
 }
@@ -433,7 +444,10 @@ pub fn list_checkpoints() -> Result<Vec<Checkpoint>> {
                     }
                 }
             }
-            Err(e) => tracing::debug!("read tenants checkpoint dir {} failed: {e}", tenants_dir.display()),
+            Err(e) => tracing::debug!(
+                "read tenants checkpoint dir {} failed: {e}",
+                tenants_dir.display()
+            ),
         }
     }
     out.sort_by(|a, b| a.started.cmp(&b.started));
@@ -477,4 +491,3 @@ impl std::fmt::Display for Checkpoint {
         )
     }
 }
-

@@ -45,7 +45,7 @@ The server reads one JSON-RPC 2.0 request per line from stdin and writes one res
 | `list_modules` | List all available modules, optionally filtered by category | -- |
 | `search_modules` | Search modules by keyword (case-insensitive substring match) | `query` |
 | `module_info` | Get metadata for a specific module (name, description, authors, references, rank) | `module_path` |
-| `check_module` | Run a module's `check` entry point against a target | `module_path`, `target` |
+|| `check_module` | Run a module's `check` entry point against a target (legacy — vestigial, framework is exploitation-only) | `module_path`, `target` |
 
 ### Target Tools
 

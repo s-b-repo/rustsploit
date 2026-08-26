@@ -139,7 +139,8 @@ impl ToolResult {
 
     /// Serialize any `Serialize` value into pretty-printed JSON text.
     pub fn json(v: &impl Serialize) -> Self {
-        let text = serde_json::to_string_pretty(v).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+        let text =
+            serde_json::to_string_pretty(v).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
         Self {
             content: vec![ToolContent {
                 content_type: "text".to_string(),

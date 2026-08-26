@@ -38,7 +38,7 @@ pub const DEFAULT_RAW_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 #[inline]
 pub fn apply_raw_send_timeout(socket: &socket2::Socket) {
     if let Err(e) = socket.set_write_timeout(Some(DEFAULT_RAW_SEND_TIMEOUT)) {
-        eprintln!("[!] Failed to set write timeout: {}", e);
+        crate::meprintln!("[!] Failed to set write timeout: {}", e);
     }
 }
 
@@ -112,7 +112,11 @@ fn getrlimit_native(resource: libc::__rlimit_resource_t) -> std::io::Result<(u64
 }
 
 #[cfg(unix)]
-fn setrlimit_native(resource: libc::__rlimit_resource_t, soft: u64, hard: u64) -> std::io::Result<()> {
+fn setrlimit_native(
+    resource: libc::__rlimit_resource_t,
+    soft: u64,
+    hard: u64,
+) -> std::io::Result<()> {
     let rl = libc::rlimit {
         rlim_cur: soft as libc::rlim_t,
         rlim_max: hard as libc::rlim_t,
@@ -136,8 +140,7 @@ pub fn read_dos_limits() -> Option<DosLimits> {
     // RLIMIT_NPROC is BSD/Linux; some libc targets won't define it, but on
     // every Unix we ship for it does. If the syscall fails (rare), we fall
     // back to "unlimited" so we don't block a run on a missing knob.
-    let (np_soft, np_hard) = getrlimit_native(libc::RLIMIT_NPROC)
-        .unwrap_or((u64::MAX, u64::MAX));
+    let (np_soft, np_hard) = getrlimit_native(libc::RLIMIT_NPROC).unwrap_or((u64::MAX, u64::MAX));
     Some(DosLimits {
         nofile_soft: no_soft,
         nofile_hard: no_hard,
@@ -149,7 +152,9 @@ pub fn read_dos_limits() -> Option<DosLimits> {
 }
 
 #[cfg(not(unix))]
-pub fn read_dos_limits() -> Option<DosLimits> { None }
+pub fn read_dos_limits() -> Option<DosLimits> {
+    None
+}
 
 #[cfg(unix)]
 #[inline]
@@ -178,8 +183,8 @@ fn is_root() -> bool {
 #[cfg(unix)]
 pub fn prepare_dos_limits(needed_fds: u64, needed_threads: u64) -> std::io::Result<DosLimits> {
     let (mut no_soft, mut no_hard) = getrlimit_native(libc::RLIMIT_NOFILE)?;
-    let (mut np_soft, mut np_hard) = getrlimit_native(libc::RLIMIT_NPROC)
-        .unwrap_or((u64::MAX, u64::MAX));
+    let (mut np_soft, mut np_hard) =
+        getrlimit_native(libc::RLIMIT_NPROC).unwrap_or((u64::MAX, u64::MAX));
 
     let target_no_soft = needed_fds.saturating_add(RESERVED_FDS);
     let target_np_soft = needed_threads.saturating_add(64);
@@ -200,7 +205,9 @@ pub fn prepare_dos_limits(needed_fds: u64, needed_threads: u64) -> std::io::Resu
         }
         if no_soft < target_no_soft {
             let new_soft = target_no_soft.min(no_hard);
-            if new_soft > no_soft && setrlimit_native(libc::RLIMIT_NOFILE, new_soft, no_hard).is_ok() {
+            if new_soft > no_soft
+                && setrlimit_native(libc::RLIMIT_NOFILE, new_soft, no_hard).is_ok()
+            {
                 no_soft = new_soft;
                 raised = true;
             }
@@ -220,7 +227,8 @@ pub fn prepare_dos_limits(needed_fds: u64, needed_threads: u64) -> std::io::Resu
         }
         if np_soft < target_np_soft {
             let new_soft = target_np_soft.min(np_hard);
-            if new_soft > np_soft && setrlimit_native(libc::RLIMIT_NPROC, new_soft, np_hard).is_ok() {
+            if new_soft > np_soft && setrlimit_native(libc::RLIMIT_NPROC, new_soft, np_hard).is_ok()
+            {
                 np_soft = new_soft;
                 raised = true;
             }
@@ -238,8 +246,14 @@ pub fn prepare_dos_limits(needed_fds: u64, needed_threads: u64) -> std::io::Resu
 }
 
 #[cfg(not(unix))]
-pub fn prepare_dos_limits(_needed_fds: u64, _needed_threads: u64) -> std::io::Result<DosLimits> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "rlimit not supported on this platform"))
+pub fn prepare_dos_limits(needed_fds: u64, needed_threads: u64) -> std::io::Result<DosLimits> {
+    tracing::trace!(
+        "prepare_dos_limits unavailable on this platform (needed fds: {needed_fds}, threads: {needed_threads})"
+    );
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "rlimit not supported on this platform",
+    ))
 }
 
 /// Convenience wrapper used by every DoS module: print a one-line status
@@ -268,9 +282,13 @@ pub fn ensure_dos_capacity(
     if let Some(initial) = read_dos_limits() {
         crate::mprintln!(
             "[*] {}: starting ulimits — RLIMIT_NOFILE soft={} hard={} | RLIMIT_NPROC soft={} hard={} | needed: {} fds, {} threads",
-            module, initial.nofile_soft, initial.nofile_hard,
-            initial.nproc_soft, initial.nproc_hard,
-            needed_fds, needed_threads,
+            module,
+            initial.nofile_soft,
+            initial.nofile_hard,
+            initial.nproc_soft,
+            initial.nproc_hard,
+            needed_fds,
+            needed_threads,
         );
     }
 
@@ -300,15 +318,22 @@ pub fn ensure_dos_capacity(
     if limits.raised {
         crate::mprintln!(
             "[*] {}: raised RLIMIT_NOFILE to {} (hard {}) / RLIMIT_NPROC to {} (hard {})",
-            module, limits.nofile_soft, limits.nofile_hard,
-            limits.nproc_soft, limits.nproc_hard,
+            module,
+            limits.nofile_soft,
+            limits.nofile_hard,
+            limits.nproc_soft,
+            limits.nproc_hard,
         );
     }
     if clamped < requested_workers {
         crate::mprintln!(
             "[!] {}: clamped workers {} -> {} to fit usable_fds={} (fds_per_worker={}) / nproc_soft={}",
-            module, requested_workers, clamped, limits.usable_fds,
-            fds_per_worker, limits.nproc_soft,
+            module,
+            requested_workers,
+            clamped,
+            limits.usable_fds,
+            fds_per_worker,
+            limits.nproc_soft,
         );
     }
     (clamped, Some(limits))
@@ -400,11 +425,7 @@ pub fn make_dst_sockaddr_any(ip: IpAddr) -> DstAddr {
 /// `fd` and for matching `dst.sin_family` to whatever socket family `fd`
 /// was opened with (this helper assumes AF_INET).
 #[inline]
-pub fn send_one_raw(
-    fd: i32,
-    buf: &[u8],
-    dst: &libc::sockaddr_in,
-) -> std::io::Result<usize> {
+pub fn send_one_raw(fd: i32, buf: &[u8], dst: &libc::sockaddr_in) -> std::io::Result<usize> {
     // SAFETY: caller owns `fd` (a valid open socket); `buf` is a Rust slice
     // so the `(ptr, len)` pair points to `buf.len()` initialised bytes;
     // `dst` is a valid `&sockaddr_in` whose layout is ABI-compatible with
@@ -430,11 +451,7 @@ pub fn send_one_raw(
 /// IPv6 counterpart of [`send_one_raw`]. Caller is responsible for the
 /// `fd` being an AF_INET6 raw socket.
 #[inline]
-pub fn send_one_raw_v6(
-    fd: i32,
-    buf: &[u8],
-    dst: &libc::sockaddr_in6,
-) -> std::io::Result<usize> {
+pub fn send_one_raw_v6(fd: i32, buf: &[u8], dst: &libc::sockaddr_in6) -> std::io::Result<usize> {
     // SAFETY: identical contract to `send_one_raw` but for the IPv6 sockaddr.
     let ret = unsafe {
         libc::sendto(
@@ -456,11 +473,7 @@ pub fn send_one_raw_v6(
 /// Family-agnostic `sendto`. The right `socklen_t` is computed from the
 /// `DstAddr` variant — caller doesn't have to remember IPv4 vs IPv6 sizes.
 #[inline]
-pub fn send_one_raw_any(
-    fd: i32,
-    buf: &[u8],
-    dst: &DstAddr,
-) -> std::io::Result<usize> {
+pub fn send_one_raw_any(fd: i32, buf: &[u8], dst: &DstAddr) -> std::io::Result<usize> {
     debug_assert_eq!(
         dst.as_ptr_len().1 as usize,
         match dst {
@@ -471,5 +484,117 @@ pub fn send_one_raw_any(
     match dst {
         DstAddr::V4(addr) => send_one_raw(fd, buf, addr),
         DstAddr::V6(addr) => send_one_raw_v6(fd, buf, addr),
+    }
+}
+
+/// Open an AF_INET6 raw socket with `IPV6_HDRINCL` enabled — the userspace
+/// path builds the full IPv6 header (`crate::native::ip_packet::write_ipv6_*`).
+///
+/// `socket2 0.6` exposes no IPv6 header-included setter, so the option is set
+/// via raw `libc::setsockopt`. `send_buf_size` is applied with
+/// `set_send_buffer_size` (failures logged but non-fatal — some kernels reject
+/// the request on unprivileged sockets, which is fine for tests).
+///
+/// SAFETY: the socket owns a valid fd for the `setsockopt` call; `one` is a
+/// real `c_int` and we pass its real size; `setsockopt` copies the value.
+pub fn create_raw_socket_v6(send_buf_size: usize) -> anyhow::Result<socket2::Socket> {
+    use std::os::fd::AsRawFd;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::RAW,
+        Some(socket2::Protocol::from(libc::IPPROTO_RAW)),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create AF_INET6 raw socket (requires root): {}",
+            e
+        )
+    })?;
+    let one: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_HDRINCL,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow::anyhow!(
+            "Failed to set IPV6_HDRINCL: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if let Err(e) = socket.set_send_buffer_size(send_buf_size) {
+        crate::meprintln!("[!] Failed to set v6 send buffer size: {}", e);
+    }
+    apply_raw_send_timeout(&socket);
+    Ok(socket)
+}
+
+/// Send a batch of raw IPv4 packets in one `sendmmsg(2)` syscall — one
+/// destination per message: `bufs[i][..pkt_len]` is sent to `dsts[i]`. The
+/// message count is `min(bufs.len(), dsts.len())`. Returns
+/// `(messages_sent, optional_errno)`; on partial success `sendmmsg` reports the
+/// number actually accepted (which may be < the batch).
+///
+/// This is the batched counterpart of [`send_one_raw`]: amortising the syscall
+/// over a batch lifts raw-flood throughput substantially. Per-message `dsts`
+/// support reflectors/amplifiers that round-robin a different destination per
+/// packet (DNS, NTP, memcached, SSDP, SYN-ACK); for a single fixed destination
+/// pass a slice of the same `sockaddr_in` repeated.
+pub fn send_batch_raw(
+    fd: i32,
+    bufs: &mut [Vec<u8>],
+    pkt_len: usize,
+    dsts: &[libc::sockaddr_in],
+) -> (usize, Option<i32>) {
+    let count = bufs.len().min(dsts.len());
+    if count == 0 {
+        return (0, None);
+    }
+
+    let mut iovecs: Vec<libc::iovec> = bufs[..count]
+        .iter_mut()
+        .map(|b| libc::iovec {
+            iov_base: b.as_mut_ptr() as *mut libc::c_void,
+            iov_len: pkt_len,
+        })
+        .collect();
+
+    let dst_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+    let mut msgs: Vec<libc::mmsghdr> = (0..count)
+        .map(|i| {
+            // SAFETY: `mmsghdr` is a POSIX POD struct (libc Linux extension);
+            // zero is its canonical empty state. Every field sendmmsg observes
+            // is written explicitly below.
+            let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            // `i < count <= dsts.len()` and `iovecs.len() == count`, so both
+            // indexes are in-bounds; `&dsts[i]` / `&mut iovecs[i]` reference
+            // storage that outlives the `sendmmsg` call below.
+            msg.msg_hdr.msg_name = &dsts[i] as *const libc::sockaddr_in as *mut libc::c_void;
+            msg.msg_hdr.msg_namelen = dst_len;
+            msg.msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            msg.msg_hdr.msg_iovlen = 1;
+            msg
+        })
+        .collect();
+
+    // On Linux `c_uint == u32`, so the cast cannot truncate a realistic batch;
+    // saturate anyway for exotic targets.
+    let vlen: libc::c_uint = count.min(libc::c_uint::MAX as usize) as libc::c_uint;
+    // SAFETY: `fd` is a caller-owned valid raw socket; `msgs` is a valid mut
+    // pointer to `vlen` `mmsghdr`s; each `msg_iov` points to one valid `iovec`
+    // whose `iov_base` refers to `pkt_len` initialised bytes inside the
+    // corresponding `Vec<u8>` in `bufs`, and each `msg_name` to a live
+    // `sockaddr_in` in `dsts`. None of these pointers escape this function.
+    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), vlen, 0) };
+    if ret < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        (0, Some(errno))
+    } else {
+        (ret as usize, None)
     }
 }

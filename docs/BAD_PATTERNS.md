@@ -55,6 +55,7 @@ non-zero count as a hard failure.
 | B7 | `\.map_err\(\|_\|`, `\.or_else\(\|_\|` | Throws away the original error type. | Capture the error and wrap it: `.map_err(\|e\| anyhow!("...: {}", e))`. |
 | B8 | `\.to_str\(\)\.ok\(\)` | Header-value utf8 failure becomes `None` and then `""` via `.unwrap_or("")` — the swallow is invisible. | `crate::utils::header_string(headers, "name")` (returns `"<non-utf8>"` sentinel for non-utf8 — the swallow shows up). |
 | B9 | `\.json\([^)]*\)\.await\.ok\(\)`, `\.send\(\)\.await\.ok\(\)`, `\.text\(\)\.await\.ok\(\)` | Discards transport / decode errors. | `match …await { Ok(v) => …, Err(e) => mprintln!(…); return Ok(()); }` |
+| B10 | Underscore-prefixed function parameter (`fn foo(_x: \&T)`) | Suppresses "unused parameter" warning instead of using it. Remove the parameter from the signature, or actually reference it in the body. | If the parameter is genuinely needed by the trait/API contract, use it in a `tracing::trace!` or assert. Otherwise remove it. |
 
 ## C. Compiler-warning-suppression — banned outright
 
@@ -139,6 +140,9 @@ non-zero count as a hard failure.
 | J3 | `\.clone\(\)\s*\.clone`, `\.to_string\(\)\s*\.to_string`, `\.to_owned\(\)\s*\.to_owned` | Double allocation. | Single call. |
 | J4 | `XXXXXX`, `TODO`, `FIXME`, `HACK\b` | Placeholder URLs / unfinished work. | Replace with real value or remove. |
 | J5 | `Bearer\s+[A-Za-z0-9_.-]{40,}`, `sk-[A-Za-z0-9]{20,}`, `AKIA[A-Z0-9]{16}`, hardcoded `"admin"\s*,\s*"admin"` and friends | Embedded secrets in source / placeholder pairs that look like secrets to scanners. | Prompt for values via `cfg_prompt_required` / read from env. |
+| J7 | `use crate_name as _;` | Underscore import to bypass `unused_crate_dependencies` lint — hides the fact that a crate listed in Cargo.toml is never referenced by any source file. | Remove the crate from Cargo.toml if unused, or add an `extern crate` declaration if it is a transitive dependency required at link time. |
+| J8 | `let _variable = expr;` where expr is NOT a `Result` | Discards a non-Result value to suppress "unused variable" warning. | Actually use the variable in the code, or remove the `let` binding entirely. |
+| J9 | `extern crate X;` in edition 2024 code without `use X;` | Old-style import used to bypass `unused_crate_dependencies` warnings instead of properly wiring the dependency. | Ensure the crate is actually used by at least one module, or remove it from Cargo.toml. |
 | J6 | `Box<dyn` in module returns | Module trait-objects are unnecessary in this codebase; `anyhow::Error` is the framework's error type. | `anyhow::Result<T>` / `anyhow::Error`. |
 
 ## K0. Mass-scan compatibility

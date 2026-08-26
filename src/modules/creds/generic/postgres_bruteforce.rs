@@ -4,13 +4,13 @@
 //! fan-out. Each invocation tries default credentials first, then iterates
 //! over operator-supplied wordlists via `crate::utils::creds_helper`.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PG_PORT: u16 = 5432;
 
@@ -36,9 +36,7 @@ pub fn info() -> ModuleInfo {
              scheduler does CIDR / random / file fan-out."
                 .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
-        references: vec![
-            "https://www.postgresql.org/docs/current/protocol-flow.html".to_string(),
-        ],
+        references: vec!["https://www.postgresql.org/docs/current/protocol-flow.html".to_string()],
         disclosure_date: None,
         rank: ModuleRank::Normal,
         default_port: Some(5432),
@@ -46,7 +44,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("postgres_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("postgres_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -129,18 +130,15 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         let body_len = (msg_len - 4) as usize;
         let mut body = vec![0u8; body_len];
         if body_len > 0
-            && let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-                &mut stream,
-                &mut body,
-                timeout,
-            )
-            .await
-            {
-                return LoginResult::Error {
-                    message: format!("read body: {e}"),
-                    retryable: true,
-                };
-            }
+            && let Err(e) =
+                crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut body, timeout)
+                    .await
+        {
+            return LoginResult::Error {
+                message: format!("read body: {e}"),
+                retryable: true,
+            };
+        }
         match msg_type {
             b'R' => {
                 if body.len() < 4 {
@@ -174,10 +172,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
                             };
                         }
                         let salt = &body[4..8];
-                        let inner = format!(
-                            "{:x}",
-                            md5::compute(format!("{}{}", pass, user).as_bytes())
-                        );
+                        let inner =
+                            format!("{:x}", md5::compute(format!("{}{}", pass, user).as_bytes()));
                         let mut hash_input = Vec::with_capacity(inner.len() + 4);
                         hash_input.extend_from_slice(inner.as_bytes());
                         hash_input.extend_from_slice(salt);
@@ -209,4 +205,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/postgres_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/postgres_bruteforce",
+    native
+);

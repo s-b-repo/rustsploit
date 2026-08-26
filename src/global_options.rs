@@ -30,7 +30,10 @@ impl GlobalOptions {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: global_options.json is corrupted ({}). Starting fresh.", e);
+                        eprintln!(
+                            "[!] Warning: global_options.json is corrupted ({}). Starting fresh.",
+                            e
+                        );
                         let backup = file_path.with_extension("json.bak");
                         if let Err(e) = std::fs::copy(&file_path, &backup) {
                             eprintln!("[!] Failed to backup corrupted global_options.json: {}", e);
@@ -63,30 +66,32 @@ impl GlobalOptions {
         if key.is_empty() || key.len() > Self::MAX_KEY_LEN || value.len() > Self::MAX_VALUE_LEN {
             return false;
         }
-        // P1-1: hold the lock across the disk save. Previous code released
-        // the lock before persisting, allowing two concurrent setters to
-        // disagree on what the on-disk file contains.
-        let mut opts = self.options.write().await;
-        if opts.len() >= Self::MAX_ENTRIES && !opts.contains_key(key) {
-            return false;
-        }
-        opts.insert(key.to_string(), value.to_string());
-        let snapshot = opts.clone();
+        let snapshot = {
+            let mut opts = self.options.write().await;
+            if opts.len() >= Self::MAX_ENTRIES && !opts.contains_key(key) {
+                return false;
+            }
+            opts.insert(key.to_string(), value.to_string());
+            opts.clone()
+        };
         self.save_locked(&snapshot).await;
         true
     }
 
-    /// Remove a global option. Persists to disk.
     pub async fn unset(&self, key: &str) -> bool {
-        // P1-1: same lock-during-save fix as `set()`.
-        let mut opts = self.options.write().await;
-        let removed = opts.remove(key).is_some();
-        if removed {
-            let snapshot = opts.clone();
-            self.save_locked(&snapshot).await;
-            return true;
-        }
-        false
+        let snapshot = {
+            let mut opts = self.options.write().await;
+            let removed = opts.remove(key).is_some();
+            if removed {
+                let snap = opts.clone();
+                drop(opts);
+                snap
+            } else {
+                return false;
+            }
+        };
+        self.save_locked(&snapshot).await;
+        true
     }
 
     /// Get a global option value.
@@ -121,42 +126,8 @@ impl GlobalOptions {
 
     /// Save to disk using atomic write (write to temp, then rename).
     async fn save_locked(&self, opts: &HashMap<String, String>) {
-        if let Some(parent) = self.file_path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await {
-                eprintln!("[!] Failed to create options directory: {}", e);
-                return;
-            }
-        let tmp = self.file_path.with_extension("json.tmp");
-        let json = match serde_json::to_string_pretty(opts) {
-            Ok(j) => j,
-            Err(e) => {
-                eprintln!("[!] Failed to serialize options: {}", e);
-                return;
-            }
-        };
-        {
-            // P1-7: O_NOFOLLOW + create-with-mode atomically.
-            let mut opts = tokio::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true).mode(0o600);
-            #[cfg(unix)]
-            {
-                opts.custom_flags(libc::O_NOFOLLOW);
-            }
-            let file = match opts.open(&tmp).await {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[!] Failed to write temp options file: {}", e);
-                    return;
-                }
-            };
-            let mut file = file;
-            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await {
-                eprintln!("[!] Failed to write temp options file: {}", e);
-                return;
-            }
-        }
-        if let Err(e) = tokio::fs::rename(&tmp, &self.file_path).await {
-            eprintln!("[!] Failed to rename options file: {}", e);
+        if let Err(e) = crate::utils::persistence::atomic_write_json(&self.file_path, opts).await {
+            eprintln!("[!] Failed to persist options: {}", e);
         }
     }
 
@@ -164,7 +135,10 @@ impl GlobalOptions {
     pub async fn display(&self) {
         let opts = self.all().await;
         if opts.is_empty() {
-            println!("{}", "No global options set. Use 'setg <key> <value>' to set one.".dimmed());
+            println!(
+                "{}",
+                "No global options set. Use 'setg <key> <value>' to set one.".dimmed()
+            );
             return;
         }
         println!();

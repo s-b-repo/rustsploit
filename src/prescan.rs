@@ -129,13 +129,17 @@ pub async fn discover_live(cidr: &IpNetwork, tool: Prescan) -> Result<Vec<String
 
     crate::mprintln!(
         "[*] prescan: {:?} → {} ports={} rate={}pps wall_timeout={}s",
-        tool, cidr, ports, rate, wall_timeout.as_secs()
+        tool,
+        cidr,
+        ports,
+        rate,
+        wall_timeout.as_secs()
     );
 
     let cmd = match tool {
         Prescan::Masscan => masscan_cmd(cidr, &ports, rate),
         Prescan::Zmap => zmap_cmd(cidr, &ports, rate),
-        Prescan::None => unreachable!("prescan::None handled above"),
+        Prescan::None => anyhow::bail!("internal error: Prescan::None reached dispatch"),
     };
 
     // The wall-clock timeout is enforced *inside* run_capture_lines so it can
@@ -315,7 +319,9 @@ async fn run_capture_lines(
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             stderr.read_to_string(&mut err_buf),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(n)) => tracing::trace!("Read {} bytes from prescan stderr", n),
             Ok(Err(e)) => tracing::trace!("stderr read error: {e}"),
             Err(e) => tracing::trace!("stderr read timed out: {e}"),
@@ -384,4 +390,3 @@ fn parse_zmap_line(line: &str) -> Option<String> {
         None
     }
 }
-

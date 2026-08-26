@@ -19,14 +19,14 @@ use std::time::Instant;
 use anyhow::Context as _;
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305,
+    aead::{Aead, KeyInit, Payload},
 };
 use hkdf::Hkdf;
 use ml_kem::{Encapsulate, Generate, Key, KeyExport, MlKem1024};
+use rand::RngExt;
 use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
-use rand::RngExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -38,8 +38,8 @@ const PROTOCOL_VERSION: &str = "pqxdh-v3-x25519-mlkem1024-mceliece460896";
 // they speak the same protocol, and the salts are cryptographically bound
 // to the host identity (which is verified during the handshake).
 const KDF_LABEL_HANDSHAKE: &[u8] = b"Rustsploit-PQXDH-v2/handshake";
-const KDF_LABEL_RATCHET:   &[u8] = b"Rustsploit-PQXDH-v2/ratchet";
-const KDF_LABEL_WS_V1:     &[u8] = b"Rustsploit-PQXDH-v2/ws-v1";
+const KDF_LABEL_RATCHET: &[u8] = b"Rustsploit-PQXDH-v2/ratchet";
+const KDF_LABEL_WS_V1: &[u8] = b"Rustsploit-PQXDH-v2/ws-v1";
 const DEFAULT_REKEY_AFTER: u64 = 100;
 
 /// Produce a per-(server, client) HKDF salt that requires possession of one
@@ -179,7 +179,13 @@ impl HostIdentity {
                 aad.extend_from_slice(&self.mlkem_ek);
                 aad.extend_from_slice(PROTOCOL_VERSION.as_bytes());
                 let ciphertext = cipher
-                    .encrypt(&nonce, Payload { msg: &plaintext, aad: &aad })
+                    .encrypt(
+                        &nonce,
+                        Payload {
+                            msg: &plaintext,
+                            aad: &aad,
+                        },
+                    )
                     .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
 
                 serde_json::json!({
@@ -221,7 +227,10 @@ impl HostIdentity {
         Ok(())
     }
 
-    fn derive_key_from_passphrase(passphrase: &str, salt: &[u8; 32]) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    fn derive_key_from_passphrase(
+        passphrase: &str,
+        salt: &[u8; 32],
+    ) -> anyhow::Result<Zeroizing<[u8; 32]>> {
         use argon2::Argon2;
         let argon2 = Argon2::new(
             argon2::Algorithm::Argon2id,
@@ -269,52 +278,90 @@ impl HostIdentity {
         let content = std::fs::read_to_string(path)?;
         let data: serde_json::Value = serde_json::from_str(&content)?;
 
-        let encrypted = data.get("encrypted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let encrypted = data
+            .get("encrypted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if encrypted {
-            let pass = passphrase
-                .ok_or_else(|| anyhow::anyhow!(
+            let pass = passphrase.ok_or_else(|| {
+                anyhow::anyhow!(
                     "Host key is encrypted but no passphrase provided (use --pq-key-passphrase)"
-                ))?;
+                )
+            })?;
 
-            let salt_bytes = b64.decode(data["argon2_salt"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing argon2_salt"))?)?;
-            let salt: [u8; 32] = salt_bytes.try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid argon2 salt length (got {} bytes)", v.len()))?;
-            let nonce_vec = b64.decode(data["nonce"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing nonce"))?)?;
-            let nonce_arr: [u8; 12] = nonce_vec.try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid nonce length (got {} bytes)", v.len()))?;
-            let ciphertext = b64.decode(data["ciphertext"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing ciphertext"))?)?;
+            let salt_bytes = b64.decode(
+                data["argon2_salt"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing argon2_salt"))?,
+            )?;
+            let salt: [u8; 32] = salt_bytes.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!("invalid argon2 salt length (got {} bytes)", v.len())
+            })?;
+            let nonce_vec = b64.decode(
+                data["nonce"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing nonce"))?,
+            )?;
+            let nonce_arr: [u8; 12] = nonce_vec.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!("invalid nonce length (got {} bytes)", v.len())
+            })?;
+            let ciphertext = b64.decode(
+                data["ciphertext"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing ciphertext"))?,
+            )?;
 
-            let x25519_pub_bytes = b64.decode(data["x25519_public"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing x25519_public"))?)?;
-            let mlkem_ek = b64.decode(data["mlkem_ek"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing mlkem_ek"))?)?;
+            let x25519_pub_bytes = b64.decode(
+                data["x25519_public"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing x25519_public"))?,
+            )?;
+            let mlkem_ek = b64.decode(
+                data["mlkem_ek"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing mlkem_ek"))?,
+            )?;
             let version = data["version"].as_str().unwrap_or("");
 
             let key = Self::derive_key_from_passphrase(pass, &salt)?;
             let cipher = ChaCha20Poly1305::new((&*key).into());
             let nonce: chacha20poly1305::Nonce = nonce_arr.into();
-            let mut aad = Vec::with_capacity(x25519_pub_bytes.len() + mlkem_ek.len() + version.len());
+            let mut aad =
+                Vec::with_capacity(x25519_pub_bytes.len() + mlkem_ek.len() + version.len());
             aad.extend_from_slice(&x25519_pub_bytes);
             aad.extend_from_slice(&mlkem_ek);
             aad.extend_from_slice(version.as_bytes());
             let plaintext = cipher
-                .decrypt(&nonce, Payload { msg: &ciphertext, aad: &aad })
-                .map_err(|e| anyhow::anyhow!("decryption failed — wrong passphrase or tampered key file? {e:?}"))?;
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: &ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decryption failed — wrong passphrase or tampered key file? {e:?}"
+                    )
+                })?;
 
             let secrets: serde_json::Value = serde_json::from_slice(&plaintext)?;
 
-            let secret_bytes = b64.decode(secrets["x25519_secret"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing x25519_secret in decrypted payload"))?)?;
-            let secret_arr: [u8; 32] = secret_bytes.try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid x25519 secret length (got {} bytes)", v.len()))?;
+            let secret_bytes =
+                b64.decode(secrets["x25519_secret"].as_str().ok_or_else(|| {
+                    anyhow::anyhow!("missing x25519_secret in decrypted payload")
+                })?)?;
+            let secret_arr: [u8; 32] = secret_bytes.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!("invalid x25519 secret length (got {} bytes)", v.len())
+            })?;
             let x25519_secret = StaticSecret::from(secret_arr);
             let x25519_public = PublicKey::from(&x25519_secret);
-            let mlkem_dk = b64.decode(secrets["mlkem_dk"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing mlkem_dk in decrypted payload"))?)?;
+            let mlkem_dk = b64.decode(
+                secrets["mlkem_dk"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing mlkem_dk in decrypted payload"))?,
+            )?;
 
             Ok(HostIdentity {
                 x25519_secret,
@@ -331,16 +378,26 @@ impl HostIdentity {
                 );
             }
 
-            let secret_bytes = b64.decode(data["x25519_secret"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing x25519_secret"))?)?;
-            let secret_arr: [u8; 32] = secret_bytes.try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid x25519 secret length (got {} bytes)", v.len()))?;
+            let secret_bytes = b64.decode(
+                data["x25519_secret"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing x25519_secret"))?,
+            )?;
+            let secret_arr: [u8; 32] = secret_bytes.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!("invalid x25519 secret length (got {} bytes)", v.len())
+            })?;
             let x25519_secret = StaticSecret::from(secret_arr);
             let x25519_public = PublicKey::from(&x25519_secret);
-            let mlkem_dk = b64.decode(data["mlkem_dk"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing mlkem_dk"))?)?;
-            let mlkem_ek = b64.decode(data["mlkem_ek"].as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing mlkem_ek"))?)?;
+            let mlkem_dk = b64.decode(
+                data["mlkem_dk"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing mlkem_dk"))?,
+            )?;
+            let mlkem_ek = b64.decode(
+                data["mlkem_ek"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing mlkem_ek"))?,
+            )?;
 
             let identity = HostIdentity {
                 x25519_secret,
@@ -377,21 +434,36 @@ impl HostIdentity {
 pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<ClientPublicIdentity>> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
-    if !path.exists() { return Ok(Vec::new()); }
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let content = std::fs::read_to_string(path)?;
     let mut keys = Vec::new();
     for (i, line) in content.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         let data: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| anyhow::anyhow!("Line {}: invalid JSON: {}", i + 1, e))?;
         let name = data["name"].as_str().unwrap_or("unnamed").to_string();
-        let x25519_bytes = b64.decode(data["x25519_pub"].as_str()
-            .ok_or_else(|| anyhow::anyhow!("Line {}: missing x25519_pub", i + 1))?)?;
-        let x25519_pub: [u8; 32] = x25519_bytes.try_into()
-            .map_err(|v: Vec<u8>| anyhow::anyhow!("Line {}: invalid x25519 pub length (got {} bytes)", i + 1, v.len()))?;
-        let mlkem_ek = b64.decode(data["mlkem_ek"].as_str()
-            .ok_or_else(|| anyhow::anyhow!("Line {}: missing mlkem_ek", i + 1))?)?;
+        let x25519_bytes = b64.decode(
+            data["x25519_pub"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Line {}: missing x25519_pub", i + 1))?,
+        )?;
+        let x25519_pub: [u8; 32] = x25519_bytes.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "Line {}: invalid x25519 pub length (got {} bytes)",
+                i + 1,
+                v.len()
+            )
+        })?;
+        let mlkem_ek = b64.decode(
+            data["mlkem_ek"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Line {}: missing mlkem_ek", i + 1))?,
+        )?;
         // Pre-v3 enrollments have no McEliece key. Rather than abort startup on a
         // stale authorized_keys file, log and skip those entries — the affected
         // client must re-enroll for the X25519 + ML-KEM-1024 + Classic McEliece
@@ -402,14 +474,21 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<ClientPublicIdent
                 tracing::warn!(
                     "authorized_keys line {}: client '{}' has no mceliece_pub (pre-v3 enrollment); \
                      skipping — it must re-enroll to use the triple-hybrid PQ handshake",
-                    i + 1, name
+                    i + 1,
+                    name
                 );
                 continue;
             }
         };
-        let mceliece_public = b64.decode(mceliece_b64)
-            .map_err(|e| anyhow::anyhow!("Line {}: mceliece_pub is not valid base64: {}", i + 1, e))?;
-        keys.push(ClientPublicIdentity { name, x25519_public: x25519_pub, mlkem_ek, mceliece_public });
+        let mceliece_public = b64.decode(mceliece_b64).map_err(|e| {
+            anyhow::anyhow!("Line {}: mceliece_pub is not valid base64: {}", i + 1, e)
+        })?;
+        keys.push(ClientPublicIdentity {
+            name,
+            x25519_public: x25519_pub,
+            mlkem_ek,
+            mceliece_public,
+        });
     }
     Ok(keys)
 }
@@ -445,7 +524,10 @@ pub fn upsert_authorized_key(path: &Path, key: &ClientPublicIdentity) -> anyhow:
             // Replace any existing entry for the same name.
             let keep = match serde_json::from_str::<serde_json::Value>(trimmed) {
                 Ok(v) => v.get("name").and_then(|n| n.as_str()) != Some(key.name.as_str()),
-                Err(e) => { tracing::debug!("preserving malformed authorized-key line: {e}"); true }
+                Err(e) => {
+                    tracing::debug!("preserving malformed authorized-key line: {e}");
+                    true
+                }
             };
             if keep {
                 lines.push(line.to_string());
@@ -507,7 +589,10 @@ pub fn remove_authorized_key(path: &Path, name: &str) -> anyhow::Result<bool> {
                     true
                 }
             }
-            Err(e) => { tracing::debug!("preserving malformed authorized-key line: {e}"); true }
+            Err(e) => {
+                tracing::debug!("preserving malformed authorized-key line: {e}");
+                true
+            }
         };
         if keep {
             lines.push(line.to_string());
@@ -638,16 +723,22 @@ pub fn process_handshake(
     let b64 = base64::engine::general_purpose::STANDARD;
 
     if request.protocol_version != PROTOCOL_VERSION {
-        anyhow::bail!("Protocol mismatch: expected {}, got {}", PROTOCOL_VERSION, request.protocol_version);
+        anyhow::bail!(
+            "Protocol mismatch: expected {}, got {}",
+            PROTOCOL_VERSION,
+            request.protocol_version
+        );
     }
 
     let client_eph_bytes = b64.decode(&request.client_x25519_pub)?;
-    let client_eph_arr: [u8; 32] = client_eph_bytes.try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid ephemeral X25519 pub (got {} bytes)", v.len()))?;
+    let client_eph_arr: [u8; 32] = client_eph_bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!("Invalid ephemeral X25519 pub (got {} bytes)", v.len())
+    })?;
 
     let client_id_bytes = b64.decode(&request.client_identity_x25519_pub)?;
-    let client_id_arr: [u8; 32] = client_id_bytes.try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid identity X25519 pub (got {} bytes)", v.len()))?;
+    let client_id_arr: [u8; 32] = client_id_bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!("Invalid identity X25519 pub (got {} bytes)", v.len())
+    })?;
 
     // Verify authorized. The compared value is a public key (not secret), so
     // a non-constant-time compare wouldn't leak anything meaningful — but the
@@ -661,15 +752,14 @@ pub fn process_handshake(
             matched = Some(k);
         }
     }
-    let authorized = matched
-        .ok_or_else(|| anyhow::anyhow!("Client not in authorized_keys"))?;
+    let authorized = matched.ok_or_else(|| anyhow::anyhow!("Client not in authorized_keys"))?;
 
     // Ephemeral X25519 DH
     let server_eph_secret = {
-            let mut key_bytes = [0u8; 32];
-            rand::rng().fill(&mut key_bytes);
-            StaticSecret::from(key_bytes)
-        };
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill(&mut key_bytes);
+        StaticSecret::from(key_bytes)
+    };
     let server_eph_public = PublicKey::from(&server_eph_secret);
     let ss_eph = server_eph_secret.diffie_hellman(&PublicKey::from(client_eph_arr));
 
@@ -692,10 +782,14 @@ pub fn process_handshake(
     if client_mlkem_bytes.len() != authorized.mlkem_ek.len()
         || !bool::from(client_mlkem_bytes.ct_eq(&authorized.mlkem_ek))
     {
-        anyhow::bail!("Client ML-KEM encapsulation key does not match the enrolled key for this identity");
+        anyhow::bail!(
+            "Client ML-KEM encapsulation key does not match the enrolled key for this identity"
+        );
     }
     // Encapsulate to the *enrolled* key (proven equal to the request key above).
-    let ek_key: Key<ml_kem::EncapsulationKey<MlKem1024>> = authorized.mlkem_ek.as_slice()
+    let ek_key: Key<ml_kem::EncapsulationKey<MlKem1024>> = authorized
+        .mlkem_ek
+        .as_slice()
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid ML-KEM encapsulation key length: {e:?}"))?;
     let ek = ml_kem::EncapsulationKey::<MlKem1024>::new(&ek_key)
@@ -720,16 +814,13 @@ pub fn process_handshake(
         let ct_bytes = b64
             .decode(ct_b64)
             .map_err(|e| anyhow::anyhow!("client_mlkem_ct is not valid base64: {e:?}"))?;
-        let seed: ml_kem::Seed = host_identity
-            .mlkem_dk
-            .as_slice()
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("stored ML-KEM decapsulation seed has wrong length: {e:?}"))?;
+        let seed: ml_kem::Seed = host_identity.mlkem_dk.as_slice().try_into().map_err(|e| {
+            anyhow::anyhow!("stored ML-KEM decapsulation seed has wrong length: {e:?}")
+        })?;
         let server_dk = ml_kem::DecapsulationKey::<MlKem1024>::from_seed(seed);
-        let ct: ml_kem::Ciphertext<MlKem1024> = ct_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("client_mlkem_ct has wrong ML-KEM-1024 ciphertext length: {e:?}"))?;
+        let ct: ml_kem::Ciphertext<MlKem1024> = ct_bytes.as_slice().try_into().map_err(|e| {
+            anyhow::anyhow!("client_mlkem_ct has wrong ML-KEM-1024 ciphertext length: {e:?}")
+        })?;
         let ss_mlkem_c2s = server_dk.decapsulate(&ct);
         ikm.extend_from_slice(ss_mlkem_c2s.as_slice());
     }
@@ -742,7 +833,9 @@ pub fn process_handshake(
     // via a second, diverse PQ assumption and means an attacker must break ALL of
     // X25519, ML-KEM-1024 AND Classic McEliece to recover the session key.
     let mceliece_ciphertext_b64 = {
-        use classic_mceliece_rust::{encapsulate_boxed, PublicKey as McePublicKey, CRYPTO_PUBLICKEYBYTES};
+        use classic_mceliece_rust::{
+            CRYPTO_PUBLICKEYBYTES, PublicKey as McePublicKey, encapsulate_boxed,
+        };
         if authorized.mceliece_public.len() != CRYPTO_PUBLICKEYBYTES {
             anyhow::bail!(
                 "enrolled Classic McEliece public key for '{}' has wrong length {} (expected {})",
@@ -818,13 +911,16 @@ pub fn process_handshake(
     let recv_chain = derive_chain_key(&root_key, b"c2s")?;
 
     let mut session_id = [0u8; 16];
-    { use rand::RngExt; rand::rng().fill(&mut session_id); }
+    {
+        use rand::RngExt;
+        rand::rng().fill(&mut session_id);
+    }
 
     let ratchet_secret = {
-            let mut key_bytes = [0u8; 32];
-            rand::rng().fill(&mut key_bytes);
-            StaticSecret::from(key_bytes)
-        };
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill(&mut key_bytes);
+        StaticSecret::from(key_bytes)
+    };
     let ratchet_public = PublicKey::from(&ratchet_secret);
 
     // Identity proof
@@ -881,7 +977,8 @@ pub fn process_handshake(
 fn derive_chain_key(root_key: &[u8], label: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let hk = Hkdf::<Sha256>::new(None, root_key);
     let mut out = Zeroizing::new(vec![0u8; 32]);
-    hk.expand(label, &mut out).map_err(|e| anyhow::anyhow!("HKDF chain key failed: {e:?}"))?;
+    hk.expand(label, &mut out)
+        .map_err(|e| anyhow::anyhow!("HKDF chain key failed: {e:?}"))?;
     Ok(out)
 }
 
@@ -900,10 +997,7 @@ fn ratchet_step(chain_key: &[u8], counter: u64) -> anyhow::Result<(Zeroizing<Vec
 /// fresh root + send/recv chain pair. Both sides of a rekey land here with
 /// the same DH input (X25519 commutativity), so they derive identical chains
 /// and root.
-fn ratchet_root(
-    session: &mut PqSession,
-    dh: &[u8; 32],
-) -> anyhow::Result<()> {
+fn ratchet_root(session: &mut PqSession, dh: &[u8; 32]) -> anyhow::Result<()> {
     let mut ikm = Zeroizing::new(Vec::with_capacity(32 + session.root_key.len()));
     ikm.extend_from_slice(dh);
     ikm.extend_from_slice(&session.root_key);
@@ -945,10 +1039,10 @@ fn dh_ratchet_receive(session: &mut PqSession, their_new_pub: PublicKey) -> anyh
 /// equal by X25519 commutativity, so both ends end up with the same new root.
 fn dh_ratchet_send(session: &mut PqSession) -> anyhow::Result<PublicKey> {
     let new_secret = {
-            let mut key_bytes = [0u8; 32];
-            rand::rng().fill(&mut key_bytes);
-            StaticSecret::from(key_bytes)
-        };
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill(&mut key_bytes);
+        StaticSecret::from(key_bytes)
+    };
     let new_public = PublicKey::from(&new_secret);
     let dh_shared = new_secret.diffie_hellman(&session.their_x25519_public);
     let dh_bytes: [u8; 32] = *dh_shared.as_bytes();
@@ -1034,10 +1128,18 @@ where
         session.recv_chain_key = new_chain;
         session.recv_counter += 1;
         session.last_activity = Instant::now();
-        let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
+        let key: [u8; 32] = msg_key
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
         cipher
-            .decrypt(nonce_bytes.into(), Payload { msg: ciphertext, aad: &aad })
+            .decrypt(
+                nonce_bytes.into(),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
             .map_err(|e| anyhow::anyhow!("PQ decrypt failed: {e}"))
     })();
     if result.is_err() {
@@ -1077,7 +1179,9 @@ where
     session.send_chain_key = new_chain;
     session.send_counter += 1;
     session.last_activity = Instant::now();
-    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
+    let key: [u8; 32] = msg_key
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     let mut nonce_bytes = [0u8; 12];
     {
@@ -1085,7 +1189,13 @@ where
         rand::rng().fill(&mut nonce_bytes);
     }
     let ct = cipher
-        .encrypt((&nonce_bytes).into(), Payload { msg: plaintext, aad: &aad })
+        .encrypt(
+            (&nonce_bytes).into(),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("PQ encrypt failed: {e}"))?;
     Ok((ct, nonce_bytes, rekey_pub, session.epoch))
 }
@@ -1171,11 +1281,17 @@ pub fn derive_ws_subsession(
     })
 }
 
-pub fn encrypt_ws_frame(sub: &mut WsSubSession, plaintext: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn encrypt_ws_frame(
+    sub: &mut WsSubSession,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let (new_chain, msg_key) = ratchet_step(&sub.send_chain_key, sub.send_counter)?;
     sub.send_chain_key = new_chain;
     sub.send_counter += 1;
-    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
+    let key: [u8; 32] = msg_key
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     if sub.epoch > u32::MAX as u64 {
         anyhow::bail!("WS sub-session epoch exhausted");
@@ -1183,7 +1299,14 @@ pub fn encrypt_ws_frame(sub: &mut WsSubSession, plaintext: &[u8], aad: &[u8]) ->
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[..4].copy_from_slice(&(sub.epoch as u32).to_le_bytes());
     nonce_bytes[4..].copy_from_slice(&(sub.send_counter - 1).to_le_bytes());
-    let ct = cipher.encrypt((&nonce_bytes).into(), Payload { msg: plaintext, aad })
+    let ct = cipher
+        .encrypt(
+            (&nonce_bytes).into(),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("WS encrypt failed: {e}"))?;
     let mut frame = Vec::with_capacity(12 + ct.len());
     frame.extend_from_slice(&nonce_bytes);
@@ -1191,18 +1314,31 @@ pub fn encrypt_ws_frame(sub: &mut WsSubSession, plaintext: &[u8], aad: &[u8]) ->
     Ok(frame)
 }
 
-pub fn decrypt_ws_frame(sub: &mut WsSubSession, frame: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt_ws_frame(
+    sub: &mut WsSubSession,
+    frame: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     if frame.len() < 12 {
         anyhow::bail!("WS frame too short (need at least 12 bytes for nonce)");
     }
-    let nonce_bytes: [u8; 12] = frame[..12].try_into()
+    let nonce_bytes: [u8; 12] = frame[..12]
+        .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid nonce slice: {e:?}"))?;
     let ciphertext = &frame[12..];
     let (candidate_chain, msg_key) = ratchet_step(&sub.recv_chain_key, sub.recv_counter)?;
-    let key: [u8; 32] = msg_key.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
+    let key: [u8; 32] = msg_key
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Bad key len (got {} bytes)", v.len()))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
     let plaintext = cipher
-        .decrypt((&nonce_bytes).into(), Payload { msg: ciphertext, aad })
+        .decrypt(
+            (&nonce_bytes).into(),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("WS decrypt failed: {e}"))?;
     sub.recv_chain_key = candidate_chain;
     sub.recv_counter += 1;
@@ -1280,7 +1416,10 @@ mod transactional_decrypt_tests {
         (server, client)
     }
 
-    fn server_to_client(server: &mut PqSession, msg: &[u8]) -> (Vec<u8>, [u8; 12], Option<PublicKey>) {
+    fn server_to_client(
+        server: &mut PqSession,
+        msg: &[u8],
+    ) -> (Vec<u8>, [u8; 12], Option<PublicKey>) {
         let (ct, nonce, rekey, _epoch) = encrypt_response(server, msg, aad).unwrap();
         (ct, nonce, rekey)
     }
@@ -1290,7 +1429,14 @@ mod transactional_decrypt_tests {
         let (mut server, mut client) = session_pair(u64::MAX);
         let (ct, nonce, rekey) = server_to_client(&mut server, b"hello");
         assert!(rekey.is_none(), "no rekey expected below threshold");
-        let pt = decrypt_request(&mut client, &ct, &nonce, aad, rekey.as_ref().map(|p| p.as_bytes())).unwrap();
+        let pt = decrypt_request(
+            &mut client,
+            &ct,
+            &nonce,
+            aad,
+            rekey.as_ref().map(|p| p.as_bytes()),
+        )
+        .unwrap();
         assert_eq!(pt, b"hello");
         assert_eq!(client.recv_counter, 1);
     }
@@ -1351,8 +1497,16 @@ mod transactional_decrypt_tests {
         );
 
         // The DH ratchet must have been rolled back entirely.
-        assert_eq!(client.root_key.to_vec(), root_before, "root key must be unchanged");
-        assert_eq!(*client.their_x25519_public.as_bytes(), their_pub_before, "peer pubkey must be unchanged");
+        assert_eq!(
+            client.root_key.to_vec(),
+            root_before,
+            "root key must be unchanged"
+        );
+        assert_eq!(
+            *client.their_x25519_public.as_bytes(),
+            their_pub_before,
+            "peer pubkey must be unchanged"
+        );
         assert_eq!(client.epoch, epoch_before);
         assert_eq!(client.recv_counter, ctr_before);
 
@@ -1373,7 +1527,14 @@ mod transactional_decrypt_tests {
         // Client encrypts a request; the server decrypts it (counter 0 → 1).
         let (ct, nonce, rekey, _e) = encrypt_response(&mut client, b"action", aad).unwrap();
         assert!(rekey.is_none());
-        let pt = decrypt_request(&mut server, &ct, &nonce, aad, rekey.as_ref().map(|p| p.as_bytes())).unwrap();
+        let pt = decrypt_request(
+            &mut server,
+            &ct,
+            &nonce,
+            aad,
+            rekey.as_ref().map(|p| p.as_bytes()),
+        )
+        .unwrap();
         assert_eq!(pt, b"action");
         assert_eq!(server.recv_counter, 1);
 
@@ -1444,9 +1605,13 @@ mod triple_hybrid_handshake_tests {
             client_mlkem_ct: None,
         };
 
-        let (resp, session) =
-            process_handshake(&req, &server, std::slice::from_ref(&enrolled), "test-instance")
-                .expect("triple-hybrid handshake should succeed");
+        let (resp, session) = process_handshake(
+            &req,
+            &server,
+            std::slice::from_ref(&enrolled),
+            "test-instance",
+        )
+        .expect("triple-hybrid handshake should succeed");
 
         // ML-KEM-1024 ciphertext is 1568 bytes; McEliece-460896 ciphertext is 156.
         assert_eq!(b64.decode(&resp.mlkem_ciphertext).unwrap().len(), 1568);

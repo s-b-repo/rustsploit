@@ -1,12 +1,12 @@
 //! Elasticsearch credential brute-force via HTTP Basic on the cluster root.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 9200;
 
@@ -22,10 +22,9 @@ const DEFAULTS: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "Elasticsearch Bruteforce".to_string(),
-        description:
-            "Tests Elasticsearch HTTP Basic auth on the cluster root endpoint. \
+        description: "Tests Elasticsearch HTTP Basic auth on the cluster root endpoint. \
              Single-target — scheduler does fan-out."
-                .to_string(),
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,
@@ -35,7 +34,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("elasticsearch_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("elasticsearch_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -57,22 +59,18 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("http client: {e}"),
                 retryable: false,
-            }
+            };
         }
     };
     let url = format!("http://{}:{}/", host, port);
-    let resp = client
-        .get(&url)
-        .basic_auth(user, Some(pass))
-        .send()
-        .await;
+    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await;
     let status = match resp {
         Ok(r) => r.status().as_u16(),
         Err(e) => {
             return LoginResult::Error {
                 message: format!("get: {e}"),
                 retryable: e.is_timeout() || e.is_connect(),
-            }
+            };
         }
     };
     match status {
@@ -108,4 +106,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/elasticsearch_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/elasticsearch_bruteforce",
+    native
+);

@@ -10,7 +10,6 @@ The `plugins/` directory is now fully operational. Drop `.rs` files into `src/mo
 ### Framework Services (Metasploit Parity)
 The following Metasploit-inspired features have been implemented:
 - **Module Metadata** (`info` command) — CVE, author, rank, description per module
-- **Vulnerability Check** (`check` command) — Non-destructive verification
 - **Global Options** (`setg`/`unsetg`) — Persistent options across modules
 - **Credential Store** (`creds`) — Track discovered credentials with JSON persistence
 - **Host/Service Tracking** (`hosts`/`services`) — Workspace-based engagement data

@@ -40,6 +40,7 @@ pub fn cache_insert(map: &mut HashMap<String, String>, key: String, value: Strin
 /// Refcount of active batch guards. Batch mode is active when > 0.
 static BATCH_REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 static BATCH_CACHE: std::sync::LazyLock<PromptCache> = std::sync::LazyLock::new(new_prompt_cache);
+static LAST_CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static BATCH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CACHE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -67,11 +68,19 @@ pub fn enter_batch_mode() -> BatchGuard {
     BatchGuard(())
 }
 
-pub fn is_batch_active() -> bool {
-    BATCH_REFCOUNT.load(Ordering::Acquire) > 0
-}
-
 pub fn batch_cache() -> &'static PromptCache {
+    let current_gen = BATCH_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let last_gen = LAST_CACHE_GEN.load(std::sync::atomic::Ordering::Acquire);
+    if current_gen != last_gen {
+        // Only advance the watermark once the clear actually happened. A
+        // contended `try_lock` used to fall through to the store anyway,
+        // permanently skipping the clear and leaking the previous batch's
+        // answers into this one.
+        if let Ok(mut cache) = BATCH_CACHE.try_lock() {
+            cache.clear();
+            LAST_CACHE_GEN.store(current_gen, std::sync::atomic::Ordering::Release);
+        }
+    }
     &BATCH_CACHE
 }
 
@@ -137,10 +146,28 @@ pub struct RunContext {
     /// passing the path manually. Empty when called outside a scheduled
     /// run (e.g. utility code invoked from the shell).
     pub module_path: String,
+    /// Batch (mass-scan) flag for THIS run, scoped via the task-local.
+    /// Prompt suppression reads this first so a concurrent batch in another
+    /// task/job can't flip prompt behaviour for an unrelated interactive run;
+    /// the process-global refcount stays only as a fallback for code running
+    /// outside any RunContext scope. Set true by the scheduler on every
+    /// mass-scan per-host context.
+    pub batch_mode: bool,
+    /// Prompt-harvest dry-run flag (pre-batch config collection). When set,
+    /// interactive answers are persisted into global options so the whole
+    /// batch can reuse them. Ordinary runs leave it false so a one-off
+    /// answer does NOT silently become a sticky global option.
+    pub prompt_only: bool,
     /// Tracked task spawns. Modules call `crate::context::spawn(...)` to
     /// register a `tokio::spawn`; the scheduler aborts every handle here
     /// in `Module::cleanup` so cancelled runs don't leak orphan tasks.
-    pub spawned: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    ///
+    /// A `std` Mutex (not tokio's) because `spawn()` is a sync fn called
+    /// from async contexts: it only ever holds the guard across the cheap,
+    /// non-awaiting `JoinSet::spawn` push. `abort_all_spawned()` swaps the
+    /// set out under the lock so it can await task exits without holding a
+    /// sync guard across an await point.
+    pub spawned: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl RunContext {
@@ -153,7 +180,9 @@ impl RunContext {
             cancel: tokio_util::sync::CancellationToken::new(),
             tenant_id: None,
             module_path: String::new(),
-            spawned: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            batch_mode: false,
+            prompt_only: false,
+            spawned: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -167,7 +196,9 @@ impl RunContext {
             cancel: tokio_util::sync::CancellationToken::new(),
             tenant_id: None,
             module_path: String::new(),
-            spawned: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            batch_mode: false,
+            prompt_only: false,
+            spawned: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -204,7 +235,27 @@ impl RunContext {
 /// Returns `false` if called outside of a `RUN_CONTEXT` scope (e.g. in tests
 /// or top-level CLI code), so it's always safe to call.
 pub fn is_cancelled() -> bool {
-    RUN_CONTEXT.try_with(|ctx| ctx.cancel.is_cancelled()).unwrap_or(false)
+    RUN_CONTEXT
+        .try_with(|ctx| ctx.cancel.is_cancelled())
+        .unwrap_or(false)
+}
+
+pub fn is_batch_active() -> bool {
+    // Task-scoped flag first: this is what the scheduler sets on every
+    // mass-scan per-host context. A concurrent batch in a DIFFERENT task
+    // (background job vs. foreground interactive run) therefore cannot flip
+    // prompt behaviour for this task. The global refcount remains only as a
+    // fallback for code running outside any RunContext scope.
+    let scoped = RUN_CONTEXT.try_with(|ctx| ctx.batch_mode).unwrap_or(false);
+    scoped || BATCH_REFCOUNT.load(Ordering::Acquire) > 0
+}
+
+/// `true` when the current run is a pre-batch prompt-harvest dry run (the
+/// scheduler's `pre_batch_prompt` phase). Only then are interactive prompt
+/// answers persisted into tenant global options so the whole batch can reuse
+/// them; ordinary runs must not turn one-off answers into sticky globals.
+pub fn is_prompt_harvest() -> bool {
+    RUN_CONTEXT.try_with(|ctx| ctx.prompt_only).unwrap_or(false)
 }
 
 /// Returns a clone of the current run's cancellation token, suitable for
@@ -218,7 +269,10 @@ pub fn cancellation_token() -> Option<tokio_util::sync::CancellationToken> {
 /// Returns the tenant_id for the current run, or `None` if not in a
 /// tenant-scoped context (shell mode / no RunContext).
 pub fn current_tenant_id() -> Option<String> {
-    RUN_CONTEXT.try_with(|ctx| ctx.tenant_id.clone()).ok().flatten()
+    RUN_CONTEXT
+        .try_with(|ctx| ctx.tenant_id.clone())
+        .ok()
+        .flatten()
 }
 
 /// Returns the `category/name` path of the module currently running in
@@ -232,31 +286,28 @@ pub fn current_module_path() -> String {
 /// Spawn a tracked tokio task that will be aborted when the current run
 /// finishes (via `Module::cleanup` or cancellation). Falls back to a
 /// plain `tokio::spawn` if called outside a `RUN_CONTEXT` scope.
+///
+/// The join-set is a `std` Mutex held only across the non-awaiting
+/// `JoinSet::spawn` push, so no spin-retry loop and no untracked fallback
+/// are needed: under contention the caller briefly blocks on an uncontended
+/// short critical section instead of letting tasks escape cancellation
+/// tracking.
 pub fn spawn<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let attached = RUN_CONTEXT
-        .try_with(|ctx| ctx.clone())
-        .ok();
-    if let Some(ctx) = attached {
-        // Acquire the lock synchronously via `try_lock` first to avoid a
-        // race where `abort_all_spawned` fires before the deferred
-        // `tokio::spawn` acquires the lock.  If contention prevents
-        // `try_lock`, fall back to a spawned acquire — the worst that
-        // happens is the future misses an `abort_all` that fires in the
-        // narrow window (same as the old code).
-        if let Ok(mut joinset) = ctx.spawned.try_lock() {
+    let attached = RUN_CONTEXT.try_with(|ctx| ctx.clone()).ok();
+    match attached {
+        Some(ctx) => {
+            // Poison recovery via into_inner(): JoinSet holds plain task
+            // handles, so its state stays valid even if another thread
+            // panicked while holding the guard. Tracking must not be lost.
+            let mut joinset = ctx.spawned.lock().unwrap_or_else(|e| e.into_inner());
             joinset.spawn(future);
-        } else {
-            let ctx = ctx.clone();
-            tokio::spawn(async move {
-                let mut joinset = ctx.spawned.lock().await;
-                joinset.spawn(future);
-            });
         }
-    } else {
-        tokio::spawn(future);
+        None => {
+            tokio::spawn(future);
+        }
     }
 }
 
@@ -264,7 +315,14 @@ where
 /// the scheduler in `Module::cleanup` and on cancellation paths.
 pub async fn abort_all_spawned() {
     if let Ok(ctx) = RUN_CONTEXT.try_with(|ctx| ctx.clone()) {
-        let mut joinset = ctx.spawned.lock().await;
+        // Swap the join-set out under the lock so we can await task exits
+        // without holding the sync guard across an await point. Spawns that
+        // race in after the swap land in the fresh set inside `ctx`; the run
+        // is ending at this point, so that window is benign.
+        let mut joinset = {
+            let mut guard = ctx.spawned.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
         joinset.abort_all();
         // Drain — abort_all only marks; we want to await so handles drop
         // before we return.
@@ -279,7 +337,11 @@ pub async fn abort_all_spawned() {
 /// Execute an async closure inside a task-local `RUN_CONTEXT` with a target.
 /// Returns the closure's result plus the `RunContext`.
 /// Automatically inherits the tenant identity from `CURRENT_TENANT` if set.
-pub async fn run_with_context_target<F, Fut, T>(config: crate::config::ModuleConfig, target: String, f: F) -> (T, std::sync::Arc<RunContext>)
+pub async fn run_with_context_target<F, Fut, T>(
+    config: crate::config::ModuleConfig,
+    target: String,
+    f: F,
+) -> (T, std::sync::Arc<RunContext>)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,

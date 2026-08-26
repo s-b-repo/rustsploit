@@ -8,7 +8,8 @@ pub fn all_resources() -> Vec<Resource> {
         Resource {
             uri: "rustsploit:///modules".into(),
             name: "Module Catalog".into(),
-            description: "Full list of available modules with info() metadata where available".into(),
+            description: "Full list of available modules with info() metadata where available"
+                .into(),
             mime_type: "application/json".into(),
         },
         Resource {
@@ -44,7 +45,9 @@ pub fn all_resources() -> Vec<Resource> {
         Resource {
             uri: "rustsploit:///status".into(),
             name: "Framework Status".into(),
-            description: "Summary: module count, workspace name, host count, credential count, loot count".into(),
+            description:
+                "Summary: module count, workspace name, host count, credential count, loot count"
+                    .into(),
             mime_type: "application/json".into(),
         },
     ]
@@ -118,7 +121,10 @@ async fn read_workspace() -> ResourceContent {
         "hosts": data.hosts,
         "services": data.services,
     }))
-    .unwrap_or_else(|e| { tracing::debug!("JSON serialize failed: {e}"); "{}".into() });
+    .unwrap_or_else(|e| {
+        tracing::debug!("JSON serialize failed: {e}");
+        "{}".into()
+    });
 
     ResourceContent {
         uri: "rustsploit:///workspace".into(),
@@ -158,7 +164,10 @@ async fn read_credentials() -> ResourceContent {
         })
         .collect();
 
-    let text = serde_json::to_string_pretty(&redacted).unwrap_or_else(|e| { tracing::debug!("JSON serialize failed: {e}"); "[]".into() });
+    let text = serde_json::to_string_pretty(&redacted).unwrap_or_else(|e| {
+        tracing::debug!("JSON serialize failed: {e}");
+        "[]".into()
+    });
 
     ResourceContent {
         uri: "rustsploit:///credentials".into(),
@@ -186,7 +195,10 @@ async fn read_loot() -> ResourceContent {
         })
         .collect();
 
-    let text = serde_json::to_string_pretty(&entries).unwrap_or_else(|e| { tracing::debug!("JSON serialize failed: {e}"); "[]".into() });
+    let text = serde_json::to_string_pretty(&entries).unwrap_or_else(|e| {
+        tracing::debug!("JSON serialize failed: {e}");
+        "[]".into()
+    });
 
     ResourceContent {
         uri: "rustsploit:///loot".into(),
@@ -198,7 +210,10 @@ async fn read_loot() -> ResourceContent {
 async fn read_options() -> ResourceContent {
     let opts = crate::global_options::GLOBAL_OPTIONS.all().await;
 
-    let text = serde_json::to_string_pretty(&opts).unwrap_or_else(|e| { tracing::debug!("JSON serialize failed: {e}"); "{}".into() });
+    let text = serde_json::to_string_pretty(&opts).unwrap_or_else(|e| {
+        tracing::debug!("JSON serialize failed: {e}");
+        "{}".into()
+    });
 
     ResourceContent {
         uri: "rustsploit:///options".into(),
@@ -217,7 +232,10 @@ fn read_target() -> ResourceContent {
         "size": size,
         "is_subnet": is_subnet,
     }))
-    .unwrap_or_else(|e| { tracing::debug!("JSON serialize failed: {e}"); "{}".into() });
+    .unwrap_or_else(|e| {
+        tracing::debug!("JSON serialize failed: {e}");
+        "{}".into()
+    });
 
     ResourceContent {
         uri: "rustsploit:///target".into(),
@@ -246,7 +264,10 @@ async fn read_status() -> ResourceContent {
         "active_jobs": job_count,
         "target": target,
     }))
-    .unwrap_or_else(|e| { tracing::debug!("JSON serialize failed: {e}"); "{}".into() });
+    .unwrap_or_else(|e| {
+        tracing::debug!("JSON serialize failed: {e}");
+        "{}".into()
+    });
 
     ResourceContent {
         uri: "rustsploit:///status".into(),

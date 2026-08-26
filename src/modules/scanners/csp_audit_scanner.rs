@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::network::{build_http_client_with, HttpClientOpts};
+use crate::utils::network::{HttpClientOpts, build_http_client_with};
 use crate::utils::{cfg_prompt_default, is_batch_mode};
 
 const RISKY_CDNS: &[&str] = &[
@@ -32,11 +32,25 @@ const RISKY_CDNS: &[&str] = &[
 ];
 
 fn banner() {
-    if is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   Content-Security-Policy Auditor                            ║".cyan());
-    crate::mprintln!("{}", "║   Flags weak/missing CSP and unsafe directive values         ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Content-Security-Policy Auditor                            ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Flags weak/missing CSP and unsafe directive values         ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -59,15 +73,20 @@ pub fn info() -> ModuleInfo {
 }
 
 fn url_with_scheme(t: &str) -> String {
-    if t.starts_with("http://") || t.starts_with("https://") { t.to_string() }
-    else { format!("https://{}", t.trim_end_matches('/')) }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        t.to_string()
+    } else {
+        format!("https://{}", t.trim_end_matches('/'))
+    }
 }
 
 fn parse_csp(s: &str) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for directive in s.split(';') {
         let directive = directive.trim();
-        if directive.is_empty() { continue; }
+        if directive.is_empty() {
+            continue;
+        }
         let mut parts = directive.split_ascii_whitespace();
         if let Some(name) = parts.next() {
             let values: Vec<String> = parts.map(|p| p.to_string()).collect();
@@ -97,7 +116,9 @@ fn extract_meta_csp(html: &str) -> Option<String> {
         let is_csp_meta = tag_lower.contains("http-equiv=\"content-security-policy\"")
             || tag_lower.contains("http-equiv='content-security-policy'")
             || tag_lower.contains("http-equiv=content-security-policy");
-        if !is_csp_meta { continue; }
+        if !is_csp_meta {
+            continue;
+        }
 
         // Find content= attribute and extract its value.
         for marker in ["content=\"", "content=\'", "content="] {
@@ -109,7 +130,10 @@ fn extract_meta_csp(html: &str) -> Option<String> {
                     _ => after.split_ascii_whitespace().next(),
                 };
                 if let Some(v) = val
-                    && !v.is_empty() { return Some(v.to_string()); }
+                    && !v.is_empty()
+                {
+                    return Some(v.to_string());
+                }
             }
         }
     }
@@ -127,19 +151,27 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut outcome = ModuleOutcome::ok();
 
     // Follow redirects so the audit reflects the page actually rendered.
-    let client = build_http_client_with(Duration::from_secs(10), HttpClientOpts {
-        follow_redirects: true,
-        ..HttpClientOpts::permissive()
-    })?;
+    let client = build_http_client_with(
+        Duration::from_secs(10),
+        HttpClientOpts {
+            follow_redirects: true,
+            ..HttpClientOpts::permissive()
+        },
+    )?;
     ctx.rate_limit(target).await;
-    let resp = client.get(&url).send().await
-        .context("Request failed")?;
+    let resp = client.get(&url).send().await.context("Request failed")?;
     let status = resp.status();
-    let header_csp = resp.headers()
+    let header_csp = resp
+        .headers()
         .get("content-security-policy")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+    let body = match crate::utils::network::read_http_body_text_capped(
+        resp,
+        crate::utils::safe_io::DEFAULT_BODY_CAP,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("Failed to read response body: {}", e);
@@ -155,7 +187,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         (None, Some(m)) => (m, "<meta> tag"),
         (None, None) => {
             crate::mprintln!("{}", "[!] No CSP found (header or meta).".red().bold());
-            crate::mprintln!("{}", "    Recommendation: missing CSP is a P4 finding on most programs.".yellow());
+            crate::mprintln!(
+                "{}",
+                "    Recommendation: missing CSP is a P4 finding on most programs.".yellow()
+            );
             outcome.findings.push(Finding {
                 target: target.to_string(),
                 kind: FindingKind::Vulnerable,
@@ -180,7 +215,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         findings.push("CSP allows http: scheme (mixed content)".to_string());
     }
 
-    let critical_dirs = ["default-src", "script-src", "script-src-elem", "connect-src", "object-src", "frame-src"];
+    let critical_dirs = [
+        "default-src",
+        "script-src",
+        "script-src-elem",
+        "connect-src",
+        "object-src",
+        "frame-src",
+    ];
     let risky_lower: Vec<String> = RISKY_CDNS.iter().map(|c| c.to_ascii_lowercase()).collect();
     for dir in &critical_dirs {
         if let Some(values) = directives.get(*dir) {
@@ -195,13 +237,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 if lv == "'unsafe-eval'" {
                     findings.push(format!("{}: 'unsafe-eval'", dir));
                 }
-                if (dir == &"script-src" || dir == &"script-src-elem") && (lv == "data:" || lv == "blob:") {
+                if (dir == &"script-src" || dir == &"script-src-elem")
+                    && (lv == "data:" || lv == "blob:")
+                {
                     findings.push(format!("{}: '{}' allowed (script smuggling)", dir, v));
                 }
                 // Match risky CDNs whether the source is bare (`*.googleapis.com`)
                 // or scheme-prefixed (`https://*.googleapis.com`).
                 let host_only = lv
-                    .strip_prefix("https://").or_else(|| lv.strip_prefix("http://"))
+                    .strip_prefix("https://")
+                    .or_else(|| lv.strip_prefix("http://"))
                     .unwrap_or(&lv);
                 if risky_lower.iter().any(|c| c == host_only) {
                     findings.push(format!("{}: broad CDN '{}' (commonly bypassable)", dir, v));
@@ -212,12 +257,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if !directives.contains_key("frame-ancestors") {
         findings.push("Missing frame-ancestors directive (clickjacking via iframe)".to_string());
-    } else if directives.get("frame-ancestors").map(|v| v.iter().any(|x| x == "*")).unwrap_or(false) {
+    } else if directives
+        .get("frame-ancestors")
+        .map(|v| v.iter().any(|x| x == "*"))
+        .unwrap_or(false)
+    {
         findings.push("frame-ancestors: '*' (clickjacking)".to_string());
     }
 
     if !directives.contains_key("default-src") && !directives.contains_key("script-src") {
-        findings.push("No default-src and no script-src — script execution is unrestricted".to_string());
+        findings.push(
+            "No default-src and no script-src — script execution is unrestricted".to_string(),
+        );
     }
 
     if !directives.contains_key("object-src") && !directives.contains_key("default-src") {
@@ -242,4 +293,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "csp_audit_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "csp_audit_scanner",
+    native
+);

@@ -1,19 +1,19 @@
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use reqwest::{Client, Method, header};
 use serde::{Deserialize, Serialize};
 
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_required, cfg_prompt_wordlist,
+    cfg_prompt_yes_no, load_lines_cached, normalize_target, safe_read_to_string,
+};
+use rand::seq::IndexedRandom;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{
-    cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_wordlist,
-    normalize_target, load_lines_cached, cfg_prompt_existing_file, safe_read_to_string
-};
-use rand::seq::IndexedRandom;
 
 // --- Constants & Data ---
 
@@ -38,16 +38,16 @@ pub struct DirBruteConfig {
     pub port: u16,
     pub base_path: String, // e.g. "/" or "/api/"
     pub wordlist_path: String,
-    
+
     // Scan Settings
     pub scan_mode: u8, // 1=GET, 2=NUKE (Safe), 3=DESTROY (Delete)
     pub concurrency: usize,
     pub delay_ms: u64,
-    
+
     // Evasion
     pub random_agent: bool,
     pub custom_cookies: Option<String>, // e.g. "cf_clearance=...; _cfduid=..."
-    
+
     // Reporting
     pub verbose: bool,
 }
@@ -79,7 +79,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .context("dir_brute requires a single-host target")?;
 
     if crate::utils::get_global_source_port().await.is_some() {
-        crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
+        crate::mprintln!(
+            "{}",
+            "[*] Note: source_port does not apply to HTTP connections.".dimmed()
+        );
     }
 
     if !crate::utils::is_batch_mode() {
@@ -102,11 +105,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             save_template(&cfg).await?;
             crate::mprintln!("\n{}", "Template saved. Exiting module.".green());
             return Ok(ModuleOutcome::ok());
-        },
+        }
         "3" => load_template().await?,
         "4" => setup_wizard(target).await?,
         _ => {
-            crate::mprintln!("{}", "Invalid selection. Defaulting to Quick Attack.".yellow());
+            crate::mprintln!(
+                "{}",
+                "Invalid selection. Defaulting to Quick Attack.".yellow()
+            );
             setup_quick_attack(target).await?
         }
     };
@@ -116,12 +122,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 }
 
 fn print_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln_block!(
-        format!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan()),
-        format!("{}", "║              Advanced Directory Brute Force               ║".cyan()),
-        format!("{}", "║      Features: Nuke Mode, WAF Evasion, Config Manager     ║".red()),
-        format!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan())
+        format!(
+            "{}",
+            "╔═══════════════════════════════════════════════════════════╗".cyan()
+        ),
+        format!(
+            "{}",
+            "║              Advanced Directory Brute Force               ║".cyan()
+        ),
+        format!(
+            "{}",
+            "║      Features: Nuke Mode, WAF Evasion, Config Manager     ║".red()
+        ),
+        format!(
+            "{}",
+            "╚═══════════════════════════════════════════════════════════╝".cyan()
+        )
     );
 }
 
@@ -129,13 +149,13 @@ fn print_banner() {
 
 async fn setup_quick_attack(initial_target: &str) -> Result<DirBruteConfig> {
     crate::mprintln!("\n{}", "--- Quick Attack Setup ---".blue().bold());
-    
+
     // 1. Target
     let (proto, host, port, path) = parse_target_interactive(initial_target).await?;
-    
+
     // 2. Wordlist
     let wordlist = cfg_prompt_wordlist("wordlist", "Wordlist path").await?;
-    
+
     Ok(DirBruteConfig {
         target_host: host,
         protocol: proto,
@@ -148,51 +168,83 @@ async fn setup_quick_attack(initial_target: &str) -> Result<DirBruteConfig> {
 }
 
 async fn setup_wizard(initial_target: &str) -> Result<DirBruteConfig> {
-    crate::mprintln!("\n{}", "--- Advanced Configuration Wizard ---".blue().bold());
-    
+    crate::mprintln!(
+        "\n{}",
+        "--- Advanced Configuration Wizard ---".blue().bold()
+    );
+
     // 1. Target
     let (proto, host, port, path) = parse_target_interactive(initial_target).await?;
-    
+
     // 2. Scan Mode
     crate::mprintln!("\n{}", "Select Scan Mode:".cyan());
     crate::mprintln!("1. Standard (GET only) - [Recommended]");
     crate::mprintln!("2. Nuke Mode (GET, POST, PUT, HEAD, OPTIONS...) - Noisy!");
     crate::mprintln!("3. TOTAL DESTRUCTION (Level 2 + DELETE) - DANGEROUS");
-    
+
     let mode_str = cfg_prompt_default("scan_mode", "Mode", "1").await?;
     let scan_mode = match mode_str.as_str() {
         "3" => {
             crate::mprintln!("\n{}", "!!! CRITICAL WARNING !!!".on_red().white().bold());
-            crate::mprintln!("{}", "You have selected TOTAL DESTRUCTION mode.".red().bold());
+            crate::mprintln!(
+                "{}",
+                "You have selected TOTAL DESTRUCTION mode.".red().bold()
+            );
             crate::mprintln!("This will attempt HTTP DELETE method on discovered resources.");
             crate::mprintln!("This can PERMANENTLY DESTROY data on the target server.");
-            let confirm = cfg_prompt_required("destroy_confirm", "Type 'DESTROY' to confirm").await?;
+            let confirm =
+                cfg_prompt_required("destroy_confirm", "Type 'DESTROY' to confirm").await?;
             if confirm != "DESTROY" {
-                crate::mprintln!("{}", "Confirmation failed. Reverting to Standard Mode.".yellow());
+                crate::mprintln!(
+                    "{}",
+                    "Confirmation failed. Reverting to Standard Mode.".yellow()
+                );
                 1
             } else {
                 3
             }
-        },
+        }
         "2" => {
-            crate::mprintln!("\n{}", "[!] Warning: Nuke Mode sends multiple requests per path.".yellow());
-            if cfg_prompt_yes_no("continue_nuke", "Continue?", true).await? { 2 } else { 1 }
-        },
-        _ => 1
+            crate::mprintln!(
+                "\n{}",
+                "[!] Warning: Nuke Mode sends multiple requests per path.".yellow()
+            );
+            if cfg_prompt_yes_no("continue_nuke", "Continue?", true).await? {
+                2
+            } else {
+                1
+            }
+        }
+        _ => 1,
     };
-    
+
     // 3. Wordlist
     let wordlist = cfg_prompt_wordlist("wordlist", "Wordlist path").await?;
-    
+
     // 4. Performance
-    let concurrency: usize = cfg_prompt_default("concurrency", "Concurrency (Threads)", "10").await?.parse().unwrap_or(10);
-    let delay_ms: u64 = cfg_prompt_default("delay_ms", "Delay per request (ms)", "200").await?.parse().unwrap_or(200);
-    
+    let concurrency: usize = cfg_prompt_default("concurrency", "Concurrency (Threads)", "10")
+        .await?
+        .parse()
+        .unwrap_or(10);
+    let delay_ms: u64 = cfg_prompt_default("delay_ms", "Delay per request (ms)", "200")
+        .await?
+        .parse()
+        .unwrap_or(200);
+
     // 5. Evasion
     let random_agent = cfg_prompt_yes_no("random_agent", "Use Random User-Agents?", false).await?;
-    
-    let custom_cookies = if cfg_prompt_yes_no("custom_cookies", "Configure Custom Cookies (WAF/Cloudflare)?", false).await? {
-        crate::mprintln!("{}", "Enter cookie string (e.g. 'cf_clearance=XXX; _cfduid=YYY')".dimmed());
+
+    let custom_cookies = if cfg_prompt_yes_no(
+        "custom_cookies",
+        "Configure Custom Cookies (WAF/Cloudflare)?",
+        false,
+    )
+    .await?
+    {
+        crate::mprintln!(
+            "{}",
+            "Enter cookie string (e.g. 'cf_clearance=XXX; _cfduid=YYY')".dimmed()
+        );
         Some(cfg_prompt_required("cookies", "Cookies").await?)
     } else {
         None
@@ -200,7 +252,7 @@ async fn setup_wizard(initial_target: &str) -> Result<DirBruteConfig> {
 
     // 6. Reporting
     let verbose = cfg_prompt_yes_no("verbose", "Verbose Output (show 403s)?", false).await?;
-    
+
     Ok(DirBruteConfig {
         target_host: host,
         protocol: proto,
@@ -225,28 +277,45 @@ async fn parse_target_interactive(raw: &str) -> Result<(String, String, u16, Str
         let normalized = normalize_target(raw)?;
         // strip port if present in normalized, we ask for it separately to allow http/https logic
         if let Some((host, _)) = normalized.split_once(':') {
-             host.to_string()
+            host.to_string()
         } else {
-             normalized
+            normalized
         }
     };
 
     let use_https = cfg_prompt_yes_no("use_https", "Use HTTPS?", true).await?;
-    let proto = if use_https { "https".to_string() } else { "http".to_string() };
-    
+    let proto = if use_https {
+        "https".to_string()
+    } else {
+        "http".to_string()
+    };
+
     let def_port = if use_https { "443" } else { "80" };
-    let port: u16 = cfg_prompt_default("port", &format!("Port (default {})", def_port), def_port).await?
+    let port: u16 = cfg_prompt_default("port", &format!("Port (default {})", def_port), def_port)
+        .await?
         .parse()
         .context("Invalid port")?;
-        
+
     let path_input = cfg_prompt_default("base_path", "Base Path (must end with /)", "/").await?;
-    
+
     // Slash check logic
     let path = if !path_input.ends_with('/') {
-        if cfg_prompt_yes_no("append_slash", "Path does not end with '/'. Append it?", true).await? {
+        if cfg_prompt_yes_no(
+            "append_slash",
+            "Path does not end with '/'. Append it?",
+            true,
+        )
+        .await?
+        {
             format!("{}/", path_input)
         } else {
-            if !cfg_prompt_yes_no("continue_no_slash", "Continue without trailing slash? (May break scanning)", false).await? {
+            if !cfg_prompt_yes_no(
+                "continue_no_slash",
+                "Continue without trailing slash? (May break scanning)",
+                false,
+            )
+            .await?
+            {
                 return Err(anyhow!("Aborted by user due to path format."));
             }
             path_input
@@ -254,14 +323,19 @@ async fn parse_target_interactive(raw: &str) -> Result<(String, String, u16, Str
     } else {
         path_input
     };
-    
+
     Ok((proto, resolved_ip, port, path))
 }
 
 // --- Persistence ---
 
 async fn save_template(config: &DirBruteConfig) -> Result<()> {
-    let name = cfg_prompt_default("template_name", "Template Name (e.g. 'myscan.json')", "scan_template.json").await?;
+    let name = cfg_prompt_default(
+        "template_name",
+        "Template Name (e.g. 'myscan.json')",
+        "scan_template.json",
+    )
+    .await?;
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&name, json).context("Failed to write template file")?;
     crate::mprintln!("Saved config to {}", name);
@@ -271,16 +345,31 @@ async fn save_template(config: &DirBruteConfig) -> Result<()> {
 async fn load_template() -> Result<DirBruteConfig> {
     let path = cfg_prompt_existing_file("template_file", "Template File Path").await?;
     let content = safe_read_to_string(&path, None)?;
-    let config: DirBruteConfig = serde_json::from_str(&content).context("Invalid template format")?;
-    
+    let config: DirBruteConfig =
+        serde_json::from_str(&content).context("Invalid template format")?;
+
     crate::mprintln!("{}", "Loaded Configuration:".green());
-    crate::mprintln!("Target: {}://{}:{}{}", config.protocol, config.target_host, config.port, config.base_path);
+    crate::mprintln!(
+        "Target: {}://{}:{}{}",
+        config.protocol,
+        config.target_host,
+        config.port,
+        config.base_path
+    );
     crate::mprintln!("Mode: Level {}", config.scan_mode);
     crate::mprintln!("Wordlist: {}", config.wordlist_path);
 
     if config.scan_mode == 3 {
-        crate::mprintln!("\n{}", "[!] WARNING: This template uses DESTROY mode (scan_mode=3).".red().bold());
-        crate::mprintln!("{}", "    DELETE requests will be sent to discovered paths on the target.".red());
+        crate::mprintln!(
+            "\n{}",
+            "[!] WARNING: This template uses DESTROY mode (scan_mode=3)."
+                .red()
+                .bold()
+        );
+        crate::mprintln!(
+            "{}",
+            "    DELETE requests will be sent to discovered paths on the target.".red()
+        );
     }
 
     if !cfg_prompt_yes_no("run_template", "Run this configuration?", true).await? {
@@ -312,9 +401,21 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
             ));
         }
 
-        crate::mprintln!("\n{}", "[!] DESTROY mode will send DELETE requests to discovered paths on the target.".red().bold());
-        crate::mprintln!("{}", "    This can PERMANENTLY DESTROY data on the remote server.".red());
-        let confirm = cfg_prompt_required("destroy_exec_confirm", "Type 'DESTROY' to confirm execution").await?;
+        crate::mprintln!(
+            "\n{}",
+            "[!] DESTROY mode will send DELETE requests to discovered paths on the target."
+                .red()
+                .bold()
+        );
+        crate::mprintln!(
+            "{}",
+            "    This can PERMANENTLY DESTROY data on the remote server.".red()
+        );
+        let confirm = cfg_prompt_required(
+            "destroy_exec_confirm",
+            "Type 'DESTROY' to confirm execution",
+        )
+        .await?;
         if confirm != "DESTROY" {
             crate::mprintln!("{}", "Confirmation failed. Aborting scan.".yellow());
             return Ok(outcome);
@@ -323,16 +424,27 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
 
     let lines = load_lines_cached(&config.wordlist_path)?;
     let total = lines.len();
-    crate::mprintln!("\n{}", format!("Loaded {} words. Starting scan...", total).blue().bold());
-    
-    let base_url = format!("{}://{}:{}{}", config.protocol, config.target_host, config.port, config.base_path);
-    
+    crate::mprintln!(
+        "\n{}",
+        format!("Loaded {} words. Starting scan...", total)
+            .blue()
+            .bold()
+    );
+
+    let base_url = format!(
+        "{}://{}:{}{}",
+        config.protocol, config.target_host, config.port, config.base_path
+    );
+
     // Build Client
     let mut headers = header::HeaderMap::new();
     if let Some(cookies) = &config.custom_cookies {
-        headers.insert(header::COOKIE, cookies.parse().context("Invalid cookie string")?);
+        headers.insert(
+            header::COOKIE,
+            cookies.parse().context("Invalid cookie string")?,
+        );
     }
-    
+
     let client = Client::builder()
         .default_headers(headers)
         .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
@@ -342,12 +454,15 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
     let sem = Arc::new(Semaphore::new(config.concurrency));
     let results_mutex = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let forbidden_count = Arc::new(AtomicUsize::new(0));
-    
+
     let methods = get_methods_for_mode(config.scan_mode);
     let delay = Duration::from_millis(config.delay_ms);
 
     crate::mprintln!("{}", format!("Target Base: {}", base_url).cyan());
-    crate::mprintln!("{}", "Press Ctrl+C to stop (handler not implemented, so just wait)".dimmed());
+    crate::mprintln!(
+        "{}",
+        "Press Ctrl+C to stop (handler not implemented, so just wait)".dimmed()
+    );
     crate::mprintln!("{}", "---------------------------------------------------");
 
     let mut tasks = Vec::new();
@@ -362,7 +477,7 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
 
         let config_verbose = config.verbose;
         let random_agent = config.random_agent;
-        
+
         let target_host = config.target_host.clone();
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
@@ -370,8 +485,13 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
         let word = word.clone();
 
         let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
-            let _permit = sem.acquire().await.context("Semaphore acquisition failed")?;
-            if cancel.is_cancelled() || crate::context::is_cancelled() { return Ok(()); }
+            let _permit = sem
+                .acquire()
+                .await
+                .context("Semaphore acquisition failed")?;
+            if cancel.is_cancelled() || crate::context::is_cancelled() {
+                return Ok(());
+            }
 
             // Apply delay
             if delay.as_millis() > 0 {
@@ -384,58 +504,69 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
                 let mut req_builder = client.request(method.clone(), &url);
 
                 if random_agent {
-                     let agent = USER_AGENTS.choose(&mut rand::rng()).unwrap_or(&"RustSploit");
-                     req_builder = req_builder.header(header::USER_AGENT, *agent);
+                    let agent = USER_AGENTS
+                        .choose(&mut rand::rng())
+                        .unwrap_or(&"RustSploit");
+                    req_builder = req_builder.header(header::USER_AGENT, *agent);
                 } else {
-                     req_builder = req_builder.header(header::USER_AGENT, "RustSploit/0.3");
+                    req_builder = req_builder.header(header::USER_AGENT, "RustSploit/0.3");
                 }
 
                 limiter.acquire(&module_path, &target_host).await;
                 match req_builder.send().await {
                     Ok(resp) => {
-                         let status = resp.status().as_u16();
-                         let len = resp.content_length().unwrap_or(0);
+                        let status = resp.status().as_u16();
+                        let len = resp.content_length().unwrap_or(0);
 
-                         // Special handling for 403 Forbidden
-                         if status == 403 {
-                             f_count.fetch_add(1, Ordering::Relaxed);
-                             if !config_verbose {
-                                 continue; // Skip printing if not verbose
-                             }
-                         }
+                        // Special handling for 403 Forbidden
+                        if status == 403 {
+                            f_count.fetch_add(1, Ordering::Relaxed);
+                            if !config_verbose {
+                                continue; // Skip printing if not verbose
+                            }
+                        }
 
-                         // Determine if "Interesting"
-                         if COMMON_STATUS_CODES.contains(&status) {
-                             let method_str = method.as_str();
+                        // Determine if "Interesting"
+                        if COMMON_STATUS_CODES.contains(&status) {
+                            let method_str = method.as_str();
 
-                             // Enhanced Color Logic
-                             let status_display = if (200..300).contains(&status) {
-                                 format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
-                             } else if (300..400).contains(&status) {
-                                 format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
-                             } else if status >= 500 {
-                                 format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
-                             } else if status == 403 || status == 401 {
-                                 format!("{} {}", "[AUTH]".yellow().bold(), status.to_string().yellow())
-                             } else {
-                                 format!("[{}]", status).white().to_string()
-                             };
+                            // Enhanced Color Logic
+                            let status_display = if (200..300).contains(&status) {
+                                format!(
+                                    "{} {}",
+                                    "[FOUND]".green().bold(),
+                                    status.to_string().green()
+                                )
+                            } else if (300..400).contains(&status) {
+                                format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
+                            } else if status >= 500 {
+                                format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
+                            } else if status == 403 || status == 401 {
+                                format!(
+                                    "{} {}",
+                                    "[AUTH]".yellow().bold(),
+                                    status.to_string().yellow()
+                                )
+                            } else {
+                                format!("[{}]", status).white().to_string()
+                            };
 
-                             crate::mprintln!("{} Size: {} | Method: {} | {}",
-                                 status_display,
-                                 len.to_string().dimmed(),
-                                 method_str.bold(),
-                                 url
-                             );
+                            crate::mprintln!(
+                                "{} Size: {} | Method: {} | {}",
+                                status_display,
+                                len.to_string().dimmed(),
+                                method_str.bold(),
+                                url
+                            );
 
-                             let res = ScanResult {
-                                 path: url.clone(),
-                                 method: method.to_string(),
-                                 status,
-                                 len,
-                             };
-                             r_mutex.lock().await.push(res);
-                         }
+                            let res = ScanResult {
+                                path: url.clone(),
+                                method: method.to_string(),
+                                status,
+                                len,
+                            };
+                            r_mutex.lock().await.push(res);
+                        }
                     }
                     Err(e) => {
                         if config_verbose {
@@ -448,26 +579,33 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
         });
         tasks.push(task);
     }
-    
+
     // Await all
     for t in tasks {
         match t.await {
             Err(e) => {
-                eprintln!("[!] Task join failed: {}", e);
+                crate::meprintln!("[!] Task join failed: {}", e);
             }
             Ok(Err(e)) => {
-                eprintln!("[!] Task inner error: {}", e);
+                crate::meprintln!("[!] Task inner error: {}", e);
             }
             Ok(Ok(())) => {}
         }
     }
 
     crate::mprintln!("\n{}", "Scan Complete.".green().bold());
-    
+
     // 403 Summary
     let f_total = forbidden_count.load(Ordering::Relaxed);
     if f_total > 0 && !config.verbose {
-        crate::mprintln!("{}", format!("[*] Aggregated {} '403 Forbidden' responses. (Use verbose mode to see them)", f_total).yellow());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Aggregated {} '403 Forbidden' responses. (Use verbose mode to see them)",
+                f_total
+            )
+            .yellow()
+        );
     }
 
     // Report & Save
@@ -477,7 +615,10 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
             outcome.findings.push(Finding {
                 target: config.target_host.clone(),
                 kind: FindingKind::Note,
-                message: format!("dir_brute hit {} {} -> {} ({} bytes)", r.method, r.path, r.status, r.len),
+                message: format!(
+                    "dir_brute hit {} {} -> {} ({} bytes)",
+                    r.method, r.path, r.status, r.len
+                ),
                 data: Some(serde_json::json!({
                     "url": r.path,
                     "method": r.method,
@@ -487,24 +628,38 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
             });
         }
     }
-    if !final_results.is_empty() && cfg_prompt_yes_no("save_results", "Save results to file?", true).await? {
-        let sort_choice = cfg_prompt_default("sort_by", "Sort by (1) Status or (2) Size", "1").await?;
-        
+    if !final_results.is_empty()
+        && cfg_prompt_yes_no("save_results", "Save results to file?", true).await?
+    {
+        let sort_choice =
+            cfg_prompt_default("sort_by", "Sort by (1) Status or (2) Size", "1").await?;
+
         let mut sorted: Vec<&ScanResult> = final_results.iter().collect();
         if sort_choice == "2" {
             sorted.sort_by_key(|b| std::cmp::Reverse(b.len)); // Size desc
         } else {
             sorted.sort_by_key(|a| a.status); // Status asc
         }
-        
-        let filename = format!("scan_results_{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+
+        let filename = format!(
+            "scan_results_{}.txt",
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        );
         let mut file_content = String::new();
         for r in sorted {
-             use std::fmt::Write;
-             writeln!(file_content, "[{}] {} | Size: {} | Method: {} | {}", 
-                 r.status, get_status_text(r.status), r.len, r.method, r.path).context("Failed to write to buffer")?;
+            use std::fmt::Write;
+            writeln!(
+                file_content,
+                "[{}] {} | Size: {} | Method: {} | {}",
+                r.status,
+                get_status_text(r.status),
+                r.len,
+                r.method,
+                r.path
+            )
+            .context("Failed to write to buffer")?;
         }
-        
+
         fs::write(&filename, file_content)?;
         crate::mprintln!("Results saved to {}", filename.green());
     }
@@ -515,14 +670,25 @@ async fn execute_scan(ctx: &ModuleCtx, config: DirBruteConfig) -> Result<ModuleO
 fn get_methods_for_mode(mode: u8) -> Vec<Method> {
     match mode {
         3 => vec![
-            Method::GET, Method::POST, Method::PUT, Method::DELETE, 
-            Method::HEAD, Method::OPTIONS, Method::PATCH, Method::TRACE,
-            Method::CONNECT
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PATCH,
+            Method::TRACE,
+            Method::CONNECT,
         ],
         2 => vec![
-            Method::GET, Method::POST, Method::PUT, 
-            Method::HEAD, Method::OPTIONS, Method::PATCH, Method::TRACE,
-            Method::CONNECT
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PATCH,
+            Method::TRACE,
+            Method::CONNECT,
         ],
         _ => vec![Method::GET], // Level 1
     }

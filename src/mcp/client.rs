@@ -1,7 +1,7 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -65,7 +65,8 @@ impl McpClient {
     /// List all tools offered by the remote server.
     pub async fn list_tools(&mut self) -> Result<Vec<Value>> {
         let id = self.next_id();
-        let result = send_request(&mut self.stdin, &mut self.stdout, id, "tools/list", None).await?;
+        let result =
+            send_request(&mut self.stdin, &mut self.stdout, id, "tools/list", None).await?;
         let tools = result
             .get("tools")
             .and_then(|v| v.as_array())
@@ -97,8 +98,14 @@ impl McpClient {
     /// List all resources offered by the remote server.
     pub async fn list_resources(&mut self) -> Result<Vec<Value>> {
         let id = self.next_id();
-        let result =
-            send_request(&mut self.stdin, &mut self.stdout, id, "resources/list", None).await?;
+        let result = send_request(
+            &mut self.stdin,
+            &mut self.stdout,
+            id,
+            "resources/list",
+            None,
+        )
+        .await?;
         let resources = result
             .get("resources")
             .and_then(|v| v.as_array())
@@ -124,7 +131,10 @@ impl McpClient {
     pub async fn close(mut self) -> Result<()> {
         drop(self.stdin);
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(status)) => { tracing::trace!("MCP server exited: {status}"); return Ok(()); }
+            Ok(Ok(status)) => {
+                tracing::trace!("MCP server exited: {status}");
+                return Ok(());
+            }
             Ok(Err(e)) => {
                 eprintln!("[!] MCP server wait error: {}", e);
             }
@@ -160,9 +170,10 @@ async fn send_request(
         "method": method,
     });
     if let Some(p) = params
-        && let Some(obj) = request.as_object_mut() {
-            obj.insert("params".to_string(), p);
-        }
+        && let Some(obj) = request.as_object_mut()
+    {
+        obj.insert("params".to_string(), p);
+    }
 
     // Serialize and send as a single line
     let line = serde_json::to_string(&request).context("Failed to serialize JSON-RPC request")?;
@@ -192,7 +203,10 @@ async fn send_request(
             .await
             .context("Failed to read from child stdout")?;
         if n == 0 {
-            anyhow::bail!("MCP server closed stdout before responding to request {}", id);
+            anyhow::bail!(
+                "MCP server closed stdout before responding to request {}",
+                id
+            );
         }
         if raw.len() > MAX_RESP_BYTES {
             anyhow::bail!(
@@ -214,19 +228,20 @@ async fn send_request(
 
         // Check if this is a response (has "id") matching our request
         if let Some(resp_id) = response.get("id")
-            && resp_id.as_u64() == Some(id) {
-                // Check for error
-                if let Some(error) = response.get("error") {
-                    let msg = error
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown error");
-                    let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    anyhow::bail!("MCP server error (code {}): {}", code, msg);
-                }
-                // Return the result field
-                return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+            && resp_id.as_u64() == Some(id)
+        {
+            // Check for error
+            if let Some(error) = response.get("error") {
+                let msg = error
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error");
+                let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                anyhow::bail!("MCP server error (code {}): {}", code, msg);
             }
+            // Return the result field
+            return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+        }
         // Not our response (notification or different id) -- skip and keep reading
     }
 }

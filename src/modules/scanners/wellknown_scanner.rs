@@ -5,14 +5,14 @@
 //! AWS EC2 IDs, Citrix OIDC), Canterbury, Twilio, etc. Each hit is reported
 //! with status, content-type, length, and a short body snippet.
 
-use anyhow::Result;
-use anyhow::Context;
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use anyhow::Context;
+use anyhow::Result;
 use colored::*;
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::parallel::{run_buffered, BoxFut};
+use crate::utils::parallel::{BoxFut, run_buffered};
 use crate::utils::{build_http_client, cfg_prompt_default, is_batch_mode};
 
 const WELLKNOWN_CONCURRENCY: usize = 16;
@@ -75,11 +75,25 @@ const PATHS: &[&str] = &[
 ];
 
 fn banner() {
-    if is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   .well-known / Discovery Endpoint Scanner                   ║".cyan());
-    crate::mprintln!("{}", "║   security.txt, OIDC config, autodiscover, swagger, .env...  ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   .well-known / Discovery Endpoint Scanner                   ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   security.txt, OIDC config, autodiscover, swagger, .env...  ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -102,12 +116,18 @@ pub fn info() -> ModuleInfo {
 }
 
 fn url_with_scheme(t: &str) -> String {
-    if t.starts_with("http://") || t.starts_with("https://") { t.to_string() }
-    else { format!("https://{}", t.trim_end_matches('/')) }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        t.to_string()
+    } else {
+        format!("https://{}", t.trim_end_matches('/'))
+    }
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
     banner();
     let mut outcome = ModuleOutcome::ok();
     let base = cfg_prompt_default("url", "Target base URL", &url_with_scheme(target)).await?;
@@ -123,9 +143,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let baseline = match client.get(&baseline_full).send().await {
         Ok(r) => {
             let status = r.status().as_u16();
-            let ct = r.headers().get("content-type")
-                .and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-            let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            let ct = r
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let body = match crate::utils::network::read_http_body_text_capped(
+                r,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Failed to read response body: {}", e);
@@ -134,29 +163,57 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             };
             Some((status, ct, body.len()))
         }
-        Err(e) => { tracing::debug!("baseline request failed: {e}"); None }
+        Err(e) => {
+            tracing::debug!("baseline request failed: {e}");
+            None
+        }
     };
-    let spa_fallback = baseline.as_ref().map(|(s, ct, _)| *s < 400 && (ct.contains("text/html") || ct.is_empty())).unwrap_or(false);
+    let spa_fallback = baseline
+        .as_ref()
+        .map(|(s, ct, _)| *s < 400 && (ct.contains("text/html") || ct.is_empty()))
+        .unwrap_or(false);
     if spa_fallback {
         crate::mprintln!(
             "{}",
-            format!("[*] SPA detected: nonexistent path returns {} HTML — suppressing same-shape hits.",
-                baseline.as_ref().map(|(s,_,_)| *s).unwrap_or(0)).dimmed()
+            format!(
+                "[*] SPA detected: nonexistent path returns {} HTML — suppressing same-shape hits.",
+                baseline.as_ref().map(|(s, _, _)| *s).unwrap_or(0)
+            )
+            .dimmed()
         );
     }
 
     // Probe all paths concurrently (up to WELLKNOWN_CONCURRENCY in flight).
-    let work: Vec<BoxFut<WellknownProbeResult>> =
-        PATHS.iter().copied().map(|path| {
+    let work: Vec<BoxFut<WellknownProbeResult>> = PATHS
+        .iter()
+        .copied()
+        .map(|path| {
             let client = client.clone();
             let full = format!("{}{}", base, path);
             Box::pin(async move {
-                let resp = match client.get(&full).send().await { Ok(r) => r, Err(e) => { tracing::debug!("request failed: {e}"); return (path, full, None); } };
+                let resp = match client.get(&full).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("request failed: {e}");
+                        return (path, full, None);
+                    }
+                };
                 let status = resp.status().as_u16();
-                if status >= 400 { return (path, full, None); }
-                let ct = resp.headers().get("content-type")
-                    .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                if status >= 400 {
+                    return (path, full, None);
+                }
+                let ct = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let body = match crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!("Failed to read response body: {}", e);
@@ -165,26 +222,34 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 };
                 (path, full, Some((status, ct, body)))
             }) as _
-        }).collect();
+        })
+        .collect();
     let probes = run_buffered(work, WELLKNOWN_CONCURRENCY).await;
 
     let mut hits: Vec<(String, u16, String, usize)> = Vec::new();
 
     for (path, full, fetched) in probes {
-        let (status, ct, body) = match fetched { Some(v) => v, None => continue };
+        let (status, ct, body) = match fetched {
+            Some(v) => v,
+            None => continue,
+        };
         let len = body.len();
-        if len == 0 { continue; }
+        if len == 0 {
+            continue;
+        }
 
         // Suppress SPA-fallback noise: same status, same length within ±5%, HTML body.
-        if spa_fallback
-            && let Some((bs, _, blen)) = baseline.as_ref() {
-                let diff = (len as isize - *blen as isize).unsigned_abs();
-                let tolerance = (*blen / 20).max(64);
-                if status == *bs && diff <= tolerance &&
-                   (ct.to_ascii_lowercase().contains("text/html") || body.trim_start().starts_with('<')) {
-                    continue;
-                }
+        if spa_fallback && let Some((bs, _, blen)) = baseline.as_ref() {
+            let diff = (len as isize - *blen as isize).unsigned_abs();
+            let tolerance = (*blen / 20).max(64);
+            if status == *bs
+                && diff <= tolerance
+                && (ct.to_ascii_lowercase().contains("text/html")
+                    || body.trim_start().starts_with('<'))
+            {
+                continue;
             }
+        }
 
         let lower = body.to_ascii_lowercase();
         let interesting = if path.contains(".env") || path.contains(".git") {
@@ -192,24 +257,36 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         } else {
             true
         };
-        if !interesting { continue; }
+        if !interesting {
+            continue;
+        }
 
-        let snippet: String = body.chars().take(140).collect::<String>()
+        let snippet: String = body
+            .chars()
+            .take(140)
+            .collect::<String>()
             .replace(['\n', '\r'], " ");
         let tag = match path {
-            "/.git/config" | "/.git/HEAD" | "/.env" | "/.env.production" |
-            "/.DS_Store" | "/server-status" | "/actuator/env" =>
-                "[!!]".red().bold().to_string(),
-            "/.well-known/openid-configuration" |
-            "/autodiscover/autodiscover.json" | "/autodiscover/autodiscover.xml" |
-            "/.well-known/jwks.json" | "/swagger.json" | "/openapi.json" |
-            "/v2/api-docs" | "/swagger/v1/swagger.json" =>
-                "[!!]".yellow().bold().to_string(),
+            "/.git/config" | "/.git/HEAD" | "/.env" | "/.env.production" | "/.DS_Store"
+            | "/server-status" | "/actuator/env" => "[!!]".red().bold().to_string(),
+            "/.well-known/openid-configuration"
+            | "/autodiscover/autodiscover.json"
+            | "/autodiscover/autodiscover.xml"
+            | "/.well-known/jwks.json"
+            | "/swagger.json"
+            | "/openapi.json"
+            | "/v2/api-docs"
+            | "/swagger/v1/swagger.json" => "[!!]".yellow().bold().to_string(),
             _ => "[+]".green().to_string(),
         };
         crate::mprintln!(
             "{} {} status={} ct='{}' len={} :: {}",
-            tag, full, status, ct, len, snippet
+            tag,
+            full,
+            status,
+            ct,
+            len,
+            snippet
         );
         outcome.findings.push(Finding {
             target: target.to_string(),
@@ -227,4 +304,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "wellknown_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "wellknown_scanner",
+    native
+);

@@ -6,13 +6,13 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use colored::*;
-use std::time::Duration;
-use std::collections::HashMap;
-use crate::utils::{cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
 use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_yes_no};
+use anyhow::{Context, Result};
+use colored::*;
+use std::collections::HashMap;
+use std::time::Duration;
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -35,11 +35,25 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   WAF / CDN Detection Scanner                                ║".cyan());
-    crate::mprintln!("{}", "║   Fingerprint web application firewalls and CDN providers    ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   WAF / CDN Detection Scanner                                ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Fingerprint web application firewalls and CDN providers    ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -86,10 +100,7 @@ fn get_waf_signatures() -> Vec<WafSignature> {
         },
         WafSignature {
             name: "Imperva / Incapsula",
-            header_checks: vec![
-                ("x-iinfo", ""),
-                ("x-cdn", "Incapsula"),
-            ],
+            header_checks: vec![("x-iinfo", ""), ("x-cdn", "Incapsula")],
             cookie_checks: vec!["incap_ses_", "visid_incap_", "nlbi_"],
             body_checks: vec!["incapsula", "imperva"],
         },
@@ -105,10 +116,7 @@ fn get_waf_signatures() -> Vec<WafSignature> {
         },
         WafSignature {
             name: "ModSecurity",
-            header_checks: vec![
-                ("server", "ModSecurity"),
-                ("server", "mod_security"),
-            ],
+            header_checks: vec![("server", "ModSecurity"), ("server", "mod_security")],
             cookie_checks: vec![],
             body_checks: vec!["mod_security", "ModSecurity", "NOYB"],
         },
@@ -124,17 +132,13 @@ fn get_waf_signatures() -> Vec<WafSignature> {
         },
         WafSignature {
             name: "Barracuda",
-            header_checks: vec![
-                ("server", "Barracuda"),
-            ],
+            header_checks: vec![("server", "Barracuda")],
             cookie_checks: vec!["barra_counter_session", "BNI__BARRACUDA"],
             body_checks: vec!["barracuda"],
         },
         WafSignature {
             name: "Fortinet / FortiWeb",
-            header_checks: vec![
-                ("server", "FortiWeb"),
-            ],
+            header_checks: vec![("server", "FortiWeb")],
             cookie_checks: vec!["FORTIWAFSID", "cookiesession1"],
             body_checks: vec!["fortigate", "fortiweb", "fortinet"],
         },
@@ -181,10 +185,12 @@ fn check_signatures(
     for (header_name, header_value) in &sig.header_checks {
         let key = header_name.to_lowercase();
         if let Some(val) = headers.get(&key)
-            && (header_value.is_empty() || val.to_lowercase().contains(&header_value.to_lowercase())) {
-                methods.push(format!("header '{}' = '{}'", header_name, val));
-                score += 3;
-            }
+            && (header_value.is_empty()
+                || val.to_lowercase().contains(&header_value.to_lowercase()))
+        {
+            methods.push(format!("header '{}' = '{}'", header_name, val));
+            score += 3;
+        }
     }
 
     // Check cookies
@@ -213,20 +219,29 @@ fn check_signatures(
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
 
     display_banner();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
-    let timeout_secs = cfg_prompt_int_range("timeout", "HTTP timeout (seconds)", 10, 1, 60).await? as u64;
-    let send_triggers = cfg_prompt_yes_no("send_triggers", "Send malicious payloads to trigger WAF?", true).await?;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "HTTP timeout (seconds)", 10, 1, 60).await? as u64;
+    let send_triggers = cfg_prompt_yes_no(
+        "send_triggers",
+        "Send malicious payloads to trigger WAF?",
+        true,
+    )
+    .await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
 
     let timeout_dur = Duration::from_secs(timeout_secs);
 
-    let client = crate::utils::build_http_client(timeout_dur)
-        .context("Failed to build HTTP client")?;
+    let client =
+        crate::utils::build_http_client(timeout_dur).context("Failed to build HTTP client")?;
 
     // Build base URL — try HTTPS first for modern targets, fall back to HTTP
     let base_url = if target.starts_with("http://") || target.starts_with("https://") {
@@ -246,7 +261,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Phase 1: Normal request
     crate::mprintln!();
-    crate::mprintln!("{}", "[*] Phase 1: Analyzing normal HTTP response...".bold());
+    crate::mprintln!(
+        "{}",
+        "[*] Phase 1: Analyzing normal HTTP response...".bold()
+    );
 
     match client.get(&base_url).send().await {
         Ok(resp) => {
@@ -267,7 +285,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
 
             // Limit response body to 128KB to prevent OOM
-            let body_bytes = crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await.unwrap_or_default();
+            let body_bytes = crate::utils::safe_io::read_http_body_capped(
+                resp,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            .unwrap_or_default();
             let body = if body_bytes.len() > 128 * 1024 {
                 String::from_utf8_lossy(&body_bytes[..128 * 1024]).to_string()
             } else {
@@ -277,7 +300,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             // Check all signatures
             for sig in &signatures {
                 if let Some((methods, score)) = check_signatures(&headers, &cookies, &body, sig) {
-                    let confidence = if score >= 5 { "High" } else if score >= 3 { "Medium" } else { "Low" };
+                    let confidence = if score >= 5 {
+                        "High"
+                    } else if score >= 3 {
+                        "Medium"
+                    } else {
+                        "Low"
+                    };
                     detections.push(WafDetection {
                         name: sig.name.to_string(),
                         confidence,
@@ -300,7 +329,32 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let url = format!("{}{}", base_url, payload);
             crate::mprintln!("{}", format!("  [*] Testing: {}", payload).dimmed());
 
-            match client.get(&url).send().await {
+            // When WAF bypass is enabled, route through the bypass engine
+            let bypass_enabled = crate::tenant::resolve()
+                .global_options()
+                .get("waf_bypass")
+                .await
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+
+            let resp = if bypass_enabled {
+                crate::utils::network::http_request_with_bypass(
+                    &client,
+                    http::Method::GET,
+                    &url,
+                    &[],
+                    None,
+                )
+                .await
+            } else {
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            };
+
+            match resp {
                 Ok(resp) => {
                     let status = resp.status();
                     let blocked = status.as_u16() == 403
@@ -309,7 +363,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         || status.as_u16() == 503;
 
                     if blocked {
-                        crate::mprintln!("{}", format!("  [+] Blocked! Status: {}", status).green());
+                        crate::mprintln!(
+                            "{}",
+                            format!("  [+] Blocked! Status: {}", status).green()
+                        );
                     }
 
                     let mut headers: HashMap<String, String> = HashMap::new();
@@ -324,7 +381,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         headers.insert(key_str, val_str);
                     }
 
-                    let body_bytes = crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await.unwrap_or_default();
+                    let body_bytes = crate::utils::safe_io::read_http_body_capped(
+                        resp,
+                        crate::utils::safe_io::DEFAULT_BODY_CAP,
+                    )
+                    .await
+                    .unwrap_or_default();
                     let body = if body_bytes.len() > 128 * 1024 {
                         String::from_utf8_lossy(&body_bytes[..128 * 1024]).to_string()
                     } else {
@@ -332,11 +394,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     };
 
                     for sig in &signatures {
-                        if let Some((methods, score)) = check_signatures(&headers, &cookies, &body, sig) {
+                        if let Some((methods, score)) =
+                            check_signatures(&headers, &cookies, &body, sig)
+                        {
                             // Only add if not already detected
                             let already = detections.iter().any(|d| d.name == sig.name);
                             if !already {
-                                let confidence = if score >= 5 { "High" } else if score >= 3 { "Medium" } else { "Low" };
+                                let confidence = if score >= 5 {
+                                    "High"
+                                } else if score >= 3 {
+                                    "Medium"
+                                } else {
+                                    "Low"
+                                };
                                 detections.push(WafDetection {
                                     name: sig.name.to_string(),
                                     confidence,
@@ -348,7 +418,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
                 Err(e) => {
                     tracing::debug!("WAF probe failed: {e}");
-                    crate::mprintln!("{}", format!("  [-] Request blocked/failed for: {}", payload).dimmed());
+                    crate::mprintln!(
+                        "{}",
+                        format!("  [-] Request blocked/failed for: {}", payload).dimmed()
+                    );
                 }
             }
         }
@@ -362,7 +435,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if detections.is_empty() {
         crate::mprintln!("  {}", "No WAF/CDN detected".dimmed());
         crate::mprintln!();
-        crate::mprintln!("{}", "[*] Note: Absence of detection does not mean no WAF is present.".yellow());
+        crate::mprintln!(
+            "{}",
+            "[*] Note: Absence of detection does not mean no WAF is present.".yellow()
+        );
     } else {
         // Surface every WAF detection to the structured event bus before
         // printing the table, so subscribers see findings as they arrive.
@@ -383,8 +459,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 "Medium" => det.confidence.yellow().to_string(),
                 _ => det.confidence.dimmed().to_string(),
             };
-            crate::mprintln!("  {} {} (confidence: {})",
-                "[+]".green(), det.name.green().bold(), conf_colored);
+            crate::mprintln!(
+                "  {} {} (confidence: {})",
+                "[+]".green(),
+                det.name.green().bold(),
+                conf_colored
+            );
             for method in &det.methods {
                 crate::mprintln!("      - {}", method);
             }
@@ -398,7 +478,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         outcome.findings.push(Finding {
             target: target.to_string(),
             kind: FindingKind::Banner,
-            message: format!("WAF/CDN detected: {} (confidence: {})", det.name, det.confidence),
+            message: format!(
+                "WAF/CDN detected: {} (confidence: {})",
+                det.name, det.confidence
+            ),
             data: Some(serde_json::json!({
                 "waf_name": det.name,
                 "confidence": det.confidence,
@@ -409,21 +492,29 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     if save_results && !detections.is_empty() {
-        let output_path = cfg_prompt_output_file("output_file", "Output file", "waf_detect_results.txt").await?;
+        let output_path =
+            cfg_prompt_output_file("output_file", "Output file", "waf_detect_results.txt").await?;
         let mut content = format!("WAF Detection Results - {}\n\n", base_url);
         for det in &detections {
-            content.push_str(&format!("WAF: {} (confidence: {})\n", det.name, det.confidence));
+            content.push_str(&format!(
+                "WAF: {} (confidence: {})\n",
+                det.name, det.confidence
+            ));
             for method in &det.methods {
                 content.push_str(&format!("  - {}\n", method));
             }
             content.push('\n');
         }
-        tokio::fs::write(&output_path, content).await
+        tokio::fs::write(&output_path, content)
+            .await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
         if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
             crate::meprintln!("[!] Failed to set file permissions: {}", e);
         }
-        crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
+        crate::mprintln!(
+            "{}",
+            format!("[+] Results saved to '{}'", output_path).green()
+        );
     }
 
     Ok(outcome)

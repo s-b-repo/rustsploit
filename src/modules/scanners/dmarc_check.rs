@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use colored::*;
 use std::net::{IpAddr, SocketAddr};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
@@ -69,8 +69,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .context("dmarc_check requires a single-host target")?;
     display_banner();
 
-    let host = sanitize_host(target);
-    let domain = registrable_domain(&host);
+    let host = crate::utils::sanitize::sanitize_host(target);
+    let domain = crate::utils::sanitize::registrable_domain(&host);
     let resolver_input =
         cfg_prompt_default("resolver", "Public resolver to query", "1.1.1.1").await?;
     let resolver = resolver_input.trim();
@@ -98,10 +98,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     data: None,
                 });
             } else if lower.contains("p=quarantine") || lower.contains("p=reject") {
-                crate::mprintln!(
-                    "{}",
-                    format!("[+] DMARC enforced: {}", rec).green().bold()
-                );
+                crate::mprintln!("{}", format!("[+] DMARC enforced: {}", rec).green().bold());
             } else {
                 crate::mprintln!(
                     "{}",
@@ -145,7 +142,11 @@ async fn lookup_dmarc(domain: &str, resolver: &str) -> Result<Option<String>> {
     let socket = SocketAddr::new(resolver_ip, 53);
     let stream = UdpClientStream::builder(socket, TokioRuntimeProvider::new()).build();
     let (mut client, bg) = Client::connect(stream).await?;
-    tokio::spawn(bg);
+    tokio::spawn(async {
+        if let Err(e) = bg.await {
+            tracing::error!("DNS background task failed: {}", e);
+        }
+    });
 
     let qname = Name::from_str_relaxed(format!("_dmarc.{}", domain))?;
     let resp = timeout(
@@ -161,26 +162,6 @@ async fn lookup_dmarc(domain: &str, resolver: &str) -> Result<Option<String>> {
         }
     }
     Ok(None)
-}
-
-fn sanitize_host(target: &str) -> String {
-    let t = target.trim();
-    let t = t
-        .strip_prefix("https://")
-        .or_else(|| t.strip_prefix("http://"))
-        .unwrap_or(t);
-    let t = t.split('/').next().unwrap_or(t);
-    let t = t.split(':').next().unwrap_or(t);
-    t.to_string()
-}
-
-fn registrable_domain(host: &str) -> String {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() >= 2 {
-        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
-    } else {
-        host.to_string()
-    }
 }
 
 crate::register_native_module!(crate::module::Category::Scanners, "dmarc_check", native);

@@ -1,13 +1,13 @@
 //! SNMPv1/v2c community-string probe — sends a GetRequest for sysDescr.0
 //! and reads the response.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 161;
 
@@ -40,7 +40,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("snmp_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("snmp_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -62,23 +65,26 @@ async fn probe(host: &str, port: u16, community: &str, timeout: Duration) -> Log
     use std::net::IpAddr;
     let ip: IpAddr = match host.parse() {
         Ok(ip) => ip,
-        Err(e) => { tracing::debug!("parse IP failed: {e}"); match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
-            Ok(mut iter) => match iter.next() {
-                Some(sa) => sa.ip(),
-                None => {
-                    return LoginResult::Error {
-                        message: "no DNS results".to_string(),
-                        retryable: false,
+        Err(e) => {
+            tracing::debug!("parse IP failed: {e}");
+            match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                Ok(mut iter) => match iter.next() {
+                    Some(sa) => sa.ip(),
+                    None => {
+                        return LoginResult::Error {
+                            message: "no DNS results".to_string(),
+                            retryable: false,
+                        };
                     }
-                }
-            },
-            Err(e) => {
-                return LoginResult::Error {
-                    message: format!("dns: {e}"),
-                    retryable: false,
+                },
+                Err(e) => {
+                    return LoginResult::Error {
+                        message: format!("dns: {e}"),
+                        retryable: false,
+                    };
                 }
             }
-        } }
+        }
     };
     let sock = match crate::utils::udp_bind(Some(ip)).await {
         Ok(s) => s,
@@ -86,7 +92,7 @@ async fn probe(host: &str, port: u16, community: &str, timeout: Duration) -> Log
             return LoginResult::Error {
                 message: format!("bind: {e}"),
                 retryable: false,
-            }
+            };
         }
     };
     let pkt = build_snmpv2c_get(community, &[1, 3, 6, 1, 2, 1, 1, 1, 0]); // sysDescr.0
@@ -104,7 +110,7 @@ async fn probe(host: &str, port: u16, community: &str, timeout: Duration) -> Log
             return LoginResult::Error {
                 message: format!("recv: {e}"),
                 retryable: true,
-            }
+            };
         }
         Err(e) => {
             tracing::debug!("SNMP recv timed out: {e}");
@@ -176,16 +182,13 @@ fn snmp_is_get_response(buf: &[u8]) -> bool {
 /// Minimal hand-rolled SNMPv2c GetRequest builder.
 /// Returns SEQUENCE {version=1, community, GetRequest PDU{request-id, 0, 0, varbinds{oid, NULL}}}.
 fn build_snmpv2c_get(community: &str, oid: &[u32]) -> Vec<u8> {
-    let mut varbind = der_seq([
-        der_oid(oid),
-        der_null(),
-    ].concat());
+    let mut varbind = der_seq([der_oid(oid), der_null()].concat());
     varbind = der_seq(varbind);
 
     let pdu_inner: Vec<u8> = [
         der_int(rand::random::<i32>().wrapping_abs() as i64), // request-id
-        der_int(0), // error-status
-        der_int(0), // error-index
+        der_int(0),                                           // error-status
+        der_int(0),                                           // error-index
         varbind,
     ]
     .concat();
@@ -259,4 +262,8 @@ fn der_with_tag(tag: u8, content: Vec<u8>) -> Vec<u8> {
     out
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/snmp_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/snmp_bruteforce",
+    native
+);

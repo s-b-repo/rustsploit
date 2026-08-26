@@ -36,8 +36,16 @@ impl LootStore {
     pub(crate) fn with_base_dir(base: PathBuf) -> Self {
         let loot_dir = base.join("loot");
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&loot_dir) {
-            eprintln!("[!] Failed to create loot directory {}: {}", loot_dir.display(), e);
+        if let Err(e) = std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&loot_dir)
+        {
+            eprintln!(
+                "[!] Failed to create loot directory {}: {}",
+                loot_dir.display(),
+                e
+            );
         }
 
         let index_path = base.join("loot_index.json");
@@ -46,7 +54,10 @@ impl LootStore {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: loot_index.json is corrupted ({}). Creating backup.", e);
+                        eprintln!(
+                            "[!] Warning: loot_index.json is corrupted ({}). Creating backup.",
+                            e
+                        );
                         let backup = index_path.with_extension("json.bak");
                         if let Err(e) = std::fs::copy(&index_path, &backup) {
                             eprintln!("[!] Failed to backup corrupted loot index: {}", e);
@@ -55,7 +66,10 @@ impl LootStore {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Failed to read loot_index.json: {}. Preserving original.", e);
+                    eprintln!(
+                        "[!] Failed to read loot_index.json: {}. Preserving original.",
+                        e
+                    );
                     let backup = index_path.with_extension("json.unreadable");
                     if let Err(e) = std::fs::rename(&index_path, &backup) {
                         eprintln!("[!] Rename failed: {}", e);
@@ -93,7 +107,11 @@ impl LootStore {
     ) -> Option<String> {
         // Validate size
         if data.len() > Self::MAX_LOOT_SIZE {
-            eprintln!("[!] Loot too large: {} bytes (max {} MB)", data.len(), Self::MAX_LOOT_SIZE / 1024 / 1024);
+            eprintln!(
+                "[!] Loot too large: {} bytes (max {} MB)",
+                data.len(),
+                Self::MAX_LOOT_SIZE / 1024 / 1024
+            );
             return None;
         }
         // Validate inputs
@@ -118,11 +136,16 @@ impl LootStore {
             _ => "dat",
         };
         // Sanitize loot_type — only allow alphanumeric and underscore
-        let safe_type: String = loot_type.chars()
+        let safe_type: String = loot_type
+            .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
             .take(64)
             .collect();
-        let safe_type = if safe_type.is_empty() { "unknown".to_string() } else { safe_type };
+        let safe_type = if safe_type.is_empty() {
+            "unknown".to_string()
+        } else {
+            safe_type
+        };
 
         let filename = format!("{}_{}.{}", id, safe_type, ext);
         let file_path = self.loot_dir.join(&filename);
@@ -183,7 +206,10 @@ impl LootStore {
                     Self::MAX_LOOT_ENTRIES
                 );
                 if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                    tracing::debug!("failed to remove orphan loot file {}: {e}", file_path.display());
+                    tracing::debug!(
+                        "failed to remove orphan loot file {}: {e}",
+                        file_path.display()
+                    );
                 }
                 return None;
             }
@@ -203,7 +229,8 @@ impl LootStore {
         text: &str,
         source_module: &str,
     ) -> Option<String> {
-        self.add(host, loot_type, description, text.as_bytes(), source_module).await
+        self.add(host, loot_type, description, text.as_bytes(), source_module)
+            .await
     }
 
     /// List all loot entries.
@@ -214,11 +241,15 @@ impl LootStore {
     /// Search loot by host or type.
     pub async fn search(&self, query: &str) -> Vec<LootEntry> {
         let q = query.to_lowercase();
-        self.list().await.into_iter().filter(|e| {
-            e.host.to_lowercase().contains(&q)
-                || e.loot_type.to_lowercase().contains(&q)
-                || e.description.to_lowercase().contains(&q)
-        }).collect()
+        self.list()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.host.to_lowercase().contains(&q)
+                    || e.loot_type.to_lowercase().contains(&q)
+                    || e.description.to_lowercase().contains(&q)
+            })
+            .collect()
     }
 
     /// Delete a loot entry by ID. Also removes the loot file from disk.
@@ -229,7 +260,10 @@ impl LootStore {
         // Look up the filename without mutating the index yet.
         let filename = {
             let entries = self.entries.read().await;
-            entries.iter().find(|e| e.id == id).map(|e| e.filename.clone())
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.filename.clone())
         };
         let Some(fname) = filename else {
             return false;
@@ -245,7 +279,11 @@ impl LootStore {
                     tracing::debug!(path = %path.display(), "loot file already gone, removing index entry");
                 }
                 Err(e) => {
-                    eprintln!("[!] Failed to remove loot file {}: {} — index entry preserved", path.display(), e);
+                    eprintln!(
+                        "[!] Failed to remove loot file {}: {} — index entry preserved",
+                        path.display(),
+                        e
+                    );
                     return false;
                 }
             }
@@ -276,16 +314,21 @@ impl LootStore {
         };
         for fname in filenames {
             if let Some(path) = self.file_path(&fname)
-                && let Err(e) = tokio::fs::remove_file(&path).await {
-                    eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
-                }
+                && let Err(e) = tokio::fs::remove_file(&path).await
+            {
+                eprintln!("[!] Failed to remove loot file {}: {}", path.display(), e);
+            }
         }
     }
 
     /// Get the full path to a loot file.
     /// Returns None if the filename contains path separators or traversal.
     pub fn file_path(&self, filename: &str) -> Option<PathBuf> {
-        if filename.contains('/') || filename.contains('\\') || filename.contains("..") || filename.contains('\0') {
+        if filename.contains('/')
+            || filename.contains('\\')
+            || filename.contains("..")
+            || filename.contains('\0')
+        {
             return None;
         }
         let path = self.loot_dir.join(filename);
@@ -341,10 +384,21 @@ impl LootStore {
             return;
         }
         println!();
-        println!("{}", format!("Loot ({} items):", entries.len()).bold().underline());
+        println!(
+            "{}",
+            format!("Loot ({} items):", entries.len())
+                .bold()
+                .underline()
+        );
         println!();
-        println!("  {:<10} {:<18} {:<15} {:<30} {}",
-            "ID".bold(), "Host".bold(), "Type".bold(), "Description".bold(), "Module".bold());
+        println!(
+            "  {:<10} {:<18} {:<15} {:<30} {}",
+            "ID".bold(),
+            "Host".bold(),
+            "Type".bold(),
+            "Description".bold(),
+            "Module".bold()
+        );
         println!("  {}", "-".repeat(90).dimmed());
         for e in &entries {
             let desc = if e.description.chars().count() > 28 {
@@ -352,8 +406,14 @@ impl LootStore {
             } else {
                 e.description.clone()
             };
-            println!("  {:<10} {:<18} {:<15} {:<30} {}",
-                e.id.yellow(), e.host.green(), e.loot_type, desc, e.source_module);
+            println!(
+                "  {:<10} {:<18} {:<15} {:<30} {}",
+                e.id.yellow(),
+                e.host.green(),
+                e.loot_type,
+                desc,
+                e.source_module
+            );
         }
         println!();
     }
@@ -374,7 +434,10 @@ pub async fn store_loot(
     source_module: &str,
 ) -> Option<String> {
     let s = crate::tenant::resolve();
-    let id = s.loot_store().add(host, loot_type, description, data, source_module).await;
+    let id = s
+        .loot_store()
+        .add(host, loot_type, description, data, source_module)
+        .await;
     if let Some(id_str) = id.as_deref() {
         crate::events::emit(crate::events::ModuleEvent::LootStored {
             id: id_str.to_string(),

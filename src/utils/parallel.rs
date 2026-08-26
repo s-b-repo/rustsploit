@@ -63,12 +63,15 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_preserves_order() {
-        let work: Vec<BoxFut<u64>> = (0..4u64).rev().map(|x| {
-            Box::pin(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(10 * x)).await;
-                x * 2
-            }) as _
-        }).collect();
+        let work: Vec<BoxFut<u64>> = (0..4u64)
+            .rev()
+            .map(|x| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * x)).await;
+                    x * 2
+                }) as _
+            })
+            .collect();
         let out = run_buffered(work, 4).await;
         assert_eq!(out, vec![6, 4, 2, 0]);
     }

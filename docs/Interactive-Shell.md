@@ -26,7 +26,7 @@ All commands are **case-insensitive** and support aliases:
 | `clear_target` | `ct`, `cleartarget` | Clear target |
 | `run` | `go`, `exec`, `ra` | Execute the selected module |
 | `run -j` | | Run module as background job |
-| `check` | `ch` | Non-destructive vulnerability check |
+|| `check` | `ch` | Non-destructive vulnerability check (legacy — deprecated, framework is exploitation-only) |
 | `setg <key> <val>` | `sg` | Set a global option (persists across modules) |
 | `unsetg <key>` | `ug` | Remove a global option |
 | `show options` | `so` | Display all global options (now includes `scan_order`, `exclusions`, `target_rps`, `module_rps`) |

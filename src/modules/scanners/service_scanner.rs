@@ -7,16 +7,18 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
 use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_yes_no,
+};
 
 /// Default ports to scan when the user accepts the default list.
 const DEFAULT_PORTS: &str = "21,22,23,25,110,143,443,3306,3389,5432,5900,6379,9200,11211,27017";
@@ -83,12 +85,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut outcome = ModuleOutcome::ok();
 
     // --- Prompts ---
-    let port_list_str = cfg_prompt_default(
-        "ports",
-        "Ports to scan (comma-separated)",
-        DEFAULT_PORTS,
-    )
-    .await?;
+    let port_list_str =
+        cfg_prompt_default("ports", "Ports to scan (comma-separated)", DEFAULT_PORTS).await?;
 
     let ports = parse_port_list(&port_list_str)?;
     if ports.is_empty() {
@@ -128,27 +126,33 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // --- Run scan ---
-    crate::mprintln!();
-    crate::mprintln!(
-        "{}",
-        format!(
-            "[*] Scanning {} ports on {} (concurrency={}, timeout={}s)",
-            ports.len(),
-            target,
-            concurrency,
-            timeout_secs
-        )
-        .cyan()
-        .bold()
-    );
-    crate::mprintln!();
+    // Suppress per-host scan-status messages in batch mode so the console
+    // isn't flooded with "[*] Scanning X ports on <ip>" for every host.
+    if !crate::utils::is_batch_mode() {
+        crate::mprintln!();
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Scanning {} ports on {} (concurrency={}, timeout={}s)",
+                ports.len(),
+                target,
+                concurrency,
+                timeout_secs
+            )
+            .cyan()
+            .bold()
+        );
+        crate::mprintln!();
+    }
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let target_str = target.to_string();
 
     let mut handles = Vec::with_capacity(ports.len());
     for port in &ports {
-        if ctx.is_cancelled() { break; }
+        if ctx.is_cancelled() {
+            break;
+        }
         ctx.rate_limit(target).await;
         let permit = semaphore.clone().acquire_owned().await?;
         let tgt = target_str.clone();
@@ -156,7 +160,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let to = timeout_secs;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            if crate::context::is_cancelled() { return None; }
+            if crate::context::is_cancelled() {
+                return None;
+            }
             probe_service(&tgt, p, to).await
         }));
     }
@@ -184,7 +190,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 results.push(r);
             }
             Ok(None) => {}
-            Err(e) => { tracing::debug!("probe failed: {e}"); }
+            Err(e) => {
+                tracing::debug!("probe failed: {e}");
+            }
         }
     }
 
@@ -203,18 +211,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // only hosts that actually have services print their results table.
     if save_results && !output_file.is_empty() && !crate::utils::is_batch_mode() {
         save_results_to_file(&results, &output_file, target)?;
-        crate::mprintln!(
-            "{}",
-            format!("[*] Results saved to {}", output_file).cyan()
-        );
+        crate::mprintln!("{}", format!("[*] Results saved to {}", output_file).cyan());
     }
 
     if !crate::utils::is_batch_mode() {
         crate::mprintln!(
             "\n{}",
-            format!("[*] Scan complete: {} services detected on {}", results.len(), target)
-                .green()
-                .bold()
+            format!(
+                "[*] Scan complete: {} services detected on {}",
+                results.len(),
+                target
+            )
+            .green()
+            .bold()
         );
     }
 
@@ -226,7 +235,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 // ---------------------------------------------------------------------------
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════════════╗".cyan()
@@ -266,7 +277,11 @@ fn print_results_table(results: &[ServiceResult]) {
 
     let separator = format!(
         "+{:-<w_port$}+{:-<w_svc$}+{:-<w_ver$}+{:-<w_banner$}+{:-<w_notes$}+",
-        "", "", "", "", "",
+        "",
+        "",
+        "",
+        "",
+        "",
         w_port = w_port + 2,
         w_svc = w_svc + 2,
         w_ver = w_ver + 2,
@@ -278,7 +293,11 @@ fn print_results_table(results: &[ServiceResult]) {
     crate::mprintln!("{}", separator);
     crate::mprintln!(
         "| {:<w_port$} | {:<w_svc$} | {:<w_ver$} | {:<w_banner$} | {:<w_notes$} |",
-        "Port", "Service", "Version", "Banner", "Notes",
+        "Port",
+        "Service",
+        "Version",
+        "Banner",
+        "Notes",
         w_port = w_port,
         w_svc = w_svc,
         w_ver = w_ver,
@@ -381,20 +400,24 @@ fn enrich_with_recog(r: &mut ServiceResult, db_name: &str, banner: &str) -> bool
     true
 }
 
-fn save_results_to_file(
-    results: &[ServiceResult],
-    path: &str,
-    target: &str,
-) -> Result<()> {
+fn save_results_to_file(results: &[ServiceResult], path: &str, target: &str) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)
         .with_context(|| format!("Failed to create output file: {}", path))?;
     if let Err(e) = crate::utils::set_secure_permissions(path, 0o600) {
-        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", path, e);
+        crate::meprintln!(
+            "[!] Failed to chmod 0o600 on {}: {} — file may be world-readable",
+            path,
+            e
+        );
     }
 
     writeln!(f, "Service Version Scan Results for {}", target)?;
-    writeln!(f, "Timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
+    writeln!(
+        f,
+        "Timestamp: {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    )?;
     writeln!(f, "{}", "-".repeat(80))?;
     writeln!(f, "{:<8} {:<16} {:<30} Notes", "Port", "Service", "Version")?;
     writeln!(f, "{}", "-".repeat(80))?;
@@ -472,8 +495,6 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
         }
     };
 
-    
-
     match port {
         21 => probe_ftp(stream, port, dur).await,
         22 => probe_ssh(stream, port, dur).await,
@@ -481,7 +502,10 @@ async fn probe_service(target: &str, port: u16, timeout_secs: u64) -> Option<Ser
         25 => probe_smtp(stream, port, dur).await,
         110 => probe_pop3(stream, port, dur).await,
         143 => probe_imap(stream, port, dur).await,
-        443 | 8443 => { drop(stream); probe_https(target, port, dur).await },
+        443 | 8443 => {
+            drop(stream);
+            probe_https(target, port, dur).await
+        }
         3306 => probe_mysql(stream, port, dur).await,
         3389 => probe_rdp(stream, port, dur).await,
         5432 => probe_postgres(stream, port, dur).await,
@@ -538,29 +562,31 @@ async fn probe_ftp(mut stream: TcpStream, port: u16, dur: Duration) -> Option<Se
     if stream.write_all(anon_cmd).await.is_ok() {
         let mut anon_buf = vec![0u8; 512];
         if let Ok(Ok(an)) = timeout(dur, stream.read(&mut anon_buf)).await
-            && an > 0 {
-                let resp = String::from_utf8_lossy(&anon_buf[..an]);
-                if resp.starts_with("230") {
-                    // 230 = Logged in without password
-                    r.notes = "ANONYMOUS LOGIN ALLOWED (no password)".to_string();
-                } else if resp.starts_with("331") {
-                    // 331 = Password required — send anonymous email
-                    if stream.write_all(b"PASS anonymous@\r\n").await.is_ok() {
-                        let mut pass_buf = vec![0u8; 512];
-                        if let Ok(Ok(pn)) = timeout(dur, stream.read(&mut pass_buf)).await
-                            && pn > 0 {
-                                let pass_resp = String::from_utf8_lossy(&pass_buf[..pn]);
-                                if pass_resp.starts_with("230") {
-                                    r.notes = "ANONYMOUS LOGIN ALLOWED".to_string();
-                                } else if pass_resp.starts_with("530") {
-                                    r.notes = "Anonymous login denied".to_string();
-                                }
-                            }
+            && an > 0
+        {
+            let resp = String::from_utf8_lossy(&anon_buf[..an]);
+            if resp.starts_with("230") {
+                // 230 = Logged in without password
+                r.notes = "ANONYMOUS LOGIN ALLOWED (no password)".to_string();
+            } else if resp.starts_with("331") {
+                // 331 = Password required — send anonymous email
+                if stream.write_all(b"PASS anonymous@\r\n").await.is_ok() {
+                    let mut pass_buf = vec![0u8; 512];
+                    if let Ok(Ok(pn)) = timeout(dur, stream.read(&mut pass_buf)).await
+                        && pn > 0
+                    {
+                        let pass_resp = String::from_utf8_lossy(&pass_buf[..pn]);
+                        if pass_resp.starts_with("230") {
+                            r.notes = "ANONYMOUS LOGIN ALLOWED".to_string();
+                        } else if pass_resp.starts_with("530") {
+                            r.notes = "Anonymous login denied".to_string();
+                        }
                     }
-                } else if resp.starts_with("530") {
-                    r.notes = "Anonymous login denied".to_string();
                 }
+            } else if resp.starts_with("530") {
+                r.notes = "Anonymous login denied".to_string();
             }
+        }
     }
 
     Some(r)
@@ -614,7 +640,9 @@ async fn probe_telnet(mut stream: TcpStream, port: u16, dur: Duration) -> Option
         .position(|&b| b != 0xFF && b.is_ascii_graphic() || b == b' ')
         .unwrap_or(n);
 
-    let readable = String::from_utf8_lossy(&buf[text_start..n]).trim().to_string();
+    let readable = String::from_utf8_lossy(&buf[text_start..n])
+        .trim()
+        .to_string();
     r.banner = readable;
 
     if !r.banner.is_empty() {
@@ -745,11 +773,15 @@ async fn probe_https(target: &str, port: u16, dur: Duration) -> Option<ServiceRe
     match client.get(&url).send().await {
         Ok(resp) => {
             let status = resp.status();
-            let server = resp.headers().get("server")
+            let server = resp
+                .headers()
+                .get("server")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let powered_by = resp.headers().get("x-powered-by")
+            let powered_by = resp
+                .headers()
+                .get("x-powered-by")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
@@ -799,7 +831,10 @@ async fn probe_mysql(mut stream: TcpStream, port: u16, dur: Duration) -> Option<
     // Extract null-terminated version string starting at byte 5.
     if n > 5 {
         let version_bytes = &buf[5..n];
-        let version_end = version_bytes.iter().position(|&b| b == 0).unwrap_or(version_bytes.len());
+        let version_end = version_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(version_bytes.len());
         let version_str = String::from_utf8_lossy(&version_bytes[..version_end]).to_string();
         if !version_str.is_empty() {
             r.version = version_str.clone();
@@ -817,11 +852,7 @@ async fn probe_mysql(mut stream: TcpStream, port: u16, dur: Duration) -> Option<
 }
 
 /// PostgreSQL (port 5432) -- send SSLRequest, read response.
-async fn probe_postgres(
-    mut stream: TcpStream,
-    port: u16,
-    dur: Duration,
-) -> Option<ServiceResult> {
+async fn probe_postgres(mut stream: TcpStream, port: u16, dur: Duration) -> Option<ServiceResult> {
     let mut r = ServiceResult::new(port);
     r.service = "PostgreSQL".to_string();
 
@@ -840,21 +871,22 @@ async fn probe_postgres(
 
     let mut buf = vec![0u8; 1024];
     if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await
-        && n > 0 {
-            match buf[0] {
-                b'S' => {
-                    r.notes = "SSL supported".to_string();
-                    r.version = "PostgreSQL (SSL)".to_string();
-                }
-                b'N' => {
-                    r.notes = "SSL not supported".to_string();
-                    r.version = "PostgreSQL".to_string();
-                }
-                _ => {
-                    r.banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                }
+        && n > 0
+    {
+        match buf[0] {
+            b'S' => {
+                r.notes = "SSL supported".to_string();
+                r.version = "PostgreSQL (SSL)".to_string();
+            }
+            b'N' => {
+                r.notes = "SSL not supported".to_string();
+                r.version = "PostgreSQL".to_string();
+            }
+            _ => {
+                r.banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
             }
         }
+    }
 
     Some(r)
 }
@@ -915,27 +947,24 @@ async fn probe_mongodb(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
 
     let mut buf = vec![0u8; 4096];
     if let Ok(Ok(n)) = timeout(dur, stream.read(&mut buf)).await
-        && n > 0 {
-            let data = &buf[..n];
-            // Look for version string pattern in the BSON response.
-            // MongoDB includes "version" : "x.y.z" in the isMaster reply.
-            let text = String::from_utf8_lossy(data);
-            if let Some(ver) = extract_bson_string_field(&text, "version") {
-                r.version = ver;
-            }
-            r.banner = format!("MongoDB ({}B response)", n);
-            r.notes = "Responded to isMaster".to_string();
+        && n > 0
+    {
+        let data = &buf[..n];
+        // Look for version string pattern in the BSON response.
+        // MongoDB includes "version" : "x.y.z" in the isMaster reply.
+        let text = String::from_utf8_lossy(data);
+        if let Some(ver) = extract_bson_string_field(&text, "version") {
+            r.version = ver;
         }
+        r.banner = format!("MongoDB ({}B response)", n);
+        r.notes = "Responded to isMaster".to_string();
+    }
 
     Some(r)
 }
 
 /// Memcached (port 11211) -- send "version\r\n", read VERSION response.
-async fn probe_memcached(
-    mut stream: TcpStream,
-    port: u16,
-    dur: Duration,
-) -> Option<ServiceResult> {
+async fn probe_memcached(mut stream: TcpStream, port: u16, dur: Duration) -> Option<ServiceResult> {
     let mut r = ServiceResult::new(port);
     r.service = "Memcached".to_string();
 
@@ -1101,29 +1130,31 @@ async fn probe_generic(mut stream: TcpStream, port: u16, dur: Duration) -> Optio
     // First, try a passive read (many services send banners on connect).
     let short_dur = Duration::from_secs(dur.as_secs().min(2));
     if let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await
-        && n > 0 {
-            let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-            r.banner = banner.clone();
-            detect_service_from_banner(&banner, &mut r);
-            return Some(r);
-        }
+        && n > 0
+    {
+        let banner = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        r.banner = banner.clone();
+        detect_service_from_banner(&banner, &mut r);
+        return Some(r);
+    }
 
     // Fallback: send an HTTP GET and see if we get an HTTP response.
     let http_req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_string();
     if stream.write_all(http_req.as_bytes()).await.is_ok()
         && let Ok(Ok(n)) = timeout(short_dur, stream.read(&mut buf)).await
-            && n > 0 {
-                let resp = String::from_utf8_lossy(&buf[..n]).to_string();
-                if resp.starts_with("HTTP/") {
-                    r.service = "HTTP".to_string();
-                    if let Some(server) = extract_http_header(&resp, "server") {
-                        r.version = server;
-                    }
-                }
-                r.banner = sanitize_banner(&resp);
-                r.banner = truncate_display(&r.banner, 120);
-                return Some(r);
+        && n > 0
+    {
+        let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+        if resp.starts_with("HTTP/") {
+            r.service = "HTTP".to_string();
+            if let Some(server) = extract_http_header(&resp, "server") {
+                r.version = server;
             }
+        }
+        r.banner = sanitize_banner(&resp);
+        r.banner = truncate_display(&r.banner, 120);
+        return Some(r);
+    }
 
     // Port is open but no data -- still report it.
     r.notes = "Open, no banner".to_string();
@@ -1141,7 +1172,11 @@ fn detect_service_from_banner(banner: &str, r: &mut ServiceResult) {
     if lower.contains("ssh-") {
         r.service = "SSH".to_string();
         if let Some(idx) = banner.find("SSH-") {
-            r.version = banner[idx..].split_whitespace().next().unwrap_or("").to_string();
+            r.version = banner[idx..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
         }
     } else if lower.starts_with("220") && (lower.contains("ftp") || lower.contains("ready")) {
         r.service = "FTP".to_string();
@@ -1168,11 +1203,7 @@ fn extract_version_after(text: &str, keyword: &str) -> String {
         let start = idx;
         let rest = &text[start..];
         // Take until whitespace or end.
-        let token = rest
-            .split(['\r', '\n'])
-            .next()
-            .unwrap_or("")
-            .trim();
+        let token = rest.split(['\r', '\n']).next().unwrap_or("").trim();
         token.to_string()
     } else {
         String::new()

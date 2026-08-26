@@ -5,12 +5,12 @@ use rand::RngExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 
 /// Standard IP exclusion ranges for mass scanning (private, reserved, CDN, DNS).
 pub const EXCLUDED_RANGES: &[&str] = &[
@@ -128,22 +128,14 @@ impl BruteforceStats {
         let errors = self.error_attempts.load(Ordering::Acquire);
         let retries = self.retried_attempts.load(Ordering::Acquire);
         let expected = self.total_expected.load(Ordering::Acquire);
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 {
-            total as f64 / elapsed
-        } else {
-            0.0
-        };
+        let elapsed_d = self.start_time.elapsed();
+        let rate = crate::utils::stats::rate_per_sec(total, elapsed_d);
 
         if expected > 0 {
-            let pct = (total as f64 / expected as f64 * 100.0).min(100.0);
-            let remaining = expected.saturating_sub(total);
-            let eta_secs = if rate > 0.0 {
-                remaining as f64 / rate
-            } else {
-                0.0
-            };
-            let eta_str = format_duration(eta_secs);
+            let pct = crate::utils::stats::percent(total, expected);
+            let eta_str = crate::utils::stats::format_duration(
+                crate::utils::stats::eta(total, expected, elapsed_d).as_secs_f64(),
+            );
 
             crate::mprint!(
                 "\r{} {}/{} ({:.1}%) | {} OK | {} err | {} retry | {:.1}/s | ETA: {}    ",
@@ -169,7 +161,7 @@ impl BruteforceStats {
             );
         }
         if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
-            eprintln!("[!] Flush failed: {}", e);
+            crate::meprintln!("[!] Flush failed: {}", e);
         }
     }
 
@@ -182,7 +174,7 @@ impl BruteforceStats {
         let retries = self.retried_attempts.load(Ordering::Acquire);
         let expected = self.total_expected.load(Ordering::Acquire);
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        let elapsed_str = format_duration(elapsed);
+        let elapsed_str = crate::utils::stats::format_duration(elapsed);
 
         crate::mprintln!("{}", "=== Final Statistics ===".bold());
         if expected > 0 {
@@ -190,7 +182,7 @@ impl BruteforceStats {
                 "  Total attempts:    {}/{} ({:.1}%)",
                 total,
                 expected,
-                (total as f64 / expected as f64 * 100.0).min(100.0)
+                crate::utils::stats::percent(total, expected)
             );
         } else {
             crate::mprintln!("  Total attempts:    {}", total);
@@ -206,7 +198,7 @@ impl BruteforceStats {
         if elapsed > 0.0 {
             crate::mprintln!(
                 "  Average rate:      {:.1} attempts/s",
-                total as f64 / elapsed
+                crate::utils::stats::rate_per_sec(total, self.start_time.elapsed())
             );
         }
 
@@ -223,18 +215,6 @@ impl BruteforceStats {
 }
 
 /// Format seconds into HH:MM:SS display string.
-pub fn format_duration(secs: f64) -> String {
-    let total = secs as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    if h > 0 {
-        format!("{:02}:{:02}:{:02}", h, m, s)
-    } else {
-        format!("{:02}:{:02}", m, s)
-    }
-}
-
 /// Compute exponential backoff delay with random jitter.
 /// `base_ms` — base delay in milliseconds (e.g. 500)
 /// `attempt` — retry attempt number (0-indexed, delay doubles each time)
@@ -356,8 +336,11 @@ async fn checked_set_for(state_file: &str) -> CheckedSet {
 
 pub async fn is_ip_checked(ip: &impl ToString, state_file: &str) -> bool {
     let path = std::path::Path::new(state_file);
-    if path.is_absolute() || state_file.contains("..") || state_file.contains('\0')
-        || state_file.contains('/') || state_file.contains('\\')
+    if path.is_absolute()
+        || state_file.contains("..")
+        || state_file.contains('\0')
+        || state_file.contains('/')
+        || state_file.contains('\\')
     {
         return false;
     }
@@ -374,7 +357,10 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
     }
     // Validate the filename contains no path separators (must be local file only)
     if state_file.contains('/') || state_file.contains('\\') {
-        crate::meprintln!("[!] Invalid state file path (no directories allowed): {}", state_file);
+        crate::meprintln!(
+            "[!] Invalid state file path (no directories allowed): {}",
+            state_file
+        );
         return;
     }
     let ip_str = ip.to_string();
@@ -403,7 +389,6 @@ pub async fn mark_ip_checked(ip: &impl ToString, state_file: &str) {
         }
     }
 }
-
 
 /// Check if a target string is a CIDR subnet (e.g. "192.168.8.0/21").
 /// Any valid CIDR notation (including 0.0.0.0/0) is treated as a subnet target.
@@ -458,7 +443,6 @@ pub fn is_mass_scan_target(target: &str) -> bool {
 // fan-out is now handled by `crate::scheduler::run` for every module.
 // See docs/Legacy.md for migration history.
 
-
 // ============================================================
 // GENERIC BRUTEFORCE ENGINE
 // ============================================================
@@ -510,8 +494,15 @@ enum StopMode {
 /// Resolve the stop mode from `setg cred_stop_mode`, falling back to the config's
 /// `stop_on_success` (true => Host, false => All) when unset/unknown.
 fn resolve_stop_mode(default_stop_on_success: bool) -> StopMode {
-    let fallback = if default_stop_on_success { StopMode::Host } else { StopMode::All };
-    match crate::tenant::resolve().global_options().try_get("cred_stop_mode") {
+    let fallback = if default_stop_on_success {
+        StopMode::Host
+    } else {
+        StopMode::All
+    };
+    match crate::tenant::resolve()
+        .global_options()
+        .try_get("cred_stop_mode")
+    {
         Some(v) => match v.trim().to_lowercase().as_str() {
             "host" | "first" => StopMode::Host,
             "user" | "peruser" | "per_user" => StopMode::User,
@@ -541,9 +532,7 @@ pub fn generate_combos_mode(
         return Vec::new();
     }
     let requested = match mode {
-        ComboMode::Combo | ComboMode::Spray => {
-            usernames.len().saturating_mul(passwords.len())
-        }
+        ComboMode::Combo | ComboMode::Spray => usernames.len().saturating_mul(passwords.len()),
         ComboMode::Linear => std::cmp::max(usernames.len(), passwords.len()),
     };
     let cap = requested.min(MAX_COMBOS);
@@ -561,7 +550,9 @@ pub fn generate_combos_mode(
         ComboMode::Combo => {
             'outer: for u in usernames {
                 for p in passwords {
-                    if combos.len() >= cap { break 'outer; }
+                    if combos.len() >= cap {
+                        break 'outer;
+                    }
                     combos.push((u.clone(), p.clone()));
                 }
             }
@@ -569,7 +560,9 @@ pub fn generate_combos_mode(
         ComboMode::Spray => {
             'outer: for p in passwords {
                 for u in usernames {
-                    if combos.len() >= cap { break 'outer; }
+                    if combos.len() >= cap {
+                        break 'outer;
+                    }
                     combos.push((u.clone(), p.clone()));
                 }
             }
@@ -595,20 +588,24 @@ pub fn load_credential_file(path: &str) -> Result<Vec<(String, String)>> {
         // process. Enforce a hard entry cap: once we hit MAX_COMBOS, stop
         // accumulating and warn, mirroring generate_combos_mode's behaviour.
         let mut capped = false;
-        crate::utils::load_lines_batched(path, crate::utils::wordlist::DEFAULT_BATCH_SIZE, |batch| {
-            if capped {
-                return;
-            }
-            for line in batch {
-                if combos.len() >= MAX_COMBOS {
-                    capped = true;
-                    break;
+        crate::utils::load_lines_batched(
+            path,
+            crate::utils::wordlist::DEFAULT_BATCH_SIZE,
+            |batch| {
+                if capped {
+                    return;
                 }
-                if let Some((user, pass)) = line.split_once(':') {
-                    combos.push((user.to_string(), pass.to_string()));
+                for line in batch {
+                    if combos.len() >= MAX_COMBOS {
+                        capped = true;
+                        break;
+                    }
+                    if let Some((user, pass)) = line.split_once(':') {
+                        combos.push((user.to_string(), pass.to_string()));
+                    }
                 }
-            }
-        })?;
+            },
+        )?;
         if capped {
             crate::meprintln!(
                 "{}",
@@ -749,7 +746,10 @@ pub fn generate_mask_passwords(spec: &str) -> Result<Vec<String>> {
 
 /// Whether streaming-bruteforce batch resume is enabled (`setg bruteforce_resume y`).
 fn bruteforce_resume_enabled() -> bool {
-    match crate::tenant::resolve().global_options().try_get("bruteforce_resume") {
+    match crate::tenant::resolve()
+        .global_options()
+        .try_get("bruteforce_resume")
+    {
         Some(v) => matches!(
             v.trim().to_lowercase().as_str(),
             "y" | "yes" | "true" | "1" | "on"
@@ -964,7 +964,10 @@ where
         // wordlist would materialize 100M task structs immediately.
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
-            Err(e) => { tracing::debug!("bruteforce semaphore closed, stopping: {e}"); break; }
+            Err(e) => {
+                tracing::debug!("bruteforce semaphore closed, stopping: {e}");
+                break;
+            }
         };
 
         let target = config.target.clone();
@@ -1104,7 +1107,6 @@ where
                 None => __body.await,
             }
         }));
-
     }
 
     // Wait for remaining tasks
@@ -1159,14 +1161,22 @@ where
 
     let pass_path = match password_file {
         Some(p) => p,
-        None => return run_bruteforce(config, generate_combos_mode(&usernames, &passwords, mode), try_login).await,
+        None => {
+            return run_bruteforce(
+                config,
+                generate_combos_mode(&usernames, &passwords, mode),
+                try_login,
+            )
+            .await;
+        }
     };
     crate::mprintln!(
         "{}",
         format!(
             "[*] Large wordlist detected ({:.0} MB), using streaming mode",
             crate::utils::file_size(pass_path) as f64 / (1024.0 * 1024.0)
-        ).cyan()
+        )
+        .cyan()
     );
 
     let mut aggregate = BruteforceResult {
@@ -1188,13 +1198,13 @@ where
         // `load_lines_batched` an early return from the loop below (e.g. stop on
         // first success) dropped the receiver but the reader kept scanning the
         // whole multi-GB file, firing a failed `blocking_send` per batch.
-        crate::utils::load_lines_batched_until(&pass_path_owned, BATCH_SIZE, |batch| {
-            match batch_tx.blocking_send(batch) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::debug!("Batch send failed (receiver dropped?): {}", e);
-                    false
-                }
+        crate::utils::load_lines_batched_until(&pass_path_owned, BATCH_SIZE, |batch| match batch_tx
+            .blocking_send(batch)
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("Batch send failed (receiver dropped?): {}", e);
+                false
             }
         })
     });
@@ -1221,7 +1231,7 @@ where
         None
     };
     let resume_from = match &resume_key {
-        Some(k) => crate::checkpoint::read_bruteforce_marker(k),
+        Some(k) => crate::checkpoint::read_bruteforce_marker(k).await,
         None => 0,
     };
     if resume_from > 0 {
@@ -1243,36 +1253,65 @@ where
             // Already attempted in a prior run — skip without re-trying.
             continue;
         }
-        crate::mprintln!("{}", format!("[*] Processing batch {} ({} passwords)", batch_idx, pass_batch.len()).cyan());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Processing batch {} ({} passwords)",
+                batch_idx,
+                pass_batch.len()
+            )
+            .cyan()
+        );
         let combos = generate_combos_mode(&usernames, &pass_batch, mode_val);
-        let result = run_bruteforce_with_abort(config_ref, combos, try_login_ref.clone(), abort.clone()).await?;
+        let result =
+            run_bruteforce_with_abort(config_ref, combos, try_login_ref.clone(), abort.clone())
+                .await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
         if abort.load(Ordering::Relaxed) {
             crate::mprintln!(
                 "{}",
-                format!("[!] Stopping streamed bruteforce of {} — host gave up (no progress)", config_ref.target).yellow()
+                format!(
+                    "[!] Stopping streamed bruteforce of {} — host gave up (no progress)",
+                    config_ref.target
+                )
+                .yellow()
             );
             break;
         }
         // Batch fully attempted — record it so an interrupted run resumes here.
         if let Some(k) = &resume_key {
-            crate::checkpoint::write_bruteforce_marker(k, batch_idx);
+            crate::checkpoint::write_bruteforce_marker(k, batch_idx).await;
         }
         if stop_after_first && !aggregate.found.is_empty() {
             // Host is done — drop the marker so a later run starts fresh.
             if let Some(k) = &resume_key {
-                crate::checkpoint::clear_bruteforce_marker(k);
+                crate::checkpoint::clear_bruteforce_marker(k).await;
             }
             return Ok(aggregate);
         }
     }
 
-    reader_handle.await.context("batch reader task panicked")??;
+    reader_handle
+        .await
+        .context("batch reader task panicked")??;
 
     if !extra_combos.is_empty() && !abort.load(Ordering::Relaxed) {
-        crate::mprintln!("{}", format!("[*] Processing {} extra combos from credential file", extra_combos.len()).cyan());
-        let result = run_bruteforce_with_abort(config_ref, extra_combos, try_login_ref.clone(), abort.clone()).await?;
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Processing {} extra combos from credential file",
+                extra_combos.len()
+            )
+            .cyan()
+        );
+        let result = run_bruteforce_with_abort(
+            config_ref,
+            extra_combos,
+            try_login_ref.clone(),
+            abort.clone(),
+        )
+        .await?;
         aggregate.found.extend(result.found);
         aggregate.errors.extend(result.errors);
     }
@@ -1282,7 +1321,7 @@ where
     if !abort.load(Ordering::Relaxed)
         && let Some(k) = &resume_key
     {
-        crate::checkpoint::clear_bruteforce_marker(k);
+        crate::checkpoint::clear_bruteforce_marker(k).await;
     }
 
     Ok(aggregate)
@@ -1407,10 +1446,11 @@ where
     for ip in network.iter() {
         // Resume support: skip IPs already recorded in the checkpoint file.
         if let Some(ref sf_name) = state_file
-            && is_ip_checked(&ip, sf_name).await {
-                stats_checked.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            && is_ip_checked(&ip, sf_name).await
+        {
+            stats_checked.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -1433,96 +1473,106 @@ where
         let __task_buf = crate::output::OUTPUT_BUFFER.try_with(|b| b.clone()).ok();
         tokio::spawn(async move {
             let __body = async move {
-            // Quick TCP port check (skipped for UDP protocols).
-            // Uses the helper so source-port (`setg src_port`) is honoured.
-            if !skip_tcp {
-                let sa = SocketAddr::new(ip, port);
-                if let Err(e) = crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
-                    .await
-                {
-                    tracing::trace!("Pre-check TCP connect to {} failed: {}", sa, e);
-                    sc.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref sf_name) = state_file_task {
-                        mark_ip_checked(&ip, sf_name).await;
-                    }
-                    drop(permit);
-                    return;
-                }
-            }
-
-            // Track consecutive transient errors per host. A single
-            // connection-refused/timeout/reset on one credential is often
-            // transient (momentary packet loss, server hiccup, rate-limit
-            // blip) and must NOT abandon every remaining credential for the
-            // host. We only give up after a run of consecutive errors —
-            // matching the lockout threshold used by `run_bruteforce`.
-            const HOST_ERROR_THRESHOLD: u32 = 10;
-            let mut consecutive_errors: u32 = 0;
-
-            let (users, passes) = &*cp;
-            'outer: for user in users {
-                for pass in passes {
-                    if jitter_ms > 0 {
-                        let jitter = rand::rng().random_range(0..=jitter_ms);
-                        tokio::time::sleep(Duration::from_millis(jitter)).await;
-                    }
-                    let result = try_login(ip, port, user.clone(), pass.clone()).await;
-                    match result {
-                        LoginResult::Success => {
-                            let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
-                            crate::mprintln!("\r{}", format!("[+] FOUND: {}", msg).green().bold());
-                            if crate::cred_store::store_credential(crate::cred_store::NewCred {
-                                host: &ip.to_string(),
-                                port,
-                                service,
-                                username: user,
-                                secret: pass,
-                                cred_type: crate::cred_store::CredType::Password,
-                                source_module: source,
-                            })
+                // Quick TCP port check (skipped for UDP protocols).
+                // Uses the helper so source-port (`setg src_port`) is honoured.
+                if !skip_tcp {
+                    let sa = SocketAddr::new(ip, port);
+                    if let Err(e) =
+                        crate::utils::network::tcp_connect_addr(sa, Duration::from_millis(3000))
                             .await
-                            .is_none() {
-                                eprintln!("[!] Failed to store credential for {}:{}", user, ip);
-                            }
-                            if let Err(e) = tx.send(format!("{}\n", msg)).await {
-                                eprintln!("[!] Channel send failed: {}", e);
-                            }
-                            hits_c.lock().await.push((
-                                ip.to_string(),
-                                user.clone(),
-                                pass.clone(),
-                            ));
-                            sf.fetch_add(1, Ordering::Relaxed);
-                            break 'outer;
+                    {
+                        tracing::trace!("Pre-check TCP connect to {} failed: {}", sa, e);
+                        sc.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref sf_name) = state_file_task {
+                            mark_ip_checked(&ip, sf_name).await;
                         }
-                        LoginResult::AuthFailed => {
-                            // A definitive auth response means the host is
-                            // reachable and responsive — clear the transient
-                            // error streak.
-                            consecutive_errors = 0;
-                            if verbose {
+                        drop(permit);
+                        return;
+                    }
+                }
+
+                // Track consecutive transient errors per host. A single
+                // connection-refused/timeout/reset on one credential is often
+                // transient (momentary packet loss, server hiccup, rate-limit
+                // blip) and must NOT abandon every remaining credential for the
+                // host. We only give up after a run of consecutive errors —
+                // matching the lockout threshold used by `run_bruteforce`.
+                const HOST_ERROR_THRESHOLD: u32 = 10;
+                let mut consecutive_errors: u32 = 0;
+
+                let (users, passes) = &*cp;
+                'outer: for user in users {
+                    for pass in passes {
+                        if jitter_ms > 0 {
+                            let jitter = rand::rng().random_range(0..=jitter_ms);
+                            tokio::time::sleep(Duration::from_millis(jitter)).await;
+                        }
+                        let result = try_login(ip, port, user.clone(), pass.clone()).await;
+                        match result {
+                            LoginResult::Success => {
+                                let msg = format!("{}:{}:{}:{}", ip, port, user, pass);
                                 crate::mprintln!(
                                     "\r{}",
-                                    format!("[-] {}:{} -> {}:{}", ip, port, user, pass).dimmed()
+                                    format!("[+] FOUND: {}", msg).green().bold()
                                 );
+                                if crate::cred_store::store_credential(crate::cred_store::NewCred {
+                                    host: &ip.to_string(),
+                                    port,
+                                    service,
+                                    username: user,
+                                    secret: pass,
+                                    cred_type: crate::cred_store::CredType::Password,
+                                    source_module: source,
+                                })
+                                .await
+                                .is_none()
+                                {
+                                    eprintln!("[!] Failed to store credential for {}:{}", user, ip);
+                                }
+                                if let Err(e) = tx.send(format!("{}\n", msg)).await {
+                                    eprintln!("[!] Channel send failed: {}", e);
+                                }
+                                hits_c.lock().await.push((
+                                    ip.to_string(),
+                                    user.clone(),
+                                    pass.clone(),
+                                ));
+                                sf.fetch_add(1, Ordering::Relaxed);
+                                break 'outer;
                             }
-                        }
-                        LoginResult::Error { message, .. } => {
-                            // Don't abandon the host on a single transient
-                            // error. Count consecutive errors and only give up
-                            // once we've seen a sustained run of them (the host
-                            // is genuinely unreachable / down), matching how
-                            // `run_bruteforce` treats consecutive errors.
-                            consecutive_errors = consecutive_errors.saturating_add(1);
-                            if verbose {
-                                crate::mprintln!(
-                                    "\r{}",
-                                    format!("[?] {}:{} -> {}:{} error: {}", ip, port, user, pass, message).yellow()
-                                );
-                            }
-                            if consecutive_errors >= HOST_ERROR_THRESHOLD {
+                            LoginResult::AuthFailed => {
+                                // A definitive auth response means the host is
+                                // reachable and responsive — clear the transient
+                                // error streak.
+                                consecutive_errors = 0;
                                 if verbose {
                                     crate::mprintln!(
+                                        "\r{}",
+                                        format!("[-] {}:{} -> {}:{}", ip, port, user, pass)
+                                            .dimmed()
+                                    );
+                                }
+                            }
+                            LoginResult::Error { message, .. } => {
+                                // Don't abandon the host on a single transient
+                                // error. Count consecutive errors and only give up
+                                // once we've seen a sustained run of them (the host
+                                // is genuinely unreachable / down), matching how
+                                // `run_bruteforce` treats consecutive errors.
+                                consecutive_errors = consecutive_errors.saturating_add(1);
+                                if verbose {
+                                    crate::mprintln!(
+                                        "\r{}",
+                                        format!(
+                                            "[?] {}:{} -> {}:{} error: {}",
+                                            ip, port, user, pass, message
+                                        )
+                                        .yellow()
+                                    );
+                                }
+                                if consecutive_errors >= HOST_ERROR_THRESHOLD {
+                                    if verbose {
+                                        crate::mprintln!(
                                         "\r{}",
                                         format!(
                                             "[!] {}:{} -> {} consecutive errors, abandoning host",
@@ -1530,18 +1580,18 @@ where
                                         )
                                         .yellow()
                                     );
+                                    }
+                                    break 'outer; // host genuinely unreachable, skip
                                 }
-                                break 'outer; // host genuinely unreachable, skip
                             }
                         }
                     }
                 }
-            }
-            sc.fetch_add(1, Ordering::Relaxed);
-            if let Some(ref sf_name) = state_file_task {
-                mark_ip_checked(&ip, sf_name).await;
-            }
-            drop(permit);
+                sc.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref sf_name) = state_file_task {
+                    mark_ip_checked(&ip, sf_name).await;
+                }
+                drop(permit);
             };
             match __task_buf {
                 Some(b) => crate::output::OUTPUT_BUFFER.scope(b, __body).await,
@@ -1554,7 +1604,10 @@ where
     // Use the same `.max(1)` as the Semaphore creation to stay consistent,
     // and cap to u32::MAX to avoid truncation on exotic configs.
     let drain_permits = (config.concurrency.max(1)).min(u32::MAX as usize) as u32;
-    let drain = semaphore.acquire_many(drain_permits).await.context("Semaphore closed")?;
+    let drain = semaphore
+        .acquire_many(drain_permits)
+        .await
+        .context("Semaphore closed")?;
     drop(drain);
 
     // Shut down writer task

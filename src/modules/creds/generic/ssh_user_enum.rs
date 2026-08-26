@@ -7,7 +7,7 @@
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_default, cfg_prompt_required, cfg_prompt_yes_no};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use ssh2::Session;
 use std::{
@@ -46,7 +46,9 @@ const MIN_ABS_DELTA: f64 = 0.02;
 const PROBE_PASSWORD_LEN: usize = 40_000;
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════════════╗".cyan()
@@ -113,8 +115,12 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
         }
     };
 
-    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs))) { eprintln!("[!] Failed to set timeout: {}", e); }
-    if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs))) { eprintln!("[!] Failed to set timeout: {}", e); }
+    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs))) {
+        crate::meprintln!("[!] Failed to set timeout: {}", e);
+    }
+    if let Err(e) = tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs))) {
+        crate::meprintln!("[!] Failed to set timeout: {}", e);
+    }
 
     let mut sess = match Session::new() {
         Ok(s) => s,
@@ -137,7 +143,11 @@ fn time_auth_attempt(host: &str, port: u16, username: &str, timeout_secs: u64) -
     let probe_password = "A".repeat(PROBE_PASSWORD_LEN);
     let start = Instant::now();
     if let Err(e) = sess.userauth_password(username, &probe_password) {
-        tracing::trace!("Auth attempt for '{}' returned error (expected): {}", username, e);
+        tracing::trace!(
+            "Auth attempt for '{}' returned error (expected): {}",
+            username,
+            e
+        );
     }
     Some(start.elapsed().as_secs_f64())
 }
@@ -200,7 +210,10 @@ fn load_usernames(path: &str) -> Result<Vec<String>> {
         .lines()
         .filter_map(|r| match r {
             Ok(l) => Some(l),
-            Err(e) => { tracing::trace!("Skipping non-UTF-8 line: {e}"); None }
+            Err(e) => {
+                tracing::trace!("Skipping non-UTF-8 line: {e}");
+                None
+            }
         })
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -234,7 +247,11 @@ pub async fn enumerate_users(
     );
     crate::mprintln!(
         "{}",
-        format!("[*] Detection cutoff: {:.1} sigma above baseline", threshold).cyan()
+        format!(
+            "[*] Detection cutoff: {:.1} sigma above baseline",
+            threshold
+        )
+        .cyan()
     );
     crate::mprintln!();
 
@@ -275,8 +292,13 @@ fn enumerate_users_blocking(
 
     // Baseline from MANY invalid-user samples → mean + stddev for a statistical
     // (not fixed-millisecond) cutoff.
-    let baseline_samples =
-        collect_samples(host, port, &baseline_user, samples.max(BASELINE_SAMPLES), timeout_secs);
+    let baseline_samples = collect_samples(
+        host,
+        port,
+        &baseline_user,
+        samples.max(BASELINE_SAMPLES),
+        timeout_secs,
+    );
     if baseline_samples.is_empty() {
         crate::mprintln!(
             "{}",
@@ -312,7 +334,9 @@ fn enumerate_users_blocking(
             usernames.len(),
             user
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+            crate::meprintln!("[!] Flush failed: {}", e);
+        }
 
         let user_samples = collect_samples(host, port, user, samples, timeout_secs);
         if user_samples.is_empty() {
@@ -385,10 +409,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await?
         .parse()
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let threshold: f64 = cfg_prompt_default("threshold", "Detection cutoff (baseline std-devs)", "3.0")
-        .await?
-        .parse()
-        .unwrap_or(TIMING_THRESHOLD);
+    let threshold: f64 =
+        cfg_prompt_default("threshold", "Detection cutoff (baseline std-devs)", "3.0")
+            .await?
+            .parse()
+            .unwrap_or(TIMING_THRESHOLD);
 
     // Get usernames
     let mut usernames: Vec<String> = Vec::new();
@@ -446,7 +471,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         outcome.findings.push(Finding {
             target: host.clone(),
             kind: FindingKind::Note,
-            message: format!("Likely-valid SSH user '{}' on {}:{} (timing side-channel)", user, host, port),
+            message: format!(
+                "Likely-valid SSH user '{}' on {}:{} (timing side-channel)",
+                user, host, port
+            ),
             data: Some(serde_json::json!({
                 "service": "ssh",
                 "port": port,
@@ -481,4 +509,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/ssh_user_enum", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/ssh_user_enum",
+    native
+);

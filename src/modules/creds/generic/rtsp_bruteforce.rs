@@ -1,12 +1,12 @@
 //! RTSP credential probe — DESCRIBE with HTTP-Basic, classify by status.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 554;
 
@@ -25,10 +25,9 @@ const DEFAULTS: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "RTSP Bruteforce".to_string(),
-        description:
-            "Tests RTSP DESCRIBE auth (HTTP-Basic) on a given path. Single-target — \
+        description: "Tests RTSP DESCRIBE auth (HTTP-Basic) on a given path. Single-target — \
              scheduler does fan-out."
-                .to_string(),
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec!["https://www.rfc-editor.org/rfc/rfc7826".to_string()],
         disclosure_date: None,
@@ -38,7 +37,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("rtsp_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("rtsp_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -64,7 +66,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("connect: {e}"),
                 retryable: true,
-            }
+            };
         }
     };
 
@@ -72,8 +74,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         .global_options()
         .try_get("rtsp_path")
         .unwrap_or_else(|| "/".to_string());
-    let basic =
-        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
     let req = format!(
         "DESCRIBE rtsp://{}:{}{}{}{} RTSP/1.0\r\n\
          CSeq: 1\r\n\
@@ -101,13 +102,13 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("read: {e}"),
                 retryable: true,
-            }
+            };
         }
         Err(e) => {
             return LoginResult::Error {
                 message: format!("read timeout: {e}"),
                 retryable: true,
-            }
+            };
         }
     };
     if n < 12 {
@@ -124,7 +125,10 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     // live-but-rejecting host isn't mistaken for a dead/erroring one. Only a reply
     // that isn't an RTSP status line at all (wrong service, garbage) is an error.
     let text = String::from_utf8_lossy(&buf[..n]);
-    let status_line = text.split("\r\n").next().unwrap_or("").trim();
+    // Use lines() to handle both \r\n and \n line endings. Some RTSP servers
+    // (especially embedded/cheap cameras) only send \n separators, which the
+    // old split("\r\n") would treat as one giant line and fail to parse.
+    let status_line = text.lines().next().unwrap_or("").trim();
     let code = status_line
         .strip_prefix("RTSP/1.0 ")
         .or_else(|| status_line.strip_prefix("RTSP/2.0 "))
@@ -145,4 +149,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/rtsp_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/rtsp_bruteforce",
+    native
+);

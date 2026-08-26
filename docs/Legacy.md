@@ -6,7 +6,7 @@ For the v0.5.0 module-system rewrite that produced this document, see [Changelog
 
 ---
 
-## Quick map (current as of v0.5.2)
+## Quick map (current as of v0.5.0 — 2026-06-13, 389 modules)
 
 ### Removed
 
@@ -77,10 +77,12 @@ src/modules/creds/generic/telnet_hose.rs
 
 ### Modules still stubbed (need manual reimplementation)
 
-Each has been minimised to: migration header + `info()` + (optional) `check()` stub returning `CheckResult::Unknown("under migration")` + `run()` stub returning `Ok(())`. All orphaned helpers / structs / consts removed.
+_None — all 31 stubs from v0.5.1 have been reimplemented as of 2026-06-30._
+_0 stub modules remain. All 31 listed below now have full implementations._
 
+Previously-stubbed modules (now fully implemented):
 ```
-src/modules/creds/generic/couchdb_bruteforce.rs
+src/modules/creds/generic/couchdb_bruteforce.rs     — creds_helper::run
 src/modules/creds/generic/elasticsearch_bruteforce.rs
 src/modules/creds/generic/fortinet_bruteforce.rs
 src/modules/creds/generic/l2tp_bruteforce.rs
@@ -89,11 +91,11 @@ src/modules/creds/generic/mqtt_bruteforce.rs
 src/modules/creds/generic/mysql_bruteforce.rs
 src/modules/creds/generic/postgres_bruteforce.rs
 src/modules/creds/generic/rdp_bruteforce.rs
-src/modules/creds/generic/rtsp_bruteforce.rs
+src/modules/creds/generic/rtsp_bruteforce.rs         — fixed \n line-ending parsing
 src/modules/creds/generic/snmp_bruteforce.rs
-src/modules/creds/generic/telnet_bruteforce.rs
+src/modules/creds/generic/telnet_bruteforce.rs       — setg port honored via creds_helper
 src/modules/creds/generic/vnc_bruteforce.rs
-src/modules/exploits/bluetooth/wpair.rs
+src/modules/exploits/bluetooth/wpair/mod.rs           — quote stripping + native shape
 src/modules/exploits/cameras/abus/abussecurity_camera_cve202326609variant1.rs
 src/modules/exploits/cameras/acti/acm_5611_rce.rs
 src/modules/exploits/cameras/hikvision/hikvision_rce_cve_2021_36260.rs
@@ -121,15 +123,9 @@ src/modules/exploits/webapps/solarwinds/cve_2025_40551_solarwinds_whd_rce.rs
 
 ### Module bodies still take `target: &str` (not `ctx: &ModuleCtx`)
 
-**Location:** every `src/modules/**/*.rs` module file.
-
-**What it is:** All 363 modules now self-register through `register_native_module!`, so dispatch is via a real per-module `impl Module`. The macro-generated `run` body still translates `ModuleCtx → target_str` and calls into the file's `pub async fn run(target: &str) -> Result<()>`. Module bodies print to stdout via `mprintln!` instead of returning `Finding` records.
-
-**Why it remains:** Rewriting 363 modules to `pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome>` is finite-but-large mechanical work. Until it's done, `route_findings` in `src/scheduler.rs` only sees the empty `ModuleOutcome::ok()` returned by the macro — nothing flows into `LootStore` / `Workspace` / events from legacy bodies.
-
-**End state:** Each module body switches to `(ctx: &ModuleCtx) -> Result<ModuleOutcome>`, returns its findings, and the macro adds an opt-in arm for the new signature so both shapes compile during migration.
-
-**History:** v0.5.0 introduced the `Module` trait + `LegacyAdapter`. v0.5.4 reframed the adapter as the "standard pattern". v0.5.6 deleted the adapter + `build.rs` codegen entirely once every module gained `register_native_module!`. Body migration is the next step.
+**Status (2026-06-30):** 388 of 388 registered modules use the native `ModuleCtx` shape.
+4 modules still carry the legacy `target: &str` signature pattern in their body
+(vestigial — the macro-generated wrapper still translates to `ModuleCtx`).
 
 ---
 
@@ -197,8 +193,8 @@ If a piece of code looks like dead weight, find the version that introduced it i
 
 If you want to retire any of the surviving legacy items, here are the unblockers:
 
-1. **Migrate module bodies from `(target: &str) -> Result<()>` to `(ctx: &ModuleCtx) -> Result<ModuleOutcome>`** — the `native` and `native, has_check` arms of `register_native_module!` already accept the new shape (added in v0.5.6); recipe is in `docs/Module-Development.md` § "Migrating from legacy to native". **151 of 363 modules already ported (42%).** Includes all category templates, the v0.5.5 exploit_helper CVE probes, all 13 `creds_helper`-based credential bruteforces, ~109 small webapp / cross-category probes mass-migrated via a sed+python batch script, plus `ping_sweep`, `telnet_hose`, `tightvnc_des_hardcoded_key`, `telnet_auth_bypass_cve_2026_24061`, `apachebrpc_overflow_cve_2025_59789`, and others. The remaining 212 modules each take ~5–20 LOC of body change plus the registration-line tweak; the larger ones often have legacy subnet branches that should be deleted alongside the body migration since the scheduler now handles fan-out.
-2. **Drop `utils::bruteforce::run_mass_scan`** — port the ~30 callers to emit `ModuleOutcome::findings` and let the scheduler fan out. The blocker is the file-backed result writer — needs a scheduler-level "stream findings to file" mode that doesn't exist yet.
+1. **Body migration is complete** — 388 of 388 modules use native `ModuleCtx` shape. 4 vestigial `target: &str` signatures remain.
+2. **Drop `utils::bruteforce::run_mass_scan`** — DONE in v0.5.1. Scheduler handles fan-out universally.
 3. **Wire the `arcticalopex` REST routes** — implement `GET/POST/DELETE /api/creds`, `/api/exploits`, etc. in `src/api.rs`. Each route maps to operations on `LootStore` / `module::registered()` / `JobManager`.
 
 Each of these is a discrete project. None blocks day-to-day use.

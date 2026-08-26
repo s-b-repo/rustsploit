@@ -1,13 +1,13 @@
 //! RDP credential probe — wraps `crate::native::rdp::try_login`.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::native::rdp::{self, RdpLoginResult, PROTO_HYBRID, PROTO_RDP, PROTO_SSL};
-use crate::utils::creds_helper::{self, CredsRun};
+use crate::native::rdp::{self, PROTO_HYBRID, PROTO_RDP, PROTO_SSL, RdpLoginResult};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 3389;
 
@@ -37,7 +37,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("rdp_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("rdp_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -75,4 +78,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/rdp_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/rdp_bruteforce",
+    native
+);

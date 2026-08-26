@@ -5,7 +5,7 @@
 // "permission denied", modules call `require_root("context")` at the top of
 // `run()` and get back a clean `anyhow::Error` if the current euid isn't 0.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Returns `true` if the current effective UID is root (0).
 ///
@@ -40,13 +40,19 @@ pub fn require_root(context: &str) -> Result<()> {
 /// Thin wrapper over `std::fs::set_permissions` that uses the unix mode bits
 /// directly. Callers MUST handle the returned `Result` — a silent chmod
 /// failure leaves the file world-readable.
-pub fn set_secure_permissions<P: AsRef<std::path::Path>>(path: P, mode: u32) -> std::io::Result<()> {
+pub fn set_secure_permissions<P: AsRef<std::path::Path>>(
+    path: P,
+    mode: u32,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// Async variant of `set_secure_permissions` for tokio contexts.
-pub async fn set_secure_permissions_async<P: AsRef<std::path::Path>>(path: P, mode: u32) -> std::io::Result<()> {
+pub async fn set_secure_permissions_async<P: AsRef<std::path::Path>>(
+    path: P,
+    mode: u32,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await
 }

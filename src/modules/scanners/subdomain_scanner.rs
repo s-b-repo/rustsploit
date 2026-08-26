@@ -5,16 +5,18 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{ Result, Context, anyhow };
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_yes_no,
+};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
-use std::time::Duration;
-use tokio::time::timeout;
 use std::sync::Arc;
-use std::sync::atomic::{ AtomicU64, Ordering };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Semaphore;
-use crate::utils::{ cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range };
-use crate::module_info::{ ModuleInfo, ModuleRank };
+use tokio::time::timeout;
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -35,23 +37,95 @@ pub fn info() -> ModuleInfo {
 }
 
 const DEFAULT_SUBDOMAINS: &[&str] = &[
-    "www", "mail", "ftp", "admin", "dev", "staging", "test", "api", "app",
-    "blog", "cdn", "cloud", "db", "demo", "docs", "git", "jenkins", "jira",
-    "lab", "login", "m", "ns1", "ns2", "portal", "proxy", "remote", "shop",
-    "smtp", "ssh", "vpn", "webmail", "wiki", "beta", "ci", "crm", "dashboard",
-    "exchange", "forum", "gateway", "grafana", "help", "hr", "internal",
-    "intranet", "ldap", "monitoring", "mx", "mysql", "nagios", "office",
-    "ops", "pma", "pop", "pop3", "preview", "prod", "rdp", "sentry",
-    "sftp", "sip", "stage", "status", "support", "syslog", "vault",
-    "web", "zabbix",
+    "www",
+    "mail",
+    "ftp",
+    "admin",
+    "dev",
+    "staging",
+    "test",
+    "api",
+    "app",
+    "blog",
+    "cdn",
+    "cloud",
+    "db",
+    "demo",
+    "docs",
+    "git",
+    "jenkins",
+    "jira",
+    "lab",
+    "login",
+    "m",
+    "ns1",
+    "ns2",
+    "portal",
+    "proxy",
+    "remote",
+    "shop",
+    "smtp",
+    "ssh",
+    "vpn",
+    "webmail",
+    "wiki",
+    "beta",
+    "ci",
+    "crm",
+    "dashboard",
+    "exchange",
+    "forum",
+    "gateway",
+    "grafana",
+    "help",
+    "hr",
+    "internal",
+    "intranet",
+    "ldap",
+    "monitoring",
+    "mx",
+    "mysql",
+    "nagios",
+    "office",
+    "ops",
+    "pma",
+    "pop",
+    "pop3",
+    "preview",
+    "prod",
+    "rdp",
+    "sentry",
+    "sftp",
+    "sip",
+    "stage",
+    "status",
+    "support",
+    "syslog",
+    "vault",
+    "web",
+    "zabbix",
 ];
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   DNS Subdomain Enumerator                                   ║".cyan());
-    crate::mprintln!("{}", "║   Brute-force subdomain discovery via DNS resolution         ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   DNS Subdomain Enumerator                                   ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Brute-force subdomain discovery via DNS resolution         ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -77,18 +151,17 @@ async fn resolve_subdomain(fqdn: &str, timeout_dur: Duration) -> Option<Vec<Stri
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
-            if ips.is_empty() {
-                None
-            } else {
-                Some(ips)
-            }
+            if ips.is_empty() { None } else { Some(ips) }
         }
         _ => None,
     }
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
     display_banner();
 
     // Clean domain: strip protocol, paths, ports
@@ -106,14 +179,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .to_lowercase();
 
     if domain.is_empty() || !domain.contains('.') {
-        return Err(anyhow!("Invalid domain: '{}'. Provide a domain like 'example.com'", target));
+        return Err(anyhow!(
+            "Invalid domain: '{}'. Provide a domain like 'example.com'",
+            target
+        ));
     }
 
     crate::mprintln!("{}", format!("[*] Target domain: {}", domain).cyan());
 
-    let wordlist_choice = cfg_prompt_default("wordlist", "Wordlist (built-in / path to file)", "built-in").await?;
-    let concurrency = cfg_prompt_int_range("concurrency", "Concurrent lookups", 20, 1, 200).await? as usize;
-    let timeout_secs = cfg_prompt_int_range("timeout", "DNS timeout per lookup (seconds)", 3, 1, 15).await? as u64;
+    let wordlist_choice =
+        cfg_prompt_default("wordlist", "Wordlist (built-in / path to file)", "built-in").await?;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Concurrent lookups", 20, 1, 200).await? as usize;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "DNS timeout per lookup (seconds)", 5, 1, 300).await?
+            as u64;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
 
     let timeout_dur = Duration::from_secs(timeout_secs);
@@ -132,7 +212,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let source = if wordlist_choice == "built-in" || wordlist_choice.is_empty() {
         WordlistSource::InMemory(DEFAULT_SUBDOMAINS.iter().map(|s| s.to_string()).collect())
     } else {
-        let meta = tokio::fs::metadata(&wordlist_choice).await
+        let meta = tokio::fs::metadata(&wordlist_choice)
+            .await
             .with_context(|| format!("Cannot stat wordlist: {}", wordlist_choice))?;
         if meta.len() > STREAM_THRESHOLD {
             crate::mprintln!(
@@ -141,13 +222,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     "[*] Large wordlist detected ({:.1} MB) — streaming in batches of {}",
                     meta.len() as f64 / (1024.0 * 1024.0),
                     BATCH_SIZE
-                ).cyan()
+                )
+                .cyan()
             );
-            WordlistSource::Streaming { path: wordlist_choice.clone(), size: meta.len() }
+            WordlistSource::Streaming {
+                path: wordlist_choice.clone(),
+                size: meta.len(),
+            }
         } else {
-            let content = tokio::fs::read_to_string(&wordlist_choice).await
+            let content = tokio::fs::read_to_string(&wordlist_choice)
+                .await
                 .with_context(|| format!("Failed to read wordlist: {}", wordlist_choice))?;
-            let v: Vec<String> = content.lines()
+            let v: Vec<String> = content
+                .lines()
                 .map(|l| l.trim().to_lowercase())
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .collect();
@@ -157,13 +244,30 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     match &source {
         WordlistSource::InMemory(v) => {
-            crate::mprintln!("{}", format!("[*] Loaded {} subdomains to test", v.len()).cyan());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Loaded {} subdomains to test", v.len()).cyan()
+            );
         }
         WordlistSource::Streaming { size, .. } => {
-            crate::mprintln!("{}", format!("[*] Streaming wordlist ({:.1} MB, total unknown until processed)", *size as f64 / (1024.0 * 1024.0)).cyan());
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[*] Streaming wordlist ({:.1} MB, total unknown until processed)",
+                    *size as f64 / (1024.0 * 1024.0)
+                )
+                .cyan()
+            );
         }
     }
-    crate::mprintln!("{}", format!("[*] Concurrency: {}, Timeout: {}s", concurrency, timeout_secs).dimmed());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Concurrency: {}, Timeout: {}s",
+            concurrency, timeout_secs
+        )
+        .dimmed()
+    );
 
     // Wildcard detection: test multiple random non-existent subdomains to reduce false negatives
     let mut wildcard_hits: Vec<Vec<String>> = Vec::new();
@@ -214,14 +318,22 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         wildcard_filter: Option<Vec<String>>,
         state: &ScanState,
     ) {
-        let ScanState { results, tested, found, semaphore } = state;
+        let ScanState {
+            results,
+            tested,
+            found,
+            semaphore,
+        } = state;
         let mut handles = Vec::with_capacity(batch.len());
         for sub in batch {
             // Acquire the permit BEFORE tokio::spawn so that a 100k-line batch
             // doesn't materialize 100k task structs at once.
             let permit = match Arc::clone(semaphore).acquire_owned().await {
                 Ok(p) => p,
-                Err(e) => { tracing::debug!("semaphore closed: {e}"); break; }
+                Err(e) => {
+                    tracing::debug!("semaphore closed: {e}");
+                    break;
+                }
             };
             let domain = domain.to_string();
             let results = Arc::clone(results);
@@ -231,35 +343,46 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
             handles.push(tokio::spawn(async move {
                 let _permit = permit;
-                if crate::context::is_cancelled() { return; }
+                if crate::context::is_cancelled() {
+                    return;
+                }
                 let fqdn = format!("{}.{}", sub, domain);
 
                 if let Some(ips) = resolve_subdomain(&fqdn, timeout_dur).await {
                     if let Some(ref wildcard_ips) = wf
-                        && ips == *wildcard_ips {
-                            tested.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
+                        && ips == *wildcard_ips
+                    {
+                        tested.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     crate::mprintln!("{}", format!("[+] {} -> {}", fqdn, ips.join(", ")).green());
                     found.fetch_add(1, Ordering::Relaxed);
-                    crate::events::emit(crate::events::ModuleEvent::HostUp {
-                        host: fqdn.clone(),
+                    crate::events::emit(crate::events::ModuleEvent::HostUp { host: fqdn.clone() });
+                    results.lock().await.push(SubdomainResult {
+                        subdomain: fqdn,
+                        ips,
                     });
-                    results.lock().await.push(SubdomainResult { subdomain: fqdn, ips });
                 }
 
                 let done = tested.fetch_add(1, Ordering::Relaxed) + 1;
                 if done.is_multiple_of(50) {
-                    crate::mprint!("\r{} {} tested, {} found    ",
+                    crate::mprint!(
+                        "\r{} {} tested, {} found    ",
                         "[Progress]".cyan(),
                         done,
                         found.load(Ordering::Relaxed).to_string().green()
                     );
-                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
+                    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+                        crate::meprintln!("[!] Flush failed: {}", e);
+                    }
                 }
             }));
         }
-        for h in handles { if let Err(e) = h.await { eprintln!("[!] Task join failed: {}", e); } }
+        for h in handles {
+            if let Err(e) = h.await {
+                crate::meprintln!("[!] Task join failed: {}", e);
+            }
+        }
     }
 
     let scan_state = ScanState {
@@ -271,10 +394,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     match source {
         WordlistSource::InMemory(batch) => {
-            scan_batch(
-                batch, &domain, timeout_dur, wf_outer.clone(),
-                &scan_state,
-            ).await;
+            scan_batch(batch, &domain, timeout_dur, wf_outer.clone(), &scan_state).await;
         }
         WordlistSource::Streaming { path, size: _ } => {
             // Read batches on a blocking thread, send to async side via channel.
@@ -283,28 +403,35 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let reader_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
                 crate::utils::load_lines_batched(&read_path, BATCH_SIZE, |raw_batch| {
                     // normalize per-line (lowercase, drop comments) on the reader thread
-                    let cleaned: Vec<String> = raw_batch.into_iter()
+                    let cleaned: Vec<String> = raw_batch
+                        .into_iter()
                         .map(|l| l.trim().to_lowercase())
                         .filter(|l| !l.is_empty() && !l.starts_with('#'))
                         .collect();
                     if !cleaned.is_empty()
-                        && let Err(e) = tx.blocking_send(cleaned) { eprintln!("[!] Channel send failed: {}", e); }
+                        && let Err(e) = tx.blocking_send(cleaned)
+                    {
+                        crate::meprintln!("[!] Channel send failed: {}", e);
+                    }
                 })
             });
 
             let mut batch_idx = 0usize;
             while let Some(batch) = rx.recv().await {
                 batch_idx += 1;
-                crate::mprintln!("{}", format!("[*] Batch {}: {} entries", batch_idx, batch.len()).cyan());
-                scan_batch(
-                    batch, &domain, timeout_dur, wf_outer.clone(),
-                    &scan_state,
-                ).await;
+                crate::mprintln!(
+                    "{}",
+                    format!("[*] Batch {}: {} entries", batch_idx, batch.len()).cyan()
+                );
+                scan_batch(batch, &domain, timeout_dur, wf_outer.clone(), &scan_state).await;
             }
 
             match reader_handle.await {
                 Ok(Ok(total_lines)) => {
-                    crate::mprintln!("{}", format!("[*] Streamed {} total lines from wordlist", total_lines).dimmed());
+                    crate::mprintln!(
+                        "{}",
+                        format!("[*] Streamed {} total lines from wordlist", total_lines).dimmed()
+                    );
                 }
                 Ok(Err(e)) => crate::meprintln!("[!] Wordlist read error: {}", e),
                 Err(e) => crate::meprintln!("[!] Wordlist reader task panicked: {}", e),
@@ -323,11 +450,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", "=== Enumeration Summary ===".bold());
     crate::mprintln!("  Domain:           {}", domain);
     crate::mprintln!("  Subdomains tested: {}", total);
-    crate::mprintln!("  Found:            {}", if found_count > 0 {
-        found_count.to_string().green().bold().to_string()
-    } else {
-        "0".dimmed().to_string()
-    });
+    crate::mprintln!(
+        "  Found:            {}",
+        if found_count > 0 {
+            found_count.to_string().green().bold().to_string()
+        } else {
+            "0".dimmed().to_string()
+        }
+    );
 
     let mut outcome = ModuleOutcome::ok();
 
@@ -339,7 +469,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             outcome = outcome.with(Finding {
                 target: r.subdomain.clone(),
                 kind: FindingKind::Note,
-                message: format!("Subdomain discovered: {} -> {}", r.subdomain, r.ips.join(", ")),
+                message: format!(
+                    "Subdomain discovered: {} -> {}",
+                    r.subdomain,
+                    r.ips.join(", ")
+                ),
                 data: Some(serde_json::json!({
                     "subdomain": r.subdomain,
                     "ips": r.ips,
@@ -351,20 +485,33 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if save_results && !results.is_empty() {
         let default_file = format!("subdomains_{}.txt", domain.replace('.', "_"));
-        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_file).await?;
-        let content = results.iter()
+        let output_path =
+            cfg_prompt_output_file("output_file", "Output file", &default_file).await?;
+        let content = results
+            .iter()
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        tokio::fs::write(&output_path, format!("Subdomain Enumeration - {}\n\n{}", domain, content)).await
-            .with_context(|| format!("Failed to write results to {}", output_path))?;
+        tokio::fs::write(
+            &output_path,
+            format!("Subdomain Enumeration - {}\n\n{}", domain, content),
+        )
+        .await
+        .with_context(|| format!("Failed to write results to {}", output_path))?;
         if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
             crate::meprintln!("[!] Failed to set file permissions: {}", e);
         }
-        crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
+        crate::mprintln!(
+            "{}",
+            format!("[+] Results saved to '{}'", output_path).green()
+        );
     }
 
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "subdomain_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "subdomain_scanner",
+    native
+);

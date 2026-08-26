@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{cfg_prompt_output_file, cfg_prompt_yes_no};
+use crate::utils::{cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_yes_no};
 
 use colored::*;
 
@@ -90,9 +90,9 @@ const HELP_KEYWORDS: &[&str] = &[
     "menu", "admin",
 ];
 
-// Internal Logic Constants
-const CONNECT_TIMEOUT_MS: u64 = 2000;
-const LOGIN_TIMEOUT_MS: u64 = 6000; // Total time for a login attempt
+// Internal Logic Defaults (user-configurable via prompts)
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_LOGIN_TIMEOUT_MS: u64 = 6000; // Total time for a login attempt
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum TelnetState {
@@ -134,6 +134,25 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         );
     }
 
+    let connect_timeout_ms: u64 = cfg_prompt_int_range(
+        "connect_timeout",
+        "Connect timeout (ms)",
+        DEFAULT_CONNECT_TIMEOUT_MS as i64,
+        100,
+        30000,
+    )
+    .await? as u64;
+    let login_timeout_ms: u64 = cfg_prompt_int_range(
+        "login_timeout",
+        "Login timeout (ms)",
+        DEFAULT_LOGIN_TIMEOUT_MS as i64,
+        500,
+        60000,
+    )
+    .await? as u64;
+    let connect_timeout = Duration::from_millis(connect_timeout_ms);
+    let login_timeout = Duration::from_millis(login_timeout_ms);
+
     let mut found_any = false;
     for &port in &ports {
         let socket: SocketAddr = match format!("{}:{}", host, port).parse() {
@@ -146,19 +165,22 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         Some(sa) => sa,
                         None => continue,
                     },
-                    Err(e) => { tracing::debug!("DNS lookup failed: {e}"); continue; }
+                    Err(e) => {
+                        tracing::debug!("DNS lookup failed: {e}");
+                        continue;
+                    }
                 }
             }
         };
 
         // Quick TCP precheck so we don't iterate 55 cred pairs against a
         // closed port.
-        if !crate::utils::tcp_port_open(socket.ip(), socket.port(), Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+        if !crate::utils::tcp_port_open(socket.ip(), socket.port(), connect_timeout).await {
             continue;
         }
 
         for (user, pass) in TOP_CREDENTIALS {
-            match try_telnet_login_hose(&socket, user, pass).await {
+            match try_telnet_login_hose(&socket, user, pass, connect_timeout, login_timeout).await {
                 Ok(true) => {
                     crate::mprintln!(
                         "{}",
@@ -180,7 +202,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         &host,
                         "credential",
                         &format!("telnet {}:{}@{}:{}", user, pass, host, port),
-                        serde_json::to_string(&payload).unwrap_or_else(|e| { tracing::warn!("JSON serialization failed: {e}"); String::new() }).as_bytes(),
+                        serde_json::to_string(&payload)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("JSON serialization failed: {e}");
+                                String::new()
+                            })
+                            .as_bytes(),
                         "creds/generic/telnet_hose",
                     )
                     .await
@@ -223,9 +250,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             && let Ok(path) =
                 cfg_prompt_output_file("output_file", "Output path", "telnet_hose_results.txt")
                     .await
-            {
-                tracing::debug!(path = %path, "telnet_hose: file already written via loot store");
-            }
+        {
+            tracing::debug!(path = %path, "telnet_hose: file already written via loot store");
+        }
     }
 
     Ok(outcome)
@@ -233,21 +260,24 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
 fn host_only(t: &str) -> String {
     if let Some(s) = t.strip_prefix('[')
-        && let Some(end) = s.find(']') {
-            return s[..end].to_string();
-        }
+        && let Some(end) = s.find(']')
+    {
+        return s[..end].to_string();
+    }
     if let Some((before, after)) = t.rsplit_once(':')
-        && after.chars().all(|c| c.is_ascii_digit()) {
-            return before.to_string();
-        }
+        && after.chars().all(|c| c.is_ascii_digit())
+    {
+        return before.to_string();
+    }
     t.to_string()
 }
 
 fn explicit_port(t: &str) -> Option<u16> {
     if let Some(s) = t.strip_prefix('[')
-        && let Some(end) = s.find(']') {
-            return s[end + 1..].strip_prefix(':').and_then(|p| p.parse().ok());
-        }
+        && let Some(end) = s.find(']')
+    {
+        return s[end + 1..].strip_prefix(':').and_then(|p| p.parse().ok());
+    }
     if let Some((_, after)) = t.rsplit_once(':') {
         return after.parse().ok();
     }
@@ -263,17 +293,29 @@ pub async fn try_login(
     socket: &SocketAddr,
     username: &str,
     password: &str,
+    connect_timeout: Duration,
+    login_timeout: Duration,
 ) -> Result<bool> {
-    try_telnet_login_hose(socket, username, password).await
+    try_telnet_login_hose(socket, username, password, connect_timeout, login_timeout).await
 }
 
 async fn try_telnet_login_hose(
     socket: &SocketAddr,
     username: &str,
     password: &str,
+    connect_timeout: Duration,
+    login_timeout: Duration,
 ) -> Result<bool> {
     // Attempt 1: Standard (try to detect, fallback to User+Pass)
-    let (success, banner_seen) = do_telnet_session(socket, username, password, false).await?;
+    let (success, banner_seen) = do_telnet_session(
+        socket,
+        username,
+        password,
+        false,
+        connect_timeout,
+        login_timeout,
+    )
+    .await?;
     if success {
         return Ok(true);
     }
@@ -281,7 +323,15 @@ async fn try_telnet_login_hose(
     // If we failed AND never saw a proper banner (blind/silence), retry with Password Only
     if !banner_seen {
         // Attempt 2: Blind Password Only
-        let (success_retry, _) = do_telnet_session(socket, username, password, true).await?;
+        let (success_retry, _) = do_telnet_session(
+            socket,
+            username,
+            password,
+            true,
+            connect_timeout,
+            login_timeout,
+        )
+        .await?;
         if success_retry {
             return Ok(true);
         }
@@ -296,10 +346,12 @@ async fn do_telnet_session(
     username: &str,
     password: &str,
     force_password_only: bool,
+    connect_timeout: Duration,
+    login_timeout: Duration,
 ) -> Result<(bool, bool)> {
     // returns (success, banner_detected)
 
-    let stream = match crate::utils::network::tcp_connect_addr(*socket, Duration::from_millis(CONNECT_TIMEOUT_MS)).await {
+    let stream = match crate::utils::network::tcp_connect_addr(*socket, connect_timeout).await {
         Ok(s) => s,
         _ => return Ok((false, false)), // Connect fail
     };
@@ -311,7 +363,7 @@ async fn do_telnet_session(
     // State Machine
     let mut state = TelnetState::WaitingForBanner;
     let start = Instant::now();
-    let max_duration = Duration::from_millis(LOGIN_TIMEOUT_MS);
+    let max_duration = login_timeout;
     let mut banner_detected = false;
 
     while start.elapsed() < max_duration {
@@ -320,7 +372,10 @@ async fn do_telnet_session(
         let n = match timeout(Duration::from_millis(1500), read_future).await {
             Ok(Ok(0)) => return Ok((false, banner_detected)), // EOF
             Ok(Ok(n)) => n,
-            Ok(Err(e)) => { tracing::debug!("telnet read error: {e}"); return Ok((false, banner_detected)); }
+            Ok(Err(e)) => {
+                tracing::debug!("telnet read error: {e}");
+                return Ok((false, banner_detected));
+            }
             Err(e) => {
                 tracing::debug!("timeout: {e}");
                 // Read Timeout logic
@@ -347,8 +402,39 @@ async fn do_telnet_session(
             }
         };
 
-        // IAC Stripping (Minimal)
-        let s = String::from_utf8_lossy(&buf[..n]);
+        // Strip Telnet IAC (Interpret As Command) sequences per RFC 854.
+        // Telnet servers intersperse binary option negotiation (0xFF followed
+        // by 1 or 2 bytes) with login banner text. from_utf8_lossy mangles
+        // these into replacement characters, breaking pattern matching.
+        let cleaned: Vec<u8> = {
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0;
+            while i < n {
+                if buf[i] == 0xFF && i + 1 < n {
+                    // IAC + command byte; skip 2 bytes for SB (subnegotiation
+                    // begin), else skip 2 bytes (command + option).
+                    i += 1; // skip IAC
+                    let cmd = buf[i];
+                    i += 1; // skip command
+                    if cmd == 0xFA {
+                        // SB (subnegotiation begin)
+                        // Skip until IAC SE (0xFF 0xF0) or end of buffer
+                        while i + 1 < n {
+                            if buf[i] == 0xFF && buf[i + 1] == 0xF0 {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                } else {
+                    out.push(buf[i]);
+                    i += 1;
+                }
+            }
+            out
+        };
+        let s = String::from_utf8_lossy(&cleaned);
         let lower = s.to_lowercase();
 
         // Handle current state
@@ -411,19 +497,29 @@ async fn do_telnet_session(
             TelnetState::SendingUsername => {
                 if let Err(e) = writer
                     .write_all(format!("{}\r\n", username).as_bytes())
-                    .await { crate::meprintln!("[!] Write error: {}", e); }
-                // Add requested 2s delay
+                    .await
+                {
+                    crate::meprintln!("[!] Username write error: {}", e);
+                    return Ok((false, banner_detected));
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 state = TelnetState::WaitingForPasswordPrompt;
             }
             TelnetState::SendingPassword => {
                 if let Err(e) = writer
                     .write_all(format!("{}\r\n", password).as_bytes())
-                    .await { crate::meprintln!("[!] Write error: {}", e); }
+                    .await
+                {
+                    crate::meprintln!("[!] Password write error: {}", e);
+                    return Ok((false, banner_detected));
+                }
                 state = TelnetState::WaitingForResult;
             }
             TelnetState::SendingHelp => {
-                if let Err(e) = writer.write_all(b"help\r\n").await { crate::meprintln!("[!] Write error: {}", e); }
+                if let Err(e) = writer.write_all(b"help\r\n").await {
+                    crate::meprintln!("[!] Help write error: {}", e);
+                    return Ok((true, banner_detected));
+                }
                 state = TelnetState::WaitingForHelpResponse;
             }
             _ => {}
@@ -433,4 +529,8 @@ async fn do_telnet_session(
     Ok((false, banner_detected))
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/telnet_hose", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/telnet_hose",
+    native
+);

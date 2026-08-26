@@ -12,15 +12,15 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use colored::*;
 
 use crate::module::{Finding, FindingKind, ModuleOutcome};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_yes_no, file_size, generate_combos_mode, generate_mask_passwords,
-    load_credential_file, load_lines, normalize_target, parse_combo_mode, run_bruteforce,
-    run_bruteforce_streaming, BruteforceConfig, LoginResult, STREAMING_THRESHOLD,
+    BruteforceConfig, LoginResult, STREAMING_THRESHOLD, cfg_prompt_default,
+    cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_yes_no, file_size,
+    generate_combos_mode, generate_mask_passwords, load_credential_file, load_lines,
+    normalize_target, parse_combo_mode, run_bruteforce, run_bruteforce_streaming,
 };
 
 /// Per-host bruteforce concurrency cap when running inside a mass-scan fan-out.
@@ -41,8 +41,9 @@ where
 {
     tokio::time::timeout(deadline, reader.read_exact(buf))
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("read timeout: {e}")))?
-        ?;
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, format!("read timeout: {e}"))
+        })??;
     Ok(())
 }
 
@@ -89,8 +90,16 @@ where
         );
     }
 
-    // Parse target → host:port (default port if not specified).
-    let (host, port) = parse_host_port(target, cfg.default_port)?;
+    // Parse target → host:port. When the operator has set `setg port`, use it
+    // as the default instead of the module's hardcoded default_port — this makes
+    // `setg port 2323; use creds/generic/telnet_bruteforce; run` actually probe
+    // port 2323 instead of silently falling back to 23.
+    let effective_port = crate::tenant::resolve()
+        .global_options()
+        .try_get("port")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(cfg.default_port);
+    let (host, port) = parse_host_port(target, effective_port)?;
 
     // Quick TCP precheck — skip the wordlist prompt round-trip for closed
     // ports during big batch scans.
@@ -118,28 +127,31 @@ where
         match cfg_prompt_existing_file("username_wordlist", "Username wordlist").await {
             Ok(p) => Some(p),
             Err(e) if have_defaults => {
-                tracing::debug!("{}: no username wordlist ({e}); using built-in defaults only", cfg.service_name);
+                tracing::debug!(
+                    "{}: no username wordlist ({e}); using built-in defaults only",
+                    cfg.service_name
+                );
                 None
             }
             Err(e) => return Err(e),
         }
     };
-    let password_path: Option<String> = match cfg_prompt_existing_file("password_wordlist", "Password wordlist").await {
-        Ok(p) => Some(p),
-        Err(e) if have_defaults => {
-            tracing::debug!("{}: no password wordlist ({e}); using built-in defaults only", cfg.service_name);
-            None
-        }
-        Err(e) => return Err(e),
-    };
+    let password_path: Option<String> =
+        match cfg_prompt_existing_file("password_wordlist", "Password wordlist").await {
+            Ok(p) => Some(p),
+            Err(e) if have_defaults => {
+                tracing::debug!(
+                    "{}: no password wordlist ({e}); using built-in defaults only",
+                    cfg.service_name
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
     // `cartesian` = full cross-product (every user × every password);
     // `paired` = user[i] with pass[i]. (cred-file mode is not implemented here.)
-    let combo_input = cfg_prompt_default(
-        "combo_mode",
-        "Combo mode (cartesian / paired)",
-        "cartesian",
-    )
-    .await?;
+    let combo_input =
+        cfg_prompt_default("combo_mode", "Combo mode (cartesian / paired)", "cartesian").await?;
     let mode = parse_combo_mode(&combo_input);
     let mut concurrency =
         cfg_prompt_int_range("concurrency", "Concurrency", 16, 1, 256).await? as usize;
@@ -298,7 +310,10 @@ where
                 match tokio::time::timeout(outer_timeout, probe(t, p, u, pw, timeout)).await {
                     Ok(r) => r,
                     Err(e) => LoginResult::Error {
-                        message: format!("attempt timed out after {}s: {e}", outer_timeout.as_secs()),
+                        message: format!(
+                            "attempt timed out after {}s: {e}",
+                            outer_timeout.as_secs()
+                        ),
                         retryable: true,
                     },
                 }
@@ -377,24 +392,8 @@ where
             "username": user,
             "password": pass,
         });
-        let serialized = match serde_json::to_string(&payload) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::meprintln!("[!] Serialization failed: {}", e);
-                return Err(e.into());
-            }
-        };
-        if crate::loot::store_loot(
-            &host,
-            "credential",
-            &format!("{} {}:{}@{}", cfg.service_name, user, pass, addr),
-            serialized.as_bytes(),
-            cfg.source_module,
-        )
-        .await
-        .is_none() {
-            eprintln!("[!] Failed to store loot for {}:{}", host, addr);
-        }
+        // LootStore + CredStore handled by scheduler::route_findings
+        // via FindingKind::Credential payload below
         crate::workspace::track_service(&host, port, "tcp", cfg.service_name, None).await;
 
         outcome.findings.push(Finding {
@@ -417,23 +416,25 @@ pub fn parse_host_port(raw: &str, default_port: u16) -> Result<(String, u16)> {
     let trimmed = raw.trim();
     // [v6]:port → (v6, port)
     if let Some(after_brk) = trimmed.strip_prefix('[')
-        && let Some(end) = after_brk.find(']') {
-            let host = after_brk[..end].to_string();
-            let after = &after_brk[end + 1..];
-            let port = after
-                .strip_prefix(':')
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default_port);
-            return Ok((host, port));
-        }
+        && let Some(end) = after_brk.find(']')
+    {
+        let host = after_brk[..end].to_string();
+        let after = &after_brk[end + 1..];
+        let port = after
+            .strip_prefix(':')
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_port);
+        return Ok((host, port));
+    }
     // host:port (only when port is digits — avoids splitting v6 hosts).
     if let Some((before, after)) = trimmed.rsplit_once(':')
         && after.chars().all(|c| c.is_ascii_digit())
-            && let Ok(port) = after.parse::<u16>() {
-                return Ok((before.to_string(), port));
-            }
+        && let Ok(port) = after.parse::<u16>()
+    {
+        return Ok((before.to_string(), port));
+    }
     let normalised = normalize_target(trimmed).unwrap_or_else(|e| {
-        tracing::debug!("normalize_target failed for '{}': {e}", trimmed);
+        tracing::warn!("normalize_target failed for '{}': {e}", trimmed);
         trimmed.to_string()
     });
     Ok((normalised, default_port))
@@ -457,11 +458,22 @@ async fn is_port_open(host: &str, port: u16) -> bool {
                     Some(sa) => sa.ip(),
                     None => return false,
                 },
-                Err(e) => { tracing::debug!("DNS lookup for {host} failed: {e}"); return false; }
+                Err(e) => {
+                    tracing::warn!("DNS lookup for {host} failed: {e}");
+                    return false;
+                }
             }
         }
     };
-    crate::utils::tcp_port_open(ip, port, Duration::from_secs(2)).await
+    // Use the globally-configured timeout for precheck, clamped to 2-10s
+    // to keep the precheck from dominating batch-scan wall time.
+    let precheck_timeout = crate::tenant::resolve()
+        .global_options()
+        .try_get("timeout")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|t| Duration::from_secs(t.clamp(2, 10)))
+        .unwrap_or(Duration::from_secs(2));
+    crate::utils::tcp_port_open(ip, port, precheck_timeout).await
 }
 
 /// Hydra-style `-e` extra-credential flags: null password, password == login
@@ -481,8 +493,15 @@ impl CredExtras {
 /// Parse `setg cred_extras` (a hydra-style subset of `n`/`s`/`r`, e.g. "nsr").
 /// Empty / "none" / "off" / "no" disables it (the default when unset).
 fn cred_extras() -> CredExtras {
-    let none = CredExtras { null: false, same: false, reversed: false };
-    let raw = match crate::tenant::resolve().global_options().try_get("cred_extras") {
+    let none = CredExtras {
+        null: false,
+        same: false,
+        reversed: false,
+    };
+    let raw = match crate::tenant::resolve()
+        .global_options()
+        .try_get("cred_extras")
+    {
         Some(s) => s.to_lowercase(),
         None => return none,
     };

@@ -1,33 +1,29 @@
-use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::ipv4::{ self, MutableIpv4Packet };
-use std::io::Read;
-use pnet_packet::icmp::{ self, echo_request, echo_reply, IcmpTypes };
-use pnet_packet::udp::{ self, MutableUdpPacket };
-use pnet_packet::tcp::{ self, MutableTcpPacket, TcpFlags };
 use pnet_packet::Packet;
 use pnet_packet::icmp::IcmpPacket;
+use pnet_packet::icmp::{self, IcmpTypes, echo_reply, echo_request};
+use pnet_packet::ip::IpNextHeaderProtocols;
+use pnet_packet::ipv4::{self, MutableIpv4Packet};
+use pnet_packet::tcp::{self, MutableTcpPacket, TcpFlags};
+use pnet_packet::udp::{self, MutableUdpPacket};
+use std::io::Read;
 use std::sync::Arc;
 
 use rand::RngExt;
 use rand::distr::Alphanumeric;
 
-use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-
-
-use tokio::time::{ Instant, Duration };
 use tokio::task;
+use tokio::time::{Duration, Instant};
 
-use socket2::{ Domain, Protocol, Socket, Type };
+use socket2::{Domain, Protocol, Socket, Type};
 
 use colored::*;
 
-use anyhow::{ Result, Context, anyhow, bail };
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-
+use anyhow::{Context, Result, anyhow, bail};
 
 const IPV4_FLAG_DF: u16 = 2;
-
 
 const USE_RANDOM_OS_SIG: bool = true;
 const SPOOF_SRC_IP_CONFIG: Option<&str> = None;
@@ -54,10 +50,26 @@ fn generate_os_signature() -> OsSignatureParams {
     }
 
     let sigs = [
-        OsSignatureParams { id: rng.random_range(0x4000..=0xffff), tos: 0, df_flag: true },
-        OsSignatureParams { id: rng.random(), tos: 0, df_flag: false },
-        OsSignatureParams { id: rng.random(), tos: 0, df_flag: true },
-        OsSignatureParams { id: rng.random(), tos: 0x10, df_flag: false },
+        OsSignatureParams {
+            id: rng.random_range(0x4000..=0xffff),
+            tos: 0,
+            df_flag: true,
+        },
+        OsSignatureParams {
+            id: rng.random(),
+            tos: 0,
+            df_flag: false,
+        },
+        OsSignatureParams {
+            id: rng.random(),
+            tos: 0,
+            df_flag: true,
+        },
+        OsSignatureParams {
+            id: rng.random(),
+            tos: 0x10,
+            df_flag: false,
+        },
     ];
     sigs[rng.random_range(0..sigs.len())].clone()
 }
@@ -123,7 +135,8 @@ fn craft_probe_packet(
     }
 
     let payload_size = rng.random_range(24..=56);
-    let payload: Vec<u8> = rng.clone()
+    let payload: Vec<u8> = rng
+        .clone()
         .sample_iter(&Alphanumeric)
         .take(payload_size)
         .collect();
@@ -131,30 +144,34 @@ fn craft_probe_packet(
     let (transport_header_len, transport_packet_data) = match protocol_type {
         ProbeProtocolType::Icmp => {
             let mut buf = vec![0u8; 8 + payload.len()];
-            let mut pkt = echo_request::MutableEchoRequestPacket::new(&mut buf).ok_or_else(|| anyhow!("Failed to create EchoRequest"))?;
+            let mut pkt = echo_request::MutableEchoRequestPacket::new(&mut buf)
+                .ok_or_else(|| anyhow!("Failed to create EchoRequest"))?;
             pkt.set_icmp_type(IcmpTypes::EchoRequest);
             pkt.set_icmp_code(echo_request::IcmpCodes::NoCode);
             pkt.set_identifier(icmp_id_val);
             pkt.set_sequence_number(icmp_seq_val);
             pkt.set_payload(&payload);
-            let view = IcmpPacket::new(pkt.packet()).ok_or_else(|| anyhow!("Failed to create ICMP view"))?;
+            let view = IcmpPacket::new(pkt.packet())
+                .ok_or_else(|| anyhow!("Failed to create ICMP view"))?;
             pkt.set_checksum(icmp::checksum(&view));
             (buf.len(), buf)
         }
         ProbeProtocolType::Udp => {
             let mut buf = vec![0u8; 8 + payload.len()];
-            let mut pkt = MutableUdpPacket::new(&mut buf).ok_or_else(|| anyhow!("Failed to create UDP packet"))?;
+            let mut pkt = MutableUdpPacket::new(&mut buf)
+                .ok_or_else(|| anyhow!("Failed to create UDP packet"))?;
             pkt.set_source(rng.random_range(33434..=65535));
             pkt.set_destination(rng.random_range(33434..=65535));
             pkt.set_length((8 + payload.len()) as u16);
             pkt.set_payload(&payload);
-            let src = src_ip_override.unwrap_or(Ipv4Addr::new(0,0,0,0));
+            let src = src_ip_override.unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
             pkt.set_checksum(udp::ipv4_checksum(&pkt.to_immutable(), &src, &dst_ip));
             (buf.len(), buf)
         }
         ProbeProtocolType::Tcp => {
             let mut buf = vec![0u8; 20 + payload.len()];
-            let mut pkt = MutableTcpPacket::new(&mut buf).ok_or_else(|| anyhow!("Failed to create TCP packet"))?;
+            let mut pkt = MutableTcpPacket::new(&mut buf)
+                .ok_or_else(|| anyhow!("Failed to create TCP packet"))?;
             pkt.set_source(rng.random_range(33434..=65535));
             pkt.set_destination(rng.random_range(33434..=65535));
             pkt.set_sequence(rng.random());
@@ -164,7 +181,7 @@ fn craft_probe_packet(
             pkt.set_window(rng.random_range(1024..=65535));
             pkt.set_urgent_ptr(0);
             pkt.set_payload(&payload);
-            let src = src_ip_override.unwrap_or(Ipv4Addr::new(0,0,0,0));
+            let src = src_ip_override.unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
             pkt.set_checksum(tcp::ipv4_checksum(&pkt.to_immutable(), &src, &dst_ip));
             (buf.len(), buf)
         }
@@ -174,11 +191,18 @@ fn craft_probe_packet(
     let mut ip_buf = vec![0u8; total_len as usize];
 
     let src_ip = src_ip_override
-        .or_else(|| SPOOF_SRC_IP_CONFIG.map(str::parse).transpose().ok().flatten())
-        .unwrap_or(Ipv4Addr::new(0,0,0,0));
+        .or_else(|| {
+            SPOOF_SRC_IP_CONFIG
+                .map(str::parse)
+                .transpose()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
 
     {
-        let mut ip = MutableIpv4Packet::new(&mut ip_buf).ok_or_else(|| anyhow!("Failed to create IPv4 packet"))?;
+        let mut ip = MutableIpv4Packet::new(&mut ip_buf)
+            .ok_or_else(|| anyhow!("Failed to create IPv4 packet"))?;
         ip.set_version(4);
         ip.set_header_length(5);
         ip.set_total_length(total_len);
@@ -200,9 +224,6 @@ fn craft_probe_packet(
 
     Ok((ip_buf, protocol_type, sig))
 }
-
-
-
 
 async fn send_and_receive_one(
     target_final_dst_ip: Ipv4Addr,
@@ -248,7 +269,12 @@ async fn send_and_receive_one(
             let mut sock = sock_clone;
             match Read::read(&mut sock, &mut buf) {
                 Ok(len) => Ok(Some(buf[..len].to_vec())),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Ok(None)
+                }
                 Err(e) => Err(e),
             }
         })
@@ -266,58 +292,68 @@ async fn send_and_receive_one(
 
             if let Some(ip_pkt) = ipv4::Ipv4Packet::new(&data)
                 && ip_pkt.get_next_level_protocol() == IpNextHeaderProtocols::Icmp
-                    && let Some(icmp_pkt) = icmp::IcmpPacket::new(ip_pkt.payload()) {
-                        let icmp_type = icmp_pkt.get_icmp_type();
-                        let icmp_code = icmp_pkt.get_icmp_code();
-                        tracing::trace!("ICMP response: type={}, code={}", icmp_type.0, icmp_code.0);
-                        let mut matched = false;
+                && let Some(icmp_pkt) = icmp::IcmpPacket::new(ip_pkt.payload())
+            {
+                let icmp_type = icmp_pkt.get_icmp_type();
+                let icmp_code = icmp_pkt.get_icmp_code();
+                tracing::trace!("ICMP response: type={}, code={}", icmp_type.0, icmp_code.0);
+                let mut matched = false;
 
-                        if icmp_type == IcmpTypes::TimeExceeded || icmp_type == IcmpTypes::DestinationUnreachable {
-                            if let Some(inner) = ipv4::Ipv4Packet::new(icmp_pkt.payload())
-                                && inner.get_destination() == target_final_dst_ip && inner.get_identification() == probe_ip_id {
-                                    let proto = inner.get_next_level_protocol();
-                                    match probe_protocol {
-                                        ProbeProtocolType::Icmp => {
-                                            if proto == IpNextHeaderProtocols::Icmp
-                                                && let Some(echo_req) = echo_request::EchoRequestPacket::new(inner.payload())
-                                                    && echo_req.get_icmp_type() == IcmpTypes::EchoRequest
-                                                        && echo_req.get_identifier() == probe_icmp_echo_id
-                                                        && echo_req.get_sequence_number() == probe_icmp_echo_seq
-                                                    {
-                                                        matched = true;
-                                                    }
-                                        }
-                                        ProbeProtocolType::Udp | ProbeProtocolType::Tcp => {
-                                            if proto == probe_protocol.to_ip_next_header_protocol() {
-                                                matched = true;
-                                            }
-                                        }
-                                    }
-                                }
-                        } else if icmp_type == IcmpTypes::EchoReply && probe_protocol == ProbeProtocolType::Icmp
-                            && let Some(reply) = echo_reply::EchoReplyPacket::new(icmp_pkt.packet())
-                                && reply.get_identifier() == probe_icmp_echo_id
-                                    && reply.get_sequence_number() == probe_icmp_echo_seq
-                                    && responder == target_final_dst_ip
+                if icmp_type == IcmpTypes::TimeExceeded
+                    || icmp_type == IcmpTypes::DestinationUnreachable
+                {
+                    if let Some(inner) = ipv4::Ipv4Packet::new(icmp_pkt.payload())
+                        && inner.get_destination() == target_final_dst_ip
+                        && inner.get_identification() == probe_ip_id
+                    {
+                        let proto = inner.get_next_level_protocol();
+                        match probe_protocol {
+                            ProbeProtocolType::Icmp => {
+                                if proto == IpNextHeaderProtocols::Icmp
+                                    && let Some(echo_req) =
+                                        echo_request::EchoRequestPacket::new(inner.payload())
+                                    && echo_req.get_icmp_type() == IcmpTypes::EchoRequest
+                                    && echo_req.get_identifier() == probe_icmp_echo_id
+                                    && echo_req.get_sequence_number() == probe_icmp_echo_seq
                                 {
                                     matched = true;
                                 }
-
-                        if matched {
-                            let desc = match icmp_type {
-                                IcmpTypes::EchoReply => "echo-reply".to_string(),
-                                IcmpTypes::DestinationUnreachable => "unreachable".to_string(),
-                                IcmpTypes::TimeExceeded => "time-exceeded".to_string(),
-                                _ => format!("type {}", icmp_type.0),
-                            };
-                            return Ok(Some(ProbeSingleResponse {
-                                source_ip: responder,
-                                rtt_ms: rtt,
-                                icmp_info: ReceivedIcmpInfo { icmp_type: icmp_type.0, description: desc },
-                                probe_protocol_used: probe_protocol.to_string_lc(),
-                            }));
+                            }
+                            ProbeProtocolType::Udp | ProbeProtocolType::Tcp => {
+                                if proto == probe_protocol.to_ip_next_header_protocol() {
+                                    matched = true;
+                                }
+                            }
                         }
                     }
+                } else if icmp_type == IcmpTypes::EchoReply
+                    && probe_protocol == ProbeProtocolType::Icmp
+                    && let Some(reply) = echo_reply::EchoReplyPacket::new(icmp_pkt.packet())
+                    && reply.get_identifier() == probe_icmp_echo_id
+                    && reply.get_sequence_number() == probe_icmp_echo_seq
+                    && responder == target_final_dst_ip
+                {
+                    matched = true;
+                }
+
+                if matched {
+                    let desc = match icmp_type {
+                        IcmpTypes::EchoReply => "echo-reply".to_string(),
+                        IcmpTypes::DestinationUnreachable => "unreachable".to_string(),
+                        IcmpTypes::TimeExceeded => "time-exceeded".to_string(),
+                        _ => format!("type {}", icmp_type.0),
+                    };
+                    return Ok(Some(ProbeSingleResponse {
+                        source_ip: responder,
+                        rtt_ms: rtt,
+                        icmp_info: ReceivedIcmpInfo {
+                            icmp_type: icmp_type.0,
+                            description: desc,
+                        },
+                        probe_protocol_used: probe_protocol.to_string_lc(),
+                    }));
+                }
+            }
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -335,7 +371,10 @@ struct TracerouteHop {
 }
 
 async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
-    crate::mprintln!("{}", format!("[+] Traceroute to {} (max {} hops)", target_name, MAX_TTL).cyan());
+    crate::mprintln!(
+        "{}",
+        format!("[+] Traceroute to {} (max {} hops)", target_name, MAX_TTL).cyan()
+    );
 
     let resolved_ips = tokio::net::lookup_host(format!("{}:0", target_name))
         .await
@@ -354,7 +393,10 @@ async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
         None => bail!("Could not resolve {} to an IPv4 address", target_name),
     };
 
-    crate::mprintln!("{}", format!("[*] Resolved {} to {}", target_name, dst_ip).green());
+    crate::mprintln!(
+        "{}",
+        format!("[*] Resolved {} to {}", target_name, dst_ip).green()
+    );
 
     let src_ip_override_opt: Option<Ipv4Addr> = SPOOF_SRC_IP_CONFIG.and_then(|s| s.parse().ok());
 
@@ -369,7 +411,9 @@ async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
         let mut ttl_responded = false;
 
         for _probe_idx in 0..PROBE_COUNT {
-            if crate::context::is_cancelled() { break; }
+            if crate::context::is_cancelled() {
+                break;
+            }
             // Scope RNG to avoid holding it across await
             let (icmp_probe_id, packet_bytes, protocol_used, os_sig_params) = {
                 let mut rng = rand::rng();
@@ -394,7 +438,8 @@ async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
                 icmp_probe_id,
                 ttl_val as u16,
                 Duration::from_secs(2),
-            ).await?;
+            )
+            .await?;
 
             if let Some(res) = response {
                 ttl_responded = true;
@@ -406,11 +451,17 @@ async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
                     host: res.source_ip.to_string(),
                 });
 
-                crate::mprint!("{}{:<16} ", line_prefix, res.source_ip.to_string().bright_white());
+                crate::mprint!(
+                    "{}{:<16} ",
+                    line_prefix,
+                    res.source_ip.to_string().bright_white()
+                );
                 crate::mprint!("{} ", res.icmp_info.description);
                 crate::mprintln!("({}) {}", res.probe_protocol_used.dimmed(), rtt_str);
 
-                let reached = (res.icmp_info.icmp_type == IcmpTypes::DestinationUnreachable.0 || res.icmp_info.icmp_type == IcmpTypes::EchoReply.0) && res.source_ip == dst_ip;
+                let reached = (res.icmp_info.icmp_type == IcmpTypes::DestinationUnreachable.0
+                    || res.icmp_info.icmp_type == IcmpTypes::EchoReply.0)
+                    && res.source_ip == dst_ip;
                 hops.push(TracerouteHop {
                     ttl: ttl_val,
                     ip: res.source_ip.to_string(),
@@ -421,9 +472,12 @@ async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
                 });
 
                 if reached {
-                        crate::mprintln!("{}", format!("[+] Target reached: {}", res.source_ip).green());
-                        return Ok(hops);
-                    }
+                    crate::mprintln!(
+                        "{}",
+                        format!("[+] Target reached: {}", res.source_ip).green()
+                    );
+                    return Ok(hops);
+                }
             }
 
             let jitter_duration = {
@@ -442,7 +496,10 @@ async fn execute_traceroute(target_name: &str) -> Result<Vec<TracerouteHop>> {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
     crate::utils::require_root("stalkroute_full_traceroute (raw ICMP/TCP/UDP probes)")?;
 
     crate::mprintln!("by suicidalteddy");
@@ -460,16 +517,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     })?;
 
     let mut outcome = ModuleOutcome::ok();
-    let hop_summaries: Vec<serde_json::Value> = hops.iter().map(|h| {
-        serde_json::json!({
-            "ttl": h.ttl,
-            "ip": h.ip,
-            "rtt_ms": h.rtt_ms,
-            "protocol": h.protocol,
-            "icmp_desc": h.icmp_desc,
-            "reached_target": h.reached_target,
+    let hop_summaries: Vec<serde_json::Value> = hops
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "ttl": h.ttl,
+                "ip": h.ip,
+                "rtt_ms": h.rtt_ms,
+                "protocol": h.protocol,
+                "icmp_desc": h.icmp_desc,
+                "reached_target": h.reached_target,
+            })
         })
-    }).collect();
+        .collect();
     let total_hops = hops.len();
     let reached = hops.iter().any(|h| h.reached_target);
     outcome = outcome.with(Finding {
@@ -503,4 +563,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "stalkroute_full_traceroute", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "stalkroute_full_traceroute",
+    native
+);

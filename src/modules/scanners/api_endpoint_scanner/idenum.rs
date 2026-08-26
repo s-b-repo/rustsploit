@@ -38,7 +38,11 @@ pub(super) async fn perform_id_enumeration(
     }
 
     let results_file = enum_dir.join("results.txt");
-    let mut results_file_handle = match OpenOptions::new().create(true).append(true).open(&results_file) {
+    let mut results_file_handle = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&results_file)
+    {
         Ok(f) => f,
         Err(e) => {
             crate::meprintln!("[!] Failed to open results file: {}", e);
@@ -60,7 +64,10 @@ pub(super) async fn perform_id_enumeration(
     let payloads: Vec<String> = if let Some(path) = &config.id_file_path {
         match load_lines(path) {
             Ok(lines) => lines,
-            Err(e) => { tracing::debug!("load lines failed: {e}"); return; }
+            Err(e) => {
+                tracing::debug!("load lines failed: {e}");
+                return;
+            }
         }
     } else if let (Some(start), Some(end)) = (config.id_start, config.id_end) {
         (start..=end).map(|i| i.to_string()).collect()
@@ -91,9 +98,13 @@ pub(super) async fn perform_id_enumeration(
         if let Ok(resp) = req_builder.send().await {
             let status = resp.status();
             if status != reqwest::StatusCode::NOT_FOUND {
-                if let Err(e) =
-                    run_enum_logging_handle(&mut results_file_handle, &payload, &label, status, &target_url)
-                {
+                if let Err(e) = run_enum_logging_handle(
+                    &mut results_file_handle,
+                    &payload,
+                    &label,
+                    status,
+                    &target_url,
+                ) {
                     crate::meprintln!("[!] Logging failed: {}", e);
                 }
                 crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
@@ -122,9 +133,17 @@ pub(super) async fn perform_id_enumeration(
 
                 if status.is_success() {
                     let body_file = bodies_dir.join(format!("{}.txt", payload));
-                    let body = match crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                    let body = match crate::utils::safe_io::read_http_body_capped(
+                        resp,
+                        crate::utils::safe_io::DEFAULT_BODY_CAP,
+                    )
+                    .await
+                    {
                         Ok(b) => b,
-                        Err(e) => { tracing::debug!("read body failed: {e}"); Vec::new() }
+                        Err(e) => {
+                            tracing::debug!("read body failed: {e}");
+                            Vec::new()
+                        }
                     };
                     if let Ok(mut f) = File::create(&body_file) {
                         if let Err(e) = crate::utils::set_secure_permissions(&body_file, 0o600) {

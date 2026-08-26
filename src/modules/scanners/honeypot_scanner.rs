@@ -1,29 +1,23 @@
-use anyhow::{Context, Result};
-use colored::*;
-use std::sync::{ Arc, atomic::{AtomicUsize, Ordering} };
-use std::time::Instant;
-use tokio::sync::Semaphore;
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{
-    cfg_prompt_default,
-    cfg_prompt_int_range,
-    cfg_prompt_yes_no,
-    cfg_prompt_output_file,
-};
 use crate::utils::target::extract_ip_from_target;
 use crate::utils::{
-    is_subnet_target,
-    parse_subnet,
-    subnet_host_count,
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_yes_no,
 };
+use crate::utils::{is_subnet_target, parse_subnet, subnet_host_count};
+use anyhow::{Context, Result};
+use colored::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Instant;
+use tokio::sync::Semaphore;
 
 /// Ports to scan for honeypot detection (50 common service ports).
 const HONEYPOT_PORTS: &[u16] = &[
-    21, 22, 23, 25, 53, 80, 110, 111, 135, 139,
-    143, 161, 389, 443, 445, 465, 502, 554, 587, 636,
-    993, 995, 1433, 1521, 1723, 1883, 2049, 3306, 3389, 5060,
-    5432, 5900, 6379, 6667, 8080, 8443, 8888, 9090, 9200, 9300,
-    11211, 27017, 5672, 15672, 2181, 4848, 7001, 8000, 8081, 10000,
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 161, 389, 443, 445, 465, 502, 554, 587, 636,
+    993, 995, 1433, 1521, 1723, 1883, 2049, 3306, 3389, 5060, 5432, 5900, 6379, 6667, 8080, 8443,
+    8888, 9090, 9200, 9300, 11211, 27017, 5672, 15672, 2181, 4848, 7001, 8000, 8081, 10000,
 ];
 
 /// Scan a single IP for honeypot indicators.
@@ -31,7 +25,10 @@ const HONEYPOT_PORTS: &[u16] = &[
 async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
     let parsed_ip: std::net::IpAddr = match ip.parse() {
         Ok(addr) => addr,
-        Err(e) => { tracing::debug!("parse IP failed: {e}"); return (0, Vec::new()); }
+        Err(e) => {
+            tracing::debug!("parse IP failed: {e}");
+            return (0, Vec::new());
+        }
     };
 
     let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -47,7 +44,10 @@ async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
         tasks.push(tokio::spawn(async move {
             let _permit = match sem.acquire().await {
                 Ok(permit) => permit,
-                Err(e) => { tracing::debug!("semaphore closed: {e}"); return; }
+                Err(e) => {
+                    tracing::debug!("semaphore closed: {e}");
+                    return;
+                }
             };
             if crate::utils::network::tcp_port_open(parsed_ip, port, timeout).await {
                 count.fetch_add(1, Ordering::Relaxed);
@@ -60,7 +60,7 @@ async fn scan_ip_ports(ip: &str, timeout_ms: u64) -> (usize, Vec<u16>) {
 
     for task in tasks {
         if let Err(e) = task.await {
-            eprintln!("[!] Task join failed: {}", e);
+            crate::meprintln!("[!] Task join failed: {}", e);
         }
     }
 
@@ -106,18 +106,26 @@ async fn scan_targets(
     let mut tasks = Vec::with_capacity(total);
 
     for ip_str in ips {
-        if ctx.is_cancelled() { break; }
+        if ctx.is_cancelled() {
+            break;
+        }
         let permit = semaphore.clone().acquire_owned().await;
         let permit = match permit {
             Ok(p) => p,
-            Err(e) => { tracing::debug!("semaphore closed: {e}"); continue; }
+            Err(e) => {
+                tracing::debug!("semaphore closed: {e}");
+                continue;
+            }
         };
         let res = results.clone();
         let prog = progress.clone();
         ctx.rate_limit(&ip_str).await;
 
         tasks.push(tokio::spawn(async move {
-            if crate::context::is_cancelled() { drop(permit); return; }
+            if crate::context::is_cancelled() {
+                drop(permit);
+                return;
+            }
             let (open_count, open_ports) = scan_ip_ports(&ip_str, timeout_ms).await;
             let (status, color) = classify(open_count);
 
@@ -142,7 +150,7 @@ async fn scan_targets(
 
     for task in tasks {
         if let Err(e) = task.await {
-            eprintln!("[!] Task join failed: {}", e);
+            crate::meprintln!("[!] Task join failed: {}", e);
         }
     }
 
@@ -156,20 +164,38 @@ fn print_results(results: &[(String, usize, String, String, Vec<u16>)], verbose:
     crate::mprintln!();
     crate::mprintln!("{}", "=== Honeypot Detection Results ===".cyan().bold());
     crate::mprintln!();
-    crate::mprintln!("  {:<40} {:<8} {:<22} {}",
-        "IP".bold(), "Open".bold(), "Status".bold(), "Ports".bold());
+    crate::mprintln!(
+        "  {:<40} {:<8} {:<22} {}",
+        "IP".bold(),
+        "Open".bold(),
+        "Status".bold(),
+        "Ports".bold()
+    );
     crate::mprintln!("  {}", "-".repeat(100));
 
     for (ip, open_count, status, color, ports) in results {
         let status_str = colored_status(status, color);
         let ports_str = if verbose || *open_count <= 25 {
-            ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+            ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         } else {
             let shown: Vec<String> = ports.iter().take(15).map(|p| p.to_string()).collect();
-            format!("{}... (+{})", shown.join(","), open_count.saturating_sub(15))
+            format!(
+                "{}... (+{})",
+                shown.join(","),
+                open_count.saturating_sub(15)
+            )
         };
-        crate::mprintln!("  {:<40} {:<8} {:<22} {}",
-            ip, open_count, status_str, ports_str.dimmed());
+        crate::mprintln!(
+            "  {:<40} {:<8} {:<22} {}",
+            ip,
+            open_count,
+            status_str,
+            ports_str.dimmed()
+        );
     }
     crate::mprintln!();
 }
@@ -182,28 +208,48 @@ fn save_results(
     use std::io::Write;
     let mut file = std::fs::File::create(output_file)?;
     if let Err(e) = crate::utils::set_secure_permissions(output_file, 0o600) {
-        crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", output_file, e);
+        crate::meprintln!(
+            "[!] Failed to chmod 0o600 on {}: {} — file may be world-readable",
+            output_file,
+            e
+        );
     }
     writeln!(file, "Honeypot Detection Results")?;
     writeln!(file, "=========================")?;
-    writeln!(file, "Scan time: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
+    writeln!(
+        file,
+        "Scan time: {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    )?;
     writeln!(file)?;
-    writeln!(file, "{:<40} {:<8} {:<22} Ports",
-        "IP", "Open", "Status")?;
+    writeln!(file, "{:<40} {:<8} {:<22} Ports", "IP", "Open", "Status")?;
     writeln!(file, "{}", "-".repeat(100))?;
 
     for (ip, open_count, status, _color, ports) in results {
-        let ports_str = ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
-        writeln!(file, "{:<40} {:<8} {:<22} {}",
-            ip, open_count, status, ports_str)?;
+        let ports_str = ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            file,
+            "{:<40} {:<8} {:<22} {}",
+            ip, open_count, status, ports_str
+        )?;
     }
 
     let honeypots: Vec<_> = results.iter().filter(|r| r.1 >= 11).collect();
     let suspicious: Vec<_> = results.iter().filter(|r| r.1 >= 6 && r.1 < 11).collect();
     let clean: Vec<_> = results.iter().filter(|r| r.1 < 6).collect();
     writeln!(file)?;
-    writeln!(file, "Summary: {} total | {} honeypot | {} suspicious | {} clean",
-        results.len(), honeypots.len(), suspicious.len(), clean.len())?;
+    writeln!(
+        file,
+        "Summary: {} total | {} honeypot | {} suspicious | {} clean",
+        results.len(),
+        honeypots.len(),
+        suspicious.len(),
+        clean.len()
+    )?;
 
     Ok(())
 }
@@ -213,8 +259,16 @@ async fn store_to_workspace(results: &[(String, usize, String, String, Vec<u16>)
     for (ip, open_count, status, _color, _ports) in results {
         if *open_count >= 6 {
             crate::workspace::track_host(ip, None, None).await;
-            let note = format!("Honeypot scan: {} ({}/{} ports open)", status, open_count, HONEYPOT_PORTS.len());
-            crate::tenant::resolve().workspace().add_note(ip, &note).await;
+            let note = format!(
+                "Honeypot scan: {} ({}/{} ports open)",
+                status,
+                open_count,
+                HONEYPOT_PORTS.len()
+            );
+            crate::tenant::resolve()
+                .workspace()
+                .add_note(ip, &note)
+                .await;
         }
     }
 }
@@ -236,11 +290,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Prompts
     let target_input = cfg_prompt_default("target", "Target (IP/CIDR/file)", target).await?;
-    let timeout_ms = cfg_prompt_int_range("port_timeout_ms", "Port timeout (ms)", 200, 50, 5000).await? as u64;
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 1000).await? as usize;
-    let save_results_opt = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
+    let timeout_ms =
+        cfg_prompt_int_range("port_timeout_ms", "Port timeout (ms)", 200, 50, 5000).await? as u64;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 1000).await? as usize;
+    let save_results_opt =
+        cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
     let output_file = if save_results_opt {
-        let default_name = format!("honeypot_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+        let default_name = format!(
+            "honeypot_results_{}.txt",
+            target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+        );
         cfg_prompt_output_file("output_file", "Output file", &default_name).await?
     } else {
         String::new()
@@ -260,7 +320,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let ips: Vec<String> = if std::path::Path::new(&target_input).is_file() {
         // File-based target list
         let content = crate::utils::safe_read_to_string_async(&target_input, None).await?;
-        content.lines()
+        content
+            .lines()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && !s.starts_with('#'))
             .collect()
@@ -268,23 +329,32 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         // CIDR subnet
         let network = parse_subnet(&target_input)?;
         let host_count = subnet_host_count(&network);
-        crate::mprintln!("{}", format!(
-            "[*] Subnet {} — {} hosts to scan", target_input, host_count
-        ).cyan());
+        crate::mprintln!(
+            "{}",
+            format!("[*] Subnet {} — {} hosts to scan", target_input, host_count).cyan()
+        );
         network.iter().map(|ip| ip.to_string()).collect()
     } else {
         // Single IP
-        let ip = extract_ip_from_target(&target_input)
-            .unwrap_or_else(|| target_input.clone());
+        let ip = extract_ip_from_target(&target_input).unwrap_or_else(|| target_input.clone());
         vec![ip]
     };
 
     let total = ips.len();
-    crate::mprintln!("{}", format!("[*] Scanning {} host(s) for honeypot indicators...", total).cyan());
-    crate::mprintln!("{}", format!(
-        "[*] Checking {} ports per host | timeout {}ms | concurrency {}",
-        HONEYPOT_PORTS.len(), timeout_ms, concurrency
-    ).cyan());
+    crate::mprintln!(
+        "{}",
+        format!("[*] Scanning {} host(s) for honeypot indicators...", total).cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Checking {} ports per host | timeout {}ms | concurrency {}",
+            HONEYPOT_PORTS.len(),
+            timeout_ms,
+            concurrency
+        )
+        .cyan()
+    );
 
     // Run scan
     let results = scan_targets(ctx, ips, timeout_ms, concurrency, verbose).await;
@@ -295,7 +365,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             outcome.findings.push(Finding {
                 target: ip.clone(),
                 kind: FindingKind::Note,
-                message: format!("Honeypot indicator at {} ({} open ports, status={})", ip, open_count, status),
+                message: format!(
+                    "Honeypot indicator at {} ({} open ports, status={})",
+                    ip, open_count, status
+                ),
                 data: Some(serde_json::json!({
                     "host": ip,
                     "open_ports": open_ports,
@@ -318,7 +391,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", "=== Summary ===".cyan().bold());
     crate::mprintln!("  Total hosts:    {}", total);
     crate::mprintln!("  {}", format!("Clean:          {}", clean.len()).green());
-    crate::mprintln!("  {}", format!("Suspicious:     {}", suspicious.len()).yellow());
+    crate::mprintln!(
+        "  {}",
+        format!("Suspicious:     {}", suspicious.len()).yellow()
+    );
     crate::mprintln!("  {}", format!("Honeypots:      {}", honeypots.len()).red());
     crate::mprintln!("  Scan duration:  {:.2}s", elapsed.as_secs_f64());
     crate::mprintln!();
@@ -326,7 +402,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // Save to file
     if save_results_opt && !output_file.is_empty() {
         match save_results(&results, &output_file) {
-            Ok(_) => crate::mprintln!("{}", format!("[+] Results saved to {}", output_file).green()),
+            Ok(_) => crate::mprintln!(
+                "{}",
+                format!("[+] Results saved to {}", output_file).green()
+            ),
             Err(e) => crate::meprintln!("{}", format!("[!] Failed to save results: {}", e).red()),
         }
     }
@@ -334,7 +413,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // Store honeypot hosts to workspace
     store_to_workspace(&results).await;
     if !honeypots.is_empty() || !suspicious.is_empty() {
-        crate::mprintln!("{}", "[+] Honeypot/suspicious hosts added to workspace with notes.".green());
+        crate::mprintln!(
+            "{}",
+            "[+] Honeypot/suspicious hosts added to workspace with notes.".green()
+        );
     }
 
     Ok(outcome)
@@ -350,13 +432,15 @@ pub fn info() -> crate::module_info::ModuleInfo {
             honeypot notes."
             .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
-        references: vec![
-            "https://en.wikipedia.org/wiki/Honeypot_(computing)".to_string(),
-        ],
+        references: vec!["https://en.wikipedia.org/wiki/Honeypot_(computing)".to_string()],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
         default_port: None,
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "honeypot_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "honeypot_scanner",
+    native
+);

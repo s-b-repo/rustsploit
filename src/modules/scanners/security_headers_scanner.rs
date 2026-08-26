@@ -23,11 +23,25 @@ use crate::utils::network::build_http_client_with;
 use crate::utils::{cfg_prompt_default, is_batch_mode};
 
 fn banner() {
-    if is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   HTTP Security Headers Audit                                ║".cyan());
-    crate::mprintln!("{}", "║   Flags missing/weak HSTS, CSP, XFO, COOP, banners, cookies  ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   HTTP Security Headers Audit                                ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Flags missing/weak HSTS, CSP, XFO, COOP, banners, cookies  ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -41,7 +55,8 @@ pub fn info() -> ModuleInfo {
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
             "https://owasp.org/www-project-secure-headers/".to_string(),
-            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Strict-Transport-Security".to_string(),
+            "https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Strict-Transport-Security"
+                .to_string(),
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
@@ -69,13 +84,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     // Follow redirects so we audit the headers of the *final* response, matching
     // browser behaviour. Otherwise a 301 to the canonical host would mask its CSP/HSTS.
-    let client = build_http_client_with(Duration::from_secs(10), HttpClientOpts {
-        follow_redirects: true,
-        ..HttpClientOpts::permissive()
-    })?;
+    let client = build_http_client_with(
+        Duration::from_secs(10),
+        HttpClientOpts {
+            follow_redirects: true,
+            ..HttpClientOpts::permissive()
+        },
+    )?;
     ctx.rate_limit(target).await;
-    let resp = client.get(&url).send().await
-        .context("Request failed")?;
+    let resp = client.get(&url).send().await.context("Request failed")?;
     let final_url = resp.url().to_string();
     if final_url != url {
         crate::mprintln!("{}", format!("[*] redirected -> {}", final_url).dimmed());
@@ -90,19 +107,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut findings: Vec<String> = Vec::new();
 
     let get = |name: &str| -> Option<String> {
-        headers.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
     };
 
     // HSTS
     match get("strict-transport-security") {
         Some(v) => {
             let lower = v.to_ascii_lowercase();
-            let max_age = lower.split(';')
+            let max_age = lower
+                .split(';')
                 .find_map(|p| p.trim().strip_prefix("max-age="))
                 .and_then(|n| n.parse::<u64>().ok())
                 .unwrap_or(0);
             if max_age < 15_768_000 {
-                findings.push(format!("HSTS max-age={} too low (<6 months): '{}'", max_age, v));
+                findings.push(format!(
+                    "HSTS max-age={} too low (<6 months): '{}'",
+                    max_age, v
+                ));
                 crate::mprintln!("{}", format!("[!] HSTS weak: {}", v).yellow());
             } else if !lower.contains("includesubdomains") {
                 findings.push(format!("HSTS missing includeSubDomains: '{}'", v));
@@ -124,7 +148,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let lower = v.to_ascii_lowercase();
             if v.contains("__NONCE__") || v.contains("{{") {
                 findings.push(format!("CSP contains unfilled placeholder: '{}'", v));
-                crate::mprintln!("{}", format!("[!!] CSP placeholder unreplaced: {}", v).red().bold());
+                crate::mprintln!(
+                    "{}",
+                    format!("[!!] CSP placeholder unreplaced: {}", v)
+                        .red()
+                        .bold()
+                );
             } else if lower.contains("unsafe-inline") || lower.contains("unsafe-eval") {
                 findings.push(format!("CSP allows unsafe-inline/unsafe-eval: '{}'", v));
                 crate::mprintln!("{}", format!("[!] CSP weak: {}", v).yellow());
@@ -149,9 +178,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 crate::mprintln!("{}", format!("[!] X-Frame-Options weak: {}", v).yellow());
             }
         }
-        None if !get("content-security-policy").map(|c| c.to_ascii_lowercase().contains("frame-ancestors")).unwrap_or(false) => {
-            findings.push("Missing X-Frame-Options and no CSP frame-ancestors directive (clickjacking)".to_string());
-            crate::mprintln!("{}", "[!] X-Frame-Options missing (no CSP frame-ancestors)".yellow());
+        None if !get("content-security-policy")
+            .map(|c| c.to_ascii_lowercase().contains("frame-ancestors"))
+            .unwrap_or(false) =>
+        {
+            findings.push(
+                "Missing X-Frame-Options and no CSP frame-ancestors directive (clickjacking)"
+                    .to_string(),
+            );
+            crate::mprintln!(
+                "{}",
+                "[!] X-Frame-Options missing (no CSP frame-ancestors)".yellow()
+            );
         }
         _ => {}
     }
@@ -163,7 +201,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
         Some(v) => {
             findings.push(format!("X-Content-Type-Options not 'nosniff': '{}'", v));
-            crate::mprintln!("{}", format!("[!] X-Content-Type-Options weak: '{}'", v).yellow());
+            crate::mprintln!(
+                "{}",
+                format!("[!] X-Content-Type-Options weak: '{}'", v).yellow()
+            );
         }
         None => {
             findings.push("Missing X-Content-Type-Options".to_string());
@@ -187,7 +228,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     // COOP / COEP / CORP
-    for h in ["cross-origin-opener-policy", "cross-origin-embedder-policy", "cross-origin-resource-policy"] {
+    for h in [
+        "cross-origin-opener-policy",
+        "cross-origin-embedder-policy",
+        "cross-origin-resource-policy",
+    ] {
         if let Some(v) = get(h) {
             crate::mprintln!("{}", format!("[+] {}: {}", h, v).green());
         }
@@ -216,21 +261,40 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // free-text substrings (otherwise `name=secureguid` falsely satisfies `Secure`).
     let mut cookie_issues: Vec<String> = Vec::new();
     for sc in headers.get_all("set-cookie").iter() {
-        let s = match sc.to_str() { Ok(s) => s, Err(e) => { tracing::debug!("non-utf8 header: {e}"); continue; } };
+        let s = match sc.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("non-utf8 header: {e}");
+                continue;
+            }
+        };
         let mut parts = s.split(';');
         let name_eq = parts.next().unwrap_or("");
         let name = name_eq.split('=').next().unwrap_or("?").trim().to_string();
-        let attrs: Vec<String> = parts.map(|p| {
-            // Each attribute token may itself be `Name=Value`; lowercase the name part only.
-            let token = p.trim();
-            token.split('=').next().unwrap_or("").trim().to_ascii_lowercase()
-        }).collect();
+        let attrs: Vec<String> = parts
+            .map(|p| {
+                // Each attribute token may itself be `Name=Value`; lowercase the name part only.
+                let token = p.trim();
+                token
+                    .split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .collect();
         let has = |a: &str| attrs.iter().any(|x| x == a);
 
         let mut probs: Vec<&str> = Vec::new();
-        if !has("secure") && final_url.starts_with("https://") { probs.push("missing Secure"); }
-        if !has("httponly") { probs.push("missing HttpOnly"); }
-        if !has("samesite") { probs.push("missing SameSite"); }
+        if !has("secure") && final_url.starts_with("https://") {
+            probs.push("missing Secure");
+        }
+        if !has("httponly") {
+            probs.push("missing HttpOnly");
+        }
+        if !has("samesite") {
+            probs.push("missing SameSite");
+        }
         if !probs.is_empty() {
             cookie_issues.push(format!("cookie '{}': {}", name, probs.join(", ")));
         }
@@ -259,4 +323,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "security_headers_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "security_headers_scanner",
+    native
+);

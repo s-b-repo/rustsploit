@@ -1,26 +1,38 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
-
-use rand::RngExt;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use colored::*;
+use rand::RngExt;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize)]
+#[non_exhaustive]
 pub enum JobEvent {
-    Started { id: u32, module: String, target: String },
-    Completed { id: u32 },
-    Failed { id: u32, error: String },
-    Cancelled { id: u32 },
+    Started {
+        id: u32,
+        module: String,
+        target: String,
+    },
+    Completed {
+        id: u32,
+    },
+    Failed {
+        id: u32,
+        error: String,
+    },
+    Cancelled {
+        id: u32,
+    },
 }
 
 /// Status of a background job.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub enum JobStatus {
     Running,
     Completed,
@@ -81,12 +93,20 @@ impl JobProgress {
             buf.push_back(capped);
         }
         self.total_lines_pushed.fetch_add(1, Ordering::Relaxed);
-        *self.last_activity.write().unwrap_or_else(|e| e.into_inner()) = chrono::Local::now();
+        *self
+            .last_activity
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = chrono::Local::now();
     }
 
     pub fn get_output(&self, from: usize) -> Vec<String> {
-        self.output.read().unwrap_or_else(|e| e.into_inner())
-            .iter().skip(from).cloned().collect()
+        self.output
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .skip(from)
+            .cloned()
+            .collect()
     }
 
     pub fn output_len(&self) -> usize {
@@ -146,7 +166,9 @@ impl JobManager {
     fn fresh_id() -> u32 {
         let mut rng = rand::rng();
         let mut id: u32 = rng.random();
-        if id == 0 { id = 1; }
+        if id == 0 {
+            id = 1;
+        }
         id
     }
 
@@ -155,11 +177,14 @@ impl JobManager {
     }
 
     pub fn running_count(&self) -> usize {
-        self.jobs.read().map(|jobs| {
-            jobs.values().filter(|j| {
-                j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
-            }).count()
-        }).unwrap_or(0)
+        self.jobs
+            .read()
+            .map(|jobs| {
+                jobs.values()
+                    .filter(|j| j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     pub fn get_max_running(&self) -> u32 {
@@ -207,18 +232,23 @@ impl JobManager {
         target: String,
         verbose: bool,
         config: Option<crate::config::ModuleConfig>,
-    ) -> Result<(u32, Arc<JobProgress>), String> {
-        let mut jobs = self.jobs.write().map_err(|e| format!("Job lock poisoned: {e}"))?;
+    ) -> anyhow::Result<(u32, Arc<JobProgress>)> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|e| anyhow::anyhow!("Job lock poisoned: {e}"))?;
 
-        let running = jobs.values().filter(|j| {
-            j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
-        }).count();
+        let running = jobs
+            .values()
+            .filter(|j| j.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false))
+            .count();
         let max = self.max_running.load(Ordering::Relaxed) as usize;
         if running >= max {
-            return Err(format!(
+            anyhow::bail!(
                 "Job limit reached: {}/{} concurrent jobs running. Kill a running job or increase the limit.",
-                running, max
-            ));
+                running,
+                max
+            );
         }
 
         let mut id = Self::fresh_id();
@@ -228,14 +258,13 @@ impl JobManager {
 
         if jobs.len() >= MAX_JOBS {
             let now = std::time::Instant::now();
-            jobs.retain(|_, j| {
-                match j.finished_at {
-                    None => true,
-                    Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
-                }
+            jobs.retain(|_, j| match j.finished_at {
+                None => true,
+                Some(at) => now.duration_since(at).as_secs() < FINISHED_JOB_RETENTION_SECS,
             });
             if jobs.len() >= MAX_JOBS {
-                let mut finished: Vec<(u32, std::time::Instant)> = jobs.iter()
+                let mut finished: Vec<(u32, std::time::Instant)> = jobs
+                    .iter()
                     .filter_map(|(jid, j)| j.finished_at.map(|t| (*jid, t)))
                     .collect();
                 finished.sort_by_key(|(_, t)| *t);
@@ -284,17 +313,15 @@ impl JobManager {
                 let t = tgt_clone.clone();
                 let token = cancel_token_for_task;
                 AssertUnwindSafe(async move {
-                    if let Some(cfg) = config {
-                        let (result, _ctx) = crate::context::run_with_context_target_and_cancel(
-                            cfg,
-                            t.clone(),
-                            token,
-                            || async move { crate::commands::run_module(&m, &t, verbose).await },
-                        ).await;
-                        result
-                    } else {
-                        crate::commands::run_module(&m, &t, verbose).await
-                    }
+                    let effective_cfg = config.unwrap_or_default();
+                    let (result, _ctx) = crate::context::run_with_context_target_and_cancel(
+                        effective_cfg,
+                        t.clone(),
+                        token,
+                        || async move { crate::commands::run_module(&m, &t, verbose).await },
+                    )
+                    .await;
+                    result
                 })
                 .catch_unwind()
             };
@@ -350,11 +377,20 @@ impl JobManager {
                         for line in chunk.lines() {
                             prog.push_line(line.to_string());
                         }
+                        let err_chunk = buf.drain_stderr();
+                        for line in err_chunk.lines() {
+                            prog.push_line(format!("[stderr] {}", line));
+                        }
                         // Mirror the scheduler's live scan counters into the job.
-                        prog.total_targets.store(counters.total.load(Relaxed), Relaxed);
-                        prog.success_count.store(counters.succeeded.load(Relaxed), Relaxed);
-                        prog.fail_count.store(counters.failed.load(Relaxed), Relaxed);
-                        if stop { break; }
+                        prog.total_targets
+                            .store(counters.total.load(Relaxed), Relaxed);
+                        prog.success_count
+                            .store(counters.succeeded.load(Relaxed), Relaxed);
+                        prog.fail_count
+                            .store(counters.failed.load(Relaxed), Relaxed);
+                        if stop {
+                            break;
+                        }
                     }
                 })
             };
@@ -433,25 +469,28 @@ impl JobManager {
             // Stop the output drainer and flush any remaining captured output so
             // the final lines of the run are visible in get_output().
             if let Err(e) = stop_tx.send(true) {
-                tracing::debug!("job output drainer stop signal failed: {e}");
+                tracing::warn!("job output drainer stop signal failed: {e}");
             }
             if let Err(e) = drainer.await {
-                tracing::debug!("job output drainer join failed: {e}");
+                tracing::warn!("job output drainer join failed: {e}");
             }
         });
 
-        jobs.insert(id, Job {
+        jobs.insert(
             id,
-            module,
-            target,
-            started_at: chrono::Local::now(),
-            status: JobStatus::Running,
-            progress: progress.clone(),
-            finished_at: None,
-            cancel_tx,
-            cancel_token,
-            handle: Some(handle),
-        });
+            Job {
+                id,
+                module,
+                target,
+                started_at: chrono::Local::now(),
+                status: JobStatus::Running,
+                progress: progress.clone(),
+                finished_at: None,
+                cancel_tx,
+                cancel_token,
+                handle: Some(handle),
+            },
+        );
         drop(jobs);
 
         if let Err(e) = self.event_tx.send(JobEvent::Started {
@@ -470,7 +509,11 @@ impl JobManager {
             let mut jobs = match self.jobs.write() {
                 Ok(j) => j,
                 Err(e) => {
-                    tracing::warn!(job_id = id, "JobManager write lock poisoned during kill: {}", e);
+                    tracing::warn!(
+                        job_id = id,
+                        "JobManager write lock poisoned during kill: {}",
+                        e
+                    );
                     return false;
                 }
             };
@@ -499,7 +542,10 @@ impl JobManager {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 if !handle.is_finished() {
-                    tracing::debug!("Job did not exit within 2s — hard-aborting");
+                    tracing::warn!(
+                        "Job {} did not exit within 2s grace — hard-aborting. Network connections, temp files, or global state may leak.",
+                        id
+                    );
                     abort_handle.abort();
                 }
             });
@@ -517,13 +563,19 @@ impl JobManager {
             // overwrites a recorded Completed/Failed/Cancelled — the task
             // (mark_completed/mark_failed) and kill() (Cancelled) own those.
             if let Some(ref handle) = job.handle
-                && handle.is_finished() && matches!(job.status, JobStatus::Running) {
-                    job.status = JobStatus::Completed;
-                }
+                && handle.is_finished()
+                && matches!(job.status, JobStatus::Running)
+            {
+                job.status = JobStatus::Completed;
+            }
             let terminal = matches!(
                 job.status,
                 JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
-            ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+            ) || job
+                .handle
+                .as_ref()
+                .map(|h| h.is_finished())
+                .unwrap_or(false);
             if terminal && job.finished_at.is_none() {
                 job.finished_at = Some(now);
             }
@@ -548,19 +600,28 @@ impl JobManager {
         result
     }
 
-    pub fn get_detail(&self, id: u32) -> Option<(String, String, String, String, Arc<JobProgress>)> {
+    pub fn get_detail(
+        &self,
+        id: u32,
+    ) -> Option<(String, String, String, String, Arc<JobProgress>)> {
         let mut jobs = self.jobs.write().unwrap_or_else(|e| e.into_inner());
         let job = jobs.get_mut(&id)?;
         // Fallback only: a finished handle whose task never recorded a terminal
         // status. Never overwrites a recorded Completed/Failed/Cancelled.
         if let Some(ref handle) = job.handle
-            && handle.is_finished() && matches!(job.status, JobStatus::Running) {
-                job.status = JobStatus::Completed;
-            }
+            && handle.is_finished()
+            && matches!(job.status, JobStatus::Running)
+        {
+            job.status = JobStatus::Completed;
+        }
         let terminal = matches!(
             job.status,
             JobStatus::Completed | JobStatus::Failed(_) | JobStatus::Cancelled
-        ) || job.handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+        ) || job
+            .handle
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(false);
         if terminal && job.finished_at.is_none() {
             job.finished_at = Some(std::time::Instant::now());
         }
@@ -574,8 +635,11 @@ impl JobManager {
     }
 
     pub fn get_progress(&self, id: u32) -> Option<Arc<JobProgress>> {
-        self.jobs.read().unwrap_or_else(|e| e.into_inner())
-            .get(&id).map(|j| j.progress.clone())
+        self.jobs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .map(|j| j.progress.clone())
     }
 
     pub fn cleanup(&self) {
@@ -600,10 +664,21 @@ impl JobManager {
             return;
         }
         crate::mprintln!();
-        crate::mprintln!("{}", format!("Background Jobs ({}):", jobs.len()).bold().underline());
+        crate::mprintln!(
+            "{}",
+            format!("Background Jobs ({}):", jobs.len())
+                .bold()
+                .underline()
+        );
         crate::mprintln!();
-        crate::mprintln!("  {:<6} {:<35} {:<20} {:<12} {}",
-            "ID".bold(), "Module".bold(), "Target".bold(), "Started".bold(), "Status".bold());
+        crate::mprintln!(
+            "  {:<6} {:<35} {:<20} {:<12} {}",
+            "ID".bold(),
+            "Module".bold(),
+            "Target".bold(),
+            "Started".bold(),
+            "Status".bold()
+        );
         crate::mprintln!("  {}", "-".repeat(80).dimmed());
         for (id, module, target, started, status) in &jobs {
             let status_colored = if status == "Running" {
@@ -615,8 +690,14 @@ impl JobManager {
             } else {
                 status.yellow().to_string()
             };
-            crate::mprintln!("  {:<6} {:<35} {:<20} {:<12} {}",
-                id, module, target, started, status_colored);
+            crate::mprintln!(
+                "  {:<6} {:<35} {:<20} {:<12} {}",
+                id,
+                module,
+                target,
+                started,
+                status_colored
+            );
         }
         crate::mprintln!();
     }

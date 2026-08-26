@@ -35,7 +35,7 @@
 
 use std::net::Ipv4Addr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Smallest prime greater than 2³²; the order-defining modulus of the group.
 const P: u64 = 4_294_967_311;
@@ -70,7 +70,10 @@ fn powmod(mut base: u64, mut exp: u64, m: u64) -> u64 {
 /// `g` is a primitive root of `Z_P*` iff `g^((P-1)/q) != 1 (mod P)` for every
 /// distinct prime factor `q` of `P-1`.
 fn is_primitive_root(g: u64) -> bool {
-    g % P != 0 && PRIME_FACTORS.iter().all(|&q| powmod(g, (P - 1) / q, P) != 1)
+    g % P != 0
+        && PRIME_FACTORS
+            .iter()
+            .all(|&q| powmod(g, (P - 1) / q, P) != 1)
 }
 
 /// First primitive root of `Z_P*`. The smallest one for this prime is tiny
@@ -171,7 +174,7 @@ pub const fn total_public_ipv4_count() -> u64 {
     let reserved_slash8 = 1u64           // 0/8
         + 1                              // 10/8
         + 1                              // 127/8
-        + (255 - 224 + 1);               // 224/4 + class E (224..=255 inclusive)
+        + (255 - 224 + 1); // 224/4 + class E (224..=255 inclusive)
     let usable_slash8 = 256u64 - reserved_slash8;
     // 65_536 /24s per /8, 254 hosts per /24 (.0 and .255 skipped).
     usable_slash8 * 65_536 * 254
@@ -226,7 +229,10 @@ mod tests {
         let mut seen = HashSet::new();
         for _ in 0..200_000 {
             let a = it.next().expect("space not exhausted this early");
-            assert!(seen.insert(a), "duplicate address {a} in permutation prefix");
+            assert!(
+                seen.insert(a),
+                "duplicate address {a} in permutation prefix"
+            );
         }
     }
 

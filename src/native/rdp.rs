@@ -3,10 +3,10 @@
 //! Implements X.224 negotiation → TLS upgrade → CredSSP/NTLM authentication
 //! to check RDP credentials without spawning external processes.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 // ============================================================================
 // RDP Protocol Constants
@@ -24,14 +24,13 @@ pub const PROTO_SSL: u32 = 0x00000001;
 pub const PROTO_HYBRID: u32 = 0x00000002; // NLA (CredSSP)
 
 // NTLM negotiate flags
-const NTLM_FLAGS: u32 =
-    0x00000001 | // UNICODE
+const NTLM_FLAGS: u32 = 0x00000001 | // UNICODE
     0x00000004 | // REQUEST_TARGET
     0x00000200 | // NTLM
     0x00008000 | // ALWAYS_SIGN
     0x00080000 | // EXTENDED_SESSIONSECURITY
     0x20000000 | // 128-bit
-    0x80000000;  // 56-bit
+    0x80000000; // 56-bit
 
 const NTLMSSP_SIG: &[u8; 8] = b"NTLMSSP\0";
 
@@ -72,10 +71,16 @@ pub async fn try_login(
     let mut stream = stream;
     match timeout(timeout_duration, stream.write_all(&cr_pdu)).await {
         Err(elapsed) => {
-            return Ok(RdpLoginResult::ConnectionFailed(format!("Write CR timeout: {}", elapsed)));
+            return Ok(RdpLoginResult::ConnectionFailed(format!(
+                "Write CR timeout: {}",
+                elapsed
+            )));
         }
         Ok(Err(io_err)) => {
-            return Ok(RdpLoginResult::ConnectionFailed(format!("Write CR I/O error: {}", io_err)));
+            return Ok(RdpLoginResult::ConnectionFailed(format!(
+                "Write CR I/O error: {}",
+                io_err
+            )));
         }
         Ok(Ok(())) => {}
     }
@@ -127,7 +132,9 @@ async fn read_tpkt_frame<S: AsyncReadExt + Unpin>(stream: &mut S, buf: &mut [u8]
     let mut total = 0;
     while total < 4 {
         let n = stream.read(&mut buf[total..]).await?;
-        if n == 0 { return Err(anyhow!("Connection closed before TPKT header")); }
+        if n == 0 {
+            return Err(anyhow!("Connection closed before TPKT header"));
+        }
         total += n;
     }
     if buf[0] != TPKT_VERSION {
@@ -143,7 +150,9 @@ async fn read_tpkt_frame<S: AsyncReadExt + Unpin>(stream: &mut S, buf: &mut [u8]
     // Read remaining bytes
     while total < frame_len {
         let n = stream.read(&mut buf[total..frame_len]).await?;
-        if n == 0 { return Err(anyhow!("Connection closed mid-TPKT frame")); }
+        if n == 0 {
+            return Err(anyhow!("Connection closed mid-TPKT frame"));
+        }
         total += n;
     }
     Ok(total)
@@ -173,7 +182,10 @@ async fn read_credssp_message<S: AsyncReadExt + Unpin>(
     } else {
         let num_len_bytes = (header[1] & 0x7f) as usize;
         if num_len_bytes == 0 || num_len_bytes > 2 {
-            anyhow::bail!("TSRequest BER length field unsupported: {} octets", num_len_bytes);
+            anyhow::bail!(
+                "TSRequest BER length field unsupported: {} octets",
+                num_len_bytes
+            );
         }
         // Read the additional length bytes
         timeout(
@@ -195,13 +207,10 @@ async fn read_credssp_message<S: AsyncReadExt + Unpin>(
     // Assemble the complete message: header + payload
     let mut buf = vec![0u8; header_size + total_len];
     buf[..header_size].copy_from_slice(&header[..header_size]);
-    timeout(
-        timeout_duration,
-        stream.read_exact(&mut buf[header_size..]),
-    )
-    .await
-    .map_err(|elapsed| anyhow!("CredSSP payload read timeout: {}", elapsed))?
-    .map_err(|io_err| anyhow!("CredSSP payload read I/O error: {}", io_err))?;
+    timeout(timeout_duration, stream.read_exact(&mut buf[header_size..]))
+        .await
+        .map_err(|elapsed| anyhow!("CredSSP payload read timeout: {}", elapsed))?
+        .map_err(|io_err| anyhow!("CredSSP payload read I/O error: {}", io_err))?;
 
     Ok(buf)
 }
@@ -219,12 +228,20 @@ fn build_x224_cr(cookie: &str, protocols: u32) -> Result<Vec<u8>> {
 
     let mut pdu = Vec::with_capacity(tpkt_len);
     // TPKT header
-    let tpkt_u16 = u16::try_from(tpkt_len)
-        .map_err(|e| anyhow!("X.224 connection request too large ({} bytes); max cookie length ~500 bytes: {e}", tpkt_len))?;
+    let tpkt_u16 = u16::try_from(tpkt_len).map_err(|e| {
+        anyhow!(
+            "X.224 connection request too large ({} bytes); max cookie length ~500 bytes: {e}",
+            tpkt_len
+        )
+    })?;
     pdu.extend_from_slice(&[TPKT_VERSION, 0, (tpkt_u16 >> 8) as u8, tpkt_u16 as u8]);
     // X.224 CR
-    let x224_len_u8 = u8::try_from(x224_payload_len)
-        .map_err(|e| anyhow!("X.224 payload length too large ({} bytes); max cookie length ~500 bytes: {e}", x224_payload_len))?;
+    let x224_len_u8 = u8::try_from(x224_payload_len).map_err(|e| {
+        anyhow!(
+            "X.224 payload length too large ({} bytes); max cookie length ~500 bytes: {e}",
+            x224_payload_len
+        )
+    })?;
     pdu.push(x224_len_u8); // length indicator
     pdu.push(X224_TYPE_CR);
     pdu.extend_from_slice(&[0, 0, 0, 0, 0]); // dst-ref(2) + src-ref(2) + class(1)
@@ -257,13 +274,22 @@ fn parse_x224_cc(data: &[u8]) -> Result<u32> {
         if off + 8 <= data.len() {
             if data[off] == RDP_NEG_RSP {
                 return Ok(u32::from_le_bytes([
-                    data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
                 ]));
             } else if data[off] == RDP_NEG_FAILURE {
                 let failure_code = u32::from_le_bytes([
-                    data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
                 ]);
-                return Err(anyhow!("Server rejected negotiation (failure code: 0x{:08x})", failure_code));
+                return Err(anyhow!(
+                    "Server rejected negotiation (failure code: 0x{:08x})",
+                    failure_code
+                ));
             }
         }
     }
@@ -282,12 +308,14 @@ async fn tls_upgrade(
     let connector = crate::native::async_tls::make_dangerous_tls_connector();
     // Extract host — handle IPv6 bracket notation like [::1]:3389
     let host = if addr.starts_with('[') {
-        addr.split(']').next().unwrap_or("localhost").trim_start_matches('[')
+        addr.split(']')
+            .next()
+            .unwrap_or("localhost")
+            .trim_start_matches('[')
     } else {
         addr.split(':').next().unwrap_or("localhost")
     };
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()))
+    let server_name = crate::utils::network::server_name_with_fallback(host, "localhost")
         .map_err(|e| anyhow!("Invalid server name: {e}"))?;
 
     match timeout(timeout_duration, connector.connect(server_name, stream)).await {
@@ -317,10 +345,16 @@ where
 
     match timeout(timeout_duration, stream.write_all(&ts_req1)).await {
         Err(elapsed) => {
-            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP write timeout: {}", elapsed)));
+            return Ok(RdpLoginResult::ConnectionFailed(format!(
+                "CredSSP write timeout: {}",
+                elapsed
+            )));
         }
         Ok(Err(io_err)) => {
-            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP write I/O error: {}", io_err)));
+            return Ok(RdpLoginResult::ConnectionFailed(format!(
+                "CredSSP write I/O error: {}",
+                io_err
+            )));
         }
         Ok(Ok(())) => {}
     }
@@ -328,32 +362,51 @@ where
     // Step 2: Read TSRequest with NTLM Challenge (Type 2)
     let challenge_buf = match read_credssp_message(&mut stream, timeout_duration).await {
         Ok(buf) => buf,
-        Err(e) => return Ok(RdpLoginResult::ProtocolError(format!("CredSSP challenge read: {}", e))),
+        Err(e) => {
+            return Ok(RdpLoginResult::ProtocolError(format!(
+                "CredSSP challenge read: {}",
+                e
+            )));
+        }
     };
 
     let ts_resp = match parse_ts_request(&challenge_buf) {
         Ok(r) => r,
-        Err(e) => return Ok(RdpLoginResult::ProtocolError(format!("TSRequest parse: {}", e))),
+        Err(e) => {
+            return Ok(RdpLoginResult::ProtocolError(format!(
+                "TSRequest parse: {}",
+                e
+            )));
+        }
     };
 
     // Check for error code → auth failed
     if let Some(err_code) = ts_resp.error_code
-        && err_code != 0 {
-            return Ok(RdpLoginResult::AuthFailed);
-        }
+        && err_code != 0
+    {
+        return Ok(RdpLoginResult::AuthFailed);
+    }
 
     let nego_token = match ts_resp.nego_tokens {
         Some(t) => t,
-        None => return Ok(RdpLoginResult::ProtocolError("No negoToken in challenge".into())),
+        None => {
+            return Ok(RdpLoginResult::ProtocolError(
+                "No negoToken in challenge".into(),
+            ));
+        }
     };
 
     // Unwrap SPNEGO to get NTLM Challenge
-    let ntlm_challenge_bytes = unwrap_spnego_response(&nego_token)
-        .unwrap_or(nego_token.clone());
+    let ntlm_challenge_bytes = unwrap_spnego_response(&nego_token).unwrap_or(nego_token.clone());
 
     let challenge = match parse_ntlm_challenge(&ntlm_challenge_bytes) {
         Ok(c) => c,
-        Err(e) => return Ok(RdpLoginResult::ProtocolError(format!("NTLM challenge: {}", e))),
+        Err(e) => {
+            return Ok(RdpLoginResult::ProtocolError(format!(
+                "NTLM challenge: {}",
+                e
+            )));
+        }
     };
 
     // Step 3: Build NTLM Authenticate (Type 3) and send
@@ -363,10 +416,16 @@ where
 
     match timeout(timeout_duration, stream.write_all(&ts_req3)).await {
         Err(elapsed) => {
-            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP auth write timeout: {}", elapsed)));
+            return Ok(RdpLoginResult::ConnectionFailed(format!(
+                "CredSSP auth write timeout: {}",
+                elapsed
+            )));
         }
         Ok(Err(io_err)) => {
-            return Ok(RdpLoginResult::ConnectionFailed(format!("CredSSP auth write I/O error: {}", io_err)));
+            return Ok(RdpLoginResult::ConnectionFailed(format!(
+                "CredSSP auth write I/O error: {}",
+                io_err
+            )));
         }
         Ok(Ok(())) => {}
     }
@@ -375,16 +434,20 @@ where
     let final_buf = match read_credssp_message(&mut stream, timeout_duration).await {
         Ok(buf) => buf,
         // Connection closed or read error after auth = auth failed (server drops connection on bad creds)
-        Err(e) => { tracing::debug!("CredSSP final read failed: {e}"); return Ok(RdpLoginResult::AuthFailed); }
+        Err(e) => {
+            tracing::debug!("CredSSP final read failed: {e}");
+            return Ok(RdpLoginResult::AuthFailed);
+        }
     };
 
     // Parse final TSRequest
     match parse_ts_request(&final_buf) {
         Ok(resp) => {
             if let Some(err) = resp.error_code
-                && err != 0 {
-                    return Ok(RdpLoginResult::AuthFailed);
-                }
+                && err != 0
+            {
+                return Ok(RdpLoginResult::AuthFailed);
+            }
             // If we get pubKeyAuth back → success
             if resp.pub_key_auth.is_some() {
                 return Ok(RdpLoginResult::Success);
@@ -392,11 +455,16 @@ where
             // If we get negoTokens back, this is a continuation, not success
             if resp.nego_tokens.is_some() {
                 // Server sent more negotiation tokens -- multi-round SPNEGO not supported
-                return Ok(RdpLoginResult::ProtocolError("Multi-round SPNEGO negotiation not supported".into()));
+                return Ok(RdpLoginResult::ProtocolError(
+                    "Multi-round SPNEGO negotiation not supported".into(),
+                ));
             }
             Ok(RdpLoginResult::AuthFailed)
         }
-        Err(e) => { tracing::debug!("TSRequest parse failed: {e}"); Ok(RdpLoginResult::AuthFailed) }
+        Err(e) => {
+            tracing::debug!("TSRequest parse failed: {e}");
+            Ok(RdpLoginResult::AuthFailed)
+        }
     }
 }
 
@@ -432,8 +500,12 @@ struct NtlmChallenge {
 const MAX_NTLM_TARGET_INFO: usize = 4096;
 
 fn parse_ntlm_challenge(data: &[u8]) -> Result<NtlmChallenge> {
-    if data.len() < 32 { return Err(anyhow!("Challenge too short")); }
-    if &data[0..8] != NTLMSSP_SIG { return Err(anyhow!("Bad NTLMSSP sig")); }
+    if data.len() < 32 {
+        return Err(anyhow!("Challenge too short"));
+    }
+    if &data[0..8] != NTLMSSP_SIG {
+        return Err(anyhow!("Bad NTLMSSP sig"));
+    }
     if u32::from_le_bytes([data[8], data[9], data[10], data[11]]) != 2 {
         return Err(anyhow!("Not Type 2"));
     }
@@ -452,11 +524,16 @@ fn parse_ntlm_challenge(data: &[u8]) -> Result<NtlmChallenge> {
         // could overflow. Without this, a malicious NTLM challenge could
         // make the bounds check pass and panic on the slice.
         if let Some(end) = ti_off.checked_add(ti_len)
-            && end <= data.len() {
-                target_info = data[ti_off..end].to_vec();
-            }
+            && end <= data.len()
+        {
+            target_info = data[ti_off..end].to_vec();
+        }
     }
-    Ok(NtlmChallenge { flags, server_challenge, target_info })
+    Ok(NtlmChallenge {
+        flags,
+        server_challenge,
+        target_info,
+    })
 }
 
 fn build_ntlm_authenticate(user: &str, pass: &str, domain: &str, ch: &NtlmChallenge) -> Vec<u8> {
@@ -516,7 +593,9 @@ fn build_ntlm_authenticate(user: &str, pass: &str, domain: &str, ch: &NtlmChalle
     msg.extend_from_slice(&ch.flags.to_le_bytes());
 
     // Pad to base offset
-    while msg.len() < base as usize { msg.push(0); }
+    while msg.len() < base as usize {
+        msg.push(0);
+    }
 
     // Payloads in order
     msg.extend_from_slice(&lm_response);
@@ -545,7 +624,9 @@ fn md4_hash(data: &[u8]) -> [u8; 16] {
     let bit_len = (data.len() as u64) * 8;
     let mut msg = data.to_vec();
     msg.push(0x80);
-    while msg.len() % 64 != 56 { msg.push(0); }
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
     let (mut a, mut b, mut c, mut d) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
@@ -553,7 +634,12 @@ fn md4_hash(data: &[u8]) -> [u8; 16] {
     for block in msg.chunks(64) {
         let mut x = [0u32; 16];
         for i in 0..16 {
-            x[i] = u32::from_le_bytes([block[i*4], block[i*4+1], block[i*4+2], block[i*4+3]]);
+            x[i] = u32::from_le_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
         let (aa, bb, cc, dd) = (a, b, c, d);
 
@@ -562,33 +648,79 @@ fn md4_hash(data: &[u8]) -> [u8; 16] {
                 $a = ($a.wrapping_add(($b & $c) | (!$b & $d)).wrapping_add(x[$k])).rotate_left($s);
             };
         }
-        round1!(a,b,c,d,0,3);  round1!(d,a,b,c,1,7);  round1!(c,d,a,b,2,11);  round1!(b,c,d,a,3,19);
-        round1!(a,b,c,d,4,3);  round1!(d,a,b,c,5,7);  round1!(c,d,a,b,6,11);  round1!(b,c,d,a,7,19);
-        round1!(a,b,c,d,8,3);  round1!(d,a,b,c,9,7);  round1!(c,d,a,b,10,11); round1!(b,c,d,a,11,19);
-        round1!(a,b,c,d,12,3); round1!(d,a,b,c,13,7); round1!(c,d,a,b,14,11); round1!(b,c,d,a,15,19);
+        round1!(a, b, c, d, 0, 3);
+        round1!(d, a, b, c, 1, 7);
+        round1!(c, d, a, b, 2, 11);
+        round1!(b, c, d, a, 3, 19);
+        round1!(a, b, c, d, 4, 3);
+        round1!(d, a, b, c, 5, 7);
+        round1!(c, d, a, b, 6, 11);
+        round1!(b, c, d, a, 7, 19);
+        round1!(a, b, c, d, 8, 3);
+        round1!(d, a, b, c, 9, 7);
+        round1!(c, d, a, b, 10, 11);
+        round1!(b, c, d, a, 11, 19);
+        round1!(a, b, c, d, 12, 3);
+        round1!(d, a, b, c, 13, 7);
+        round1!(c, d, a, b, 14, 11);
+        round1!(b, c, d, a, 15, 19);
 
         macro_rules! round2 {
             ($a:expr,$b:expr,$c:expr,$d:expr,$k:expr,$s:expr) => {
-                $a = ($a.wrapping_add(($b & $c) | ($b & $d) | ($c & $d)).wrapping_add(x[$k]).wrapping_add(0x5A827999)).rotate_left($s);
+                $a = ($a
+                    .wrapping_add(($b & $c) | ($b & $d) | ($c & $d))
+                    .wrapping_add(x[$k])
+                    .wrapping_add(0x5A827999))
+                .rotate_left($s);
             };
         }
-        round2!(a,b,c,d,0,3);  round2!(d,a,b,c,4,5);  round2!(c,d,a,b,8,9);   round2!(b,c,d,a,12,13);
-        round2!(a,b,c,d,1,3);  round2!(d,a,b,c,5,5);  round2!(c,d,a,b,9,9);   round2!(b,c,d,a,13,13);
-        round2!(a,b,c,d,2,3);  round2!(d,a,b,c,6,5);  round2!(c,d,a,b,10,9);  round2!(b,c,d,a,14,13);
-        round2!(a,b,c,d,3,3);  round2!(d,a,b,c,7,5);  round2!(c,d,a,b,11,9);  round2!(b,c,d,a,15,13);
+        round2!(a, b, c, d, 0, 3);
+        round2!(d, a, b, c, 4, 5);
+        round2!(c, d, a, b, 8, 9);
+        round2!(b, c, d, a, 12, 13);
+        round2!(a, b, c, d, 1, 3);
+        round2!(d, a, b, c, 5, 5);
+        round2!(c, d, a, b, 9, 9);
+        round2!(b, c, d, a, 13, 13);
+        round2!(a, b, c, d, 2, 3);
+        round2!(d, a, b, c, 6, 5);
+        round2!(c, d, a, b, 10, 9);
+        round2!(b, c, d, a, 14, 13);
+        round2!(a, b, c, d, 3, 3);
+        round2!(d, a, b, c, 7, 5);
+        round2!(c, d, a, b, 11, 9);
+        round2!(b, c, d, a, 15, 13);
 
         macro_rules! round3 {
             ($a:expr,$b:expr,$c:expr,$d:expr,$k:expr,$s:expr) => {
-                $a = ($a.wrapping_add($b ^ $c ^ $d).wrapping_add(x[$k]).wrapping_add(0x6ED9EBA1)).rotate_left($s);
+                $a = ($a
+                    .wrapping_add($b ^ $c ^ $d)
+                    .wrapping_add(x[$k])
+                    .wrapping_add(0x6ED9EBA1))
+                .rotate_left($s);
             };
         }
-        round3!(a,b,c,d,0,3);  round3!(d,a,b,c,8,9);  round3!(c,d,a,b,4,11);  round3!(b,c,d,a,12,15);
-        round3!(a,b,c,d,2,3);  round3!(d,a,b,c,10,9); round3!(c,d,a,b,6,11);  round3!(b,c,d,a,14,15);
-        round3!(a,b,c,d,1,3);  round3!(d,a,b,c,9,9);  round3!(c,d,a,b,5,11);  round3!(b,c,d,a,13,15);
-        round3!(a,b,c,d,3,3);  round3!(d,a,b,c,11,9); round3!(c,d,a,b,7,11);  round3!(b,c,d,a,15,15);
+        round3!(a, b, c, d, 0, 3);
+        round3!(d, a, b, c, 8, 9);
+        round3!(c, d, a, b, 4, 11);
+        round3!(b, c, d, a, 12, 15);
+        round3!(a, b, c, d, 2, 3);
+        round3!(d, a, b, c, 10, 9);
+        round3!(c, d, a, b, 6, 11);
+        round3!(b, c, d, a, 14, 15);
+        round3!(a, b, c, d, 1, 3);
+        round3!(d, a, b, c, 9, 9);
+        round3!(c, d, a, b, 5, 11);
+        round3!(b, c, d, a, 13, 15);
+        round3!(a, b, c, d, 3, 3);
+        round3!(d, a, b, c, 11, 9);
+        round3!(c, d, a, b, 7, 11);
+        round3!(b, c, d, a, 15, 15);
 
-        a = a.wrapping_add(aa); b = b.wrapping_add(bb);
-        c = c.wrapping_add(cc); d = d.wrapping_add(dd);
+        a = a.wrapping_add(aa);
+        b = b.wrapping_add(bb);
+        c = c.wrapping_add(cc);
+        d = d.wrapping_add(dd);
     }
 
     let mut out = [0u8; 16];
@@ -614,7 +746,10 @@ fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
 
     let mut ipad = [0x36u8; 64];
     let mut opad = [0x5cu8; 64];
-    for i in 0..64 { ipad[i] ^= key_block[i]; opad[i] ^= key_block[i]; }
+    for i in 0..64 {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
 
     let mut inner = ipad.to_vec();
     inner.extend_from_slice(data);
@@ -661,9 +796,14 @@ fn ber_len(buf: &mut Vec<u8>, len: usize) {
 }
 
 fn ber_read_len(data: &[u8], pos: &mut usize) -> Result<usize> {
-    if *pos >= data.len() { anyhow::bail!("BER length: read past end of data"); }
-    let b = data[*pos]; *pos += 1;
-    if b < 0x80 { return Ok(b as usize); }
+    if *pos >= data.len() {
+        anyhow::bail!("BER length: read past end of data");
+    }
+    let b = data[*pos];
+    *pos += 1;
+    if b < 0x80 {
+        return Ok(b as usize);
+    }
     let nb = (b & 0x7f) as usize;
     // BER allows up to 127 length octets, but anything past 8 (for 64-bit
     // usize) would silently truncate via the cumulative left-shifts. Reject
@@ -673,14 +813,21 @@ fn ber_read_len(data: &[u8], pos: &mut usize) -> Result<usize> {
     }
     let mut val = 0usize;
     for _ in 0..nb {
-        if *pos >= data.len() { anyhow::bail!("BER length: truncated multi-byte length"); }
+        if *pos >= data.len() {
+            anyhow::bail!("BER length: truncated multi-byte length");
+        }
         val = (val << 8) | data[*pos] as usize;
         *pos += 1;
     }
     Ok(val)
 }
 
-fn build_ts_request(version: u32, nego: Option<&[u8]>, auth: Option<&[u8]>, pubkey: Option<&[u8]>) -> Vec<u8> {
+fn build_ts_request(
+    version: u32,
+    nego: Option<&[u8]>,
+    auth: Option<&[u8]>,
+    pubkey: Option<&[u8]>,
+) -> Vec<u8> {
     let mut inner = Vec::new();
 
     // version [0] INTEGER
@@ -695,23 +842,41 @@ fn build_ts_request(version: u32, nego: Option<&[u8]>, auth: Option<&[u8]>, pubk
 
     // negoTokens [1]
     if let Some(token) = nego {
-        let mut octet = vec![0x04]; ber_len(&mut octet, token.len()); octet.extend(token);
-        let mut ctx0 = vec![0xA0]; ber_len(&mut ctx0, octet.len()); ctx0.extend(octet);
-        let mut seq1 = vec![0x30]; ber_len(&mut seq1, ctx0.len()); seq1.extend(ctx0);
-        let mut seqof = vec![0x30]; ber_len(&mut seqof, seq1.len()); seqof.extend(seq1);
-        let mut ctx1 = vec![0xA1]; ber_len(&mut ctx1, seqof.len()); ctx1.extend(seqof);
+        let mut octet = vec![0x04];
+        ber_len(&mut octet, token.len());
+        octet.extend(token);
+        let mut ctx0 = vec![0xA0];
+        ber_len(&mut ctx0, octet.len());
+        ctx0.extend(octet);
+        let mut seq1 = vec![0x30];
+        ber_len(&mut seq1, ctx0.len());
+        seq1.extend(ctx0);
+        let mut seqof = vec![0x30];
+        ber_len(&mut seqof, seq1.len());
+        seqof.extend(seq1);
+        let mut ctx1 = vec![0xA1];
+        ber_len(&mut ctx1, seqof.len());
+        ctx1.extend(seqof);
         inner.extend(ctx1);
     }
 
     if let Some(a) = auth {
-        let mut octet = vec![0x04]; ber_len(&mut octet, a.len()); octet.extend(a);
-        let mut ctx2 = vec![0xA2]; ber_len(&mut ctx2, octet.len()); ctx2.extend(octet);
+        let mut octet = vec![0x04];
+        ber_len(&mut octet, a.len());
+        octet.extend(a);
+        let mut ctx2 = vec![0xA2];
+        ber_len(&mut ctx2, octet.len());
+        ctx2.extend(octet);
         inner.extend(ctx2);
     }
 
     if let Some(pk) = pubkey {
-        let mut octet = vec![0x04]; ber_len(&mut octet, pk.len()); octet.extend(pk);
-        let mut ctx3 = vec![0xA3]; ber_len(&mut ctx3, octet.len()); ctx3.extend(octet);
+        let mut octet = vec![0x04];
+        ber_len(&mut octet, pk.len());
+        octet.extend(pk);
+        let mut ctx3 = vec![0xA3];
+        ber_len(&mut ctx3, octet.len());
+        ctx3.extend(octet);
         inner.extend(ctx3);
     }
 
@@ -723,7 +888,9 @@ fn build_ts_request(version: u32, nego: Option<&[u8]>, auth: Option<&[u8]>, pubk
 
 fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
     let mut pos = 0;
-    if pos >= data.len() || data[pos] != 0x30 { return Err(anyhow!("Not a SEQUENCE")); }
+    if pos >= data.len() || data[pos] != 0x30 {
+        return Err(anyhow!("Not a SEQUENCE"));
+    }
     pos += 1;
     let seq_len = ber_read_len(data, &mut pos)?;
     // `ber_read_len` accepts up to 8 length octets, so on a malicious server
@@ -731,14 +898,20 @@ fn parse_ts_request(data: &[u8]) -> Result<TsRequestData> {
     // arithmetic `pos + len` overflows: in debug it panics, and in release it
     // wraps small and defeats the `> data.len()` guard so the following slice
     // panics — which, with `panic = "abort"`, takes down the whole scanner.
-    let seq_end = pos.checked_add(seq_len).map_or(data.len(), |e| e.min(data.len()));
+    let seq_end = pos
+        .checked_add(seq_len)
+        .map_or(data.len(), |e| e.min(data.len()));
 
     let mut result = TsRequestData {
-        nego_tokens: None, auth_info: None, pub_key_auth: None, error_code: None,
+        nego_tokens: None,
+        auth_info: None,
+        pub_key_auth: None,
+        error_code: None,
     };
 
     while pos < data.len() && pos < seq_end {
-        let tag = data[pos]; pos += 1;
+        let tag = data[pos];
+        pos += 1;
         let field_len = ber_read_len(data, &mut pos)?;
         let field_end = match pos.checked_add(field_len) {
             Some(e) if e <= data.len() => e,
@@ -780,7 +953,8 @@ fn extract_octet(data: &[u8]) -> Result<Vec<u8>> {
         // checked_add: a server-controlled `len` near usize::MAX would otherwise
         // overflow and slice-panic (abort).
         if let Some(end) = pos.checked_add(len)
-            && end <= data.len() {
+            && end <= data.len()
+        {
             return Ok(data[pos..end].to_vec());
         }
     }
@@ -792,7 +966,9 @@ fn extract_nested_octet(data: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0;
     // Skip SEQUENCE tags
     for _ in 0..3 {
-        if pos >= data.len() { return Ok(data.to_vec()); }
+        if pos >= data.len() {
+            return Ok(data.to_vec());
+        }
         let tag = data[pos];
         if tag == 0x30 || tag == 0xA0 || tag == 0x04 {
             pos += 1;
@@ -815,7 +991,9 @@ fn extract_integer(data: &[u8]) -> Result<Option<i64>> {
         pos += 1;
         let len = ber_read_len(data, &mut pos)?;
         // checked_add guards against a server-controlled `len` overflowing `pos`.
-        if len == 0 || pos.checked_add(len).is_none_or(|e| e > data.len()) { return Ok(None); }
+        if len == 0 || pos.checked_add(len).is_none_or(|e| e > data.len()) {
+            return Ok(None);
+        }
         // Sign-extend: if first byte has high bit set, the value is negative
         let mut val: i64 = if data[pos] & 0x80 != 0 { -1 } else { 0 };
         for i in 0..len {
@@ -827,7 +1005,9 @@ fn extract_integer(data: &[u8]) -> Result<Option<i64>> {
 }
 
 fn encode_ber_int(val: i64) -> Vec<u8> {
-    if val == 0 { return vec![0x00]; }
+    if val == 0 {
+        return vec![0x00];
+    }
     let bytes = val.to_be_bytes();
     if val > 0 {
         // Skip leading zero bytes, but keep a 0x00 prefix if high bit is set
@@ -860,24 +1040,36 @@ fn wrap_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {
     // SPNEGO OID
     let spnego_oid: &[u8] = &[0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
     // NTLM OID
-    let ntlm_oid: &[u8] = &[0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+    let ntlm_oid: &[u8] = &[
+        0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+    ];
 
     // mechToken [2] OCTET STRING
     let mut mech_token = vec![0xA2];
-    let mut mt_octet = vec![0x04]; ber_len(&mut mt_octet, ntlm_token.len()); mt_octet.extend(ntlm_token);
-    ber_len(&mut mech_token, mt_octet.len()); mech_token.extend(mt_octet);
+    let mut mt_octet = vec![0x04];
+    ber_len(&mut mt_octet, ntlm_token.len());
+    mt_octet.extend(ntlm_token);
+    ber_len(&mut mech_token, mt_octet.len());
+    mech_token.extend(mt_octet);
 
     // mechTypes [0] SEQUENCE
-    let mut mech_types_seq = vec![0x30]; ber_len(&mut mech_types_seq, ntlm_oid.len()); mech_types_seq.extend(ntlm_oid);
-    let mut mech_types = vec![0xA0]; ber_len(&mut mech_types, mech_types_seq.len()); mech_types.extend(mech_types_seq);
+    let mut mech_types_seq = vec![0x30];
+    ber_len(&mut mech_types_seq, ntlm_oid.len());
+    mech_types_seq.extend(ntlm_oid);
+    let mut mech_types = vec![0xA0];
+    ber_len(&mut mech_types, mech_types_seq.len());
+    mech_types.extend(mech_types_seq);
 
     // NegTokenInit SEQUENCE
     let mut neg_init_inner: Vec<u8> = Vec::new();
     neg_init_inner.extend(&mech_types);
     neg_init_inner.extend(&mech_token);
     let mut neg_init = vec![0xA0]; // [0] constructed
-    let mut neg_init_seq = vec![0x30]; ber_len(&mut neg_init_seq, neg_init_inner.len()); neg_init_seq.extend(neg_init_inner);
-    ber_len(&mut neg_init, neg_init_seq.len()); neg_init.extend(neg_init_seq);
+    let mut neg_init_seq = vec![0x30];
+    ber_len(&mut neg_init_seq, neg_init_inner.len());
+    neg_init_seq.extend(neg_init_inner);
+    ber_len(&mut neg_init, neg_init_seq.len());
+    neg_init.extend(neg_init_seq);
 
     // Application [0] { OID + NegTokenInit }
     let mut app_inner: Vec<u8> = Vec::new();
@@ -891,9 +1083,15 @@ fn wrap_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {
 
 fn wrap_spnego_response(ntlm_token: &[u8]) -> Vec<u8> {
     // NegTokenResp [1] SEQUENCE { responseToken [2] OCTET STRING }
-    let mut rt_octet = vec![0x04]; ber_len(&mut rt_octet, ntlm_token.len()); rt_octet.extend(ntlm_token);
-    let mut rt = vec![0xA2]; ber_len(&mut rt, rt_octet.len()); rt.extend(rt_octet);
-    let mut seq = vec![0x30]; ber_len(&mut seq, rt.len()); seq.extend(rt);
+    let mut rt_octet = vec![0x04];
+    ber_len(&mut rt_octet, ntlm_token.len());
+    rt_octet.extend(ntlm_token);
+    let mut rt = vec![0xA2];
+    ber_len(&mut rt, rt_octet.len());
+    rt.extend(rt_octet);
+    let mut seq = vec![0x30];
+    ber_len(&mut seq, rt.len());
+    seq.extend(rt);
     let mut result = vec![0xA1]; // [1] constructed
     ber_len(&mut result, seq.len());
     result.extend(seq);
@@ -907,7 +1105,10 @@ fn unwrap_spnego_response(data: &[u8]) -> Option<Vec<u8>> {
     // not deep in unrelated fields.
     if let Some(pos) = data.windows(8).position(|w| w == NTLMSSP_SIG) {
         if pos > 128 {
-            tracing::warn!("NTLMSSP signature found at suspicious offset {} (max 128); ignoring", pos);
+            tracing::warn!(
+                "NTLMSSP signature found at suspicious offset {} (max 128); ignoring",
+                pos
+            );
             return None;
         }
         return Some(data[pos..].to_vec());

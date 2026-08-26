@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use suppaftp::async_native_tls::TlsConnector;
 use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::cfg_prompt_yes_no;
@@ -22,7 +22,9 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln!(
         "{}",
         "╔═══════════════════════════════════════════════════════════╗".cyan()
@@ -129,7 +131,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                                         .dimmed()
                                 );
                                 for entry in entries.iter().take(20) {
-                                    crate::mprintln!("{}", format!("[VERBOSE]   {}", entry).dimmed());
+                                    crate::mprintln!(
+                                        "{}",
+                                        format!("[VERBOSE]   {}", entry).dimmed()
+                                    );
                                 }
                                 if entries.len() > 20 {
                                     crate::mprintln!(
@@ -158,7 +163,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         cred_type: crate::cred_store::CredType::Password,
                         source_module: "creds/generic/ftp_anonymous",
                     })
-                    .await.is_none() { eprintln!("[!] Failed to store credential"); }
+                    .await
+                    .is_none()
+                    {
+                        crate::meprintln!("[!] Failed to store credential");
+                    }
                     outcome.findings.push(Finding {
                         target: domain.to_string(),
                         kind: FindingKind::Credential,
@@ -169,7 +178,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                             "tls": false,
                         })),
                     });
-                    if let Err(e) = ftp.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
+                    if let Err(e) = ftp.quit().await {
+                        crate::meprintln!("[!] FTP quit failed: {}", e);
+                    }
                     return Ok(outcome);
                 } else if let Err(e) = result {
                     if e.to_string().contains("530") {
@@ -180,7 +191,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                                 format!("[VERBOSE] Server response: {}", e).dimmed()
                             );
                         }
-                        if let Err(e) = ftp.quit().await { tracing::debug!("FTP quit failed: {e}"); }
+                        if let Err(e) = ftp.quit().await {
+                            tracing::debug!("FTP quit failed: {e}");
+                        }
                         return Ok(outcome);
                     } else if e.to_string().contains("550 SSL") {
                         crate::mprintln!(
@@ -320,7 +333,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 cred_type: crate::cred_store::CredType::Password,
                 source_module: "creds/generic/ftp_anonymous",
             })
-            .await.is_none() { eprintln!("[!] Failed to store credential"); }
+            .await
+            .is_none()
+            {
+                crate::meprintln!("[!] Failed to store credential");
+            }
             outcome.findings.push(Finding {
                 target: domain.to_string(),
                 kind: FindingKind::Credential,
@@ -331,7 +348,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     "tls": true,
                 })),
             });
-            if let Err(e) = ftps.quit().await { eprintln!("[!] FTP quit failed: {}", e); }
+            if let Err(e) = ftps.quit().await {
+                crate::meprintln!("[!] FTP quit failed: {}", e);
+            }
         }
         Err(e) if e.to_string().contains("530") => {
             crate::mprintln!("{}", "[-] Anonymous login rejected (FTPS)".yellow());
@@ -345,4 +364,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/ftp_anonymous", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/ftp_anonymous",
+    native
+);

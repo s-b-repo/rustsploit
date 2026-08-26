@@ -29,7 +29,9 @@ impl FastRng {
         let s0 = time_seed ^ (thread_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
         let s1 = time_seed.rotate_left(17) ^ (thread_id as u64).wrapping_mul(0xBF58476D1CE4E5B9);
         let mut rng = Self { s0, s1 };
-        for _ in 0..16 { rng.next_u64(); }
+        for _ in 0..16 {
+            rng.next_u64();
+        }
         rng
     }
 
@@ -44,10 +46,14 @@ impl FastRng {
     }
 
     #[inline(always)]
-    pub fn next_u32(&mut self) -> u32 { self.next_u64() as u32 }
+    pub fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
 
     #[inline(always)]
-    pub fn next_u16(&mut self) -> u16 { self.next_u64() as u16 }
+    pub fn next_u16(&mut self) -> u16 {
+        self.next_u64() as u16
+    }
 
     /// Fill a buffer with pseudo-random bytes (8 at a time, remainder copied).
     #[inline]

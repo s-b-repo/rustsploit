@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use once_cell::sync::Lazy;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::types::{Tool, ToolResult};
 
@@ -80,6 +80,7 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "module_path": { "type": "string", "description": "Full module path" },
                     "target": { "type": "string", "description": "Target IP, hostname, CIDR, comma-list, or 'random'" },
                     "port": { "type": "integer", "description": "Optional port override" },
+                    "timeout": { "type": "integer", "description": "Per-module timeout in seconds (overrides setg timeout). Default: 60." },
                     "verbose": { "type": "boolean", "description": "Enable verbose output" },
                     "background": { "type": "boolean", "description": "Run as a background job and return a job_id immediately (recommended for mass scans)" },
                     "prompts": {
@@ -392,11 +393,15 @@ fn str_param<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 fn u16_param(args: &Value, key: &str) -> Option<u16> {
     // try_from rejects out-of-range — `as u16` would silently wrap, e.g.
     // {"port": 70000} → 4464, bypassing every downstream port check.
-    args.get(key).and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok())
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u16::try_from(n).ok())
 }
 
 fn u32_param(args: &Value, key: &str) -> Option<u32> {
-    args.get(key).and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok())
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 fn bool_param(args: &Value, key: &str) -> Option<bool> {
@@ -601,7 +606,9 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     if args.get("port").is_some_and(|v| !v.is_null()) {
         match u16_param(args, "port") {
             Some(port) => {
-                prompts.entry("port".into()).or_insert_with(|| port.to_string());
+                prompts
+                    .entry("port".into())
+                    .or_insert_with(|| port.to_string());
             }
             None => return ToolResult::error("Invalid 'port': must be an integer 1-65535".into()),
         }
@@ -616,7 +623,10 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     // blocked metadata/link-local/loopback destination past the filter.
     for (key, raw) in prompts.iter() {
         let lkey = key.to_ascii_lowercase();
-        let is_dest_key = matches!(lkey.as_str(), "url" | "host" | "endpoint" | "lhost" | "rhost" | "remote_host" | "target_url" | "uri");
+        let is_dest_key = matches!(
+            lkey.as_str(),
+            "url" | "host" | "endpoint" | "lhost" | "rhost" | "remote_host" | "target_url" | "uri"
+        );
         if let Some(candidate) = extract_ssrf_candidate(raw) {
             // Always check explicit destination keys; for other keys only check
             // values that actually parse as a URL or host:port to avoid false
@@ -635,6 +645,13 @@ async fn handle_run_module(args: &Value) -> ToolResult {
         }
     }
 
+    // If caller supplied a per-call 'timeout' (seconds), push it into the
+    // tenant-scoped global options so the scheduler picks it up.
+    if let Some(t) = u32_param(args, "timeout") {
+        let s = crate::tenant::resolve();
+        s.global_options().set("timeout", &t.to_string()).await;
+    }
+
     let module_config = crate::config::ModuleConfig {
         api_mode: true,
         custom_prompts: prompts,
@@ -645,7 +662,12 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     // MCP tool-call timeout — running them inline would be cut off mid-scan.
     if bool_param(args, "background").unwrap_or(false) {
         let s = crate::tenant::resolve();
-        return match s.job_manager().spawn(module_path.clone(), target.clone(), verbose, Some(module_config)) {
+        return match s.job_manager().spawn(
+            module_path.clone(),
+            target.clone(),
+            verbose,
+            Some(module_config),
+        ) {
             Ok((job_id, _progress)) => ToolResult::json(&serde_json::json!({
                 "job_id": job_id,
                 "status": "started",
@@ -658,18 +680,15 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     let output_buf = crate::output::OutputBuffer::new();
     let buf_clone = output_buf.clone();
 
-    let (result, _ctx) = crate::context::run_with_context_target(
-        module_config,
-        target.clone(),
-        || async {
+    let (result, _ctx) =
+        crate::context::run_with_context_target(module_config, target.clone(), || async {
             crate::output::OUTPUT_BUFFER
                 .scope(buf_clone, async {
                     crate::commands::run_module(&module_path, &target, verbose).await
                 })
                 .await
-        },
-    )
-    .await;
+        })
+        .await;
 
     let stdout = output_buf.drain_stdout();
     let stderr = output_buf.drain_stderr();
@@ -728,13 +747,17 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
         return ToolResult::error("host too long (max 4096) or contains control characters".into());
     }
     if username.len() > 4096 || username.chars().any(|c| c.is_control()) {
-        return ToolResult::error("username too long (max 4096) or contains control characters".into());
+        return ToolResult::error(
+            "username too long (max 4096) or contains control characters".into(),
+        );
     }
     if secret.len() > 4096 {
         return ToolResult::error("secret too long (max 4096 chars)".into());
     }
     if service.len() > 4096 || service.chars().any(|c| c.is_control()) {
-        return ToolResult::error("service too long (max 4096) or contains control characters".into());
+        return ToolResult::error(
+            "service too long (max 4096) or contains control characters".into(),
+        );
     }
     let cred_type = match str_param(args, "cred_type").unwrap_or("password") {
         "hash" => crate::cred_store::CredType::Hash,
@@ -744,11 +767,21 @@ async fn handle_add_cred(args: &Value) -> ToolResult {
     };
 
     match crate::cred_store::CRED_STORE
-        .add(crate::cred_store::NewCred { host, port, service, username, secret, cred_type, source_module: "mcp" })
+        .add(crate::cred_store::NewCred {
+            host,
+            port,
+            service,
+            username,
+            secret,
+            cred_type,
+            source_module: "mcp",
+        })
         .await
     {
         Some(id) => ToolResult::json(&json!({ "id": id, "status": "added" })),
-        None => ToolResult::error("Failed to add credential (store limit reached or I/O error)".into()),
+        None => {
+            ToolResult::error("Failed to add credential (store limit reached or I/O error)".into())
+        }
     }
 }
 
@@ -775,14 +808,20 @@ async fn handle_add_host(args: &Value) -> ToolResult {
     }
     let hostname = str_param(args, "hostname");
     if let Some(h) = hostname
-        && (h.len() > 256 || h.chars().any(|c| c.is_control())) {
-            return ToolResult::error("hostname too long (max 256) or contains control characters".into());
-        }
+        && (h.len() > 256 || h.chars().any(|c| c.is_control()))
+    {
+        return ToolResult::error(
+            "hostname too long (max 256) or contains control characters".into(),
+        );
+    }
     let os_guess = str_param(args, "os_guess");
     if let Some(o) = os_guess
-        && (o.len() > 256 || o.chars().any(|c| c.is_control())) {
-            return ToolResult::error("os_guess too long (max 256) or contains control characters".into());
-        }
+        && (o.len() > 256 || o.chars().any(|c| c.is_control()))
+    {
+        return ToolResult::error(
+            "os_guess too long (max 256) or contains control characters".into(),
+        );
+    }
     crate::workspace::WORKSPACE
         .add_host(ip, hostname, os_guess)
         .await;
@@ -816,13 +855,18 @@ async fn handle_add_service(args: &Value) -> ToolResult {
     let service_name = require_str!(args, "service_name");
     let protocol = str_param(args, "protocol").unwrap_or("tcp");
     if protocol.len() > 256 || protocol.chars().any(|c| c.is_control()) {
-        return ToolResult::error("protocol too long (max 256) or contains control characters".into());
+        return ToolResult::error(
+            "protocol too long (max 256) or contains control characters".into(),
+        );
     }
     let version = str_param(args, "version");
     crate::workspace::WORKSPACE
         .add_service(host, port, protocol, service_name, version)
         .await;
-    ToolResult::text(format!("Service {}:{} ({}) added/updated", host, port, service_name))
+    ToolResult::text(format!(
+        "Service {}:{} ({}) added/updated",
+        host, port, service_name
+    ))
 }
 
 async fn handle_delete_service(args: &Value) -> ToolResult {
@@ -832,7 +876,10 @@ async fn handle_delete_service(args: &Value) -> ToolResult {
         None => return ToolResult::error("Missing required parameter: port".into()),
     };
     let protocol = args.get("protocol").and_then(|v| v.as_str());
-    if crate::workspace::WORKSPACE.delete_service(host, port, protocol).await {
+    if crate::workspace::WORKSPACE
+        .delete_service(host, port, protocol)
+        .await
+    {
         ToolResult::text(format!("Service {}:{} deleted", host, port))
     } else {
         ToolResult::error(format!("Service {}:{} not found", host, port))
@@ -866,7 +913,11 @@ async fn handle_add_loot(args: &Value) -> ToolResult {
     }
     const MAX_LOOT_DATA: usize = 100 * 1024 * 1024;
     if data.len() > MAX_LOOT_DATA {
-        return ToolResult::error(format!("data too large ({} bytes, max {} MB)", data.len(), MAX_LOOT_DATA / 1024 / 1024));
+        return ToolResult::error(format!(
+            "data too large ({} bytes, max {} MB)",
+            data.len(),
+            MAX_LOOT_DATA / 1024 / 1024
+        ));
     }
 
     match crate::loot::LOOT_STORE
@@ -898,7 +949,10 @@ async fn handle_set_option(args: &Value) -> ToolResult {
     let key = require_str!(args, "key");
     let value = require_str!(args, "value");
     if !crate::global_options::GLOBAL_OPTIONS.set(key, value).await {
-        return ToolResult::error(format!("Failed to set '{}': key/value too long or entry limit reached", key));
+        return ToolResult::error(format!(
+            "Failed to set '{}': key/value too long or entry limit reached",
+            key
+        ));
     }
     ToolResult::text(format!("{} => {}", key, value))
 }
@@ -960,10 +1014,15 @@ async fn handle_list_workspaces() -> ToolResult {
 
 async fn handle_switch_workspace(args: &Value) -> ToolResult {
     let name = require_str!(args, "name");
-    if name.is_empty() || name.len() > 64
-        || name.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
+    if name.is_empty()
+        || name.len() > 64
+        || name
+            .chars()
+            .any(|c| !c.is_alphanumeric() && c != '_' && c != '-')
     {
-        return ToolResult::error("Workspace name must be 1-64 alphanumeric chars, dashes, or underscores".into());
+        return ToolResult::error(
+            "Workspace name must be 1-64 alphanumeric chars, dashes, or underscores".into(),
+        );
     }
     crate::workspace::WORKSPACE.switch(name).await;
     ToolResult::text(format!("Switched to workspace: {}", name))

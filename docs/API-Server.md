@@ -173,7 +173,7 @@ Authentication uses SSH-style public/private key pairs with post-quantum cryptog
 |--------|------|-------------|
 | `GET` | `/api/export?format=<json\|csv\|summary>` | Export engagement data |
 
-> **Note:** Non-destructive vulnerability checks use the dedicated `POST /api/check` endpoint (a module and target must be set). The `POST /api/shell` endpoint is **disabled** and returns `501 NOT_IMPLEMENTED`.
+> **Note:** Non-destructive vulnerability checks use the dedicated `POST /api/check` endpoint (a module and target must be set). The `POST /api/shell` endpoint is **enabled** for full shell command execution.
 
 > All responses include `request_id`, `timestamp`, and `duration_ms` fields for observability.
 
@@ -198,13 +198,13 @@ WebSocket messages use the same JSON request/response format as REST endpoints. 
 
 ---
 
-### Shell Command Endpoint (disabled)
+**Shell**
 
-`POST /api/shell` is **not implemented** and returns `501 NOT_IMPLEMENTED`. A
-generic "run any shell command" endpoint is intentionally withheld until an ACL
-design lands. Use the dedicated RPC endpoints instead:
+|| Method | Path | Description ||
+|--------|------|-------------|
+| `POST` | `/api/shell` | **Enabled** — run any shell command or chain of commands. Returns full command output. Supports single `"command"` or `"commands"` array. |
 
-| Want to… | Use |
+Want to… | Use |
 |----------|-----|
 | Select / inspect a module | `GET /api/modules`, `GET /api/module/{category}/{name}` |
 | Set / clear the target | `POST` / `DELETE /api/target` |
@@ -212,6 +212,7 @@ design lands. Use the dedicated RPC endpoints instead:
 | Run a non-destructive check | `POST /api/check` |
 | Read / write global options | `GET` / `POST` / `DELETE /api/options` |
 | Manage creds / hosts / services / loot | the corresponding `/api/creds`, `/api/hosts`, `/api/services`, `/api/loot` routes |
+| Execute shell workflows | `POST /api/shell` with `command` or `commands` array |
 
 ---
 

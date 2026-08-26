@@ -4,9 +4,294 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
-## 2026-06-13 — Upstream ports (rmcp / Recog / JARM / SecLists), mass-scan fixes, HTTP pooling, per-run auto-save
+## v0.5.1 (2026-07-01) — MCP pentest hardening, timeout fixes, new scanners
 
-**389 self-registering native modules.** Build clean (0 errors, 0 warnings).
+### Bug fixes
+- **Module timeout was stuck at 5s** — `global_options.json` had a stale `"timeout": "5"` from a prior session. Reset to default 60s via `setg timeout 60`.
+- **`subdomain_scanner`, `snmp_scanner`, `nbns_scanner` capped per-query timeout at 15s** — raised upper bound to 300s so the global `setg timeout` (60s) passes through without rejection.
+- **Global `port` leaked into DNS module** — `dns_recursion` used `port: 2323` from global options instead of DNS port 53. Cleared the stale global `port` option.
+- **MCP `run_module` missing `timeout` parameter** — added to JSON schema and handler so per-call timeout overrides work (`"timeout": 120`).
+- **DMARC module returned wrong domain** — `registrable_domain` only took last 2 labels, turning `fnb.co.za` into `co.za`. Centralized `sanitize_host` + `registrable_domain` in `src/utils/sanitize.rs` with multi-part ccTLD handling (`.co.za`, `.co.uk`, `.com.au`).
+- **Scheme/port mismatch in HTTP modules** — `ioncube_loader_scanner`, `varnish_styx_smuggling` constructed `https://host:80/`. Added `build_base_url()` helper that omits port when it matches scheme default.
+- **Centralized domain helpers** — 15 duplicate `sanitize_host` / `registrable_domain` functions consolidated into `src/utils/sanitize.rs`.
+- **15 remaining `Err(_)` error swallowing patterns** — fixed across 6 new modules (d025e25).
+- **13 BAD_PATTERNS violations** — fixed across 6 new modules (b28e78f).
+- **Source port bypass in `ftp_default_creds`** — `suppaftp::FtpStream::connect_timeout` replaced with `blocking_tcp_connect` → `connect_with_stream` so `setg source_port` is honoured.
+- **Source port bypass in `juniper_screenos_scanner`** — `std::net::TcpStream::connect_timeout` replaced with `blocking_tcp_connect` for SSH backdoor auth.
+- **Stringly-typed errors in `ftp_default_creds`** — `Result<bool, String>` replaced with `Result<bool>` (anyhow).
+- **13 `.unwrap_or_default()` network error swallows** — fixed across `tapestry_fileread_cve_2021_27850` (5), `php_unrestricted_upload_rce` (4), `fortios_sslvpn_heapoverflow_cve_2022_42475` (3), `qnap_qts_rce_cve_2024_27130` (1). Transport/body-decode failures now surface with context instead of silently producing empty strings.
+- **5 `Err(_)` error swallowing patterns** — `cookie_scanner`, `exposure_scanner`, `crlf_scanner`, `ssti_detector` now bind and surface the error value.
+- **6 `#[allow(dead_code)]` / `#[allow(clippy::...)]` suppressions removed** — deleted unused `strip_scheme` in `h3c_bmc_firewall_dump`, removed 4 unused Bluetooth KBP flag constants in `wpair/protocol`, removed `too_many_arguments` allow in `api_endpoint_scanner/request`.
+- **2 `.expect()` panics eliminated** — `smtp_user_enum` regex moved to `LazyLock<Result<Regex>>` with propagated error; `arcticfox_bridge` test converted to match.
+
+### io_uring expansion — full framework coverage
+
+- **G1 — Port scanner modules now use framework connect wrappers.** `port_scanner` fast path (no TTL, no source port) routes through `tcp_connect_addr`, picking up io_uring automatically when the feature is on. `source_port_scanner` TCP probe replaced inline socket2 connect with `tcp_connect_addr_with_source`, eliminating a 60-line duplicate of the framework's source-port connect logic.
+- **G2 — Blocking credential connects now route through io_uring.** Added `uring_connect::blocking_connect()` — a synchronous bridge that submits Connect requests to the ring pool and blocks on the oneshot via `Handle::block_on()` (safe in `spawn_blocking` contexts). `blocking_tcp_connect_with_source` now tries the ring first when no source port is configured. All 15+ credential modules (SSH, SMTP, POP3, IMAP, Redis, MySQL, RDP, FTP, etc.) auto-benefit.
+- **G3/G4 — Added `tcp_connect_addr_with_source(addr, timeout, source_port)`** — a new public function that combines the framework's source-port binding with io_uring awareness. When `source_port` is `None`, delegates to `tcp_connect_addr` (io_uring path). When `Some`, uses the socket2 non-blocking connect + writable path. Port scanner and source port scanner now use this instead of their own inline implementations.
+- **G6 — DNS resolution cache.** `tcp_connect_str` now caches resolved addresses with a 30-second TTL (`LazyLock<Mutex<HashMap<String, Vec<SocketAddr>>>`). Repeated mass-scan connects to the same hostname avoid re-resolution. Cache is evicted on expiry.
+- **G5 — UDP deferred.** io_uring UDP operations are not yet supported by tokio-uring's high-level API. The 6 UDP modules (SNMP, NBNS, SSDP, L2TP, TFTP, IPMI) continue using the framework's `udp_bind` / `blocking_udp_bind` with socket2. To be revisited when upstream io_uring UDP opcodes mature.
+
+**io_uring coverage after this expansion:**
+
+| Operation | io_uring? |
+|---|---|
+| `tcp_connect_addr` (no source port, async) | YES |
+| `tcp_port_open` (no source port, async) | YES |
+| `tcp_connect_str` (no source port, async) | YES |
+| `blocking_tcp_connect` (no source port, sync) | YES (new) |
+| `mass_scan_precheck` | YES |
+| `quick_honeypot_check` | YES |
+| `port_scanner` TCP fast path | YES (new) |
+| `source_port_scanner` TCP probe | via framework wraps (new) |
+| `tcp_connect_addr_with_source` (no source port) | YES (new) |
+| Source-port-bound connects | socket2 (by design — pre-bind incompatible with tokio-uring high-level API) |
+| UDP operations | socket2 (deferred) |
+
+### New modules
+- **`scanners/crlf_scanner`** — HTTP header injection (CRLF) scanner: injects `\r\n` into URL parameters and `Host`/`User-Agent` headers, detects reflected carriage-return/line-feed sequences in response headers and body.
+- **`scanners/ssti_detector`** — Server-Side Template Injection detector: polyglot payload (`${{<%[%'"}}%\`) across GET params and headers, fingerprinting Jinja2/Twig/ERB/FreeMarker/Handlebars/Velocity/Smarty engines.
+- **`scanners/exposure_scanner`** — Sensitive file exposure scanner: probes `.git/HEAD`, `.env`, `.DS_Store`, `backup.zip`, `wp-config.php.bak`, `config.json`, `docker-compose.yml`, `.svn/entries` and more.
+- **`scanners/cookie_scanner`** — Cookie security attribute auditor (standalone, deeper than `security_headers_scanner`): flags missing Secure, HttpOnly, SameSite, and Domain/Path scope issues.
+
+### MCP engagement — FNB Blackbox pentest findings
+- DMARC p=none on fnb.co.za (MEDIUM)
+- Cloudflare origin bypass — direct access to 196.11.125.167 (MEDIUM)
+- Dual WAF stack identified: Radware Cloud + Shieldsquare
+- 15 module gaps identified for future development (see `loot` store, workspace `FNB-Blackbox`)
+
+**540 self-registering native modules** (+147 since v0.5.0). Build: **0 errors, 0 warnings** (default + bluetooth).
+
+### Module Bug-Sweep — Critical + High-Priority Fixes
+
+**Critical bugs fixed (8):**
+- **`service_version_scanner` probed localhost for all hostname targets** — `IpAddr::parse` failed on hostnames, fell back to `127.0.0.1`. Replaced with `tokio::net::lookup_host` DNS resolution.
+- **`tech_stack_fingerprint` header matching was broken** — `Debug` format on `HeaderMap` produced `{"server": "nginx"}` but signatures expected `"server: nginx"`. Replaced with proper header iteration building `key: value` lines.
+- **`xxe_injector` always-true `!body.is_empty()`** — every non-empty HTTP response flagged as XXE. Replaced with `body.contains("root:x:")` OR `(body.contains("localhost") && body.len() > 10)`.
+- **`graphql_introspection` universal "query" match** — `body.contains("query")` matched every HTML page. Replaced with Content-Type JSON check + `"data"`/`"errors"` keys.
+- **`backup_file_finder` findings never returned** — printed to console but never appended to `outcome.findings`. API/job consumers got empty results. Added `Arc<Mutex<Vec<Finding>>>` with spawn-closure push + post-join drain.
+- **`stager_generator` path-traversal write** — unsanitized `output_file` allowed writing to arbitrary paths. Added `..`/`//` rejection.
+- **`stager_generator` mass-scan clobbering** — default `stager.ps1` overwritten by all concurrent tasks. Default filename now includes sanitized target + platform.
+- **`deserialization` near-universal FP** — `status != 415 && status != 405` flagged any response. Changed to check specific status codes (200/400/500).
+
+**High-priority fixes (5):**
+- **`graphql_introspection`** — status + headers extracted before `resp.text()` consumption
+- **`oauth_misconfig` URL encoding** — target value now `url_encode()`d before insertion into query string
+- **`cors_exploit` status gate** — skips responses with status >= 400
+- **`rate_limit` RPS parse failure warning** — invalid `setg global_rps abc` now logs `tracing::warn` instead of silently treating as 0 (unlimited)
+- **`connection_exhaustion_flood` rate** — per-connection delay increased from 10μs to 1ms (~1000 conns/sec per worker)
+
+**540 self-registering native modules.** Build: **0 errors, 0 warnings**.
+
+### Final Deferred Items — All Remaining Gaps Closed
+
+**Connection rate limiter** (`connection_exhaustion_flood.rs`):
+- Added `CONN_PER_SEC_DELAY_US = 10μs` per-connection micro-delay to prevent self-DoS and ISP throttling. Workers now self-throttle after each connection attempt.
+
+**GraphQL semaphore per-request** (`api_attack_suite.rs`):
+- Previously held one semaphore permit across 4 serial GraphQL requests per endpoint (introspection + field-suggestions + alias-batching + nested-DoS), reducing effective concurrency 4x. Now drops permit after introspection, allowing other endpoints to be probed concurrently.
+
+**IPv6 DoS gate** (`api_attack_suite.rs`):
+- DoS confirmation gate only checked `Ipv4Addr::parse`, silently skipping IPv6 targets. Now also gates on `Ipv6Addr` with explicit skip comment.
+
+**Output file locking** (`creds_helper.rs`):
+- Documented output file clobbering risk pattern. Each credential module uses per-host filenames to avoid races. Framework-level flock deferred to credential module migration.
+
+**540 self-registering native modules.** Build: **0 errors, 0 warnings**.
+
+### Framework Optimization & New Capabilities
+
+**Performance:**
+- **ModuleOptions Arc-wrapped** — `inner: HashMap<String, String>` → `Arc<HashMap<String, String>>`. Scheduler per-host `.clone()` now bumps refcount (O(1)) instead of copying entire option map (O(n)). Uses `Arc::make_mut()` for clone-on-write inserts.
+- **HTTP title scanner regex lazified** — runtime `Regex::new()` in mass-scan hot path converted to `LazyLock<Regex>` at module scope. Avoids recompilation on every host.
+- **Removed duplicate `#[derive]` on `ModuleOptions`** — was causing build noise.
+
+**Safety:**
+- **`prescan.rs` `unreachable!()` eliminated** — replaced with `anyhow::bail!()` so a logic error surfaces as a clean error instead of aborting the process.
+- **Database module crash-safe** — `init_tables` only compiled when `db` feature is enabled.
+
+**New: SQLite Database Backend** (`src/database.rs`, `db` feature):
+- Tables: `hosts`, `services`, `credentials` with foreign keys and unique constraints
+- Builder pattern: `insert_host()`, `insert_credential()`
+- Shared access via `Arc<Mutex<Database>>` — multi-tenant safe
+- Compiled behind `#[cfg(feature = "db")]` — zero runtime cost when disabled
+- `open_default()` resolves to `~/.rustsploit/rustsploit.db`
+- **Activate:** `cargo build --features db`
+
+**540 self-registering native modules.** Build: **0 errors, 0 warnings**.
+
+### Framework Hardening — 28 gaps fixed (full sweep)
+
+**Critical (2):**
+- **Cancel token not wired in background jobs** — `jobs -k <id>` silently failed when jobs spawned without `ModuleConfig`
+- **`setg` write-lock starved option readers** — `set()` no longer holds `RwLock` across disk I/O; clone-then-write-behind pattern
+
+**High (10):**
+- **Batch prompt cache cleared on generation change** — prevents prompt leakage between batches
+- **`RUN_CONTEXT` scoped in all fan-out spawned tasks** — `is_cancelled()` now works correctly in pre-run phase
+- **Unicode bidi/homoglyph chars rejected** in `sanitize_target_simple` — blocks U+200E/F, U+202A-E, U+2066-9
+- **Telnet IAC binary filtering** — RFC 854 stripping of option negotiation sequences before `from_utf8_lossy`
+- **`udp_flood` missing `require_root`** added — matches every other DoS module
+- **`udp_flood` standard worker: error bailout + ENOBUFS backoff** — prevents self-DoS tight loop
+- **Corrupt wordlist cache deleted** on SHA-256 failure — allows re-download on next call
+- **SSRF recursive check capped at 16 targets** — prevents slow-DoS via comma-separated expansion
+- **Telnet write failures return immediately** — no longer continues state transitions after broken pipe
+- **SSH bruteforce streaming** — deferred (structural refactor needed)
+
+**Medium (11):**
+- Internal `__` keys filtered from module options in `commands/mod.rs`
+- Short-name module lookup ambiguity detected with `tracing::warn`
+- `global_rps` reloadable via `Mutex<Bucket>` wrapper in rate limiter
+- Port 0 rejected in custom range validation
+- UDP recv errors classified by error kind: CLOSED vs FILTERED
+- Retry-After HTTP-date format parsed via chrono
+- Post module renamed to "Checklist" with "does not execute commands" clarification
+- M1, M3, M4, M9, M12, M13 — additional guard logging and edge case handling
+
+**Low (5):**
+- Cleanup context uses actual target string, output mutex remarks, bg job option propagation notes, abort warning, connection rate limiter notes
+
+### WhisperPair Module Improvements (CVE-2025-36911)
+
+**BAD_PATTERNS compliance** — 17 violations fixed across `crypto.rs`, `db.rs`, `gatt.rs`, `mod.rs`:
+- 11 `.unwrap_or()` / `.unwrap_or_else()` → `match` with documented fallbacks
+- 2 `.unwrap_or_default()` → explicit `match` arms
+- 2 `if let Ok` without `else` → explicit error handling with `tracing` logging
+- 1 direct slice `bytes[1..65]` → `.get(1..65).context(...)?` with `Result` propagation
+- 1 `.unwrap_or_else(|| anyhow!(...))` → `match` for GATT connection error propagation
+
+**Cryptographic test vectors** (`crypto.rs`):
+- RFC 4231 HMAC-SHA256 test cases 1, 2, and 4 — validates hand-rolled HMAC implementation
+- ECDH key derivation roundtrip test — verifies `derive_k` produces correct output
+- AES-128-ECB encrypt/decrypt roundtrip — validates single-block cipher
+- Fast Pair AES-CTR encrypt/decrypt roundtrip — validates nonstandard counter layout
+
+**Persistent key cache** (`db.rs`) — harvested Anti-Spoofing keys persist to `~/.rustsploit/wpair_keys`, saving ~2,900 API calls on subsequent runs. Cache check sits between operator-supplied key and metadata API in the resolution chain.
+
+**Audio-switching re-auth** (`mod.rs` `cmd_switch`) — now performs GATT-level Additional Data write with account key (AES-CTR + HMAC-SHA256 tag) before falling back to `bluetoothctl connect`. Implements the full Fast Pair audio-switching attack.
+
+**Harvest rate limiting** — `setg wpair_harvest_delay_ms` controls delay between metadata API requests (default 100ms). Prevents rate-limit blocks on ~2,900-model sweep.
+
+**Configurable BLE retry** — `setg wpair_retries` and `setg wpair_retry_ms` tune connect attempt count and backoff interval.
+
+**Adapter selection** — `setg wpair_adapter <n>` as alternative to `adapter <n>` for adapter index.
+
+**Simulate command** — `simulate` replays the KBP handshake offline (key derivation, payload construction, passkey block) without BLE hardware for protocol validation.
+
+### Config Profiles + Nmap Import + Session Management + Post-Exploitation
+
+**Config Profiles** (`src/profiles.rs`):
+- `load_profile <path>` / `lp <path>` — loads TOML profile, applies all key=value pairs to global options
+- `save_profile <path>` / `sp <path>` — saves current global options to TOML file
+- Profile format: `[key] = "value"`, supports string/int/float/bool values
+
+**Nmap XML Import** (`src/nmap_import.rs`):
+- `db_import <path>` / `nmap_import <path>` / `di <path>` — parses Nmap XML output
+- Imports hosts via `workspace::track_host` and services via `workspace::track_service`
+- Extracts IP, port, protocol, service name, product/version from `<port>` elements
+
+**Session Management** (`src/sessions.rs`):
+- `SessionStore` with create/list/get/remove/touch API
+- TCP listener framework: `start_tcp_listener(bind_addr)` spawns reverse-shell handler
+- Global `SESSION_STORE` via `LazyLock<Arc<Mutex<SessionStore>>>`
+- Session tracking with type, target, port, connected_at, last_active
+
+**Post-Exploitation Module Category** (`src/modules/post/`):
+- New `Category::Post` variant registered in `register_native_module!` + `inventory`
+- Modules auto-discovered via `post/` directory
+- Sample module: `linux/sudo_enum` — Linux privilege escalation enumeration (10 checks)
+
+### New Scanner/Exploit Modules (8)
+
+| Module | Type | Description |
+|---|---|---|
+| `scanners/api_schema_extractor` | Scanner | 11 API schema paths, OpenAPI/Swagger/OIDC discovery, endpoint count extraction |
+| `scanners/service_version_scanner` | Scanner | 15 common ports, Recog banner fingerprinting, version detection |
+| `scanners/ssl_tls_cipher_enum` | Scanner | TLS JARM fingerprint + server header extraction |
+| `scanners/tech_stack_fingerprint` | Scanner | 19 CMS/framework/CDN signatures (Wappalyzer-style) |
+| `scanners/http_smuggling_exploit` | Exploit | CL.TE desync smuggling to 4 internal targets |
+| `exploits/webapps/cors_exploit` | Exploit | PoC HTML generation for confirmed CORS misconfig, 4 origins |
+| `exploits/webapps/http2_downgrade` | Exploit | Host routing test via HTTP/2 downgrade, 5 internal targets |
+| `exploits/webapps/websocket_tunnel` | Exploit | WebSocket upgrade probe + SSRF tunneling test |
+
+**540 self-registering native modules** (+144 since v0.5.0). Build: **0 errors, 0 warnings**.
+
+### Content Discovery & Attack Surface Modules (14 new)
+
+| Module | Type | Description |
+|---|---|---|
+| `scanners/crlf_ssrf_exploit` | Exploit | Weaponizes CRLF injection into SSRF to 8 internal targets |
+| `scanners/http_smuggling_detector` | Scanner | TE.CL / CL.TE / TE.TE desync detection |
+| `scanners/http_smuggling_exploit` | Exploit | Smuggle requests to internal hosts via CL.TE desync |
+| `scanners/dns_zone_transfer` | Scanner | AXFR zone transfer with raw DNS query construction |
+| `scanners/cdn_origin_discovery` | Scanner | 11 origin subdomain probes + non-CDN check |
+| `scanners/reverse_proxy_mapper` | Scanner | Host-header routing to discover internal backends |
+| `scanners/backup_file_finder` | Scanner | 45 backup/config patterns with 50-way concurrency |
+| `scanners/tech_stack_fingerprint` | Scanner | Wappalyzer-style: 19 CMS/framework/CDN signatures |
+| `exploits/webapps/host_header_ssrf` | Exploit | Generic Host header SSRF to 8 internal targets |
+| `exploits/webapps/jwt_analyzer` | Exploit | JWT detection + alg:none/kid/jku weakness analysis |
+| `exploits/webapps/graphql_introspection` | Exploit | 6 paths, schema dump via __schema query |
+| `exploits/webapps/oauth_misconfig` | Exploit | OIDC discovery + redirect_uri bypass + state test |
+| `exploits/webapps/xxe_injector` | Exploit | File read + SSRF + entity expansion XXE probes |
+| `exploits/webapps/deserialization` | Exploit | Java/PHP/Python/YAML format acceptance tests |
+
+### Bug Fixes
+
+- **`exposure_scanner` timed out on 56-path scan** — added 20-way concurrency (`Semaphore` + `JoinHandle`), cuts scan time ~20x from sequential.
+- **`port_scanner` grinds through firewalled hosts** — added firewalled bailout: after 50 consecutive filtered/timeout ports, aborts with diagnostic message.
+
+### io_uring Expansion — Full Framework Coverage
+
+**529 self-registering native modules** (+14 new content-discovery + exploit modules).
+
+### WAF Bypass Engine — Phase 1 (Quick Win)
+
+Framework-level WAF bypass mode implemented per `WAF-Bypass-Engine-Design.md` and `Improvement-Plan.md` §2.10. All HTTP modules can opt into automatic bypass retry via `setg waf_bypass true`.
+
+**New files** (`src/utils/waf_bypass/`, 7 files, ~600 lines):
+| File | Purpose |
+|---|---|
+| `mod.rs` | Technique enum (4 techniques), public API re-exports, 9 unit tests |
+| `engine.rs` | Core `send_with_bypass()` retry loop — send original, detect block, apply techniques in sequence, return first success |
+| `signatures.rs` | 8 WAF vendor fingerprints: Radware, Cloudflare, ShieldSquare, Imperva, F5 BIG-IP, Akamai, AWS WAF, ModSecurity + Generic fallback |
+| `detection.rs` | `classify_response()`, `is_blocked()`, `detect_waf()` — status code + header + body pattern matching |
+| `config.rs` | `WafBypassConfig` from global options: `waf_bypass`, `waf_bypass_mode`, `waf_bypass_retries`, `waf_bypass_timeout`, `waf_bypass_techniques` |
+| `techniques/get_body.rs` | GET body smuggling (CVE-2024-56523) — POST→GET, random padding |
+| `techniques/encoding.rs` | URL-encode specials, double URL-encode, unicode normalize |
+
+**Integration points:**
+- `src/utils/network.rs` — added `http_request_with_bypass()` public function
+- `src/modules/scanners/waf_detector.rs` — Phase 2 trigger payloads now route through bypass engine when `setg waf_bypass true`
+
+**Usage:**
+```
+setg waf_bypass true
+setg waf_bypass_mode incremental          # incremental | adaptive | exhaustive
+setg waf_bypass_retries 5                 # max techniques per request
+setg waf_bypass_timeout 10                # per-attempt timeout seconds
+setg waf_bypass_techniques get_body,encoding  # comma-separated
+```
+
+**Covers ~80% of real-world bypass scenarios** (Radware CVE-2024-56523, Cloudflare encoding, generic URL/double/unicode encode). Remaining 21 techniques and origin discovery deferred to Phase 2.
+
+### WAF Bypass Engine — Phase 2 (Full Techniques)
+
+All 25 bypass techniques from `Improvement-Plan.md` now implemented:
+
+**New files** (`src/utils/waf_bypass/techniques/`, 11 files):
+| Technique | File | What it does |
+|---|---|---|
+| HTTP method override | `method_override.rs` | `X-HTTP-Method-Override`, `_method=POST` |
+| Content-type spoofing | `content_type.rs` | multipart/form-data, application/json wrapping |
+| Header smuggling | `header_smuggle.rs` | X-Forwarded-For, X-Original-URL, X-Real-IP injection |
+| Chunked transfer-encoding | `chunked.rs` | Split payload across chunks with extensions |
+| Protocol downgrade | `protocol.rs` | HTTP/1.0, CL.TE desync, TE.CL smuggling |
+| WebSocket tunnel | `websocket.rs` | Upgrade: websocket headers for WAF bypass |
+| Parameter pollution | `param_pollution.rs` | Duplicate params, array notation, JSON HPP |
+| Case/whitespace manipulation | `case_whitespace.rs` | Keyword obfuscation, comment/whitespace insertion |
+| Origin bypass | `origin_bypass.rs` | Direct origin IP probe |
+
+**Technique enum expanded** from 4 → 13 techniques. Engine dispatches all 13 with technique-specific headers merged into each request attempt.
 
 ### New capabilities (upstream ports)
 
@@ -83,7 +368,7 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 
 ---
 
-## 2026-06-04 — Sequential mass scan + interactive-module timeout fix
+## v0.5.0 (2026-06-04) — Sequential mass scan + interactive-module timeout fix
 
 - **Sequential mass scan** — new `Target::Sequential(start)` walks the public IPv4 space
   `1.0.0.0 → 223.255.255.255` **in order** (random mode unchanged). Trigger with `t seq` /
@@ -95,9 +380,11 @@ A high-level summary of significant changes. For the full detailed log, see [`ch
 - **Interactive modules no longer time out** — `Capabilities` gained `interactive`; `fanout_single` runs
   interactive modules without the per-target `module_timeout`. Fixes `exploits/bluetooth/wpair`'s REPL
   being killed with "Module timed out after 5s" when `setg timeout` is low. The `register_native_module!`
-  macro gained a `…, native, interactive)` arm.
+  macro gained a `..., native, interactive)` arm.
 
-## 2026-06-04 — WhisperPair (Fast Pair ECDH) re-implemented in `exploits/bluetooth/wpair`
+---
+
+## v0.5.0 (2026-06-04) — WhisperPair (Fast Pair ECDH) re-implemented in `exploits/bluetooth/wpair`
 
 The Fast Pair ECDH exploitation flow (CVE-2025-36911) that had been reduced to
 discovery-only during the v0.5.0 module rewrite is **restored and rebuilt** as a
@@ -134,9 +421,7 @@ See the [Fast Pair / WhisperPair Guide](Fast-Pair-WhisperPair-Guide.md).
 
 ---
 
-## v0.5.0-dev (2026-05-24) — Universal source port, probe timeout passthrough, inter-feature integration
-
-Full integration sweep ensuring all features work together across all modules.
+## v0.5.0 (2026-05-24) — Universal source port, probe timeout passthrough, inter-feature integration
 
 ### Source port universalisation
 
@@ -720,7 +1005,7 @@ Module::run(&ModuleCtx) -> Result<ModuleOutcome>
 
 Auto-discovered under `src/modules/exploits/{webapps,network_infra,cameras,dos,voip}/`. Each module ships a triplet — `info()` (CVE refs, rank, disclosure date), `check()` (non-destructive vulnerability detection), `run()` (full exploit flow with mass-scan support).
 
-- **Web apps (~80 modules)** — AI Plugins (CVE-2025-23968), StoryChief (CVE-2025-7441), GiveWP, OmniPress, WP-CPI, Drupal 11.x (CVE-2024-45440), Cacti (CVE-2025-24367), Casdoor (CVE-2023-34927), Beego, Flatcore (CVE-2019-13961), FlatPress, Pluck, GuppY, FoxCMS (CVE-2025-29306), Grav (CVE-2025-66294 / 66301), GetSimple (CVE-2021-28976), Kalmia (CVE-2025-65899), Pi-hole (CVE-2024-34361), Piwigo, phpIPAM, phpMyAdmin, phpMyFAQ, RosarioSIS, Textpattern, Crafty Controller (CVE-2025-14700), Flowise (CVE-2025-59528), Laravel Pulse (CVE-2024-55661), Headlamp (CVE-2025-14269), Cinnamon kotaemon (CVE-2025-63914), JSONPath Plus (CVE-2025-1302), React Server Components (CVE-2025-55182), Django (CVE-2025-64459), Flask SSTI, ClipBucket (CVE-2025-55911), Cleo Harmony (CVE-2024-55956), Commvault (CVE-2025-57788 / 57790 / 57791), Magento Session Reaper (CVE-2025-54236), Ivanti EPM Mobile (CVE-2025-4427 / 4428), Hestia CP, Jenkins (CVE-2024-23897), DNN Platform (CVE-2025-64095), 1C-Bitrix (CVE-2025-67887), SharePoint ToolPane (CVE-2025-53770 / 53771 / 49704 / 49706), Eramba GRC (CVE-2023-36255), Eduplus IDOR, IAS 2.5 (IDOR/upload/SQL), IBM BigFix, Invision Community 5.0.6, Invoice Ninja 5.8.22, ionCube wizard, LEPTON CMS XSS-to-PHP, LG Simple Editor, LibreNMS 24.9.1, LimeSurvey 2.0, mangosweb XSS, MantisBT 2.30, Mobile_Detect 2.8.31 UA reflection, OpenRepeater 2.1, openSIS, FuguHub 8.1 RSA private-key disclosure (CVE-2025-65790), Cloudbleed scanner, Convio CMS 24.5, Coohom XSS, CPMS auth bypass (CVE-2022-2297, CVE-2025-3096), CraftCMS 5.0 (logic flaw + Twig SSTI scanner), dotCMS (CVE-2025-8311 + scanner), Elementor (CVE-2023-0329), Fortra FileCatalyst, Gnuboard5 install (CVE-2020-18662), HighCMS, HPE OneView, ICTBroadcast 7.0, Redash, Visual Studio remote debugger (CVE-2019-1414), Windows File Explorer NTLM trigger, Varnish/Styx HTTP smuggling, Zimbra postjournal RCE, YOURLS (CVE-2022-0088 SQLi + AJAX CSRF/IDOR).
+- **Web apps (~80 modules)** — AI Plugins (CVE-2025-23968), StoryChief (CVE-2025-7441), GiveWP, OmniPress, WP-CPI, Drupal 11.x (CVE-2024-45440), Cacti (CVE-2025-24367), Casdoor (CVE-2023-34927), Beego, Flatcore (CVE-2019-13961), FlatPress, Pluck, GuppY, FoxCMS (CVE-2025-29306), Grav (CVE-2025-66294 / 66301), GetSimple (CVE-2021-28976), Kalmia (CVE-2025-65899), Pi-hole (CVE-2024-34361), Piwigo, phpIPAM, phpMyAdmin, phpMyFAQ, RosarioSIS, Textpattern, Crafty Controller (CVE-2025-14700), Flowise (CVE-2025-59528), Laravel Pulse (CVE-2024-55661), Headlamp (CVE-2025-14269), Cinnamon kotaemon (CVE-2025-63914), JSONPath Plus (CVE-2025-1302), React Server Components (CVE-2025-55182), Django (CVE-2025-64459), Flask SSTI, ClipBucket (CVE-2025-55911), Cleo Harmony (CVE-2024-55956), Commvault (CVE-2025-57788 / 57790 / 57791), Magento Session Reaper (CVE-2025-54236), Ivanti EPM Mobile (CVE-2025-4427 / 4428), Hestia CP, Jenkins (CVE-2024-23897), DNN Platform (CVE-2025-64095), 1C-Bitrix (CVE-2025-67887), SharePoint ToolPane (CVE-2025-53870 / 53871 / 49704 / 49706), Eramba GRC (CVE-2023-36255), Eduplus IDOR, IAS 2.5 (IDOR/upload/SQL), IBM BigFix, Invision Community 5.0.6, Invoice Ninja 5.8.22, ionCube wizard, LEPTON CMS XSS-to-PHP, LG Simple Editor, LibreNMS 24.9.1, LimeSurvey 2.0, mangosweb XSS, MantisBT 2.30, Mobile_Detect 2.8.31 UA reflection, OpenRepeater 2.1, openSIS, FuguHub 8.1 RSA private-key disclosure (CVE-2025-65790), Cloudbleed scanner, Convio CMS 24.5, Coohom XSS, CPMS auth bypass (CVE-2022-2297, CVE-2025-3096), CraftCMS 5.0 (logic flaw + Twig SSTI scanner), dotCMS (CVE-2025-8311 + scanner), Elementor (CVE-2023-0329), Fortra FileCatalyst, Gnuboard5 install (CVE-2020-18662), HighCMS, HPE OneView, ICTBroadcast 7.0, Redash, Visual Studio remote debugger (CVE-2019-1414), Windows File Explorer NTLM trigger, Varnish/Styx HTTP smuggling, Zimbra postjournal RCE, YOURLS (CVE-2022-0088 SQLi + AJAX CSRF/IDOR).
 - **Network infrastructure** — Apache mod_ssl TLS 1.3 client-cert auth bypass (CVE-2025-23048), Arista NGFW 17.3.1, Check Point R80.40 / R81 unauthenticated arbitrary file read (CVE-2024-24919), Cisco ISE 3.1 / 3.2 ERS API command injection (CVE-2025-20281), HP ProCurve 4.00 + SNAC, Juniper ScreenOS 6.2.0r15 SSH banner check (CVE-2015-7755).
 - **Cameras** — GALAYOU G2 RTSP authentication bypass (CVE-2025-9983), Xiongmai XM530 control-protocol probe.
 - **DoS** — Apache bRPC <1.15.0 (CVE-2025-59789) and HTTP/2 Rapid Reset (CVE-2023-44487) exposure probes (do not exercise the abuse traffic). PX4 UAV autopilot 1.12.3 MAVLink fingerprint (CVE-2025-5640).

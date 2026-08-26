@@ -19,12 +19,14 @@ use crate::module_info::ModuleInfo;
 
 /// Module category — corresponds to `src/modules/<category>/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Category {
     Scanners,
     Exploits,
     Creds,
     Osint,
     Plugins,
+    Post,
 }
 
 impl Category {
@@ -35,6 +37,7 @@ impl Category {
             Self::Creds => "creds",
             Self::Osint => "osint",
             Self::Plugins => "plugins",
+            Self::Post => "post",
         }
     }
 
@@ -45,6 +48,7 @@ impl Category {
             "creds" | "credential" | "credentials" => Some(Self::Creds),
             "osint" => Some(Self::Osint),
             "plugins" | "plugin" => Some(Self::Plugins),
+            "post" => Some(Self::Post),
             _ => None,
         }
     }
@@ -62,6 +66,7 @@ impl std::fmt::Display for Category {
 
 /// A scan target. Replaces the loose `&str` plumbed through every module.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Target {
     /// Single host: `"10.0.0.1"`, `"example.com"`, `"[2001:db8::1]:80"`.
     Single(String),
@@ -111,10 +116,9 @@ impl Target {
             .strip_prefix("seq:")
             .or_else(|| lower.strip_prefix("sequential:"))
         {
-            let ip: std::net::Ipv4Addr = rest
-                .trim()
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid sequential start IP '{}': {e}", rest.trim()))?;
+            let ip: std::net::Ipv4Addr = rest.trim().parse().map_err(|e| {
+                anyhow::anyhow!("invalid sequential start IP '{}': {e}", rest.trim())
+            })?;
             return Ok(Target::Sequential(u32::from(ip)));
         }
         if trimmed.contains(',') {
@@ -200,7 +204,7 @@ impl Target {
 /// see the same answers.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleOptions {
-    inner: HashMap<String, String>,
+    inner: Arc<HashMap<String, String>>,
 }
 
 impl ModuleOptions {
@@ -213,14 +217,24 @@ impl ModuleOptions {
     }
 
     pub fn get_or<T: std::str::FromStr>(&self, key: &str, default: T) -> T {
-        self.inner
-            .get(key)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+        match self.inner.get(key) {
+            None => default,
+            Some(v) => match v.parse() {
+                Ok(parsed) => parsed,
+                // Surface, don't silently swallow: an operator who set an
+                // unparseable value must be able to find out why the module
+                // used its default instead. (`FromStr::Err` has no Display
+                // bound here, so only the offending value is reported.)
+                Err(_) => {
+                    tracing::warn!("option '{}' has invalid value '{}' — using default", key, v);
+                    default
+                }
+            },
+        }
     }
 
     pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
-        self.inner.insert(key.into(), value.into());
+        Arc::make_mut(&mut self.inner).insert(key.into(), value.into());
         self
     }
 
@@ -229,11 +243,13 @@ impl ModuleOptions {
     }
 
     pub fn into_inner(self) -> HashMap<String, String> {
-        self.inner
+        Arc::unwrap_or_clone(self.inner)
     }
 
     pub fn from_map(map: HashMap<String, String>) -> Self {
-        Self { inner: map }
+        Self {
+            inner: Arc::new(map),
+        }
     }
 }
 
@@ -278,6 +294,7 @@ impl Default for Capabilities {
 // ============================================================
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FindingKind {
     Vulnerable,
     Credential,
@@ -411,6 +428,10 @@ impl ModuleCtx {
         rc = rc.with_cancellation(self.cancel.clone());
         rc.tenant_id = self.tenant_id.clone();
         rc.module_path = self.module_path.clone();
+        // Propagate batch / prompt-harvest state so cfg_prompt_* and
+        // answer-persistence behave per-run instead of process-wide.
+        rc.batch_mode = self.batch_mode;
+        rc.prompt_only = self.prompt_only;
         rc
     }
 }
@@ -437,7 +458,12 @@ pub trait Module: Send + Sync {
     /// supplied port is in 1..=65535, root privilege available, etc.) so
     /// the operator gets a single error instead of `N` identical errors
     /// across `N` hosts in a /16 scan. Default: succeed.
-    async fn pre_check(&self, _ctx: &ModuleCtx) -> Result<()> {
+    async fn pre_check(&self, ctx: &ModuleCtx) -> Result<()> {
+        tracing::trace!(
+            "pre_check not implemented for {} (target {:?})",
+            self.info().name,
+            ctx.target
+        );
         Ok(())
     }
 
@@ -448,7 +474,13 @@ pub trait Module: Send + Sync {
     ///
     /// `outcome` is the final aggregate (`success` count, total findings).
     /// Default: no-op.
-    async fn cleanup(&self, _ctx: &ModuleCtx, _outcome: &ModuleOutcome) -> Result<()> {
+    async fn cleanup(&self, ctx: &ModuleCtx, outcome: &ModuleOutcome) -> Result<()> {
+        tracing::trace!(
+            "cleanup not implemented for {} (target {:?}, success: {})",
+            self.info().name,
+            ctx.target,
+            outcome.success
+        );
         Ok(())
     }
 
@@ -491,21 +523,40 @@ pub fn find(path: &str) -> Option<Box<dyn Module>> {
     // Pass 1: exact match on entry.name (with optional category constraint).
     for entry in registered() {
         if let Some(c) = maybe_cat
-            && entry.category.as_str() != c && Category::parse(c) != Some(entry.category) {
-                continue;
-            }
+            && entry.category.as_str() != c
+            && Category::parse(c) != Some(entry.category)
+        {
+            continue;
+        }
         if entry.name == body {
             return Some((entry.factory)());
         }
     }
     // Pass 2: short-leaf match — final segment after the last `/` in `entry.name`.
+    // First match wins (documented contract); if the leaf is ambiguous we warn
+    // with the full candidate list but still return the FIRST registered match
+    // so callers get a deterministic module instead of whichever came last.
     if maybe_cat.is_none() {
+        let mut found: Option<Box<dyn Module>> = None;
+        let mut matches: Vec<String> = Vec::new();
         for entry in registered() {
             let leaf = entry.name.rsplit('/').next().unwrap_or(entry.name);
             if leaf == path {
-                return Some((entry.factory)());
+                matches.push(format!("{}/{}", entry.category.as_str(), entry.name));
+                if found.is_none() {
+                    found = Some((entry.factory)());
+                }
             }
         }
+        if matches.len() > 1 {
+            tracing::warn!(
+                "ambiguous module name '{}': matches multiple modules ({}) — using '{}'; use a full path to disambiguate",
+                path,
+                matches.join(", "),
+                matches[0]
+            );
+        }
+        return found;
     }
     None
 }
@@ -550,8 +601,12 @@ pub fn render_catalog_markdown() -> String {
          the module.\n\n",
     );
 
-    for cat in ["scanners", "exploits", "creds", "osint", "plugins"] {
-        let Some(entries) = by_cat.get(cat) else { continue };
+    // `post` is a real registered category (src/modules/post) — include it so
+    // the generated catalog doesn't silently omit those modules.
+    for cat in ["scanners", "exploits", "creds", "osint", "plugins", "post"] {
+        let Some(entries) = by_cat.get(cat) else {
+            continue;
+        };
         out.push_str(&format!("## {} ({})\n\n", cat, entries.len()));
         out.push_str(&format!("- {} modules\n\n", entries.len()));
         out.push_str("| Module | Description | Rank |\n");
@@ -633,14 +688,19 @@ macro_rules! __register_native_module_impl {
     (@no_check $category:expr, $name:expr) => {
         struct __ModuleImpl;
         impl ::std::default::Default for __ModuleImpl {
-            fn default() -> Self { Self }
+            fn default() -> Self {
+                Self
+            }
         }
         #[::async_trait::async_trait]
         impl $crate::module::Module for __ModuleImpl {
-            fn info(&self) -> $crate::module_info::ModuleInfo { info() }
-            async fn run(&self, ctx: &$crate::module::ModuleCtx)
-                -> ::anyhow::Result<$crate::module::ModuleOutcome>
-            {
+            fn info(&self) -> $crate::module_info::ModuleInfo {
+                info()
+            }
+            async fn run(
+                &self,
+                ctx: &$crate::module::ModuleCtx,
+            ) -> ::anyhow::Result<$crate::module::ModuleOutcome> {
                 let t = ctx.target.as_legacy_str();
                 let rc = ctx.build_run_context(t.clone());
                 let ctx_arc = ::std::sync::Arc::new(rc);
@@ -667,20 +727,25 @@ macro_rules! __register_native_module_impl {
     (@native $category:expr, $name:expr, $interactive:expr) => {
         struct __ModuleImpl;
         impl ::std::default::Default for __ModuleImpl {
-            fn default() -> Self { Self }
+            fn default() -> Self {
+                Self
+            }
         }
         #[::async_trait::async_trait]
         impl $crate::module::Module for __ModuleImpl {
-            fn info(&self) -> $crate::module_info::ModuleInfo { info() }
+            fn info(&self) -> $crate::module_info::ModuleInfo {
+                info()
+            }
             fn capabilities(&self) -> $crate::module::Capabilities {
                 $crate::module::Capabilities {
                     interactive: $interactive,
                     ..::core::default::Default::default()
                 }
             }
-            async fn run(&self, ctx: &$crate::module::ModuleCtx)
-                -> ::anyhow::Result<$crate::module::ModuleOutcome>
-            {
+            async fn run(
+                &self,
+                ctx: &$crate::module::ModuleCtx,
+            ) -> ::anyhow::Result<$crate::module::ModuleOutcome> {
                 // Keep `RunContext` scope so `cfg_prompt_*` / `is_cancelled()`
                 // helpers used inside the body still resolve. Pass the
                 // canonical target string for compatibility with helpers
@@ -707,4 +772,3 @@ macro_rules! __register_native_module_impl {
         }
     };
 }
-

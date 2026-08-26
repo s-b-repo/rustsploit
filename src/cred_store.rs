@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 
 /// Type of credential stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CredType {
     Password,
     Hash,
@@ -75,7 +76,10 @@ impl CredStore {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: creds.json is corrupted ({}). Starting fresh.", e);
+                        eprintln!(
+                            "[!] Warning: creds.json is corrupted ({}). Starting fresh.",
+                            e
+                        );
                         let backup = file_path.with_extension("json.bak");
                         if let Err(e) = std::fs::copy(&file_path, &backup) {
                             eprintln!("[!] Failed to backup corrupted creds.json: {}", e);
@@ -198,11 +202,15 @@ impl CredStore {
     /// Search credentials by host.
     pub async fn search(&self, query: &str) -> Vec<CredEntry> {
         let q = query.to_lowercase();
-        self.list().await.into_iter().filter(|e| {
-            e.host.to_lowercase().contains(&q)
-                || e.service.to_lowercase().contains(&q)
-                || e.username.to_lowercase().contains(&q)
-        }).collect()
+        self.list()
+            .await
+            .into_iter()
+            .filter(|e| {
+                e.host.to_lowercase().contains(&q)
+                    || e.service.to_lowercase().contains(&q)
+                    || e.username.to_lowercase().contains(&q)
+            })
+            .collect()
     }
 
     /// Delete a credential by ID.
@@ -245,10 +253,11 @@ impl CredStore {
 
     async fn save_locked(&self, entries: &[CredEntry]) {
         if let Some(parent) = self.file_path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await {
-                eprintln!("[!] Failed to create creds directory: {}", e);
-                return;
-            }
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            eprintln!("[!] Failed to create creds directory: {}", e);
+            return;
+        }
         let tmp = self.file_path.with_extension("json.tmp");
         let json = match serde_json::to_string_pretty(entries) {
             Ok(j) => j,
@@ -293,22 +302,49 @@ impl CredStore {
     pub async fn display(&self) {
         let entries = self.list().await;
         if entries.is_empty() {
-            println!("{}", "No credentials stored. Use 'creds add' to add one.".dimmed());
+            println!(
+                "{}",
+                "No credentials stored. Use 'creds add' to add one.".dimmed()
+            );
             return;
         }
         println!();
-        println!("{}", format!("Credentials ({} total):", entries.len()).bold().underline());
+        println!(
+            "{}",
+            format!("Credentials ({} total):", entries.len())
+                .bold()
+                .underline()
+        );
         println!();
-        println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
-            "ID".bold(), "Host".bold(), "Port".bold(), "Service".bold(),
-            "Username".bold(), "Secret".bold(), "Type".bold(), "Valid".bold());
+        println!(
+            "  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
+            "ID".bold(),
+            "Host".bold(),
+            "Port".bold(),
+            "Service".bold(),
+            "Username".bold(),
+            "Secret".bold(),
+            "Type".bold(),
+            "Valid".bold()
+        );
         println!("  {}", "-".repeat(100).dimmed());
         for e in &entries {
             let valid_str = if e.valid { "yes".green() } else { "no".red() };
-            println!("  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
-                e.id, e.host, e.port, e.service, e.username,
-                if e.secret.chars().count() > 18 { format!("{}...", e.secret.chars().take(15).collect::<String>()) } else { e.secret.clone() },
-                e.cred_type, valid_str);
+            println!(
+                "  {:<10} {:<18} {:<6} {:<10} {:<16} {:<20} {:<10} {}",
+                e.id,
+                e.host,
+                e.port,
+                e.service,
+                e.username,
+                if e.secret.chars().count() > 18 {
+                    format!("{}...", e.secret.chars().take(15).collect::<String>())
+                } else {
+                    e.secret.clone()
+                },
+                e.cred_type,
+                valid_str
+            );
         }
         println!();
     }
@@ -320,13 +356,26 @@ impl CredStore {
             return;
         }
         println!();
-        println!("{}", format!("Found {} credential(s):", results.len()).bold());
+        println!(
+            "{}",
+            format!("Found {} credential(s):", results.len()).bold()
+        );
         println!();
         for e in results {
-            println!("  [{}] {}@{}:{} ({}) - {} [{}]",
-                e.id.yellow(), e.username.green(), e.host, e.port,
-                e.service, e.cred_type,
-                if e.valid { "valid".green() } else { "invalid".red() });
+            println!(
+                "  [{}] {}@{}:{} ({}) - {} [{}]",
+                e.id.yellow(),
+                e.username.green(),
+                e.host,
+                e.port,
+                e.service,
+                e.cred_type,
+                if e.valid {
+                    "valid".green()
+                } else {
+                    "invalid".red()
+                }
+            );
         }
         println!();
     }

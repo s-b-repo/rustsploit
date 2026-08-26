@@ -22,7 +22,7 @@ use crate::native::payload_engine::{self as payload_mutator, PayloadCategory};
 /// `ModuleOutcome` instead of only the on-disk result files.
 pub(super) type FindingSink = Arc<tokio::sync::Mutex<Vec<Finding>>>;
 
-use super::config::{Endpoint, ScanConfig, ScanModule, SPOOF_HEADERS};
+use super::config::{Endpoint, SPOOF_HEADERS, ScanConfig, ScanModule};
 use super::idenum::perform_id_enumeration;
 use super::request::RequestSpec;
 use super::request::perform_request;
@@ -87,7 +87,13 @@ pub(super) async fn scan_endpoint(
             match module {
                 ScanModule::Baseline => {
                     scan_method(
-                        client, &url, method.clone(), &endpoint_dir, &method_str, config, findings,
+                        client,
+                        &url,
+                        method.clone(),
+                        &endpoint_dir,
+                        &method_str,
+                        config,
+                        findings,
                     )
                     .await;
                 }
@@ -105,7 +111,8 @@ pub(super) async fn scan_endpoint(
                 }
                 ScanModule::SQLi => {
                     if let Some(payloads) = &config.sqli_payloads {
-                        let effective = expand_with_mutations(payloads, PayloadCategory::SQLi, config);
+                        let effective =
+                            expand_with_mutations(payloads, PayloadCategory::SQLi, config);
                         for payload in &effective {
                             perform_injection(
                                 client,
@@ -142,7 +149,8 @@ pub(super) async fn scan_endpoint(
                 }
                 ScanModule::CMDi => {
                     if let Some(payloads) = &config.cmdi_payloads {
-                        let effective = expand_with_mutations(payloads, PayloadCategory::CMDi, config);
+                        let effective =
+                            expand_with_mutations(payloads, PayloadCategory::CMDi, config);
                         for payload in &effective {
                             perform_injection(
                                 client,
@@ -179,7 +187,12 @@ pub(super) async fn scan_endpoint(
                 }
                 ScanModule::IdEnumeration => {
                     perform_id_enumeration(
-                        client, &url, method.clone(), &endpoint_dir, config, findings,
+                        client,
+                        &url,
+                        method.clone(),
+                        &endpoint_dir,
+                        config,
+                        findings,
                     )
                     .await;
                 }

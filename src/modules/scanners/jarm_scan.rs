@@ -42,10 +42,22 @@ fn display_banner() {
     if crate::utils::is_batch_mode() {
         return;
     }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   JARM TLS Server Fingerprint                                ║".cyan());
-    crate::mprintln!("{}", "║   10-probe active TLS fingerprint (Salesforce JARM)           ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   JARM TLS Server Fingerprint                                ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   10-probe active TLS fingerprint (Salesforce JARM)           ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -80,22 +92,33 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if all_zero {
         crate::mprintln!(
             "{}",
-            format!("[-] No JARM response from {}:{} (host down, not TLS, or all probes rejected)", target, port)
-                .yellow()
+            format!(
+                "[-] No JARM response from {}:{} (host down, not TLS, or all probes rejected)",
+                target, port
+            )
+            .yellow()
         );
         crate::mprintln!("{}", format!("    JARM: {}", report.jarm).dimmed());
     } else {
         crate::mprintln!("{}", format!("[+] JARM: {}", report.jarm).green().bold());
         crate::mprintln!(
             "{}",
-            format!("[+] {}/{} probes elicited a ServerHello", responsive, report.probes.len()).green()
+            format!(
+                "[+] {}/{} probes elicited a ServerHello",
+                responsive,
+                report.probes.len()
+            )
+            .green()
         );
         if let Some(ref ja3s) = report.ja3s {
             crate::mprintln!("{}", format!("[+] JA3S: {}", ja3s).green());
         }
     }
     if let Some(ref ja3) = report.client_ja3 {
-        crate::mprintln!("{}", format!("[*] Client JA3 (this scan): {}", ja3).dimmed());
+        crate::mprintln!(
+            "{}",
+            format!("[*] Client JA3 (this scan): {}", ja3).dimmed()
+        );
     }
 
     outcome.findings.push(Finding {

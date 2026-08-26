@@ -12,15 +12,31 @@ use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::network::{build_http_client_with, HttpClientOpts};
-use crate::utils::{build_http_client, cfg_prompt_default, cfg_prompt_int_range, is_batch_mode, url_encode};
+use crate::utils::network::{HttpClientOpts, build_http_client_with};
+use crate::utils::{
+    build_http_client, cfg_prompt_default, cfg_prompt_int_range, is_batch_mode, url_encode,
+};
 
 fn banner() {
-    if is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   WordPress User Enumeration                                 ║".cyan());
-    crate::mprintln!("{}", "║   wp-json/users + ?author=N + oembed disclosure              ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   WordPress User Enumeration                                 ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   wp-json/users + ?author=N + oembed disclosure              ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -42,8 +58,11 @@ pub fn info() -> ModuleInfo {
 }
 
 fn url_with_scheme(t: &str) -> String {
-    if t.starts_with("http://") || t.starts_with("https://") { t.to_string() }
-    else { format!("https://{}", t.trim_end_matches('/')) }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        t.to_string()
+    } else {
+        format!("https://{}", t.trim_end_matches('/'))
+    }
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
@@ -55,7 +74,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     banner();
     let base = cfg_prompt_default("url", "Target base URL", &url_with_scheme(target)).await?;
     let base = base.trim_end_matches('/').to_string();
-    let max_author_id = cfg_prompt_int_range("max_author_id", "Max author ID for ?author=N probe", 10, 1, 200).await?;
+    let max_author_id = cfg_prompt_int_range(
+        "max_author_id",
+        "Max author ID for ?author=N probe",
+        10,
+        1,
+        200,
+    )
+    .await?;
 
     let client = build_http_client(Duration::from_secs(10))?;
     let mut users: Vec<(String, String, String)> = Vec::new(); // (id/source, slug, name)
@@ -66,7 +92,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", format!("[*] GET {}", url).cyan());
     if let Ok(r) = client.get(&url).send().await {
         let s = r.status().as_u16();
-        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        let body = match crate::utils::network::read_http_body_text_capped(
+            r,
+            crate::utils::safe_io::DEFAULT_BODY_CAP,
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);
@@ -74,17 +105,35 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
         };
         if s == 200 && body.starts_with('[') {
-            crate::mprintln!("{}", "[+] /wp-json/wp/v2/users returned a JSON array".green().bold());
+            crate::mprintln!(
+                "{}",
+                "[+] /wp-json/wp/v2/users returned a JSON array"
+                    .green()
+                    .bold()
+            );
             // crude id/slug/name extraction
             for chunk in body.split("\"id\":") {
                 let id: String = chunk.chars().take_while(|c| c.is_ascii_digit()).collect();
-                let slug = chunk.split("\"slug\":\"").nth(1).and_then(|s| s.split('"').next()).unwrap_or("").to_string();
-                let name = chunk.split("\"name\":\"").nth(1).and_then(|s| s.split('"').next()).unwrap_or("").to_string();
+                let slug = chunk
+                    .split("\"slug\":\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .unwrap_or("")
+                    .to_string();
+                let name = chunk
+                    .split("\"name\":\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .unwrap_or("")
+                    .to_string();
                 if !id.is_empty() && !slug.is_empty() {
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Note,
-                        message: format!("WP user disclosed via /wp-json/wp/v2/users id={} slug={} name={}", id, slug, name),
+                        message: format!(
+                            "WP user disclosed via /wp-json/wp/v2/users id={} slug={} name={}",
+                            id, slug, name
+                        ),
                         data: Some(serde_json::json!({
                             "vector": "wp_json_users",
                             "id": id,
@@ -96,44 +145,78 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 }
             }
         } else {
-            crate::mprintln!("{}", format!("[~] /wp-json/wp/v2/users -> {} ({})", s, body.chars().take(80).collect::<String>()).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[~] /wp-json/wp/v2/users -> {} ({})",
+                    s,
+                    body.chars().take(80).collect::<String>()
+                )
+                .dimmed()
+            );
         }
     }
 
     // 2) ?author=N redirect — use the framework client with redirects OFF so we
     //    can read the Location header. build_http_client already sets follow_redirects=false
     //    *and* honours --strict-tls; rolling our own would bypass both.
-    crate::mprintln!("{}", format!("[*] Probing ?author=1..{}", max_author_id).cyan());
-    let redir_client = build_http_client_with(Duration::from_secs(10), HttpClientOpts {
-        follow_redirects: false,
-        ..HttpClientOpts::permissive()
-    })?;
+    crate::mprintln!(
+        "{}",
+        format!("[*] Probing ?author=1..{}", max_author_id).cyan()
+    );
+    let redir_client = build_http_client_with(
+        Duration::from_secs(10),
+        HttpClientOpts {
+            follow_redirects: false,
+            ..HttpClientOpts::permissive()
+        },
+    )?;
     for n in 1..=max_author_id {
         let url = format!("{}/?author={}", base, n);
         if let Ok(r) = redir_client.get(&url).send().await
             && r.status().is_redirection()
-                && let Some(loc) = r.headers().get("location").and_then(|v| v.to_str().ok())
-                    && let Some(slug) = loc.split("/author/").nth(1).and_then(|s| s.split('/').next()) {
-                        crate::mprintln!("{}", format!("[+] ?author={} -> /author/{} (slug)", n, slug).green());
-                        users.push((format!("?author={}", n), slug.to_string(), String::new()));
-                        outcome.findings.push(Finding {
-                            target: target.to_string(),
-                            kind: FindingKind::Note,
-                            message: format!("WP user slug leak: ?author={} -> /author/{}", n, slug),
-                            data: Some(serde_json::json!({
-                                "vector": "author_redirect",
-                                "author_id": n,
-                                "slug": slug,
-                            })),
-                        });
-                    }
+            && let Some(loc) = r.headers().get("location").and_then(|v| v.to_str().ok())
+            && let Some(slug) = loc
+                .split("/author/")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+        {
+            crate::mprintln!(
+                "{}",
+                format!("[+] ?author={} -> /author/{} (slug)", n, slug).green()
+            );
+            users.push((format!("?author={}", n), slug.to_string(), String::new()));
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Note,
+                message: format!("WP user slug leak: ?author={} -> /author/{}", n, slug),
+                data: Some(serde_json::json!({
+                    "vector": "author_redirect",
+                    "author_id": n,
+                    "slug": slug,
+                })),
+            });
+        }
     }
 
     // 3) oembed author disclosure (needs a known post URL — try /?p=1 redirect first)
     let probe = format!("{}/?p=1", base);
-    if let Ok(r) = client.get(format!("{}/wp-json/oembed/1.0/embed?url={}", base, url_encode(&probe))).send().await {
+    if let Ok(r) = client
+        .get(format!(
+            "{}/wp-json/oembed/1.0/embed?url={}",
+            base,
+            url_encode(&probe)
+        ))
+        .send()
+        .await
+    {
         let s = r.status().as_u16();
-        let body = match crate::utils::network::read_http_body_text_capped(r, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        let body = match crate::utils::network::read_http_body_text_capped(
+            r,
+            crate::utils::safe_io::DEFAULT_BODY_CAP,
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);
@@ -141,21 +224,41 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             }
         };
         if s == 200 && body.contains("author_name") {
-            let author_name = body.split("\"author_name\":\"").nth(1)
-                .and_then(|s| s.split('"').next()).unwrap_or("").to_string();
-            let author_url = body.split("\"author_url\":\"").nth(1)
-                .and_then(|s| s.split('"').next()).unwrap_or("").to_string();
+            let author_name = body
+                .split("\"author_name\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            let author_url = body
+                .split("\"author_url\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+                .to_string();
             // derive slug from /author/<slug> in the author_url if present
-            let slug = author_url.split("/author/").nth(1)
+            let slug = author_url
+                .split("/author/")
+                .nth(1)
                 .and_then(|s| s.trim_end_matches('/').split('/').next())
-                .unwrap_or("").to_string();
-            crate::mprintln!("{}", format!("[+] oembed disclosed author for {}: name='{}' url='{}'",
-                probe, author_name, author_url).green());
+                .unwrap_or("")
+                .to_string();
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[+] oembed disclosed author for {}: name='{}' url='{}'",
+                    probe, author_name, author_url
+                )
+                .green()
+            );
             users.push(("oembed".to_string(), slug.clone(), author_name.clone()));
             outcome.findings.push(Finding {
                 target: target.to_string(),
                 kind: FindingKind::Note,
-                message: format!("WP author disclosed via oembed: name={} url={}", author_name, author_url),
+                message: format!(
+                    "WP author disclosed via oembed: name={} url={}",
+                    author_name, author_url
+                ),
                 data: Some(serde_json::json!({
                     "vector": "oembed",
                     "author_name": author_name,
@@ -178,6 +281,5 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     Ok(outcome)
 }
-
 
 crate::register_native_module!(crate::module::Category::Scanners, "wp_user_enum", native);

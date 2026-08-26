@@ -5,14 +5,16 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context, anyhow};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{
+    cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port, cfg_prompt_yes_no,
+};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::time::Duration;
-use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::module_info::{ModuleInfo, ModuleRank};
+use tokio::time::timeout;
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -24,7 +26,8 @@ pub fn info() -> ModuleInfo {
         authors: vec!["rustsploit contributors".into()],
         references: vec![
             "https://www.rfc-editor.org/rfc/rfc6143".into(),
-            "https://book.hacktricks.wiki/en/network-services-pentesting/pentesting-vnc.html".into(),
+            "https://book.hacktricks.wiki/en/network-services-pentesting/pentesting-vnc.html"
+                .into(),
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
@@ -33,11 +36,25 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   VNC Security Scanner                                       ║".cyan());
-    crate::mprintln!("{}", "║   Enumerate VNC versions and security types                  ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   VNC Security Scanner                                       ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Enumerate VNC versions and security types                  ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -62,11 +79,7 @@ fn security_type_name(t: u8) -> &'static str {
 }
 
 /// Scan a single VNC target and return findings
-async fn scan_vnc(
-    target: &str,
-    port: u16,
-    timeout_dur: Duration,
-) -> Result<VncResult> {
+async fn scan_vnc(target: &str, port: u16, timeout_dur: Duration) -> Result<VncResult> {
     let addr = format!("{}:{}", target, port);
 
     let mut stream = crate::utils::network::tcp_connect_str(&addr, timeout_dur)
@@ -84,13 +97,17 @@ async fn scan_vnc(
         return Err(anyhow!("Short read for VNC version ({} bytes)", n));
     }
 
-    let server_version = String::from_utf8_lossy(&version_buf[..n]).trim().to_string();
+    let server_version = String::from_utf8_lossy(&version_buf[..n])
+        .trim()
+        .to_string();
     if !server_version.starts_with("RFB ") {
         return Err(anyhow!("Not a VNC server (got: {})", server_version));
     }
 
     // Step 2: Send back the same version
-    stream.write_all(&version_buf[..n]).await
+    stream
+        .write_all(&version_buf[..n])
+        .await
         .context("Failed to send VNC version")?;
     stream.flush().await?;
 
@@ -120,7 +137,8 @@ async fn scan_vnc(
                 // Error: read reason string (length + message)
                 if sec_n > 8 {
                     let msg_len = std::cmp::min(
-                        u32::from_be_bytes([sec_buf[4], sec_buf[5], sec_buf[6], sec_buf[7]]) as usize,
+                        u32::from_be_bytes([sec_buf[4], sec_buf[5], sec_buf[6], sec_buf[7]])
+                            as usize,
                         sec_n.saturating_sub(8),
                     );
                     error_msg = Some(String::from_utf8_lossy(&sec_buf[8..8 + msg_len]).to_string());
@@ -183,9 +201,14 @@ struct VncResult {
 
 impl std::fmt::Display for VncResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{} | {} | Security: [{}]",
-            self.host, self.port, self.version,
-            self.security_types.iter()
+        write!(
+            f,
+            "{}:{} | {} | Security: [{}]",
+            self.host,
+            self.port,
+            self.version,
+            self.security_types
+                .iter()
                 .map(|t| format!("{}({})", t, security_type_name(*t)))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -201,15 +224,24 @@ impl std::fmt::Display for VncResult {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
 
     display_banner();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     let port = cfg_prompt_port("port", "VNC port", 5900).await?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 30).await? as u64;
-    let scan_display_range = cfg_prompt_yes_no("scan_range", "Scan display range :0-:10 (ports 5900-5910)?", false).await?;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 300).await? as u64;
+    let scan_display_range = cfg_prompt_yes_no(
+        "scan_range",
+        "Scan display range :0-:10 (ports 5900-5910)?",
+        false,
+    )
+    .await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
 
     let timeout_dur = Duration::from_secs(timeout_secs);
@@ -224,15 +256,25 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut outcome = ModuleOutcome::ok();
 
     for p in &ports {
-        if crate::context::is_cancelled() { break; }
+        if crate::context::is_cancelled() {
+            break;
+        }
         let display_num = p - 5900;
         crate::mprintln!();
-        crate::mprintln!("{}", format!("[*] Scanning {}:{} (display :{})", target, p, display_num).bold());
+        crate::mprintln!(
+            "{}",
+            format!("[*] Scanning {}:{} (display :{})", target, p, display_num).bold()
+        );
 
         match scan_vnc(target, *p, timeout_dur).await {
             Ok(result) => {
                 if result.no_auth {
-                    crate::mprintln!("{}", format!("[+] {} - NO AUTHENTICATION REQUIRED!", result).red().bold());
+                    crate::mprintln!(
+                        "{}",
+                        format!("[+] {} - NO AUTHENTICATION REQUIRED!", result)
+                            .red()
+                            .bold()
+                    );
                     crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
                         host: target.to_string(),
                         port: *p,
@@ -294,7 +336,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 // Print security type details
                 for t in &result.security_types {
                     let name = security_type_name(*t);
-                    let indicator = if *t == 1 { "[!!!]".red().bold() } else { "[*]".dimmed() };
+                    let indicator = if *t == 1 {
+                        "[!!!]".red().bold()
+                    } else {
+                        "[*]".dimmed()
+                    };
                     crate::mprintln!("  {} Type {}: {}", indicator, t, name);
                 }
 
@@ -313,24 +359,41 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("  VNC found:        {}", results.len().to_string().green());
     let no_auth_count = results.iter().filter(|r| r.no_auth).count();
     if no_auth_count > 0 {
-        crate::mprintln!("  No-auth servers:  {}", no_auth_count.to_string().red().bold());
+        crate::mprintln!(
+            "  No-auth servers:  {}",
+            no_auth_count.to_string().red().bold()
+        );
         crate::mprintln!();
-        crate::mprintln!("{}", "[!] WARNING: VNC servers with no authentication allow full remote desktop access!".red().bold());
+        crate::mprintln!(
+            "{}",
+            "[!] WARNING: VNC servers with no authentication allow full remote desktop access!"
+                .red()
+                .bold()
+        );
     }
 
     if save_results && !results.is_empty() {
-        let default_name = format!("vnc_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
-        let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
-        let content = results.iter()
+        let default_name = format!(
+            "vnc_scan_results_{}.txt",
+            target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+        );
+        let output_path =
+            cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
+        let content = results
+            .iter()
             .map(|r| r.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        tokio::fs::write(&output_path, content).await
+        tokio::fs::write(&output_path, content)
+            .await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
         if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
             crate::meprintln!("[!] Failed to set file permissions: {}", e);
         }
-        crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
+        crate::mprintln!(
+            "{}",
+            format!("[+] Results saved to '{}'", output_path).green()
+        );
     }
 
     Ok(outcome)

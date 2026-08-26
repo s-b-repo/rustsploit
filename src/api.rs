@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     body::Bytes,
     extract::Path as AxumPath,
     http::{Method, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
     routing::{any, get, post},
-    Router,
 };
 use colored::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
@@ -20,7 +20,9 @@ use tower_http::trace::TraceLayer;
 pub(crate) fn validate_module_name(module: &str) -> bool {
     !module.is_empty()
         && module.len() <= 256
-        && module.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '/' | '_' | '-'))
+        && module
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '/' | '_' | '-'))
 }
 
 pub(crate) fn validate_target(target: &str) -> bool {
@@ -54,9 +56,7 @@ pub(crate) fn is_blocked_target(target: &str) -> bool {
     // Try proper URL parsing first — handles @, port, scheme correctly
     let host_no_port = if let Ok(parsed) = url::Url::parse(&lower) {
         // Percent-decode the host and check it
-        parsed.host_str().map(|h| {
-            percent_decode_host(h)
-        })
+        parsed.host_str().map(|h| percent_decode_host(h))
     } else {
         None
     };
@@ -133,15 +133,14 @@ fn percent_decode_host(host: &str) -> String {
     let bytes = host.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (
-                hex_val(bytes[i + 1]),
-                hex_val(bytes[i + 2]),
-            ) {
-                result.push((hi << 4 | lo) as char);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            result.push((hi << 4 | lo) as char);
+            i += 3;
+            continue;
+        }
         result.push(bytes[i] as char);
         i += 1;
     }
@@ -168,10 +167,7 @@ fn check_blocked_hostname(host: &str) -> bool {
         ("metadata.azure.com", ".metadata.azure.com"),
         ("metadata.oraclecloud.com", ".metadata.oraclecloud.com"),
     ];
-    const BLOCKED_HOST_EXACT: &[&str] = &[
-        "metadata",
-        "instance-data",
-    ];
+    const BLOCKED_HOST_EXACT: &[&str] = &["metadata", "instance-data"];
     const BLOCKED_WILDCARD_SUFFIXES: &[&str] = &[
         ".sslip.io",
         ".nip.io",
@@ -201,11 +197,19 @@ fn check_blocked_hostname(host: &str) -> bool {
 fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() { return true; }
+            if v6.is_loopback() {
+                return true;
+            }
             let segs = v6.segments();
-            if segs[0] == 0xfd00 && segs[1] == 0x0ec2 { return true; }
-            if segs[0] & 0xfe00 == 0xfc00 { return true; }
-            if segs[0] & 0xffc0 == 0xfe80 { return true; }
+            if segs[0] == 0xfd00 && segs[1] == 0x0ec2 {
+                return true;
+            }
+            if segs[0] & 0xfe00 == 0xfc00 {
+                return true;
+            }
+            if segs[0] & 0xffc0 == 0xfe80 {
+                return true;
+            }
             // Use to_ipv4() (not to_ipv4_mapped()) so both IPv4-mapped
             // (::ffff:a.b.c.d) and the deprecated IPv4-compatible (::a.b.c.d)
             // forms are unwrapped — otherwise ::127.0.0.1 bypasses the filter.
@@ -228,7 +232,7 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
         || (o[0] == 169 && o[1] == 254)         // 169.254.0.0/16 link-local
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
         || o == [168, 63, 129, 16]              // Azure wireserver metadata
-        || o == [100, 100, 100, 200]            // Alibaba metadata
+        || o == [100, 100, 100, 200] // Alibaba metadata
 }
 
 /// SSRF/resolution gate: resolve `target` and verify no resolved IP is blocked.
@@ -240,8 +244,14 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
 pub(crate) async fn ssrf_gate(target: &str) -> Result<(), (&'static str, String)> {
     match resolve_and_check(target).await {
         Ok(_) => Ok(()),
-        Err(msg) if msg.contains("blocked") => Err(("SSRF_BLOCKED", msg)),
-        Err(msg) => Err(("TARGET_ERROR", msg)),
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("blocked") {
+                Err(("SSRF_BLOCKED", msg))
+            } else {
+                Err(("TARGET_ERROR", msg))
+            }
+        }
     }
 }
 
@@ -249,14 +259,20 @@ pub(crate) async fn ssrf_gate(target: &str) -> Result<(), (&'static str, String)
 /// Returns the resolved addresses on success, or an error if blocked / unresolvable.
 /// Callers should connect to the returned addresses directly (not re-resolve)
 /// to prevent DNS rebinding attacks.
-pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::SocketAddr>> {
     // Multi-target (comma-separated): resolve and SSRF-check each element
     // individually; the whole list is rejected if any element is blocked or
     // fails to resolve. Without this, the list is fed to lookup_host as one
     // string, which always fails DNS and rejects even legitimate lists.
     if target.contains(',') {
+        const MAX_SSRF_TARGETS: usize = 16;
         let mut all = Vec::new();
-        for part in target.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        for part in target
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .take(MAX_SSRF_TARGETS)
+        {
             all.extend(Box::pin(resolve_and_check(part)).await?);
         }
         return Ok(all);
@@ -268,7 +284,7 @@ pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::Sock
     }
 
     if is_blocked_target(target) {
-        return Err("target blocked by SSRF filter".to_string());
+        return Err(anyhow::anyhow!("target blocked by SSRF filter"));
     }
     let lower = target.to_lowercase();
     let host_part = lower
@@ -284,12 +300,14 @@ pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::Sock
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::net::lookup_host(&lookup_addr),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(addrs)) => {
             let resolved: Vec<std::net::SocketAddr> = addrs.collect();
             for addr in &resolved {
                 if is_blocked_ip(addr.ip()) {
-                    return Err(format!("resolved IP {} is blocked", addr.ip()));
+                    return Err(anyhow::anyhow!("resolved IP {} is blocked", addr.ip()));
                 }
             }
             // Pin the validated IPs to the bare hostname so the subsequent module
@@ -322,19 +340,30 @@ pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::Sock
             Ok(resolved)
         }
         Ok(Err(e)) => {
-            tracing::debug!(target = lookup_addr, "SSRF resolve failed → blocking: {}", e);
-            Err(format!("DNS resolution failed: {}", e))
+            tracing::debug!(
+                target = lookup_addr,
+                "SSRF resolve failed → blocking: {}",
+                e
+            );
+            Err(anyhow::anyhow!("DNS resolution failed: {}", e))
         }
         Err(e) => {
-            tracing::debug!(target = lookup_addr, "SSRF resolve timed out (5s) → blocking: {e}");
-            Err(format!("DNS resolution timed out: {e}"))
+            tracing::debug!(
+                target = lookup_addr,
+                "SSRF resolve timed out (5s) → blocking: {e}"
+            );
+            Err(anyhow::anyhow!("DNS resolution timed out: {e}"))
         }
     }
 }
 
 pub(crate) fn contains_shell_metacharacters(input: &str) -> bool {
-    input.chars().any(|c| matches!(c, '&' | '|' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r' | '(' | ')' | '{' | '}'))
-        || input.contains("$(")
+    input.chars().any(|c| {
+        matches!(
+            c,
+            '&' | '|' | ';' | '`' | '$' | '>' | '<' | '\n' | '\r' | '(' | ')' | '{' | '}'
+        )
+    }) || input.contains("$(")
         || input.contains("${")
 }
 
@@ -345,7 +374,9 @@ pub(crate) fn validate_result_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains("..")
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         && !name.starts_with('.')
         && name.ends_with(".txt")
 }
@@ -370,30 +401,24 @@ async fn health_check() -> Json<serde_json::Value> {
 
 fn rpc_status(code: &str) -> StatusCode {
     match code {
-        "INVALID_INPUT" | "INVALID_OUTPUT_FILE" | "INVALID_JOB_ID" | "PARSE_ERROR"
-        | "INVALID_PORT" | "INVALID_CONCURRENCY" => {
-            StatusCode::BAD_REQUEST
-        }
+        "INVALID_INPUT"
+        | "INVALID_OUTPUT_FILE"
+        | "INVALID_JOB_ID"
+        | "PARSE_ERROR"
+        | "INVALID_PORT"
+        | "INVALID_CONCURRENCY" => StatusCode::BAD_REQUEST,
         "NOT_FOUND" | "MODULE_NOT_FOUND" | "METHOD_NOT_FOUND" => StatusCode::NOT_FOUND,
         "SSRF_BLOCKED" | "SECURITY" => StatusCode::FORBIDDEN,
         "TENANT_REJECTED" => StatusCode::SERVICE_UNAVAILABLE,
         // Genuine capacity/limit conflicts the caller can retry later.
-        "JOB_LIMIT" | "OPTION_LIMIT" | "SUB_LIMIT" | "SPOOL_BUSY" => {
-            StatusCode::CONFLICT
-        }
+        "JOB_LIMIT" | "OPTION_LIMIT" | "SUB_LIMIT" | "SPOOL_BUSY" => StatusCode::CONFLICT,
         "RATE_LIMIT" => StatusCode::TOO_MANY_REQUESTS,
         // Module / IO / serialization / persistence failures are server-side
         // runtime failures, not client conflicts. `OPTION_ERROR`/`TARGET_ERROR`/
         // `STORE_ERROR` mean "failed to persist", so they belong here (500), not
         // 409 — a 409 wrongly tells the client its request conflicts with state.
-        "MODULE_ERROR"
-        | "EXPORT_ERROR"
-        | "SPOOL_ERROR"
-        | "IO_ERROR"
-        | "STORE_ERROR"
-        | "OPTION_ERROR"
-        | "TARGET_ERROR"
-        | "SERIALIZE_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+        "MODULE_ERROR" | "EXPORT_ERROR" | "SPOOL_ERROR" | "IO_ERROR" | "STORE_ERROR"
+        | "OPTION_ERROR" | "TARGET_ERROR" | "SERIALIZE_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -501,6 +526,23 @@ async fn api_dispatcher(
             params.insert("path".to_string(), Value::String(module_path.to_string()));
             "module_info"
         }
+        // ArcticFox-compatible: POST /api/modules/{module}/run — module name in URL path.
+        ("POST", "modules", Some(_), Some("run")) => {
+            if let Some(module_name) = sub {
+                params.insert("module".to_string(), Value::String(module_name.to_string()));
+            }
+            body_into_params!(params, body_obj);
+            "run_module"
+        }
+        // ArcticFox-compatible: POST /api/modules/{module}/check — module check
+        // (runs module.check() if the module exposes one, otherwise returns 404).
+        ("POST", "modules", Some(_), Some("check")) => {
+            if let Some(module_name) = sub {
+                params.insert("module".to_string(), Value::String(module_name.to_string()));
+            }
+            body_into_params!(params, body_obj);
+            "check_module"
+        }
 
         // ── Run / Check / Honeypot ──────────────────────────────────
         ("POST", "run", None, _) => {
@@ -541,10 +583,18 @@ async fn api_dispatcher(
             let tenant_name = identity.client_name.clone();
             // Fail closed, same as the main dispatcher.
             if let Err(e) = crate::tenant::resolve_for(&tenant_name) {
-                return err_resp(StatusCode::SERVICE_UNAVAILABLE, "TENANT_REJECTED", &e);
+                return err_resp(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TENANT_REJECTED",
+                    &e.to_string(),
+                );
             }
             if body_obj.is_empty() {
-                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "Request body must list at least one option key to delete");
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "Request body must list at least one option key to delete",
+                );
             }
             let mut deleted = Vec::new();
             let mut errors = Vec::new();
@@ -565,8 +615,16 @@ async fn api_dispatcher(
                 let all_not_found = errors
                     .iter()
                     .all(|e| e.get("code").and_then(|c| c.as_str()) == Some("NOT_FOUND"));
-                let status = if all_not_found { StatusCode::NOT_FOUND } else { StatusCode::CONFLICT };
-                return (status, Json(json!({ "data": { "deleted": deleted, "errors": errors } }))).into_response();
+                let status = if all_not_found {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::CONFLICT
+                };
+                return (
+                    status,
+                    Json(json!({ "data": { "deleted": deleted, "errors": errors } })),
+                )
+                    .into_response();
             }
             return ok(json!({
                 "data": { "deleted": deleted, "errors": errors }
@@ -578,9 +636,10 @@ async fn api_dispatcher(
             merge_query!(params, query, ["host", "service", "search"]);
             merge_query_int!(params, query, ["limit", "offset"]);
             if let Some(v) = query.get("reveal")
-                && (v == "1" || v.eq_ignore_ascii_case("true")) {
-                    params.insert("reveal".to_string(), Value::Bool(true));
-                }
+                && (v == "1" || v.eq_ignore_ascii_case("true"))
+            {
+                params.insert("reveal".to_string(), Value::Bool(true));
+            }
             "list_creds"
         }
         ("GET", "creds", Some("search"), _) => {
@@ -594,6 +653,18 @@ async fn api_dispatcher(
         ("DELETE", "creds", None, _) => {
             body_into_params!(params, body_obj);
             "delete_cred"
+        }
+        ("POST", "creds", Some("import"), _) => {
+            // ArcticFox sends a raw JSON array of credentials.
+            // `body_into_params!` only works for objects; for arrays
+            // we stash the whole value under the "credentials" key so
+            // the handler can find it regardless of format.
+            if let Some(_arr) = body_value.as_array() {
+                params.insert("credentials".to_string(), body_value.clone());
+            } else {
+                body_into_params!(params, body_obj);
+            }
+            "creds_import"
         }
         ("POST", "creds", Some("clear"), _) => "clear_creds",
 
@@ -670,7 +741,11 @@ async fn api_dispatcher(
             if let Ok(n) = id.parse::<u64>() {
                 params.insert("id".to_string(), Value::Number(n.into()));
             } else {
-                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "job id must be numeric");
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "job id must be numeric",
+                );
             }
             merge_query_int!(params, query, ["from"]);
             "get_job"
@@ -679,7 +754,11 @@ async fn api_dispatcher(
             if let Ok(n) = id.parse::<u64>() {
                 params.insert("id".to_string(), Value::Number(n.into()));
             } else {
-                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "job id must be numeric");
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "job id must be numeric",
+                );
             }
             "kill_job"
         }
@@ -694,7 +773,11 @@ async fn api_dispatcher(
                     return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "invalid job id");
                 }
             } else {
-                return err_resp(StatusCode::BAD_REQUEST, "INVALID_INPUT", "job id is required");
+                return err_resp(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_INPUT",
+                    "job id is required",
+                );
             }
             "kill_job"
         }
@@ -763,7 +846,11 @@ async fn api_dispatcher(
     // MAX_TENANTS cap is hit), which would otherwise let a REST caller read and
     // write another tenant's loot/creds/options/jobs.
     if let Err(e) = crate::tenant::resolve_for(&identity.client_name) {
-        return err_resp(StatusCode::SERVICE_UNAVAILABLE, "TENANT_REJECTED", &e);
+        return err_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TENANT_REJECTED",
+            &e.to_string(),
+        );
     }
     crate::tenant::CURRENT_TENANT
         .scope(
@@ -789,8 +876,9 @@ pub async fn start_api_server(
     // one-time enrollment token printed at startup (see /pq/register-key),
     // not by the bind interface — the token is the sole authority that
     // permits the very first authorized_keys entry.
-    let host_identity = crate::pq_channel::HostIdentity::load_or_generate(host_key_path, passphrase)
-        .context("Failed to load/generate PQ host key")?;
+    let host_identity =
+        crate::pq_channel::HostIdentity::load_or_generate(host_key_path, passphrase)
+            .context("Failed to load/generate PQ host key")?;
 
     let authorized_keys = crate::pq_channel::load_authorized_keys(authorized_keys_path)
         .context("Failed to load authorized keys")?;
@@ -808,9 +896,15 @@ pub async fn start_api_server(
     println!("Host key fingerprint: {}", host_identity.fingerprint());
     println!("Authorized clients: {}", authorized_keys.len());
     for key in &authorized_keys {
-        println!("  {} ({})",
+        println!(
+            "  {} ({})",
             key.name,
-            crate::pq_channel::fingerprint(&[&key.x25519_public, &key.mlkem_ek, &key.mceliece_public]));
+            crate::pq_channel::fingerprint(&[
+                &key.x25519_public,
+                &key.mlkem_ek,
+                &key.mceliece_public
+            ])
+        );
     }
 
     // Generate a one-time enrollment token. Operators bootstrap remote
@@ -845,9 +939,10 @@ pub async fn start_api_server(
                 let mut out = Vec::new();
                 for (id, sess_arc) in store.iter() {
                     if let Ok(sess) = sess_arc.try_lock()
-                        && sess.last_activity.elapsed() >= std::time::Duration::from_secs(3600) {
-                            out.push(*id);
-                        }
+                        && sess.last_activity.elapsed() >= std::time::Duration::from_secs(3600)
+                    {
+                        out.push(*id);
+                    }
                 }
                 out
             };
@@ -855,13 +950,21 @@ pub async fn start_api_server(
                 let mut store = cleanup_sessions.write().await;
                 let mut n = 0usize;
                 for id in &doomed {
-                    if store.remove(id).is_some() { n += 1; }
+                    if store.remove(id).is_some() {
+                        n += 1;
+                    }
                 }
                 n
-            } else { 0 };
+            } else {
+                0
+            };
             if removed_n > 0 {
                 let remaining = cleanup_sessions.read().await.len();
-                tracing::info!("PQ session cleanup: removed {} idle sessions ({} remaining)", removed_n, remaining);
+                tracing::info!(
+                    "PQ session cleanup: removed {} idle sessions ({} remaining)",
+                    removed_n,
+                    remaining
+                );
             }
 
             let mut limiter = cleanup_rate_limiter.lock().await;
@@ -880,9 +983,14 @@ pub async fn start_api_server(
         // Specific routes BEFORE the catch-all so the dispatcher doesn't
         // swallow them. Identity revocation lives behind the PQ middleware
         // so the request is AEAD-authenticated by an existing client.
-        .route("/api/pq/revoke-key", post(crate::pq_middleware::revoke_key_handler))
+        .route(
+            "/api/pq/revoke-key",
+            post(crate::pq_middleware::revoke_key_handler),
+        )
         .route("/api/{*tail}", any(api_dispatcher))
-        .route_layer(axum::middleware::from_fn(crate::pq_middleware::pq_middleware));
+        .route_layer(axum::middleware::from_fn(
+            crate::pq_middleware::pq_middleware,
+        ));
 
     // Cap the JSON request body explicitly. Axum's default is 2 MiB, but we
     // pin it here so a future caller can't disable it upstream by accident.
@@ -890,16 +998,19 @@ pub async fn start_api_server(
 
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/pq/handshake", post(crate::pq_middleware::handshake_handler))
-        .route("/pq/register-key", post(crate::pq_middleware::register_key_handler))
+        .route(
+            "/pq/handshake",
+            post(crate::pq_middleware::handshake_handler),
+        )
+        .route(
+            "/pq/register-key",
+            post(crate::pq_middleware::register_key_handler),
+        )
         .route("/pq/ws", get(crate::ws::ws_upgrade))
         .merge(api_router)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .layer(axum::Extension(pq_state))
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http()),
-        );
+        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
     println!("Server running on http://{}", bind_address);
     println!("Transport: Post-Quantum encryption (ML-KEM-768 + X25519 + ChaCha20-Poly1305)");
@@ -907,14 +1018,33 @@ pub async fn start_api_server(
         "Endpoints: GET /health, POST /pq/handshake, POST /pq/register-key, GET /pq/ws, ALL /api/*"
     );
     println!();
-    println!("{}", "═══════════════════════════════════════════════════════════════".cyan());
-    println!("{} {}", "ENROLLMENT TOKEN (one-time, prints once):".yellow().bold(), enrollment_token_print.bright_white().bold());
-    println!("{}", "Bootstrap a client by POSTing its PQ public keys + this".dimmed());
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════════════════".cyan()
+    );
+    println!(
+        "{} {}",
+        "ENROLLMENT TOKEN (one-time, prints once):".yellow().bold(),
+        enrollment_token_print.bright_white().bold()
+    );
+    println!(
+        "{}",
+        "Bootstrap a client by POSTing its PQ public keys + this".dimmed()
+    );
     println!("{}", "token to POST /pq/register-key:".dimmed());
     println!("{}", "  { token, name, x25519_pub, mlkem_ek }".dimmed());
-    println!("{}", "After first successful registration the token is consumed; further".dimmed());
-    println!("{}", "key changes must go through the established PQ session.".dimmed());
-    println!("{}", "═══════════════════════════════════════════════════════════════".cyan());
+    println!(
+        "{}",
+        "After first successful registration the token is consumed; further".dimmed()
+    );
+    println!(
+        "{}",
+        "key changes must go through the established PQ session.".dimmed()
+    );
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════════════════".cyan()
+    );
     println!();
 
     let listener = tokio::net::TcpListener::bind(bind_address)

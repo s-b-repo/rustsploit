@@ -3,13 +3,13 @@
 //! VNC passwords are password-only (no usernames) and silently truncated
 //! to 8 bytes by the server.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 5900;
 
@@ -28,10 +28,9 @@ const DEFAULTS: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "VNC Password Bruteforce".to_string(),
-        description:
-            "Tests VNC RFB 3.x security-type 2 (DES challenge-response). Password-only — \
+        description: "Tests VNC RFB 3.x security-type 2 (DES challenge-response). Password-only — \
              server silently truncates to 8 bytes. Single-target — scheduler does fan-out."
-                .to_string(),
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec!["https://www.rfc-editor.org/rfc/rfc6143".to_string()],
         disclosure_date: None,
@@ -41,7 +40,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("vnc_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("vnc_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -71,15 +73,14 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
             return LoginResult::Error {
                 message: format!("connect: {e}"),
                 retryable: true,
-            }
+            };
         }
     };
 
     // Server sends 12-byte protocol-version banner (e.g. "RFB 003.008\n").
     let mut banner = [0u8; 12];
     if let Err(e) =
-        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut banner, timeout)
-            .await
+        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut banner, timeout).await
     {
         return LoginResult::Error {
             message: format!("read banner: {e}"),
@@ -110,7 +111,8 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
         // RFB 3.7/3.8: 1-byte count, then `count` type bytes; client selects one.
         let mut nsec = [0u8; 1];
         if let Err(e) =
-            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut nsec, timeout).await
+            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut nsec, timeout)
+                .await
         {
             return LoginResult::Error {
                 message: format!("read sec count: {e}"),
@@ -140,7 +142,10 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
             } else {
                 format!("server doesn't offer VNC auth (type 2); offered {sec_types:?}")
             };
-            return LoginResult::Error { message: msg, retryable: false };
+            return LoginResult::Error {
+                message: msg,
+                retryable: false,
+            };
         }
         if let Err(e) = stream.write_all(&[2u8]).await {
             return LoginResult::Error {
@@ -153,7 +158,8 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
         // selection. The challenge (for type 2) follows directly.
         let mut sec = [0u8; 4];
         if let Err(e) =
-            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut sec, timeout).await
+            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut sec, timeout)
+                .await
         {
             return LoginResult::Error {
                 message: format!("read sec type: {e}"),
@@ -166,14 +172,14 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
                 return LoginResult::Error {
                     message: "VNC requires no authentication (open access)".to_string(),
                     retryable: false,
-                }
+                };
             }
             0 => return LoginResult::AuthFailed, // invalid/refused; reason follows
             other => {
                 return LoginResult::Error {
                     message: format!("unexpected RFB 3.3 security type {other}"),
                     retryable: false,
-                }
+                };
             }
         }
     }
@@ -204,7 +210,7 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
             return LoginResult::Error {
                 message: "DES init failed".to_string(),
                 retryable: false,
-            }
+            };
         }
     };
     let mut response = [0u8; 16];
@@ -217,7 +223,7 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
                 return LoginResult::Error {
                     message: "DES block build failed".to_string(),
                     retryable: false,
-                }
+                };
             }
         };
         let mut block = block;
@@ -233,12 +239,9 @@ async fn probe(host: &str, port: u16, pass: &str, timeout: Duration) -> LoginRes
 
     // 4-byte SecurityResult (0 = OK, 1 = failed).
     let mut sec_result = [0u8; 4];
-    if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-        &mut stream,
-        &mut sec_result,
-        timeout,
-    )
-    .await
+    if let Err(e) =
+        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut sec_result, timeout)
+            .await
     {
         return LoginResult::Error {
             message: format!("read result: {e}"),
@@ -267,4 +270,8 @@ fn rfb_minor(banner: &[u8; 12]) -> u32 {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/vnc_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/vnc_bruteforce",
+    native
+);

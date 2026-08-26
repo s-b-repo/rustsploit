@@ -1,12 +1,12 @@
 //! MQTT v3.1.1 CONNECT credential probe.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 1883;
 
@@ -37,7 +37,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("mqtt_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("mqtt_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -62,7 +65,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("connect: {e}"),
                 retryable: true,
-            }
+            };
         }
     };
 
@@ -98,12 +101,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     // Read CONNACK fixed header (1 byte) + remaining length (1 byte) +
     // session-present (1) + return code (1).
     let mut buf = [0u8; 4];
-    if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-        &mut stream,
-        &mut buf,
-        timeout,
-    )
-    .await
+    if let Err(e) =
+        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut buf, timeout).await
     {
         return LoginResult::Error {
             message: format!("read CONNACK: {e}"),
@@ -131,7 +130,10 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
     let len = match u16::try_from(bytes.len()) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("MQTT string too long ({} bytes), truncating length to u16::MAX: {e}", bytes.len());
+            tracing::warn!(
+                "MQTT string too long ({} bytes), truncating length to u16::MAX: {e}",
+                bytes.len()
+            );
             u16::MAX
         }
     };
@@ -153,4 +155,8 @@ fn encode_remaining_length(buf: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/mqtt_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/mqtt_bruteforce",
+    native
+);

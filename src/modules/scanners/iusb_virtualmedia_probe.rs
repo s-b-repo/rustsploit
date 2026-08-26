@@ -20,30 +20,43 @@
 //!
 //! FOR AUTHORIZED TESTING ONLY.
 
-use anyhow::{ anyhow, Context, Result };
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::time::Duration;
-use tokio::io::{ AsyncReadExt, AsyncWriteExt };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{ModuleInfo, ModuleRank };
-use crate::utils::{
-    cfg_prompt_default,
-    cfg_prompt_int_range,
-    cfg_prompt_yes_no,
-};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no};
 
 const DEFAULT_PORTS: &[u16] = &[5120, 5123, 5124, 5126, 5127];
 const HANDSHAKE: &[u8] = b"IUSB\x20\x20\x20\x20\x00\x00\x00\x00";
 const PROBE_TIMEOUT_MS: u64 = 5_000;
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   IUSB Virtual-Media Protocol Probe                          ║".cyan());
-    crate::mprintln!("{}", "║   Detects BMC virtual-media services on 5120/5123/5124/...   ║".cyan());
-    crate::mprintln!("{}", "║   Plaintext + TLS handshake, reports each speaking port      ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   IUSB Virtual-Media Protocol Probe                          ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Detects BMC virtual-media services on 5120/5123/5124/...   ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Plaintext + TLS handshake, reports each speaking port      ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -82,9 +95,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let port_input = cfg_prompt_default(
         "ports",
         "Ports to probe (comma-separated)",
-        &DEFAULT_PORTS.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
-    ).await?;
-    let ports: Vec<u16> = port_input.split(',')
+        &DEFAULT_PORTS
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+    .await?;
+    let ports: Vec<u16> = port_input
+        .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
     if ports.is_empty() {
@@ -92,7 +111,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     let try_tls = cfg_prompt_yes_no("try_tls", "Also try TLS-wrapped handshake?", true).await?;
-    let timeout_ms = cfg_prompt_int_range("timeout_ms", "Per-port timeout (ms)", PROBE_TIMEOUT_MS as i64, 500, 30_000).await? as u64;
+    let timeout_ms = cfg_prompt_int_range(
+        "timeout_ms",
+        "Per-port timeout (ms)",
+        PROBE_TIMEOUT_MS as i64,
+        500,
+        30_000,
+    )
+    .await? as u64;
 
     let host = sanitize_host(target);
     let mut hits = 0usize;
@@ -107,8 +133,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 outcome.findings.push(Finding {
                     target: host.clone(),
                     kind: FindingKind::Vulnerable,
-                    message: format!("IUSB virtual-media reachable at {}:{} (plaintext)", host, port),
-                    data: Some(serde_json::json!({"host": host, "port": port, "transport": "plaintext"})),
+                    message: format!(
+                        "IUSB virtual-media reachable at {}:{} (plaintext)",
+                        host, port
+                    ),
+                    data: Some(
+                        serde_json::json!({"host": host, "port": port, "transport": "plaintext"}),
+                    ),
                 });
                 continue;
             }
@@ -139,8 +170,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     crate::mprintln!();
     if hits > 0 {
-        crate::mprintln!("{}", format!("[!] {} IUSB-speaking port(s) — virtual-media is reachable.", hits).red().bold());
-        crate::mprintln!("{}", "    Pair with valid BMC credentials to mount a remote ISO.".yellow());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[!] {} IUSB-speaking port(s) — virtual-media is reachable.",
+                hits
+            )
+            .red()
+            .bold()
+        );
+        crate::mprintln!(
+            "{}",
+            "    Pair with valid BMC credentials to mount a remote ISO.".yellow()
+        );
     } else {
         crate::mprintln!("{}", "[*] No IUSB-speaking ports detected.".cyan());
     }
@@ -164,13 +206,17 @@ async fn probe_one_with_timeout(host: &str, port: u16, tls: bool, timeout_ms: u6
         // versions — fall back to a plain "localhost" sentinel since we
         // disabled cert verification anyway.
         let server_name = ServerName::try_from(host.to_string())
-            .or_else(|_| ServerName::try_from("localhost".to_string()))
+            .or_else(|e| {
+                tracing::debug!("VirtualMedia SNI parse failed ({e:#}), falling back to localhost");
+                ServerName::try_from("localhost".to_string())
+            })
             .context("ServerName")?;
-        let mut tls_stream = match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(anyhow!(e)),
-            Err(e) => return Err(anyhow!("TLS handshake timed out: {e}")),
-        };
+        let mut tls_stream =
+            match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(anyhow!(e)),
+                Err(e) => return Err(anyhow!("TLS handshake timed out: {e}")),
+            };
         match tokio::time::timeout(timeout, tls_stream.write_all(HANDSHAKE)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(anyhow!(e)),
@@ -179,9 +225,18 @@ async fn probe_one_with_timeout(host: &str, port: u16, tls: bool, timeout_ms: u6
         let mut buf = [0u8; 64];
         match tokio::time::timeout(timeout, tls_stream.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => Ok(buf[..n].windows(4).any(|w| w == b"IUSB")),
-            Ok(Ok(n)) => { tracing::trace!("TLS read returned {n} bytes (no IUSB match)"); Ok(false) }
-            Ok(Err(e)) => { tracing::debug!("TLS read error: {e}"); Ok(false) }
-            Err(e) => { tracing::debug!("timeout: {e}"); Ok(false) }
+            Ok(Ok(n)) => {
+                tracing::trace!("TLS read returned {n} bytes (no IUSB match)");
+                Ok(false)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("TLS read error: {e}");
+                Ok(false)
+            }
+            Err(e) => {
+                tracing::debug!("timeout: {e}");
+                Ok(false)
+            }
         }
     } else {
         let mut sock = crate::utils::network::tcp_connect_str(&addr, timeout)
@@ -195,9 +250,18 @@ async fn probe_one_with_timeout(host: &str, port: u16, tls: bool, timeout_ms: u6
         let mut buf = [0u8; 64];
         match tokio::time::timeout(timeout, sock.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => Ok(buf[..n].windows(4).any(|w| w == b"IUSB")),
-            Ok(Ok(n)) => { tracing::trace!("TCP read returned {n} bytes (no IUSB match)"); Ok(false) }
-            Ok(Err(e)) => { tracing::debug!("TCP read error: {e}"); Ok(false) }
-            Err(e) => { tracing::debug!("timeout: {e}"); Ok(false) }
+            Ok(Ok(n)) => {
+                tracing::trace!("TCP read returned {n} bytes (no IUSB match)");
+                Ok(false)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("TCP read error: {e}");
+                Ok(false)
+            }
+            Err(e) => {
+                tracing::debug!("timeout: {e}");
+                Ok(false)
+            }
         }
     }
 }
@@ -210,9 +274,17 @@ fn sanitize_host(target: &str) -> String {
             break;
         }
     }
-    if let Some(slash) = t.find('/') { t.truncate(slash); }
-    if let Some(colon) = t.find(':') { t.truncate(colon); }
+    if let Some(slash) = t.find('/') {
+        t.truncate(slash);
+    }
+    if let Some(colon) = t.find(':') {
+        t.truncate(colon);
+    }
     t
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "iusb_virtualmedia_probe", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "iusb_virtualmedia_probe",
+    native
+);

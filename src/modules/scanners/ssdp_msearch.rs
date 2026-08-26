@@ -1,17 +1,15 @@
-use anyhow::{Context, Result};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use colored::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 
+use crate::utils::{cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port, cfg_prompt_yes_no};
 use std::net::SocketAddr;
 use std::time::Instant;
-use tokio::time::{timeout as tokio_timeout, Duration};
-use crate::utils::{
-    cfg_prompt_port, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_default,
-};
+use tokio::time::{Duration, timeout as tokio_timeout};
 
 /// SSDP Search Target types
 #[derive(Clone, Debug)]
@@ -32,23 +30,41 @@ impl SearchTarget {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   SSDP M-SEARCH Scanner                                      ║".cyan());
-    crate::mprintln!("{}", "║   Discovers UPnP devices via SSDP protocol                   ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   SSDP M-SEARCH Scanner                                      ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Discovers UPnP devices via SSDP protocol                   ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
 
     display_banner();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-    
+
     let port = cfg_prompt_port("port", "Enter custom port", 1900).await?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout in seconds", 3, 1, 60).await? as u64;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Timeout in seconds", 3, 1, 60).await? as u64;
     let retries = cfg_prompt_int_range("retries", "Number of retries", 1, 1, 10).await? as u32;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
@@ -59,19 +75,28 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .with_context(|| format!("Failed to normalize target '{}'", target))?;
 
     // Determine search targets
-    let search_target_choice = cfg_prompt_default("search_target", "SSDP Search Target (1=rootdevice, 2=all, 3=custom, 4=both)", "1").await?;
+    let search_target_choice = cfg_prompt_default(
+        "search_target",
+        "SSDP Search Target (1=rootdevice, 2=all, 3=custom, 4=both)",
+        "1",
+    )
+    .await?;
     let search_targets = match search_target_choice.as_str() {
         "2" => vec![SearchTarget::All],
         "3" => {
-            let custom_st = cfg_prompt_default("custom_st", "Enter custom ST", "upnp:rootdevice").await?;
+            let custom_st =
+                cfg_prompt_default("custom_st", "Enter custom ST", "upnp:rootdevice").await?;
             vec![SearchTarget::Custom(custom_st)]
-        },
+        }
         "4" => vec![SearchTarget::RootDevice, SearchTarget::All],
         _ => vec![SearchTarget::RootDevice],
     };
 
     crate::mprintln!();
-    crate::mprintln!("{}", format!("[*] Sending SSDP M-SEARCH to {}:{}...", target, port).bold());
+    crate::mprintln!(
+        "{}",
+        format!("[*] Sending SSDP M-SEARCH to {}:{}...", target, port).bold()
+    );
 
     let mut found_any = false;
     let mut results = Vec::new();
@@ -82,8 +107,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if search_targets.len() > 1 {
             crate::mprintln!(
                 "{}",
-                format!("[*] Trying ST: {} ({}/{})", st.st_header(), idx + 1, search_targets.len())
-                    .cyan()
+                format!(
+                    "[*] Trying ST: {} ({}/{})",
+                    st.st_header(),
+                    idx + 1,
+                    search_targets.len()
+                )
+                .cyan()
             );
         }
 
@@ -92,7 +122,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 crate::mprintln!("  [*] Attempt {}/{}", attempt, retries);
             }
 
-            match send_ssdp_request(&target, port, st, Duration::from_secs(timeout_secs), verbose).await {
+            match send_ssdp_request(
+                &target,
+                port,
+                st,
+                Duration::from_secs(timeout_secs),
+                verbose,
+            )
+            .await
+            {
                 Ok(Some(response)) => {
                     found_any = true;
                     let result = parse_ssdp_response(&response, &target, port, st.st_header());
@@ -139,31 +177,54 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("  Target:           {}:{}", target, port);
     crate::mprintln!("  Search types:     {}", search_targets.len());
     crate::mprintln!("  Retries:          {}", retries);
-    crate::mprintln!("  Devices found:    {}", if found_any { 
-        results.len().to_string().green().to_string() 
-    } else { 
-        "0".red().to_string() 
-    });
+    crate::mprintln!(
+        "  Devices found:    {}",
+        if found_any {
+            results.len().to_string().green().to_string()
+        } else {
+            "0".red().to_string()
+        }
+    );
     crate::mprintln!("  Duration:         {:.2}s", elapsed.as_secs_f64());
 
     if !found_any {
         crate::mprintln!();
-        crate::mprintln!("{}", "[-] Target did not respond to any M-SEARCH requests".yellow());
+        crate::mprintln!(
+            "{}",
+            "[-] Target did not respond to any M-SEARCH requests".yellow()
+        );
     }
 
     // Save results if requested
     if save_results && !results.is_empty() {
-        let filename = format!("ssdp_scan_{}.txt", target.replace([':', '.', '[', ']'], "_"));
+        let filename = format!(
+            "ssdp_scan_{}.txt",
+            target.replace([':', '.', '[', ']'], "_")
+        );
         if let Ok(mut file) = File::create(&filename) {
             if let Err(e) = crate::utils::set_secure_permissions(&filename, 0o600) {
-                crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", filename, e);
+                crate::meprintln!(
+                    "[!] Failed to chmod 0o600 on {}: {} — file may be world-readable",
+                    filename,
+                    e
+                );
             }
-            if let Err(e) = writeln!(file, "SSDP M-SEARCH Scan Results") { tracing::debug!("ssdp log write: {e}"); }
-            if let Err(e) = writeln!(file, "Target: {}:{}", target, port) { tracing::debug!("ssdp log write: {e}"); }
-            if let Err(e) = writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()) { tracing::debug!("ssdp log write: {e}"); }
-            if let Err(e) = writeln!(file) { tracing::debug!("ssdp log write: {e}"); }
+            if let Err(e) = writeln!(file, "SSDP M-SEARCH Scan Results") {
+                tracing::debug!("ssdp log write: {e}");
+            }
+            if let Err(e) = writeln!(file, "Target: {}:{}", target, port) {
+                tracing::debug!("ssdp log write: {e}");
+            }
+            if let Err(e) = writeln!(file, "Duration: {:.2}s", elapsed.as_secs_f64()) {
+                tracing::debug!("ssdp log write: {e}");
+            }
+            if let Err(e) = writeln!(file) {
+                tracing::debug!("ssdp log write: {e}");
+            }
             for result in &results {
-                if let Err(e) = writeln!(file, "{}", result) { tracing::debug!("ssdp log write: {e}"); }
+                if let Err(e) = writeln!(file, "{}", result) {
+                    tracing::debug!("ssdp log write: {e}");
+                }
             }
             crate::mprintln!("{}", format!("[+] Results saved to '{}'", filename).green());
         }
@@ -179,13 +240,17 @@ async fn send_ssdp_request(
     timeout: Duration,
     verbose: bool,
 ) -> Result<Option<String>> {
-    let socket = crate::utils::udp_bind(None).await
+    let socket = crate::utils::udp_bind(None)
+        .await
         .context("Failed to bind UDP socket")?;
-    
-    let remote_addr: SocketAddr = format!("{}:{}", target, port).parse()
+
+    let remote_addr: SocketAddr = format!("{}:{}", target, port)
+        .parse()
         .with_context(|| format!("Failed to parse remote address {}:{}", target, port))?;
-    
-    socket.connect(&remote_addr).await
+
+    socket
+        .connect(&remote_addr)
+        .await
         .with_context(|| format!("Failed to connect to {}:{}", target, port))?;
 
     let request = format!(
@@ -205,7 +270,9 @@ async fn send_ssdp_request(
         crate::mprintln!("  [*] Sending request:\n{}", request.dimmed());
     }
 
-    socket.send(request.as_bytes()).await
+    socket
+        .send(request.as_bytes())
+        .await
         .context("Failed to send SSDP request")?;
 
     let mut buf = vec![0u8; 4096]; // Increased buffer size for larger responses
@@ -239,9 +306,7 @@ fn normalize_target(target: &str, port: u16) -> Result<String> {
 
 /// Cleans up accidental double or triple brackets like [[::1]] → ::1
 fn clean_ipv6_brackets(ip: &str) -> String {
-    ip.trim_start_matches('[')
-      .trim_end_matches(']')
-      .to_string()
+    ip.trim_start_matches('[').trim_end_matches(']').to_string()
 }
 
 fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> Option<String> {
@@ -260,7 +325,8 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> 
     for (key, pattern) in regexps {
         if let Ok(re) = Regex::new(pattern) {
             if let Some(caps) = re.captures(response) {
-                let value = caps.get(1)
+                let value = caps
+                    .get(1)
                     .map(|m| m.as_str().trim())
                     .unwrap_or("")
                     .to_string();
@@ -276,36 +342,48 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> 
     let status_ok = status_line.contains("200") || status_line.contains("HTTP/1.1");
 
     if status_ok {
-        let st_value = results.get("st").or(results.get("nt")).unwrap_or(&st.to_string()).clone();
+        let st_value = results
+            .get("st")
+            .or(results.get("nt"))
+            .unwrap_or(&st.to_string())
+            .clone();
         let server = results.get("server").unwrap_or(&String::new()).clone();
         let location = results.get("location").unwrap_or(&String::new()).clone();
         let usn = results.get("usn").unwrap_or(&String::new()).clone();
-        
+
         let result_line = format!(
             "{}:{} | ST: {} | Server: {} | Location: {} | USN: {}",
             target_ip, port, st_value, server, location, usn
         );
-        
+
         crate::mprintln!("{}", format!("[+] {}", result_line).green());
 
         // Show additional headers if present
         if let Some(cache) = results.get("cache-control")
-            && !cache.is_empty() {
-                crate::mprintln!("  {} Cache-Control: {}", "  |".dimmed(), cache.dimmed());
-            }
+            && !cache.is_empty()
+        {
+            crate::mprintln!("  {} Cache-Control: {}", "  |".dimmed(), cache.dimmed());
+        }
 
         crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
             host: target_ip.to_string(),
             port,
             service: format!("ssdp:{}", st_value),
-            version: if server.is_empty() { None } else { Some(server.clone()) },
+            version: if server.is_empty() {
+                None
+            } else {
+                Some(server.clone())
+            },
         });
         Some(result_line)
     } else {
         crate::mprintln!(
             "{}",
-            format!("[!] {}:{} | Unexpected response: {}", target_ip, port, status_line)
-                .yellow()
+            format!(
+                "[!] {}:{} | Unexpected response: {}",
+                target_ip, port, status_line
+            )
+            .yellow()
         );
         None
     }
@@ -314,7 +392,9 @@ fn parse_ssdp_response(response: &str, target_ip: &str, port: u16, st: &str) -> 
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
         name: "SSDP M-SEARCH Scanner".to_string(),
-        description: "Discovers UPnP devices on a network via SSDP M-SEARCH multicast and unicast probes.".to_string(),
+        description:
+            "Discovers UPnP devices on a network via SSDP M-SEARCH multicast and unicast probes."
+                .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,

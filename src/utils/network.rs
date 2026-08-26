@@ -2,6 +2,7 @@
 //
 // Network utility functions: honeypot detection, TCP connection with source port, etc.
 
+use anyhow::Context;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -30,7 +31,8 @@ use super::target::extract_ip_from_target;
 
 const DNS_PIN_TTL: Duration = Duration::from_secs(30);
 
-fn dns_pins() -> &'static std::sync::Mutex<std::collections::HashMap<String, (Vec<IpAddr>, std::time::Instant)>> {
+fn dns_pins()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (Vec<IpAddr>, std::time::Instant)>> {
     static PINS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (Vec<IpAddr>, std::time::Instant)>>,
     > = std::sync::OnceLock::new();
@@ -48,7 +50,9 @@ pub fn pin_resolved_ips(host: &str, ips: &[IpAddr]) {
     // logically valid after another thread panicked, and silently skipping the
     // insert would leave the host unpinned (re-resolved at connect → the very
     // rebind window we are closing). The data is non-secret, so reusing it is safe.
-    let mut m = dns_pins().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut m = dns_pins()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Evict stale entries first so a long-lived daemon scanning many hostnames
     // can't grow the map without bound. `retain` always passes the key; we keep
     // an entry iff its pin is still within the TTL.
@@ -56,14 +60,19 @@ pub fn pin_resolved_ips(host: &str, ips: &[IpAddr]) {
         let (_ips, pinned_at) = entry;
         pinned_at.elapsed() < DNS_PIN_TTL
     });
-    m.insert(host.to_ascii_lowercase(), (ips.to_vec(), std::time::Instant::now()));
+    m.insert(
+        host.to_ascii_lowercase(),
+        (ips.to_vec(), std::time::Instant::now()),
+    );
 }
 
 /// Return the pinned IPs for `host` if the pin is still fresh.
 fn pinned_ips(host: &str) -> Option<Vec<IpAddr>> {
     // Recover a poisoned lock (see pin_resolved_ips) so a fresh pin is still
     // honoured rather than silently falling back to re-resolution.
-    let m = dns_pins().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let m = dns_pins()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (ips, t) = m.get(&host.to_ascii_lowercase())?;
     (t.elapsed() < DNS_PIN_TTL).then(|| ips.clone())
 }
@@ -85,8 +94,9 @@ impl reqwest::dns::Resolve for PinningResolver {
                 return Ok(addrs);
             }
             // Not pinned: ordinary system resolution.
-            let resolved: Vec<SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0u16)).await?.collect();
+            let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0u16))
+                .await?
+                .collect();
             let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
             Ok(addrs)
         })
@@ -136,18 +146,20 @@ pub async fn assert_dos_target_authorized(target: &str) -> anyhow::Result<()> {
     // reach an unresolvable host, so gating on it would only false-positive.
     let blocked = match crate::api::resolve_and_check(target).await {
         Ok(_) => false,
-        Err(e) => e.contains("blocked"),
+        Err(e) => e.to_string().contains("blocked"),
     };
     if !blocked {
         return Ok(());
     }
+    crate::mprintln!("{}", "!!! DoS TARGET WARNING !!!".on_red().white().bold());
     crate::mprintln!(
         "{}",
-        "!!! DoS TARGET WARNING !!!".on_red().white().bold()
-    );
-    crate::mprintln!(
-        "{}",
-        format!("Target {} resolves to a private / loopback / metadata address.", target).red().bold()
+        format!(
+            "Target {} resolves to a private / loopback / metadata address.",
+            target
+        )
+        .red()
+        .bold()
     );
     crate::mprintln!(
         "{}",
@@ -156,7 +168,8 @@ pub async fn assert_dos_target_authorized(target: &str) -> anyhow::Result<()> {
     let confirm = crate::utils::cfg_prompt_required(
         "dos_target_ack",
         "Type 'I HAVE AUTHORIZATION' to proceed against this target",
-    ).await?;
+    )
+    .await?;
     if confirm.trim() != "I HAVE AUTHORIZATION" {
         anyhow::bail!(
             "DoS target authorization not confirmed — aborting before any packets are sent."
@@ -168,7 +181,10 @@ pub async fn assert_dos_target_authorized(target: &str) -> anyhow::Result<()> {
 /// Get the globally configured source port (from `setg source_port` or `set source_port`).
 /// Returns `None` if not set or invalid.
 pub async fn get_global_source_port() -> Option<u16> {
-    crate::tenant::resolve().global_options().get("source_port").await
+    crate::tenant::resolve()
+        .global_options()
+        .get("source_port")
+        .await
         .and_then(|v| v.trim().parse::<u16>().ok())
         .filter(|&p| p > 0)
 }
@@ -176,7 +192,9 @@ pub async fn get_global_source_port() -> Option<u16> {
 /// Synchronous version of `get_global_source_port` for use in blocking contexts.
 /// Uses `try_read()` which returns immediately without awaiting.
 pub fn get_global_source_port_sync() -> Option<u16> {
-    crate::tenant::resolve().global_options().try_get("source_port")
+    crate::tenant::resolve()
+        .global_options()
+        .try_get("source_port")
         .and_then(|v| v.trim().parse::<u16>().ok())
         .filter(|&p| p > 0)
 }
@@ -206,10 +224,12 @@ pub async fn tcp_connect_with_source(
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
             .next()
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Cannot resolve address: {}", addr),
-            ))?;
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Cannot resolve address: {}", addr),
+                )
+            })?;
 
         let domain = if dest.is_ipv4() {
             socket2::Domain::IPV4
@@ -217,8 +237,9 @@ pub async fn tcp_connect_with_source(
             socket2::Domain::IPV6
         };
 
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(std::io::Error::other)?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .map_err(std::io::Error::other)?;
 
         socket.set_reuse_address(true)?;
         socket.set_nonblocking(true)?;
@@ -234,15 +255,22 @@ pub async fn tcp_connect_with_source(
         // Surface anything else (EACCES from a privileged source port,
         // EAFNOSUPPORT, etc.) so the caller doesn't block forever on writable().
         if let Err(e) = socket.connect(&dest.into())
-            && !is_in_progress(&e) {
-                return Err(e);
-            }
+            && !is_in_progress(&e)
+        {
+            return Err(e);
+        }
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream)?;
 
         // Wait for connection to complete with timeout
-        tokio::time::timeout(timeout, stream.writable()).await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}")))??;
+        tokio::time::timeout(timeout, stream.writable())
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Connection timed out: {e}"),
+                )
+            })??;
 
         // Check for connection errors
         if let Some(err) = stream.take_error()? {
@@ -266,12 +294,22 @@ pub async fn tcp_connect_with_source(
                 format!("Cannot resolve address: {}", addr),
             ));
         }
-        let mut last_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "all addresses failed");
+        let mut last_err = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "all addresses failed",
+        );
         for sa in &addrs {
-            match tokio::time::timeout(timeout, TcpStream::connect(sa)).await {
+            // Route through tcp_connect_addr so every resolved address gets
+            // io_uring-backed connect when the feature is on.
+            match tokio::time::timeout(timeout, tcp_connect_addr(*sa, timeout)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => last_err = e,
-                Err(e) => last_err = std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}")),
+                Err(e) => {
+                    last_err = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Connection timed out: {e}"),
+                    )
+                }
             }
         }
         Err(last_err)
@@ -280,9 +318,31 @@ pub async fn tcp_connect_with_source(
 
 /// Create a TCP connection to a resolved `SocketAddr` with optional source port binding.
 /// Skips DNS resolution — use this when you already have an IP address.
+/// Under the `io_uring` feature (no source port configured), routes the connect
+/// through the dedicated io_uring ring service for lower CPU and higher throughput.
 #[inline]
 pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
     let src_port = get_global_source_port().await;
+
+    // io_uring connect path — only when no source port is needed (the ring
+    // service uses tokio_uring::net::TcpStream::connect which doesn't support
+    // socket2-level source port binding).
+    #[cfg(feature = "io_uring")]
+    {
+        if src_port.is_none() {
+            if let Some(result) = crate::utils::uring_connect::connect(addr, timeout).await {
+                return result.and_then(|std_stream| {
+                    TcpStream::from_std(std_stream).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("io_uring stream conversion failed: {e}"),
+                        )
+                    })
+                });
+            }
+            // Ring unavailable — fall through to tokio path below.
+        }
+    }
 
     if let Some(port) = src_port {
         let domain = if addr.is_ipv4() {
@@ -291,8 +351,9 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
             socket2::Domain::IPV6
         };
 
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(std::io::Error::other)?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .map_err(std::io::Error::other)?;
 
         socket.set_reuse_address(true)?;
         socket.set_nonblocking(true)?;
@@ -308,14 +369,21 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
         // it's a synchronous failure (EACCES, EAFNOSUPPORT, etc.). Real connect
         // result is checked via take_error() once the socket becomes writable.
         if let Err(e) = socket.connect(&addr.into())
-            && !is_in_progress(&e) {
-                return Err(e);
-            }
+            && !is_in_progress(&e)
+        {
+            return Err(e);
+        }
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream)?;
 
-        tokio::time::timeout(timeout, stream.writable()).await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}")))??;
+        tokio::time::timeout(timeout, stream.writable())
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Connection timed out: {e}"),
+                )
+            })??;
 
         if let Some(err) = stream.take_error()? {
             return Err(err);
@@ -326,16 +394,87 @@ pub async fn tcp_connect_addr(addr: SocketAddr, timeout: Duration) -> std::io::R
         match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => Ok(stream),
             Ok(Err(e)) => Err(e),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Connection timed out: {e}"))),
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Connection timed out: {e}"),
+            )),
         }
     }
+}
+
+/// Like [`tcp_connect_addr`] but with an explicit source port override.
+/// When `source_port` is `None`, delegates to [`tcp_connect_addr`] (uses global
+/// option, routes through io_uring when available).
+/// When `source_port` is `Some(port)`, binds to that port via socket2 then
+/// performs a non-blocking connect + writable check.
+pub async fn tcp_connect_addr_with_source(
+    addr: SocketAddr,
+    timeout: Duration,
+    source_port: Option<u16>,
+) -> std::io::Result<TcpStream> {
+    let Some(port) = source_port else {
+        return tcp_connect_addr(addr, timeout).await;
+    };
+
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(std::io::Error::other)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let bind_addr = if addr.is_ipv4() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+    };
+    socket.bind(&bind_addr.into())?;
+    if let Err(e) = socket.connect(&addr.into())
+        && !is_in_progress(&e)
+    {
+        return Err(e);
+    }
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream = TcpStream::from_std(std_stream)?;
+    tokio::time::timeout(timeout, stream.writable())
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Connection timed out: {e}"),
+            )
+        })??;
+    if let Some(err) = stream.take_error()? {
+        return Err(err);
+    }
+    Ok(stream)
 }
 
 /// Quick TCP port open check with global source port support.
 /// Uses zero-alloc SocketAddr path — no format!() or DNS resolution.
 #[inline]
 pub async fn tcp_port_open(ip: std::net::IpAddr, port: u16, timeout: Duration) -> bool {
-    tcp_connect_addr(SocketAddr::new(ip, port), timeout).await.is_ok()
+    // Under the `io_uring` feature, the no-source-port probe (the mass-scan
+    // common case) is routed to the dedicated io_uring connect service, which
+    // drives many connects on one ring instead of a connect()/writable()
+    // syscall pair per host. A `None` verdict means the ring couldn't answer
+    // definitively (service down / ring-level failure) — self-heal on the
+    // tokio path below. Source-port binding always uses the socket2/tokio path.
+    #[cfg(feature = "io_uring")]
+    {
+        if get_global_source_port().await.is_none() {
+            if let Some(open) =
+                crate::utils::uring_connect::probe(SocketAddr::new(ip, port), timeout).await
+            {
+                return open;
+            }
+        }
+    }
+    tcp_connect_addr(SocketAddr::new(ip, port), timeout)
+        .await
+        .is_ok()
 }
 
 /// Convenience wrapper: resolve a "host:port" string (or bare IP+port) via
@@ -343,22 +482,56 @@ pub async fn tcp_port_open(ip: std::net::IpAddr, port: u16, timeout: Duration) -
 /// that accept hostnames from user input should prefer this over raw
 /// `TcpStream::connect(&str)` so they still get source-port binding and
 /// consistent EINPROGRESS handling.
+///
+/// DNS resolution results are cached with a 30-second TTL, so repeated connects
+/// to the same hostname during a mass scan avoid re-resolution.
 pub async fn tcp_connect_str(addr_str: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+    use std::time::Instant;
     use tokio::net::lookup_host;
-    // Cap the resolved address list — a malicious DNS responder can hand back
-    // hundreds of A/AAAA records and force us to try them all serially.
+    use tokio::sync::Mutex;
+
+    static DNS_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Vec<SocketAddr>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    const DNS_TTL: Duration = Duration::from_secs(30);
     const MAX_RESOLVED_ADDRS: usize = 16;
-    let addrs: Vec<SocketAddr> = lookup_host(addr_str)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput,
-            format!("DNS resolve '{}': {}", addr_str, e)))?
-        .take(MAX_RESOLVED_ADDRS)
-        .collect();
-    if addrs.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-            format!("no address resolved for '{}'", addr_str)));
-    }
-    let mut last_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "all addresses failed");
+
+    let addrs = {
+        let mut cache = DNS_CACHE.lock().await;
+        // Evict stale entries periodically
+        cache.retain(|_, (t, _)| t.elapsed() < DNS_TTL);
+        if let Some((_, cached)) = cache.get(addr_str) {
+            cached.clone()
+        } else {
+            drop(cache); // Release lock before DNS resolve
+            let resolved: Vec<SocketAddr> = lookup_host(addr_str)
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("DNS resolve '{}': {}", addr_str, e),
+                    )
+                })?
+                .take(MAX_RESOLVED_ADDRS)
+                .collect();
+            if resolved.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("no address resolved for '{}'", addr_str),
+                ));
+            }
+            DNS_CACHE
+                .lock()
+                .await
+                .insert(addr_str.to_string(), (Instant::now(), resolved.clone()));
+            resolved
+        }
+    };
+    let mut last_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "all addresses failed",
+    );
     for sa in addrs {
         match tcp_connect_addr(sa, timeout).await {
             Ok(stream) => return Ok(stream),
@@ -374,7 +547,12 @@ pub async fn tcp_connect_str(addr_str: &str, timeout: Duration) -> std::io::Resu
 /// Blocking TCP connection with automatic global source port binding.
 /// Drop-in replacement for `std::net::TcpStream::connect_timeout()`.
 /// Used by SSH modules, blocking protocol modules (SMTP, POP3, Heartbleed, etc.).
-pub fn blocking_tcp_connect(addr: &SocketAddr, timeout: Duration) -> std::io::Result<std::net::TcpStream> {
+/// Under the `io_uring` feature (no source port configured), routes through the
+/// dedicated io_uring ring service via a blocking bridge for lower CPU.
+pub fn blocking_tcp_connect(
+    addr: &SocketAddr,
+    timeout: Duration,
+) -> std::io::Result<std::net::TcpStream> {
     blocking_tcp_connect_with_source(addr, timeout, get_global_source_port_sync())
 }
 
@@ -386,6 +564,17 @@ pub fn blocking_tcp_connect_with_source(
 ) -> std::io::Result<std::net::TcpStream> {
     let src_port = source_port.or_else(get_global_source_port_sync);
 
+    // io_uring blocking path — bridge synchronous connect to the ring service
+    // when no source port is configured. Falls back to std TcpStream on None.
+    #[cfg(feature = "io_uring")]
+    {
+        if src_port.is_none() {
+            if let Some(result) = crate::utils::uring_connect::blocking_connect(*addr, timeout) {
+                return result;
+            }
+        }
+    }
+
     if let Some(port) = src_port {
         let domain = if addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -393,7 +582,8 @@ pub fn blocking_tcp_connect_with_source(
             socket2::Domain::IPV6
         };
 
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
         socket.set_reuse_address(true)?;
 
         let bind_addr = if addr.is_ipv4() {
@@ -414,8 +604,16 @@ pub fn blocking_tcp_connect_with_source(
 /// Pass `Some(ip)` to select IPv4 vs IPv6 address family; `None` defaults to IPv4.
 pub async fn udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<tokio::net::UdpSocket> {
     let is_v6 = matches!(target_ip, Some(IpAddr::V6(_)));
-    let any_addr: IpAddr = if is_v6 { IpAddr::V6(Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
-    let domain = if is_v6 { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 };
+    let any_addr: IpAddr = if is_v6 {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    };
+    let domain = if is_v6 {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
 
     if let Some(port) = get_global_source_port().await {
         let bind_addr = SocketAddr::new(any_addr, port);
@@ -428,7 +626,11 @@ pub async fn udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<tokio::net::
                     "UDP plain bind failed ({}), retrying with SO_REUSEADDR/SO_REUSEPORT",
                     e
                 );
-                let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+                let socket = socket2::Socket::new(
+                    domain,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )?;
                 socket.set_reuse_address(true)?;
                 #[cfg(target_os = "linux")]
                 socket.set_reuse_port(true)?;
@@ -446,12 +648,21 @@ pub async fn udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<tokio::net::
 /// Pass `Some(ip)` to select IPv4 vs IPv6 address family; `None` defaults to IPv4.
 pub fn blocking_udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<std::net::UdpSocket> {
     let is_v6 = matches!(target_ip, Some(IpAddr::V6(_)));
-    let any_addr: IpAddr = if is_v6 { IpAddr::V6(Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
-    let domain = if is_v6 { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 };
+    let any_addr: IpAddr = if is_v6 {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    };
+    let domain = if is_v6 {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
 
     if let Some(port) = get_global_source_port_sync() {
         let bind_addr = SocketAddr::new(any_addr, port);
-        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         socket.set_reuse_address(true)?;
         #[cfg(target_os = "linux")]
         socket.set_reuse_port(true)?;
@@ -460,8 +671,6 @@ pub fn blocking_udp_bind(target_ip: Option<IpAddr>) -> std::io::Result<std::net:
     }
     std::net::UdpSocket::bind(SocketAddr::new(any_addr, 0))
 }
-
-
 
 /// Optional knobs for [`build_http_client_with`]. Use `HttpClientOpts::permissive()`
 /// for the standard pentest client that respects `--strict-tls`.
@@ -541,8 +750,7 @@ impl HttpClientOpts {
 /// P0-2 strict-TLS toggle. Set once at startup from the CLI flag; consulted
 /// every time a module asks for a "permissive" client. `Lazy<AtomicBool>`
 /// keeps the read path branchless after init.
-static GLOBAL_STRICT_TLS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static GLOBAL_STRICT_TLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_global_strict_tls(on: bool) {
     GLOBAL_STRICT_TLS.store(on, std::sync::atomic::Ordering::SeqCst);
@@ -623,6 +831,19 @@ pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::
 /// should go through this function (or the simpler [`build_http_client`])
 /// instead of rolling its own `reqwest::Client::builder()` so that source-port
 /// warnings, TLS defaults, and redirect policy stay centralised.
+/// Install the rustls ring CryptoProvider required by reqwest
+/// (`rustls-no-provider` build). Idempotent; safe to call anywhere a raw
+/// `reqwest::Client` is created — including tests, which bypass the shared
+/// client builders and would otherwise panic with "No provider set".
+pub fn ensure_crypto_provider() {
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+            tracing::warn!("Failed to install default crypto provider: {:?}", e);
+        }
+    });
+}
+
 pub fn build_http_client_with(
     timeout: Duration,
     opts: HttpClientOpts,
@@ -640,12 +861,7 @@ pub fn build_http_client_with(
     // reqwest is built with `rustls-no-provider`, so a CryptoProvider must be
     // installed before the first TLS handshake or rustls panics with
     // "No provider set". Install the ring provider once, lazily.
-    static PROVIDER: std::sync::Once = std::sync::Once::new();
-    PROVIDER.call_once(|| {
-        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-            tracing::warn!("Failed to install default crypto provider: {:?}", e);
-        }
-    });
+    ensure_crypto_provider();
 
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
@@ -702,9 +918,10 @@ pub async fn mass_scan_precheck(
     honeypot_check: bool,
 ) -> bool {
     if let Some(port) = service_port
-        && !tcp_port_open(ip, port, Duration::from_secs(3)).await {
-            return false;
-        }
+        && !tcp_port_open(ip, port, Duration::from_secs(3)).await
+    {
+        return false;
+    }
     if honeypot_check {
         let ip_str = ip.to_string();
         if quick_honeypot_check(&ip_str).await {
@@ -729,10 +946,8 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
     }
 
     const QUICK_PORTS: &[u16] = &[
-        21, 22, 23, 25, 53, 80, 110, 135, 139, 143,
-        443, 445, 993, 995, 1433, 1723, 3306, 3389,
-        5432, 5900, 6379, 8080, 8443, 8888, 9090,
-        11211, 27017, 1521, 161, 389,
+        21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995, 1433, 1723, 3306, 3389,
+        5432, 5900, 6379, 8080, 8443, 8888, 9090, 11211, 27017, 1521, 161, 389,
     ];
 
     let scan_timeout = Duration::from_millis(200);
@@ -747,7 +962,10 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
         tasks.push(tokio::spawn(async move {
             let _permit = match sem.acquire().await {
                 Ok(permit) => permit,
-                Err(e) => { tracing::trace!("host-alive semaphore closed: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("host-alive semaphore closed: {e}");
+                    return;
+                }
             };
             let addr = format!("{}:{}", ip_clone, port);
             if tcp_connect(&addr, scan_timeout).await.is_ok() {
@@ -758,7 +976,7 @@ pub async fn quick_honeypot_check(ip: &str) -> bool {
 
     for task in tasks {
         if let Err(e) = task.await {
-            eprintln!("[!] Task join failed: {}", e);
+            crate::meprintln!("[!] Task join failed: {}", e);
         }
     }
 
@@ -857,8 +1075,423 @@ pub fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> String
         None => String::new(),
         Some(v) => match v.to_str() {
             Ok(s) => s.to_string(),
-            Err(e) => { tracing::trace!("non-utf8 header value: {e}"); String::from("<non-utf8>") }
+            Err(e) => {
+                tracing::trace!("non-utf8 header value: {e}");
+                String::from("<non-utf8>")
+            }
         },
     }
 }
 
+/// Build a rustls [`rustls::pki_types::ServerName`] for a TLS connection to
+/// `host`, falling back to `fallback` when `host` is an IP literal or otherwise
+/// not a valid DNS name (rustls rejects those in SNI position). The fallback is
+/// used for the SNI extension only; certificate validation on exploit paths is
+/// typically disabled, so the name does not need to resolve.
+pub fn server_name_with_fallback(
+    host: &str,
+    fallback: &'static str,
+) -> anyhow::Result<rustls::pki_types::ServerName<'static>> {
+    match rustls::pki_types::ServerName::try_from(host.to_string()) {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            tracing::trace!(
+                "'{host}' is not a valid TLS server name ({e}) — using '{fallback}' for SNI"
+            );
+            rustls::pki_types::ServerName::try_from(fallback.to_string())
+                .with_context(|| format!("building fallback TLS server name '{fallback}'"))
+        }
+    }
+}
+
+/// Maximum IPv4 entries accepted from a list/file — guards an accidentally huge
+/// file from allocating an unbounded `Vec`.
+pub const MAX_IPV4_LIST_ENTRIES: usize = 65_536;
+
+/// Parse an IPv4 list from either a file path (one IP per line; blank lines and
+/// `#` comments skipped) or a comma-separated string. `label` customises the
+/// error text (e.g. "resolver", "NTP server", "SSDP reflector").
+///
+/// The `MAX_IPV4_LIST_ENTRIES` cap is enforced on BOTH the file and comma paths
+/// — the per-module parsers this replaces capped only the file path, letting a
+/// huge comma list through.
+pub fn parse_ipv4_list(input: &str, label: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
+    use anyhow::{Context, anyhow};
+    let trimmed = input.trim();
+    let mut addrs: Vec<Ipv4Addr> = Vec::new();
+
+    if std::path::Path::new(trimmed).is_file() {
+        let contents = std::fs::read_to_string(trimmed)
+            .with_context(|| format!("Failed to read {label} list file '{trimmed}'"))?;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if addrs.len() >= MAX_IPV4_LIST_ENTRIES {
+                return Err(anyhow!(
+                    "Too many {label} entries (max {MAX_IPV4_LIST_ENTRIES})"
+                ));
+            }
+            let ip = line
+                .parse::<Ipv4Addr>()
+                .map_err(|e| anyhow!("Invalid {label} IP in file: '{line}': {e}"))?;
+            addrs.push(ip);
+        }
+        return Ok(addrs);
+    }
+
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if addrs.len() >= MAX_IPV4_LIST_ENTRIES {
+            return Err(anyhow!(
+                "Too many {label} entries (max {MAX_IPV4_LIST_ENTRIES})"
+            ));
+        }
+        let ip = part
+            .parse::<Ipv4Addr>()
+            .map_err(|e| anyhow!("Invalid {label} IP: '{part}': {e}"))?;
+        addrs.push(ip);
+    }
+    Ok(addrs)
+}
+
+/// IPv6 sibling of [`parse_ipv4_list`]. Same file-or-comma source and same
+/// per-entry cap. Used by the v6 paths of the amplification modules (dns/ntp/
+/// memcached/ssdp) — those modules ask the operator separately for an IPv6
+/// reflector list when the victim is IPv6, because reflectors on the public
+/// internet rarely respond on both families.
+pub fn parse_ipv6_list(input: &str, label: &str) -> anyhow::Result<Vec<Ipv6Addr>> {
+    use anyhow::{Context, anyhow};
+    let trimmed = input.trim();
+    let mut addrs: Vec<Ipv6Addr> = Vec::new();
+
+    if std::path::Path::new(trimmed).is_file() {
+        let contents = std::fs::read_to_string(trimmed)
+            .with_context(|| format!("Failed to read {label} list file '{trimmed}'"))?;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if addrs.len() >= MAX_IPV4_LIST_ENTRIES {
+                return Err(anyhow!(
+                    "Too many {label} entries (max {MAX_IPV4_LIST_ENTRIES})"
+                ));
+            }
+            let stripped = line.trim_start_matches('[').trim_end_matches(']');
+            let ip = stripped
+                .parse::<Ipv6Addr>()
+                .map_err(|e| anyhow!("Invalid {label} IPv6 in file: '{line}': {e}"))?;
+            addrs.push(ip);
+        }
+        return Ok(addrs);
+    }
+
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if addrs.len() >= MAX_IPV4_LIST_ENTRIES {
+            return Err(anyhow!(
+                "Too many {label} entries (max {MAX_IPV4_LIST_ENTRIES})"
+            ));
+        }
+        let stripped = part.trim_start_matches('[').trim_end_matches(']');
+        let ip = stripped
+            .parse::<Ipv6Addr>()
+            .map_err(|e| anyhow!("Invalid {label} IPv6: '{part}': {e}"))?;
+        addrs.push(ip);
+    }
+    Ok(addrs)
+}
+
+/// Best-effort IPv6 victim parser used at the top of every raw DoS module.
+/// Accepts bare `2001:db8::1` and bracketed `[2001:db8::1]` forms (the latter
+/// is what `crate::utils::network::normalize_target` emits). Returns `None`
+/// for IPv4 / hostnames / anything else, so the caller's existing IPv4 path
+/// keeps handling those.
+pub fn parse_ipv6_victim(normalized: &str) -> Option<Ipv6Addr> {
+    let stripped = normalized.trim_start_matches('[').trim_end_matches(']');
+    stripped.parse::<Ipv6Addr>().ok()
+}
+
+// ============================================================
+// Connect-storm benchmark (baseline for the io_uring migration)
+// ============================================================
+//
+// Measures the framework's real connect-probe hot path — `tcp_port_open` →
+// `tcp_connect_addr` → `TcpStream::connect` — which is what the mass-scan
+// scheduler fans out across a sweep. This is the path io_uring is meant to
+// accelerate, so we record a "before" number here and re-run the identical
+// harness after the migration.
+//
+// Gated on `BENCH_RUN=1` (NOT `#[ignore]`, which the bad-pattern audit forbids)
+// so a normal `cargo test` skips it instantly. Reproducible run:
+//
+//   BENCH_RUN=1 cargo test --no-default-features --bin rustsploit \
+//       connect_bench -- --nocapture --test-threads=1
+//
+// Tunables (env): BENCH_CLOSED, BENCH_OPEN, BENCH_CONCURRENCY.
+//
+// Metrics, all apples-to-apples before/after on the same host:
+//   * throughput  — completed connect attempts per wall-clock second
+//   * cpu_sys     — kernel CPU jiffies (the per-op syscall overhead io_uring cuts)
+//   * cpu_user    — user CPU jiffies
+//   * peak_rss    — VmHWM, to catch any memory regression from batching
+
+// ============================================================
+// WAF Bypass Integration — framework-level HTTP request with
+// automatic bypass retry when `setg waf_bypass true`.
+// ============================================================
+
+/// Send an HTTP request with automatic WAF bypass retry.
+///
+/// When global option `waf_bypass` is `true`, blocked requests (403/406/429/503
+/// or WAF-signature body matches) are automatically retried with bypass
+/// techniques: GET body smuggling (CVE-2024-56523), URL-encoding, double
+/// URL-encoding, and unicode normalization. The first non-blocked response
+/// is returned. When bypass is disabled, this is equivalent to
+/// `client.request(method, url).headers(...).body(...).send().await`.
+///
+/// Bypass configuration is read from global options:
+///   setg waf_bypass true
+///   setg waf_bypass_mode adaptive|exhaustive|incremental
+///   setg waf_bypass_retries 5
+///   setg waf_bypass_timeout 10
+///   setg waf_bypass_techniques get_body,encoding
+pub async fn http_request_with_bypass(
+    client: &reqwest::Client,
+    method: http::Method,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<Vec<u8>>,
+) -> anyhow::Result<reqwest::Response> {
+    use crate::utils::waf_bypass;
+
+    let config = waf_bypass::WafBypassConfig::from_global_options().await;
+    if !config.enabled {
+        let mut req = client.request(method, url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        if let Some(b) = body {
+            req = req.body(b);
+        }
+        return req.send().await.map_err(anyhow::Error::from);
+    }
+
+    let outcome = waf_bypass::send_with_bypass(client, method, url, headers, body, &config).await?;
+
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] WAF bypass: {} attempt(s), technique used: {}, WAF detected: {:?}",
+            outcome.attempts,
+            outcome
+                .technique_used
+                .map_or("none".to_string(), |t| t.name().to_string()),
+            outcome.waf_detected
+        )
+        .cyan()
+    );
+
+    Ok(outcome.response)
+}
+
+#[cfg(test)]
+mod connect_bench {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    use tokio::net::TcpListener;
+    use tokio::sync::{Notify, Semaphore};
+
+    /// Only run when explicitly asked, so the default test suite stays fast and
+    /// we avoid `#[ignore]` (a banned lint-suppression pattern here).
+    fn bench_enabled() -> bool {
+        matches!(std::env::var("BENCH_RUN").ok().as_deref(), Some("1"))
+    }
+
+    fn env_usize(key: &str, default: usize) -> usize {
+        match std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(v) if v > 0 => v,
+            _ => default,
+        }
+    }
+
+    /// (utime, stime) in clock ticks for the whole process (all worker threads),
+    /// read from /proc — no `libc`/`unsafe`, no external tools. Per proc(5) the
+    /// fields after the final ')' are: state, ppid, ... cmajflt, utime, stime —
+    /// i.e. utime is index 11 and stime index 12 in that tail.
+    fn proc_cpu_jiffies() -> Option<(u64, u64)> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let rparen = stat.rfind(')')?;
+        let tail = stat.get(rparen + 1..)?;
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        let utime = fields.get(11)?.parse::<u64>().ok()?;
+        let stime = fields.get(12)?.parse::<u64>().ok()?;
+        Some((utime, stime))
+    }
+
+    /// Peak resident set size (VmHWM) in kB from /proc/self/status.
+    fn proc_peak_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(v) = line.strip_prefix("VmHWM:") {
+                return v.split_whitespace().next()?.parse::<u64>().ok();
+            }
+        }
+        None
+    }
+
+    /// Reserve then release an ephemeral port so connects to it get a fast
+    /// ECONNREFUSED (the closed-port path that dominates a real internet sweep,
+    /// and which leaves no TIME_WAIT sockets behind).
+    async fn reserve_closed_port() -> Option<SocketAddr> {
+        let l = TcpListener::bind(("127.0.0.1", 0u16)).await.ok()?;
+        let a = l.local_addr().ok()?;
+        drop(l);
+        Some(a)
+    }
+
+    async fn run_storm(label: &str, addr: SocketAddr, total: usize, conc: usize) {
+        let sem = Arc::new(Semaphore::new(conc));
+        let opened = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicU64::new(0));
+        let cpu0 = proc_cpu_jiffies();
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[bench] semaphore closed early: {e}");
+                    break;
+                }
+            };
+            let opened = opened.clone();
+            let done = done.clone();
+            let ip = addr.ip();
+            let port = addr.port();
+            handles.push(tokio::spawn(async move {
+                if tcp_port_open(ip, port, Duration::from_secs(2)).await {
+                    opened.fetch_add(1, Ordering::Relaxed);
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+                drop(permit);
+            }));
+        }
+        for h in handles {
+            if let Err(e) = h.await {
+                eprintln!("[bench] task join error: {e}");
+            }
+        }
+        let elapsed = start.elapsed();
+        let cpu1 = proc_cpu_jiffies();
+        let n_done = done.load(Ordering::Relaxed);
+        let n_open = opened.load(Ordering::Relaxed);
+        let (du, ds) = match (cpu0, cpu1) {
+            (Some((u0, s0)), Some((u1, s1))) => (u1.saturating_sub(u0), s1.saturating_sub(s0)),
+            _ => (0u64, 0u64),
+        };
+        let rss = proc_peak_rss_kb().unwrap_or(0);
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        let rate = (n_done as f64) / secs; // audit-allow: bench throughput float math
+        let user_s = (du as f64) / 100.0; // audit-allow: jiffies→seconds (SC_CLK_TCK≈100)
+        let sys_s = (ds as f64) / 100.0; // audit-allow: jiffies→seconds (SC_CLK_TCK≈100)
+        println!("[{label}]");
+        println!("  attempts={n_done} opened={n_open} concurrency={conc}");
+        println!("  elapsed={secs:.3}s  throughput={rate:.0} conn/s");
+        println!("  cpu_user={du}j ({user_s:.2}s)  cpu_sys={ds}j ({sys_s:.2}s)  peak_rss={rss} kB");
+    }
+
+    /// Runs a closed-port then an open-port connect storm and prints metrics.
+    /// `runtime_label` records which runtime drove it for the results table.
+    async fn run_scenarios(runtime_label: &str) {
+        let closed_total = env_usize("BENCH_CLOSED", 30_000);
+        let open_total = env_usize("BENCH_OPEN", 10_000);
+        let conc = env_usize("BENCH_CONCURRENCY", 1_000);
+        println!("==== rustsploit connect-storm ({runtime_label}) ====");
+        println!("runtime={runtime_label}");
+
+        match reserve_closed_port().await {
+            Some(addr) => run_storm("closed-port ECONNREFUSED", addr, closed_total, conc).await,
+            None => eprintln!("[bench] could not reserve a closed port; skipping"),
+        }
+
+        match TcpListener::bind(("127.0.0.1", 0u16)).await {
+            Ok(listener) => match listener.local_addr() {
+                Ok(addr) => {
+                    let stop = Arc::new(Notify::new());
+                    let stop_rx = stop.clone();
+                    let acceptor = tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = stop_rx.notified() => break,
+                                res = listener.accept() => match res {
+                                    Ok((s, _)) => drop(s),
+                                    Err(e) => {
+                                        eprintln!("[bench] accept error: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    run_storm("open-port full handshake", addr, open_total, conc).await;
+                    stop.notify_one();
+                    if let Err(e) = acceptor.await {
+                        eprintln!("[bench] acceptor join error: {e}");
+                    }
+                }
+                Err(e) => eprintln!("[bench] local_addr failed: {e}"),
+            },
+            Err(e) => eprintln!("[bench] listener bind failed: {e}"),
+        }
+        println!("================================================================");
+    }
+
+    /// Before/after harness. Always drives the storm on a multi-thread Tokio
+    /// runtime mirroring `#[tokio::main]` — that is the real production path.
+    /// With `io_uring`, `tcp_port_open` routes the probe to the dedicated ring
+    /// service thread; without it, the standard tokio connect is used. So the
+    /// same harness measures both, labelled by which path is active.
+    #[test]
+    fn bench_connect_storm() {
+        if !bench_enabled() {
+            eprintln!("[bench] skipped (set BENCH_RUN=1 to run)");
+            return;
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("[bench] runtime build failed: {e}");
+                return;
+            }
+        };
+        #[cfg(feature = "io_uring")]
+        let label = format!(
+            "tokio mt x{workers} + io_uring x{} rings",
+            crate::utils::uring_connect::ring_count()
+        );
+        #[cfg(not(feature = "io_uring"))]
+        let label = format!("tokio mt x{workers} (tokio connect)");
+        rt.block_on(run_scenarios(&label));
+    }
+}

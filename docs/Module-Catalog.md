@@ -2,9 +2,8 @@
 
 > Auto-generated from the inventory registry by `rustsploit --gen-module-catalog`. Do not edit by hand.
 >
-> **Stale snapshot.** This file last reflects 363 modules; the current build has **389** (the 2026-06-13 release added `scanners/jarm_scan` and others). Re-run `rustsploit --gen-module-catalog > docs/Module-Catalog.md` to regenerate the live list.
-
-**Total registered modules: 363**
+> **Current as of v0.5.0 (2026-06-13).** This file reflects 389 modules. Re-run `rustsploit --gen-module-catalog > docs/Module-Catalog.md` to regenerate the live list.
+**Total registered modules: 389**
 
 All modules support mass scan universally — `random` / CIDR / file targets / comma-separated lists fan out through `crate::scheduler::run` regardless of the module.
 

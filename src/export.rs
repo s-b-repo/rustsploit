@@ -83,43 +83,62 @@ pub async fn export_csv_string() -> Result<String> {
     output.push_str("# Hosts\n");
     output.push_str("ip,hostname,os_guess,first_seen,last_seen,notes_count\n");
     for h in &data.hosts {
-        output.push_str(&format!("{},{},{},{},{},{}\n",
+        output.push_str(&format!(
+            "{},{},{},{},{},{}\n",
             csv_escape(&h.ip),
             csv_escape(h.hostname.as_deref().unwrap_or("")),
             csv_escape(h.os_guess.as_deref().unwrap_or("")),
             csv_escape(&h.first_seen),
             csv_escape(&h.last_seen),
-            h.notes.len()));
+            h.notes.len()
+        ));
     }
     output.push('\n');
 
     output.push_str("# Services\n");
     output.push_str("host,port,protocol,service,version\n");
     for s in &data.services {
-        output.push_str(&format!("{},{},{},{},{}\n",
-            csv_escape(&s.host), s.port, csv_escape(&s.protocol),
-            csv_escape(&s.service_name), csv_escape(s.version.as_deref().unwrap_or(""))));
+        output.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_escape(&s.host),
+            s.port,
+            csv_escape(&s.protocol),
+            csv_escape(&s.service_name),
+            csv_escape(s.version.as_deref().unwrap_or(""))
+        ));
     }
     output.push('\n');
 
     output.push_str("# Credentials\n");
     output.push_str("id,host,port,service,username,secret,type,source,valid\n");
     for c in &data.credentials {
-        output.push_str(&format!("{},{},{},{},{},{},{},{},{}\n",
-            csv_escape(&c.id), csv_escape(&c.host), c.port,
-            csv_escape(&c.service), csv_escape(&c.username),
-            csv_escape(&c.secret), c.cred_type,
-            csv_escape(&c.source_module), c.valid));
+        output.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            csv_escape(&c.id),
+            csv_escape(&c.host),
+            c.port,
+            csv_escape(&c.service),
+            csv_escape(&c.username),
+            csv_escape(&c.secret),
+            c.cred_type,
+            csv_escape(&c.source_module),
+            c.valid
+        ));
     }
     output.push('\n');
 
     output.push_str("# Loot\n");
     output.push_str("id,host,type,description,filename,source\n");
     for l in &data.loot {
-        output.push_str(&format!("{},{},{},{},{},{}\n",
-            csv_escape(&l.id), csv_escape(&l.host), csv_escape(&l.loot_type),
-            csv_escape(&l.description), csv_escape(&l.filename),
-            csv_escape(&l.source_module)));
+        output.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            csv_escape(&l.id),
+            csv_escape(&l.host),
+            csv_escape(&l.loot_type),
+            csv_escape(&l.description),
+            csv_escape(&l.filename),
+            csv_escape(&l.source_module)
+        ));
     }
 
     Ok(output)
@@ -148,17 +167,28 @@ pub async fn export_summary_string() -> Result<String> {
     report.push_str("--- Summary ---\n");
     report.push_str(&format!("Hosts discovered:     {}\n", data.hosts.len()));
     report.push_str(&format!("Services found:       {}\n", data.services.len()));
-    report.push_str(&format!("Credentials obtained: {}\n", data.credentials.len()));
+    report.push_str(&format!(
+        "Credentials obtained: {}\n",
+        data.credentials.len()
+    ));
     report.push_str(&format!("Loot collected:       {}\n\n", data.loot.len()));
 
     if !data.hosts.is_empty() {
         report.push_str("--- Hosts ---\n");
         for h in &data.hosts {
-            report.push_str(&format!("  {} ({})\n", h.ip, h.hostname.as_deref().unwrap_or("unknown")));
-            if let Some(ref os) = h.os_guess { report.push_str(&format!("    OS: {}\n", os)); }
+            report.push_str(&format!(
+                "  {} ({})\n",
+                h.ip,
+                h.hostname.as_deref().unwrap_or("unknown")
+            ));
+            if let Some(ref os) = h.os_guess {
+                report.push_str(&format!("    OS: {}\n", os));
+            }
             if !h.notes.is_empty() {
                 report.push_str("    Notes:\n");
-                for note in &h.notes { report.push_str(&format!("      - {}\n", note)); }
+                for note in &h.notes {
+                    report.push_str(&format!("      - {}\n", note));
+                }
             }
         }
         report.push('\n');
@@ -166,21 +196,39 @@ pub async fn export_summary_string() -> Result<String> {
     if !data.services.is_empty() {
         report.push_str("--- Services ---\n");
         for s in &data.services {
-            report.push_str(&format!("  {}:{}/{} - {} {}\n", s.host, s.port, s.protocol, s.service_name, s.version.as_deref().unwrap_or("")));
+            report.push_str(&format!(
+                "  {}:{}/{} - {} {}\n",
+                s.host,
+                s.port,
+                s.protocol,
+                s.service_name,
+                s.version.as_deref().unwrap_or("")
+            ));
         }
         report.push('\n');
     }
     if !data.credentials.is_empty() {
         report.push_str("--- Credentials ---\n");
         for c in &data.credentials {
-            report.push_str(&format!("  {}@{}:{} ({}) - {} [{}]\n", c.username, c.host, c.port, c.service, c.cred_type, if c.valid { "valid" } else { "invalid" }));
+            report.push_str(&format!(
+                "  {}@{}:{} ({}) - {} [{}]\n",
+                c.username,
+                c.host,
+                c.port,
+                c.service,
+                c.cred_type,
+                if c.valid { "valid" } else { "invalid" }
+            ));
         }
         report.push('\n');
     }
     if !data.loot.is_empty() {
         report.push_str("--- Loot ---\n");
         for l in &data.loot {
-            report.push_str(&format!("  [{}] {} from {} - {}\n", l.loot_type, l.filename, l.host, l.description));
+            report.push_str(&format!(
+                "  [{}] {} from {} - {}\n",
+                l.loot_type, l.filename, l.host, l.description
+            ));
         }
         report.push('\n');
     }
@@ -194,7 +242,10 @@ pub async fn export_summary(path: &str) -> Result<()> {
     validate_export_path(path)?;
     let report = export_summary_string().await?;
     safe_write(path, report.as_bytes())?;
-    crate::mprintln!("{}", format!("[+] Exported summary report to '{}'", path).green());
+    crate::mprintln!(
+        "{}",
+        format!("[+] Exported summary report to '{}'", path).green()
+    );
     Ok(())
 }
 
@@ -220,13 +271,18 @@ fn csv_escape(s: &str) -> String {
 
 pub fn validate_export_path(path: &str) -> Result<()> {
     if path.is_empty() || path.len() > 255 {
-        return Err(anyhow::anyhow!("Invalid export path length (max 255 chars)"));
+        return Err(anyhow::anyhow!(
+            "Invalid export path length (max 255 chars)"
+        ));
     }
     if path.contains("..") || path.contains('\0') {
         return Err(anyhow::anyhow!("Path traversal not allowed in export path"));
     }
-    if path.starts_with('/') || path.starts_with('\\') || path.contains('/') || path.contains('\\') {
-        return Err(anyhow::anyhow!("Only filenames are allowed for export (no directory separators). Use a relative filename like 'report.json'."));
+    if path.starts_with('/') || path.starts_with('\\') || path.contains('/') || path.contains('\\')
+    {
+        return Err(anyhow::anyhow!(
+            "Only filenames are allowed for export (no directory separators). Use a relative filename like 'report.json'."
+        ));
     }
     if path.starts_with('.') {
         return Err(anyhow::anyhow!("Hidden files not allowed for export"));

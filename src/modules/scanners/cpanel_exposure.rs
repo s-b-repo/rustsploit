@@ -122,7 +122,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                let body = match crate::utils::network::read_http_body_text_capped(
+                    resp,
+                    crate::utils::safe_io::DEFAULT_BODY_CAP,
+                )
+                .await
+                {
                     Ok(b) => b,
                     Err(e) => {
                         crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
@@ -154,7 +159,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     outcome.findings.push(Finding {
                         target: host.clone(),
                         kind: FindingKind::OpenPort,
-                        message: format!("Exposed {} on {}:{} (server={})", label, host, port, server),
+                        message: format!(
+                            "Exposed {} on {}:{} (server={})",
+                            label, host, port, server
+                        ),
                         data: Some(serde_json::json!({
                             "host": host,
                             "port": port,
@@ -195,10 +203,7 @@ fn extract_title(body: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
     let start = lower.find("<title")?;
     let after_open = body[start..].find('>')? + start + 1;
-    let end = body[after_open..]
-        .to_ascii_lowercase()
-        .find("</title>")?
-        + after_open;
+    let end = body[after_open..].to_ascii_lowercase().find("</title>")? + after_open;
     Some(body[after_open..end].trim().to_string())
 }
 

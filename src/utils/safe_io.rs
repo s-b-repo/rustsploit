@@ -5,9 +5,9 @@
 //! probe). Use `read_http_body_capped` instead of `reqwest::Response::text()`
 //! / `.bytes()` for the same reason.
 
-use anyhow::{anyhow, Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use anyhow::{Context, Result, anyhow};
 use std::io::Read;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Default upper bound for "I expect a small response" callers — 8 MiB.
 ///
@@ -64,13 +64,14 @@ where
 /// `max`. Honours `Content-Length` early when present.
 pub async fn read_http_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
     if let Some(len) = resp.content_length()
-        && len > max as u64 {
-            return Err(anyhow!(
-                "response Content-Length {} exceeds {} byte cap",
-                len,
-                max
-            ));
-        }
+        && len > max as u64
+    {
+        return Err(anyhow!(
+            "response Content-Length {} exceeds {} byte cap",
+            len,
+            max
+        ));
+    }
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     use futures::StreamExt;

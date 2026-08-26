@@ -7,15 +7,13 @@
 //!
 //! FOR AUTHORIZED SECURITY TESTING ONLY.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::net::{IpAddr, SocketAddr};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{
-    cfg_prompt_default, cfg_prompt_yes_no,
-};
+use crate::utils::{cfg_prompt_default, cfg_prompt_yes_no};
 
 // ============================================================================
 // MODULE INFO
@@ -51,8 +49,10 @@ fn dns_probe() -> Vec<u8> {
     // Questions: 1, Answers: 0, Authority: 0, Additional: 0
     pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     // QNAME: google.com
-    pkt.push(6); pkt.extend_from_slice(b"google");
-    pkt.push(3); pkt.extend_from_slice(b"com");
+    pkt.push(6);
+    pkt.extend_from_slice(b"google");
+    pkt.push(3);
+    pkt.extend_from_slice(b"com");
     pkt.push(0); // root label
     // QTYPE: ANY (0x00FF), QCLASS: IN (0x0001)
     pkt.extend_from_slice(&[0x00, 0xFF, 0x00, 0x01]);
@@ -98,11 +98,15 @@ struct ProbeResult {
 
 /// Check if a DNS response indicates an open resolver.
 fn check_dns(buf: &[u8], n: usize, probe_len: usize) -> Option<ProbeResult> {
-    if n < 12 { return None; }
+    if n < 12 {
+        return None;
+    }
     // Check QR bit (response) and RCODE (no error)
     let qr = (buf[2] >> 7) & 1;
     let rcode = buf[3] & 0x0F;
-    if qr != 1 { return None; }
+    if qr != 1 {
+        return None;
+    }
     let answer_count = u16::from_be_bytes([buf[6], buf[7]]);
     let rcode_str = match rcode {
         0 => "NOERROR",
@@ -111,7 +115,9 @@ fn check_dns(buf: &[u8], n: usize, probe_len: usize) -> Option<ProbeResult> {
         _ => "OTHER",
     };
     // Even SERVFAIL means the server accepted the query (open resolver)
-    if rcode == 5 { return None; } // REFUSED = not open
+    if rcode == 5 {
+        return None;
+    } // REFUSED = not open
     Some(ProbeResult {
         protocol: "DNS",
         port: 53,
@@ -123,10 +129,14 @@ fn check_dns(buf: &[u8], n: usize, probe_len: usize) -> Option<ProbeResult> {
 
 /// Check if an NTP response indicates monlist support.
 fn check_ntp(buf: &[u8], n: usize) -> Option<ProbeResult> {
-    if n < 8 { return None; }
+    if n < 8 {
+        return None;
+    }
     // NTP mode 7 response: first byte & 0x07 == 0x07, or response bit set
     let mode = buf[0] & 0x07;
-    if mode != 7 && mode != 6 { return None; }
+    if mode != 7 && mode != 6 {
+        return None;
+    }
     Some(ProbeResult {
         protocol: "NTP",
         port: 123,
@@ -138,12 +148,15 @@ fn check_ntp(buf: &[u8], n: usize) -> Option<ProbeResult> {
 
 /// Check if an SSDP response indicates a UPnP device.
 fn check_ssdp(buf: &[u8], n: usize) -> Option<ProbeResult> {
-    if n < 10 { return None; }
+    if n < 10 {
+        return None;
+    }
     let response = String::from_utf8_lossy(&buf[..n]);
     if !response.contains("HTTP/1.1") && !response.contains("NOTIFY") {
         return None;
     }
-    let server = response.lines()
+    let server = response
+        .lines()
         .find(|l| l.to_lowercase().starts_with("server:"))
         .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
         .unwrap_or_default();
@@ -152,13 +165,19 @@ fn check_ssdp(buf: &[u8], n: usize) -> Option<ProbeResult> {
         port: 1900,
         response_size: n,
         amplification: n as f64 / SSDP_MSEARCH_PROBE.len() as f64,
-        detail: if server.is_empty() { "UPnP device".to_string() } else { format!("UPnP: {}", server) },
+        detail: if server.is_empty() {
+            "UPnP device".to_string()
+        } else {
+            format!("UPnP: {}", server)
+        },
     })
 }
 
 /// Check if a Memcached response indicates an exposed instance.
 fn check_memcached(buf: &[u8], n: usize, probe_len: usize) -> Option<ProbeResult> {
-    if n < 8 { return None; }
+    if n < 8 {
+        return None;
+    }
     let response = String::from_utf8_lossy(&buf[..n]);
     if !response.contains("STAT") && !response.contains("END") {
         return None;
@@ -178,26 +197,31 @@ fn check_memcached(buf: &[u8], n: usize, probe_len: usize) -> Option<ProbeResult
 // ============================================================================
 
 /// Probe a single IP for all selected amplification protocols.
-async fn probe_host(
-    ip: IpAddr,
-    protocols: &ProbeConfig,
-    timeout_ms: u64,
-) -> Vec<ProbeResult> {
+async fn probe_host(ip: IpAddr, protocols: &ProbeConfig, timeout_ms: u64) -> Vec<ProbeResult> {
     let mut results = Vec::new();
     let dur = Duration::from_millis(timeout_ms);
 
     if protocols.dns
-        && let Some(r) = probe_single(ip, 53, &dns_probe(), dur, check_dns).await {
-            results.push(r);
-        }
+        && let Some(r) = probe_single(ip, 53, &dns_probe(), dur, check_dns).await
+    {
+        results.push(r);
+    }
     if protocols.ntp
-        && let Some(r) = probe_single(ip, 123, &NTP_MONLIST_PROBE, dur, |buf, n, _| check_ntp(buf, n)).await {
-            results.push(r);
-        }
+        && let Some(r) = probe_single(ip, 123, &NTP_MONLIST_PROBE, dur, |buf, n, _| {
+            check_ntp(buf, n)
+        })
+        .await
+    {
+        results.push(r);
+    }
     if protocols.ssdp
-        && let Some(r) = probe_single(ip, 1900, SSDP_MSEARCH_PROBE, dur, |buf, n, _| check_ssdp(buf, n)).await {
-            results.push(r);
-        }
+        && let Some(r) = probe_single(ip, 1900, SSDP_MSEARCH_PROBE, dur, |buf, n, _| {
+            check_ssdp(buf, n)
+        })
+        .await
+    {
+        results.push(r);
+    }
     if protocols.memcached {
         let probe = memcached_probe();
         if let Some(r) = probe_single(ip, 11211, &probe, dur, check_memcached).await {
@@ -241,25 +265,52 @@ struct ProbeConfig {
 
 impl ProbeConfig {
     fn all() -> Self {
-        Self { dns: true, ntp: true, ssdp: true, memcached: true }
+        Self {
+            dns: true,
+            ntp: true,
+            ssdp: true,
+            memcached: true,
+        }
     }
 
     fn enabled_names(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
-        if self.dns { v.push("DNS"); }
-        if self.ntp { v.push("NTP"); }
-        if self.ssdp { v.push("SSDP"); }
-        if self.memcached { v.push("Memcached"); }
+        if self.dns {
+            v.push("DNS");
+        }
+        if self.ntp {
+            v.push("NTP");
+        }
+        if self.ssdp {
+            v.push("SSDP");
+        }
+        if self.memcached {
+            v.push("Memcached");
+        }
         v
     }
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "+=================================================================+".cyan());
-    crate::mprintln!("{}", "|         UDP Amplification Vulnerability Scanner                 |".cyan());
-    crate::mprintln!("{}", "|   DNS (53) | NTP (123) | SSDP (1900) | Memcached (11211)       |".cyan());
-    crate::mprintln!("{}", "+=================================================================+".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "+=================================================================+".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "|         UDP Amplification Vulnerability Scanner                 |".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "|   DNS (53) | NTP (123) | SSDP (1900) | Memcached (11211)       |".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "+=================================================================+".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -280,13 +331,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut outcome = ModuleOutcome::ok();
 
     let protos_input = cfg_prompt_default(
-        "protocols", "Protocols to scan (dns,ntp,ssdp,memcached,all)", "all"
-    ).await?;
+        "protocols",
+        "Protocols to scan (dns,ntp,ssdp,memcached,all)",
+        "all",
+    )
+    .await?;
     let protocols = parse_protocols(&protos_input);
 
-    let timeout_ms: u64 = cfg_prompt_default(
-        "timeout", "Probe timeout (ms)", "3000"
-    ).await?.parse().unwrap_or(3000);
+    let timeout_ms: u64 = cfg_prompt_default("timeout", "Probe timeout (ms)", "3000")
+        .await?
+        .parse()
+        .unwrap_or(3000);
 
     let verbose = if batch {
         false
@@ -295,7 +350,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     };
 
     if !batch {
-        crate::mprintln!("[*] Protocols: {}", protocols.enabled_names().join(", ").cyan());
+        crate::mprintln!(
+            "[*] Protocols: {}",
+            protocols.enabled_names().join(", ").cyan()
+        );
         crate::mprintln!("[*] Target: {}", target.yellow());
         crate::mprintln!("[*] Timeout: {}ms", timeout_ms);
         crate::mprintln!();
@@ -348,20 +406,36 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     } else if batch {
         for r in &results {
-            crate::mprintln!("{}", format!(
-                "[+] {}:{} {} — {:.1}x amplification ({} bytes, {})",
-                ip, r.port, r.protocol, r.amplification, r.response_size, r.detail
-            ).green().bold());
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[+] {}:{} {} — {:.1}x amplification ({} bytes, {})",
+                    ip, r.port, r.protocol, r.amplification, r.response_size, r.detail
+                )
+                .green()
+                .bold()
+            );
         }
     } else {
-        crate::mprintln!("{}", format!(
-            "[+] Found {} amplification vulnerability(ies):", results.len()
-        ).green().bold());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[+] Found {} amplification vulnerability(ies):",
+                results.len()
+            )
+            .green()
+            .bold()
+        );
         crate::mprintln!();
 
-        crate::mprintln!("  {:<12} {:<8} {:<12} {:<14} {}",
-            "Protocol".bold(), "Port".bold(), "Resp Size".bold(),
-            "Amplification".bold(), "Details".bold());
+        crate::mprintln!(
+            "  {:<12} {:<8} {:<12} {:<14} {}",
+            "Protocol".bold(),
+            "Port".bold(),
+            "Resp Size".bold(),
+            "Amplification".bold(),
+            "Details".bold()
+        );
         crate::mprintln!("  {}", "-".repeat(70).dimmed());
 
         for r in &results {
@@ -373,34 +447,63 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 format!("{:.1}x", r.amplification).to_string()
             };
 
-            crate::mprintln!("  {:<12} {:<8} {:<12} {:<14} {}",
-                r.protocol.green(), r.port, format!("{} B", r.response_size),
-                amp_color, r.detail);
+            crate::mprintln!(
+                "  {:<12} {:<8} {:<12} {:<14} {}",
+                r.protocol.green(),
+                r.port,
+                format!("{} B", r.response_size),
+                amp_color,
+                r.detail
+            );
 
             if verbose {
-                crate::mprintln!("    {} Probe: {} bytes -> Response: {} bytes",
-                    "->".dimmed(), probe_size(r.protocol), r.response_size);
+                crate::mprintln!(
+                    "    {} Probe: {} bytes -> Response: {} bytes",
+                    "->".dimmed(),
+                    probe_size(r.protocol),
+                    r.response_size
+                );
             }
         }
         crate::mprintln!();
 
         // Risk summary
-        let max_amp = results.iter().map(|r| r.amplification).fold(0.0_f64, f64::max);
-        let risk = if max_amp > 500.0 { "CRITICAL".red().bold() }
-            else if max_amp > 50.0 { "HIGH".red() }
-            else if max_amp > 10.0 { "MEDIUM".yellow() }
-            else { "LOW".green() };
-        crate::mprintln!("[*] Risk level: {} (max amplification: {:.1}x)", risk, max_amp);
+        let max_amp = results
+            .iter()
+            .map(|r| r.amplification)
+            .fold(0.0_f64, f64::max);
+        let risk = if max_amp > 500.0 {
+            "CRITICAL".red().bold()
+        } else if max_amp > 50.0 {
+            "HIGH".red()
+        } else if max_amp > 10.0 {
+            "MEDIUM".yellow()
+        } else {
+            "LOW".green()
+        };
+        crate::mprintln!(
+            "[*] Risk level: {} (max amplification: {:.1}x)",
+            risk,
+            max_amp
+        );
 
         // Recommendations
         crate::mprintln!();
         crate::mprintln!("{}", "[*] Recommendations:".cyan().bold());
         for r in &results {
             match r.protocol {
-                "DNS" => crate::mprintln!("  - DNS: Restrict recursion to authorized clients (allow-recursion ACL)"),
-                "NTP" => crate::mprintln!("  - NTP: Disable monlist (restrict noquery in ntp.conf)"),
-                "SSDP" => crate::mprintln!("  - SSDP: Disable UPnP or block port 1900 at the firewall"),
-                "Memcached" => crate::mprintln!("  - Memcached: Disable UDP listener (-U 0) or bind to localhost only"),
+                "DNS" => crate::mprintln!(
+                    "  - DNS: Restrict recursion to authorized clients (allow-recursion ACL)"
+                ),
+                "NTP" => {
+                    crate::mprintln!("  - NTP: Disable monlist (restrict noquery in ntp.conf)")
+                }
+                "SSDP" => {
+                    crate::mprintln!("  - SSDP: Disable UPnP or block port 1900 at the firewall")
+                }
+                "Memcached" => crate::mprintln!(
+                    "  - Memcached: Disable UDP listener (-U 0) or bind to localhost only"
+                ),
                 _ => {}
             }
         }

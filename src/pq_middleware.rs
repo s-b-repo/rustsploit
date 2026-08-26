@@ -21,9 +21,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::pq_channel::{
-    decrypt_request, encrypt_response, process_handshake, remove_authorized_key,
-    upsert_authorized_key, ClientPublicIdentity, HandshakeRequest, HandshakeResponse,
-    HostIdentity, PqSession, SessionStore,
+    ClientPublicIdentity, HandshakeRequest, HandshakeResponse, HostIdentity, PqSession,
+    SessionStore, decrypt_request, encrypt_response, process_handshake, remove_authorized_key,
+    upsert_authorized_key,
 };
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -98,8 +98,16 @@ pub async fn handshake_handler(
         let timestamps = limiter.entry(client_ip).or_default();
         timestamps.retain(|t| now.duration_since(*t) < window);
         if timestamps.len() >= HANDSHAKE_RATE_MAX_PER_IP {
-            tracing::debug!("PQ handshake rate-limited for {}: {}/{} in window", client_ip, timestamps.len(), HANDSHAKE_RATE_MAX_PER_IP);
-            return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".to_string()));
+            tracing::debug!(
+                "PQ handshake rate-limited for {}: {}/{} in window",
+                client_ip,
+                timestamps.len(),
+                HANDSHAKE_RATE_MAX_PER_IP
+            );
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded".to_string(),
+            ));
         }
         timestamps.push(now);
         // Evict stale entries (IPs with no recent timestamps) to prevent unbounded growth
@@ -113,7 +121,11 @@ pub async fn handshake_handler(
         });
         let evicted = before.saturating_sub(limiter.len());
         if evicted > 0 {
-            tracing::debug!("Rate limiter: evicted {} stale IP entries, {} remaining", evicted, limiter.len());
+            tracing::debug!(
+                "Rate limiter: evicted {} stale IP entries, {} remaining",
+                evicted,
+                limiter.len()
+            );
         }
     }
 
@@ -121,13 +133,7 @@ pub async fn handshake_handler(
 
     let (response, session) = {
         let keys = pq.authorized_keys.read().await;
-        process_handshake(
-            &request,
-            &pq.host_identity,
-            keys.as_slice(),
-            tenant_id,
-        )
-        .map_err(|e| {
+        process_handshake(&request, &pq.host_identity, keys.as_slice(), tenant_id).map_err(|e| {
             tracing::warn!("PQ handshake failed for tenant {}: {}", tenant_id, e);
             crate::events::emit(crate::events::ModuleEvent::PqHandshakeRejected {
                 reason: format!("{e}"),
@@ -168,11 +174,16 @@ pub async fn handshake_handler(
             // Route to the evicted client's own tenant, not every subscriber.
             crate::events::emit_for(
                 Some(evicted.clone()),
-                crate::events::ModuleEvent::PqSessionEvicted { client_name: evicted },
+                crate::events::ModuleEvent::PqSessionEvicted {
+                    client_name: evicted,
+                },
             );
         }
     }
-    store.insert(session.session_id, Arc::new(tokio::sync::Mutex::new(session)));
+    store.insert(
+        session.session_id,
+        Arc::new(tokio::sync::Mutex::new(session)),
+    );
     drop(store);
 
     // Route to the accepting client's own tenant only.
@@ -216,29 +227,54 @@ pub async fn register_key_handler(
 ) -> Result<axum::Json<RegisterKeyResponse>, (StatusCode, String)> {
     // Validate the input shape FIRST so we can fail fast without taking the
     // token lock. Costs nothing to do this before authentication.
-    if request.name.is_empty() || request.name.len() > 64
-        || !request.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    if request.name.is_empty()
+        || request.name.len() > 64
+        || !request
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err((StatusCode::BAD_REQUEST, "name must be 1-64 [a-zA-Z0-9_-]".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must be 1-64 [a-zA-Z0-9_-]".into(),
+        ));
     }
-    let x25519_bytes = B64.decode(&request.x25519_pub)
-        .map_err(|e| { tracing::debug!("x25519_pub is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "x25519_pub is not base64".into()) })?;
-    let x25519_pub: [u8; 32] = x25519_bytes.try_into()
-        .map_err(|e: Vec<u8>| { tracing::debug!("x25519_pub must decode to 32 bytes (got {} bytes)", e.len()); (StatusCode::BAD_REQUEST, "x25519_pub must decode to 32 bytes".into()) })?;
-    let mlkem_ek = B64.decode(&request.mlkem_ek)
-        .map_err(|e| { tracing::debug!("mlkem_ek is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "mlkem_ek is not base64".into()) })?;
+    let x25519_bytes = B64.decode(&request.x25519_pub).map_err(|e| {
+        tracing::debug!("x25519_pub is not base64: {e:?}");
+        (StatusCode::BAD_REQUEST, "x25519_pub is not base64".into())
+    })?;
+    let x25519_pub: [u8; 32] = x25519_bytes.try_into().map_err(|e: Vec<u8>| {
+        tracing::debug!("x25519_pub must decode to 32 bytes (got {} bytes)", e.len());
+        (
+            StatusCode::BAD_REQUEST,
+            "x25519_pub must decode to 32 bytes".into(),
+        )
+    })?;
+    let mlkem_ek = B64.decode(&request.mlkem_ek).map_err(|e| {
+        tracing::debug!("mlkem_ek is not base64: {e:?}");
+        (StatusCode::BAD_REQUEST, "mlkem_ek is not base64".into())
+    })?;
     // ML-KEM-1024 encapsulation key is exactly 1568 bytes.
     if mlkem_ek.len() != 1568 {
-        return Err((StatusCode::BAD_REQUEST, format!("mlkem_ek must be 1568 bytes, got {}", mlkem_ek.len())));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("mlkem_ek must be 1568 bytes, got {}", mlkem_ek.len()),
+        ));
     }
-    let mceliece_public = B64.decode(&request.mceliece_pub)
-        .map_err(|e| { tracing::debug!("mceliece_pub is not base64: {e:?}"); (StatusCode::BAD_REQUEST, "mceliece_pub is not base64".into()) })?;
+    let mceliece_public = B64.decode(&request.mceliece_pub).map_err(|e| {
+        tracing::debug!("mceliece_pub is not base64: {e:?}");
+        (StatusCode::BAD_REQUEST, "mceliece_pub is not base64".into())
+    })?;
     // Classic McEliece 460896 public key is exactly 524160 bytes.
     if mceliece_public.len() != classic_mceliece_rust::CRYPTO_PUBLICKEYBYTES {
-        return Err((StatusCode::BAD_REQUEST, format!(
-            "mceliece_pub must be {} bytes, got {}",
-            classic_mceliece_rust::CRYPTO_PUBLICKEYBYTES, mceliece_public.len()
-        )));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "mceliece_pub must be {} bytes, got {}",
+                classic_mceliece_rust::CRYPTO_PUBLICKEYBYTES,
+                mceliece_public.len()
+            ),
+        ));
     }
 
     // Token check + atomic consume. Holding the lock across the persist
@@ -281,7 +317,10 @@ pub async fn register_key_handler(
         let timestamps = limiter.entry(addr.ip()).or_default();
         timestamps.retain(|t| now.duration_since(*t) < window);
         if timestamps.len() >= HANDSHAKE_RATE_MAX_PER_IP {
-            tracing::warn!("Rate-limited /pq/register-key from {} (bad token, budget exhausted)", addr);
+            tracing::warn!(
+                "Rate-limited /pq/register-key from {} (bad token, budget exhausted)",
+                addr
+            );
             return Err((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".into()));
         }
         timestamps.push(now);
@@ -304,8 +343,15 @@ pub async fn register_key_handler(
     // Persist to disk first so a restart doesn't lose the registration. If
     // persist fails, do NOT consume the token — the operator can retry.
     if let Err(e) = upsert_authorized_key(&pq.authorized_keys_path, &new_key) {
-        tracing::error!("Failed to persist authorized key for {}: {}", new_key.name, e);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {e}")));
+        tracing::error!(
+            "Failed to persist authorized key for {}: {}",
+            new_key.name,
+            e
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist failed: {e}"),
+        ));
     }
 
     let mut keys = pq.authorized_keys.write().await;
@@ -320,8 +366,16 @@ pub async fn register_key_handler(
         t.zeroize();
     }
 
-    tracing::info!("Registered PQ client '{}' ({}) from {}; enrollment token consumed", new_key.name, fp, addr);
-    Ok(axum::Json(RegisterKeyResponse { registered: true, fingerprint: fp }))
+    tracing::info!(
+        "Registered PQ client '{}' ({}) from {}; enrollment token consumed",
+        new_key.name,
+        fp,
+        addr
+    );
+    Ok(axum::Json(RegisterKeyResponse {
+        registered: true,
+        fingerprint: fp,
+    }))
 }
 
 /// Middleware layer — wraps all /api/* routes. PQ is mandatory.
@@ -339,23 +393,51 @@ pub async fn pq_middleware(
         }
     };
 
-    let session_id_b64 = pq_header.to_str().map_err(|e| { tracing::debug!("X-PQ-Session header not valid UTF-8: {e:?}"); StatusCode::BAD_REQUEST })?;
-    let session_id_vec = B64.decode(session_id_b64).map_err(|e| { tracing::debug!("X-PQ-Session not valid base64: {e:?}"); StatusCode::BAD_REQUEST })?;
-    let session_id: [u8; 16] = session_id_vec.try_into().map_err(|e: Vec<u8>| { tracing::debug!("session ID wrong length: got {} bytes", e.len()); StatusCode::BAD_REQUEST })?;
+    let session_id_b64 = pq_header.to_str().map_err(|e| {
+        tracing::debug!("X-PQ-Session header not valid UTF-8: {e:?}");
+        StatusCode::BAD_REQUEST
+    })?;
+    let session_id_vec = B64.decode(session_id_b64).map_err(|e| {
+        tracing::debug!("X-PQ-Session not valid base64: {e:?}");
+        StatusCode::BAD_REQUEST
+    })?;
+    let session_id: [u8; 16] = session_id_vec.try_into().map_err(|e: Vec<u8>| {
+        tracing::debug!("session ID wrong length: got {} bytes", e.len());
+        StatusCode::BAD_REQUEST
+    })?;
 
-    let nonce_b64 = request.headers().get("X-PQ-Nonce")
-        .and_then(|v| v.to_str().ok()).ok_or(StatusCode::BAD_REQUEST)?.to_string();
-    let nonce: [u8; 12] = B64.decode(&nonce_b64).map_err(|e| { tracing::debug!("X-PQ-Nonce not valid base64: {e:?}"); StatusCode::BAD_REQUEST })?
-        .try_into().map_err(|e: Vec<u8>| { tracing::debug!("X-PQ-Nonce wrong length: got {} bytes", e.len()); StatusCode::BAD_REQUEST })?;
+    let nonce_b64 = request
+        .headers()
+        .get("X-PQ-Nonce")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .to_string();
+    let nonce: [u8; 12] = B64
+        .decode(&nonce_b64)
+        .map_err(|e| {
+            tracing::debug!("X-PQ-Nonce not valid base64: {e:?}");
+            StatusCode::BAD_REQUEST
+        })?
+        .try_into()
+        .map_err(|e: Vec<u8>| {
+            tracing::debug!("X-PQ-Nonce wrong length: got {} bytes", e.len());
+            StatusCode::BAD_REQUEST
+        })?;
 
     // X-PQ-Epoch is informational on the request side (the AAD is built
     // from the post-ratchet session epoch on both sides; AEAD verification
     // covers the rest). We still parse it for trace logging.
-    let header_epoch: Option<u64> = request.headers().get("X-PQ-Epoch")
-        .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+    let header_epoch: Option<u64> = request
+        .headers()
+        .get("X-PQ-Epoch")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
 
-    let rekey_pub: Option<[u8; 32]> = request.headers().get("X-PQ-Rekey")
-        .and_then(|v| v.to_str().ok()).and_then(|v| B64.decode(v).ok())
+    let rekey_pub: Option<[u8; 32]> = request
+        .headers()
+        .get("X-PQ-Rekey")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| B64.decode(v).ok())
         .and_then(|v| v.try_into().ok());
 
     // The wire HTTP method is always POST (Node forbids GET-with-body), so the
@@ -383,9 +465,15 @@ pub async fn pq_middleware(
         std::time::Duration::from_secs(30),
         axum::body::to_bytes(body, 1024 * 1024),
     )
-        .await
-        .map_err(|e| { tracing::debug!("PQ request body read timed out: {e:?}"); StatusCode::REQUEST_TIMEOUT })?
-        .map_err(|e| { tracing::debug!("PQ request body too large: {e:?}"); StatusCode::PAYLOAD_TOO_LARGE })?;
+    .await
+    .map_err(|e| {
+        tracing::debug!("PQ request body read timed out: {e:?}");
+        StatusCode::REQUEST_TIMEOUT
+    })?
+    .map_err(|e| {
+        tracing::debug!("PQ request body too large: {e:?}");
+        StatusCode::PAYLOAD_TOO_LARGE
+    })?;
 
     // Look up the per-session mutex via a SHORT read lock on the map. Hold
     // an Arc clone so the session survives concurrent registrations. The
@@ -412,8 +500,10 @@ pub async fn pq_middleware(
             &body_bytes,
             &nonce,
             move |epoch| {
-                format!("{semantic_method_for_aad}|{path_aad_for_aad}|{epoch}|{session_id_b64_for_aad}")
-                    .into_bytes()
+                format!(
+                    "{semantic_method_for_aad}|{path_aad_for_aad}|{epoch}|{session_id_b64_for_aad}"
+                )
+                .into_bytes()
             },
             rekey_pub.as_ref(),
         )
@@ -425,7 +515,9 @@ pub async fn pq_middleware(
         // matching authorized_keys entry; surfacing it here lets handlers
         // ACL on the identity proven by AEAD rather than trusting any
         // client-supplied header or path component.
-        let identity = AuthenticatedIdentity { client_name: session.client_name.clone() };
+        let identity = AuthenticatedIdentity {
+            client_name: session.client_name.clone(),
+        };
         (pt, identity)
         // session lock released here, BEFORE next.run — so the application
         // handler is free to call back into the middleware (or other
@@ -433,24 +525,44 @@ pub async fn pq_middleware(
         // them concurrently).
     };
 
-    let decrypted: serde_json::Value = serde_json::from_slice(&plaintext)
-        .map_err(|e| { tracing::debug!("PQ decrypted body is not valid JSON: {e:?}"); StatusCode::BAD_REQUEST })?;
+    let decrypted: serde_json::Value = serde_json::from_slice(&plaintext).map_err(|e| {
+        tracing::debug!("PQ decrypted body is not valid JSON: {e:?}");
+        StatusCode::BAD_REQUEST
+    })?;
 
-    let inner_body = decrypted.get("body").map(|v| {
-        if v.is_string() { v.as_str().unwrap_or("").to_string() } else { v.to_string() }
-    }).unwrap_or_default();
+    let inner_body = decrypted
+        .get("body")
+        .map(|v| {
+            if v.is_string() {
+                v.as_str().unwrap_or("").to_string()
+            } else {
+                v.to_string()
+            }
+        })
+        .unwrap_or_default();
 
     // Restore the original semantic HTTP method so the inner router matches
     // GET/PUT/DELETE handlers — the wire request was always POST so without
     // this restore, only POST routes would dispatch.
     match semantic_method.parse::<axum::http::Method>() {
         Ok(restored) => parts.method = restored,
-        Err(e) => tracing::debug!("X-PQ-Method {:?} is not a valid HTTP method, keeping wire method: {e}", semantic_method),
+        Err(e) => tracing::debug!(
+            "X-PQ-Method {:?} is not a valid HTTP method, keeping wire method: {e}",
+            semantic_method
+        ),
     }
 
     let mut new_req = Request::from_parts(parts, Body::from(inner_body));
-    new_req.headers_mut().insert("Content-Type", HeaderValue::from_static("application/json"));
-    for h in ["X-PQ-Session", "X-PQ-Nonce", "X-PQ-Epoch", "X-PQ-Rekey", "X-PQ-Method"] {
+    new_req
+        .headers_mut()
+        .insert("Content-Type", HeaderValue::from_static("application/json"));
+    for h in [
+        "X-PQ-Session",
+        "X-PQ-Nonce",
+        "X-PQ-Epoch",
+        "X-PQ-Rekey",
+        "X-PQ-Method",
+    ] {
         new_req.headers_mut().remove(h);
     }
     // Inject the AEAD-authenticated identity so handlers can `Extension(id)`
@@ -464,9 +576,15 @@ pub async fn pq_middleware(
         std::time::Duration::from_secs(30),
         axum::body::to_bytes(resp_body, 10 * 1024 * 1024),
     )
-        .await
-        .map_err(|e| { tracing::debug!("PQ response body read timed out: {e:?}"); StatusCode::GATEWAY_TIMEOUT })?
-        .map_err(|e| { tracing::debug!("PQ response body read failed: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?;
+    .await
+    .map_err(|e| {
+        tracing::debug!("PQ response body read timed out: {e:?}");
+        StatusCode::GATEWAY_TIMEOUT
+    })?
+    .map_err(|e| {
+        tracing::debug!("PQ response body read failed: {e:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let session_id_b64_for_aad = session_id_b64.to_string();
     let status_code = resp_parts.status.as_u16();
@@ -479,22 +597,43 @@ pub async fn pq_middleware(
         encrypt_response(&mut session, &resp_bytes, move |ep| {
             format!("{status_code}|{ep}|{session_id_b64_for_aad}").into_bytes()
         })
-            .map_err(|e| { tracing::debug!("PQ response encryption failed: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?
+        .map_err(|e| {
+            tracing::debug!("PQ response encryption failed: {e:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
     };
 
     let mut resp = Response::new(Body::from(ct));
     *resp.status_mut() = resp_parts.status;
-    resp.headers_mut().insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
-    resp.headers_mut().insert("X-PQ-Nonce",
-        HeaderValue::from_str(&B64.encode(resp_nonce)).map_err(|e| { tracing::debug!("X-PQ-Nonce header value invalid: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?);
+    resp.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    resp.headers_mut().insert(
+        "X-PQ-Nonce",
+        HeaderValue::from_str(&B64.encode(resp_nonce)).map_err(|e| {
+            tracing::debug!("X-PQ-Nonce header value invalid: {e:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?,
+    );
     // Surface the post-encryption (post-ratchet, if rekey fired) epoch so the
     // client can sanity-check against its session state.
-    resp.headers_mut().insert("X-PQ-Epoch",
-        HeaderValue::from_str(&effective_epoch.to_string()).map_err(|e| { tracing::debug!("X-PQ-Epoch header value invalid: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?);
+    resp.headers_mut().insert(
+        "X-PQ-Epoch",
+        HeaderValue::from_str(&effective_epoch.to_string()).map_err(|e| {
+            tracing::debug!("X-PQ-Epoch header value invalid: {e:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?,
+    );
 
     if let Some(pub_key) = rekey {
-        resp.headers_mut().insert("X-PQ-Rekey",
-            HeaderValue::from_str(&B64.encode(pub_key.as_bytes())).map_err(|e| { tracing::debug!("X-PQ-Rekey header value invalid: {e:?}"); StatusCode::INTERNAL_SERVER_ERROR })?);
+        resp.headers_mut().insert(
+            "X-PQ-Rekey",
+            HeaderValue::from_str(&B64.encode(pub_key.as_bytes())).map_err(|e| {
+                tracing::debug!("X-PQ-Rekey header value invalid: {e:?}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
+        );
     }
 
     Ok(resp)
@@ -527,10 +666,16 @@ pub async fn revoke_key_handler(
     axum::Json(request): axum::Json<RevokeKeyRequest>,
 ) -> Result<axum::Json<RevokeKeyResponse>, (StatusCode, String)> {
     let target = request.name.trim();
-    if target.is_empty() || target.len() > 64
-        || !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    if target.is_empty()
+        || target.len() > 64
+        || !target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err((StatusCode::BAD_REQUEST, "name must be 1-64 [a-zA-Z0-9_-]".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name must be 1-64 [a-zA-Z0-9_-]".into(),
+        ));
     }
 
     // Don't let a caller revoke a key while it's the only one left — that

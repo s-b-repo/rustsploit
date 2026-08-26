@@ -69,23 +69,18 @@ impl Bucket {
 
 /// Process-wide rate limiter with global + per-module + per-target tiers.
 pub struct GlobalLimiter {
-    global: Bucket,
+    global: tokio::sync::Mutex<Bucket>,
     per_module: Mutex<HashMap<String, Arc<Bucket>>>,
-    /// Per-target buckets paired with their last-access time (for LRU eviction).
     per_target: Mutex<HashMap<String, (Arc<Bucket>, Instant)>>,
-    /// Shared unlimited bucket returned when no per-target limit is configured,
-    /// so the `per_target` map is never populated in the common (rps=0) case.
     target_noop: Arc<Bucket>,
-    /// Default per-module RPS when no override is set.
     module_default: AtomicUsize,
-    /// Default per-target RPS when no override is set.
     target_default: AtomicUsize,
 }
 
 impl GlobalLimiter {
     fn new(global_rps: usize, module_default: usize, target_default: usize) -> Self {
         Self {
-            global: Bucket::new(global_rps),
+            global: tokio::sync::Mutex::new(Bucket::new(global_rps)),
             per_module: Mutex::new(HashMap::new()),
             per_target: Mutex::new(HashMap::new()),
             target_noop: Arc::new(Bucket::new(0)),
@@ -105,17 +100,40 @@ impl GlobalLimiter {
     ///
     /// `global_rps` is fixed at first construction; changing it needs a restart.
     pub async fn reload(&self) {
-        self.module_default.store(rps_option("module_rps"), Ordering::Relaxed);
-        self.target_default.store(rps_option("target_rps"), Ordering::Relaxed);
+        let new_global_rps = rps_option("global_rps");
+        self.module_default
+            .store(rps_option("module_rps"), Ordering::Relaxed);
+        self.target_default
+            .store(rps_option("target_rps"), Ordering::Relaxed);
         self.per_module.lock().await.clear();
         self.per_target.lock().await.clear();
+        let mut global = self.global.lock().await;
+        *global = Bucket::new(new_global_rps);
     }
 
     /// Acquire all three tiers. Call once per network round trip.
     /// `module` is the module path (e.g. `"scanners/port_scanner"`),
     /// `target` is the host (without port).
     pub async fn acquire(&self, module: &str, target: &str) {
-        self.global.acquire().await;
+        // Acquire global tier: read rps/sem, drop mutex guard, then await
+        let global_sem = {
+            let guard = self.global.lock().await;
+            if guard.rps == 0 {
+                return self.acquire_module_target(module, target).await;
+            }
+            guard.sem.clone()
+        };
+        // semaphore await happens WITHOUT holding the global mutex
+        if let Ok(p) = global_sem.acquire_owned().await {
+            p.forget();
+        }
+        let mb = self.module_bucket(module).await;
+        mb.acquire().await;
+        let tb = self.target_bucket(target).await;
+        tb.acquire().await;
+    }
+
+    async fn acquire_module_target(&self, module: &str, target: &str) {
         let mb = self.module_bucket(module).await;
         mb.acquire().await;
         let tb = self.target_bucket(target).await;
@@ -158,7 +176,11 @@ impl GlobalLimiter {
                 .min_by_key(|(_, (_, last))| *last)
                 .map(|(k, _)| k.clone())
             {
-                tracing::debug!("Rate limiter: evicting LRU target bucket '{}' (cap {} reached)", old_key, Self::MAX_TARGET_BUCKETS);
+                tracing::debug!(
+                    "Rate limiter: evicting LRU target bucket '{}' (cap {} reached)",
+                    old_key,
+                    Self::MAX_TARGET_BUCKETS
+                );
                 m.remove(&old_key);
             }
         }
@@ -173,26 +195,49 @@ impl GlobalLimiter {
 fn module_rps_from_options(module: &str) -> Option<usize> {
     let key = format!("module_rps:{}", module);
     let scope = crate::tenant::resolve();
-    scope.global_options().try_get(&key).and_then(|v| v.parse().ok())
+    scope
+        .global_options()
+        .try_get(&key)
+        .and_then(|v| v.parse().ok())
 }
 
 /// Read an rps option (`global_rps` / `module_rps` / `target_rps`) from the
 /// active tenant's `global_options`, defaulting to 0 (unlimited).
 fn rps_option(key: &str) -> usize {
-    crate::tenant::resolve()
-        .global_options()
-        .try_get(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    let raw = crate::tenant::resolve().global_options().try_get(key);
+    match raw {
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "rate limit option '{}' has invalid value '{}' ({}) — treating as 0 (unlimited)",
+                    key,
+                    v,
+                    e
+                );
+                0
+            }
+        },
+        None => 0,
+    }
 }
 
 /// Process-wide singleton initialised lazily from `global_options`.
 pub static LIMITER: Lazy<Arc<GlobalLimiter>> = Lazy::new(|| {
     let scope = crate::tenant::resolve();
     let opts = scope.global_options();
-    let global = opts.try_get("global_rps").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let module = opts.try_get("module_rps").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let target = opts.try_get("target_rps").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let global = opts
+        .try_get("global_rps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let module = opts
+        .try_get("module_rps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let target = opts
+        .try_get("target_rps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     Arc::new(GlobalLimiter::new(global, module, target))
 });
 

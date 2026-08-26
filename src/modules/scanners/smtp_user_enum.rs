@@ -1,27 +1,27 @@
 //! SMTP Username Enumeration Scanner Module
-//! 
+//!
 //! Enumerates usernames on an SMTP server using the VRFY command.
 //! Supports wordlist-based enumeration with concurrent scanning.
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 
-use std::net::ToSocketAddrs;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use telnet::{Telnet, Event};
-use crossbeam_channel::unbounded;
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_port, cfg_prompt_yes_no,
-    cfg_prompt_int_range, cfg_prompt_existing_file, cfg_prompt_output_file,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_port, cfg_prompt_yes_no,
 };
+use crossbeam_channel::unbounded;
+use std::net::ToSocketAddrs;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use telnet::{Event, Telnet};
 
 const PROGRESS_INTERVAL_SECS: u64 = 2;
 const DEFAULT_SMTP_PORT: u16 = 25;
@@ -66,7 +66,11 @@ impl Statistics {
         let invalid = self.invalid_users.load(Ordering::Relaxed);
         let errors = self.error_attempts.load(Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+        let rate = if elapsed > 0.0 {
+            total as f64 / elapsed
+        } else {
+            0.0
+        };
 
         crate::mprint!(
             "\r{} {} checked | {} valid | {} invalid | {} err | {:.1}/s    ",
@@ -77,7 +81,9 @@ impl Statistics {
             errors.to_string().red(),
             rate
         );
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+            crate::meprintln!("[!] Flush failed: {}", e);
+        }
     }
 
     fn print_final(&self) {
@@ -95,17 +101,34 @@ impl Statistics {
         crate::mprintln!("  Errors:             {}", errors.to_string().red());
         crate::mprintln!("  Elapsed time:       {:.2}s", elapsed);
         if elapsed > 0.0 {
-            crate::mprintln!("  Average rate:       {:.1} checks/s", total as f64 / elapsed);
+            crate::mprintln!(
+                "  Average rate:       {:.1} checks/s",
+                total as f64 / elapsed
+            );
         }
     }
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   SMTP Username Enumeration Scanner                        ║".cyan());
-    crate::mprintln!("{}", "║   Enumerates usernames using SMTP VRFY command             ║".cyan());
-    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   SMTP Username Enumeration Scanner                        ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Enumerates usernames using SMTP VRFY command             ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -152,7 +175,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut targets: Vec<String> = Vec::new();
     match mode.trim() {
         "2" => {
-            let file_path = cfg_prompt_existing_file("target_file", "Targets file (one IP/hostname per line)").await?;
+            let file_path =
+                cfg_prompt_existing_file("target_file", "Targets file (one IP/hostname per line)")
+                    .await?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 2"));
             }
@@ -166,7 +191,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             if !target.trim().is_empty() {
                 targets.push(target.trim().to_string());
             }
-            let file_path = cfg_prompt_existing_file("additional_target_file", "Additional targets file (one IP/hostname per line)").await?;
+            let file_path = cfg_prompt_existing_file(
+                "additional_target_file",
+                "Additional targets file (one IP/hostname per line)",
+            )
+            .await?;
             if file_path.trim().is_empty() {
                 return Err(anyhow!("Targets file path cannot be empty in mode 3"));
             }
@@ -186,14 +215,22 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let port = cfg_prompt_port("port", "SMTP Port", DEFAULT_SMTP_PORT).await?;
     let username_wordlist = cfg_prompt_existing_file("wordlist", "Username wordlist file").await?;
-    let threads = cfg_prompt_int_range("threads", "Threads", DEFAULT_THREADS as i64, 1, 1024).await? as usize;
-    let timeout_ms = cfg_prompt_int_range("timeout_ms", "Timeout in milliseconds", DEFAULT_TIMEOUT_MS as i64, 100, 60000).await? as u64;
+    let threads =
+        cfg_prompt_int_range("threads", "Threads", DEFAULT_THREADS as i64, 1, 1024).await? as usize;
+    let timeout_ms = cfg_prompt_int_range(
+        "timeout_ms",
+        "Timeout in milliseconds",
+        DEFAULT_TIMEOUT_MS as i64,
+        100,
+        60000,
+    )
+    .await? as u64;
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
 
     if targets.is_empty() {
         return Err(anyhow!("No targets specified for SMTP enumeration"));
     }
-    
+
     let config = SmtpUserEnumConfig {
         targets,
         port,
@@ -226,8 +263,12 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
     }
 
     // Decide whether to load usernames into memory or stream line-by-line
-    let metadata = std::fs::metadata(&config.username_wordlist)
-        .with_context(|| format!("Failed to stat username wordlist: {}", config.username_wordlist))?;
+    let metadata = std::fs::metadata(&config.username_wordlist).with_context(|| {
+        format!(
+            "Failed to stat username wordlist: {}",
+            config.username_wordlist
+        )
+    })?;
     let size_bytes = metadata.len();
     let use_streaming = size_bytes > STREAMING_THRESHOLD_BYTES;
 
@@ -244,7 +285,10 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
             return Err(anyhow!("Username wordlist is empty."));
         }
 
-        crate::mprintln!("{}", format!("[*] Loaded {} username(s).", usernames.len()).cyan());
+        crate::mprintln!(
+            "{}",
+            format!("[*] Loaded {} username(s).", usernames.len()).cyan()
+        );
         crate::mprintln!(
             "{}",
             format!(
@@ -300,14 +344,23 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
                         break;
                     }
 
-                    let _permit = semaphore.acquire().await;
+                    // Hold the permit for the probe duration; a closed
+                    // semaphore means shutdown — skip this probe.
+                    let _permit = match semaphore.acquire().await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            tracing::debug!("SMTP probe skipped: semaphore closed ({e})");
+                            continue;
+                        }
+                    };
 
                     let addr_c = addr.clone();
                     let username_c = username.clone();
                     let timeout_ms = config.timeout_ms;
                     let result = tokio::task::spawn_blocking(move || {
                         verify_smtp_user(&addr_c, &username_c, timeout_ms)
-                    }).await;
+                    })
+                    .await;
 
                     let result = match result {
                         Ok(r) => r,
@@ -349,23 +402,20 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
                             if msg.starts_with("Unknown VRFY response for '") {
                                 {
                                     let mut unk = unknown.lock().unwrap_or_else(|e| e.into_inner());
-                                    unk.push((
-                                        format!("{}@{}", username, raw_target),
-                                        msg.clone(),
-                                    ));
+                                    unk.push((format!("{}@{}", username, raw_target), msg.clone()));
                                 }
                                 if config.verbose {
                                     crate::meprintln!(
                                         "\r{}",
-                                        format!(
-                                            "[?] {}@{} -> {}",
-                                            username, raw_target, msg
-                                        )
-                                        .yellow()
+                                        format!("[?] {}@{} -> {}", username, raw_target, msg)
+                                            .yellow()
                                     );
                                 }
                             } else if config.verbose {
-                                crate::meprintln!("\r{}", format!("[!] {}: {}", username, msg).red());
+                                crate::meprintln!(
+                                    "\r{}",
+                                    format!("[!] {}: {}", username, msg).red()
+                                );
                             }
                         }
                     }
@@ -376,18 +426,25 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
 
         for handle in handles {
             if let Err(e) = handle.await {
-                eprintln!("[!] Task join failed: {}", e);
+                crate::meprintln!("[!] Task join failed: {}", e);
             }
         }
 
         // Stop progress reporter
         stop_flag.store(true, Ordering::Relaxed);
         if let Err(e) = progress_handle.join() {
-            eprintln!("[!] Thread join failed: {:?}", e);
+            crate::meprintln!("[!] Thread join failed: {:?}", e);
         }
 
         // Final reporting including unknown responses
-        return finalize_and_report(&config.targets.join(","), config.port, found, unknown, stats).await;
+        return finalize_and_report(
+            &config.targets.join(","),
+            config.port,
+            found,
+            unknown,
+            stats,
+        )
+        .await;
     }
 
     // Streaming mode for very large username lists
@@ -412,7 +469,7 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
     crate::mprintln!("{}", format!("[*] Threads: {}", config.threads).cyan());
     crate::mprintln!("{}", format!("[*] Timeout: {}ms", config.timeout_ms).cyan());
     crate::mprintln!();
-    
+
     let found = Arc::new(Mutex::new(Vec::new()));
     let unknown = Arc::new(Mutex::new(Vec::new()));
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -427,18 +484,13 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
         let tx_clone = tx.clone();
 
         std::thread::spawn(move || {
-            if let Err(e) =
-                enqueue_streaming_usernames(&path_clone, &targets_clone, tx_clone)
-            {
-                crate::meprintln!(
-                    "\r{}",
-                    format!("[!] Username producer error: {}", e).red()
-                );
+            if let Err(e) = enqueue_streaming_usernames(&path_clone, &targets_clone, tx_clone) {
+                crate::meprintln!("\r{}", format!("[!] Username producer error: {}", e).red());
             }
         });
     }
     drop(tx);
-    
+
     // Start progress reporter thread
     let progress_stop = Arc::clone(&stop_flag);
     let progress_stats = Arc::clone(&stats);
@@ -448,7 +500,7 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
             std::thread::sleep(Duration::from_secs(PROGRESS_INTERVAL_SECS));
         }
     });
-    
+
     // Worker tasks
     let mut handles = Vec::new();
     for _ in 0..config.threads {
@@ -466,14 +518,23 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
                     break;
                 }
 
-                let _permit = semaphore.acquire().await;
+                // Hold the permit for the probe duration; a closed
+                // semaphore means shutdown — skip this probe.
+                let _permit = match semaphore.acquire().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::debug!("SMTP probe skipped: semaphore closed ({e})");
+                        continue;
+                    }
+                };
 
                 let addr_c = addr.clone();
                 let username_c = username.clone();
                 let timeout_ms = config.timeout_ms;
                 let result = tokio::task::spawn_blocking(move || {
                     verify_smtp_user(&addr_c, &username_c, timeout_ms)
-                }).await;
+                })
+                .await;
 
                 let result = match result {
                     Ok(r) => r,
@@ -515,19 +576,12 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
                         if msg.starts_with("Unknown VRFY response for '") {
                             {
                                 let mut unk = unknown.lock().unwrap_or_else(|e| e.into_inner());
-                                unk.push((
-                                    format!("{}@{}", username, raw_target),
-                                    msg.clone(),
-                                ));
+                                unk.push((format!("{}@{}", username, raw_target), msg.clone()));
                             }
                             if config.verbose {
                                 crate::meprintln!(
                                     "\r{}",
-                                    format!(
-                                        "[?] {}@{} -> {}",
-                                        username, raw_target, msg
-                                    )
-                                    .yellow()
+                                    format!("[?] {}@{} -> {}", username, raw_target, msg).yellow()
                                 );
                             }
                         } else if config.verbose {
@@ -542,18 +596,25 @@ async fn run_smtp_user_enum(ctx: &ModuleCtx, config: SmtpUserEnumConfig) -> Resu
 
     for handle in handles {
         if let Err(e) = handle.await {
-            eprintln!("[!] Task join failed: {}", e);
+            crate::meprintln!("[!] Task join failed: {}", e);
         }
     }
 
     // Stop progress reporter
     stop_flag.store(true, Ordering::Relaxed);
     if let Err(e) = progress_handle.join() {
-        eprintln!("[!] Thread join failed: {:?}", e);
+        crate::meprintln!("[!] Thread join failed: {:?}", e);
     }
-    
+
     // Final reporting including unknown responses
-    finalize_and_report(&config.targets.join(","), config.port, found, unknown, stats).await
+    finalize_and_report(
+        &config.targets.join(","),
+        config.port,
+        found,
+        unknown,
+        stats,
+    )
+    .await
 }
 
 /// Verify a username using SMTP VRFY command
@@ -563,17 +624,19 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("Could not resolve address"))?;
-    
+
     let stream = crate::utils::blocking_tcp_connect(&socket, Duration::from_millis(timeout_ms))
         .context("Connection timeout")?;
-    if let Err(e) = stream.set_nodelay(true) { eprintln!("[!] Failed to set nodelay: {}", e); }
+    if let Err(e) = stream.set_nodelay(true) {
+        crate::meprintln!("[!] Failed to set nodelay: {}", e);
+    }
 
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))?;
-    
+
     let mut telnet = Telnet::from_stream(Box::new(stream), 256);
     let timeout = Duration::from_millis(timeout_ms);
-    
+
     // Read initial banner (220 response)
     let mut banner_ok = false;
     let start = Instant::now();
@@ -597,11 +660,11 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
     if !banner_ok {
         return Err(anyhow!("No 220 banner received"));
     }
-    
+
     // Send VRFY command
     let vrfy_cmd = format!("VRFY {}\r\n", username);
     telnet.write(vrfy_cmd.as_bytes())?;
-    
+
     // Read VRFY response (cap at 8KB to prevent OOM from malicious servers)
     let start = Instant::now();
     let mut response_text = String::new();
@@ -615,31 +678,45 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
                     break; // Cap response accumulation
                 }
                 response_text.push_str(&response);
-                
+
                 // Check for valid user responses (250, 251)
                 if response.starts_with("250") || response.starts_with("251") {
                     // User exists
-                    if let Err(e) = telnet.write(b"QUIT\r\n") { tracing::trace!("SMTP QUIT write failed: {e}"); }
+                    if let Err(e) = telnet.write(b"QUIT\r\n") {
+                        tracing::trace!("SMTP QUIT write failed: {e}");
+                    }
                     return Ok(Some(response_text.trim().to_string()));
                 }
-                
+
                 // Check for invalid user responses (550, 551, 553)
-                if response.starts_with("550") || response.starts_with("551") || response.starts_with("553") {
+                if response.starts_with("550")
+                    || response.starts_with("551")
+                    || response.starts_with("553")
+                {
                     // User doesn't exist
-                    if let Err(e) = telnet.write(b"QUIT\r\n") { tracing::trace!("SMTP QUIT write failed: {e}"); }
+                    if let Err(e) = telnet.write(b"QUIT\r\n") {
+                        tracing::trace!("SMTP QUIT write failed: {e}");
+                    }
                     return Ok(None);
                 }
-                
+
                 // Check for ambiguous response (252 - cannot verify)
                 if response.starts_with("252") {
                     // Server explicitly refuses to verify (VRFY disabled) – treat as error
-                    if let Err(e) = telnet.write(b"QUIT\r\n") { tracing::trace!("SMTP QUIT write failed: {e}"); }
-                    return Err(anyhow!("Server returned 252 (cannot VRFY) for user '{}'", username));
+                    if let Err(e) = telnet.write(b"QUIT\r\n") {
+                        tracing::trace!("SMTP QUIT write failed: {e}");
+                    }
+                    return Err(anyhow!(
+                        "Server returned 252 (cannot VRFY) for user '{}'",
+                        username
+                    ));
                 }
-                
+
                 // If we got a complete response line but no known status code, treat as unknown
                 if response.contains("\r\n") {
-                    if let Err(e) = telnet.write(b"QUIT\r\n") { tracing::trace!("SMTP QUIT write failed: {e}"); }
+                    if let Err(e) = telnet.write(b"QUIT\r\n") {
+                        tracing::trace!("SMTP QUIT write failed: {e}");
+                    }
                     return Err(anyhow!(
                         "Unknown VRFY response for '{}': {}",
                         username,
@@ -656,7 +733,9 @@ fn verify_smtp_user(addr: &str, username: &str, timeout_ms: u64) -> Result<Optio
     }
 
     // If we didn't get a clear response, treat as error
-    if let Err(e) = telnet.write(b"QUIT\r\n") { tracing::trace!("SMTP QUIT write failed: {e}"); }
+    if let Err(e) = telnet.write(b"QUIT\r\n") {
+        tracing::trace!("SMTP QUIT write failed: {e}");
+    }
     Err(anyhow!("No valid VRFY response received"))
 }
 
@@ -666,7 +745,10 @@ fn read_lines(path: &str) -> Result<Vec<String>> {
         .lines()
         .filter_map(|r| match r {
             Ok(l) => Some(l),
-            Err(e) => { tracing::trace!("Skipping non-UTF-8 line: {e}"); None }
+            Err(e) => {
+                tracing::trace!("Skipping non-UTF-8 line: {e}");
+                None
+            }
         })
         .filter(|s| !s.trim().is_empty())
         .collect())
@@ -754,17 +836,21 @@ async fn finalize_and_report(
         }
     }; // guard dropped here — before any .await
 
-    if !found_empty
-        && cfg_prompt_yes_no("save_valid", "Save valid usernames?", false).await? {
-            let filename = cfg_prompt_output_file("valid_output", "What should the valid results be saved as?", "smtp_valid_users.txt").await?;
-            if filename.is_empty() {
-                crate::mprintln!("{}", "[-] Filename cannot be empty.".red());
-            } else {
-                let found_guard = found.lock().unwrap_or_else(|e| e.into_inner());
-                save_results(&filename, &found_guard)?;
-                crate::mprintln!("{}", format!("[+] Results saved to {}", filename).green());
-            }
+    if !found_empty && cfg_prompt_yes_no("save_valid", "Save valid usernames?", false).await? {
+        let filename = cfg_prompt_output_file(
+            "valid_output",
+            "What should the valid results be saved as?",
+            "smtp_valid_users.txt",
+        )
+        .await?;
+        if filename.is_empty() {
+            crate::mprintln!("{}", "[-] Filename cannot be empty.".red());
+        } else {
+            let found_guard = found.lock().unwrap_or_else(|e| e.into_inner());
+            save_results(&filename, &found_guard)?;
+            crate::mprintln!("{}", format!("[+] Results saved to {}", filename).green());
         }
+    }
 
     let unknown_has_data = {
         let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
@@ -785,22 +871,28 @@ async fn finalize_and_report(
     }; // guard dropped before await
 
     if unknown_has_data
-        && cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false).await? {
-            let default_name = "smtp_unknown_responses.txt";
-            let chosen = cfg_prompt_output_file("unknown_output", "What should the unknown results be saved as?", default_name).await?;
-            let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = save_unknown_responses(&chosen, &unknown_guard) {
-                crate::mprintln!(
-                    "{}",
-                    format!("[!] Failed to save unknown responses: {}", e).red()
-                );
-            } else {
-                crate::mprintln!(
-                    "{}",
-                    format!("[+] Unknown responses saved to {}", chosen).green()
-                );
-            }
+        && cfg_prompt_yes_no("save_unknown", "Save unknown responses to file?", false).await?
+    {
+        let default_name = "smtp_unknown_responses.txt";
+        let chosen = cfg_prompt_output_file(
+            "unknown_output",
+            "What should the unknown results be saved as?",
+            default_name,
+        )
+        .await?;
+        let unknown_guard = unknown.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = save_unknown_responses(&chosen, &unknown_guard) {
+            crate::mprintln!(
+                "{}",
+                format!("[!] Failed to save unknown responses: {}", e).red()
+            );
+        } else {
+            crate::mprintln!(
+                "{}",
+                format!("[+] Unknown responses saved to {}", chosen).green()
+            );
         }
+    }
 
     Ok(outcome)
 }
@@ -811,16 +903,16 @@ fn save_results(path: &str, users: &[(String, String)]) -> Result<()> {
         .write(true)
         .truncate(true)
         .open(path)?;
-    
+
     writeln!(file, "# SMTP Username Enumeration Results")?;
     writeln!(file, "# Generated by RustSploit SMTP User Enum Scanner")?;
     writeln!(file, "# Total: {} valid username(s)", users.len())?;
     writeln!(file)?;
-    
+
     for (username, response) in users {
         writeln!(file, "{} - {}", username, response)?;
     }
-    
+
     Ok(())
 }
 
@@ -845,13 +937,22 @@ fn save_unknown_responses(path: &str, entries: &[(String, String)]) -> Result<()
 
 fn normalize_target(host: &str, port: u16) -> Result<String> {
     use std::sync::LazyLock;
-    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$").expect("hardcoded regex"));
-    let re = &*RE;
+    static RE: LazyLock<Result<Regex>> = LazyLock::new(|| {
+        Regex::new(r"^\[*([^\]]+?)\]*(?::(\d{1,5}))?$")
+            .map_err(|e| anyhow!("broken hardcoded target regex: {}", e))
+    });
+    let result_ref = RE.as_ref();
+    let re = result_ref
+        .as_ref()
+        .map_err(|e| anyhow!("target regex compile failed: {}", e))?;
     let t = host.trim();
     let cap = re
         .captures(t)
         .ok_or_else(|| anyhow!("Invalid target: {}", host))?;
-    let addr = cap.get(1).map(|m| m.as_str()).ok_or_else(|| anyhow!("Target address missing"))?;
+    let addr = cap
+        .get(1)
+        .map(|m| m.as_str())
+        .ok_or_else(|| anyhow!("Target address missing"))?;
     let p = cap
         .get(2)
         .and_then(|m| m.as_str().parse::<u16>().ok())
@@ -879,6 +980,5 @@ pub fn info() -> crate::module_info::ModuleInfo {
         default_port: None,
     }
 }
-
 
 crate::register_native_module!(crate::module::Category::Scanners, "smtp_user_enum", native);

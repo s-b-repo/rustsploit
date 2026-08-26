@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use colored::*;
 use regex::Regex;
@@ -6,12 +6,22 @@ use reqwest::{Client, StatusCode, Url};
 use std::collections::HashSet;
 use std::fs;
 
-use std::time::{Duration, Instant};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_yes_no, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_yes_no,
     safe_read_to_string,
 };
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Compiled once; a compile failure of the hardcoded pattern is surfaced as
+/// an error at use time instead of panicking during static init.
+fn title_regex() -> Result<&'static Regex> {
+    static RE: OnceLock<std::result::Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>").map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| anyhow!("title regex failed to compile: {}", e))
+}
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let initial_target = ctx
@@ -20,7 +30,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .context("http_title_scanner requires a single-host target")?;
 
     if crate::utils::get_global_source_port().await.is_some() {
-        crate::mprintln!("{}", "[*] Note: source_port does not apply to HTTP connections.".dimmed());
+        crate::mprintln!(
+            "{}",
+            "[*] Note: source_port does not apply to HTTP connections.".dimmed()
+        );
     }
 
     banner();
@@ -29,12 +42,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let mut targets = collect_initial_targets(initial_target);
 
-    let additional = cfg_prompt_default("additional_targets", "Enter additional comma-separated targets (optional)", "").await?;
+    let additional = cfg_prompt_default(
+        "additional_targets",
+        "Enter additional comma-separated targets (optional)",
+        "",
+    )
+    .await?;
     if !additional.is_empty() {
         targets.extend(split_targets(&additional));
     }
 
-    let file_path = cfg_prompt_default("target_file", "Path to file with targets (optional)", "").await?;
+    let file_path =
+        cfg_prompt_default("target_file", "Path to file with targets (optional)", "").await?;
     if !file_path.is_empty() {
         let file_targets = load_targets_from_file(&file_path)?;
         targets.extend(file_targets);
@@ -48,15 +67,22 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         return Ok(outcome);
     }
 
-    let use_ports = cfg_prompt_yes_no("use_ports", "Test via specific ports (port tunneling)?", false).await?;
+    let use_ports = cfg_prompt_yes_no(
+        "use_ports",
+        "Test via specific ports (port tunneling)?",
+        false,
+    )
+    .await?;
     let ports = if use_ports {
-        let ports_str = cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "").await?;
+        let ports_str =
+            cfg_prompt_default("ports", "Enter port(s) comma-separated (e.g. 80,8080)", "").await?;
         parse_ports_from_string(&ports_str)
     } else {
         Vec::new()
     };
 
-    let timeout_secs = cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120).await? as u64;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Request timeout in seconds", 10, 1, 120).await? as u64;
     let save_output = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
     let verbose = cfg_prompt_yes_no("verbose", "Enable verbose output?", false).await?;
 
@@ -64,7 +90,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if !ports.is_empty() {
         let expanded = expand_targets_with_ports(&normalized, &ports);
         if expanded.is_empty() {
-            crate::mprintln!("[!] No valid port combinations derived; continuing without port tunneling.");
+            crate::mprintln!(
+                "[!] No valid port combinations derived; continuing without port tunneling."
+            );
         } else {
             normalized = expanded;
         }
@@ -82,23 +110,40 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .build()
         .context("Failed to build HTTP client")?;
 
-    let title_re = Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>")?;
+    let title_re: &Regex = title_regex()?;
     let mut all_results = Vec::new();
     let mut success_count = 0usize;
     let mut error_count = 0usize;
     let start_time = Instant::now();
     let total_targets = normalized.len();
 
-    crate::mprintln!("{}", format!("[*] Scanning {} target(s)...", total_targets).cyan().bold());
+    crate::mprintln!(
+        "{}",
+        format!("[*] Scanning {} target(s)...", total_targets)
+            .cyan()
+            .bold()
+    );
     crate::mprintln!();
 
     for (idx, url) in normalized.iter().enumerate() {
-        if ctx.is_cancelled() { break; }
+        if ctx.is_cancelled() {
+            break;
+        }
         // Progress indicator
         if (idx + 1) % 10 == 0 || idx + 1 == total_targets {
-            crate::mprint!("\r{}", format!("[*] Progress: {}/{} ({:.0}%)",
-                idx + 1, total_targets, ((idx + 1) as f64 / total_targets as f64) * 100.0).dimmed());
-            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
+            crate::mprint!(
+                "\r{}",
+                format!(
+                    "[*] Progress: {}/{} ({:.0}%)",
+                    idx + 1,
+                    total_targets,
+                    ((idx + 1) as f64 / total_targets as f64) * 100.0
+                )
+                .dimmed()
+            );
+            if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+                crate::meprintln!("[!] Flush failed: {}", e);
+            }
         }
 
         ctx.rate_limit(url).await;
@@ -118,7 +163,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     });
                 } else if let Some(status) = result.status {
                     if status.is_success() {
-                        crate::mprintln!("\r{}", format!("[+] {} -> <no title> (status: {})", url, status).green());
+                        crate::mprintln!(
+                            "\r{}",
+                            format!("[+] {} -> <no title> (status: {})", url, status).green()
+                        );
                         success_count += 1;
                         outcome.findings.push(Finding {
                             target: url.clone(),
@@ -130,7 +178,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                             })),
                         });
                     } else {
-                        crate::mprintln!("\r{}", format!("[~] {} -> <no title> (status: {})", url, status).yellow());
+                        crate::mprintln!(
+                            "\r{}",
+                            format!("[~] {} -> <no title> (status: {})", url, status).yellow()
+                        );
                     }
                 } else {
                     crate::mprintln!("\r{}", format!("[~] {} -> <no title>", url).yellow());
@@ -158,7 +209,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     let elapsed = start_time.elapsed();
-    
+
     // Print statistics
     crate::mprintln!();
     crate::mprintln!("{}", "=== Scan Statistics ===".bold());
@@ -167,15 +218,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("  Errors:         {}", error_count.to_string().red());
     crate::mprintln!("  Duration:       {:.2}s", elapsed.as_secs_f64());
     if elapsed.as_secs() > 0 {
-        crate::mprintln!("  Rate:           {:.1} requests/s", total_targets as f64 / elapsed.as_secs_f64());
+        crate::mprintln!(
+            "  Rate:           {:.1} requests/s",
+            total_targets as f64 / elapsed.as_secs_f64()
+        );
     }
 
     if save_output {
-        let default_name = format!(
-            "http_title_scan_{}.txt",
-            Utc::now().format("%Y%m%d_%H%M%S")
-        );
-        let output_path = cfg_prompt_output_file("output_file", "Enter output file path", &default_name).await?;
+        let default_name = format!("http_title_scan_{}.txt", Utc::now().format("%Y%m%d_%H%M%S"));
+        let output_path =
+            cfg_prompt_output_file("output_file", "Enter output file path", &default_name).await?;
         write_report(&output_path, &all_results)?;
         crate::mprintln!("[*] Results saved to {}", output_path);
     }
@@ -235,8 +287,7 @@ async fn fetch_title(client: &Client, url: &str, title_re: &Regex) -> Result<Tit
 }
 
 fn sanitize_title(raw: &str) -> String {
-    raw
-        .lines()
+    raw.lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
@@ -365,18 +416,34 @@ fn write_report(path: &str, results: &[TitleResult]) -> Result<()> {
 }
 
 fn banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   HTTP Title Scanner                                         ║".cyan());
-    crate::mprintln!("{}", "║   Enumerate page titles over HTTP/HTTPS endpoints            ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   HTTP Title Scanner                                         ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Enumerate page titles over HTTP/HTTPS endpoints            ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
         name: "HTTP Title Scanner".to_string(),
-        description: "Enumerates HTML page titles across HTTP and HTTPS endpoints for target fingerprinting.".to_string(),
+        description:
+            "Enumerates HTML page titles across HTTP and HTTPS endpoints for target fingerprinting."
+                .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,
@@ -385,4 +452,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "http_title_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "http_title_scanner",
+    native
+);

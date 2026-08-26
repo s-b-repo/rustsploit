@@ -19,12 +19,12 @@
 //! Constants (defaults + hard caps) are also re-exported so the wrapper can
 //! drive `cfg_prompt_int_range` calls without hard-coding numbers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use data_encoding::{BASE32, BASE32HEX, BASE64, BASE64URL, HEXUPPER};
-use flate2::write::GzEncoder;
 use flate2::Compression;
-use rand::seq::IndexedRandom;
+use flate2::write::GzEncoder;
 use rand::RngExt;
+use rand::seq::IndexedRandom;
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 
@@ -80,7 +80,7 @@ pub enum Method {
     Gzip,
     Url,
     Caesar(u8),
-    BitRot(u8),       // 1..=7
+    BitRot(u8), // 1..=7
     Vigenere(Vec<u8>),
     ZeroWidth,
     HexSplit,
@@ -123,9 +123,9 @@ impl Method {
 
 /// Set of method IDs the user can request explicitly.
 pub const ALL_METHOD_IDS: &[&str] = &[
-    "xor", "xor1", "b16", "b32", "b32hex", "b64", "b64url", "b85", "b91",
-    "rot13", "rot47", "rev", "rc4", "gzip", "url", "caesar", "bitrot",
-    "vigenere", "zw", "hexsplit", "utf16le", "csub", "ansi", "chunk",
+    "xor", "xor1", "b16", "b32", "b32hex", "b64", "b64url", "b85", "b91", "rot13", "rot47", "rev",
+    "rc4", "gzip", "url", "caesar", "bitrot", "vigenere", "zw", "hexsplit", "utf16le", "csub",
+    "ansi", "chunk",
 ];
 
 /// Conservative upper bound on output size for a given input length. Used
@@ -158,8 +158,8 @@ pub fn growth_factor(method: &Method) -> f64 {
         Method::Utf16Le => 2.00,
         Method::HexSplit => 4.00,
         Method::AnsiEscape => 7.00,
-        Method::Url => 3.00,        // %XX per byte
-        Method::ZeroWidth => 24.0,  // each bit → 3-byte UTF-8 codepoint
+        Method::Url => 3.00,       // %XX per byte
+        Method::ZeroWidth => 24.0, // each bit → 3-byte UTF-8 codepoint
 
         // Variable; gzip *usually* shrinks but worst-case is ~1.001 + 18 bytes.
         Method::Gzip => 1.05,
@@ -178,7 +178,9 @@ pub fn caveat(method: &Method) -> &'static str {
         Method::Rot47 => "destructive on bytes outside 33..=126 (passes them through unchanged)",
         Method::Rot13 => "passes non-letters unchanged — chain randomness reduced",
         Method::B91 => "encoding only; basE91 has no `=` padding character",
-        Method::Vigenere(_) => "alpha-only key; non-letter bytes shifted but key shift = 0 → identity",
+        Method::Vigenere(_) => {
+            "alpha-only key; non-letter bytes shifted but key shift = 0 → identity"
+        }
         Method::Chunk(_) => "permutation embedded in decoder ⇒ blob carries full perm vector",
         Method::CharSubst(_) => "256-byte substitution table embedded ⇒ adds 256 bytes to decoder",
         _ => "",
@@ -196,13 +198,17 @@ pub fn instantiate(id: &str) -> Result<Method> {
             let mut k = vec![0u8; 16];
             rng.fill(k.as_mut_slice());
             // Reject all-zero keys (degenerates to identity).
-            if k.iter().all(|&b| b == 0) { k[0] = 0x5a; }
+            if k.iter().all(|&b| b == 0) {
+                k[0] = 0x5a;
+            }
             Method::XorMulti(k)
         }
         "xor1" => {
             let mut b = [0u8; 1];
             rng.fill(b.as_mut_slice());
-            if b[0] == 0 { b[0] = 0x5a; }
+            if b[0] == 0 {
+                b[0] = 0x5a;
+            }
             Method::Xor1(b[0])
         }
         "b16" | "hex" => Method::B16,
@@ -219,7 +225,9 @@ pub fn instantiate(id: &str) -> Result<Method> {
             let mut k = vec![0u8; 16];
             rng.fill(k.as_mut_slice());
             // Reject all-zero keys (degenerates to a deterministic, weak stream).
-            if k.iter().all(|&b| b == 0) { k[0] = 0x5a; }
+            if k.iter().all(|&b| b == 0) {
+                k[0] = 0x5a;
+            }
             Method::Rc4(k)
         }
         "gzip" => Method::Gzip,
@@ -228,7 +236,9 @@ pub fn instantiate(id: &str) -> Result<Method> {
             let mut b = [0u8; 1];
             loop {
                 rng.fill(b.as_mut_slice());
-                if b[0] != 0 { break; }
+                if b[0] != 0 {
+                    break;
+                }
             }
             Method::Caesar(b[0])
         }
@@ -264,7 +274,9 @@ pub fn instantiate(id: &str) -> Result<Method> {
         "csub" => {
             // Random byte-permutation table (Fisher-Yates).
             let mut tbl = [0u8; 256];
-            for (i, b) in tbl.iter_mut().enumerate() { *b = i as u8; }
+            for (i, b) in tbl.iter_mut().enumerate() {
+                *b = i as u8;
+            }
             for i in (1..256).rev() {
                 let mut buf = [0u8; 4];
                 rng.fill(buf.as_mut_slice());
@@ -313,21 +325,35 @@ fn xor_multi(input: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("xor key cannot be empty"));
     }
     let n = key.len();
-    Ok(input.iter().enumerate().map(|(i, b)| b ^ key[i % n]).collect())
+    Ok(input
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ key[i % n])
+        .collect())
 }
 
 fn rot13(input: &[u8]) -> Vec<u8> {
-    input.iter().map(|&b| match b {
-        b'a'..=b'z' => b'a' + (b - b'a' + 13) % 26,
-        b'A'..=b'Z' => b'A' + (b - b'A' + 13) % 26,
-        _ => b,
-    }).collect()
+    input
+        .iter()
+        .map(|&b| match b {
+            b'a'..=b'z' => b'a' + (b - b'a' + 13) % 26,
+            b'A'..=b'Z' => b'A' + (b - b'A' + 13) % 26,
+            _ => b,
+        })
+        .collect()
 }
 
 fn rot47(input: &[u8]) -> Vec<u8> {
-    input.iter().map(|&b| {
-        if (33..=126).contains(&b) { 33 + ((b - 33 + 47) % 94) } else { b }
-    }).collect()
+    input
+        .iter()
+        .map(|&b| {
+            if (33..=126).contains(&b) {
+                33 + ((b - 33 + 47) % 94)
+            } else {
+                b
+            }
+        })
+        .collect()
 }
 
 fn caesar(input: &[u8], shift: u8) -> Vec<u8> {
@@ -343,18 +369,25 @@ fn vigenere(input: &[u8], key: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("vigenere key cannot be empty"));
     }
     // Key bytes map A=0..Z=25 (already restricted to letters at instantiate).
-    let shifts: Vec<u8> = key.iter().map(|&b| {
-        match b {
+    let shifts: Vec<u8> = key
+        .iter()
+        .map(|&b| match b {
             b'a'..=b'z' => b - b'a',
             b'A'..=b'Z' => b - b'A',
             _ => 0,
-        }
-    }).collect();
+        })
+        .collect();
     if shifts.iter().all(|&s| s == 0) {
-        return Err(anyhow!("vigenere key reduces to identity (all letters map to shift 0)"));
+        return Err(anyhow!(
+            "vigenere key reduces to identity (all letters map to shift 0)"
+        ));
     }
     let n = shifts.len();
-    Ok(input.iter().enumerate().map(|(i, &b)| b.wrapping_add(shifts[i % n])).collect())
+    Ok(input
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| b.wrapping_add(shifts[i % n]))
+        .collect())
 }
 
 fn rc4(input: &[u8], key: &[u8]) -> Result<Vec<u8>> {
@@ -366,7 +399,9 @@ fn rc4(input: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     }
     // Standard RC4 KSA + PRGA.
     let mut s: [u8; 256] = [0; 256];
-    for (i, b) in s.iter_mut().enumerate() { *b = i as u8; }
+    for (i, b) in s.iter_mut().enumerate() {
+        *b = i as u8;
+    }
     let key_len = key.len();
     let mut j: usize = 0;
     for i in 0..256 {
@@ -430,8 +465,7 @@ fn ascii85_encode(input: &[u8]) -> Vec<u8> {
 
 /// basE91 encoder (simplified; emits only the 91 printable ASCII chars).
 fn base91_encode(input: &[u8]) -> Vec<u8> {
-    const TABLE: &[u8; 91] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\
+    const TABLE: &[u8; 91] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\
           0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~\"";
     let mut out = Vec::with_capacity(safe_capacity(input.len(), 2));
     let mut buf: u32 = 0;
@@ -556,18 +590,19 @@ fn chunk_permute(input: &[u8], perm: &[usize]) -> Result<Vec<u8>> {
 
 fn ensure_chunk_permutation(method: &mut Method, len: usize) {
     if let Method::Chunk(perm) = method
-        && perm.len() != len {
-            let mut p: Vec<usize> = (0..len).collect();
-            // Fisher-Yates over the index vector.
-            let mut rng = rand::rng();
-            for i in (1..p.len()).rev() {
-                let mut buf = [0u8; 4];
-                rng.fill(buf.as_mut_slice());
-                let j = (u32::from_le_bytes(buf) as usize) % (i + 1);
-                p.swap(i, j);
-            }
-            *perm = p;
+        && perm.len() != len
+    {
+        let mut p: Vec<usize> = (0..len).collect();
+        // Fisher-Yates over the index vector.
+        let mut rng = rand::rng();
+        for i in (1..p.len()).rev() {
+            let mut buf = [0u8; 4];
+            rng.fill(buf.as_mut_slice());
+            let j = (u32::from_le_bytes(buf) as usize) % (i + 1);
+            p.swap(i, j);
         }
+        *perm = p;
+    }
 }
 
 /// Apply one round of the chain. `method` is `&mut` because `Chunk` populates
@@ -622,10 +657,12 @@ pub fn apply_method(method: &mut Method, input: &[u8]) -> Result<Vec<u8>> {
                 Method::Chunk(p) => chunk_permute(input, p)?,
                 // SAFETY: the outer match already selected Method::Chunk;
                 // no other variant can reach here.
-                other => return Err(anyhow::anyhow!(
-                    "internal: outer match was Chunk but inner saw {:?}",
-                    std::mem::discriminant(other)
-                )),
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "internal: outer match was Chunk but inner saw {:?}",
+                        std::mem::discriminant(other)
+                    ));
+                }
             }
         }
     })
@@ -707,7 +744,9 @@ pub fn obfuscate_bytes(
 /// Build a 4-round random chain. Convenience for callers that want a quick
 /// obfuscation without picking methods themselves.
 pub fn random_chain(rounds: usize) -> Result<Vec<Method>> {
-    (0..rounds).map(|_| instantiate(random_method_id())).collect()
+    (0..rounds)
+        .map(|_| instantiate(random_method_id()))
+        .collect()
 }
 
 /// SHA-256 of the original input bytes (hex-encoded, lowercase). Embedded
@@ -731,6 +770,16 @@ pub enum OutputFormat {
     Bash,
     JavaScript,
     CArray,
+    /// VB.NET — emitted as a recipe-style file with `'`-prefixed comments.
+    /// Like Raw/CArray this format **does not** ship a self-decoder stub: the
+    /// encoded blob + plain-text decode steps live in comments, and the
+    /// operator pastes the decode chain into their own VB.NET harness.
+    /// `supports(method, VbNet)` is true for every method (no decoder gate).
+    VbNet,
+    /// Go — recipe-style file with `//`-prefixed comments. Same no-decoder
+    /// rationale as [`OutputFormat::VbNet`]: the operator pastes the chain
+    /// into their own Go harness.
+    Go,
 }
 
 pub fn parse_format(s: &str) -> Result<OutputFormat> {
@@ -742,6 +791,8 @@ pub fn parse_format(s: &str) -> Result<OutputFormat> {
         "bash" | "sh" => OutputFormat::Bash,
         "javascript" | "js" | "node" => OutputFormat::JavaScript,
         "c_array" | "c" | "carray" => OutputFormat::CArray,
+        "vb" | "vbnet" | "vb.net" => OutputFormat::VbNet,
+        "go" | "golang" => OutputFormat::Go,
         other => anyhow::bail!("unknown output format '{}'", other),
     })
 }
@@ -753,8 +804,13 @@ pub fn parse_format(s: &str) -> Result<OutputFormat> {
 pub fn supports(method: &Method, fmt: OutputFormat) -> bool {
     use Method::*;
     match (method, fmt) {
-        // Raw / Recipe / CArray require no decoder, so they accept everything.
-        (_, OutputFormat::Raw) | (_, OutputFormat::Recipe) | (_, OutputFormat::CArray) => true,
+        // Raw / Recipe / CArray / VbNet / Go ship no self-decoder stub, so
+        // they accept every method (operator decodes in their own harness).
+        (_, OutputFormat::Raw)
+        | (_, OutputFormat::Recipe)
+        | (_, OutputFormat::CArray)
+        | (_, OutputFormat::VbNet)
+        | (_, OutputFormat::Go) => true,
 
         // Python: full coverage.
         (_, OutputFormat::Python) => true,
@@ -806,7 +862,7 @@ pub fn supports(method: &Method, fmt: OutputFormat) -> bool {
 // Method describers (used by recipe / debug output)
 // ---------------------------------------------------------------------------
 
-pub fn describe_method(m: &Method) -> String {
+fn describe_method(m: &Method) -> String {
     match m {
         Method::XorMulti(k) => format!("key={}", hex_pretty(k)),
         Method::Xor1(b) => format!("key=0x{:02x}", b),
@@ -838,12 +894,18 @@ pub fn emit(
 ) -> String {
     match fmt {
         OutputFormat::Raw => emit_raw(blob),
-        OutputFormat::Recipe => emit_recipe(blob, chain, recipe_lines, original),
+        OutputFormat::Recipe => emit_recipe_with_prefix("#", blob, chain, recipe_lines, original),
         OutputFormat::CArray => emit_c_array(blob),
         OutputFormat::Python => emit_python(blob, chain, original),
         OutputFormat::PowerShell => emit_powershell(blob, chain, original),
         OutputFormat::Bash => emit_bash(blob, chain, original),
         OutputFormat::JavaScript => emit_javascript(blob, chain, original),
+        // VbNet (`'` line comments) and Go (`//` line comments) use the same
+        // recipe body, only the comment prefix differs. The blob still ends
+        // up below a comment header so the file opens cleanly in language
+        // tooling but is NOT an auto-executable decoder.
+        OutputFormat::VbNet => emit_recipe_with_prefix("'", blob, chain, recipe_lines, original),
+        OutputFormat::Go => emit_recipe_with_prefix("//", blob, chain, recipe_lines, original),
     }
 }
 
@@ -852,35 +914,62 @@ fn emit_raw(blob: &[u8]) -> String {
     // ASCII); otherwise we hex-encode for safety.
     match std::str::from_utf8(blob) {
         Ok(s) => s.to_string(),
-        Err(e) => { tracing::trace!("blob is not valid UTF-8, hex-encoding: {e}"); HEXUPPER.encode(blob) }
+        Err(e) => {
+            tracing::trace!("blob is not valid UTF-8, hex-encoding: {e}");
+            HEXUPPER.encode(blob)
+        }
     }
 }
 
-fn emit_recipe(blob: &[u8], chain: &[Method], recipe_lines: &[String], original: &[u8]) -> String {
+/// Recipe-style output with a parameterised line-comment prefix so the same
+/// body can be emitted as a `#`-commented text recipe, a `'`-commented VB.NET
+/// file, or a `//`-commented Go file. The body itself is intentionally inert:
+/// only the encoded blob + plain-text decode steps, no compilable decoder
+/// stub.
+fn emit_recipe_with_prefix(
+    prefix: &str,
+    blob: &[u8],
+    chain: &[Method],
+    recipe_lines: &[String],
+    original: &[u8],
+) -> String {
     let mut out = String::new();
-    out.push_str("# Obfuscator recipe — apply the inverse of each round in REVERSE order:\n");
-    out.push_str("#\n");
+    out.push_str(&format!(
+        "{} Obfuscator recipe — apply the inverse of each round in REVERSE order:\n",
+        prefix
+    ));
+    out.push_str(&format!("{}\n", prefix));
     for line in recipe_lines.iter().rev() {
-        out.push_str("#   ");
+        out.push_str(&format!("{}   ", prefix));
         out.push_str(line);
         out.push('\n');
     }
-    out.push_str("#\n");
-    out.push_str("# Forward (encoding) order:\n");
+    out.push_str(&format!("{}\n", prefix));
+    out.push_str(&format!("{} Forward (encoding) order:\n", prefix));
     for (i, m) in chain.iter().enumerate() {
-        out.push_str(&format!("#   {:02}. {} {}\n", i + 1, m.id(), describe_method(m)));
+        out.push_str(&format!(
+            "{}   {:02}. {} {}\n",
+            prefix,
+            i + 1,
+            m.id(),
+            describe_method(m)
+        ));
     }
-    out.push_str("#\n");
+    out.push_str(&format!("{}\n", prefix));
     out.push_str(&format!(
-        "# original: {} B, sha256={}\n",
+        "{} original: {} B, sha256={}\n",
+        prefix,
         original.len(),
         sha256_hex(original)
     ));
-    out.push_str("#\n");
-    out.push_str("# Encoded blob follows.\n");
+    out.push_str(&format!("{}\n", prefix));
+    out.push_str(&format!("{} Encoded blob follows.\n", prefix));
     match std::str::from_utf8(blob) {
         Ok(s) => out.push_str(s),
-        Err(e) => { tracing::trace!("recipe blob not UTF-8, hex-encoding: {e}"); out.push_str(&HEXUPPER.encode(blob)) }
+        Err(e) => {
+            tracing::trace!("recipe blob not UTF-8, hex-encoding: {e}");
+            out.push_str(&HEXUPPER.encode(blob))
+        }
     }
     out.push('\n');
     out
@@ -892,7 +981,10 @@ fn emit_c_array(blob: &[u8]) -> String {
         "/* obfuscator output — {} bytes; user must supply matching decoder. */\n",
         blob.len()
     ));
-    out.push_str(&format!("unsigned char obf_payload[{}] = {{\n    ", blob.len()));
+    out.push_str(&format!(
+        "unsigned char obf_payload[{}] = {{\n    ",
+        blob.len()
+    ));
     for (i, b) in blob.iter().enumerate() {
         out.push_str(&format!("0x{:02x}", b));
         if i != blob.len() - 1 {
@@ -939,7 +1031,8 @@ fn emit_python(blob: &[u8], chain: &[Method], original: &[u8]) -> String {
 // method. The U+200B and U+200C characters in `_zw_dec` are the actual alphabet
 // the encoder uses; they must be present literally for round-tripping.
 // The invisible characters are expressed via \u{...} escapes to satisfy clippy.
-const PY_HELPERS: &str = concat!(r#"
+const PY_HELPERS: &str = concat!(
+    r#"
 def _xor(data, key):
     if not key: return data
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
@@ -995,8 +1088,12 @@ def _zw_dec(data):
     bits = []
     s = data.decode('utf-8', 'ignore')
     for ch in s:
-        if ch == '"#, "\u{200C}", r#"': bits.append(1)
-        elif ch == '"#, "\u{200B}", r#"': bits.append(0)
+        if ch == '"#,
+    "\u{200C}",
+    r#"': bits.append(1)
+        elif ch == '"#,
+    "\u{200B}",
+    r#"': bits.append(0)
     out = bytearray()
     for i in range(0, len(bits) - 7, 8):
         v = 0
@@ -1042,7 +1139,8 @@ def _url_dec(data):
         else:
             out.append(ord(s[i])); i += 1
     return bytes(out)
-"#);
+"#
+);
 
 fn py_inverse(m: &Method) -> String {
     match m {
@@ -1079,7 +1177,11 @@ fn py_inverse(m: &Method) -> String {
         }
         Method::AnsiEscape => "_ansi_dec(DATA)".into(),
         Method::Chunk(p) => {
-            let json: String = p.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+            let json: String = p
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             format!("_chunk_dec(DATA, [{}])", json)
         }
     }
@@ -1174,11 +1276,18 @@ fn ps_inverse(m: &Method) -> String {
     // stage. Callers re-assign $DATA from the global immediately after.
     match m {
         Method::XorMulti(k) => {
-            let bytes = k.iter().map(|b| format!("0x{:02x}", b)).collect::<Vec<_>>().join(",");
+            let bytes = k
+                .iter()
+                .map(|b| format!("0x{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(",");
             format!("_Xor $DATA @({}); $DATA = $script:_obf_buf", bytes)
         }
         Method::Xor1(b) => format!("_Xor $DATA @(0x{:02x}); $DATA = $script:_obf_buf", b),
-        Method::B64 => "$DATA = [Convert]::FromBase64String([System.Text.Encoding]::UTF8.GetString($DATA))".into(),
+        Method::B64 => {
+            "$DATA = [Convert]::FromBase64String([System.Text.Encoding]::UTF8.GetString($DATA))"
+                .into()
+        }
         // Binary-safe: avoid round-trip through [char] (UTF-16 widening corrupts 0x80–0xFF).
         Method::B16 => "_Hex16Dec $DATA; $DATA = $script:_obf_buf".into(),
         Method::Url => "_UrlDec $DATA; $DATA = $script:_obf_buf".into(),
@@ -1262,7 +1371,9 @@ fn emit_javascript(blob: &[u8], chain: &[Method], original: &[u8]) -> String {
     let blob_b64 = BASE64.encode(blob);
     let mut out = String::new();
     out.push_str("// obfuscator-generated JS / Node self-decoder.\n");
-    out.push_str("// Methods covered: b64, b64url, b16, xor, xor1, url, rev, rot13, caesar, hexsplit.\n");
+    out.push_str(
+        "// Methods covered: b64, b64url, b16, xor, xor1, url, rev, rot13, caesar, hexsplit.\n",
+    );
     out.push_str(&format!(
         "let DATA = Buffer.from('{}', 'base64');\n",
         blob_b64
@@ -1324,7 +1435,10 @@ function _hexsplitDec(d) {
 fn js_inverse(m: &Method) -> String {
     match m {
         Method::B64 => "DATA = Buffer.from(DATA.toString(), 'base64');".into(),
-        Method::B64Url => "DATA = Buffer.from(DATA.toString().replace(/-/g,'+').replace(/_/g,'/'), 'base64');".into(),
+        Method::B64Url => {
+            "DATA = Buffer.from(DATA.toString().replace(/-/g,'+').replace(/_/g,'/'), 'base64');"
+                .into()
+        }
         Method::B16 => "DATA = Buffer.from(DATA.toString(), 'hex');".into(),
         Method::Reverse => "DATA = Buffer.from([...DATA].reverse());".into(),
         Method::Rot13 => "DATA = _rot13(DATA);".into(),
@@ -1332,7 +1446,11 @@ fn js_inverse(m: &Method) -> String {
         Method::Url => "DATA = _urlDec(DATA);".into(),
         Method::HexSplit => "DATA = _hexsplitDec(DATA);".into(),
         Method::XorMulti(k) => {
-            let bytes = k.iter().map(|b| format!("0x{:02x}", b)).collect::<Vec<_>>().join(",");
+            let bytes = k
+                .iter()
+                .map(|b| format!("0x{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(",");
             format!("DATA = _xor(DATA, Buffer.from([{}]));", bytes)
         }
         Method::Xor1(b) => format!("DATA = _xor(DATA, Buffer.from([0x{:02x}]));", b),

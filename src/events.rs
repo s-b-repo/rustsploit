@@ -123,8 +123,7 @@ pub struct TenantEvent {
 }
 
 /// Singleton event bus. One per process, lazily initialised.
-static EVENT_BUS: std::sync::OnceLock<broadcast::Sender<TenantEvent>> =
-    std::sync::OnceLock::new();
+static EVENT_BUS: std::sync::OnceLock<broadcast::Sender<TenantEvent>> = std::sync::OnceLock::new();
 
 fn bus() -> &'static broadcast::Sender<TenantEvent> {
     EVENT_BUS.get_or_init(|| broadcast::channel(CHANNEL_CAPACITY).0)
@@ -142,11 +141,7 @@ pub fn subscribe() -> broadcast::Receiver<TenantEvent> {
 /// context (from `CURRENT_TENANT` task-local or `RunContext::tenant_id`).
 pub fn emit(event: ModuleEvent) {
     let tenant_id = crate::context::current_tenant_id()
-        .or_else(|| {
-            crate::tenant::CURRENT_TENANT
-                .try_with(|t| t.clone())
-                .ok()
-        });
+        .or_else(|| crate::tenant::CURRENT_TENANT.try_with(|t| t.clone()).ok());
     if let Err(e) = bus().send(TenantEvent { tenant_id, event }) {
         tracing::trace!("Event bus: no active subscribers ({})", e);
     }

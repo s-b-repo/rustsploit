@@ -19,11 +19,25 @@ pub fn info() -> crate::module_info::ModuleInfo {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   Sample Default Credential Checker                       ║".cyan());
-    crate::mprintln!("{}", "║   HTTP Basic Auth Test Module                             ║".cyan());
-    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Sample Default Credential Checker                       ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   HTTP Basic Auth Test Module                             ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -37,7 +51,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     display_banner();
 
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
-    crate::mprintln!("{}", "[*] Checking default credentials (admin:admin)...".cyan());
+    crate::mprintln!(
+        "{}",
+        "[*] Checking default credentials (admin:admin)...".cyan()
+    );
     crate::mprintln!();
 
     let url = format!("http://{}/login", target);
@@ -65,14 +82,28 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let mut outcome = ModuleOutcome::ok();
     if creds_valid {
-        crate::mprintln!("{}", "[+] Default credentials admin:admin are valid!".green().bold());
+        crate::mprintln!(
+            "{}",
+            "[+] Default credentials admin:admin are valid!"
+                .green()
+                .bold()
+        );
         // Persist discovered credential to the framework's credential store.
         // The scheduler also routes the Finding below into LootStore.
         if crate::cred_store::store_credential(crate::cred_store::NewCred {
-            host: target, port: 80, service: "http", username: "admin", secret: "admin",
+            host: target,
+            port: 80,
+            service: "http",
+            username: "admin",
+            secret: "admin",
             cred_type: crate::cred_store::CredType::Password,
             source_module: "creds/generic/sample_cred_check",
-        }).await.is_none() { eprintln!("[!] Failed to store credential"); }
+        })
+        .await
+        .is_none()
+        {
+            crate::meprintln!("[!] Failed to store credential");
+        }
         outcome.findings.push(Finding {
             target: target.to_string(),
             kind: FindingKind::Credential,
@@ -92,4 +123,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/sample_cred_check", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/sample_cred_check",
+    native
+);

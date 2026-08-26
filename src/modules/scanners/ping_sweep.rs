@@ -11,7 +11,7 @@
 use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use tokio::process::Command;
 
@@ -72,11 +72,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         format!("[+] {} is up ({})", host, method).green().bold()
     );
     crate::workspace::track_host(&host, None, None).await;
-    crate::workspace::add_note(
-        &host,
-        &format!("[ping_sweep] alive via {}", method),
-    )
-    .await;
+    crate::workspace::add_note(&host, &format!("[ping_sweep] alive via {}", method)).await;
 
     let mut outcome = ModuleOutcome::ok();
     outcome.findings.push(Finding {
@@ -93,13 +89,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
 fn host_only(target: &str) -> String {
     if let Some(stripped) = target.strip_prefix('[')
-        && let Some(end) = stripped.find(']') {
-            return stripped[..end].to_string();
-        }
+        && let Some(end) = stripped.find(']')
+    {
+        return stripped[..end].to_string();
+    }
     if let Some((before, after)) = target.rsplit_once(':')
-        && after.chars().all(|c| c.is_ascii_digit()) {
-            return before.to_string();
-        }
+        && after.chars().all(|c| c.is_ascii_digit())
+    {
+        return before.to_string();
+    }
     target.to_string()
 }
 

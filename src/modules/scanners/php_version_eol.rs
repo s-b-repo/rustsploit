@@ -84,12 +84,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         60,
     )
     .await? as u64;
-    let probe_vicidial = cfg_prompt_yes_no(
-        "probe_vicidial",
-        "Probe common Vicidial paths?",
-        true,
-    )
-    .await?;
+    let probe_vicidial =
+        cfg_prompt_yes_no("probe_vicidial", "Probe common Vicidial paths?", true).await?;
 
     let client = build_http_client(Duration::from_secs(timeout_secs))
         .context("Failed to build HTTP client")?;
@@ -174,10 +170,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     // Read the body so we can require a Vicidial-specific fingerprint.
                     // A bare success/401/302 status is returned by a huge fraction of
                     // ordinary endpoints and is NOT proof of Vicidial.
-                    let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+                    let body = match crate::utils::network::read_http_body_text_capped(
+                        resp,
+                        crate::utils::safe_io::DEFAULT_BODY_CAP,
+                    )
+                    .await
+                    {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::debug!("body read failed for {}: {}", url, redact_err(&e.to_string()));
+                            tracing::debug!(
+                                "body read failed for {}: {}",
+                                url,
+                                redact_err(&e.to_string())
+                            );
                             continue;
                         }
                     };
@@ -196,7 +201,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         outcome.findings.push(Finding {
                             target: host.clone(),
                             kind: FindingKind::Vulnerable,
-                            message: format!("Vicidial install confirmed at {} (status {})", url, status),
+                            message: format!(
+                                "Vicidial install confirmed at {} (status {})",
+                                url, status
+                            ),
                             data: Some(serde_json::json!({
                                 "host": host,
                                 "url": url,
@@ -248,9 +256,7 @@ fn is_eol_php(banner: &str) -> bool {
         return false;
     }
     let rest = banner.trim_start_matches("PHP/");
-    rest.starts_with("4.")
-        || rest.starts_with("5.")
-        || rest.starts_with("7.")
+    rest.starts_with("4.") || rest.starts_with("5.") || rest.starts_with("7.")
 }
 
 /// Returns true only when the response body carries a Vicidial-specific

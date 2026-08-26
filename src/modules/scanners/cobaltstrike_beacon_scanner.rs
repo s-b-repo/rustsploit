@@ -55,7 +55,8 @@ pub fn info() -> ModuleInfo {
         authors: vec!["RustSploit Team".to_string()],
         references: vec![
             "https://www.cobaltstrike.com/".to_string(),
-            "https://www.elastic.co/security-labs/disclosing-the-bloodhound-from-zero-to-hero".to_string(),
+            "https://www.elastic.co/security-labs/disclosing-the-bloodhound-from-zero-to-hero"
+                .to_string(),
             "https://attack.mitre.org/software/S0154/".to_string(),
         ],
         disclosure_date: Some("2026-06-12".to_string()),
@@ -70,7 +71,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .as_single()
         .context("cobaltstrike_beacon_scanner requires a single-host target")?;
     let normalized = normalize_target(target)?;
-    let port = cfg_prompt_port("port", "Probe port (CS typically 443/80/8080)", DEFAULT_PORT).await?;
+    let port = cfg_prompt_port(
+        "port",
+        "Probe port (CS typically 443/80/8080)",
+        DEFAULT_PORT,
+    )
+    .await?;
     let scheme = cfg_prompt_default("scheme", "Scheme (https/http)", "https").await?;
     let base = format!("{}://{}:{}", scheme, normalized, port);
 
@@ -108,7 +114,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let status = r.status().as_u16();
         let server = crate::utils::header_string(r.headers(), "server");
         let cl = crate::utils::header_string(r.headers(), "content-length");
-        if status == 404 && cl == "0" && (server.is_empty() || server.to_lowercase().contains("nano")) {
+        if status == 404
+            && cl == "0"
+            && (server.is_empty() || server.to_lowercase().contains("nano"))
+        {
             crate::mprintln!(
                 "{} NanoHTTPD-style 404 with CL:0 (CS team server pattern)",
                 "[+]".green()
@@ -146,7 +155,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             // CS x86 stager begins with a small loader prologue; look for the
             // standard pattern `\xfc\xe8` (CLD; CALL) typical of shellcode.
             if bytes.starts_with(&[0xfc, 0xe8]) || bytes.starts_with(&[0xfc, 0x48, 0x83]) {
-                crate::mprintln!("{} stager prologue matches shellcode pattern", "[+]".green());
+                crate::mprintln!(
+                    "{} stager prologue matches shellcode pattern",
+                    "[+]".green()
+                );
                 indicators.push("stager_shellcode_prologue");
             }
 
@@ -321,7 +333,8 @@ fn sha1_update(s: &mut Sha1State, data: &[u8]) {
     s.len = s.len.wrapping_add(data.len() as u64);
     s.buf.extend_from_slice(data);
     while s.buf.len() >= 64 {
-        let block: [u8; 64] = s.buf[..64].try_into().expect("64-byte block");
+        let mut block = [0u8; 64];
+        block.copy_from_slice(&s.buf[..64]);
         sha1_compress(&mut s.h, &block);
         s.buf.drain(..64);
     }
@@ -335,7 +348,8 @@ fn sha1_finalize(mut s: Sha1State) -> [u8; 20] {
     }
     s.buf.extend_from_slice(&bit_len.to_be_bytes());
     while s.buf.len() >= 64 {
-        let block: [u8; 64] = s.buf[..64].try_into().expect("64-byte block");
+        let mut block = [0u8; 64];
+        block.copy_from_slice(&s.buf[..64]);
         sha1_compress(&mut s.h, &block);
         s.buf.drain(..64);
     }
@@ -349,7 +363,9 @@ fn sha1_finalize(mut s: Sha1State) -> [u8; 20] {
 fn sha1_compress(h: &mut [u32; 5], block: &[u8; 64]) {
     let mut w = [0u32; 80];
     for i in 0..16 {
-        w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&block[i * 4..i * 4 + 4]);
+        w[i] = u32::from_be_bytes(bytes);
     }
     for i in 16..80 {
         w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);

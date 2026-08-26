@@ -71,13 +71,11 @@ impl ExclusionSet {
     {
         let nets = strs
             .into_iter()
-            .filter_map(|s| {
-                match s.as_ref().parse::<IpNetwork>() {
-                    Ok(net) => Some(net),
-                    Err(e) => {
-                        eprintln!("[!] Invalid exclusion entry '{}': {}", s.as_ref(), e);
-                        None
-                    }
+            .filter_map(|s| match s.as_ref().parse::<IpNetwork>() {
+                Ok(net) => Some(net),
+                Err(e) => {
+                    eprintln!("[!] Invalid exclusion entry '{}': {}", s.as_ref(), e);
+                    None
                 }
             })
             .collect();

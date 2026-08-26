@@ -11,16 +11,19 @@
 // during migration; new code (CLI, shell, API, MCP) calls
 // `scheduler::run` directly.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use colored::Colorize;
 use tokio::sync::Semaphore;
 
-use crate::module::{Finding, FindingKind, Module, ModuleCtx, ModuleOptions, ModuleOutcome, Target};
+use crate::module::{
+    Finding, FindingKind, Module, ModuleCtx, ModuleOptions, ModuleOutcome, Target,
+};
 
 // ============================================================
 // LIMITS
@@ -64,19 +67,24 @@ impl SchedulerLimits {
         let mut l = Self::default();
         let scope = crate::tenant::resolve();
         let opts = scope.global_options();
-        if let Some(v) = opts.try_get("concurrency")
+        if let Some(v) = opts
+            .try_get("concurrency")
             .or_else(|| opts.try_get("threads"))
             .and_then(|v| v.parse().ok())
         {
             l.concurrency = v;
         }
-        if let Some(v) = opts.try_get("module_timeout")
+        if let Some(v) = opts
+            .try_get("module_timeout")
             .or_else(|| opts.try_get("timeout"))
             .and_then(|v| v.parse().ok())
         {
             l.timeout_secs = v;
         }
-        if let Some(v) = opts.try_get("max_random_hosts").and_then(|v| v.parse().ok()) {
+        if let Some(v) = opts
+            .try_get("max_random_hosts")
+            .and_then(|v| v.parse().ok())
+        {
             l.max_random_hosts = v;
         }
         l.precheck_port = opts.try_get("port").and_then(|v| v.parse().ok());
@@ -113,7 +121,24 @@ struct ScanStats {
     /// precheck-skipped (the common case on random/sparse mass scans).
     considered: AtomicUsize,
     abort: AtomicBool,
-    findings: std::sync::Mutex<Vec<Finding>>,
+    findings: tokio::sync::Mutex<Vec<Finding>>,
+    /// Unix-millis timestamp of the last emitted progress line. Drives the
+    /// stale-progress rescue in `tick`: on huge sweeps (e.g. a full-internet
+    /// scan whose step is 10_000 hosts) the count-based step alone can mean
+    /// many minutes between lines, so elapsed time also triggers emission.
+    last_emit_ms: AtomicU64,
+}
+
+/// Minimum wall-clock gap before the stale-progress rescue emits a line.
+const PROGRESS_STALE_MS: u64 = 15_000;
+
+/// Millis since the Unix epoch; 0 when the clock is before the epoch (which
+/// only degrades progress pacing, never correctness).
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Point-in-time view of a running scan's counters.
@@ -127,7 +152,7 @@ struct StatsSnapshot {
 }
 
 impl ScanStats {
-    fn record(&self, outcome: Result<ModuleOutcome>) -> bool {
+    async fn record(&self, outcome: Result<ModuleOutcome>) -> bool {
         match outcome {
             Ok(out) => {
                 if out.success {
@@ -137,17 +162,41 @@ impl ScanStats {
                 }
                 if !out.findings.is_empty() {
                     self.hits.fetch_add(out.findings.len(), Ordering::Relaxed);
-                    let mut g = self.findings.lock().unwrap_or_else(|e| e.into_inner());
-                    g.extend(out.findings);
+                    // Await the lock instead of try_lock-and-drop: dropping a
+                    // host's findings while still counting them as hits made
+                    // the summary report hits that were neither listed nor
+                    // stored. The lock is only ever held briefly, so awaiting
+                    // costs nothing here.
+                    self.findings.lock().await.extend(out.findings);
                 }
                 false
             }
             Err(e) => {
-                tracing::debug!("module run failed: {e:#}");
+                tracing::warn!("module run failed: {e:#}");
                 self.failed.fetch_add(1, Ordering::Relaxed);
                 true
             }
         }
+    }
+
+    /// Record the outcome AND print live per-IP hit reports so the operator
+    /// sees findings in real time during a mass scan instead of only at the
+    /// final summary. Called from every fan-out spawned task.
+    async fn record_and_report(&self, outcome: Result<ModuleOutcome>, target: &str) -> bool {
+        // Print findings live before they're locked away in the Mutex.
+        if let Ok(ref out) = outcome {
+            for f in &out.findings {
+                let prefix = match f.kind {
+                    FindingKind::Vulnerable => "[+]".green(),
+                    FindingKind::Credential => "[*]".green(),
+                    FindingKind::OpenPort => "[o]".cyan(),
+                    FindingKind::Banner => "[b]".dimmed(),
+                    FindingKind::Note => "[n]".dimmed(),
+                };
+                crate::mprintln!("{} {}: {}", prefix, target, f.message);
+            }
+        }
+        self.record(outcome).await
     }
 
     fn snapshot(&self) -> StatsSnapshot {
@@ -162,17 +211,34 @@ impl ScanStats {
     }
 
     /// Count one host as examined (skipped or run) and report whether a
-    /// progress line should be emitted now: the first host, then every
-    /// `step` hosts. Called at the very top of each spawned task — *before*
-    /// any precheck — so feedback keeps moving on sparse/random ranges
-    /// where the vast majority of hosts never reach the module.
+    /// progress line should be emitted now: the first host, every `step`
+    /// hosts, OR whenever `PROGRESS_STALE_MS` has passed since the last line.
+    /// The time-based rescue keeps feedback alive on huge sweeps where the
+    /// count-based step alone would look frozen (e.g. ~10 minutes between
+    /// lines on a full-internet scan at modest throughput). Called at the
+    /// very top of each spawned task — *before* any precheck — so feedback
+    /// keeps moving on sparse/random ranges where the vast majority of hosts
+    /// never reach the module.
     fn tick(&self, step: usize) -> Option<usize> {
         let n = self.considered.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || step == 0 || n.is_multiple_of(step) {
-            Some(n)
-        } else {
-            None
+            self.last_emit_ms.store(unix_millis(), Ordering::Release);
+            return Some(n);
         }
+        // Stale-progress rescue: emit if nothing was printed recently. The
+        // compare_exchange arbitrates between concurrent tasks so exactly
+        // one of them claims the emission slot.
+        let now = unix_millis();
+        let last = self.last_emit_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last) >= PROGRESS_STALE_MS
+            && self
+                .last_emit_ms
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Some(n);
+        }
+        None
     }
 }
 
@@ -197,7 +263,11 @@ fn progress_step_for(total: u128) -> usize {
 /// always sees the one number that matters — `hits` — alongside throughput.
 fn progress_line(considered: usize, total: u128, s: &StatsSnapshot) -> String {
     let pct = if total > 0 {
-        format!(" ({:.1}%)", (considered as f64 / total as f64) * 100.0)
+        // Shared percent helper (also drops the ad-hoc `as f64` casts). `total`
+        // is u128 for theoretical IPv6 ranges; saturate to u64 for the ratio.
+        let done = u64::try_from(considered).unwrap_or(u64::MAX);
+        let tot = u64::try_from(total).unwrap_or(u64::MAX);
+        format!(" ({:.1}%)", crate::utils::stats::percent(done, tot))
     } else {
         String::new()
     };
@@ -212,11 +282,20 @@ fn progress_line(considered: usize, total: u128, s: &StatsSnapshot) -> String {
 // ============================================================
 
 /// Run a module against a target with limits pulled from `global_options`.
+///
+/// `module_path` is the canonical `category/name` path of the module being
+/// run, as resolved by the dispatcher (`commands::run_module`). It is used
+/// verbatim for rate-limit buckets, loot attribution, and checkpoints;
+/// pass `""` only when the path is genuinely unknown (direct library use),
+/// in which case a best-effort reverse lookup by display name is performed.
+/// The reverse lookup mis-attributes when two modules share a display name,
+/// so callers that know the path must always supply it.
 pub async fn run(
     module: Arc<dyn Module>,
     target: Target,
     options: ModuleOptions,
     verbose: bool,
+    module_path: &str,
 ) -> Result<ModuleOutcome> {
     run_with_limits(
         module,
@@ -224,6 +303,7 @@ pub async fn run(
         options,
         verbose,
         SchedulerLimits::from_global_options(),
+        module_path,
     )
     .await
 }
@@ -234,8 +314,9 @@ pub async fn run_with_limits(
     options: ModuleOptions,
     verbose: bool,
     limits: SchedulerLimits,
+    module_path: &str,
 ) -> Result<ModuleOutcome> {
-    run_with_limits_shared(module, target, options, verbose, limits, None).await
+    run_with_limits_shared(module, target, options, verbose, limits, None, module_path).await
 }
 
 /// Internal entry that accepts an optional parent-shared semaphore so a
@@ -249,11 +330,42 @@ async fn run_with_limits_shared(
     verbose: bool,
     limits: SchedulerLimits,
     shared_sem: Option<Arc<Semaphore>>,
+    module_path_arg: &str,
 ) -> Result<ModuleOutcome> {
-    let cancel = crate::context::cancellation_token()
-        .unwrap_or_default();
+    let cancel = match crate::context::cancellation_token() {
+        Some(t) => t,
+        None => tokio_util::sync::CancellationToken::new(),
+    };
     let tenant_id = crate::context::current_tenant_id();
-    let module_path = current_module_path(module.as_ref());
+    let module_path = if module_path_arg.is_empty() {
+        current_module_path(module.as_ref())
+    } else {
+        module_path_arg.to_string()
+    };
+    // Snapshot the ACTIVE module config once, before fan-out. The per-host
+    // tasks below are spawned onto the tokio runtime where task-locals do
+    // NOT propagate, so without this they would fall back to the process
+    // global — losing api_mode and API-supplied custom_prompts for every
+    // mass-scan host (single-target runs scope the real config and were
+    // unaffected, which made the inconsistency hard to spot).
+    let module_config = crate::config::get_module_config();
+
+    // Interactive modules own their lifetime (REPL / long-lived session).
+    // Fanning them out per-host across a mass target would run one REPL per
+    // host against batch defaults — refuse up front instead.
+    if module.capabilities().interactive && target.is_mass() {
+        anyhow::bail!(
+            "'{}' is an interactive module and cannot be fanned out across a mass target \
+             ({:?}). Set a single host as the target instead.",
+            module.info().name,
+            target.as_legacy_str()
+        );
+    }
+
+    let cleanup_target = target
+        .as_single()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "mass-scan".to_string());
 
     // Refresh the rate limiter from the current options at the start of each
     // top-level scan (not for `fanout_multi` sub-targets, which pass a shared
@@ -291,15 +403,22 @@ async fn run_with_limits_shared(
         // shell's `setg target` handler, so without this it would silently fall
         // back to the scheduler default of 10_000 — while `setg target 0.0.0.0`
         // auto-bumps to the full public-IPv4 count. Normalise both paths: when
-        // the operator has NOT explicitly set `max_random_hosts`, a full sweep
-        // means every reachable public host. An explicit `setg max_random_hosts`
-        // is always honoured. The advisory + confirmation gate still runs.
+        // the operator hasn't set a DIFFERENT value (i.e. current value still
+        // equals the factory default), a full sweep means every reachable public
+        // host. An explicit `setg max_random_hosts` to a non-default value is
+        // always honoured. The advisory + confirmation gate still runs.
         if matches!(target, Target::Random) {
+            let current = l.max_random_hosts;
+            // Auto-bump when the operator never changed the default (10_000).
+            // If they explicitly set any other value — even 10_000 itself —
+            // honour it. We detect "operator explicitly set" by checking
+            // whether the key exists in persistent global_options; if absent,
+            // the value came from the factory default.
             let operator_set = crate::tenant::resolve()
                 .global_options()
                 .try_get("max_random_hosts")
                 .is_some();
-            if !operator_set {
+            if !operator_set && current >= 10_000 {
                 l.max_random_hosts = crate::utils::cyclic::total_public_ipv4_count() as usize;
             }
         }
@@ -309,20 +428,114 @@ async fn run_with_limits_shared(
     // Mass-scan fan-out is universal: every module gets fanned out per host
     // for Cidr/Multi/File/Random, sees `Target::Single` inside `run()`.
     let outcome = match target.clone() {
-        Target::Single(_) => fanout_single(FanoutParams { module: module.clone(), target, options, cancel, tenant_id: tenant_id.clone(), limits, module_path: module_path.clone() }, verbose).await,
-        Target::Cidr(_) => fanout_cidr(FanoutParams { module: module.clone(), target, options, cancel, tenant_id: tenant_id.clone(), limits, module_path: module_path.clone() }, shared_sem.clone()).await,
-        Target::File(_) => fanout_file(FanoutParams { module: module.clone(), target, options, cancel, tenant_id: tenant_id.clone(), limits, module_path: module_path.clone() }, shared_sem.clone()).await,
-        Target::Multi(_) => fanout_multi(module.clone(), target, options, cancel, tenant_id.clone(), verbose, limits).await,
+        Target::Single(_) => {
+            fanout_single(
+                FanoutParams {
+                    module: module.clone(),
+                    target,
+                    options,
+                    cancel,
+                    tenant_id: tenant_id.clone(),
+                    limits,
+                    module_path: module_path.clone(),
+                    config: module_config.clone(),
+                },
+                verbose,
+            )
+            .await
+        }
+        Target::Cidr(_) => {
+            fanout_cidr(
+                FanoutParams {
+                    module: module.clone(),
+                    target,
+                    options,
+                    cancel,
+                    tenant_id: tenant_id.clone(),
+                    limits,
+                    module_path: module_path.clone(),
+                    config: module_config.clone(),
+                },
+                shared_sem.clone(),
+            )
+            .await
+        }
+        Target::File(_) => {
+            fanout_file(
+                FanoutParams {
+                    module: module.clone(),
+                    target,
+                    options,
+                    cancel,
+                    tenant_id: tenant_id.clone(),
+                    limits,
+                    module_path: module_path.clone(),
+                    config: module_config.clone(),
+                },
+                shared_sem.clone(),
+            )
+            .await
+        }
+        Target::Multi(_) => {
+            fanout_multi(
+                FanoutParams {
+                    module: module.clone(),
+                    target,
+                    options,
+                    cancel,
+                    tenant_id: tenant_id.clone(),
+                    limits,
+                    module_path: module_path.clone(),
+                    config: module_config.clone(),
+                },
+                verbose,
+            )
+            .await
+        }
         // `0.0.0.0/0` / `random` honour `setg scan_order sequential` so an
         // operator can flip the full-internet sweep between random and in-order.
         Target::Random => {
             if scan_order_is_sequential() {
-                fanout_sequential(crate::module::FIRST_PUBLIC_IPV4, module.clone(), options, cancel, tenant_id.clone(), limits, module_path.clone(), shared_sem.clone()).await
+                fanout_sequential(SequentialSweep {
+                    start: crate::module::FIRST_PUBLIC_IPV4,
+                    module: module.clone(),
+                    options,
+                    cancel,
+                    tenant_id: tenant_id.clone(),
+                    limits,
+                    module_path: module_path.clone(),
+                    shared_sem: shared_sem.clone(),
+                    config: module_config.clone(),
+                })
+                .await
             } else {
-                fanout_random(module.clone(), options, cancel, tenant_id.clone(), limits, module_path.clone(), shared_sem.clone()).await
+                fanout_random(RandomSweep {
+                    module: module.clone(),
+                    options,
+                    cancel,
+                    tenant_id: tenant_id.clone(),
+                    limits,
+                    module_path: module_path.clone(),
+                    shared_sem: shared_sem.clone(),
+                    config: module_config.clone(),
+                })
+                .await
             }
         }
-        Target::Sequential(start) => fanout_sequential(start, module.clone(), options, cancel, tenant_id.clone(), limits, module_path.clone(), shared_sem.clone()).await,
+        Target::Sequential(start) => {
+            fanout_sequential(SequentialSweep {
+                start,
+                module: module.clone(),
+                options,
+                cancel,
+                tenant_id: tenant_id.clone(),
+                limits,
+                module_path: module_path.clone(),
+                shared_sem: shared_sem.clone(),
+                config: module_config.clone(),
+            })
+            .await
+        }
     };
 
     // Cleanup runs whether the fan-out succeeded or failed so modules
@@ -336,7 +549,7 @@ async fn run_with_limits_shared(
                 &fallback
             }
         };
-        let mut cleanup_ctx = ModuleCtx::new(Target::Single(String::new()));
+        let mut cleanup_ctx = ModuleCtx::new(Target::Single(cleanup_target));
         cleanup_ctx.tenant_id = tenant_id;
         cleanup_ctx.verbose = verbose;
         cleanup_ctx.module_path = module_path;
@@ -353,15 +566,23 @@ async fn run_with_limits_shared(
 /// limiter and finding-routing know which entry produced a given outcome.
 fn current_module_path(module: &dyn Module) -> String {
     let info_name = module.info().name;
-    // Pass 1: compare display name without instantiating every module.
-    // `entry.name` is the registry key (e.g. "ssh/known_vuln"), while
-    // `info_name` is the human-readable title. We need to compare
-    // info().name from the factory, but avoid instantiating all modules.
-    // Instead, compare the passed module's info().name against each
-    // factory's info().name — break on first match to avoid O(N) allocs.
+    // Cache: module_path is static per module type, compute once.
+    static PATH_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    {
+        let cache = PATH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.get(&info_name) {
+            return cached.clone();
+        }
+    }
     for entry in crate::module::registered() {
         if (entry.factory)().info().name == info_name {
-            return format!("{}/{}", entry.category.as_str(), entry.name);
+            let path = format!("{}/{}", entry.category.as_str(), entry.name);
+            PATH_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(info_name, path.clone());
+            return path;
         }
     }
     info_name
@@ -442,17 +663,26 @@ struct FanoutParams {
     tenant_id: Option<String>,
     limits: SchedulerLimits,
     module_path: String,
+    /// Snapshot of the active `ModuleConfig` taken before fan-out. Spawned
+    /// per-host tasks must scope this explicitly: tokio task-locals do not
+    /// cross `tokio::spawn`, so without it each host loses api_mode and any
+    /// API-supplied custom_prompts and silently falls back to process globals.
+    config: crate::config::ModuleConfig,
 }
 
-async fn fanout_single(
-    params: FanoutParams,
-    verbose: bool,
-) -> Result<ModuleOutcome> {
-    let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
+async fn fanout_single(params: FanoutParams, verbose: bool) -> Result<ModuleOutcome> {
+    let FanoutParams {
+        module,
+        target,
+        options,
+        cancel,
+        tenant_id,
+        limits,
+        module_path,
+        config: _,
+    } = params;
     let host = target.as_single().unwrap_or("").to_string();
-    if limits.honeypot_detection
-        && crate::utils::network::quick_honeypot_check(&host).await
-    {
+    if limits.honeypot_detection && crate::utils::network::quick_honeypot_check(&host).await {
         crate::mprintln!(
             "{}",
             format!(
@@ -520,7 +750,16 @@ async fn fanout_cidr(
     params: FanoutParams,
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
-    let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
+    let FanoutParams {
+        module,
+        target,
+        options,
+        cancel,
+        tenant_id,
+        limits,
+        module_path,
+        config: module_config,
+    } = params;
     let cidr = match &target {
         Target::Cidr(s) => s.clone(),
         // Reachable only via an internal dispatch bug; surface it as a clean
@@ -533,7 +772,13 @@ async fn fanout_cidr(
     if host_count <= 1 {
         let single = Target::Single(network.network().to_string());
         return Box::pin(run_with_limits_shared(
-            module, single, options, false, limits, shared_sem,
+            module,
+            single,
+            options,
+            false,
+            limits,
+            shared_sem,
+            &module_path,
         ))
         .await;
     }
@@ -579,7 +824,14 @@ async fn fanout_cidr(
     // --- Pre-batch interactive prompt phase ---
     let cfg = crate::config::get_module_config();
     if !cfg.api_mode {
-        pre_batch_prompt(&module, &options, cancel.clone(), tenant_id.clone(), &module_path).await?;
+        pre_batch_prompt(
+            &module,
+            &options,
+            cancel.clone(),
+            tenant_id.clone(),
+            &module_path,
+        )
+        .await?;
     }
 
     let batch_guard = crate::context::enter_batch_mode();
@@ -587,8 +839,7 @@ async fn fanout_cidr(
     // When the parent (e.g. `fanout_multi`) supplies a shared semaphore,
     // use it so cross-target runs share one concurrency budget; otherwise
     // create a fresh one sized to the configured concurrency.
-    let sem = shared_sem
-        .unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
+    let sem = shared_sem.unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
     let prompt_cache = crate::context::new_prompt_cache();
 
     let checkpoint = open_checkpoint(&module_path, &cidr).await;
@@ -601,9 +852,7 @@ async fn fanout_cidr(
             Ok(ips) if !ips.is_empty() => Some(ips),
             Ok(_) => None,
             Err(e) => {
-                crate::meprintln!(
-                    "[!] prescan failed: {e:#}. Falling back to per-IP fan-out."
-                );
+                crate::meprintln!("[!] prescan failed: {e:#}. Falling back to per-IP fan-out.");
                 None
             }
         }
@@ -622,7 +871,11 @@ async fn fanout_cidr(
             "[*] Subnet: {} ({} {}) — running '{}' with concurrency {}",
             network,
             effective_count,
-            if live_hosts.is_some() { "live hosts via prescan" } else { "hosts" },
+            if live_hosts.is_some() {
+                "live hosts via prescan"
+            } else {
+                "hosts"
+            },
             module.info().name,
             limits.concurrency
         )
@@ -663,11 +916,12 @@ async fn fanout_cidr(
         }
         // Skip already-processed targets when resuming.
         if let Some(cp) = &checkpoint
-            && cp.already_processed(&ip_str).await {
-                stats.considered.fetch_add(1, Ordering::Relaxed);
-                stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            && cp.already_processed(&ip_str).await
+        {
+            stats.considered.fetch_add(1, Ordering::Relaxed);
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         // Race the permit acquisition against cancellation: when the semaphore
         // is saturated this await can block for a long time, and without the
         // race a Ctrl-C would not stop the dispatcher from enqueuing more hosts
@@ -685,46 +939,74 @@ async fn fanout_cidr(
         let stats_clone = stats.clone();
         let mp = module_path.clone();
         let cp_clone = checkpoint.clone();
+        let cfg_clone = module_config.clone();
 
         joinset.spawn(async move {
-            // Load-bearing: holds the owned semaphore permit for the task's
-            // whole lifetime so concurrency stays bounded; the slot is freed
-            // when this task ends. This is NOT a `let _ =` discard.
             let _permit = permit;
             let ip_str = ip.to_string();
-            if let Some(n) = stats_clone.tick(progress_step) {
-                crate::mprintln!("{}", progress_line(n, effective_count, &stats_clone.snapshot()));
-            }
-            // Service-port + honeypot precheck (skips hosts that don't have the
-            // module's port open), consistent with the random fan-out.
-            if !crate::utils::network::mass_scan_precheck(ip, precheck_port, honeypot).await {
-                stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
-                record_checkpoint(&cp_clone, &ip_str).await;
-                return;
-            }
-            stats_clone.processed.fetch_add(1, Ordering::Relaxed);
-            let mut ctx = ModuleCtx::new(Target::Single(ip_str.clone()));
-            ctx.options = opts;
-            ctx.cancel = cancel_clone;
-            ctx.tenant_id = tenant;
-            ctx.batch_mode = true;
-            ctx.prompt_cache = Some(cache);
-            ctx.module_path = mp;
-            let outcome = run_host_with_retry(
-                &module_clone,
-                &ctx,
-                Some(Duration::from_secs(limits.timeout_secs)),
-            )
-            .await;
-            stats_clone.record(outcome);
-            record_checkpoint(&cp_clone, &ip_str).await;
+            // Re-scope the run context inside this spawned task: tokio
+            // task-locals do not propagate across tokio::spawn. The config
+            // snapshot carries api_mode + API-supplied custom_prompts so a
+            // mass scan driven over the API behaves like its single-target
+            // equivalent.
+            let run_ctx = std::sync::Arc::new(crate::context::RunContext {
+                config: cfg_clone,
+                target: Some(ip_str.clone()),
+                prompt_cache: Some(cache.clone()),
+                cancel: cancel_clone.clone(),
+                tenant_id: tenant.clone(),
+                module_path: mp.clone(),
+                batch_mode: true,
+                prompt_only: false,
+                spawned: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            });
+            crate::context::RUN_CONTEXT
+                .scope(run_ctx, async move {
+                    if let Some(n) = stats_clone.tick(progress_step) {
+                        crate::mprintln!(
+                            "{}",
+                            progress_line(n, effective_count, &stats_clone.snapshot())
+                        );
+                    }
+                    // Service-port + honeypot precheck (skips hosts that don't have the
+                    // module's port open), consistent with the random fan-out.
+                    if !crate::utils::network::mass_scan_precheck(ip, precheck_port, honeypot).await
+                    {
+                        stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
+                        record_checkpoint(&cp_clone, &ip_str).await;
+                        return;
+                    }
+                    stats_clone.processed.fetch_add(1, Ordering::Relaxed);
+                    let mut ctx = ModuleCtx::new(Target::Single(ip_str.clone()));
+                    ctx.options = opts;
+                    ctx.cancel = cancel_clone;
+                    ctx.tenant_id = tenant;
+                    ctx.batch_mode = true;
+                    ctx.prompt_cache = Some(cache);
+                    ctx.module_path = mp;
+                    let outcome = run_host_with_retry(
+                        &module_clone,
+                        &ctx,
+                        Some(Duration::from_secs(limits.timeout_secs)),
+                    )
+                    .await;
+                    stats_clone.record_and_report(outcome, &ip_str).await;
+                    record_checkpoint(&cp_clone, &ip_str).await;
+                })
+                .await;
         });
     }
 
     drain_joinset(&mut joinset).await;
     let completed_cleanly = !cancel.is_cancelled() && !stats.abort.load(Ordering::Relaxed);
     finalize_checkpoint(&checkpoint, completed_cleanly).await;
-    let outcome = finalize(&format!("Subnet Scan ({})", network), &stats, effective_count as usize, completed_cleanly);
+    let outcome = finalize(
+        &format!("Subnet Scan ({})", network),
+        &stats,
+        effective_count as usize,
+        completed_cleanly,
+    )
+    .await;
     route_findings(&outcome, module.as_ref()).await;
     drop(batch_guard);
     Ok(outcome)
@@ -734,17 +1016,23 @@ async fn fanout_file(
     params: FanoutParams,
     shared_sem: Option<Arc<Semaphore>>,
 ) -> Result<ModuleOutcome> {
-    let FanoutParams { module, target, options, cancel, tenant_id, limits, module_path } = params;
+    let FanoutParams {
+        module,
+        target,
+        options,
+        cancel,
+        tenant_id,
+        limits,
+        module_path,
+        config: module_config,
+    } = params;
     let path = match &target {
         Target::File(p) => p.clone(),
         _ => anyhow::bail!("internal error: fanout_file called with non-File target"),
     };
-    let content = crate::utils::safe_read_to_string_async(
-        path.to_str().unwrap_or(""),
-        None,
-    )
-    .await
-    .with_context(|| format!("Failed to read target file '{}'", path.display()))?;
+    let content = crate::utils::safe_read_to_string_async(path.to_str().unwrap_or(""), None)
+        .await
+        .with_context(|| format!("Failed to read target file '{}'", path.display()))?;
     let targets: Vec<String> = content
         .lines()
         .map(|s| s.trim().to_string())
@@ -763,16 +1051,33 @@ async fn fanout_file(
         .bold()
     );
 
+    if count > limits.warn_threshold as usize && !crate::config::get_module_config().api_mode {
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[!] {} hosts exceeds warn threshold ({}). Consider reducing scope or increasing concurrency.",
+                count, limits.warn_threshold
+            )
+            .yellow()
+        );
+    }
+
     // --- Pre-batch interactive prompt phase ---
     let cfg = crate::config::get_module_config();
     if !cfg.api_mode {
-        pre_batch_prompt(&module, &options, cancel.clone(), tenant_id.clone(), &module_path).await?;
+        pre_batch_prompt(
+            &module,
+            &options,
+            cancel.clone(),
+            tenant_id.clone(),
+            &module_path,
+        )
+        .await?;
     }
 
     let batch_guard = crate::context::enter_batch_mode();
     let stats = Arc::new(ScanStats::default());
-    let sem = shared_sem
-        .unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
+    let sem = shared_sem.unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
     let prompt_cache = crate::context::new_prompt_cache();
     // Checkpoint key includes the file path so different host lists
     // checkpoint independently.
@@ -794,17 +1099,19 @@ async fn fanout_file(
         }
         // Count producer-side skips as considered too (accurate progress).
         if let Ok(ip) = host.parse::<std::net::IpAddr>()
-            && exclusions.contains(ip) {
-                stats.considered.fetch_add(1, Ordering::Relaxed);
-                stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            && exclusions.contains(ip)
+        {
+            stats.considered.fetch_add(1, Ordering::Relaxed);
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if let Some(cp) = checkpoint.as_ref()
-            && cp.already_processed(&host).await {
-                stats.considered.fetch_add(1, Ordering::Relaxed);
-                stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            && cp.already_processed(&host).await
+        {
+            stats.considered.fetch_add(1, Ordering::Relaxed);
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         // Race the permit acquisition against cancellation: when the semaphore
         // is saturated this await can block for a long time, and without the
         // race a Ctrl-C would not stop the dispatcher from enqueuing more hosts
@@ -822,72 +1129,101 @@ async fn fanout_file(
         let stats_clone = stats.clone();
         let mp = module_path.clone();
         let cp_clone = checkpoint.clone();
+        let cfg_clone = module_config.clone();
 
         joinset.spawn(async move {
             // Load-bearing: holds the owned semaphore permit for the task's
             // whole lifetime so concurrency stays bounded; the slot is freed
             // when this task ends. This is NOT a `let _ =` discard.
             let _permit = permit;
-            if let Some(n) = stats_clone.tick(progress_step) {
-                crate::mprintln!("{}", progress_line(n, count as u128, &stats_clone.snapshot()));
-            }
-            // IP-literal entries get the full service-port + honeypot precheck;
-            // hostname entries keep the honeypot-only check.
-            let skip = match host.parse::<std::net::IpAddr>() {
-                Ok(ip) => !crate::utils::network::mass_scan_precheck(ip, precheck_port, honeypot).await,
-                Err(e) => {
-                    tracing::trace!("'{host}' is not an IP literal ({e}); honeypot-only precheck");
-                    honeypot && crate::utils::network::quick_honeypot_check(&host).await
-                }
-            };
-            if skip {
-                stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
-                record_checkpoint(&cp_clone, &host).await;
-                return;
-            }
-            stats_clone.processed.fetch_add(1, Ordering::Relaxed);
-            let mut ctx = ModuleCtx::new(Target::Single(host.clone()));
-            ctx.options = opts;
-            ctx.cancel = cancel_clone;
-            ctx.tenant_id = tenant;
-            ctx.batch_mode = true;
-            ctx.prompt_cache = Some(cache);
-            ctx.module_path = mp;
-            let outcome = run_host_with_retry(
-                &module_clone,
-                &ctx,
-                Some(Duration::from_secs(limits.timeout_secs)),
-            )
-            .await;
-            stats_clone.record(outcome);
-            record_checkpoint(&cp_clone, &host).await;
+            // Re-scope the run context inside this spawned task: tokio
+            // task-locals do not propagate across tokio::spawn. Mirrors the
+            // CIDR fan-out (config snapshot, prompt cache, batch flag).
+            let run_ctx = std::sync::Arc::new(crate::context::RunContext {
+                config: cfg_clone,
+                target: Some(host.clone()),
+                prompt_cache: Some(cache.clone()),
+                cancel: cancel_clone.clone(),
+                tenant_id: tenant.clone(),
+                module_path: mp.clone(),
+                batch_mode: true,
+                prompt_only: false,
+                spawned: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            });
+            crate::context::RUN_CONTEXT
+                .scope(run_ctx, async move {
+                    if let Some(n) = stats_clone.tick(progress_step) {
+                        crate::mprintln!(
+                            "{}",
+                            progress_line(n, count as u128, &stats_clone.snapshot())
+                        );
+                    }
+                    // IP-literal entries get the full service-port + honeypot precheck;
+                    // hostname entries keep the honeypot-only check.
+                    let skip = match host.parse::<std::net::IpAddr>() {
+                        Ok(ip) => {
+                            !crate::utils::network::mass_scan_precheck(ip, precheck_port, honeypot)
+                                .await
+                        }
+                        Err(e) => {
+                            tracing::trace!(
+                                "'{host}' is not an IP literal ({e}); honeypot-only precheck"
+                            );
+                            honeypot && crate::utils::network::quick_honeypot_check(&host).await
+                        }
+                    };
+                    if skip {
+                        stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
+                        record_checkpoint(&cp_clone, &host).await;
+                        return;
+                    }
+                    stats_clone.processed.fetch_add(1, Ordering::Relaxed);
+                    let mut ctx = ModuleCtx::new(Target::Single(host.clone()));
+                    ctx.options = opts;
+                    ctx.cancel = cancel_clone;
+                    ctx.tenant_id = tenant;
+                    ctx.batch_mode = true;
+                    ctx.prompt_cache = Some(cache);
+                    ctx.module_path = mp;
+                    let outcome = run_host_with_retry(
+                        &module_clone,
+                        &ctx,
+                        Some(Duration::from_secs(limits.timeout_secs)),
+                    )
+                    .await;
+                    stats_clone.record_and_report(outcome, &host).await;
+                    record_checkpoint(&cp_clone, &host).await;
+                })
+                .await;
         });
     }
 
     drain_joinset(&mut joinset).await;
     let completed_cleanly = !cancel.is_cancelled();
     finalize_checkpoint(&checkpoint, completed_cleanly).await;
-    let outcome = finalize("File Target Scan", &stats, count, completed_cleanly);
+    let outcome = finalize("File Target Scan", &stats, count, completed_cleanly).await;
     route_findings(&outcome, module.as_ref()).await;
     drop(batch_guard);
     Ok(outcome)
 }
 
-async fn fanout_multi(
-    module: Arc<dyn Module>,
-    target: Target,
-    options: ModuleOptions,
-    cancel: tokio_util::sync::CancellationToken,
-    tenant_id: Option<String>,
-    verbose: bool,
-    limits: SchedulerLimits,
-) -> Result<ModuleOutcome> {
+async fn fanout_multi(params: FanoutParams, verbose: bool) -> Result<ModuleOutcome> {
+    let FanoutParams {
+        module,
+        target,
+        options,
+        cancel,
+        tenant_id,
+        limits,
+        module_path,
+        config: _,
+    } = params;
     let parts = match target {
         Target::Multi(p) => p,
         _ => anyhow::bail!("internal error: fanout_multi called with non-Multi target"),
     };
     let total = parts.len();
-    if let Some(ref tid) = tenant_id {
+    if let Some(tid) = &tenant_id {
         tracing::debug!("fanout_multi: tenant_id={}, targets={}", tid, total);
     }
     crate::mprintln!(
@@ -910,7 +1246,9 @@ async fn fanout_multi(
         }
         crate::mprintln!(
             "\n{}",
-            format!("[*] === Target {}/{} ===", i + 1, total).cyan().bold()
+            format!("[*] === Target {}/{} ===", i + 1, total)
+                .cyan()
+                .bold()
         );
         match Box::pin(run_with_limits_shared(
             module.clone(),
@@ -919,6 +1257,7 @@ async fn fanout_multi(
             verbose,
             limits,
             Some(shared_sem.clone()),
+            &module_path,
         ))
         .await
         {
@@ -937,7 +1276,10 @@ async fn fanout_multi(
     Ok(combined)
 }
 
-async fn fanout_random(
+/// Parameters for a random full-internet sweep. Bundled into one struct so
+/// `fanout_random` stays under clippy's too-many-arguments threshold
+/// without lint suppression.
+struct RandomSweep {
     module: Arc<dyn Module>,
     options: ModuleOptions,
     cancel: tokio_util::sync::CancellationToken,
@@ -945,6 +1287,20 @@ async fn fanout_random(
     limits: SchedulerLimits,
     module_path: String,
     shared_sem: Option<Arc<Semaphore>>,
+    config: crate::config::ModuleConfig,
+}
+
+async fn fanout_random(
+    RandomSweep {
+        module,
+        options,
+        cancel,
+        tenant_id,
+        limits,
+        module_path,
+        shared_sem,
+        config: module_config,
+    }: RandomSweep,
 ) -> Result<ModuleOutcome> {
     // Full-internet sweep advisory + interactive confirmation FIRST. Declining
     // must abort before anything is touched — including the prompt-harvest
@@ -965,17 +1321,28 @@ async fn fanout_random(
     // interactively. Answers are cached and reused for all targets.
     let cfg = crate::config::get_module_config();
     if !cfg.api_mode {
-        pre_batch_prompt(&module, &options, cancel.clone(), tenant_id.clone(), &module_path).await?;
+        pre_batch_prompt(
+            &module,
+            &options,
+            cancel.clone(),
+            tenant_id.clone(),
+            &module_path,
+        )
+        .await?;
     }
 
     let batch_guard = crate::context::enter_batch_mode();
     let stats = Arc::new(ScanStats::default());
-    let sem = shared_sem
-        .unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
+    let sem = shared_sem.unwrap_or_else(|| Arc::new(Semaphore::new(limits.concurrency)));
     let prompt_cache = crate::context::new_prompt_cache();
     // Pluggable per-tenant exclusion list. Operators control via
     // `setg exclusions ...`; falls back to bogons + RFC1918 + Cloudflare + DNS.
-    let exclusion_set = crate::exclusions::shared();
+    // `setg block_internal off` (interactive shell only) disables RFC1918
+    // exclusions for operators scanning their own internal infrastructure.
+    let mut exclusion_set = crate::exclusions::shared();
+    if block_internal_disabled() {
+        exclusion_set = Arc::new(crate::exclusions::ExclusionSet::empty());
+    }
     let exclusions = Arc::new(exclusion_set.networks().to_vec());
     let module_err = Arc::new(AtomicUsize::new(0));
     // Random scans checkpoint by IP so a kill-then-restart skips the IPs
@@ -1034,13 +1401,17 @@ async fn fanout_random(
             }
         };
         let Some(ip) = ip else { break };
-        dispatched += 1;
         let ip_str = ip.to_string();
+        // Checkpoint skips do NOT consume the host budget: the budget counts
+        // hosts actually dispatched this run, so a resumed sweep still makes
+        // a full `max_random_hosts` of fresh progress.
         if let Some(cp) = checkpoint.as_ref()
-            && cp.already_processed(&ip_str).await {
-                stats.skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            && cp.already_processed(&ip_str).await
+        {
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        dispatched += 1;
         // Race the permit acquisition against cancellation: when the semaphore
         // is saturated this await can block for a long time, and without the
         // race a Ctrl-C would not stop the dispatcher from enqueuing more hosts
@@ -1061,57 +1432,81 @@ async fn fanout_random(
         let honeypot = limits.honeypot_detection;
         let mp = module_path.clone();
         let cp_clone = checkpoint.clone();
+        let cfg_clone = module_config.clone();
 
         joinset.spawn(async move {
             // Load-bearing: holds the owned semaphore permit for the task's
             // whole lifetime so concurrency stays bounded; the slot is freed
             // when this task ends. This is NOT a `let _ =` discard.
             let _permit = permit;
-            // Tick BEFORE the precheck so progress advances even when (as is
-            // typical for random ranges) almost every host fails the port
-            // precheck and is skipped. Previously progress only moved on
-            // hosts that passed the precheck, so a sparse scan looked frozen.
-            if let Some(n) = stats_clone.tick(progress_step) {
-                crate::mprintln!(
-                    "{}",
-                    progress_line(n, limits.max_random_hosts as u128, &stats_clone.snapshot())
-                );
-            }
-            if !crate::utils::network::mass_scan_precheck(ip, port, honeypot).await {
-                stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
-                record_checkpoint(&cp_clone, &ip.to_string()).await;
-                return;
-            }
-            stats_clone.processed.fetch_add(1, Ordering::Relaxed);
-            let mut ctx = ModuleCtx::new(Target::Single(ip.to_string()));
-            ctx.options = opts;
-            ctx.cancel = cancel_clone;
-            ctx.tenant_id = tenant;
-            ctx.batch_mode = true;
-            ctx.prompt_cache = Some(cache);
-            ctx.module_path = mp;
-            let outcome = run_host_with_retry(
-                &module_clone,
-                &ctx,
-                Some(Duration::from_secs(limits.timeout_secs)),
-            )
-            .await;
-            let was_err = stats_clone.record(outcome);
-            record_checkpoint(&cp_clone, &ip.to_string()).await;
-            if was_err {
-                let n = module_err_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                let ok_so_far = stats_clone.success.load(Ordering::Relaxed);
-                // Warn once if the run looks misconfigured, but keep going:
-                // transient failures are already retried, and the operator asked
-                // for error -> retry -> continue rather than an automatic abort.
-                if n == 10 && ok_so_far == 0 {
-                    crate::meprintln!(
-                        "{}",
-                        "[!] First 10 dispatches errored with no successes — continuing anyway (check module/target config if this persists; Ctrl+C to stop)."
-                            .yellow()
-                    );
-                }
-            }
+            // Re-scope the run context inside this spawned task: tokio
+            // task-locals do not propagate across tokio::spawn. Mirrors the
+            // CIDR fan-out (config snapshot, batch flag).
+            let run_ctx = std::sync::Arc::new(crate::context::RunContext {
+                config: cfg_clone,
+                target: Some(ip.to_string()),
+                prompt_cache: Some(cache.clone()),
+                cancel: cancel_clone.clone(),
+                tenant_id: tenant.clone(),
+                module_path: mp.clone(),
+                batch_mode: true,
+                prompt_only: false,
+                spawned: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            });
+            crate::context::RUN_CONTEXT
+                .scope(run_ctx, async move {
+                    // Tick BEFORE the precheck so progress advances even when (as is
+                    // typical for random ranges) almost every host fails the port
+                    // precheck and is skipped. Previously progress only moved on
+                    // hosts that passed the precheck, so a sparse scan looked frozen.
+                    if let Some(n) = stats_clone.tick(progress_step) {
+                        crate::mprintln!(
+                            "{}",
+                            progress_line(
+                                n,
+                                limits.max_random_hosts as u128,
+                                &stats_clone.snapshot()
+                            )
+                        );
+                    }
+                    if !crate::utils::network::mass_scan_precheck(ip, port, honeypot).await {
+                        stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
+                        record_checkpoint(&cp_clone, &ip.to_string()).await;
+                        return;
+                    }
+                    stats_clone.processed.fetch_add(1, Ordering::Relaxed);
+                    let mut ctx = ModuleCtx::new(Target::Single(ip.to_string()));
+                    ctx.options = opts;
+                    ctx.cancel = cancel_clone;
+                    ctx.tenant_id = tenant;
+                    ctx.batch_mode = true;
+                    ctx.prompt_cache = Some(cache);
+                    ctx.module_path = mp;
+                    let outcome = run_host_with_retry(
+                        &module_clone,
+                        &ctx,
+                        Some(Duration::from_secs(limits.timeout_secs)),
+                    )
+                    .await;
+                    let ip_s = ip.to_string();
+                    let was_err = stats_clone.record_and_report(outcome, &ip_s).await;
+                    record_checkpoint(&cp_clone, &ip_s).await;
+                    if was_err {
+                        let n = module_err_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                        let ok_so_far = stats_clone.success.load(Ordering::Relaxed);
+                        // Warn once if the run looks misconfigured, but keep going:
+                        // transient failures are already retried, and the operator asked
+                        // for error -> retry -> continue rather than an automatic abort.
+                        if n == 10 && ok_so_far == 0 {
+                            crate::meprintln!(
+                                "{}",
+                                "[!] First 10 dispatches errored with no successes — continuing anyway (check module/target config if this persists; Ctrl+C to stop)."
+                                    .yellow()
+                            );
+                        }
+                    }
+                })
+                .await;
         });
     }
 
@@ -1120,7 +1515,13 @@ async fn fanout_random(
     finalize_checkpoint(&checkpoint, completed_cleanly).await;
     // Denominator is the host budget, not the post-precheck count, so
     // "examined / total" reflects how far through the random sweep we got.
-    let outcome = finalize("Random Mass Scan", &stats, limits.max_random_hosts, completed_cleanly);
+    let outcome = finalize(
+        "Random Mass Scan",
+        &stats,
+        limits.max_random_hosts,
+        completed_cleanly,
+    )
+    .await;
     route_findings(&outcome, module.as_ref()).await;
     drop(batch_guard);
     Ok(outcome)
@@ -1139,13 +1540,31 @@ fn scan_order_is_sequential() -> bool {
         .unwrap_or(false)
 }
 
+/// `true` when the operator disabled internal-IP blocking via
+/// `setg block_internal off`. Only changeable from the interactive shell
+/// (not API/MCP/scripts) to prevent accidental internal-network scans.
+fn block_internal_disabled() -> bool {
+    crate::tenant::resolve()
+        .global_options()
+        .try_get("block_internal")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "no" | "false" | "0" | "disabled"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Sequential public-IPv4 sweep from `start` (clamped to the first public
 /// address) up to the last public address (223.255.255.255), in order. Honors
 /// the exclusion list, the service-port precheck, honeypot detection, and a
 /// high-water-mark checkpoint so a killed scan resumes from where it left off.
 /// Unbounded by default; capped only when the operator sets `max_random_hosts`.
-#[allow(clippy::too_many_arguments)]
-async fn fanout_sequential(
+/// Parameters for a sequential full-internet sweep. Bundled into one struct so
+/// `fanout_sequential` stays under clippy's too-many-arguments threshold
+/// without lint suppression.
+struct SequentialSweep {
     start: u32,
     module: Arc<dyn Module>,
     options: ModuleOptions,
@@ -1154,6 +1573,23 @@ async fn fanout_sequential(
     limits: SchedulerLimits,
     module_path: String,
     shared_sem: Option<Arc<Semaphore>>,
+    /// Config snapshot scoped into each spawned per-host task (task-locals
+    /// don't cross `tokio::spawn`).
+    config: crate::config::ModuleConfig,
+}
+
+async fn fanout_sequential(
+    SequentialSweep {
+        start,
+        module,
+        options,
+        cancel,
+        tenant_id,
+        limits,
+        module_path,
+        shared_sem,
+        config: module_config,
+    }: SequentialSweep,
 ) -> Result<ModuleOutcome> {
     const LAST_PUBLIC: u32 = 0xDFFF_FFFF; // 223.255.255.255 (end of Class A-C)
 
@@ -1186,7 +1622,14 @@ async fn fanout_sequential(
 
     // Pre-batch interactive prompt phase (after confirmation).
     if !cfg.api_mode {
-        pre_batch_prompt(&module, &options, cancel.clone(), tenant_id.clone(), &module_path).await?;
+        pre_batch_prompt(
+            &module,
+            &options,
+            cancel.clone(),
+            tenant_id.clone(),
+            &module_path,
+        )
+        .await?;
     }
 
     let batch_guard = crate::context::enter_batch_mode();
@@ -1201,7 +1644,7 @@ async fn fanout_sequential(
     // resumes from `hi + 1`.
     let scan_id = crate::checkpoint::auto_scan_id(&module_path, "sequential");
     let mut start_ip = start.max(crate::module::FIRST_PUBLIC_IPV4);
-    if let Some(hi) = crate::checkpoint::read_seq_marker(&scan_id) {
+    if let Some(hi) = crate::checkpoint::read_seq_marker(&scan_id).await {
         let resume = hi.saturating_add(1);
         if resume > start_ip {
             crate::mprintln!(
@@ -1240,7 +1683,11 @@ async fn fanout_sequential(
     match cap {
         Some(c) => crate::mprintln!(
             "{}",
-            format!("[*] Capped at {c} hosts (max_random_hosts), concurrency {}", limits.concurrency).cyan()
+            format!(
+                "[*] Capped at {c} hosts (max_random_hosts), concurrency {}",
+                limits.concurrency
+            )
+            .cyan()
         ),
         None => crate::mprintln!(
             "{}",
@@ -1292,56 +1739,79 @@ async fn fanout_sequential(
         let honeypot = limits.honeypot_detection;
         let mp = module_path.clone();
         let timeout_secs = limits.timeout_secs;
+        let cfg_clone = module_config.clone();
 
         joinset.spawn(async move {
             // Load-bearing: holds the permit for the task's lifetime.
             let _permit = permit;
-            if let Some(n) = stats_clone.tick(progress_step) {
-                crate::mprintln!("{}", progress_line(n, total, &stats_clone.snapshot()));
-            }
-            if !crate::utils::network::mass_scan_precheck(std::net::IpAddr::V4(addr), port, honeypot)
-                .await
-            {
-                stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            stats_clone.processed.fetch_add(1, Ordering::Relaxed);
-            let mut ctx = ModuleCtx::new(Target::Single(addr.to_string()));
-            ctx.options = opts;
-            ctx.cancel = cancel_clone;
-            ctx.tenant_id = tenant;
-            ctx.batch_mode = true;
-            ctx.prompt_cache = Some(cache);
-            ctx.module_path = mp;
-            let outcome = run_host_with_retry(
-                &module_clone,
-                &ctx,
-                Some(Duration::from_secs(timeout_secs)),
-            )
-            .await;
-            let was_err = stats_clone.record(outcome);
-            if was_err {
-                let n = module_err_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                let ok_so_far = stats_clone.success.load(Ordering::Relaxed);
-                // Warn once if the run looks misconfigured, but keep going:
-                // transient failures are already retried, and the operator asked
-                // for error -> retry -> continue rather than an automatic abort.
-                if n == 10 && ok_so_far == 0 {
-                    crate::meprintln!(
-                        "{}",
-                        "[!] First 10 dispatches errored with no successes — continuing anyway (check module/target config if this persists; Ctrl+C to stop)."
-                            .yellow()
-                    );
-                }
-            }
+            // Re-scope the run context inside this spawned task: tokio
+            // task-locals do not propagate across tokio::spawn. Mirrors the
+            // CIDR fan-out (config snapshot, batch flag).
+            let run_ctx = std::sync::Arc::new(crate::context::RunContext {
+                config: cfg_clone,
+                target: Some(addr.to_string()),
+                prompt_cache: Some(cache.clone()),
+                cancel: cancel_clone.clone(),
+                tenant_id: tenant.clone(),
+                module_path: mp.clone(),
+                batch_mode: true,
+                prompt_only: false,
+                spawned: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            });
+            crate::context::RUN_CONTEXT
+                .scope(run_ctx, async move {
+                    if let Some(n) = stats_clone.tick(progress_step) {
+                        crate::mprintln!(
+                            "{}",
+                            progress_line(n, total, &stats_clone.snapshot())
+                        );
+                    }
+                    if !crate::utils::network::mass_scan_precheck(
+                        std::net::IpAddr::V4(addr),
+                        port,
+                        honeypot,
+                    )
+                    .await
+                    {
+                        stats_clone.skipped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    stats_clone.processed.fetch_add(1, Ordering::Relaxed);
+                    let mut ctx = ModuleCtx::new(Target::Single(addr.to_string()));
+                    ctx.options = opts;
+                    ctx.cancel = cancel_clone;
+                    ctx.tenant_id = tenant;
+                    ctx.batch_mode = true;
+                    ctx.prompt_cache = Some(cache);
+                    ctx.module_path = mp;
+                    let outcome = run_host_with_retry(
+                        &module_clone,
+                        &ctx,
+                        Some(Duration::from_secs(timeout_secs)),
+                    )
+                    .await;
+                    let addr_s = addr.to_string();
+                    let was_err = stats_clone.record_and_report(outcome, &addr_s).await;
+                    if was_err {
+                        let n = module_err_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                        let ok_so_far = stats_clone.success.load(Ordering::Relaxed);
+                        // Warn once if the run looks misconfigured, but keep going:
+                        // transient failures are already retried, and the operator asked
+                        // for error -> retry -> continue rather than an automatic abort.
+                        if n == 10 && ok_so_far == 0 {
+                            crate::meprintln!(
+                                "{}",
+                                "[!] First 10 dispatches errored with no successes — continuing anyway (check module/target config if this persists; Ctrl+C to stop)."
+                                    .yellow()
+                            );
+                        }
+                    }
+                })
+                .await;
         });
 
         dispatched += 1;
         last_dispatched = ip;
-        // Persist the high-water mark periodically (cheap; bounds resume granularity).
-        if dispatched.is_multiple_of(progress_step.max(1)) {
-            crate::checkpoint::write_seq_marker(&scan_id, ip);
-        }
 
         match ip.checked_add(1) {
             Some(n) => ip = n,
@@ -1354,12 +1824,18 @@ async fn fanout_sequential(
     let completed_cleanly =
         reached_end && !cancel.is_cancelled() && !stats.abort.load(Ordering::Relaxed);
     if completed_cleanly {
-        crate::checkpoint::clear_seq_marker(&scan_id);
+        crate::checkpoint::clear_seq_marker(&scan_id).await;
     } else {
         // Save where we stopped so the next run resumes.
-        crate::checkpoint::write_seq_marker(&scan_id, last_dispatched);
+        crate::checkpoint::write_seq_marker(&scan_id, last_dispatched).await;
     }
-    let outcome = finalize("Sequential Mass Scan", &stats, total as usize, completed_cleanly);
+    let outcome = finalize(
+        "Sequential Mass Scan",
+        &stats,
+        total as usize,
+        completed_cleanly,
+    )
+    .await;
     route_findings(&outcome, module.as_ref()).await;
     drop(batch_guard);
     Ok(outcome)
@@ -1386,7 +1862,9 @@ async fn pre_batch_prompt(
 ) -> Result<()> {
     crate::mprintln!(
         "{}",
-        "[*] Mass scan mode — configuring module options (answers apply to ALL targets)".cyan().bold()
+        "[*] Mass scan mode — configuring module options (answers apply to ALL targets)"
+            .cyan()
+            .bold()
     );
     crate::mprintln!(
         "{}",
@@ -1427,10 +1905,8 @@ async fn pre_batch_prompt(
     // a confusing `Scanning 0.0.0.1 … 0 services detected` block. Interactive
     // prompts use `print!` (real stdout) and stay visible; only `mprintln!` /
     // `meprintln!` module output is suppressed.
-    let run_fut = crate::output::OUTPUT_BUFFER.scope(
-        crate::output::OutputBuffer::new(),
-        module.run(&ctx),
-    );
+    let run_fut =
+        crate::output::OUTPUT_BUFFER.scope(crate::output::OutputBuffer::new(), module.run(&ctx));
     let result = tokio::time::timeout(Duration::from_secs(300), run_fut).await;
 
     // The prompts have already been answered and stored by cfg_prompt_*. The
@@ -1442,8 +1918,12 @@ async fn pre_batch_prompt(
             "pre_batch_prompt: dry-run completed with {} finding(s) (ignored — placeholder host)",
             outcome.findings.len()
         ),
-        Ok(Err(e)) => tracing::warn!("pre_batch_prompt: config dry-run errored (prompts may be incomplete): {e:#}"),
-        Err(elapsed) => tracing::warn!("pre_batch_prompt: config dry-run timed out (prompts may be incomplete): {elapsed}"),
+        Ok(Err(e)) => tracing::warn!(
+            "pre_batch_prompt: config dry-run errored (prompts may be incomplete): {e:#}"
+        ),
+        Err(elapsed) => tracing::warn!(
+            "pre_batch_prompt: config dry-run timed out (prompts may be incomplete): {elapsed}"
+        ),
     }
 
     crate::mprintln!();
@@ -1478,10 +1958,7 @@ async fn full_sweep_advisory_and_confirm(
                 // Surface, don't swallow: a bad `setg port` would otherwise be
                 // silently ignored and the operator would never know why the
                 // precheck used a different port.
-                crate::meprintln!(
-                    "[!] Ignoring invalid `setg port` value '{}': {e}",
-                    v.trim()
-                );
+                crate::meprintln!("[!] Ignoring invalid `setg port` value '{}': {e}", v.trim());
                 None
             }
         },
@@ -1512,11 +1989,29 @@ async fn full_sweep_advisory_and_confirm(
         .yellow()
         .bold()
     );
-    crate::mprintln!("{}", "    Settings for this sweep (override with `setg <key> <value>`):".yellow());
+    crate::mprintln!(
+        "{}",
+        "    Settings for this sweep (override with `setg <key> <value>`):".yellow()
+    );
     crate::mprintln!("      {:<17}{}", "port:", port_line);
-    crate::mprintln!("      {:<17}{}   {}", "concurrency:", limits.concurrency, "(setg concurrency <n>)".dimmed());
-    crate::mprintln!("      {:<17}{}   {}", "host cap:", host_cap, "(setg max_random_hosts <n>)".dimmed());
-    crate::mprintln!("      {:<17}{}s   {}", "per-host timeout:", limits.timeout_secs, "(setg timeout <n>)".dimmed());
+    crate::mprintln!(
+        "      {:<17}{}   {}",
+        "concurrency:",
+        limits.concurrency,
+        "(setg concurrency <n>)".dimmed()
+    );
+    crate::mprintln!(
+        "      {:<17}{}   {}",
+        "host cap:",
+        host_cap,
+        "(setg max_random_hosts <n>)".dimmed()
+    );
+    crate::mprintln!(
+        "      {:<17}{}s   {}",
+        "per-host timeout:",
+        limits.timeout_secs,
+        "(setg timeout <n>)".dimmed()
+    );
     crate::mprintln!(
         "      {:<17}{} networks excluded (RFC1918/bogons/...)   {}",
         "exclusions:",
@@ -1532,9 +2027,13 @@ async fn full_sweep_advisory_and_confirm(
     if !interactive_console {
         return Ok(true);
     }
-    let proceed = crate::utils::prompt_yes_no("Proceed with the full-internet sweep?", false).await?;
+    let proceed =
+        crate::utils::prompt_yes_no("Proceed with the full-internet sweep?", false).await?;
     if !proceed {
-        crate::mprintln!("{}", "[*] Full-internet sweep aborted by operator.".yellow());
+        crate::mprintln!(
+            "{}",
+            "[*] Full-internet sweep aborted by operator.".yellow()
+        );
     }
     Ok(proceed)
 }
@@ -1551,9 +2050,10 @@ async fn full_sweep_advisory_and_confirm(
 async fn drain_joinset(joinset: &mut tokio::task::JoinSet<()>) {
     while let Some(res) = joinset.join_next().await {
         if let Err(e) = res
-            && !e.is_cancelled() {
-                tracing::debug!("spawned task panicked: {e:#}");
-            }
+            && !e.is_cancelled()
+        {
+            tracing::debug!("spawned task panicked: {e:#}");
+        }
     }
 }
 
@@ -1592,14 +2092,12 @@ async fn open_checkpoint(
 
 /// Record a target as processed, swallowing only at debug-trace level so
 /// scans don't terminate on transient disk errors.
-async fn record_checkpoint(
-    cp: &Option<Arc<crate::checkpoint::CheckpointWriter>>,
-    target: &str,
-) {
+async fn record_checkpoint(cp: &Option<Arc<crate::checkpoint::CheckpointWriter>>, target: &str) {
     if let Some(cp) = cp.as_ref()
-        && let Err(e) = cp.record(target).await {
-            tracing::debug!(target = %target, "checkpoint record failed: {e:#}");
-        }
+        && let Err(e) = cp.record(target).await
+    {
+        tracing::debug!(target = %target, "checkpoint record failed: {e:#}");
+    }
 }
 
 /// Final flush + delete-on-success. The checkpoint file is preserved on
@@ -1613,13 +2111,24 @@ async fn finalize_checkpoint(
     if let Err(e) = cp.flush().await {
         crate::meprintln!("[!] Checkpoint flush failed: {e:#}");
     }
-    if completed_cleanly
-        && let Err(e) = cp.finish().await {
-            crate::meprintln!("[!] Checkpoint finalize failed: {e:#}");
-        }
+    if completed_cleanly && let Err(e) = cp.finish().await {
+        crate::meprintln!("[!] Checkpoint finalize failed: {e:#}");
+    }
 }
 
-fn finalize(label: &str, stats: &ScanStats, total: usize, completed_cleanly: bool) -> ModuleOutcome {
+/// Build the end-of-scan summary and final `ModuleOutcome`.
+///
+/// Async because it awaits the findings lock. It used to call
+/// `blocking_lock()`, which panics ("Cannot block the current thread from
+/// within a runtime") whenever called inside the tokio runtime — i.e. at
+/// the end of EVERY completed mass scan, killing the summary and skipping
+/// finding routing entirely.
+async fn finalize(
+    label: &str,
+    stats: &ScanStats,
+    total: usize,
+    completed_cleanly: bool,
+) -> ModuleOutcome {
     let s = stats.snapshot();
     // Publish the final per-target breakdown to the job's scan counters (if this
     // run is a backgrounded job that scoped them) so `jobs`/get_detail reports
@@ -1633,7 +2142,9 @@ fn finalize(label: &str, stats: &ScanStats, total: usize, completed_cleanly: boo
     crate::mprintln!("  Hosts examined:  {} / {}", s.considered, total);
     crate::mprintln!(
         "  Module ran on:   {}  ({} ok, {} errored)",
-        s.processed, s.success, s.failed
+        s.processed,
+        s.success,
+        s.failed
     );
     if s.skipped > 0 {
         crate::mprintln!(
@@ -1649,11 +2160,7 @@ fn finalize(label: &str, stats: &ScanStats, total: usize, completed_cleanly: boo
     // find anything? `success`/`ok` only means a host did not error — it is
     // not a hit. Surface findings explicitly so a scan that ran cleanly but
     // found nothing reads as "0 findings", not "N successful".
-    let findings: Vec<Finding> = stats.findings.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .cloned()
-        .collect();
+    let findings: Vec<Finding> = stats.findings.lock().await.iter().cloned().collect();
     if s.hits > 0 {
         crate::mprintln!(
             "  {}",
@@ -1681,10 +2188,7 @@ fn finalize(label: &str, stats: &ScanStats, total: usize, completed_cleanly: boo
             );
         }
     } else {
-        crate::mprintln!(
-            "  {}",
-            "Findings:        0  (nothing found)".yellow()
-        );
+        crate::mprintln!("  {}", "Findings:        0  (nothing found)".yellow());
     }
     // A scan that was cancelled (Ctrl-C) or auto-aborted stopped before
     // examining every host, so its result is NOT a clean success even if no
@@ -1722,8 +2226,34 @@ async fn route_findings(outcome: &ModuleOutcome, module: &dyn Module) {
                     &module_name,
                 )
                 .await
-                .is_none() {
-                    eprintln!("[!] Failed to store loot for {}", f.target);
+                .is_none()
+                {
+                    // Buffer-aware output: raw eprintln! bypasses OUTPUT_BUFFER
+                    // and is lost in API/job runs.
+                    crate::meprintln!("[!] Failed to store loot for {}", f.target);
+                }
+                // Also persist to structured credential store if we can extract user/pass
+                if let Some(ref data) = f.data {
+                    if let (Some(user), Some(pass)) = (
+                        data.get("username").and_then(|v| v.as_str()),
+                        data.get("password").and_then(|v| v.as_str()),
+                    ) {
+                        let port = data.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                        let service = data
+                            .get("service")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        crate::cred_store::store_credential(crate::cred_store::NewCred {
+                            host: &f.target,
+                            port,
+                            service,
+                            username: user,
+                            secret: pass,
+                            cred_type: crate::cred_store::CredType::Password,
+                            source_module: &module_name,
+                        })
+                        .await;
+                    }
                 }
             }
             FindingKind::Vulnerable => {
@@ -1732,11 +2262,8 @@ async fn route_findings(outcome: &ModuleOutcome, module: &dyn Module) {
                 // freshly-seen host (or a non-IP target like a BLE MAC) would
                 // be dropped on the floor.
                 crate::workspace::track_host(&f.target, None, None).await;
-                crate::workspace::add_note(
-                    &f.target,
-                    &format!("[{}] {}", module_name, f.message),
-                )
-                .await;
+                crate::workspace::add_note(&f.target, &format!("[{}] {}", module_name, f.message))
+                    .await;
             }
             FindingKind::OpenPort | FindingKind::Banner | FindingKind::Note => {
                 crate::workspace::track_host(&f.target, None, None).await;

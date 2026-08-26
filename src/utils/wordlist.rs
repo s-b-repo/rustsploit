@@ -17,7 +17,7 @@
 // Modules adopt this incrementally — there is no need to retrofit existing
 // `cfg_prompt_existing_file("password_wordlist", …)` calls today.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -114,13 +114,24 @@ pub async fn resolve(name: &str) -> Result<PathBuf> {
         let check_path = dest.clone();
         let check_hash = spec.sha256.to_string();
         let check_name = spec.name.to_string();
-        tokio::task::spawn_blocking(move || {
+        let checksum_ok = tokio::task::spawn_blocking(move || {
             verify_sha256(&check_path, &check_hash)
                 .with_context(|| format!("cached wordlist {} failed checksum check", check_name))
         })
         .await
-        .context("sha256 verify task panicked")??;
-        return Ok(dest);
+        .context("sha256 verify task panicked")?
+        .is_ok();
+        if checksum_ok {
+            return Ok(dest);
+        }
+        // Delete corrupt cached file so next call re-downloads
+        if let Err(e) = std::fs::remove_file(&dest) {
+            tracing::warn!("failed to delete corrupt wordlist {:?}: {}", dest, e);
+        }
+        anyhow::bail!(
+            "cached wordlist {} failed checksum — deleted; re-run to re-download",
+            spec.name
+        );
     }
 
     download_to(&dest, spec).await?;
@@ -163,15 +174,12 @@ fn wordlist_dir() -> Result<PathBuf> {
     let home =
         home::home_dir().ok_or_else(|| anyhow!("cannot resolve $HOME for wordlist cache"))?;
     let dir = home.join(".rustsploit").join("wordlists");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     // Best-effort: tighten perms (700) on Unix so other local users can't read
     // wordlists that may be sensitive (e.g. client-specific lists).
     #[cfg(unix)]
     {
-        if let Err(e) =
-            crate::utils::privilege::set_secure_permissions(&dir, 0o700)
-        {
+        if let Err(e) = crate::utils::privilege::set_secure_permissions(&dir, 0o700) {
             tracing::debug!("could not chmod {}: {}", dir.display(), e);
         }
     }
@@ -191,22 +199,19 @@ async fn download_to(dest: &Path, spec: &WordlistSpec) -> Result<()> {
         .with_context(|| format!("download of {} failed (network)", spec.url))?;
 
     if !resp.status().is_success() {
-        anyhow::bail!(
-            "download of {} returned HTTP {}",
-            spec.url,
-            resp.status()
-        );
+        anyhow::bail!("download of {} returned HTTP {}", spec.url, resp.status());
     }
 
     if let Some(len) = resp.content_length()
-        && len > MAX_BYTES {
-            anyhow::bail!(
-                "{} reports content-length {} bytes — exceeds {}-byte cap",
-                spec.url,
-                len,
-                MAX_BYTES
-            );
-        }
+        && len > MAX_BYTES
+    {
+        anyhow::bail!(
+            "{} reports content-length {} bytes — exceeds {}-byte cap",
+            spec.url,
+            len,
+            MAX_BYTES
+        );
+    }
 
     // Write to `<dest>.tmp` first; rename only after checksum passes so a
     // crashed / cancelled download never leaves a corrupt cached file.
@@ -225,7 +230,7 @@ async fn download_to(dest: &Path, spec: &WordlistSpec) -> Result<()> {
         if total > MAX_BYTES {
             // Best-effort cleanup; ignore errors (we're already failing).
             if let Err(e) = tokio::fs::remove_file(&tmp).await {
-                eprintln!("[!] Failed to remove temp file: {}", e);
+                crate::meprintln!("[!] Failed to remove temp file: {}", e);
             }
             anyhow::bail!(
                 "wordlist {} exceeded {}-byte cap mid-stream",
@@ -236,7 +241,9 @@ async fn download_to(dest: &Path, spec: &WordlistSpec) -> Result<()> {
         hasher.update(&chunk);
         file.write_all(&chunk).await.context("disk write failed")?;
     }
-    file.flush().await.context("flush downloaded wordlist failed")?;
+    file.flush()
+        .await
+        .context("flush downloaded wordlist failed")?;
     drop(file);
 
     let got = hex::encode(hasher.finalize());
@@ -269,8 +276,8 @@ async fn download_to(dest: &Path, spec: &WordlistSpec) -> Result<()> {
 
 fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("could not open {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -362,10 +369,7 @@ impl BatchedReader {
 
     /// Open `path` with an explicit batch size. `batch_size` of 0 is
     /// treated as 1 to avoid an infinite loop in pathological callers.
-    pub async fn open_with_batch_size(
-        path: impl AsRef<Path>,
-        batch_size: usize,
-    ) -> Result<Self> {
+    pub async fn open_with_batch_size(path: impl AsRef<Path>, batch_size: usize) -> Result<Self> {
         let path = path.as_ref();
         let f = tokio::fs::File::open(path)
             .await
@@ -537,9 +541,11 @@ pub fn load_lines_cached<P: AsRef<Path>>(path: P) -> Result<Arc<Vec<String>>> {
     {
         let cache = WORDLIST_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cache.get(&canonical)
-            && cached.len == len && cached.mtime == mtime {
-                return Ok(cached.lines.clone());
-            }
+            && cached.len == len
+            && cached.mtime == mtime
+        {
+            return Ok(cached.lines.clone());
+        }
     }
 
     // Cache miss — load fresh. Honour the same size cap as `load_lines`.
@@ -587,9 +593,17 @@ pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
         .filter_map(|line| match line {
             Ok(s) => {
                 let trimmed = s.trim().to_string();
-                if trimmed.is_empty() { None } else { Some(trimmed) }
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
             }
-            Err(e) => { tracing::trace!("Non-UTF-8 line in wordlist: {}", e); skipped += 1; None }
+            Err(e) => {
+                tracing::trace!("Non-UTF-8 line in wordlist: {}", e);
+                skipped += 1;
+                None
+            }
         })
         .collect();
     if skipped > 0 {
@@ -602,11 +616,7 @@ pub fn load_lines<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
 /// Files <= 250 MB are loaded into memory. Larger files are streamed in
 /// batches of `batch_size` lines, calling `on_batch` for each chunk.
 /// Returns the total number of lines processed.
-pub fn load_lines_batched<P, F>(
-    path: P,
-    batch_size: usize,
-    mut on_batch: F,
-) -> Result<usize>
+pub fn load_lines_batched<P, F>(path: P, batch_size: usize, mut on_batch: F) -> Result<usize>
 where
     P: AsRef<Path>,
     F: FnMut(Vec<String>),
@@ -619,7 +629,10 @@ where
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l.trim().to_string(),
-            Err(e) => { tracing::trace!("skipping non-UTF-8 wordlist line: {e}"); continue; }
+            Err(e) => {
+                tracing::trace!("skipping non-UTF-8 wordlist line: {e}");
+                continue;
+            }
         };
         if line.is_empty() {
             continue;
@@ -627,7 +640,10 @@ where
         batch.push(line);
         if batch.len() >= batch_size {
             total += batch.len();
-            on_batch(std::mem::replace(&mut batch, Vec::with_capacity(batch_size)));
+            on_batch(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(batch_size),
+            ));
         }
     }
     if !batch.is_empty() {
@@ -641,11 +657,7 @@ where
 /// `false` to STOP reading the file. Lets a consumer (e.g. the streaming
 /// bruteforce driver whose channel receiver was dropped) halt the read instead
 /// of scanning a multi-GB wordlist to the end for nothing.
-pub fn load_lines_batched_until<P, F>(
-    path: P,
-    batch_size: usize,
-    mut on_batch: F,
-) -> Result<usize>
+pub fn load_lines_batched_until<P, F>(path: P, batch_size: usize, mut on_batch: F) -> Result<usize>
 where
     P: AsRef<Path>,
     F: FnMut(Vec<String>) -> bool,
@@ -658,7 +670,10 @@ where
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l.trim().to_string(),
-            Err(e) => { tracing::trace!("skipping non-UTF-8 wordlist line: {e}"); continue; }
+            Err(e) => {
+                tracing::trace!("skipping non-UTF-8 wordlist line: {e}");
+                continue;
+            }
         };
         if line.is_empty() {
             continue;
@@ -666,7 +681,10 @@ where
         batch.push(line);
         if batch.len() >= batch_size {
             total += batch.len();
-            if !on_batch(std::mem::replace(&mut batch, Vec::with_capacity(batch_size))) {
+            if !on_batch(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(batch_size),
+            )) {
                 return Ok(total);
             }
         }
@@ -694,7 +712,7 @@ pub fn load_lines_uncapped<P: AsRef<Path>>(path: P) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{catalogue, KNOWN_LISTS};
+    use super::{KNOWN_LISTS, catalogue};
 
     /// Every catalogue entry must be structurally sound: a non-empty logical
     /// name + local filename, an HTTPS raw URL, and a syntactically valid

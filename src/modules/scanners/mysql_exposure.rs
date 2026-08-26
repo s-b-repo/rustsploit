@@ -87,10 +87,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await
         .with_context(|| format!("Could not resolve {}", host))?;
     if !tcp_port_open(ip, port, Duration::from_secs(timeout_secs)).await {
-        crate::mprintln!(
-            "{}",
-            format!("[-] {}:{} closed/filtered", host, port).red()
-        );
+        crate::mprintln!("{}", format!("[-] {}:{} closed/filtered", host, port).red());
         return Ok(outcome);
     }
 
@@ -98,9 +95,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         Ok(banner) => {
             crate::mprintln!(
                 "{}",
-                format!("[+] MySQL/MariaDB exposed on {}:{} — {}", host, port, banner)
-                    .green()
-                    .bold()
+                format!(
+                    "[+] MySQL/MariaDB exposed on {}:{} — {}",
+                    host, port, banner
+                )
+                .green()
+                .bold()
             );
             outcome.findings.push(Finding {
                 target: host.clone(),
@@ -117,7 +117,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         Err(e) => {
             crate::mprintln!(
                 "{}",
-                format!("[?] {}:{} reachable but banner read failed: {}", host, port, e).yellow()
+                format!(
+                    "[?] {}:{} reachable but banner read failed: {}",
+                    host, port, e
+                )
+                .yellow()
             );
         }
     }
@@ -126,9 +130,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
 async fn grab_handshake(ip: IpAddr, port: u16) -> Result<String> {
     let addr = SocketAddr::new(ip, port);
-    let stream = crate::utils::network::tcp_connect_addr(addr, Duration::from_secs(TCP_TIMEOUT_SECS))
-        .await
-        .context("connect failed")?;
+    let stream =
+        crate::utils::network::tcp_connect_addr(addr, Duration::from_secs(TCP_TIMEOUT_SECS))
+            .await
+            .context("connect failed")?;
     let mut stream = stream;
     let mut buf = [0u8; 256];
     let n = timeout(Duration::from_secs(TCP_TIMEOUT_SECS), stream.read(&mut buf))
@@ -146,7 +151,13 @@ fn parse_mysql_handshake(buf: &[u8]) -> String {
         let tail = &buf[buf.len().saturating_sub(96)..];
         let s: String = tail
             .iter()
-            .map(|b| if (0x20..=0x7e).contains(b) { *b as char } else { '.' })
+            .map(|b| {
+                if (0x20..=0x7e).contains(b) {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         return format!("ERR packet: {}", s.trim());
     }

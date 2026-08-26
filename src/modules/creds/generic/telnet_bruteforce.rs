@@ -5,12 +5,12 @@
 //! shell-prompt heuristics) we delegate to the proven helper in
 //! `telnet_hose` — keeps both modules consistent.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 23;
 
@@ -30,10 +30,9 @@ const DEFAULTS: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "Telnet Bruteforce".to_string(),
-        description:
-            "Wordlist-driven Telnet credential probe with IAC handling. Single-target — \
+        description: "Wordlist-driven Telnet credential probe with IAC handling. Single-target — \
              scheduler does fan-out."
-                .to_string(),
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,
@@ -43,7 +42,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("telnet_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("telnet_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -58,32 +60,46 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     .await
 }
 
-async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: std::time::Duration) -> LoginResult {
+async fn probe(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    timeout: std::time::Duration,
+) -> LoginResult {
     use std::net::SocketAddr;
 
     let socket: SocketAddr = match format!("{}:{}", host, port).parse() {
         Ok(sa) => sa,
-        Err(e) => { tracing::debug!("parse socket addr failed: {e}"); match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
-            Ok(mut iter) => match iter.next() {
-                Some(sa) => sa,
-                None => {
-                    return LoginResult::Error {
-                        message: "no DNS results".to_string(),
-                        retryable: false,
+        Err(e) => {
+            tracing::debug!("parse socket addr failed: {e}");
+            match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                Ok(mut iter) => match iter.next() {
+                    Some(sa) => sa,
+                    None => {
+                        return LoginResult::Error {
+                            message: "no DNS results".to_string(),
+                            retryable: false,
+                        };
                     }
-                }
-            },
-            Err(e) => {
-                return LoginResult::Error {
-                    message: format!("dns: {e}"),
-                    retryable: false,
+                },
+                Err(e) => {
+                    return LoginResult::Error {
+                        message: format!("dns: {e}"),
+                        retryable: false,
+                    };
                 }
             }
-        } }
+        }
     };
 
     use super::telnet_hose;
-    match tokio::time::timeout(timeout, telnet_hose::try_login(&socket, user, pass)).await {
+    match tokio::time::timeout(
+        timeout,
+        telnet_hose::try_login(&socket, user, pass, timeout / 2, timeout),
+    )
+    .await
+    {
         Ok(Ok(true)) => LoginResult::Success,
         Ok(Ok(false)) => LoginResult::AuthFailed,
         Ok(Err(e)) => LoginResult::Error {
@@ -97,4 +113,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: std::time
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/telnet_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/telnet_bruteforce",
+    native
+);

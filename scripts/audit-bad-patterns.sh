@@ -57,8 +57,7 @@ N_FILES=$(echo "$ALL_RS" | wc -l)
 
 # ---- pattern arrays ------------------------------------------------------
 
-A=(  # Panicking error handling — explicit \(\) anchors so we don't match the
-     # value-providing _or family.
+A=(  # Panicking error handling
     '\.unwrap\(\)'  '\.expect\('  '\.unwrap_or_default\(\)'
     '\.parse\(\)\.unwrap\(\)'  '\.parse::<[^>]+>\(\)\.unwrap\(\)'
     '\.try_into\(\)\.unwrap\(\)'
@@ -81,6 +80,10 @@ B=(  # Silent error swallowing
     '\.map_err\(\|_\|'  '\.or_else\(\|_\|'
     '\.to_str\(\)\.ok\(\)'  '\.json\([^)]*\)\.await\.ok\(\)'
     '\.send\(\)\.await\.ok\(\)'  '\.text\(\)\.await\.ok\(\)'
+    # B10: underscore-prefixed function parameter (bypass unused-parameter warning)
+    'fn\s+\w+\([^)]*\b_\w+\s*:\s*[^)]*\)'
+    # B11: underscore-prefixed variable binding (bypass unused-variable warning)
+    'let\s+_\w+\s*='
 )
 C=(  # Lint suppression
     '#\[allow\('  '#\[deny\('  '#\[ignore\b'
@@ -131,6 +134,12 @@ J=(  # Style / secrets
     'sk-[A-Za-z0-9]{20,}'  'AKIA[A-Z0-9]{16}'
     '"admin"\s*,\s*"admin"'  '"root"\s*,\s*"root"'
     'Box<dyn'
+    # J7: underscore import to bypass unused_crate_dependencies
+    'use\s+\w+\s+as\s+_;'
+    # J8: extern crate in edition 2024 to bypass unused-dep warning
+    '^extern\s+crate\s+'
+    # J9: &*format!(...) temporary drop — creates dangling reference
+    '&\*format!\('
 )
 L=(  # Crypto
     '\bmd5::compute\b|\bmd5::Md5\b'
@@ -184,7 +193,6 @@ SECTION_DESC[N]="UB / concurrency"
 SECTION_DESC[O]="Performance"
 SECTION_DESC[P]="API hygiene"
 
-# Sections that should be hard zero in module code (strict mode)
 STRICT_SECTIONS=(A B C L M N O)
 
 GRAND_TOTAL=0
@@ -202,10 +210,6 @@ run_section() {
     declare -a lines
     for p in "${arr[@]}"; do
         local c
-        # Strip line+doc comments before counting so we don't flag matches in
-        # `// foo .unwrap() bar` or `/// .expect(...)`. We also filter `#[test]`
-        # / `#[cfg(test)]` blocks heuristically by skipping lines tagged with
-        # `// audit-allow:` (an explicit per-line waiver).
         c=$(echo "$ALL_RS" | xargs grep -hE "$p" 2>/dev/null \
             | grep -vE '^\s*//' \
             | grep -vE '// audit-allow:' \
@@ -222,7 +226,6 @@ run_section() {
         "$label" "${SECTION_DESC[$label]}" "$total" "$hit_pats" "$pats"
     [ "$total" -gt 0 ] && printf "%s\n" "${lines[@]}"
 
-    # Strict accounting
     local s
     for s in "${STRICT_SECTIONS[@]}"; do
         if [ "$s" = "$label" ]; then

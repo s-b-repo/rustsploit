@@ -98,11 +98,20 @@ fn is_throttle(status: StatusCode, retry_503: bool) -> bool {
 
 /// Parse a `Retry-After` header value. Per RFC 7231 it can be either an
 /// integer count of seconds or an HTTP-date. The integer form is what every
-/// real-world rate limiter sends; we accept that and ignore the date form
-/// (rather than pulling in `httpdate` for an edge case).
+/// real-world rate limiter sends; we accept that and also parse HTTP-date via
+/// chrono (Cloudflare/AWS/Azure all use date format).
 fn parse_retry_after(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
-    trimmed.parse::<u64>().ok().map(Duration::from_secs)
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    chrono::DateTime::parse_from_rfc2822(trimmed)
+        .ok()
+        .map(|dt| {
+            let delta = dt.signed_duration_since(chrono::Utc::now());
+            let secs = delta.num_seconds().max(1);
+            Duration::from_secs(secs as u64)
+        })
 }
 
 /// Run `f` to produce a `reqwest::Response`, retrying on 429/503 with the
@@ -148,8 +157,11 @@ where
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
-        let mut wait = retry_after.unwrap_or_else(|| backoff_delay(cfg.base_ms, attempt, cfg.max_multiplier));
-        if wait > cfg.max_wait { wait = cfg.max_wait; }
+        let mut wait =
+            retry_after.unwrap_or_else(|| backoff_delay(cfg.base_ms, attempt, cfg.max_multiplier));
+        if wait > cfg.max_wait {
+            wait = cfg.max_wait;
+        }
 
         if cfg.verbose {
             crate::mprintln!(
@@ -161,7 +173,11 @@ where
                     attempt + 1,
                     cfg.max_retries,
                     wait.as_millis(),
-                    if retry_after.is_some() { " (Retry-After)" } else { " (backoff)" },
+                    if retry_after.is_some() {
+                        " (Retry-After)"
+                    } else {
+                        " (backoff)"
+                    },
                 )
             );
         }

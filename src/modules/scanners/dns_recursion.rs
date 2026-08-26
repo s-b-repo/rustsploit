@@ -1,19 +1,17 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 
-use std::net::{IpAddr, SocketAddr};
-use tokio::time::{timeout, Duration};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{
-    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port,
-};
+use crate::utils::{cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_port};
+use std::net::{IpAddr, SocketAddr};
+use tokio::time::{Duration, timeout};
 
 use hickory_client::client::{Client, ClientHandle};
+use hickory_proto::op::Message;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, Name, RecordType};
-use hickory_proto::udp::UdpClientStream;
 use hickory_proto::runtime::TokioRuntimeProvider;
-use hickory_proto::op::Message;
+use hickory_proto::udp::UdpClientStream;
 use hickory_proto::xfer::DnsResponse;
 
 #[derive(Clone, Debug)]
@@ -24,11 +22,25 @@ struct TargetSpec {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   DNS Recursion & Amplification Scanner                      ║".cyan());
-    crate::mprintln!("{}", "║   Detects open resolvers that may be abused for DoS attacks  ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   DNS Recursion & Amplification Scanner                      ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Detects open resolvers that may be abused for DoS attacks  ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -43,13 +55,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let mut outcome = ModuleOutcome::ok();
 
-    let mut targets = vec![
-        TargetSpec {
-            input: initial_target.to_string(),
-            host: initial_target.to_string(),
-            port: None,
-        }
-    ];
+    let mut targets = vec![TargetSpec {
+        input: initial_target.to_string(),
+        host: initial_target.to_string(),
+        port: None,
+    }];
 
     let needs_default_port = targets.iter().any(|t| t.port.is_none());
     let default_port = if needs_default_port {
@@ -61,8 +71,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let query_name_input = cfg_prompt_default("domain", "Domain to query", "google.com").await?;
     let query_name = validate_domain_input(&query_name_input)?;
 
-    let record_input =
-        cfg_prompt_default("record_type", "Record type (A, AAAA, ANY, DNSKEY, TXT, MX)", "ANY").await?;
+    let record_input = cfg_prompt_default(
+        "record_type",
+        "Record type (A, AAAA, ANY, DNSKEY, TXT, MX)",
+        "ANY",
+    )
+    .await?;
     let record_type = parse_record_type(&record_input)?;
 
     let timeout_secs = cfg_prompt_int_range("timeout", "Timeout (seconds)", 5, 1, 60).await? as u64;
@@ -99,8 +113,21 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         ctx.rate_limit(&spec.host).await;
         match resolve_target(&spec.host, port).await {
             Ok((socket_addr, resolved_display)) => {
-                crate::mprintln!("{}", format!("[*] Target resolver: {}", resolved_display).cyan());
-                match query_target(socket_addr, &resolved_display, &name, record_type, timeout_secs, &mut vulnerable_count, &mut outcome).await {
+                crate::mprintln!(
+                    "{}",
+                    format!("[*] Target resolver: {}", resolved_display).cyan()
+                );
+                match query_target(
+                    socket_addr,
+                    &resolved_display,
+                    &name,
+                    record_type,
+                    timeout_secs,
+                    &mut vulnerable_count,
+                    &mut outcome,
+                )
+                .await
+                {
                     Ok(()) => any_success = true,
                     Err(err) => {
                         crate::meprintln!(
@@ -127,17 +154,28 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!();
     crate::mprintln!("{}", "=== Scan Statistics ===".bold());
     crate::mprintln!("  Targets tested:       {}", tested_count);
-    crate::mprintln!("  Vulnerable (open):    {}", if vulnerable_count > 0 { 
-        vulnerable_count.to_string().red().bold().to_string() 
-    } else { 
-        "0".green().to_string() 
-    });
+    crate::mprintln!(
+        "  Vulnerable (open):    {}",
+        if vulnerable_count > 0 {
+            vulnerable_count.to_string().red().bold().to_string()
+        } else {
+            "0".green().to_string()
+        }
+    );
     crate::mprintln!("  Duration:             {:.2}s", elapsed.as_secs_f64());
 
     if vulnerable_count > 0 {
         crate::mprintln!();
-        crate::mprintln!("{}", "[!] WARNING: Open recursive DNS resolvers detected!".red().bold());
-        crate::mprintln!("{}", "    These can be abused for DNS amplification attacks.".yellow());
+        crate::mprintln!(
+            "{}",
+            "[!] WARNING: Open recursive DNS resolvers detected!"
+                .red()
+                .bold()
+        );
+        crate::mprintln!(
+            "{}",
+            "    These can be abused for DNS amplification attacks.".yellow()
+        );
     }
 
     if any_success {
@@ -158,15 +196,21 @@ async fn query_target(
 ) -> Result<()> {
     crate::mprintln!(
         "[*] Sending {} query (timeout {}s) to {}",
-        record_type, timeout_secs, display_target
+        record_type,
+        timeout_secs,
+        display_target
     );
 
-    let stream = UdpClientStream::builder(socket_addr, TokioRuntimeProvider::new())
-        .build();
+    let stream = UdpClientStream::builder(socket_addr, TokioRuntimeProvider::new()).build();
 
-    let (mut client, bg) =
-        Client::connect(stream).await.context("Failed to initiate DNS client")?;
-    tokio::spawn(bg);
+    let (mut client, bg) = Client::connect(stream)
+        .await
+        .context("Failed to initiate DNS client")?;
+    tokio::spawn(async {
+        if let Err(e) = bg.await {
+            tracing::error!("DNS background task failed: {}", e);
+        }
+    });
 
     let response: DnsResponse = timeout(
         Duration::from_secs(timeout_secs),
@@ -212,7 +256,8 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
             message.answers().len(),
             message.name_servers().len(),
             message.additionals().len()
-        ).dimmed()
+        )
+        .dimmed()
     );
 
     if truncated {
@@ -221,7 +266,11 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
 
     crate::mprintln!(
         "{}",
-        format!("[*] Flags: RD={} RA={} AA={}", recursion_desired, recursion_available, authoritative).dimmed()
+        format!(
+            "[*] Flags: RD={} RA={} AA={}",
+            recursion_desired, recursion_available, authoritative
+        )
+        .dimmed()
     );
 
     if recursion_available && rcode != ResponseCode::Refused {
@@ -231,7 +280,11 @@ fn report_result(message: &Message, display_target: &str, record_type: RecordTyp
                 "[+] {} appears to allow recursion (RA flag set) for {} {} queries.",
                 display_target,
                 record_type,
-                if authoritative { "(authoritative data returned)" } else { "" }
+                if authoritative {
+                    "(authoritative data returned)"
+                } else {
+                    ""
+                }
             )
             .green()
             .bold()
@@ -333,7 +386,9 @@ fn validate_domain_input(input: &str) -> Result<String> {
 pub fn info() -> crate::module_info::ModuleInfo {
     crate::module_info::ModuleInfo {
         name: "DNS Recursion Scanner".to_string(),
-        description: "Detects open DNS resolvers vulnerable to recursion and amplification attacks.".to_string(),
+        description:
+            "Detects open DNS resolvers vulnerable to recursion and amplification attacks."
+                .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![],
         disclosure_date: None,

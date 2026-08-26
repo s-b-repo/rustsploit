@@ -25,15 +25,26 @@ pub fn module_exists(module_path: &str) -> bool {
     if module_path.contains("..") || module_path.contains("//") {
         return false;
     }
-    crate::commands::discover_modules_cached().iter().any(|m| m == module_path)
+    crate::commands::discover_modules_cached()
+        .iter()
+        .any(|m| m == module_path)
 }
 
 /// Helper to get a random color for module display.
 fn get_random_color() -> Color {
     let colors = [
-        Color::Red, Color::Green, Color::Yellow, Color::Blue,
-        Color::Magenta, Color::Cyan, Color::BrightRed, Color::BrightGreen,
-        Color::BrightYellow, Color::BrightBlue, Color::BrightMagenta, Color::BrightCyan,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::BrightRed,
+        Color::BrightGreen,
+        Color::BrightYellow,
+        Color::BrightBlue,
+        Color::BrightMagenta,
+        Color::BrightCyan,
     ];
     let mut rng = rand::rng();
     *colors.choose(&mut rng).unwrap_or(&Color::Green)
@@ -51,7 +62,10 @@ pub fn list_all_modules() {
     for module in &modules {
         let parts: Vec<&str> = module.split('/').collect();
         let category = parts.first().unwrap_or(&"Other").to_string();
-        grouped.entry(category).or_insert_with(Vec::new).push(module.clone());
+        grouped
+            .entry(category)
+            .or_insert_with(Vec::new)
+            .push(module.clone());
     }
     crate::mprintln!();
     for (category, paths) in grouped {
@@ -92,15 +106,26 @@ pub fn find_modules(keyword: &str) {
         .filter(|m| m.to_lowercase().contains(&keyword_lower))
         .collect();
     if filtered.is_empty() {
-        crate::mprintln!("{}", format!("No modules found matching '{}'.", keyword).red());
+        crate::mprintln!(
+            "{}",
+            format!("No modules found matching '{}'.", keyword).red()
+        );
         return;
     }
-    crate::mprintln!("{}", format!("Modules matching '{}':", keyword).bold().underline());
+    crate::mprintln!(
+        "{}",
+        format!("Modules matching '{}':", keyword)
+            .bold()
+            .underline()
+    );
     let mut grouped = std::collections::BTreeMap::new();
     for module in filtered {
         let parts: Vec<&str> = module.split('/').collect();
         let category = parts.first().unwrap_or(&"Other").to_string();
-        grouped.entry(category).or_insert_with(Vec::new).push(module.clone());
+        grouped
+            .entry(category)
+            .or_insert_with(Vec::new)
+            .push(module.clone());
     }
     for (category, paths) in grouped {
         crate::mprintln!("\n{}:", category.blue().bold());
@@ -154,9 +179,13 @@ pub fn safe_read_to_string<P: AsRef<Path>>(path: P, max_bytes: Option<u64>) -> R
 }
 
 /// Async version of safe_read_to_string.
-pub async fn safe_read_to_string_async<P: AsRef<Path>>(path: P, max_bytes: Option<u64>) -> Result<String> {
+pub async fn safe_read_to_string_async<P: AsRef<Path>>(
+    path: P,
+    max_bytes: Option<u64>,
+) -> Result<String> {
     let limit = max_bytes.unwrap_or(MAX_FILE_SIZE);
-    let metadata = tokio::fs::metadata(path.as_ref()).await
+    let metadata = tokio::fs::metadata(path.as_ref())
+        .await
         .with_context(|| format!("Failed to stat file '{}'", path.as_ref().display()))?;
     if metadata.len() > limit {
         bail!(
@@ -166,7 +195,8 @@ pub async fn safe_read_to_string_async<P: AsRef<Path>>(path: P, max_bytes: Optio
             limit / (1024 * 1024)
         );
     }
-    tokio::fs::read_to_string(path.as_ref()).await
+    tokio::fs::read_to_string(path.as_ref())
+        .await
         .with_context(|| format!("Failed to read file '{}'", path.as_ref().display()))
 }
 

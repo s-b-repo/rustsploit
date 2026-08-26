@@ -1,21 +1,20 @@
-use anyhow::{Context, Result, anyhow};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port,
+    cfg_prompt_yes_no,
+};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::{
     fs::File,
-    io::{Write, BufWriter},
+    io::{BufWriter, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
     time::Instant,
 };
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
-use socket2::{Socket, Domain, Type, Protocol};
-use crate::utils::{
-    cfg_prompt_default, cfg_prompt_int_range, cfg_prompt_yes_no, cfg_prompt_output_file,
-    cfg_prompt_port,
-};
-use crate::module_info::{ModuleInfo, ModuleRank};
+use tokio::time::{Duration, timeout};
 
 /// Module metadata for `info` command.
 pub fn info() -> ModuleInfo {
@@ -51,7 +50,10 @@ struct ScanSettings {
 
 /// Main module entrypoint.
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
 
     if !crate::utils::is_batch_mode() {
         print_banner();
@@ -62,26 +64,47 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let (ip_str, ip) = resolve_target(target)?;
 
     // Warn about privileged ports requiring root
-    if settings.source_start < 1024
-        && !crate::utils::is_root() {
-            let priv_end = std::cmp::min(settings.source_end, 1023);
-            crate::mprintln!("{}", format!(
+    if settings.source_start < 1024 && !crate::utils::is_root() {
+        let priv_end = std::cmp::min(settings.source_end, 1023);
+        crate::mprintln!(
+            "{}",
+            format!(
                 "[!] Warning: Source ports {}-{} are privileged (< 1024). \
                  Binding requires root or CAP_NET_BIND_SERVICE. \
                  These ports will show as errors without elevated privileges.",
                 settings.source_start, priv_end
-            ).yellow().bold());
-        }
+            )
+            .yellow()
+            .bold()
+        );
+    }
 
     let source_ports: Vec<u16> = (settings.source_start..=settings.source_end).collect();
     let total = source_ports.len();
     let protocol_label = if settings.scan_udp { "UDP" } else { "TCP" };
 
-    crate::mprintln!("\n{}", format!(
-        "[*] Scanning {} source ports ({}-{}) against {}:{} via {}",
-        total, settings.source_start, settings.source_end, ip_str, settings.dest_port, protocol_label
-    ).cyan().bold());
-    crate::mprintln!("{}", format!("[*] Concurrency: {} | Timeout: {}s", settings.concurrency, settings.timeout_secs).cyan());
+    crate::mprintln!(
+        "\n{}",
+        format!(
+            "[*] Scanning {} source ports ({}-{}) against {}:{} via {}",
+            total,
+            settings.source_start,
+            settings.source_end,
+            ip_str,
+            settings.dest_port,
+            protocol_label
+        )
+        .cyan()
+        .bold()
+    );
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Concurrency: {} | Timeout: {}s",
+            settings.concurrency, settings.timeout_secs
+        )
+        .cyan()
+    );
 
     let semaphore = Arc::new(Semaphore::new(settings.concurrency));
     let allowed_ports: Arc<Mutex<Vec<SourcePortResult>>> = Arc::new(Mutex::new(Vec::new()));
@@ -91,7 +114,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut tasks = Vec::with_capacity(total);
 
     for src_port in source_ports {
-        if crate::context::is_cancelled() { break; }
+        if crate::context::is_cancelled() {
+            break;
+        }
         let permit = semaphore.clone().acquire_owned().await?;
         let allowed = allowed_ports.clone();
         let prog = progress.clone();
@@ -103,7 +128,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            if crate::context::is_cancelled() { return; }
+            if crate::context::is_cancelled() {
+                return;
+            }
 
             let result = if scan_udp {
                 probe_udp(ip, dest_port, src_port, timeout_secs).await
@@ -117,21 +144,42 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                         source_port: src_port,
                         banner: banner.clone(),
                     };
-                    allowed.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+                    allowed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(entry);
 
                     let proto = if scan_udp { "UDP" } else { "TCP" };
                     let line = if banner.is_empty() {
-                        format!("[{}] src:{} -> {}:{} => {}", proto, src_port, ip_str, dest_port, "ALLOWED".green().bold())
+                        format!(
+                            "[{}] src:{} -> {}:{} => {}",
+                            proto,
+                            src_port,
+                            ip_str,
+                            dest_port,
+                            "ALLOWED".green().bold()
+                        )
                     } else {
-                        format!("[{}] src:{} -> {}:{} => {} | Banner: {}",
-                            proto, src_port, ip_str, dest_port, "ALLOWED".green().bold(), banner.trim().bright_black())
+                        format!(
+                            "[{}] src:{} -> {}:{} => {} | Banner: {}",
+                            proto,
+                            src_port,
+                            ip_str,
+                            dest_port,
+                            "ALLOWED".green().bold(),
+                            banner.trim().bright_black()
+                        )
                     };
                     crate::mprintln!("{}", line);
                     crate::events::emit(crate::events::ModuleEvent::ServiceDetected {
                         host: ip_str.clone(),
                         port: dest_port,
                         service: format!("src-port-bypass:{}/{}", proto.to_lowercase(), src_port),
-                        version: if banner.is_empty() { None } else { Some(banner.trim().to_string()) },
+                        version: if banner.is_empty() {
+                            None
+                        } else {
+                            Some(banner.trim().to_string())
+                        },
                     });
                 }
                 ProbeResult::Denied => {
@@ -162,19 +210,39 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     for task in tasks {
         if let Err(e) = task.await {
-            eprintln!("[!] Task join failed: {}", e);
+            crate::meprintln!("[!] Task join failed: {}", e);
         }
     }
 
     let elapsed = start_time.elapsed();
-    let mut results = allowed_ports.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut results = allowed_ports
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     results.sort_by_key(|r| r.source_port);
 
     // Print summary
     crate::mprintln!("\n{}", "=== Source Port Scan Summary ===".cyan().bold());
-    crate::mprintln!("{}", format!("Target: {}:{} ({})", ip_str, settings.dest_port, protocol_label).white());
-    crate::mprintln!("{}", format!("Duration: {:.2}s", elapsed.as_secs_f64()).green());
-    crate::mprintln!("{}", format!("Scanned: {} source ports ({}-{})", total, settings.source_start, settings.source_end).white());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "Target: {}:{} ({})",
+            ip_str, settings.dest_port, protocol_label
+        )
+        .white()
+    );
+    crate::mprintln!(
+        "{}",
+        format!("Duration: {:.2}s", elapsed.as_secs_f64()).green()
+    );
+    crate::mprintln!(
+        "{}",
+        format!(
+            "Scanned: {} source ports ({}-{})",
+            total, settings.source_start, settings.source_end
+        )
+        .white()
+    );
     crate::mprintln!("{}", format!("Allowed: {}", results.len()).green().bold());
 
     if results.is_empty() {
@@ -186,7 +254,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             let label = if well_known.is_empty() {
                 format!("  {} port {}", "✓".green(), r.source_port)
             } else {
-                format!("  {} port {} ({})", "✓".green(), r.source_port, well_known.cyan())
+                format!(
+                    "  {} port {} ({})",
+                    "✓".green(),
+                    r.source_port,
+                    well_known.cyan()
+                )
             };
             if r.banner.is_empty() {
                 crate::mprintln!("{}", label);
@@ -223,40 +296,68 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if !settings.output_file.is_empty() {
         let file = File::create(&settings.output_file)?;
         if let Err(e) = crate::utils::set_secure_permissions(&settings.output_file, 0o600) {
-            crate::meprintln!("[!] Failed to chmod 0o600 on {}: {} — file may be world-readable", settings.output_file, e);
+            crate::meprintln!(
+                "[!] Failed to chmod 0o600 on {}: {} — file may be world-readable",
+                settings.output_file,
+                e
+            );
         }
         let mut writer = BufWriter::new(file);
         writeln!(writer, "Source Port Scan Results")?;
-        writeln!(writer, "Target: {}:{} ({})", ip_str, settings.dest_port, protocol_label)?;
-        writeln!(writer, "Range: {}-{}", settings.source_start, settings.source_end)?;
+        writeln!(
+            writer,
+            "Target: {}:{} ({})",
+            ip_str, settings.dest_port, protocol_label
+        )?;
+        writeln!(
+            writer,
+            "Range: {}-{}",
+            settings.source_start, settings.source_end
+        )?;
         writeln!(writer, "Duration: {:.2}s", elapsed.as_secs_f64())?;
         writeln!(writer, "Allowed: {}/{}\n", results.len(), total)?;
         for r in &results {
             let wk = well_known_source_port(r.source_port);
             if wk.is_empty() {
-                writeln!(writer, "ALLOWED src:{} -> {}:{}", r.source_port, ip_str, settings.dest_port)?;
+                writeln!(
+                    writer,
+                    "ALLOWED src:{} -> {}:{}",
+                    r.source_port, ip_str, settings.dest_port
+                )?;
             } else {
-                writeln!(writer, "ALLOWED src:{} ({}) -> {}:{}", r.source_port, wk, ip_str, settings.dest_port)?;
+                writeln!(
+                    writer,
+                    "ALLOWED src:{} ({}) -> {}:{}",
+                    r.source_port, wk, ip_str, settings.dest_port
+                )?;
             }
             if !r.banner.is_empty() {
                 writeln!(writer, "  Banner: {}", r.banner.trim())?;
             }
         }
-        crate::mprintln!("\n{}", format!("[*] Results saved to {}", settings.output_file).cyan());
+        crate::mprintln!(
+            "\n{}",
+            format!("[*] Results saved to {}", settings.output_file).cyan()
+        );
     }
 
     Ok(outcome)
 }
 
 fn print_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln_block!(
         format!("{}", r#" ╔══════════════════════════════════════════════════════════╗ ║              Source Port Scanner                          ║ ║  Discover which source ports bypass firewall rules       ║ ╚══════════════════════════════════════════════════════════╝"#.cyan())
     );
 }
 
 async fn prompt_settings(target: &str) -> Result<ScanSettings> {
-    crate::mprintln!("{}", "\n=== Source Port Scanner Configuration ===".cyan().bold());
+    crate::mprintln!(
+        "{}",
+        "\n=== Source Port Scanner Configuration ===".cyan().bold()
+    );
 
     let dest_port = cfg_prompt_port("dest_port", "Destination port to test against", 80).await?;
 
@@ -264,14 +365,17 @@ async fn prompt_settings(target: &str) -> Result<ScanSettings> {
         "source_range",
         "Source port range (1=All 1-65535, 2=Privileged 1-1023, 3=Ephemeral 49152-65535, 4=Custom)",
         "1",
-    ).await?;
+    )
+    .await?;
 
     let (source_start, source_end) = match range_choice.trim() {
         "2" => (1u16, 1023u16),
         "3" => (49152, 65535),
         "4" => {
-            let s = cfg_prompt_int_range("source_start", "Start source port", 1, 1, 65535).await? as u16;
-            let e = cfg_prompt_int_range("source_end", "End source port", 65535, 1, 65535).await? as u16;
+            let s = cfg_prompt_int_range("source_start", "Start source port", 1, 1, 65535).await?
+                as u16;
+            let e = cfg_prompt_int_range("source_end", "End source port", 65535, 1, 65535).await?
+                as u16;
             if s > e {
                 return Err(anyhow!("Start port must be <= end port"));
             }
@@ -281,14 +385,34 @@ async fn prompt_settings(target: &str) -> Result<ScanSettings> {
     };
 
     let total = (source_end as u32) - (source_start as u32) + 1;
-    crate::mprintln!("{}", format!("[*] Will scan {} source ports ({}-{})", total, source_start, source_end).green());
+    crate::mprintln!(
+        "{}",
+        format!(
+            "[*] Will scan {} source ports ({}-{})",
+            total, source_start, source_end
+        )
+        .green()
+    );
 
     let scan_udp = cfg_prompt_yes_no("scan_udp", "Use UDP instead of TCP?", false).await?;
-    let concurrency = cfg_prompt_int_range("concurrency", "Concurrency (parallel probes)", 500, 1, 10000).await? as usize;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 3, 1, 60).await? as u64;
-    let verbose = cfg_prompt_yes_no("verbose", "Verbose output (show denied/filtered)?", false).await?;
-    let default_name = format!("source_port_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
-    let output_file = cfg_prompt_output_file("output_file", "Output filename", &default_name).await?;
+    let concurrency = cfg_prompt_int_range(
+        "concurrency",
+        "Concurrency (parallel probes)",
+        500,
+        1,
+        10000,
+    )
+    .await? as usize;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 3, 1, 60).await? as u64;
+    let verbose =
+        cfg_prompt_yes_no("verbose", "Verbose output (show denied/filtered)?", false).await?;
+    let default_name = format!(
+        "source_port_results_{}.txt",
+        target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+    );
+    let output_file =
+        cfg_prompt_output_file("output_file", "Output filename", &default_name).await?;
 
     Ok(ScanSettings {
         dest_port,
@@ -313,59 +437,26 @@ enum ProbeResult {
 /// Attempt a TCP connection from a specific source port to target:dest_port.
 async fn probe_tcp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64) -> ProbeResult {
     let dest = SocketAddr::new(ip, dest_port);
-    let domain = if ip.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let timeout = Duration::from_secs(timeout_secs);
 
-    let socket = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
-        Ok(s) => s,
-        Err(e) => return ProbeResult::Error(e.to_string()),
-    };
-
-    if let Err(e) = socket.set_reuse_address(true) { eprintln!("[!] Failed to set reuse address: {}", e); }
-    if let Err(e) = socket.set_nonblocking(true) { eprintln!("[!] Failed to set nonblocking: {}", e); }
-    if let Err(e) = socket.set_tcp_nodelay(true) { eprintln!("[!] Failed to set TCP nodelay: {}", e); }
-
-    // Bind to the specific source port
-    let bind_addr = if ip.is_ipv4() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), src_port)
-    } else {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), src_port)
-    };
-
-    if let Err(e) = socket.bind(&bind_addr.into()) {
-        return ProbeResult::Error(format!("bind src:{}: {}", src_port, e));
-    }
-
-    // Non-blocking connect
-    let connect_res = socket.connect(&dest.into());
-    match connect_res {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(e) => { tracing::debug!("connect failed: {e}"); return ProbeResult::Denied; }
-    }
-
-    // Convert to tokio TcpStream and wait for writable
-    let std_stream: std::net::TcpStream = socket.into();
-    match tokio::net::TcpStream::from_std(std_stream) {
+    match crate::utils::network::tcp_connect_addr_with_source(dest, timeout, Some(src_port)).await {
         Ok(stream) => {
-            match timeout(Duration::from_secs(timeout_secs), stream.writable()).await {
-                Ok(Ok(())) => {
-                    // Check for socket error to confirm real connection
-                    match stream.take_error() {
-                        Ok(None) => {
-                            // Connection succeeded — try a quick banner grab
-                            let banner = quick_banner(&stream, timeout_secs).await;
-                            ProbeResult::Allowed { banner }
-                        }
-                        Ok(Some(e)) => { tracing::debug!("socket error: {e}"); ProbeResult::Denied }
-                        Err(e) => { tracing::debug!("take_error failed: {e}"); ProbeResult::Denied }
-                    }
-                }
-                Ok(Err(e)) => { tracing::debug!("writable failed: {e}"); ProbeResult::Denied }
-                Err(e) => { tracing::debug!("timeout: {e}"); ProbeResult::Timeout }
+            let banner = quick_banner(&stream, timeout_secs).await;
+            ProbeResult::Allowed { banner }
+        }
+        Err(e) => {
+            let kind = e.kind();
+            if kind == std::io::ErrorKind::TimedOut {
+                ProbeResult::Timeout
+            } else if kind == std::io::ErrorKind::ConnectionRefused
+                || kind == std::io::ErrorKind::ConnectionReset
+            {
+                ProbeResult::Denied
+            } else {
+                tracing::debug!("source-port connect to {dest}:{dest_port} failed: {e}");
+                ProbeResult::Error(e.to_string())
             }
         }
-        Err(e) => { tracing::debug!("from_std failed: {e}"); ProbeResult::Denied }
     }
 }
 
@@ -399,21 +490,32 @@ async fn probe_udp(ip: IpAddr, dest_port: u16, src_port: u16, timeout_secs: u64)
             };
             ProbeResult::Allowed { banner }
         }
-        Ok(Err(e)) => { tracing::debug!("UDP recv error: {e}"); ProbeResult::Denied }
-        Err(e) => { tracing::debug!("timeout: {e}"); ProbeResult::Timeout }
+        Ok(Err(e)) => {
+            tracing::debug!("UDP recv error: {e}");
+            ProbeResult::Denied
+        }
+        Err(e) => {
+            tracing::debug!("timeout: {e}");
+            ProbeResult::Timeout
+        }
     }
 }
 
-/// Quick banner read after successful TCP connect.
-async fn quick_banner(stream: &tokio::net::TcpStream, _timeout_secs: u64) -> String {
+/// Quick banner read after successful TCP connect. The wait window is capped
+/// by the operator-configured timeout so a very short `setg timeout` also
+/// shortens the banner grab.
+async fn quick_banner(stream: &tokio::net::TcpStream, timeout_secs: u64) -> String {
     let mut buf = [0u8; 1024];
-    match timeout(Duration::from_millis(800), stream.readable()).await {
-        Ok(Ok(())) => {
-            match stream.try_read(&mut buf) {
-                Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
-                _ => String::new(),
-            }
-        }
+    let window =
+        Duration::from_millis(800).min(Duration::from_secs(timeout_secs.clamp(1, u64::MAX)));
+    match timeout(window, stream.readable()).await {
+        Ok(Ok(())) => match stream.try_read(&mut buf) {
+            Ok(n) if n > 0 => match buf.get(..n) {
+                Some(slice) => String::from_utf8_lossy(slice).trim().to_string(),
+                None => String::new(),
+            },
+            _ => String::new(),
+        },
         _ => String::new(),
     }
 }
@@ -475,7 +577,11 @@ struct ProgressTracker {
 
 impl ProgressTracker {
     fn new(total: usize) -> Self {
-        Self { total, current: 0, last_print: 0 }
+        Self {
+            total,
+            current: 0,
+            last_print: 0,
+        }
     }
 
     fn increment(&mut self) {
@@ -504,11 +610,17 @@ impl ProgressTracker {
             0.0
         };
 
-        crate::mprint!("\r{}", format!(
-            "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
-            self.current, self.total, pct, rate, eta
-        ).cyan());
-        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) { eprintln!("[!] Flush failed: {}", e); }
+        crate::mprint!(
+            "\r{}",
+            format!(
+                "[*] Progress: {}/{} ({:.1}%) | {:.0} probes/sec | ETA: {:.0}s",
+                self.current, self.total, pct, rate, eta
+            )
+            .cyan()
+        );
+        if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+            crate::meprintln!("[!] Flush failed: {}", e);
+        }
 
         if self.current == self.total {
             crate::mprintln!();
@@ -517,4 +629,8 @@ impl ProgressTracker {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "source_port_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "source_port_scanner",
+    native
+);

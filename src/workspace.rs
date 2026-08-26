@@ -58,8 +58,16 @@ impl Workspace {
     pub(crate) fn with_base_dir(base: PathBuf) -> Self {
         let base_dir = base.join("workspaces");
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&base_dir) {
-            eprintln!("[!] Failed to create workspaces directory {}: {}", base_dir.display(), e);
+        if let Err(e) = std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&base_dir)
+        {
+            eprintln!(
+                "[!] Failed to create workspaces directory {}: {}",
+                base_dir.display(),
+                e
+            );
         }
 
         let data = Self::load_sync(&base_dir, "default");
@@ -83,7 +91,10 @@ impl Workspace {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
+                        eprintln!(
+                            "[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.",
+                            name, e
+                        );
                         let backup = path.with_extension("json.bak");
                         if let Err(e) = std::fs::copy(&path, &backup) {
                             eprintln!("[!] Failed to backup corrupted workspace '{}': {}", name, e);
@@ -92,7 +103,10 @@ impl Workspace {
                     }
                 },
                 Err(e) => {
-                    eprintln!("[!] Failed to read workspace '{}': {}. Preserving original.", name, e);
+                    eprintln!(
+                        "[!] Failed to read workspace '{}': {}. Preserving original.",
+                        name, e
+                    );
                     let backup = path.with_extension("json.unreadable");
                     if let Err(e) = std::fs::rename(&path, &backup) {
                         eprintln!("[!] Rename failed: {}", e);
@@ -116,7 +130,10 @@ impl Workspace {
                 Ok(contents) => match serde_json::from_str(&contents) {
                     Ok(data) => data,
                     Err(e) => {
-                        eprintln!("[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.", name, e);
+                        eprintln!(
+                            "[!] Warning: Workspace '{}' is corrupted ({}). Creating backup.",
+                            name, e
+                        );
                         let backup = path.with_extension("json.bak");
                         if let Err(e) = tokio::fs::copy(&path, &backup).await {
                             eprintln!("[!] Failed to backup corrupted workspace '{}': {}", name, e);
@@ -128,7 +145,10 @@ impl Workspace {
                     // Read errors (EACCES/EIO) leave the original file
                     // intact. Move it aside so a subsequent successful
                     // start doesn't silently overwrite the original.
-                    eprintln!("[!] Warning: Failed to read workspace '{}': {}. Preserving original.", name, e);
+                    eprintln!(
+                        "[!] Warning: Failed to read workspace '{}': {}. Preserving original.",
+                        name, e
+                    );
                     let backup = path.with_extension("json.unreadable");
                     if let Err(e) = tokio::fs::rename(&path, &backup).await {
                         eprintln!("[!] Rename failed: {}", e);
@@ -222,7 +242,11 @@ impl Workspace {
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!("[!] Failed to read workspaces directory {}: {}", self.base_dir.display(), e);
+                eprintln!(
+                    "[!] Failed to read workspaces directory {}: {}",
+                    self.base_dir.display(),
+                    e
+                );
                 names.push("default".to_string());
                 return names;
             }
@@ -246,7 +270,11 @@ impl Workspace {
                     // A transient read error must be distinguishable from
                     // end-of-directory — don't silently return a partial list as
                     // if it were complete.
-                    eprintln!("[!] Error while listing workspaces in {}: {}", self.base_dir.display(), e);
+                    eprintln!(
+                        "[!] Error while listing workspaces in {}: {}",
+                        self.base_dir.display(),
+                        e
+                    );
                     break;
                 }
             }
@@ -287,9 +315,14 @@ impl Workspace {
         let is_ip = ip.parse::<std::net::IpAddr>().is_ok();
         let is_hostname = !is_ip
             && ip.contains('.')
-            && ip.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+            && ip
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
         if !is_ip && !is_hostname {
-            tracing::debug!(ip, "workspace add_host rejected: not a valid IP or hostname shape");
+            tracing::debug!(
+                ip,
+                "workspace add_host rejected: not a valid IP or hostname shape"
+            );
             return;
         }
         let ip = Self::normalize_host_key(ip);
@@ -340,7 +373,14 @@ impl Workspace {
 
     /// Add or update a service. Updates service_name and version if the
     /// host:port/protocol already exists.
-    pub async fn add_service(&self, host: &str, port: u16, protocol: &str, service_name: &str, version: Option<&str>) {
+    pub async fn add_service(
+        &self,
+        host: &str,
+        port: u16,
+        protocol: &str,
+        service_name: &str,
+        version: Option<&str>,
+    ) {
         let host = Self::normalize_host_key(host);
         let host = host.as_str();
         // Scrub the protocol ONCE up front and compare against the scrubbed
@@ -350,7 +390,11 @@ impl Workspace {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         {
             let mut data = self.data.write().await;
-            if let Some(existing) = data.services.iter_mut().find(|s| s.host == host && s.port == port && s.protocol == protocol) {
+            if let Some(existing) = data
+                .services
+                .iter_mut()
+                .find(|s| s.host == host && s.port == port && s.protocol == protocol)
+            {
                 // Update service name and version on re-discovery
                 existing.service_name = crate::utils::scrub_stored_text(service_name);
                 if version.is_some() {
@@ -444,23 +488,39 @@ impl Workspace {
     pub async fn display_hosts(&self) {
         let hosts = self.hosts().await;
         if hosts.is_empty() {
-            println!("{}", "No hosts tracked. Use 'hosts add <ip>' to add one.".dimmed());
+            println!(
+                "{}",
+                "No hosts tracked. Use 'hosts add <ip>' to add one.".dimmed()
+            );
             return;
         }
         let name = self.current_name().await;
         println!();
-        println!("{}", format!("Hosts ({} total) - Workspace: {}", hosts.len(), name).bold().underline());
+        println!(
+            "{}",
+            format!("Hosts ({} total) - Workspace: {}", hosts.len(), name)
+                .bold()
+                .underline()
+        );
         println!();
-        println!("  {:<18} {:<25} {:<15} {:<20} {}",
-            "IP".bold(), "Hostname".bold(), "OS".bold(), "Last Seen".bold(), "Notes".bold());
+        println!(
+            "  {:<18} {:<25} {:<15} {:<20} {}",
+            "IP".bold(),
+            "Hostname".bold(),
+            "OS".bold(),
+            "Last Seen".bold(),
+            "Notes".bold()
+        );
         println!("  {}", "-".repeat(90).dimmed());
         for h in &hosts {
-            println!("  {:<18} {:<25} {:<15} {:<20} {}",
+            println!(
+                "  {:<18} {:<25} {:<15} {:<20} {}",
                 h.ip.green(),
                 h.hostname.as_deref().unwrap_or("-"),
                 h.os_guess.as_deref().unwrap_or("-"),
                 &h.last_seen,
-                h.notes.len());
+                h.notes.len()
+            );
         }
         println!();
     }
@@ -469,20 +529,39 @@ impl Workspace {
     pub async fn display_services(&self) {
         let services = self.services().await;
         if services.is_empty() {
-            println!("{}", "No services tracked. Use 'services add' to add one.".dimmed());
+            println!(
+                "{}",
+                "No services tracked. Use 'services add' to add one.".dimmed()
+            );
             return;
         }
         let name = self.current_name().await;
         println!();
-        println!("{}", format!("Services ({} total) - Workspace: {}", services.len(), name).bold().underline());
+        println!(
+            "{}",
+            format!("Services ({} total) - Workspace: {}", services.len(), name)
+                .bold()
+                .underline()
+        );
         println!();
-        println!("  {:<18} {:<8} {:<8} {:<15} {}",
-            "Host".bold(), "Port".bold(), "Proto".bold(), "Service".bold(), "Version".bold());
+        println!(
+            "  {:<18} {:<8} {:<8} {:<15} {}",
+            "Host".bold(),
+            "Port".bold(),
+            "Proto".bold(),
+            "Service".bold(),
+            "Version".bold()
+        );
         println!("  {}", "-".repeat(70).dimmed());
         for s in &services {
-            println!("  {:<18} {:<8} {:<8} {:<15} {}",
-                s.host.green(), s.port, s.protocol, s.service_name,
-                s.version.as_deref().unwrap_or("-"));
+            println!(
+                "  {:<18} {:<8} {:<8} {:<15} {}",
+                s.host.green(),
+                s.port,
+                s.protocol,
+                s.service_name,
+                s.version.as_deref().unwrap_or("-")
+            );
         }
         println!();
     }
@@ -501,7 +580,9 @@ pub async fn track_host(ip: &str, hostname: Option<&str>, os_guess: Option<&str>
     s.workspace().add_host(ip, hostname, os_guess).await;
     // Typed event so subscribers get machine-readable fields, plus the legacy
     // Finding (human string) for backward compatibility.
-    crate::events::emit(crate::events::ModuleEvent::HostUp { host: ip.to_string() });
+    crate::events::emit(crate::events::ModuleEvent::HostUp {
+        host: ip.to_string(),
+    });
     crate::events::emit(crate::events::ModuleEvent::Finding {
         module: emitting_module(),
         target: ip.to_string(),
@@ -523,7 +604,9 @@ pub async fn track_service(
     version: Option<&str>,
 ) {
     let s = crate::tenant::resolve();
-    s.workspace().add_service(host, port, protocol, service_name, version).await;
+    s.workspace()
+        .add_service(host, port, protocol, service_name, version)
+        .await;
     let version_str = version.map(|v| format!(" {v}")).unwrap_or_default();
     // Typed event (machine-readable fields) + legacy Finding for compatibility.
     crate::events::emit(crate::events::ModuleEvent::ServiceDetected {

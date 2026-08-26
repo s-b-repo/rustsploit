@@ -1,12 +1,12 @@
-use anyhow::{ Context, Result };
+use anyhow::{Context, Result};
 use base64::Engine;
 use colored::*;
 use std::time::Duration;
 
 use crate::module::{FindingKind, ModuleCtx, ModuleOutcome};
-use crate::module_info::{ModuleInfo, ModuleRank };
-use crate::utils::network::{ build_http_client_with, HttpClientOpts };
+use crate::module_info::{ModuleInfo, ModuleRank};
 use crate::utils::cfg_prompt_yes_no;
+use crate::utils::network::{HttpClientOpts, build_http_client_with};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -29,13 +29,12 @@ const KNOWN_MODULES: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "SGBox NG-SIEM Recon".to_string(),
-        description:
-            "Non-destructive recon of Securegate SGBox NG-SIEM consoles.\n\
+        description: "Non-destructive recon of Securegate SGBox NG-SIEM consoles.\n\
              Extracts version + license owner from pre-auth window._vars (base64 JSON),\n\
              enumerates installed SGBox modules (NVS/SCM/LM/LCE/SM/PB/ADE/IM/RS) via the\n\
              /sgbox/<MOD>/pages/dashboard.php response-size oracle, and audits the login\n\
              surface for HSTS, deprecated TLS, and absent rate-limiting. Read-only."
-                .to_string(),
+            .to_string(),
         authors: vec!["Bottomline Pentest".to_string()],
         references: vec![
             "https://www.sgbox.eu/en/knowledge-base/network-requirements/".to_string(),
@@ -69,7 +68,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let url = format!("https://{}/sgbox/", host);
     ctx.rate_limit(&host).await;
     let body = match client.get(&url).send().await {
-        Ok(resp) => match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        Ok(resp) => match crate::utils::network::read_http_body_text_capped(
+            resp,
+            crate::utils::safe_io::DEFAULT_BODY_CAP,
+        )
+        .await
+        {
             Ok(b) => b,
             Err(e) => {
                 crate::meprintln!("[!] {}: failed to read body: {e:#}", host);
@@ -88,10 +92,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     };
 
-    if !body.contains("SGFrame")
-        && !body.contains("window._vars")
-        && !body.contains("sgbox")
-    {
+    if !body.contains("SGFrame") && !body.contains("window._vars") && !body.contains("sgbox") {
         if !crate::utils::is_batch_mode() {
             crate::mprintln!(
                 "{}",
@@ -104,7 +105,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let version = extract_version_from_html(&body);
     let owner = extract_license_owner_from_vars(&body);
     if version.is_some() || owner.is_some() {
-        crate::mprintln!("{}", format!("[+] {} — SGBox NG-SIEM detected", host).green().bold());
+        crate::mprintln!(
+            "{}",
+            format!("[+] {} — SGBox NG-SIEM detected", host)
+                .green()
+                .bold()
+        );
         if let Some(v) = &version {
             crate::mprintln!("    version: {}", v.cyan());
             crate::workspace::add_note(&host, &format!("[sgbox_siem] version: {}", v)).await;
@@ -143,12 +149,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     ctx.rate_limit(&host).await;
     let modules = enumerate_modules(&client, &host).await;
     if !modules.is_empty() {
-        crate::mprintln!("{}", format!("[+] {} reachable SGBox modules:", modules.len()).green());
+        crate::mprintln!(
+            "{}",
+            format!("[+] {} reachable SGBox modules:", modules.len()).green()
+        );
         for (code, name, status) in &modules {
             crate::mprintln!("    {} {} (HTTP {})", code.cyan(), name, status);
             crate::workspace::add_note(
                 &host,
-                &format!("[sgbox_siem] module reachable: {} ({}) HTTP {}", code, name, status),
+                &format!(
+                    "[sgbox_siem] module reachable: {} ({}) HTTP {}",
+                    code, name, status
+                ),
             )
             .await;
             report.installed_modules.push((code.clone(), name.clone()));
@@ -232,7 +244,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .await
         {
             Some(id) => {
-                crate::mprintln!("    report saved: {} (loot id {})", label.cyan(), id.dimmed())
+                crate::mprintln!(
+                    "    report saved: {} (loot id {})",
+                    label.cyan(),
+                    id.dimmed()
+                )
             }
             None => crate::meprintln!("[!] failed to persist sgbox recon report"),
         }
@@ -304,11 +320,7 @@ fn extract_license_owner_from_vars(body: &str) -> Option<String> {
         .get("owner")?
         .as_str()?
         .to_string();
-    if owner.is_empty() {
-        None
-    } else {
-        Some(owner)
-    }
+    if owner.is_empty() { None } else { Some(owner) }
 }
 
 fn decode_window_vars(body: &str) -> Option<String> {
@@ -323,16 +335,18 @@ fn decode_window_vars(body: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-async fn enumerate_modules(
-    client: &reqwest::Client,
-    base: &str,
-) -> Vec<(String, String, usize)> {
+async fn enumerate_modules(client: &reqwest::Client, base: &str) -> Vec<(String, String, usize)> {
     let mut found = Vec::new();
     for (code, name) in KNOWN_MODULES {
         let url = format!("{}/sgbox/{}/pages/dashboard.php", base, code);
         if let Ok(resp) = client.get(&url).send().await {
             let status = resp.status().as_u16();
-            let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+            let body = match crate::utils::network::read_http_body_text_capped(
+                resp,
+                crate::utils::safe_io::DEFAULT_BODY_CAP,
+            )
+            .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     crate::mprintln!("{} body decode failed: {}", "[-]".red(), e);
@@ -389,7 +403,10 @@ async fn probe_login_rate_limit(
                 }
                 p.successes += 1;
             }
-            Err(e) => { tracing::debug!("login probe failed: {e}"); continue; }
+            Err(e) => {
+                tracing::debug!("login probe failed: {e}");
+                continue;
+            }
         }
     }
     Ok(p)
@@ -473,7 +490,10 @@ impl ReportBuilder {
     fn to_markdown(&self) -> String {
         let mut out = String::new();
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        out.push_str(&format!("# SGBox NG-SIEM Recon — {}:{}\n\n", self.host, self.port));
+        out.push_str(&format!(
+            "# SGBox NG-SIEM Recon — {}:{}\n\n",
+            self.host, self.port
+        ));
         out.push_str(&format!("Generated: {}\n\n", ts));
         out.push_str("## Pre-auth disclosure\n\n");
         out.push_str(&format!(
@@ -518,8 +538,18 @@ impl ReportBuilder {
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "sgbox_siem_recon", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "sgbox_siem_recon",
+    native
+);

@@ -1,22 +1,22 @@
-use anyhow::{Result, Context};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_required, cfg_prompt_yes_no,
+    normalize_target, safe_read_to_string, url_encode,
+};
+use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
 use colored::*;
+use rand::seq::IndexedRandom;
 use reqwest::{Client, header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use tokio::fs;
-use std::io::Write;
 use std::fmt::Write as FmtWrite; // Rename to avoid conflict with io::Write
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
-use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{
-    cfg_prompt_required, cfg_prompt_default, cfg_prompt_yes_no, normalize_target, cfg_prompt_existing_file,
-    safe_read_to_string, url_encode,
-};
-use base64::{Engine as _, engine::general_purpose};
-use rand::seq::IndexedRandom;
+use tokio::fs;
+use tokio::sync::{Semaphore, mpsc};
 
 // --- Enums & Config ---
 
@@ -31,7 +31,7 @@ pub enum EncodingType {
     Decimal,
     Octal,
     Base64,
-    Mixed, 
+    Mixed,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -81,7 +81,12 @@ fn get_charset(config: &SequentialFuzzerConfig) -> Vec<char> {
         1 => CHARSET_SQL.chars().collect(),
         2 => CHARSET_TRAVERSAL.chars().collect(),
         3 => CHARSET_CMD.chars().collect(),
-        5 => config.custom_charset.as_deref().unwrap_or("").chars().collect(),
+        5 => config
+            .custom_charset
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .collect(),
         _ => CHARSET_ALL.chars().collect(),
     }
 }
@@ -95,45 +100,53 @@ fn encode_payload(input: &str, encoding: EncodingType) -> String {
         EncodingType::DoubleUrl => url_encode(&url_encode(input).to_string()).to_string(),
         EncodingType::Hex => {
             // Encode each byte of the UTF-8 representation
-            input.as_bytes().iter().map(|b| format!("\\x{:02X}", b)).collect()
-        },
+            input
+                .as_bytes()
+                .iter()
+                .map(|b| format!("\\x{:02X}", b))
+                .collect()
+        }
         EncodingType::Unicode => {
             // Use actual Unicode code points for proper encoding
-            input.chars().map(|c| format!("\\u{:04X}", c as u32)).collect()
-        },
-        EncodingType::HtmlEntity => {
-             input.chars().map(|c| {
-                 match c {
-                     '"' => "&quot;".to_string(),
-                     '\'' => "&apos;".to_string(),
-                     '<' => "&lt;".to_string(),
-                     '>' => "&gt;".to_string(),
-                     '&' => "&amp;".to_string(),
-                     _ => c.to_string()
-                 }
-             }).collect()
-        },
+            input
+                .chars()
+                .map(|c| format!("\\u{:04X}", c as u32))
+                .collect()
+        }
+        EncodingType::HtmlEntity => input
+            .chars()
+            .map(|c| match c {
+                '"' => "&quot;".to_string(),
+                '\'' => "&apos;".to_string(),
+                '<' => "&lt;".to_string(),
+                '>' => "&gt;".to_string(),
+                '&' => "&amp;".to_string(),
+                _ => c.to_string(),
+            })
+            .collect(),
         EncodingType::Decimal => {
-             // Use Unicode code point for proper decimal encoding
-             input.chars().map(|c| format!("&#{};", c as u32)).collect()
-        },
-        EncodingType::Octal => {
-             input.as_bytes().iter().map(|b| format!("\\{:03o}", b)).collect()
-        },
-        EncodingType::Base64 => {
-             general_purpose::STANDARD.encode(input)
-        },
+            // Use Unicode code point for proper decimal encoding
+            input.chars().map(|c| format!("&#{};", c as u32)).collect()
+        }
+        EncodingType::Octal => input
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\{:03o}", b))
+            .collect(),
+        EncodingType::Base64 => general_purpose::STANDARD.encode(input),
         EncodingType::Mixed => {
-             // Randomly apply an encoding per byte (simplified: raw or url or hex)
-             let mut rng = rand::rng();
-             input.as_bytes().iter().map(|b| {
-                 match [0, 1, 2].choose(&mut rng).copied().unwrap_or(0) {
-                     0 if b.is_ascii() => String::from(*b as char),
-                     0 => format!("%{:02X}", b),
-                     1 => format!("%{:02X}", b),
-                     _ => format!("\\x{:02X}", b),
-                 }
-             }).collect()
+            // Randomly apply an encoding per byte (simplified: raw or url or hex)
+            let mut rng = rand::rng();
+            input
+                .as_bytes()
+                .iter()
+                .map(|b| match [0, 1, 2].choose(&mut rng).copied().unwrap_or(0) {
+                    0 if b.is_ascii() => String::from(*b as char),
+                    0 => format!("%{:02X}", b),
+                    1 => format!("%{:02X}", b),
+                    _ => format!("\\x{:02X}", b),
+                })
+                .collect()
         }
     }
 }
@@ -166,11 +179,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             save_template(&cfg).await?;
             crate::mprintln!("\n{}", "Template saved. Exiting module.".green());
             return Ok(ModuleOutcome::ok());
-        },
+        }
         "3" => load_template().await?,
         "4" => setup_wizard(target).await?,
         _ => {
-            crate::mprintln!("{}", "Invalid selection. Defaulting to Quick Attack.".yellow());
+            crate::mprintln!(
+                "{}",
+                "Invalid selection. Defaulting to Quick Attack.".yellow()
+            );
             setup_quick_attack(target).await?
         }
     };
@@ -179,12 +195,26 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 }
 
 fn print_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln_block!(
-        format!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan()),
-        format!("{}", "║              Sequential Fuzzer (Brute Force)              ║".cyan()),
-        format!("{}", "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red()),
-        format!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan())
+        format!(
+            "{}",
+            "╔═══════════════════════════════════════════════════════════╗".cyan()
+        ),
+        format!(
+            "{}",
+            "║              Sequential Fuzzer (Brute Force)              ║".cyan()
+        ),
+        format!(
+            "{}",
+            "║  Features: Actor Storage, 10 Encodings, Instant Saving    ║".red()
+        ),
+        format!(
+            "{}",
+            "╚═══════════════════════════════════════════════════════════╝".cyan()
+        )
     );
 }
 
@@ -193,14 +223,14 @@ fn print_banner() {
 async fn setup_quick_attack(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     crate::mprintln!("\n{}", "--- Quick Attack Setup ---".blue().bold());
     let url = parse_target_interactive(initial_target).await?;
-    
+
     // Forced Input for Reliability
     let min_len_str = cfg_prompt_required("min_length", "Min Sequence Length (e.g. 1)").await?;
     let min_len: usize = min_len_str.parse().unwrap_or(1);
-    
+
     let max_len_str = cfg_prompt_required("max_length", "Max Sequence Length (e.g. 3)").await?;
     let max_len: usize = max_len_str.parse().unwrap_or(3);
-    
+
     let verbose = cfg_prompt_yes_no("verbose", "Verbose Mode? (Print all 403s)", false).await?;
 
     Ok(SequentialFuzzerConfig {
@@ -217,10 +247,10 @@ async fn setup_quick_attack(initial_target: &str) -> Result<SequentialFuzzerConf
 
 async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     crate::mprintln!("\n{}", "--- Configuration Wizard ---".blue().bold());
-    
+
     // 1. Target
     let url = parse_target_interactive(initial_target).await?;
-    
+
     // 2. Charset
     crate::mprintln!("\n{}", "Select Charset:".cyan());
     crate::mprintln!("1. SQL Injection ({})", CHARSET_SQL);
@@ -228,7 +258,7 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     crate::mprintln!("3. Command Injection ({})", CHARSET_CMD);
     crate::mprintln!("4. All Printable ASCII (Standard Brute)");
     crate::mprintln!("5. Custom");
-    
+
     let c_mode_str = cfg_prompt_required("charset", "Charset Selection (1-5)").await?;
     let c_mode: u8 = c_mode_str.parse().unwrap_or(4);
 
@@ -237,17 +267,21 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     } else {
         None
     };
-    
+
     // 3. Lengths
     // Using cfg_prompt_required to prevent skipping issues with buffered inputs
     let min_len_str = cfg_prompt_required("min_length", "Min Sequence Length (e.g. 1)").await?;
     let min_len: usize = min_len_str.parse().unwrap_or(1);
-    
+
     let max_len_str = cfg_prompt_required("max_length", "Max Sequence Length (e.g. 3)").await?;
     let max_len: usize = max_len_str.parse().unwrap_or(3);
-    
+
     if max_len > 4 && c_mode == 4 {
-        crate::mprintln!("{}", "[!] Warning: Brute forcing printable ASCII > 4 chars will take a VERY long time.".yellow());
+        crate::mprintln!(
+            "{}",
+            "[!] Warning: Brute forcing printable ASCII > 4 chars will take a VERY long time."
+                .yellow()
+        );
     }
 
     // 4. Encoding
@@ -262,7 +296,7 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
     crate::mprintln!("7. Octal (\\OOO)");
     crate::mprintln!("8. Base64");
     crate::mprintln!("9. Mixed/Random");
-    
+
     let enc_choice_str = cfg_prompt_required("encoding", "Encoding Selection (0-9)").await?;
     let enc_choice: u8 = enc_choice_str.parse().unwrap_or(0);
 
@@ -278,17 +312,17 @@ async fn setup_wizard(initial_target: &str) -> Result<SequentialFuzzerConfig> {
         9 => EncodingType::Mixed,
         _ => EncodingType::None,
     };
-    
+
     // 5. Config
     let concurrency_str = cfg_prompt_required("concurrency", "Concurrency (Threads)").await?;
     let concurrency: usize = concurrency_str.parse().unwrap_or(50);
-    
+
     let cookies = if cfg_prompt_yes_no("add_cookies", "Add Cookies?", false).await? {
         Some(cfg_prompt_required("cookies", "Cookie Header Value").await?)
     } else {
         None
     };
-    
+
     let verbose = cfg_prompt_yes_no("verbose", "Verbose Mode? (Print all 403s)", false).await?;
 
     Ok(SequentialFuzzerConfig {
@@ -310,7 +344,7 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
     } else {
         normalize_target(raw)?
     };
-    
+
     // Ensure protocol
     let url = if !base.starts_with("http") {
         format!("http://{}", base)
@@ -321,7 +355,13 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
     // Ensure trailing slash
     if !url.ends_with('/') {
         crate::mprintln!("{}", format!("[*] Current Target: {}", url).cyan());
-        if cfg_prompt_yes_no("append_slash", "Target does not end with '/'. Append it?", true).await? {
+        if cfg_prompt_yes_no(
+            "append_slash",
+            "Target does not end with '/'. Append it?",
+            true,
+        )
+        .await?
+        {
             Ok(format!("{}/", url))
         } else {
             Ok(url)
@@ -336,7 +376,9 @@ async fn parse_target_interactive(raw: &str) -> Result<String> {
 async fn save_template(config: &SequentialFuzzerConfig) -> Result<()> {
     let name = cfg_prompt_default("template_name", "Template Name", "fuzz_template.json").await?;
     let json = serde_json::to_string_pretty(config)?;
-    fs::write(&name, json).await.context("Failed to write template")?;
+    fs::write(&name, json)
+        .await
+        .context("Failed to write template")?;
     crate::mprintln!("Saved to {}", name);
     Ok(())
 }
@@ -356,62 +398,83 @@ enum WriterMessage {
     Stop,
 }
 
-async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerConfig) -> Result<ModuleOutcome> {
+async fn execute_fuzz(
+    ctx: &ModuleCtx,
+    target: &str,
+    config: SequentialFuzzerConfig,
+) -> Result<ModuleOutcome> {
     let mut outcome = ModuleOutcome::ok();
     // 1. Prepare Output Dir
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let out_dir = format!("scans/fuzz_{}", timestamp);
-    fs::create_dir_all(&out_dir).await.context("Failed to create output dir")?;
+    fs::create_dir_all(&out_dir)
+        .await
+        .context("Failed to create output dir")?;
     crate::mprintln!("Output Directory: {}", out_dir.cyan());
 
     // 2. Spawn Writer Actor
     let (tx, mut rx) = mpsc::channel::<WriterMessage>(1000);
     let writer_dir = out_dir.clone();
     let verbose = config.verbose;
-    
+
     // We cannot move the JoinHandle out easily if we await it later, but we can spawn it.
     // We need to await it at the end.
     let writer_handle = tokio::spawn(async move {
         let mut buffer: HashMap<u16, Vec<FuzzResult>> = HashMap::new();
         // We don't keep file handles open to avoid limits, we append-open each time.
-        
+
         while let Some(msg) = rx.recv().await {
             match msg {
                 WriterMessage::Result(res) => {
                     // 1. Instant Save
                     let file_path = format!("{}/raw_{}.txt", writer_dir, res.status);
                     let line = format!("[Size: {}] {}\n", res.size, res.path);
-                    
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&file_path)
-                        && let Err(e) = file.write_all(line.as_bytes()) { eprintln!("[!] Write failed: {}", e); }
+
+                    if let Ok(mut file) = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&file_path)
+                        && let Err(e) = file.write_all(line.as_bytes())
+                    {
+                        crate::meprintln!("[!] Write failed: {}", e);
+                    }
 
                     // 2. Print Control (Real-time Output)
                     let status = res.status;
                     let should_print = status != 403 || verbose;
 
                     if should_print {
-                         let status_display = if (200..300).contains(&status) {
-                             format!("{} {}", "[FOUND]".green().bold(), status.to_string().green())
-                         } else if (300..400).contains(&status) {
-                             format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
-                         } else if status >= 500 {
-                             format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
-                         } else if status == 403 || status == 401 {
-                             format!("{} {}", "[AUTH]".yellow().bold(), status.to_string().yellow())
-                         } else {
-                             format!("[{}]", status).white().to_string()
-                         };
+                        let status_display = if (200..300).contains(&status) {
+                            format!(
+                                "{} {}",
+                                "[FOUND]".green().bold(),
+                                status.to_string().green()
+                            )
+                        } else if (300..400).contains(&status) {
+                            format!("{} {}", "[REDIR]".blue().bold(), status.to_string().blue())
+                        } else if status >= 500 {
+                            format!("{} {}", "[ERROR]".red().bold(), status.to_string().red())
+                        } else if status == 403 || status == 401 {
+                            format!(
+                                "{} {}",
+                                "[AUTH]".yellow().bold(),
+                                status.to_string().yellow()
+                            )
+                        } else {
+                            format!("[{}]", status).white().to_string()
+                        };
 
-                         crate::mprintln!("{} Size: {} | {}",
-                             status_display,
-                             res.size.to_string().dimmed(),
-                             res.path
-                         );
+                        crate::mprintln!(
+                            "{} Size: {} | {}",
+                            status_display,
+                            res.size.to_string().dimmed(),
+                            res.path
+                        );
                     }
 
                     // 3. Buffer
                     buffer.entry(res.status).or_default().push(res);
-                },
+                }
                 WriterMessage::Stop => break,
             }
         }
@@ -420,19 +483,24 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
 
     // 3. Engine Setup
     let client = crate::utils::build_http_client(Duration::from_secs(10))?;
-        
+
     let charset = get_charset(&config);
     let sem = Arc::new(Semaphore::new(config.concurrency));
-    
-    crate::mprintln!("{}", "Starting Fuzzer... Press Ctrl+C to abort (not handled cleanly)".yellow());
-    
+
+    crate::mprintln!(
+        "{}",
+        "Starting Fuzzer... Press Ctrl+C to abort (not handled cleanly)".yellow()
+    );
+
     // 4. Generator Loop
     // Memory Fix: Do not store JoinHandles in a Vec.
     // Instead, we rely on the semaphore to track active tasks.
-    
+
     // We iterate lengths
     for len in config.min_length..=config.max_length {
-        if ctx.is_cancelled() { break; }
+        if ctx.is_cancelled() {
+            break;
+        }
         spawn_combinations_iterative(&CombinationCtx {
             ctx,
             target,
@@ -442,21 +510,26 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
             length: len,
             sem: &sem,
             tx: &tx,
-        }).await;
+        })
+        .await;
     }
-    
+
     // 5. Wait for all tasks to finish
     // We do this by attempting to acquire ALL permits.
     // This will block until all active tasks release their permits.
     crate::mprintln!("Generation done. Waiting for active tasks to complete...");
-    if let Err(e) = sem.acquire_many(config.concurrency as u32).await { eprintln!("[!] Semaphore acquire failed: {}", e); }
+    if let Err(e) = sem.acquire_many(config.concurrency as u32).await {
+        crate::meprintln!("[!] Semaphore acquire failed: {}", e);
+    }
 
     // Stop Writer
-    if let Err(e) = tx.send(WriterMessage::Stop).await { eprintln!("[!] Channel send failed: {}", e); }
+    if let Err(e) = tx.send(WriterMessage::Stop).await {
+        crate::meprintln!("[!] Channel send failed: {}", e);
+    }
     let final_buffer = writer_handle.await?;
-    
+
     crate::mprintln!("\n{}", "Scan Complete. Sorting results...".blue());
-    
+
     // 6. Sort and Final Save
     let mut total_403 = 0;
 
@@ -473,7 +546,10 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
                 outcome.findings.push(Finding {
                     target: target.to_string(),
                     kind: FindingKind::Note,
-                    message: format!("Sequential fuzz hit {} -> {} ({} bytes)", r.path, status, r.size),
+                    message: format!(
+                        "Sequential fuzz hit {} -> {} ({} bytes)",
+                        r.path, status, r.size
+                    ),
                     data: Some(serde_json::json!({
                         "url": r.path,
                         "status": status,
@@ -487,14 +563,27 @@ async fn execute_fuzz(ctx: &ModuleCtx, target: &str, config: SequentialFuzzerCon
         let mut content = String::new();
         for r in results {
             // Avoid unwrap on string write (very unlikely to fail on memory, but strictness requested)
-            if let Err(e) = writeln!(content, "[Size: {}] {}", r.size, r.path) { eprintln!("[!] Write failed: {}", e); }
+            if let Err(e) = writeln!(content, "[Size: {}] {}", r.size, r.path) {
+                crate::meprintln!("[!] Write failed: {}", e);
+            }
         }
         fs::write(&file_path, content).await?;
-        crate::mprintln!("Saved sorted results for status {} to {}", status, file_path.green());
+        crate::mprintln!(
+            "Saved sorted results for status {} to {}",
+            status,
+            file_path.green()
+        );
     }
 
     if total_403 > 0 && !config.verbose {
-         crate::mprintln!("{}", format!("\n[*] Aggregated {} '403 Forbidden' responses. (Use verbose mode to see them)", total_403).yellow());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "\n[*] Aggregated {} '403 Forbidden' responses. (Use verbose mode to see them)",
+                total_403
+            )
+            .yellow()
+        );
     }
 
     Ok(outcome)
@@ -513,22 +602,36 @@ struct CombinationCtx<'a> {
 
 // Iterative generator that spawns tasks (Base-N Counting)
 async fn spawn_combinations_iterative(cc: &CombinationCtx<'_>) {
-    let CombinationCtx { ctx, target, client, config, charset, length, sem, tx } = *cc;
-    if charset.is_empty() || length == 0 { return; }
-    
+    let CombinationCtx {
+        ctx,
+        target,
+        client,
+        config,
+        charset,
+        length,
+        sem,
+        tx,
+    } = *cc;
+    if charset.is_empty() || length == 0 {
+        return;
+    }
+
     // Performance: Parse headers ONCE, not per iteration
     let mut base_headers = header::HeaderMap::new();
     if let Some(c) = &config.cookies
-         && let Ok(val) = c.parse() {
-             base_headers.insert(header::COOKIE, val);
-         }
-    
+        && let Ok(val) = c.parse()
+    {
+        base_headers.insert(header::COOKIE, val);
+    }
+
     // Indices for each position in the string (0 to charset.len()-1)
     let mut indices = vec![0; length];
     let charset_len = charset.len();
-    
+
     loop {
-        if ctx.is_cancelled() { return; }
+        if ctx.is_cancelled() {
+            return;
+        }
         // 1. Build String from Indices
         let current_payload: String = indices.iter().map(|&i| charset[i]).collect();
 
@@ -548,30 +651,32 @@ async fn spawn_combinations_iterative(cc: &CombinationCtx<'_>) {
         let base = config.target_url.clone();
         let encoding = config.encoding;
         let headers = base_headers.clone(); // Clone ARC-like/cheap map? No, HeaderMap clone is relatively cheap but doing it here is necessary for async move.
-        
+
         // Apply encoding
         let encoded_payload = encode_payload(&current_payload, encoding);
         let url = format!("{}{}", base, encoded_payload);
-        
+
         tokio::spawn(async move {
             let _permit = permit; // drop when task done (releases semaphore)
-            
+
             let req = client.get(&url).headers(headers);
             // Safety: Handle send errors (don't unwrap)
             if let Ok(resp) = req.send().await {
                 let status = resp.status().as_u16();
                 let size = resp.content_length().unwrap_or(0);
-                
+
                 let res = FuzzResult {
                     path: url,
                     status,
                     size,
                 };
                 // If receiver dropped, we just stop sending.
-                if let Err(e) = tx.send(WriterMessage::Result(res)).await { eprintln!("[!] Channel send failed: {}", e); }
+                if let Err(e) = tx.send(WriterMessage::Result(res)).await {
+                    crate::meprintln!("[!] Channel send failed: {}", e);
+                }
             }
         });
-        
+
         // 3. Increment Indices (Standard Base-N Carry)
         let mut carry = true;
         for i in (0..length).rev() {
@@ -601,4 +706,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "sequential_fuzzer", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "sequential_fuzzer",
+    native
+);

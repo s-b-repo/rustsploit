@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 // ============================================================
 
 /// Thread-safe text buffer for capturing module output.
-/// Uses std::sync::Mutex (not tokio) so it works in both sync and async contexts.
+/// Uses std::sync::Mutex intentionally (not tokio::sync::Mutex) — the lock
+/// is held only for Vec::push/String::with_capacity, never across an await
+/// point, so std::Mutex works correctly in both sync and async contexts.
 #[derive(Debug, Clone, Default)]
 pub struct OutputBuffer {
     stdout: Arc<Mutex<Vec<String>>>,
@@ -30,14 +32,20 @@ impl OutputBuffer {
 
     /// Warn once when a buffer hits capacity.
     fn warn_truncated(label: &str) {
-        static STDOUT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        static STDERR_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static STDOUT_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        static STDERR_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let flag = match label {
             "stdout" => &STDOUT_WARNED,
             _ => &STDERR_WARNED,
         };
         if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("[!] Output buffer ({}) reached {} lines — further output truncated", label, Self::MAX_BUFFER_LINES);
+            eprintln!(
+                "[!] Output buffer ({}) reached {} lines — further output truncated",
+                label,
+                Self::MAX_BUFFER_LINES
+            );
         }
     }
 
@@ -276,4 +284,3 @@ pub fn _meprint_raw(text: &str) {
 // ============================================================
 // TESTS
 // ============================================================
-

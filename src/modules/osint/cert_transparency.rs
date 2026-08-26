@@ -46,11 +46,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .target
         .as_single()
         .context("cert_transparency requires a single domain target")?;
-    let domain = sanitize_domain(target)
-        .with_context(|| format!("invalid domain '{}'", target))?;
+    let domain = sanitize_domain(target).with_context(|| format!("invalid domain '{}'", target))?;
 
     if !crate::utils::is_batch_mode() {
-        crate::mprintln!("{}", "=== Certificate Transparency Subdomain Enum ===".bold());
+        crate::mprintln!(
+            "{}",
+            "=== Certificate Transparency Subdomain Enum ===".bold()
+        );
         crate::mprintln!("[*] Querying crt.sh for {}", domain.cyan());
     }
 
@@ -75,8 +77,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let body = crate::utils::read_http_body_capped(resp, MAX_CRTSH_BODY)
         .await
         .context("reading crt.sh response body")?;
-    let entries: Vec<CrtEntry> = serde_json::from_slice(&body)
-        .context("crt.sh response was not valid JSON")?;
+    let entries: Vec<CrtEntry> =
+        serde_json::from_slice(&body).context("crt.sh response was not valid JSON")?;
 
     let mut subdomains: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
@@ -146,7 +148,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // to preserve the existing operator-visible note format. Will be
     // collapsed once the route handles structured `data:` payloads.)
     for sub in &subdomains {
-        crate::workspace::add_note(&domain, &format!("[cert_transparency] subdomain: {}", sub)).await;
+        crate::workspace::add_note(&domain, &format!("[cert_transparency] subdomain: {}", sub))
+            .await;
     }
 
     Ok(outcome)
@@ -188,7 +191,10 @@ fn sanitize_domain(input: &str) -> Result<String> {
     if trimmed.is_empty() || trimmed.len() > 253 {
         anyhow::bail!("domain length out of range (1..=253)");
     }
-    if !trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
         anyhow::bail!("domain contains characters that are not letters, digits, '-' or '.'");
     }
     if trimmed.starts_with('.') || trimmed.starts_with('-') {

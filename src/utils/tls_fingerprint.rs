@@ -102,25 +102,105 @@ struct ProbeSpec {
 /// (host/port are filled in at connect time.)
 const JARM_PROBES: [ProbeSpec; 10] = [
     // tls1.2_forward
-    ProbeSpec { version: TlsVersion::Tls1_2, ciphers: CipherList::All,   cipher_order: CipherOrder::Forward,    grease: Grease::Off, alpn: Alpn::All,  ext_order: ExtOrder::Forward, support: Support::Tls1_2 },
+    ProbeSpec {
+        version: TlsVersion::Tls1_2,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::Forward,
+        grease: Grease::Off,
+        alpn: Alpn::All,
+        ext_order: ExtOrder::Forward,
+        support: Support::Tls1_2,
+    },
     // tls1.2_reverse
-    ProbeSpec { version: TlsVersion::Tls1_2, ciphers: CipherList::All,   cipher_order: CipherOrder::Reverse,    grease: Grease::Off, alpn: Alpn::All,  ext_order: ExtOrder::Reverse, support: Support::Tls1_2 },
+    ProbeSpec {
+        version: TlsVersion::Tls1_2,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::Reverse,
+        grease: Grease::Off,
+        alpn: Alpn::All,
+        ext_order: ExtOrder::Reverse,
+        support: Support::Tls1_2,
+    },
     // tls1.2_top_half
-    ProbeSpec { version: TlsVersion::Tls1_2, ciphers: CipherList::All,   cipher_order: CipherOrder::TopHalf,    grease: Grease::Off, alpn: Alpn::Rare, ext_order: ExtOrder::Forward, support: Support::None },
+    ProbeSpec {
+        version: TlsVersion::Tls1_2,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::TopHalf,
+        grease: Grease::Off,
+        alpn: Alpn::Rare,
+        ext_order: ExtOrder::Forward,
+        support: Support::None,
+    },
     // tls1.2_bottom_half
-    ProbeSpec { version: TlsVersion::Tls1_2, ciphers: CipherList::All,   cipher_order: CipherOrder::BottomHalf, grease: Grease::Off, alpn: Alpn::Rare, ext_order: ExtOrder::Forward, support: Support::None },
+    ProbeSpec {
+        version: TlsVersion::Tls1_2,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::BottomHalf,
+        grease: Grease::Off,
+        alpn: Alpn::Rare,
+        ext_order: ExtOrder::Forward,
+        support: Support::None,
+    },
     // tls1.2_middle_out
-    ProbeSpec { version: TlsVersion::Tls1_2, ciphers: CipherList::All,   cipher_order: CipherOrder::MiddleOut,  grease: Grease::On,  alpn: Alpn::Rare, ext_order: ExtOrder::Reverse, support: Support::None },
+    ProbeSpec {
+        version: TlsVersion::Tls1_2,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::MiddleOut,
+        grease: Grease::On,
+        alpn: Alpn::Rare,
+        ext_order: ExtOrder::Reverse,
+        support: Support::None,
+    },
     // tls1.1_middle_out  (jarm.py uses TLS1.1 record but No1.3 cipher list, no support)
-    ProbeSpec { version: TlsVersion::Tls1_2, ciphers: CipherList::No1_3, cipher_order: CipherOrder::Forward,    grease: Grease::Off, alpn: Alpn::Rare, ext_order: ExtOrder::Forward, support: Support::None },
+    ProbeSpec {
+        version: TlsVersion::Tls1_2,
+        ciphers: CipherList::No1_3,
+        cipher_order: CipherOrder::Forward,
+        grease: Grease::Off,
+        alpn: Alpn::Rare,
+        ext_order: ExtOrder::Forward,
+        support: Support::None,
+    },
     // tls1.3_forward
-    ProbeSpec { version: TlsVersion::Tls1_3, ciphers: CipherList::All,   cipher_order: CipherOrder::Forward,    grease: Grease::Off, alpn: Alpn::All,  ext_order: ExtOrder::Forward, support: Support::Tls1_2 },
+    ProbeSpec {
+        version: TlsVersion::Tls1_3,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::Forward,
+        grease: Grease::Off,
+        alpn: Alpn::All,
+        ext_order: ExtOrder::Forward,
+        support: Support::Tls1_2,
+    },
     // tls1.3_reverse
-    ProbeSpec { version: TlsVersion::Tls1_3, ciphers: CipherList::All,   cipher_order: CipherOrder::Reverse,    grease: Grease::Off, alpn: Alpn::All,  ext_order: ExtOrder::Reverse, support: Support::Tls1_2 },
+    ProbeSpec {
+        version: TlsVersion::Tls1_3,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::Reverse,
+        grease: Grease::Off,
+        alpn: Alpn::All,
+        ext_order: ExtOrder::Reverse,
+        support: Support::Tls1_2,
+    },
     // tls1.3_invalid (top-half ciphers)
-    ProbeSpec { version: TlsVersion::Tls1_3, ciphers: CipherList::All,   cipher_order: CipherOrder::MiddleOut,  grease: Grease::On,  alpn: Alpn::Rare, ext_order: ExtOrder::Forward, support: Support::Tls1_2 },
+    ProbeSpec {
+        version: TlsVersion::Tls1_3,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::MiddleOut,
+        grease: Grease::On,
+        alpn: Alpn::Rare,
+        ext_order: ExtOrder::Forward,
+        support: Support::Tls1_2,
+    },
     // tls1.3_middle_out
-    ProbeSpec { version: TlsVersion::Tls1_3, ciphers: CipherList::All,   cipher_order: CipherOrder::MiddleOut,  grease: Grease::On,  alpn: Alpn::Rare, ext_order: ExtOrder::Reverse, support: Support::Tls1_2 },
+    ProbeSpec {
+        version: TlsVersion::Tls1_3,
+        ciphers: CipherList::All,
+        cipher_order: CipherOrder::MiddleOut,
+        grease: Grease::On,
+        alpn: Alpn::Rare,
+        ext_order: ExtOrder::Reverse,
+        support: Support::Tls1_2,
+    },
 ];
 
 // ============================================================
@@ -134,38 +214,144 @@ const GREASE_VALUE: [u8; 2] = [0x0a, 0x0a];
 
 /// "ALL" cipher list (each entry is a 2-byte cipher suite), in jarm.py order.
 const CIPHERS_ALL: &[[u8; 2]] = &[
-    [0x00, 0x16], [0x00, 0x33], [0x00, 0x67], [0xc0, 0x9e], [0xc0, 0xa2],
-    [0x00, 0x9e], [0x00, 0x39], [0x00, 0x6b], [0xc0, 0x9f], [0xc0, 0xa3],
-    [0x00, 0x9f], [0x00, 0x45], [0x00, 0xbe], [0x00, 0x88], [0x00, 0xc4],
-    [0x00, 0x9a], [0xc0, 0x08], [0xc0, 0x09], [0xc0, 0x23], [0xc0, 0xac],
-    [0xc0, 0xae], [0xc0, 0x2b], [0xc0, 0x0a], [0xc0, 0x24], [0xc0, 0xad],
-    [0xc0, 0xaf], [0xc0, 0x2c], [0xc0, 0x72], [0xc0, 0x73], [0xcc, 0xa9],
-    [0x13, 0x02], [0x13, 0x01], [0xcc, 0x14], [0xc0, 0x07], [0xc0, 0x12],
-    [0xc0, 0x13], [0xc0, 0x27], [0xc0, 0x2f], [0xc0, 0x14], [0xc0, 0x28],
-    [0xc0, 0x30], [0xc0, 0x60], [0xc0, 0x61], [0xc0, 0x76], [0xc0, 0x77],
-    [0xcc, 0xa8], [0x13, 0x05], [0x13, 0x04], [0x13, 0x03], [0xcc, 0x13],
-    [0xc0, 0x11], [0x00, 0x0a], [0x00, 0x2f], [0x00, 0x3c], [0xc0, 0x9c],
-    [0xc0, 0xa0], [0x00, 0x9c], [0x00, 0x35], [0x00, 0x3d], [0xc0, 0x9d],
-    [0xc0, 0xa1], [0x00, 0x9d], [0x00, 0x41], [0x00, 0xba], [0x00, 0x84],
-    [0x00, 0xc0], [0x00, 0x07], [0x00, 0x04], [0x00, 0x05],
+    [0x00, 0x16],
+    [0x00, 0x33],
+    [0x00, 0x67],
+    [0xc0, 0x9e],
+    [0xc0, 0xa2],
+    [0x00, 0x9e],
+    [0x00, 0x39],
+    [0x00, 0x6b],
+    [0xc0, 0x9f],
+    [0xc0, 0xa3],
+    [0x00, 0x9f],
+    [0x00, 0x45],
+    [0x00, 0xbe],
+    [0x00, 0x88],
+    [0x00, 0xc4],
+    [0x00, 0x9a],
+    [0xc0, 0x08],
+    [0xc0, 0x09],
+    [0xc0, 0x23],
+    [0xc0, 0xac],
+    [0xc0, 0xae],
+    [0xc0, 0x2b],
+    [0xc0, 0x0a],
+    [0xc0, 0x24],
+    [0xc0, 0xad],
+    [0xc0, 0xaf],
+    [0xc0, 0x2c],
+    [0xc0, 0x72],
+    [0xc0, 0x73],
+    [0xcc, 0xa9],
+    [0x13, 0x02],
+    [0x13, 0x01],
+    [0xcc, 0x14],
+    [0xc0, 0x07],
+    [0xc0, 0x12],
+    [0xc0, 0x13],
+    [0xc0, 0x27],
+    [0xc0, 0x2f],
+    [0xc0, 0x14],
+    [0xc0, 0x28],
+    [0xc0, 0x30],
+    [0xc0, 0x60],
+    [0xc0, 0x61],
+    [0xc0, 0x76],
+    [0xc0, 0x77],
+    [0xcc, 0xa8],
+    [0x13, 0x05],
+    [0x13, 0x04],
+    [0x13, 0x03],
+    [0xcc, 0x13],
+    [0xc0, 0x11],
+    [0x00, 0x0a],
+    [0x00, 0x2f],
+    [0x00, 0x3c],
+    [0xc0, 0x9c],
+    [0xc0, 0xa0],
+    [0x00, 0x9c],
+    [0x00, 0x35],
+    [0x00, 0x3d],
+    [0xc0, 0x9d],
+    [0xc0, 0xa1],
+    [0x00, 0x9d],
+    [0x00, 0x41],
+    [0x00, 0xba],
+    [0x00, 0x84],
+    [0x00, 0xc0],
+    [0x00, 0x07],
+    [0x00, 0x04],
+    [0x00, 0x05],
 ];
 
 /// "NO1.3" cipher list — jarm.py's ALL list with the TLS 1.3 suites removed
 /// (0x1301..0x1305). Same ordering otherwise.
 const CIPHERS_NO13: &[[u8; 2]] = &[
-    [0x00, 0x16], [0x00, 0x33], [0x00, 0x67], [0xc0, 0x9e], [0xc0, 0xa2],
-    [0x00, 0x9e], [0x00, 0x39], [0x00, 0x6b], [0xc0, 0x9f], [0xc0, 0xa3],
-    [0x00, 0x9f], [0x00, 0x45], [0x00, 0xbe], [0x00, 0x88], [0x00, 0xc4],
-    [0x00, 0x9a], [0xc0, 0x08], [0xc0, 0x09], [0xc0, 0x23], [0xc0, 0xac],
-    [0xc0, 0xae], [0xc0, 0x2b], [0xc0, 0x0a], [0xc0, 0x24], [0xc0, 0xad],
-    [0xc0, 0xaf], [0xc0, 0x2c], [0xc0, 0x72], [0xc0, 0x73], [0xcc, 0xa9],
-    [0xcc, 0x14], [0xc0, 0x07], [0xc0, 0x12], [0xc0, 0x13], [0xc0, 0x27],
-    [0xc0, 0x2f], [0xc0, 0x14], [0xc0, 0x28], [0xc0, 0x30], [0xc0, 0x60],
-    [0xc0, 0x61], [0xc0, 0x76], [0xc0, 0x77], [0xcc, 0xa8], [0xcc, 0x13],
-    [0xc0, 0x11], [0x00, 0x0a], [0x00, 0x2f], [0x00, 0x3c], [0xc0, 0x9c],
-    [0xc0, 0xa0], [0x00, 0x9c], [0x00, 0x35], [0x00, 0x3d], [0xc0, 0x9d],
-    [0xc0, 0xa1], [0x00, 0x9d], [0x00, 0x41], [0x00, 0xba], [0x00, 0x84],
-    [0x00, 0xc0], [0x00, 0x07], [0x00, 0x04], [0x00, 0x05],
+    [0x00, 0x16],
+    [0x00, 0x33],
+    [0x00, 0x67],
+    [0xc0, 0x9e],
+    [0xc0, 0xa2],
+    [0x00, 0x9e],
+    [0x00, 0x39],
+    [0x00, 0x6b],
+    [0xc0, 0x9f],
+    [0xc0, 0xa3],
+    [0x00, 0x9f],
+    [0x00, 0x45],
+    [0x00, 0xbe],
+    [0x00, 0x88],
+    [0x00, 0xc4],
+    [0x00, 0x9a],
+    [0xc0, 0x08],
+    [0xc0, 0x09],
+    [0xc0, 0x23],
+    [0xc0, 0xac],
+    [0xc0, 0xae],
+    [0xc0, 0x2b],
+    [0xc0, 0x0a],
+    [0xc0, 0x24],
+    [0xc0, 0xad],
+    [0xc0, 0xaf],
+    [0xc0, 0x2c],
+    [0xc0, 0x72],
+    [0xc0, 0x73],
+    [0xcc, 0xa9],
+    [0xcc, 0x14],
+    [0xc0, 0x07],
+    [0xc0, 0x12],
+    [0xc0, 0x13],
+    [0xc0, 0x27],
+    [0xc0, 0x2f],
+    [0xc0, 0x14],
+    [0xc0, 0x28],
+    [0xc0, 0x30],
+    [0xc0, 0x60],
+    [0xc0, 0x61],
+    [0xc0, 0x76],
+    [0xc0, 0x77],
+    [0xcc, 0xa8],
+    [0xcc, 0x13],
+    [0xc0, 0x11],
+    [0x00, 0x0a],
+    [0x00, 0x2f],
+    [0x00, 0x3c],
+    [0xc0, 0x9c],
+    [0xc0, 0xa0],
+    [0x00, 0x9c],
+    [0x00, 0x35],
+    [0x00, 0x3d],
+    [0xc0, 0x9d],
+    [0xc0, 0xa1],
+    [0x00, 0x9d],
+    [0x00, 0x41],
+    [0x00, 0xba],
+    [0x00, 0x84],
+    [0x00, 0xc0],
+    [0x00, 0x07],
+    [0x00, 0x04],
+    [0x00, 0x05],
 ];
 
 // ============================================================
@@ -294,16 +480,46 @@ fn ext_alpn(spec: &ProbeSpec) -> Vec<u8> {
     // jarm.py "rare" alpn vs "all" alpn protocol lists.
     let protocols: &[&[u8]] = match spec.alpn {
         Alpn::All => &[
-            b"http/0.9", b"http/1.0", b"http/1.1", b"spdy/1", b"spdy/2",
-            b"spdy/3", b"stun.turn", b"stun.nat-discovery", b"h2", b"h2c",
-            b"webrtc", b"c-webrtc", b"ftp", b"imap", b"pop3", b"managesieve",
-            b"coap", b"xmpp-client", b"xmpp-server", b"acme-tls/1",
+            b"http/0.9",
+            b"http/1.0",
+            b"http/1.1",
+            b"spdy/1",
+            b"spdy/2",
+            b"spdy/3",
+            b"stun.turn",
+            b"stun.nat-discovery",
+            b"h2",
+            b"h2c",
+            b"webrtc",
+            b"c-webrtc",
+            b"ftp",
+            b"imap",
+            b"pop3",
+            b"managesieve",
+            b"coap",
+            b"xmpp-client",
+            b"xmpp-server",
+            b"acme-tls/1",
         ],
         Alpn::Rare => &[
-            b"http/0.9", b"http/1.0", b"http/1.1", b"spdy/1", b"spdy/2",
-            b"spdy/3", b"stun.turn", b"stun.nat-discovery", b"webrtc",
-            b"c-webrtc", b"ftp", b"imap", b"pop3", b"managesieve", b"coap",
-            b"xmpp-client", b"xmpp-server", b"acme-tls/1",
+            b"http/0.9",
+            b"http/1.0",
+            b"http/1.1",
+            b"spdy/1",
+            b"spdy/2",
+            b"spdy/3",
+            b"stun.turn",
+            b"stun.nat-discovery",
+            b"webrtc",
+            b"c-webrtc",
+            b"ftp",
+            b"imap",
+            b"pop3",
+            b"managesieve",
+            b"coap",
+            b"xmpp-client",
+            b"xmpp-server",
+            b"acme-tls/1",
         ],
     };
     let mut alpn_list = Vec::new();
@@ -355,9 +571,9 @@ fn build_extensions(spec: &ProbeSpec) -> Vec<u8> {
         &[0x00, 0x0d],
         &[
             0x00, 0x20, // list length = 32
-            0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06,
-            0x04, 0x01, 0x05, 0x01, 0x06, 0x01, 0x03, 0x03, 0x03, 0x01, 0x03, 0x02,
-            0x04, 0x02, 0x05, 0x02, 0x06, 0x02, 0x02, 0x02,
+            0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01,
+            0x05, 0x01, 0x06, 0x01, 0x03, 0x03, 0x03, 0x01, 0x03, 0x02, 0x04, 0x02, 0x05, 0x02,
+            0x06, 0x02, 0x02, 0x02,
         ],
     ));
 
@@ -395,8 +611,8 @@ fn ext_supported_groups(spec: &ProbeSpec) -> Vec<u8> {
     }
     // x25519, secp256r1, x448, secp521r1, secp384r1, ffdhe2048..8192
     groups.extend_from_slice(&[
-        0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e, 0x00, 0x19, 0x00, 0x18,
-        0x01, 0x00, 0x01, 0x01, 0x01, 0x02, 0x01, 0x03, 0x01, 0x04,
+        0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e, 0x00, 0x19, 0x00, 0x18, 0x01, 0x00, 0x01, 0x01, 0x01,
+        0x02, 0x01, 0x03, 0x01, 0x04,
     ]);
     let mut ext = Vec::new();
     ext.extend_from_slice(&[0x00, 0x0a]);
@@ -538,7 +754,7 @@ impl ProbeResult {
 ///
 /// Bounds-safe: every read uses checked slicing; truncated or garbage input
 /// returns `None` rather than panicking.
-pub fn parse_server_hello(handshake: &[u8]) -> Option<ServerHello> {
+fn parse_server_hello(handshake: &[u8]) -> Option<ServerHello> {
     // Handshake header: type(1) + length(3).
     let htype = *handshake.first()?;
     if htype != 0x02 {
@@ -637,7 +853,7 @@ fn hex2(b: [u8; 2]) -> String {
 /// pairs; the last 32 chars are the first 32 hex chars of the SHA-256 of the
 /// concatenated extension-hash material. An all-empty set of probes yields the
 /// canonical all-zero JARM hash.
-pub fn build_jarm_hash(probes: &[ProbeResult]) -> String {
+fn build_jarm_hash(probes: &[ProbeResult]) -> String {
     // If every probe failed, return the canonical "no response" hash (62 zeros).
     if probes.iter().all(|p| p.cipher_and_version.is_empty()) {
         return "0".repeat(62);
@@ -835,11 +1051,7 @@ pub struct JarmReport {
 /// plus the per-probe raw results (and a JA3S derived from the first
 /// responding ServerHello). Probes run sequentially (jarm.py opens a fresh
 /// connection per probe).
-pub async fn jarm_fingerprint(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<JarmReport> {
+pub async fn jarm_fingerprint(host: &str, port: u16, timeout: Duration) -> Result<JarmReport> {
     // JA3 of the first crafted ClientHello (the handshake message sits at
     // offset 5, after the 5-byte TLS record header).
     let client_ja3 = JARM_PROBES.first().and_then(|spec| {
@@ -876,7 +1088,7 @@ pub async fn jarm_fingerprint(
 /// JA3 = `SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats`
 /// where each list is `-`-joined decimal. GREASE values are excluded by the
 /// caller (this function does not strip them — pass cleaned lists if needed).
-pub fn ja3_string(
+fn ja3_string(
     ssl_version: u16,
     ciphers: &[u16],
     extensions: &[u16],
@@ -894,12 +1106,12 @@ pub fn ja3_string(
 }
 
 /// MD5 of a JA3/JA3S string → lowercase hex (the canonical JA3 hash).
-pub fn ja3_md5(ja3_str: &str) -> String {
+fn ja3_md5(ja3_str: &str) -> String {
     format!("{:x}", md5::compute(ja3_str.as_bytes()))
 }
 
 /// Convenience: build the JA3 string and hash it in one call.
-pub fn ja3_hash(
+fn ja3_hash(
     ssl_version: u16,
     ciphers: &[u16],
     extensions: &[u16],
@@ -918,21 +1130,21 @@ pub fn ja3_hash(
 /// Build the JA3S server-hello string from raw component fields.
 ///
 /// JA3S = `SSLVersion,Cipher,Extensions` (`-`-joined decimal extension list).
-pub fn ja3s_string(ssl_version: u16, cipher: u16, extensions: &[u16]) -> String {
+fn ja3s_string(ssl_version: u16, cipher: u16, extensions: &[u16]) -> String {
     format!("{},{},{}", ssl_version, cipher, join_u16(extensions))
 }
 
 /// Build the JA3S string from a parsed [`ServerHello`] and hash it (MD5 hex).
 /// This is the entry point for callers (e.g. a raw-bytes TLS scanner) that
 /// already have the ServerHello wire bytes.
-pub fn ja3s_from_components(sh: &ServerHello) -> String {
+fn ja3s_from_components(sh: &ServerHello) -> String {
     let version = u16::from_be_bytes(sh.version);
     let cipher = u16::from_be_bytes(sh.cipher);
     ja3s_hash(version, cipher, &sh.extensions)
 }
 
 /// Convenience: build the JA3S string and hash it (MD5 hex).
-pub fn ja3s_hash(ssl_version: u16, cipher: u16, extensions: &[u16]) -> String {
+fn ja3s_hash(ssl_version: u16, cipher: u16, extensions: &[u16]) -> String {
     ja3_md5(&ja3s_string(ssl_version, cipher, extensions))
 }
 
@@ -968,7 +1180,7 @@ fn is_grease_u16(v: u16) -> bool {
 ///
 /// Exposed so a caller holding the raw ClientHello bytes (e.g. this module's
 /// own crafted probes) can report the JA3 it presents to the server.
-pub fn ja3_from_client_hello(handshake: &[u8]) -> Option<String> {
+fn ja3_from_client_hello(handshake: &[u8]) -> Option<String> {
     if *handshake.first()? != 0x01 {
         return None;
     }
@@ -1048,7 +1260,13 @@ pub fn ja3_from_client_hello(handshake: &[u8]) -> Option<String> {
         }
     }
 
-    Some(ja3_hash(version, &ciphers, &extensions, &curves, &point_formats))
+    Some(ja3_hash(
+        version,
+        &ciphers,
+        &extensions,
+        &curves,
+        &point_formats,
+    ))
 }
 
 // ============================================================
@@ -1067,12 +1285,10 @@ mod tests {
         let s = ja3_string(
             771,
             &[
-                4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49171, 49172, 156,
-                157, 47, 53,
+                4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49171, 49172, 156, 157,
+                47, 53,
             ],
-            &[
-                0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 21,
-            ],
+            &[0, 23, 65281, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 21],
             &[29, 23, 24],
             &[0],
         );
@@ -1111,7 +1327,10 @@ mod tests {
             cipher: [0xc0, 0x2f],  // 49199
             extensions: vec![65281, 16, 23],
         };
-        assert_eq!(ja3s_from_components(&sh), "4cf820cab8f5a2bf61be14f5493233ae");
+        assert_eq!(
+            ja3s_from_components(&sh),
+            "4cf820cab8f5a2bf61be14f5493233ae"
+        );
     }
 
     #[test]

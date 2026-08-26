@@ -17,17 +17,31 @@ use std::time::Duration;
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::parallel::{run_buffered, BoxFut};
+use crate::utils::parallel::{BoxFut, run_buffered};
 use crate::utils::{build_http_client, cfg_prompt_default, is_batch_mode};
 
 const S3_CONCURRENCY: usize = 4;
 
 fn banner() {
-    if is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   AWS S3 Bucket Exposure Scanner                             ║".cyan());
-    crate::mprintln!("{}", "║   Public-list / ACL / policy disclosure / takeover candidate ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   AWS S3 Bucket Exposure Scanner                             ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Public-list / ACL / policy disclosure / takeover candidate ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -41,7 +55,8 @@ pub fn info() -> ModuleInfo {
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
             "https://hackerone.com/reports/406003".to_string(),
-            "https://docs.aws.amazon.com/AmazonS3/latest/userguide/RESTAuthentication.html".to_string(),
+            "https://docs.aws.amazon.com/AmazonS3/latest/userguide/RESTAuthentication.html"
+                .to_string(),
         ],
         disclosure_date: None,
         rank: ModuleRank::Excellent,
@@ -50,7 +65,8 @@ pub fn info() -> ModuleInfo {
 }
 
 fn extract_bucket(target: &str) -> String {
-    let t = target.trim()
+    let t = target
+        .trim()
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
@@ -78,25 +94,42 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     let client = build_http_client(Duration::from_secs(10))?;
     let urls = vec![
-        ("vhost",     format!("https://{}.s3.amazonaws.com/", bucket)),
-        ("path",      format!("https://s3.amazonaws.com/{}/", bucket)),
-        ("v2-list",   format!("https://{}.s3.amazonaws.com/?list-type=2", bucket)),
-        ("acl",       format!("https://{}.s3.amazonaws.com/?acl", bucket)),
-        ("policy",    format!("https://{}.s3.amazonaws.com/?policy", bucket)),
-        ("versioning",format!("https://{}.s3.amazonaws.com/?versioning", bucket)),
-        ("logging",   format!("https://{}.s3.amazonaws.com/?logging", bucket)),
-        ("location",  format!("https://{}.s3.amazonaws.com/?location", bucket)),
+        ("vhost", format!("https://{}.s3.amazonaws.com/", bucket)),
+        ("path", format!("https://s3.amazonaws.com/{}/", bucket)),
+        (
+            "v2-list",
+            format!("https://{}.s3.amazonaws.com/?list-type=2", bucket),
+        ),
+        ("acl", format!("https://{}.s3.amazonaws.com/?acl", bucket)),
+        (
+            "policy",
+            format!("https://{}.s3.amazonaws.com/?policy", bucket),
+        ),
+        (
+            "versioning",
+            format!("https://{}.s3.amazonaws.com/?versioning", bucket),
+        ),
+        (
+            "logging",
+            format!("https://{}.s3.amazonaws.com/?logging", bucket),
+        ),
+        (
+            "location",
+            format!("https://{}.s3.amazonaws.com/?location", bucket),
+        ),
     ];
 
     // Probe all 8 URLs concurrently (up to S3_CONCURRENCY in flight).
-    let work: Vec<BoxFut<(&'static str, String, reqwest::Result<reqwest::Response>)>> =
-        urls.into_iter().map(|(label, url)| {
+    let work: Vec<BoxFut<(&'static str, String, reqwest::Result<reqwest::Response>)>> = urls
+        .into_iter()
+        .map(|(label, url)| {
             let client = client.clone();
             Box::pin(async move {
                 let resp = client.get(&url).send().await;
                 (label, url, resp)
             }) as _
-        }).collect();
+        })
+        .collect();
     let probes = run_buffered(work, S3_CONCURRENCY).await;
 
     let mut state: &str = "Unknown";
@@ -105,10 +138,18 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     for (label, url, result) in probes {
         let resp = match result {
             Ok(r) => r,
-            Err(e) => { crate::mprintln!("{}", format!("[-] {} -> {}", label, e).dimmed()); continue; }
+            Err(e) => {
+                crate::mprintln!("{}", format!("[-] {} -> {}", label, e).dimmed());
+                continue;
+            }
         };
         let status = resp.status().as_u16();
-        let body = match crate::utils::network::read_http_body_text_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+        let body = match crate::utils::network::read_http_body_text_capped(
+            resp,
+            crate::utils::safe_io::DEFAULT_BODY_CAP,
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("Failed to read response body: {}", e);
@@ -119,22 +160,49 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
         if body.contains("<Code>NoSuchBucket</Code>") {
             state = "NoSuchBucket";
-            crate::mprintln!("{}", format!("[!] {} {} -> NoSuchBucket (registration-takeover candidate)", label, url).yellow());
-            findings.push(format!("Bucket does not exist — registration-takeover candidate via {}", url));
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[!] {} {} -> NoSuchBucket (registration-takeover candidate)",
+                    label, url
+                )
+                .yellow()
+            );
+            findings.push(format!(
+                "Bucket does not exist — registration-takeover candidate via {}",
+                url
+            ));
             outcome.findings.push(Finding {
                 target: bucket.clone(),
                 kind: FindingKind::Vulnerable,
-                message: format!("S3 bucket {bucket} returns NoSuchBucket — registration-takeover candidate"),
+                message: format!(
+                    "S3 bucket {bucket} returns NoSuchBucket — registration-takeover candidate"
+                ),
                 data: None,
             });
             break;
         } else if body.contains("<Code>AccessDenied</Code>") {
             state = "AccessDenied";
-            crate::mprintln!("{}", format!("[~] {} status={} AccessDenied (bucket exists, listing locked)", label, status).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[~] {} status={} AccessDenied (bucket exists, listing locked)",
+                    label, status
+                )
+                .dimmed()
+            );
         } else if body.contains("<ListBucketResult") {
             state = "PublicList";
             let key_count = body.matches("<Key>").count();
-            crate::mprintln!("{}", format!("[!!] {} status={} PUBLIC LISTING ({} keys visible)", label, status, key_count).red().bold());
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[!!] {} status={} PUBLIC LISTING ({} keys visible)",
+                    label, status, key_count
+                )
+                .red()
+                .bold()
+            );
             findings.push(format!("Public listing on {} ({} keys)", url, key_count));
             crate::mprintln!("    {}", snippet.dimmed());
             outcome.findings.push(Finding {
@@ -144,7 +212,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 data: None,
             });
         } else if body.contains("<AccessControlPolicy>") {
-            crate::mprintln!("{}", format!("[!] {} ACL disclosed: {}", label, snippet).yellow());
+            crate::mprintln!(
+                "{}",
+                format!("[!] {} ACL disclosed: {}", label, snippet).yellow()
+            );
             findings.push(format!("ACL disclosed via {}", url));
             outcome.findings.push(Finding {
                 target: bucket.clone(),
@@ -154,9 +225,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             });
         } else if label == "policy"
             && status == 200
-            && (body.contains("\"Statement\"") || body.contains("<PolicyDocument>") || body.contains("\"Effect\""))
+            && (body.contains("\"Statement\"")
+                || body.contains("<PolicyDocument>")
+                || body.contains("\"Effect\""))
         {
-            crate::mprintln!("{}", format!("[!] {} policy disclosed: {}", label, snippet).yellow());
+            crate::mprintln!(
+                "{}",
+                format!("[!] {} policy disclosed: {}", label, snippet).yellow()
+            );
             findings.push(format!("Bucket policy disclosed via {}", url));
             outcome.findings.push(Finding {
                 target: bucket.clone(),
@@ -165,14 +241,23 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 data: None,
             });
         } else if status < 400 {
-            crate::mprintln!("{}", format!("[+] {} status={} :: {}", label, status, snippet).green());
+            crate::mprintln!(
+                "{}",
+                format!("[+] {} status={} :: {}", label, status, snippet).green()
+            );
         } else {
-            crate::mprintln!("{}", format!("[~] {} status={} :: {}", label, status, snippet).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!("[~] {} status={} :: {}", label, status, snippet).dimmed()
+            );
         }
     }
 
     crate::mprintln!();
-    crate::mprintln!("{}", format!("=== Bucket: {} ({}) ===", bucket, state).bold());
+    crate::mprintln!(
+        "{}",
+        format!("=== Bucket: {} ({}) ===", bucket, state).bold()
+    );
     if findings.is_empty() {
         crate::mprintln!("{}", "  No exposure flagged.".green());
     } else {
@@ -184,4 +269,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     Ok(outcome)
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "s3_bucket_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "s3_bucket_scanner",
+    native
+);

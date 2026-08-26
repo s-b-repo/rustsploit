@@ -6,13 +6,15 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{Result, Context};
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{
+    cfg_prompt_int_range, cfg_prompt_output_file, cfg_prompt_port, cfg_prompt_yes_no,
+};
+use anyhow::{Context, Result};
 use colored::*;
 use std::time::Duration;
 use tokio::time::timeout;
-use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
-use crate::utils::{cfg_prompt_port, cfg_prompt_yes_no, cfg_prompt_output_file, cfg_prompt_int_range};
-use crate::module_info::{ModuleInfo, ModuleRank};
 
 pub fn info() -> ModuleInfo {
     ModuleInfo {
@@ -33,11 +35,25 @@ pub fn info() -> ModuleInfo {
 }
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   NetBIOS Name Service (NBNS) Scanner                        ║".cyan());
-    crate::mprintln!("{}", "║   Discover Windows hosts via NBNS queries (UDP 137)          ║".cyan());
-    crate::mprintln!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   NetBIOS Name Service (NBNS) Scanner                        ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Discover Windows hosts via NBNS queries (UDP 137)          ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -150,13 +166,15 @@ impl std::fmt::Display for NbnsResult {
 
 impl NbnsResult {
     fn get_computer_name(&self) -> Option<&str> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .find(|e| e.suffix == 0x00 && !e.is_group)
             .map(|e| e.name.as_str())
     }
 
     fn get_domain(&self) -> Option<&str> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .find(|e| e.suffix == 0x00 && e.is_group)
             .map(|e| e.name.as_str())
     }
@@ -195,7 +213,9 @@ fn parse_nbns_response(data: &[u8], host: &str) -> Option<NbnsResult> {
 
     // Skip QTYPE (2) + QCLASS (2)
     offset = offset.checked_add(4)?;
-    if offset >= data.len() { return None; }
+    if offset >= data.len() {
+        return None;
+    }
 
     // Skip answer name (compression pointer or labels)
     if data[offset] & 0xC0 == 0xC0 {
@@ -210,7 +230,9 @@ fn parse_nbns_response(data: &[u8], host: &str) -> Option<NbnsResult> {
 
     // Skip TYPE (2) + CLASS (2) + TTL (4) = 8 bytes
     offset = offset.checked_add(8)?;
-    if offset + 2 > data.len() { return None; }
+    if offset + 2 > data.len() {
+        return None;
+    }
 
     // RDLENGTH
     let rdlength = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
@@ -252,7 +274,9 @@ fn parse_nbns_response(data: &[u8], host: &str) -> Option<NbnsResult> {
     let mac = if offset.checked_add(6).is_some_and(|end| end <= data.len()) {
         let mut s = String::with_capacity(17);
         for i in 0..6 {
-            if i > 0 { s.push(':'); }
+            if i > 0 {
+                s.push(':');
+            }
             let pair = crate::native::hex::byte_to_upper(data[offset + i]);
             s.push(pair[0] as char);
             s.push(pair[1] as char);
@@ -277,7 +301,9 @@ async fn query_nbns(
 ) -> Result<Option<NbnsResult>> {
     let packet = build_nbns_query();
 
-    socket.send_to(&packet, addr).await
+    socket
+        .send_to(&packet, addr)
+        .await
         .context("Failed to send NBNS query")?;
 
     let mut buf = [0u8; 4096];
@@ -286,8 +312,14 @@ async fn query_nbns(
             let host = addr.split(':').next().unwrap_or(addr);
             Ok(parse_nbns_response(&buf[..n], host))
         }
-        Ok(Err(e)) => { tracing::debug!("NBNS recv error: {e}"); Ok(None) }
-        Err(e) => { tracing::debug!("timeout: {e}"); Ok(None) }
+        Ok(Err(e)) => {
+            tracing::debug!("NBNS recv error: {e}");
+            Ok(None)
+        }
+        Err(e) => {
+            tracing::debug!("timeout: {e}");
+            Ok(None)
+        }
     }
 }
 
@@ -304,14 +336,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     let port = cfg_prompt_port("port", "NBNS port", 137).await?;
-    let timeout_secs = cfg_prompt_int_range("timeout", "Query timeout (seconds)", 3, 1, 15).await? as u64;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Query timeout (seconds)", 5, 1, 300).await? as u64;
     let retries = cfg_prompt_int_range("retries", "Number of retries", 2, 1, 5).await? as u32;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", false).await?;
 
     let timeout_dur = Duration::from_secs(timeout_secs);
     let addr = format!("{}:{}", target, port);
 
-    let socket = crate::utils::udp_bind(None).await
+    let socket = crate::utils::udp_bind(None)
+        .await
         .context("Failed to bind UDP socket")?;
 
     crate::mprintln!();
@@ -321,7 +355,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     for attempt in 1..=retries {
         if retries > 1 {
-            crate::mprintln!("{}", format!("  [*] Attempt {}/{}", attempt, retries).dimmed());
+            crate::mprintln!(
+                "{}",
+                format!("  [*] Attempt {}/{}", attempt, retries).dimmed()
+            );
         }
 
         ctx.rate_limit(target).await;
@@ -361,19 +398,30 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             crate::mprintln!("  {}", format!("MAC Address:    {}", r.mac_address).green());
 
             if r.mac_address == "00:00:00:00:00:00" {
-                crate::mprintln!("  {}", "[*] Null MAC may indicate Samba/non-Windows NBNS".dimmed());
+                crate::mprintln!(
+                    "  {}",
+                    "[*] Null MAC may indicate Samba/non-Windows NBNS".dimmed()
+                );
             }
 
             crate::mprintln!();
             crate::mprintln!("  {}", "NetBIOS Name Table:".bold());
-            crate::mprintln!("  {:<20} {:<6} {:<8} {}", "Name", "Suffix", "Type", "Service");
+            crate::mprintln!(
+                "  {:<20} {:<6} {:<8} {}",
+                "Name",
+                "Suffix",
+                "Type",
+                "Service"
+            );
             crate::mprintln!("  {}", "-".repeat(60));
 
             for entry in &r.entries {
                 let type_str = if entry.is_group { "GROUP" } else { "UNIQUE" };
                 let service = nbns_suffix_name(entry.suffix);
-                let line = format!("  {:<20} 0x{:02X}   {:<8} {}",
-                    entry.name, entry.suffix, type_str, service);
+                let line = format!(
+                    "  {:<20} 0x{:02X}   {:<8} {}",
+                    entry.name, entry.suffix, type_str, service
+                );
 
                 if entry.suffix == 0x20 {
                     crate::mprintln!("{}", line.green()); // File server
@@ -386,7 +434,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
             // Check for interesting services
             let has_file_server = r.entries.iter().any(|e| e.suffix == 0x20);
-            let has_dc = r.entries.iter().any(|e| e.suffix == 0x1C || e.suffix == 0x1B);
+            let has_dc = r
+                .entries
+                .iter()
+                .any(|e| e.suffix == 0x1C || e.suffix == 0x1B);
 
             crate::mprintln!();
             if has_file_server {
@@ -422,35 +473,50 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             crate::mprintln!("  {}", "No response received.".dimmed());
             crate::mprintln!();
             crate::mprintln!("{}", "[-] Host did not respond to NBNS query.".yellow());
-            crate::mprintln!("{}", "    Possible reasons: host down, filtered, or not running NetBIOS.".dimmed());
+            crate::mprintln!(
+                "{}",
+                "    Possible reasons: host down, filtered, or not running NetBIOS.".dimmed()
+            );
         }
     }
 
-    if save_results
-        && let Some(r) = &result {
-            let default_name = format!("nbns_scan_results_{}.txt", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
-            let output_path = cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
-            let mut content = format!("NBNS Scan Results - {}\n\n", addr);
-            content.push_str(&format!("MAC: {}\n", r.mac_address));
-            if let Some(name) = r.get_computer_name() {
-                content.push_str(&format!("Computer: {}\n", name));
-            }
-            if let Some(domain) = r.get_domain() {
-                content.push_str(&format!("Domain: {}\n", domain));
-            }
-            content.push_str("\nName Table:\n");
-            for entry in &r.entries {
-                let type_str = if entry.is_group { "GROUP" } else { "UNIQUE" };
-                content.push_str(&format!("  {} 0x{:02X} {} {}\n",
-                    entry.name, entry.suffix, type_str, nbns_suffix_name(entry.suffix)));
-            }
-            tokio::fs::write(&output_path, content).await
-                .with_context(|| format!("Failed to write results to {}", output_path))?;
-            if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
-                crate::meprintln!("[!] Failed to set file permissions: {}", e);
-            }
-            crate::mprintln!("{}", format!("[+] Results saved to '{}'", output_path).green());
+    if save_results && let Some(r) = &result {
+        let default_name = format!(
+            "nbns_scan_results_{}.txt",
+            target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+        );
+        let output_path =
+            cfg_prompt_output_file("output_file", "Output file", &default_name).await?;
+        let mut content = format!("NBNS Scan Results - {}\n\n", addr);
+        content.push_str(&format!("MAC: {}\n", r.mac_address));
+        if let Some(name) = r.get_computer_name() {
+            content.push_str(&format!("Computer: {}\n", name));
         }
+        if let Some(domain) = r.get_domain() {
+            content.push_str(&format!("Domain: {}\n", domain));
+        }
+        content.push_str("\nName Table:\n");
+        for entry in &r.entries {
+            let type_str = if entry.is_group { "GROUP" } else { "UNIQUE" };
+            content.push_str(&format!(
+                "  {} 0x{:02X} {} {}\n",
+                entry.name,
+                entry.suffix,
+                type_str,
+                nbns_suffix_name(entry.suffix)
+            ));
+        }
+        tokio::fs::write(&output_path, content)
+            .await
+            .with_context(|| format!("Failed to write results to {}", output_path))?;
+        if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
+            crate::meprintln!("[!] Failed to set file permissions: {}", e);
+        }
+        crate::mprintln!(
+            "{}",
+            format!("[+] Results saved to '{}'", output_path).green()
+        );
+    }
 
     Ok(outcome)
 }

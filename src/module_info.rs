@@ -20,6 +20,7 @@ pub struct ModuleInfo {
 
 /// Reliability/safety rank for modules (inspired by Metasploit ranking).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ModuleRank {
     /// Reliable, no crash risk
     Excellent,
@@ -51,13 +52,26 @@ impl std::fmt::Display for ModuleRank {
 /// Pretty-print module info to the console.
 pub fn display_module_info(module_path: &str, info: &ModuleInfo) {
     println!();
-    println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║                       Module Information                      ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    println!(
+        "{}",
+        "║                       Module Information                      ║".cyan()
+    );
+    println!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
     println!();
     println!("  {:<16} {}", "Path:".bold(), module_path);
     println!("  {:<16} {}", "Name:".bold(), info.name);
-    println!("  {:<16} {}", "Rank:".bold(), format!("{}", info.rank).green());
+    println!(
+        "  {:<16} {}",
+        "Rank:".bold(),
+        format!("{}", info.rank).green()
+    );
     if let Some(ref date) = info.disclosure_date {
         println!("  {:<16} {}", "Disclosed:".bold(), date);
     }
@@ -82,4 +96,3 @@ pub fn display_module_info(module_path: &str, info: &ModuleInfo) {
         println!();
     }
 }
-

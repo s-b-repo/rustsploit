@@ -82,15 +82,16 @@ pub fn normalize_target(raw: &str) -> Result<String> {
 
     // Try to parse as URL first
     if let Ok(url) = Url::parse(trimmed)
-        && let Some(host) = url.host_str() {
-            let port = url.port().unwrap_or(0);
-            let normalized = if port > 0 {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            return normalize_target(&normalized);
-        }
+        && let Some(host) = url.host_str()
+    {
+        let port = url.port().unwrap_or(0);
+        let normalized = if port > 0 {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        return normalize_target(&normalized);
+    }
 
     // Basic sanitization
     let sanitized: String = trimmed
@@ -204,26 +205,27 @@ pub fn normalize_target(raw: &str) -> Result<String> {
 
     // IPv4 or hostname with port
     if sanitized.contains(':')
-        && let Some(colon_pos) = sanitized.rfind(':') {
-            let host_part = &sanitized[..colon_pos];
-            let port_str = &sanitized[colon_pos + 1..];
-            if port_str.is_empty() {
-                return Err(anyhow!("Invalid port format: missing port number"));
-            }
-            let port: u16 = port_str
-                .parse()
-                .map_err(|e| anyhow!("Invalid port number: '{}': {e}", port_str))?;
-            if port == 0 {
-                return Err(anyhow!("Port cannot be 0"));
-            }
-            if host_part.is_empty() {
-                return Err(anyhow!("Invalid target: empty hostname/IP"));
-            }
-            if !is_valid_hostname_or_ipv4(host_part) {
-                return Err(anyhow!("Invalid hostname or IPv4 address: '{}'", host_part));
-            }
-            return Ok(format!("{}:{}", host_part, port));
+        && let Some(colon_pos) = sanitized.rfind(':')
+    {
+        let host_part = &sanitized[..colon_pos];
+        let port_str = &sanitized[colon_pos + 1..];
+        if port_str.is_empty() {
+            return Err(anyhow!("Invalid port format: missing port number"));
         }
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| anyhow!("Invalid port number: '{}': {e}", port_str))?;
+        if port == 0 {
+            return Err(anyhow!("Port cannot be 0"));
+        }
+        if host_part.is_empty() {
+            return Err(anyhow!("Invalid target: empty hostname/IP"));
+        }
+        if !is_valid_hostname_or_ipv4(host_part) {
+            return Err(anyhow!("Invalid hostname or IPv4 address: '{}'", host_part));
+        }
+        return Ok(format!("{}:{}", host_part, port));
+    }
 
     // No port
     if sanitized.contains(' ') {
@@ -260,7 +262,10 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
         Lazy::new(|| Regex::new(r"^[a-zA-Z0-9.\-_]+$"));
     let re = match &*HOST_RE {
         Ok(re) => re,
-        Err(e) => { tracing::error!("HOST_RE failed to compile: {e}"); return false; }
+        Err(e) => {
+            tracing::error!("HOST_RE failed to compile: {e}");
+            return false;
+        }
     };
     if !re.is_match(host) {
         return false;
@@ -296,7 +301,7 @@ fn is_valid_hostname_or_ipv4(host: &str) -> bool {
 // ============================================================
 
 /// Resolve a domain name to its first IP address.
-pub fn resolve_domain(domain: &str) -> Result<String> {
+fn resolve_domain(domain: &str) -> Result<String> {
     let lookup = format!("{}:0", domain);
     let mut addrs = lookup
         .to_socket_addrs()
@@ -308,7 +313,7 @@ pub fn resolve_domain(domain: &str) -> Result<String> {
 }
 
 /// Resolve a domain and return all IPs.
-pub fn resolve_domain_all(domain: &str) -> Result<Vec<String>> {
+fn resolve_domain_all(domain: &str) -> Result<Vec<String>> {
     let lookup = format!("{}:0", domain);
     let addrs: Vec<String> = lookup
         .to_socket_addrs()
@@ -326,9 +331,19 @@ pub fn is_domain(input: &str) -> bool {
     let trimmed = input.trim();
     // Strip protocol prefix if present
     let host = if let Some(rest) = trimmed.strip_prefix("https://") {
-        rest.split('/').next().unwrap_or(rest).split(':').next().unwrap_or(rest)
+        rest.split('/')
+            .next()
+            .unwrap_or(rest)
+            .split(':')
+            .next()
+            .unwrap_or(rest)
     } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        rest.split('/').next().unwrap_or(rest).split(':').next().unwrap_or(rest)
+        rest.split('/')
+            .next()
+            .unwrap_or(rest)
+            .split(':')
+            .next()
+            .unwrap_or(rest)
     } else {
         trimmed.split(':').next().unwrap_or(trimmed)
     };
@@ -348,7 +363,8 @@ pub fn is_domain(input: &str) -> bool {
 /// Asks user for protocol (http/https) and optional custom port,
 /// then resolves the domain and returns (resolved_target, full_url).
 pub async fn prompt_domain_target(domain: &str) -> Result<(String, String)> {
-    let clean_domain = domain.trim()
+    let clean_domain = domain
+        .trim()
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .split('/')
@@ -363,7 +379,10 @@ pub async fn prompt_domain_target(domain: &str) -> Result<(String, String)> {
         return Err(anyhow!("Domain cannot be empty"));
     }
 
-    crate::mprintln!("{}", format!("[*] Domain target detected: {}", clean_domain).cyan());
+    crate::mprintln!(
+        "{}",
+        format!("[*] Domain target detected: {}", clean_domain).cyan()
+    );
 
     // Resolve domain
     match resolve_domain_all(clean_domain) {
@@ -372,7 +391,10 @@ pub async fn prompt_domain_target(domain: &str) -> Result<(String, String)> {
         }
         Err(e) => {
             crate::mprintln!("{}", format!("[!] DNS resolution failed: {}", e).red());
-            crate::mprintln!("{}", "[*] Continuing with domain name (some modules may fail)".yellow());
+            crate::mprintln!(
+                "{}",
+                "[*] Continuing with domain name (some modules may fail)".yellow()
+            );
         }
     }
 
@@ -422,7 +444,10 @@ pub async fn prompt_domain_target(domain: &str) -> Result<(String, String)> {
         match resolve_domain(clean_domain) {
             Ok(ip) => ip,
             Err(e) => {
-                crate::mprintln!("{}", format!("[!] Resolution failed ({e}), using domain name").yellow());
+                crate::mprintln!(
+                    "{}",
+                    format!("[!] Resolution failed ({e}), using domain name").yellow()
+                );
                 clean_domain.to_string()
             }
         }
@@ -483,4 +508,3 @@ pub fn extract_ip_from_target(target: &str) -> Option<String> {
     }
     Some(trimmed.to_string())
 }
-

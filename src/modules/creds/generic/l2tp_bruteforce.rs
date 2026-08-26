@@ -9,13 +9,13 @@
 //! implemented — operators should use a dedicated tool (e.g. `ike-scan`,
 //! `xl2tpd-attack`).
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 1701;
 
@@ -39,7 +39,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("l2tp_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("l2tp_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -61,23 +64,26 @@ async fn detect(host: &str, port: u16, timeout: Duration) -> LoginResult {
     use std::net::IpAddr;
     let ip: IpAddr = match host.parse() {
         Ok(ip) => ip,
-        Err(e) => { tracing::debug!("parse IP failed: {e}"); match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
-            Ok(mut iter) => match iter.next() {
-                Some(sa) => sa.ip(),
-                None => {
-                    return LoginResult::Error {
-                        message: "no DNS results".to_string(),
-                        retryable: false,
+        Err(e) => {
+            tracing::debug!("parse IP failed: {e}");
+            match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                Ok(mut iter) => match iter.next() {
+                    Some(sa) => sa.ip(),
+                    None => {
+                        return LoginResult::Error {
+                            message: "no DNS results".to_string(),
+                            retryable: false,
+                        };
                     }
-                }
-            },
-            Err(e) => {
-                return LoginResult::Error {
-                    message: format!("dns: {e}"),
-                    retryable: false,
+                },
+                Err(e) => {
+                    return LoginResult::Error {
+                        message: format!("dns: {e}"),
+                        retryable: false,
+                    };
                 }
             }
-        } }
+        }
     };
 
     let sock = match crate::utils::udp_bind(Some(ip)).await {
@@ -86,7 +92,7 @@ async fn detect(host: &str, port: u16, timeout: Duration) -> LoginResult {
             return LoginResult::Error {
                 message: format!("bind: {e}"),
                 retryable: false,
-            }
+            };
         }
     };
 
@@ -105,9 +111,12 @@ async fn detect(host: &str, port: u16, timeout: Duration) -> LoginResult {
             return LoginResult::Error {
                 message: format!("recv: {e}"),
                 retryable: true,
-            }
+            };
         }
-        Err(e) => { tracing::debug!("timeout: {e}"); return LoginResult::AuthFailed }
+        Err(e) => {
+            tracing::debug!("timeout: {e}");
+            return LoginResult::AuthFailed;
+        }
     };
     // L2TPv2 control packet: byte 0 has T (control) + L (length present) bits set
     // (0xC0), and byte 1's low nibble is the protocol version (2). Requiring the
@@ -167,4 +176,8 @@ fn avp_mandatory(vendor: u16, attribute: u16, value: &[u8]) -> Vec<u8> {
     avp
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/l2tp_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/l2tp_bruteforce",
+    native
+);

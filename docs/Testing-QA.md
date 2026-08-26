@@ -19,7 +19,7 @@ cargo clippy
 cargo check
 ```
 
-A clean `cargo check` with **0 errors** is required. The current codebase (363 modules) compiles with legacy warnings from mid-migration modules — see the Changelog for the running count.
+A clean `cargo check` with **0 errors** is required. The current codebase (389 modules) compiles with legacy warnings from mid-migration modules — see the Changelog for the running count.
 
 ---
 
@@ -31,7 +31,7 @@ cargo build
 
 Modules self-register via `register_native_module!` at compile time using
 the `inventory` crate — there is no `build.rs` codegen (removed in v0.5.6).
-All 363 modules are auto-discovered at link time. If a new module fails to
+All 389 modules are auto-discovered at link time. If a new module fails to
 register, ensure `pub mod your_module;` is present in the sibling `mod.rs`.
 
 ---
@@ -161,4 +161,4 @@ curl http://localhost:8080/health
 
 | Module | Status | Reason |
 |--------|--------|--------|
-| `scanners/dns_recursion` | ✅ Fixed | Rewritten for hickory-client v0.25 (`AsyncClient` → `Client`, builder pattern + `TokioRuntimeProvider`) |
+| `scanners/dns_recursion` | ✅ Fixed | Rewritten for hickory-client v0.26 (`AsyncClient` → `Client`, builder pattern + `TokioRuntimeProvider`) |

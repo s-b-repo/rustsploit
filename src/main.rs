@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::process;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use colored::*;
 use tracing_subscriber::EnvFilter;
@@ -19,9 +19,9 @@ mod utils;
 
 pub mod checkpoint;
 pub mod cred_store;
+pub mod database;
 pub mod events;
 pub mod exclusions;
-pub mod tenant;
 pub mod export;
 pub mod global_options;
 pub mod jobs;
@@ -29,21 +29,25 @@ pub mod loot;
 pub mod mcp;
 pub mod module;
 pub mod module_info;
+pub mod nmap_import;
 pub mod output;
+pub mod output_stream;
 pub mod pq_channel;
 pub mod pq_middleware;
 pub mod prescan;
+pub mod profiles;
 pub mod rate_limit;
-pub mod scheduler;
-pub mod spool;
 pub mod results_sink;
+pub mod scheduler;
+pub mod sessions;
+pub mod socks;
+pub mod spool;
+pub mod tenant;
 pub mod workspace;
 pub mod ws;
 
-
 /// Maximum length for interface/bind address
 const MAX_BIND_ADDRESS_LENGTH: usize = 128;
-
 
 /// Validates the bind address format
 fn validate_bind_address(addr: &str) -> Result<String> {
@@ -53,7 +57,10 @@ fn validate_bind_address(addr: &str) -> Result<String> {
         return Err(anyhow!("Bind address cannot be empty"));
     }
     if trimmed.len() > MAX_BIND_ADDRESS_LENGTH {
-        return Err(anyhow!("Bind address too long (max {} characters)", MAX_BIND_ADDRESS_LENGTH));
+        return Err(anyhow!(
+            "Bind address too long (max {} characters)",
+            MAX_BIND_ADDRESS_LENGTH
+        ));
     }
     if trimmed.chars().any(|c| c.is_control()) {
         return Err(anyhow!("Bind address cannot contain control characters"));
@@ -80,7 +87,9 @@ fn pq_host_key_path(custom: Option<&str>) -> std::path::PathBuf {
         // Refuse to fall back to CWD for security-sensitive key material —
         // CWD may be world-readable or an attacker-controlled directory.
         let home = home::home_dir().unwrap_or_else(|| {
-            eprintln!("[!] $HOME not set — PQ host key will use /tmp/.rustsploit (insecure fallback)");
+            eprintln!(
+                "[!] $HOME not set — PQ host key will use /tmp/.rustsploit (insecure fallback)"
+            );
             std::path::PathBuf::from("/tmp")
         });
         home.join(".rustsploit").join("pq_host_key")
@@ -100,6 +109,11 @@ fn pq_authorized_keys_path(custom: Option<&str>) -> std::path::PathBuf {
     }
 }
 
+// The main runtime stays multi-thread. io_uring (feature = "io_uring") runs on
+// its own dedicated thread via `utils::uring_connect`, NOT by swapping this
+// runtime to tokio-uring's current-thread model — see
+// docs/perf/io_uring-migration-plan.md for why (tokio-uring's !Send I/O types
+// are incompatible with the Send-based Module dispatch).
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -150,9 +164,15 @@ async fn run() -> Result<()> {
     if cli_args.gen_module_catalog {
         let md = module::render_catalog_markdown();
         let out = std::path::Path::new("docs/Module-Catalog.md");
-        tokio::fs::write(out, md).await.context("Failed to write docs/Module-Catalog.md")?;
-        println!("{} Wrote {} ({} modules)",
-            "✓".green(), out.display(), module::count());
+        tokio::fs::write(out, md)
+            .await
+            .context("Failed to write docs/Module-Catalog.md")?;
+        println!(
+            "{} Wrote {} ({} modules)",
+            "✓".green(),
+            out.display(),
+            module::count()
+        );
         return Ok(());
     }
 
@@ -180,7 +200,10 @@ async fn run() -> Result<()> {
         let host_key_path = pq_host_key_path(cli_args.pq_host_key.as_deref());
         let auth_keys_path = pq_authorized_keys_path(cli_args.pq_authorized_keys.as_deref());
 
-        let interface = cli_args.interface.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        let interface = cli_args
+            .interface
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         let bind_address = validate_bind_address(&interface).context("Invalid bind address")?;
 
         tracing::debug!("Starting PQ-encrypted API server on {}...", bind_address);
@@ -204,9 +227,10 @@ async fn run() -> Result<()> {
 
     // Validate target if provided
     if let Some(ref target) = cli_args.target
-        && let Err(e) = utils::normalize_target(target) {
-            return Err(anyhow!("Invalid target '{}': {}", target, e));
-        }
+        && let Err(e) = utils::normalize_target(target)
+    {
+        return Err(anyhow!("Invalid target '{}': {}", target, e));
+    }
 
     // Set global target if provided
     if let Some(ref target) = cli_args.set_target {
@@ -225,12 +249,18 @@ async fn run() -> Result<()> {
         if let Some(ref target) = cli_args.target {
             tracing::debug!("Running module '{}' against '{}'", module, target);
             commands::run_module(module, target, cli_args.verbose).await?;
-        } else if config::GLOBAL_CONFIG.has_target() {
-            let target = config::GLOBAL_CONFIG.get_target().unwrap_or_default();
-            tracing::debug!("Running module '{}' against global target '{}'", module, target);
+        } else if let Some(target) = config::GLOBAL_CONFIG.get_target() {
+            tracing::debug!(
+                "Running module '{}' against global target '{}'",
+                module,
+                target
+            );
             commands::run_module(module, &target, cli_args.verbose).await?;
         } else {
-            eprintln!("{}", "⚠ Warning: --module specified without --target. Launching shell...".yellow());
+            eprintln!(
+                "{}",
+                "⚠ Warning: --module specified without --target. Launching shell...".yellow()
+            );
             tracing::debug!("Launching interactive shell...");
             if let Some(ref rc) = cli_args.resource {
                 shell::interactive_shell_with_resource(cli_args.verbose, Some(rc)).await?;

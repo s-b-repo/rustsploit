@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ipnetwork::IpNetwork;
 use regex::Regex;
 
@@ -19,6 +19,7 @@ pub struct GlobalConfig {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum TargetConfig {
     /// Single IP address or hostname
     Single(String),
@@ -39,12 +40,12 @@ impl GlobalConfig {
     /// Set the global target (IP, hostname, or CIDR subnet)
     pub fn set_target(&self, target: &str) -> Result<()> {
         let trimmed = target.trim();
-        
+
         // Basic validation
         if trimmed.is_empty() {
             return Err(anyhow!("Target cannot be empty"));
         }
-        
+
         // Length check
         if trimmed.len() > MAX_TARGET_LENGTH {
             return Err(anyhow!(
@@ -52,7 +53,7 @@ impl GlobalConfig {
                 MAX_TARGET_LENGTH
             ));
         }
-        
+
         // Check for control characters
         if trimmed.chars().any(|c| c.is_control()) {
             return Err(anyhow!("Target cannot contain control characters"));
@@ -61,7 +62,10 @@ impl GlobalConfig {
         // Mass scan keyword: "random" — store as-is. "0.0.0.0/0" is handled
         // below as a CIDR subnet.
         if trimmed == "random" {
-            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
             return Ok(());
         }
@@ -75,7 +79,10 @@ impl GlobalConfig {
             let net: IpNetwork = "0.0.0.0/0"
                 .parse()
                 .map_err(|e| anyhow!("internal: failed to parse 0.0.0.0/0 as a network: {e}"))?;
-            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Subnet(net));
             return Ok(());
         }
@@ -90,7 +97,10 @@ impl GlobalConfig {
                 || lower.starts_with("seq:")
                 || lower.starts_with("sequential:")
             {
-                let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+                let mut target_guard = self
+                    .target
+                    .write()
+                    .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
                 *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
                 return Ok(());
             }
@@ -102,7 +112,8 @@ impl GlobalConfig {
         let path = std::path::Path::new(trimmed);
         if path.exists() && path.is_file() {
             // Resolve to canonical path (eliminates .., symlinks, etc.)
-            let canonical = path.canonicalize()
+            let canonical = path
+                .canonicalize()
                 .with_context(|| format!("Failed to resolve file path '{}'", trimmed))?;
             let canonical_str = canonical.to_string_lossy().to_string();
             if canonical_str.len() > MAX_TARGET_LENGTH {
@@ -111,14 +122,19 @@ impl GlobalConfig {
                     MAX_TARGET_LENGTH
                 ));
             }
-            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Single(canonical_str));
             return Ok(());
         }
 
         // Check for path traversal attempts (only for non-file targets)
         if trimmed.contains("..") || trimmed.contains("//") {
-            return Err(anyhow!("Target contains invalid characters (path traversal)"));
+            return Err(anyhow!(
+                "Target contains invalid characters (path traversal)"
+            ));
         }
 
         // Comma-separated multi-target: "10.0.0.1, 192.168.1.0/24, example.com"
@@ -149,7 +165,10 @@ impl GlobalConfig {
                     Self::validate_hostname_or_ip(t)?;
                 }
             }
-            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Multi(targets));
             return Ok(());
         }
@@ -167,7 +186,10 @@ impl GlobalConfig {
         {
             // No size limit enforced here - user can set 0.0.0.0/0 if they want.
             // Consumers (looping logic) must handle large subnets responsibly (e.g. via iterators).
-            let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
             *target_guard = Some(TargetConfig::Subnet(network));
             return Ok(());
         }
@@ -176,11 +198,14 @@ impl GlobalConfig {
         Self::validate_hostname_or_ip(trimmed)?;
 
         // Otherwise, treat as single IP or hostname
-        let mut target_guard = self.target.write().map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+        let mut target_guard = self
+            .target
+            .write()
+            .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
         *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
         Ok(())
     }
-    
+
     /// Validates a hostname or IP address format
     fn validate_hostname_or_ip(target: &str) -> Result<()> {
         // Length check for hostname
@@ -190,7 +215,7 @@ impl GlobalConfig {
                 MAX_HOSTNAME_LENGTH
             ));
         }
-        
+
         // Check for valid characters
         // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
         // Use OnceCell::get_or_try_init so a (theoretically impossible)
@@ -207,19 +232,19 @@ impl GlobalConfig {
                 "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"
             ));
         }
-        
+
         // Basic hostname format check (not starting/ending with special chars)
         if target.starts_with('.') || target.starts_with('-') {
             return Err(anyhow!("Target cannot start with '.' or '-'"));
         }
-        
+
         // A single trailing dot (FQDN root label, e.g. "example.com.") is
         // allowed implicitly; consecutive dots are rejected just below.
         // Check for consecutive dots (invalid in hostnames)
         if target.contains("..") {
             return Err(anyhow!("Target cannot contain consecutive dots"));
         }
-        
+
         Ok(())
     }
 
@@ -235,12 +260,26 @@ impl GlobalConfig {
 
     /// Check if global target is set
     pub fn has_target(&self) -> bool {
-        self.target.read().map(|g| g.is_some()).unwrap_or(false)
+        // Recover from poisoning (same policy as get_target) instead of
+        // reporting "no target" — a poisoned lock must not silently make the
+        // framework forget the operator's target.
+        self.target
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Check if global target is a subnet
     pub fn is_subnet(&self) -> bool {
-        self.target.read().map(|g| matches!(g.as_ref(), Some(TargetConfig::Subnet(_)) | Some(TargetConfig::Multi(_)))).unwrap_or(false)
+        self.target
+            .read()
+            .map(|g| {
+                matches!(
+                    g.as_ref(),
+                    Some(TargetConfig::Subnet(_)) | Some(TargetConfig::Multi(_))
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Get the size of the target (number of IPs)
@@ -250,9 +289,7 @@ impl GlobalConfig {
         let target_guard = self.target.read().unwrap_or_else(|e| e.into_inner());
         match target_guard.as_ref() {
             Some(TargetConfig::Single(_)) => Some(1),
-            Some(TargetConfig::Subnet(net)) => {
-                Some(Self::network_size(net))
-            }
+            Some(TargetConfig::Subnet(net)) => Some(Self::network_size(net)),
             Some(TargetConfig::Multi(targets)) => {
                 let mut total = 0u64;
                 for t in targets {
@@ -289,7 +326,11 @@ impl GlobalConfig {
         match net {
             IpNetwork::V4(net4) => {
                 let prefix = net4.prefix() as u32;
-                if prefix >= 32 { 1u64 } else { 2u64.pow(32 - prefix) }
+                if prefix >= 32 {
+                    1u64
+                } else {
+                    2u64.pow(32 - prefix)
+                }
             }
             IpNetwork::V6(net6) => {
                 let prefix = net6.prefix() as u32;
@@ -399,9 +440,8 @@ impl ModuleConfig {
 }
 
 /// Global module config instance (API-provided configuration)
-pub static MODULE_CONFIG: Lazy<Arc<RwLock<ModuleConfig>>> = Lazy::new(|| {
-    Arc::new(RwLock::new(ModuleConfig::new()))
-});
+pub static MODULE_CONFIG: Lazy<Arc<RwLock<ModuleConfig>>> =
+    Lazy::new(|| Arc::new(RwLock::new(ModuleConfig::new())));
 
 /// Get a clone of the current module config.
 /// Checks the task-local RunContext first (for concurrent API runs),
@@ -413,9 +453,7 @@ pub fn get_module_config() -> ModuleConfig {
         return config;
     }
     // Fallback to global (for CLI/shell mode)
-    MODULE_CONFIG.read()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    MODULE_CONFIG.read().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Get the per-request target from the task-local RunContext, if set.
@@ -434,8 +472,16 @@ pub fn results_dir() -> std::path::PathBuf {
         .join("results");
     if !dir.exists() {
         use std::os::unix::fs::DirBuilderExt;
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir) {
-            eprintln!("[!] Failed to create results directory {}: {}", dir.display(), e);
+        if let Err(e) = std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+        {
+            eprintln!(
+                "[!] Failed to create results directory {}: {}",
+                dir.display(),
+                e
+            );
         }
     }
     dir

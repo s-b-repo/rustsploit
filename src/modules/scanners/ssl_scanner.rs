@@ -6,8 +6,8 @@
 //!
 //! For authorized penetration testing only.
 
-use anyhow::{anyhow, Context, Result};
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,9 +33,10 @@ const DEFAULT_TIMEOUT_SECS: i64 = 10;
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "SSL/TLS Certificate Scanner".into(),
-        description: "Analyzes SSL/TLS certificates and configuration. Detects expired certificates, \
+        description:
+            "Analyzes SSL/TLS certificates and configuration. Detects expired certificates, \
             self-signed certs, weak ciphers, and misconfigurations."
-            .into(),
+                .into(),
         authors: vec!["rustsploit contributors".into()],
         references: vec![],
         disclosure_date: None,
@@ -131,7 +132,8 @@ fn read_der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         }
         let mut len: usize = 0;
         for i in 0..num_bytes {
-            len = len.checked_mul(256)
+            len = len
+                .checked_mul(256)
                 .and_then(|l| l.checked_add(data[2 + i] as usize))?;
         }
         (len, 2 + num_bytes)
@@ -409,7 +411,9 @@ fn parse_certificate(der: &[u8]) -> Option<CertInfo> {
         let serial = &tbs_items[idx].1;
         let mut out = String::with_capacity(serial.len() * 3);
         for (i, &b) in serial.iter().enumerate() {
-            if i > 0 { out.push(':'); }
+            if i > 0 {
+                out.push(':');
+            }
             let pair = crate::native::hex::byte_to_upper(b);
             out.push(pair[0] as char);
             out.push(pair[1] as char);
@@ -462,12 +466,11 @@ fn parse_certificate(der: &[u8]) -> Option<CertInfo> {
     while idx < tbs_items.len() {
         if tbs_items[idx].0 == 0xa3 {
             // Extensions wrapper: SEQUENCE of Extension
-            let ext_seq_data =
-                if let Some((0x30, content, _)) = read_der_tlv(&tbs_items[idx].1) {
-                    content
-                } else {
-                    &tbs_items[idx].1
-                };
+            let ext_seq_data = if let Some((0x30, content, _)) = read_der_tlv(&tbs_items[idx].1) {
+                content
+            } else {
+                &tbs_items[idx].1
+            };
             let extensions = parse_sequence_items(ext_seq_data);
             for (_etag, ext_content) in &extensions {
                 let ext_items = parse_sequence_items(ext_content);
@@ -540,11 +543,7 @@ fn format_tls_version(version: rustls::ProtocolVersion) -> String {
 }
 
 /// Connect to a target, perform TLS handshake, and extract certificate + connection info.
-async fn scan_target(
-    host: &str,
-    port: u16,
-    timeout_secs: u64,
-) -> Result<SslScanResult> {
+async fn scan_target(host: &str, port: u16, timeout_secs: u64) -> Result<SslScanResult> {
     let (verifier, captured_certs) = CertCaptureVerifier::new();
 
     let config = ClientConfig::builder()
@@ -556,16 +555,17 @@ async fn scan_target(
 
     // TCP connect with timeout — also honors `setg src_port`.
     let addr = format!("{}:{}", host, port);
-    let tcp_stream = crate::utils::network::tcp_connect_str(
-        &addr,
-        Duration::from_secs(timeout_secs),
-    )
-    .await
-    .context("TCP connection failed")?;
+    let tcp_stream =
+        crate::utils::network::tcp_connect_str(&addr, Duration::from_secs(timeout_secs))
+            .await
+            .context("TCP connection failed")?;
 
     // Build server name — for IP addresses, use the IP directly
     let server_name = ServerName::try_from(host.to_string())
-        .or_else(|_| ServerName::try_from("localhost".to_string()))
+        .or_else(|e| {
+            tracing::debug!("SNI hostname parse failed ({e:#}), falling back to localhost");
+            ServerName::try_from("localhost".to_string())
+        })
         .map_err(|e| anyhow!("Invalid server name: {}: {e}", host))?;
 
     // TLS handshake with timeout
@@ -591,7 +591,10 @@ async fn scan_target(
         .unwrap_or_else(|| "Unknown".to_string());
 
     // Parse captured certificates
-    let certs = captured_certs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let certs = captured_certs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let chain_depth = certs.len();
     let cert_info = certs.first().and_then(|der| parse_certificate(der));
 
@@ -602,9 +605,10 @@ async fn scan_target(
         if ci.is_expired() {
             issues.push("EXPIRED certificate".to_string());
         } else if ci.is_expiring_soon()
-            && let Some(days) = ci.days_until_expiry() {
-                issues.push(format!("Certificate expires in {} days", days));
-            }
+            && let Some(days) = ci.days_until_expiry()
+        {
+            issues.push(format!("Certificate expires in {} days", days));
+        }
         if ci.is_self_signed {
             issues.push("Self-signed certificate".to_string());
         }
@@ -650,7 +654,9 @@ async fn scan_target(
 // ============================================================
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
+    if crate::utils::is_batch_mode() {
+        return;
+    }
     crate::mprintln!(
         "{}",
         "╔══════════════════════════════════════════════════════════════╗".cyan()
@@ -674,7 +680,9 @@ fn print_result(result: &SslScanResult) {
     crate::mprintln!();
     crate::mprintln!(
         "{}",
-        format!("=== {}:{} ===", result.host, result.port).cyan().bold()
+        format!("=== {}:{} ===", result.host, result.port)
+            .cyan()
+            .bold()
     );
     crate::mprintln!(
         "  {:<20} {}",
@@ -694,11 +702,7 @@ fn print_result(result: &SslScanResult) {
             result.cipher_suite.clone()
         }
     );
-    crate::mprintln!(
-        "  {:<20} {}",
-        "Chain Depth:".bold(),
-        result.chain_depth
-    );
+    crate::mprintln!("  {:<20} {}", "Chain Depth:".bold(), result.chain_depth);
 
     if let Some(ref ci) = result.cert_info {
         crate::mprintln!();
@@ -708,21 +712,9 @@ fn print_result(result: &SslScanResult) {
             "Subject CN:",
             ci.subject_cn().white().bold()
         );
-        crate::mprintln!(
-            "    {:<18} {}",
-            "Subject:",
-            format_dn(&ci.subject)
-        );
-        crate::mprintln!(
-            "    {:<18} {}",
-            "Issuer CN:",
-            ci.issuer_cn()
-        );
-        crate::mprintln!(
-            "    {:<18} {}",
-            "Issuer:",
-            format_dn(&ci.issuer)
-        );
+        crate::mprintln!("    {:<18} {}", "Subject:", format_dn(&ci.subject));
+        crate::mprintln!("    {:<18} {}", "Issuer CN:", ci.issuer_cn());
+        crate::mprintln!("    {:<18} {}", "Issuer:", format_dn(&ci.issuer));
         if !ci.serial_hex.is_empty() {
             crate::mprintln!("    {:<18} {}", "Serial:", ci.serial_hex);
         }
@@ -771,11 +763,7 @@ fn print_result(result: &SslScanResult) {
         }
 
         if ci.is_self_signed {
-            crate::mprintln!(
-                "    {:<18} {}",
-                "Self-Signed:",
-                "YES".yellow().bold()
-            );
+            crate::mprintln!("    {:<18} {}", "Self-Signed:", "YES".yellow().bold());
         }
 
         if !ci.san_names.is_empty() {
@@ -790,9 +778,15 @@ fn print_result(result: &SslScanResult) {
         crate::mprintln!();
         crate::mprintln!("  {}", "Issues Found:".bold().underline());
         for issue in &result.issues {
-            let colored_issue = if issue.contains("EXPIRED") || issue.contains("Weak cipher") || issue.contains("Deprecated TLS") {
+            let colored_issue = if issue.contains("EXPIRED")
+                || issue.contains("Weak cipher")
+                || issue.contains("Deprecated TLS")
+            {
                 format!("    [!] {}", issue).red().to_string()
-            } else if issue.contains("Self-signed") || issue.contains("expires in") || issue.contains("Incomplete") {
+            } else if issue.contains("Self-signed")
+                || issue.contains("expires in")
+                || issue.contains("Incomplete")
+            {
                 format!("    [!] {}", issue).yellow().to_string()
             } else {
                 format!("    [*] {}", issue)
@@ -855,7 +849,10 @@ fn format_result_for_file(result: &SslScanResult) -> String {
 // ============================================================
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
 
     display_banner();
 
@@ -865,15 +862,17 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         return Err(anyhow!("No target specified"));
     }
 
-    crate::mprintln!(
-        "{}",
-        format!("[*] Target: {}", target).cyan()
-    );
+    crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
 
     let port = cfg_prompt_port("port", "Target port", DEFAULT_PORT).await?;
-    let timeout_secs =
-        cfg_prompt_int_range("timeout", "Connection timeout (seconds)", DEFAULT_TIMEOUT_SECS, 1, 60)
-            .await? as u64;
+    let timeout_secs = cfg_prompt_int_range(
+        "timeout",
+        "Connection timeout (seconds)",
+        DEFAULT_TIMEOUT_SECS,
+        1,
+        60,
+    )
+    .await? as u64;
 
     // Parse targets: support comma-separated hosts
     let hosts: Vec<&str> = target
@@ -886,9 +885,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         return Err(anyhow!("No valid targets provided"));
     }
 
-    let additional =
-        cfg_prompt_default("additional_targets", "Additional targets (comma-separated, or leave empty)", "")
-            .await?;
+    let additional = cfg_prompt_default(
+        "additional_targets",
+        "Additional targets (comma-separated, or leave empty)",
+        "",
+    )
+    .await?;
     let mut all_hosts: Vec<String> = hosts.iter().map(|s| s.to_string()).collect();
     if !additional.is_empty() {
         for h in additional.split([',', ' ']) {
@@ -905,7 +907,12 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 
     crate::mprintln!(
         "{}",
-        format!("[*] Scanning {} target(s) on port {}...", all_hosts.len(), port).cyan()
+        format!(
+            "[*] Scanning {} target(s) on port {}...",
+            all_hosts.len(),
+            port
+        )
+        .cyan()
     );
     crate::mprintln!();
 
@@ -983,10 +990,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 results.push(result);
             }
             Err(e) => {
-                crate::mprintln!(
-                    "{}",
-                    format!("[-] {}:{} - Error: {}", host, port, e).red()
-                );
+                crate::mprintln!("{}", format!("[-] {}:{} - Error: {}", host, port, e).red());
             }
         }
     }
@@ -1062,7 +1066,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             lines.push(String::new());
         }
 
-        tokio::fs::write(&output_path, lines.join("\n")).await
+        tokio::fs::write(&output_path, lines.join("\n"))
+            .await
             .with_context(|| format!("Failed to write results to {}", output_path))?;
         if let Err(e) = crate::utils::set_secure_permissions(&output_path, 0o600) {
             crate::meprintln!("[!] Failed to set file permissions: {}", e);
@@ -1076,7 +1081,11 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     crate::mprintln!();
     crate::mprintln!(
         "{}",
-        format!("[*] SSL/TLS scan complete. {} target(s) analyzed.", results.len()).green()
+        format!(
+            "[*] SSL/TLS scan complete. {} target(s) analyzed.",
+            results.len()
+        )
+        .green()
     );
 
     Ok(outcome)

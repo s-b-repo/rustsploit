@@ -5,20 +5,20 @@
 //! has its own file. This file owns only the interactive `run` driver, the
 //! `ModuleInfo`, and the inventory registration.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use reqwest::Method;
 
 use crate::module::{Finding, ModuleCtx, ModuleOutcome};
 use crate::native::payload_engine::MutatorConfig;
 use crate::utils::{
-    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
-    cfg_prompt_wordlist, cfg_prompt_yes_no,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_wordlist,
+    cfg_prompt_yes_no,
 };
 
 mod config;
@@ -28,23 +28,40 @@ mod request;
 mod scan;
 
 use config::{
-    ScanConfig, ScanModule, CMDI_PAYLOADS, NOSQLI_PAYLOADS, SQLI_PAYLOADS, TRAVERSAL_PAYLOADS,
+    CMDI_PAYLOADS, NOSQLI_PAYLOADS, SQLI_PAYLOADS, ScanConfig, ScanModule, TRAVERSAL_PAYLOADS,
 };
 use enumerate::{configure_injection_payloads, enumerate_endpoints, parse_endpoint_file};
 use scan::scan_endpoint;
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("module requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("module requires a single-host target")?;
 
-    crate::mprintln!("{}", "╔═══════════════════════════════════════════════════════════╗".cyan());
-    crate::mprintln!("{}", "║   API Endpoint Pentest Module                             ║".cyan());
-    crate::mprintln!("{}", "║   Tests API endpoints for common issues                   ║".cyan());
-    crate::mprintln!("{}", "╚═══════════════════════════════════════════════════════════╝".cyan());
+    crate::mprintln!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   API Endpoint Pentest Module                             ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Tests API endpoints for common issues                   ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
     crate::mprintln!();
 
     // 1. Input parsing & configuration.
-    let default_output_dir =
-        format!("api_scan_results_{}", target.replace(['/', ':', '.', '[', ']', '\\'], "_"));
+    let default_output_dir = format!(
+        "api_scan_results_{}",
+        target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+    );
     let output_dir_name =
         cfg_prompt_default("output_dir", "Output directory name", &default_output_dir).await?;
     let use_spoofing = cfg_prompt_yes_no(
@@ -125,8 +142,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         return Err(anyhow!("No modules selected!"));
     }
 
-    let concurrency = cfg_prompt_int_range("concurrency", "Concurrency limit", 10, 1, 100).await?
-        as usize;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Concurrency limit", 10, 1, 100).await? as usize;
     let timeout_secs =
         cfg_prompt_int_range("timeout", "Timeout (seconds)", 10, 1, 60).await? as u64;
 
@@ -186,10 +203,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let has_injection = modules.iter().any(|m| {
         matches!(
             m,
-            ScanModule::SQLi
-                | ScanModule::NoSQLi
-                | ScanModule::CMDi
-                | ScanModule::PathTraversal
+            ScanModule::SQLi | ScanModule::NoSQLi | ScanModule::CMDi | ScanModule::PathTraversal
         )
     });
     let mutation_enabled = if has_injection {
@@ -280,8 +294,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         let wordlist_path = cfg_prompt_wordlist("wordlist", "Wordlist path").await?;
 
         let enum_client = crate::utils::build_http_client(std::time::Duration::from_secs(5))?;
-        enumerate_endpoints(&enum_client, &target_base, &base_path, &wordlist_path, concurrency)
-            .await?
+        enumerate_endpoints(
+            &enum_client,
+            &target_base,
+            &base_path,
+            &wordlist_path,
+            concurrency,
+        )
+        .await?
     } else {
         let endpoint_file =
             cfg_prompt_existing_file("endpoint_file", "Path to endpoint list file").await?;
@@ -295,11 +315,15 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if endpoints.is_empty() {
         return Err(anyhow!("No valid endpoints found/discovered. Exiting."));
     }
-    crate::mprintln!("[*] Processing {} endpoints", endpoints.len().to_string().cyan());
+    crate::mprintln!(
+        "[*] Processing {} endpoints",
+        endpoints.len().to_string().cyan()
+    );
 
     // 3. Setup HTTP client + output directory.
     let client = crate::utils::build_http_client(std::time::Duration::from_secs(timeout_secs))?;
-    tokio::fs::create_dir_all(&output_dir_name).await
+    tokio::fs::create_dir_all(&output_dir_name)
+        .await
         .context("Failed to create output directory")?;
     let abs_output_dir = tokio::fs::canonicalize(&output_dir_name).await?;
     crate::mprintln!(
@@ -367,7 +391,9 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     if !collected.is_empty() {
         crate::mprintln!(
             "{}",
-            format!("[+] {} finding(s) recorded.", collected.len()).green().bold()
+            format!("[+] {} finding(s) recorded.", collected.len())
+                .green()
+                .bold()
         );
     }
     let mut outcome = ModuleOutcome::ok();
@@ -389,4 +415,8 @@ pub fn info() -> crate::module_info::ModuleInfo {
     }
 }
 
-crate::register_native_module!(crate::module::Category::Scanners, "api_endpoint_scanner", native);
+crate::register_native_module!(
+    crate::module::Category::Scanners,
+    "api_endpoint_scanner",
+    native
+);

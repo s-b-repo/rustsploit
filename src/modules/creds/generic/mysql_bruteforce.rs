@@ -5,13 +5,13 @@
 //! distinguish "valid creds" from "wrong creds" without pulling in a
 //! full MySQL client.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_MYSQL_PORT: u16 = 3306;
 
@@ -30,12 +30,11 @@ const DEFAULT_MYSQL_CREDS: &[(&str, &str)] = &[
 pub fn info() -> ModuleInfo {
     ModuleInfo {
         name: "MySQL Bruteforce".to_string(),
-        description:
-            "Tests MySQL/MariaDB authentication via the HandshakeV10 → \
+        description: "Tests MySQL/MariaDB authentication via the HandshakeV10 → \
              HandshakeResponse41 (mysql_native_password) flow. Reads the \
              OK/ERR packet to classify the result. Single-target — \
              scheduler does fan-out."
-                .to_string(),
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
         references: vec![
             "https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html"
@@ -48,7 +47,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("mysql_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("mysql_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -82,20 +84,15 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
 
     // MySQL packet: 3-byte LE length + 1-byte sequence ID + payload.
     let mut header = [0u8; 4];
-    if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-        &mut stream,
-        &mut header,
-        timeout,
-    )
-    .await
+    if let Err(e) =
+        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut header, timeout).await
     {
         return LoginResult::Error {
             message: format!("read handshake header: {e}"),
             retryable: true,
         };
     }
-    let payload_len =
-        u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+    let payload_len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
     let seq_id = header[3];
     if !(20..=4096).contains(&payload_len) {
         return LoginResult::Error {
@@ -104,12 +101,9 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         };
     }
     let mut payload = vec![0u8; payload_len];
-    if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-        &mut stream,
-        &mut payload,
-        timeout,
-    )
-    .await
+    if let Err(e) =
+        crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut payload, timeout)
+            .await
     {
         return LoginResult::Error {
             message: format!("read handshake payload: {e}"),
@@ -213,12 +207,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
 
         // Read OK / ERR / AuthSwitchRequest.
         let mut h2 = [0u8; 4];
-        if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-            &mut stream,
-            &mut h2,
-            timeout,
-        )
-        .await
+        if let Err(e) =
+            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut h2, timeout).await
         {
             return LoginResult::Error {
                 message: format!("read auth result: {e}"),
@@ -233,12 +223,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             };
         }
         let mut p2 = vec![0u8; p2_len];
-        if let Err(e) = crate::utils::creds_helper::read_exact_with_timeout(
-            &mut stream,
-            &mut p2,
-            timeout,
-        )
-        .await
+        if let Err(e) =
+            crate::utils::creds_helper::read_exact_with_timeout(&mut stream, &mut p2, timeout).await
         {
             return LoginResult::Error {
                 message: format!("read auth body: {e}"),
@@ -295,4 +281,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/mysql_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/mysql_bruteforce",
+    native
+);

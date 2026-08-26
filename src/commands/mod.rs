@@ -31,7 +31,11 @@ pub async fn handle_command(command: &str, cli_args: &Cli) -> Result<()> {
                 crate::mprintln!("[*] Using global target: {}", t);
                 t
             }
-            None => return Err(anyhow::anyhow!("No target specified and global target not set")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "No target specified and global target not set"
+                ));
+            }
         }
     } else {
         return Err(anyhow::anyhow!(
@@ -78,12 +82,10 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
                 .map(|m| (m, strsim::levenshtein(module_path, m)))
                 .min_by_key(|&(_, d)| d);
             if let Some((suggestion, dist)) = best
-                && dist < 5 {
-                    crate::meprintln!(
-                        "{}",
-                        format!("  Did you mean: {}?", suggestion).yellow()
-                    );
-                }
+                && dist < 5
+            {
+                crate::meprintln!("{}", format!("  Did you mean: {}?", suggestion).yellow());
+            }
             return Err(anyhow::anyhow!("Module not found"));
         }
     };
@@ -121,6 +123,9 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
     // `resolve()` falls back to the global store when there is no tenant (CLI).
     let scoped_opts = crate::tenant::resolve().global_options().all().await;
     for (k, v) in &scoped_opts {
+        if k.starts_with("__") {
+            continue;
+        }
         opts.set(k.clone(), v.clone());
     }
     // Auto-save: append all of this run's console output to
@@ -132,7 +137,11 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
         crate::results_sink::begin(&resolved_path);
     }
 
-    let result = scheduler::run(module, target, opts, verbose).await;
+    // Pass the canonical path through so rate-limit buckets, loot
+    // attribution, and checkpoints key off `category/name` instead of a
+    // best-effort reverse lookup by display name (which mis-attributes when
+    // two modules share an info().name).
+    let result = scheduler::run(module, target, opts, verbose, &resolved_path).await;
 
     if autosave {
         crate::results_sink::end();
@@ -172,7 +181,7 @@ pub fn plugin_count() -> usize {
 
 /// Static category list, derived from the `Category` enum.
 pub fn categories() -> &'static [&'static str] {
-    &["scanners", "exploits", "creds", "osint", "plugins"]
+    &["scanners", "exploits", "creds", "osint", "plugins", "post"]
 }
 
 pub fn module_info(module_path: &str) -> Option<crate::module_info::ModuleInfo> {

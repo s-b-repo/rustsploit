@@ -1,14 +1,14 @@
 //! Fortinet FortiGate SSL VPN credential probe via the `/remote/logincheck`
 //! POST endpoint.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
-use crate::utils::network::{build_http_client_with, HttpClientOpts};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
+use crate::utils::network::{HttpClientOpts, build_http_client_with};
 
 const DEFAULT_PORT: u16 = 443;
 
@@ -38,7 +38,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("fortinet_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("fortinet_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -61,7 +64,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("http client: {e}"),
                 retryable: false,
-            }
+            };
         }
     };
     let url = format!("https://{}:{}/remote/logincheck", host, port);
@@ -82,7 +85,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("post: {e}"),
                 retryable: e.is_timeout() || e.is_connect(),
-            }
+            };
         }
     };
     let status = resp.status().as_u16();
@@ -91,13 +94,18 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     // the raw bytes with a sane cap avoids an OOM, and we only ever inspect a
     // short prefix below.
     const MAX_BODY: usize = 64 * 1024;
-    let bytes = match crate::utils::safe_io::read_http_body_capped(resp, crate::utils::safe_io::DEFAULT_BODY_CAP).await {
+    let bytes = match crate::utils::safe_io::read_http_body_capped(
+        resp,
+        crate::utils::safe_io::DEFAULT_BODY_CAP,
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             return LoginResult::Error {
                 message: format!("read body: {e}"),
                 retryable: true,
-            }
+            };
         }
     };
     let capped = &bytes[..bytes.len().min(MAX_BODY)];
@@ -110,10 +118,17 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
         LoginResult::AuthFailed
     } else {
         LoginResult::Error {
-            message: format!("unexpected response status={status} body={}", txt.chars().take(80).collect::<String>()),
+            message: format!(
+                "unexpected response status={status} body={}",
+                txt.chars().take(80).collect::<String>()
+            ),
             retryable: false,
         }
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/fortinet_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/fortinet_bruteforce",
+    native
+);

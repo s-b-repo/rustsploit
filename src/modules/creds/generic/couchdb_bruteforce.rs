@@ -1,12 +1,12 @@
 //! CouchDB credential brute-force via POST /_session.
 
-use anyhow::{Context, Result};
 use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::module_info::{ModuleInfo, ModuleRank};
-use crate::utils::creds_helper::{self, CredsRun};
 use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
 
 const DEFAULT_PORT: u16 = 5984;
 
@@ -26,9 +26,7 @@ pub fn info() -> ModuleInfo {
              CIDR / random / file fan-out."
                 .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
-        references: vec![
-            "https://docs.couchdb.org/en/stable/api/server/authn.html".to_string(),
-        ],
+        references: vec!["https://docs.couchdb.org/en/stable/api/server/authn.html".to_string()],
         disclosure_date: None,
         rank: ModuleRank::Normal,
         default_port: Some(5984),
@@ -36,7 +34,10 @@ pub fn info() -> ModuleInfo {
 }
 
 pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    let target = ctx.target.as_single().context("couchdb_bruteforce requires a single-host target")?;
+    let target = ctx
+        .target
+        .as_single()
+        .context("couchdb_bruteforce requires a single-host target")?;
     creds_helper::run(
         target,
         CredsRun {
@@ -58,7 +59,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("http client: {e}"),
                 retryable: false,
-            }
+            };
         }
     };
     let url = format!("http://{}:{}/_session", host, port);
@@ -79,7 +80,7 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
             return LoginResult::Error {
                 message: format!("post: {e}"),
                 retryable: e.is_timeout() || e.is_connect(),
-            }
+            };
         }
     };
     let status = resp.status().as_u16();
@@ -109,4 +110,8 @@ async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration)
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/couchdb_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/couchdb_bruteforce",
+    native
+);

@@ -1,31 +1,19 @@
-use anyhow::{ anyhow, Context, Result };
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use native_tls::TlsConnector;
-use std::io::{ Read, Write };
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::module::{ Finding, FindingKind, ModuleCtx, ModuleOutcome };
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{
-    load_lines,
-    get_filename_in_current_dir,
-    cfg_prompt_default,
-    cfg_prompt_yes_no,
-    cfg_prompt_existing_file,
-    cfg_prompt_int_range,
-    cfg_prompt_output_file,
+    BruteforceConfig, LoginResult, SubnetScanConfig, backoff_delay, generate_combos_mode,
+    is_subnet_target, load_credential_file, parse_combo_mode, run_bruteforce,
+    run_subnet_bruteforce,
 };
 use crate::utils::{
-    BruteforceConfig,
-    LoginResult,
-    SubnetScanConfig,
-    generate_combos_mode,
-    parse_combo_mode,
-    load_credential_file,
-    run_bruteforce,
-    run_subnet_bruteforce,
-    is_subnet_target,
-    backoff_delay,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_yes_no, get_filename_in_current_dir, load_lines,
 };
 
 // ============================================================================
@@ -57,11 +45,10 @@ pub fn info() -> crate::module_info::ModuleInfo {
         description: "Brute-force IMAP authentication using raw TCP protocol with TLS/IMAPS \
             support. Sends IMAP LOGIN commands, handles greeting banners, and supports \
             default credential testing, combo mode, concurrent connections, and subnet/mass \
-            scanning.".to_string(),
+            scanning."
+            .to_string(),
         authors: vec!["RustSploit Contributors".to_string()],
-        references: vec![
-            "https://datatracker.ietf.org/doc/html/rfc3501".to_string(),
-        ],
+        references: vec!["https://datatracker.ietf.org/doc/html/rfc3501".to_string()],
         disclosure_date: None,
         rank: crate::module_info::ModuleRank::Normal,
         default_port: Some(143),
@@ -107,7 +94,10 @@ impl ImapErrorType {
             || lower.contains("handshake")
         {
             Self::TlsError
-        } else if lower.contains("protocol") || lower.contains("unexpected") || lower.contains("banner") {
+        } else if lower.contains("protocol")
+            || lower.contains("unexpected")
+            || lower.contains("banner")
+        {
             Self::ProtocolError
         } else {
             Self::Unknown
@@ -115,7 +105,10 @@ impl ImapErrorType {
     }
 
     fn is_retryable(&self) -> bool {
-        matches!(self, Self::ConnectionRefused | Self::ConnectionTimeout | Self::Unknown)
+        matches!(
+            self,
+            Self::ConnectionRefused | Self::ConnectionTimeout | Self::Unknown
+        )
     }
 
     fn description(&self) -> &'static str {
@@ -148,7 +141,10 @@ impl ImapError {
     fn from_anyhow(err: anyhow::Error) -> Self {
         let msg = err.to_string();
         let error_type = ImapErrorType::classify_error(&msg);
-        Self { error_type, message: msg }
+        Self {
+            error_type,
+            message: msg,
+        }
     }
 }
 
@@ -161,7 +157,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .target
         .as_single()
         .context("imap_bruteforce requires a single-host target")?;
-    crate::mprintln!("\n{}", "=== IMAP Bruteforce Module (RustSploit) ===".bold().cyan());
+    crate::mprintln!(
+        "\n{}",
+        "=== IMAP Bruteforce Module (RustSploit) ===".bold().cyan()
+    );
     crate::mprintln!();
 
     // --- Subnet Scan Mode ---
@@ -169,58 +168,94 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
 
         let use_tls = cfg_prompt_yes_no("use_tls", "Use TLS/IMAPS?", false).await?;
-        let default_port = if use_tls { DEFAULT_IMAPS_PORT } else { DEFAULT_IMAP_PORT };
-        let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
-        let usernames_file = cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
-        let passwords_file = cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let default_port = if use_tls {
+            DEFAULT_IMAPS_PORT
+        } else {
+            DEFAULT_IMAP_PORT
+        };
+        let port =
+            cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
+        let usernames_file =
+            cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file =
+            cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
         let users = load_lines(&usernames_file)?;
         let passes = load_lines(&passwords_file)?;
-        if users.is_empty() { return Err(anyhow!("User list empty")); }
-        if passes.is_empty() { return Err(anyhow!("Pass list empty")); }
+        if users.is_empty() {
+            return Err(anyhow!("User list empty"));
+        }
+        if passes.is_empty() {
+            return Err(anyhow!("Pass list empty"));
+        }
 
-        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000).await? as usize;
+        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)
+            .await? as usize;
         let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-        let output_file = cfg_prompt_output_file("output_file", "Output result file", "imap_subnet_results.txt").await?;
+        let output_file = cfg_prompt_output_file(
+            "output_file",
+            "Output result file",
+            "imap_subnet_results.txt",
+        )
+        .await?;
 
         let connection_timeout: u64 = 5;
 
         let limiter = ctx.limiter.clone();
         let module_path = ctx.module_path.clone();
-        let hits = run_subnet_bruteforce(target, port, users, passes, &SubnetScanConfig {
-            concurrency,
-            verbose,
-            output_file,
-            service_name: "imap",
-            jitter_ms: 50,
-            source_module: "creds/generic/imap_credcheck",
-            skip_tcp_check: false,
-            state_file: None,
-        }, move |ip: IpAddr, port: u16, user: String, pass: String| {
-            let limiter = limiter.clone();
-            let module_path = module_path.clone();
-            async move {
-                let target_str = ip.to_string();
-                limiter.acquire(&module_path, &target_str).await;
-                let res = tokio::task::spawn_blocking(move || {
-                    attempt_imap_login(&target_str, port, &user, &pass, use_tls, connection_timeout)
-                }).await;
-                match res {
-                    Ok(Ok(true)) => LoginResult::Success,
-                    Ok(Ok(false)) => LoginResult::AuthFailed,
-                    Ok(Err(e)) => {
-                        let retryable = e.error_type.is_retryable();
-                        if retryable {
-                            tokio::time::sleep(backoff_delay(250, 1, 4)).await;
+        let hits = run_subnet_bruteforce(
+            target,
+            port,
+            users,
+            passes,
+            &SubnetScanConfig {
+                concurrency,
+                verbose,
+                output_file,
+                service_name: "imap",
+                jitter_ms: 50,
+                source_module: "creds/generic/imap_credcheck",
+                skip_tcp_check: false,
+                state_file: None,
+            },
+            move |ip: IpAddr, port: u16, user: String, pass: String| {
+                let limiter = limiter.clone();
+                let module_path = module_path.clone();
+                async move {
+                    let target_str = ip.to_string();
+                    limiter.acquire(&module_path, &target_str).await;
+                    let res = tokio::task::spawn_blocking(move || {
+                        attempt_imap_login(
+                            &target_str,
+                            port,
+                            &user,
+                            &pass,
+                            use_tls,
+                            connection_timeout,
+                        )
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(true)) => LoginResult::Success,
+                        Ok(Ok(false)) => LoginResult::AuthFailed,
+                        Ok(Err(e)) => {
+                            let retryable = e.error_type.is_retryable();
+                            if retryable {
+                                tokio::time::sleep(backoff_delay(250, 1, 4)).await;
+                            }
+                            LoginResult::Error {
+                                message: e.message,
+                                retryable,
+                            }
                         }
-                        LoginResult::Error { message: e.message, retryable }
+                        Err(e) => LoginResult::Error {
+                            message: format!("Task panic: {}", e),
+                            retryable: false,
+                        },
                     }
-                    Err(e) => LoginResult::Error {
-                        message: format!("Task panic: {}", e),
-                        retryable: false,
-                    },
                 }
-            }
-        }).await?;
+            },
+        )
+        .await?;
         let mut outcome = ModuleOutcome::ok();
         for (host, user, pass) in &hits {
             outcome.findings.push(Finding {
@@ -241,36 +276,49 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // --- Single Target Mode ---
     let mut outcome = ModuleOutcome::ok();
     let use_tls = cfg_prompt_yes_no("use_tls", "Use TLS/IMAPS?", false).await?;
-    let default_port = if use_tls { DEFAULT_IMAPS_PORT } else { DEFAULT_IMAP_PORT };
+    let default_port = if use_tls {
+        DEFAULT_IMAPS_PORT
+    } else {
+        DEFAULT_IMAP_PORT
+    };
     let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
 
-    let use_defaults = cfg_prompt_yes_no("use_defaults", "Try default credentials first?", true).await?;
+    let use_defaults =
+        cfg_prompt_yes_no("use_defaults", "Try default credentials first?", true).await?;
 
-    let usernames_file = if cfg_prompt_yes_no("use_username_wordlist", "Use username wordlist?", true).await? {
-        Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?)
-    } else {
-        None
-    };
+    let usernames_file =
+        if cfg_prompt_yes_no("use_username_wordlist", "Use username wordlist?", true).await? {
+            Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?)
+        } else {
+            None
+        };
 
-    let passwords_file = if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true).await? {
-        Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?)
-    } else {
-        None
-    };
+    let passwords_file =
+        if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true).await? {
+            Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?)
+        } else {
+            None
+        };
 
     if !use_defaults && usernames_file.is_none() && passwords_file.is_none() {
-        return Err(anyhow!("At least one wordlist or default credentials must be enabled"));
+        return Err(anyhow!(
+            "At least one wordlist or default credentials must be enabled"
+        ));
     }
 
-    let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 256).await? as usize;
-    let connection_timeout = cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 60).await? as u64;
-    let retry_on_error = cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 256).await? as usize;
+    let connection_timeout =
+        cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 60).await? as u64;
+    let retry_on_error =
+        cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
     let max_retries = if retry_on_error {
         cfg_prompt_int_range("max_retries", "Max retries per attempt", 2, 1, 10).await? as usize
     } else {
         0
     };
-    let stop_on_success = cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
     let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
     let save_path = if save_results {
         Some(cfg_prompt_output_file("output_file", "Output file", "imap_brute_results.txt").await?)
@@ -278,9 +326,13 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         None
     };
     let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
-    let combo_input = cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
+    let combo_input =
+        cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
 
-    crate::mprintln!("\n{}", format!("[*] Starting brute-force on {}:{}", target, port).cyan());
+    crate::mprintln!(
+        "\n{}",
+        format!("[*] Starting brute-force on {}:{}", target, port).cyan()
+    );
 
     // Load wordlists
     let mut usernames = Vec::new();
@@ -289,7 +341,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if usernames.is_empty() {
             crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
         } else {
-            crate::mprintln!("{}", format!("[*] Loaded {} usernames", usernames.len()).green());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Loaded {} usernames", usernames.len()).green()
+            );
         }
     }
 
@@ -299,7 +354,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if passwords.is_empty() {
             crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
         } else {
-            crate::mprintln!("{}", format!("[*] Loaded {} passwords", passwords.len()).green());
+            crate::mprintln!(
+                "{}",
+                format!("[*] Loaded {} passwords", passwords.len()).green()
+            );
         }
     }
 
@@ -313,7 +371,14 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                 passwords.push(pass.to_string());
             }
         }
-        crate::mprintln!("{}", format!("[*] Added {} default credentials", DEFAULT_CREDENTIALS.len()).green());
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Added {} default credentials",
+                DEFAULT_CREDENTIALS.len()
+            )
+            .green()
+        );
     }
 
     if usernames.is_empty() {
@@ -324,8 +389,16 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     }
 
     let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
-    if cfg_prompt_yes_no("cred_file", "Load additional user:pass combos from file?", false).await? {
-        let cred_path = cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)").await?;
+    if cfg_prompt_yes_no(
+        "cred_file",
+        "Load additional user:pass combos from file?",
+        false,
+    )
+    .await?
+    {
+        let cred_path =
+            cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)")
+                .await?;
         combos.extend(load_credential_file(&cred_path)?);
     }
 
@@ -338,7 +411,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             limiter.acquire(&module_path, &t).await;
             let res = tokio::task::spawn_blocking(move || {
                 attempt_imap_login(&t, p, &user, &pass, use_tls, connection_timeout)
-            }).await;
+            })
+            .await;
             match res {
                 Ok(Ok(true)) => LoginResult::Success,
                 Ok(Ok(false)) => LoginResult::AuthFailed,
@@ -349,7 +423,10 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
                     if retryable {
                         tokio::time::sleep(backoff_delay(250, 1, 4)).await;
                     }
-                    LoginResult::Error { message: e.message, retryable }
+                    LoginResult::Error {
+                        message: e.message,
+                        retryable,
+                    }
                 }
                 Err(e) => LoginResult::Error {
                     message: format!("Task panic: {}", e),
@@ -359,18 +436,23 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
     };
 
-    let result = run_bruteforce(&BruteforceConfig {
-        target: target.to_string(),
-        port,
-        concurrency,
-        stop_on_success,
-        verbose,
-        delay_ms: 0,
-        max_retries,
-        service_name: "imap",
-        jitter_ms: 50,
-        source_module: "creds/generic/imap_credcheck",
-    }, combos, try_login).await?;
+    let result = run_bruteforce(
+        &BruteforceConfig {
+            target: target.to_string(),
+            port,
+            concurrency,
+            stop_on_success,
+            verbose,
+            delay_ms: 0,
+            max_retries,
+            service_name: "imap",
+            jitter_ms: 50,
+            source_module: "creds/generic/imap_credcheck",
+        },
+        combos,
+        try_login,
+    )
+    .await?;
 
     result.print_found();
     if let Some(ref path) = save_path {
@@ -388,13 +470,20 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
             .yellow()
             .bold()
         );
-        if cfg_prompt_yes_no("save_unknown_responses", "Save unknown responses to file?", true).await? {
+        if cfg_prompt_yes_no(
+            "save_unknown_responses",
+            "Save unknown responses to file?",
+            true,
+        )
+        .await?
+        {
             let default_name = "imap_unknown_responses.txt";
             let fname = cfg_prompt_output_file(
                 "unknown_responses_file",
                 "What should the unknown results be saved as?",
                 default_name,
-            ).await?;
+            )
+            .await?;
             let filename = get_filename_in_current_dir(&fname);
             use std::os::unix::fs::OpenOptionsExt;
             let mut opts = std::fs::OpenOptions::new();
@@ -489,9 +578,15 @@ fn attempt_imap_login(
 
         let stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
-        if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
-        stream.set_read_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
-        stream.set_write_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
+        if let Err(e) = stream.set_nodelay(true) {
+            crate::meprintln!("[!] Socket option error: {}", e);
+        }
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
 
         let mut stream = connector.connect(target, stream).map_err(|e| ImapError {
             error_type: ImapErrorType::TlsError,
@@ -500,7 +595,9 @@ fn attempt_imap_login(
 
         // Read IMAP greeting banner
         let mut buffer = [0u8; 2048];
-        let n = stream.read(&mut buffer).map_err(|e| ImapError::from_anyhow(e.into()))?;
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
         let banner = String::from_utf8_lossy(&buffer[..n]);
         if !banner.contains("* OK") && !banner.contains("* PREAUTH") {
             return Err(ImapError {
@@ -510,15 +607,20 @@ fn attempt_imap_login(
         }
 
         // Send LOGIN command
-        stream.write_all(login_cmd.as_bytes())
+        stream
+            .write_all(login_cmd.as_bytes())
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
 
-        let n = stream.read(&mut buffer).map_err(|e| ImapError::from_anyhow(e.into()))?;
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
         let response = String::from_utf8_lossy(&buffer[..n]);
 
         if response.contains("A001 OK") {
             // Clean logout
-            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") { crate::meprintln!("[!] IMAP LOGOUT write error: {}", e); }
+            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") {
+                crate::meprintln!("[!] IMAP LOGOUT write error: {}", e);
+            }
             return Ok(true);
         }
         if response.contains("A001 NO") || response.contains("A001 BAD") {
@@ -541,13 +643,21 @@ fn attempt_imap_login(
 
         let mut stream = crate::utils::blocking_tcp_connect(&socket_addr, timeout)
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
-        if let Err(e) = stream.set_nodelay(true) { crate::meprintln!("[!] Socket option error: {}", e); }
-        stream.set_read_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
-        stream.set_write_timeout(Some(timeout)).map_err(|e| ImapError::from_anyhow(e.into()))?;
+        if let Err(e) = stream.set_nodelay(true) {
+            crate::meprintln!("[!] Socket option error: {}", e);
+        }
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
 
         // Read IMAP greeting banner
         let mut buffer = [0u8; 2048];
-        let n = stream.read(&mut buffer).map_err(|e| ImapError::from_anyhow(e.into()))?;
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
         let banner = String::from_utf8_lossy(&buffer[..n]);
         if !banner.contains("* OK") && !banner.contains("* PREAUTH") {
             return Err(ImapError {
@@ -557,15 +667,20 @@ fn attempt_imap_login(
         }
 
         // Send LOGIN command
-        stream.write_all(login_cmd.as_bytes())
+        stream
+            .write_all(login_cmd.as_bytes())
             .map_err(|e| ImapError::from_anyhow(e.into()))?;
 
-        let n = stream.read(&mut buffer).map_err(|e| ImapError::from_anyhow(e.into()))?;
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|e| ImapError::from_anyhow(e.into()))?;
         let response = String::from_utf8_lossy(&buffer[..n]);
 
         if response.contains("A001 OK") {
             // Clean logout
-            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") { crate::meprintln!("[!] IMAP LOGOUT write error: {}", e); }
+            if let Err(e) = stream.write_all(b"A002 LOGOUT\r\n") {
+                crate::meprintln!("[!] IMAP LOGOUT write error: {}", e);
+            }
             return Ok(true);
         }
         if response.contains("A001 NO") || response.contains("A001 BAD") {
@@ -579,4 +694,8 @@ fn attempt_imap_login(
     }
 }
 
-crate::register_native_module!(crate::module::Category::Creds, "generic/imap_bruteforce", native);
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/imap_bruteforce",
+    native
+);

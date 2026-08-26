@@ -6,17 +6,25 @@ pub mod bruteforce;
 pub mod creds_helper;
 pub mod cyclic;
 pub mod exploit_helper;
+pub mod http_ua;
 pub mod modules;
 pub mod network;
 pub mod parallel;
+pub mod persistence;
 pub mod privilege;
 pub mod prompt;
 pub mod recog;
 pub mod safe_io;
 pub mod sanitize;
+pub mod stats;
 pub mod target;
 pub mod throttle;
 pub mod tls_fingerprint;
+/// io_uring-backed TCP connect probe service (dedicated ring thread + Send
+/// bridge). Only compiled with the `io_uring` feature.
+#[cfg(feature = "io_uring")]
+pub mod uring_connect;
+pub mod waf_bypass;
 pub mod wordlist;
 
 use colored::*;
@@ -65,41 +73,25 @@ pub fn is_batch_mode() -> bool {
 
 // --- prompt.rs ---
 pub use prompt::{
-    cfg_prompt_default,
-    cfg_prompt_existing_file,
-    cfg_prompt_int_range,
-    cfg_prompt_output_file,
-    cfg_prompt_port,
-    cfg_prompt_required,
-    cfg_prompt_wordlist,
-    cfg_prompt_yes_no,
-    prompt_default,
-    prompt_required,
-    prompt_yes_no,
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_port, cfg_prompt_required, cfg_prompt_wordlist, cfg_prompt_yes_no, prompt_default,
+    prompt_required, prompt_yes_no,
 };
 
 // --- sanitize.rs ---
 pub use sanitize::{
-    escape_js_command,
-    escape_shell_command,
-    sanitize_target_simple,
-    scrub_stored_text,
-    validate_command_input,
-    validate_file_path,
-    validate_url,
+    escape_js_command, escape_shell_command, sanitize_target_simple, scrub_stored_text,
+    validate_command_input, validate_file_path, validate_url,
 };
 
 // --- target.rs ---
-pub use target::{
-    is_domain,
-    normalize_target,
-    prompt_domain_target,
-};
+pub use target::{is_domain, normalize_target, prompt_domain_target};
 
 // --- safe_io.rs ---
 pub use safe_io::read_http_body_capped;
 
 // --- network.rs ---
+pub use http_ua::USER_AGENTS;
 pub use network::blocking_tcp_connect;
 pub use network::blocking_udp_bind;
 pub use network::build_http_client;
@@ -107,6 +99,9 @@ pub use network::get_global_source_port;
 pub use network::header_string;
 pub use network::http_get_status_body;
 pub use network::http_get_status_headers_body;
+pub use network::parse_ipv4_list;
+pub use network::parse_ipv6_list;
+pub use network::parse_ipv6_victim;
 pub use network::tcp_connect_str;
 pub use network::tcp_port_open;
 pub use network::udp_bind;
@@ -117,22 +112,13 @@ pub use network::udp_bind;
 
 // --- modules.rs ---
 pub use modules::{
-    find_modules,
-    get_filename_in_current_dir,
-    list_all_modules,
-    file_size,
-    module_exists,
-    safe_read_to_string,
-    safe_read_to_string_async,
-    STREAMING_THRESHOLD,
+    STREAMING_THRESHOLD, file_size, find_modules, get_filename_in_current_dir, list_all_modules,
+    module_exists, safe_read_to_string, safe_read_to_string_async,
 };
 
 // --- wordlist.rs (line-loading functions migrated from modules.rs) ---
 pub use wordlist::{
-    load_lines,
-    load_lines_batched,
-    load_lines_batched_until,
-    load_lines_cached,
+    load_lines, load_lines_batched, load_lines_batched_until, load_lines_cached,
     load_lines_uncapped,
 };
 
@@ -140,21 +126,8 @@ pub use wordlist::{
 // `run_mass_scan` and `MassScanConfig` were removed in v0.5.1 — universal
 // mass-scan fan-out is handled by `crate::scheduler::run` for every module.
 pub use bruteforce::{
-    backoff_delay,
-    BruteforceConfig,
-    EXCLUDED_RANGES,
-    generate_combos_mode,
-    generate_mask_passwords,
-    generate_random_public_ip,
-    is_mass_scan_target,
-    is_subnet_target,
-    load_credential_file,
-    LoginResult,
-    parse_combo_mode,
-    parse_subnet,
-    run_bruteforce,
-    run_bruteforce_streaming,
-    run_subnet_bruteforce,
-    subnet_host_count,
-    SubnetScanConfig,
+    BruteforceConfig, EXCLUDED_RANGES, LoginResult, SubnetScanConfig, backoff_delay,
+    generate_combos_mode, generate_mask_passwords, generate_random_public_ip, is_mass_scan_target,
+    is_subnet_target, load_credential_file, parse_combo_mode, parse_subnet, run_bruteforce,
+    run_bruteforce_streaming, run_subnet_bruteforce, subnet_host_count,
 };

@@ -5,11 +5,11 @@
 //!
 //! FOR AUTHORIZED SECURITY TESTING ONLY.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::*;
 use std::net::IpAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
 use crate::utils::{cfg_prompt_default, cfg_prompt_int_range};
@@ -45,15 +45,29 @@ struct ProxyHit {
 async fn check_http_connect(ip: IpAddr, port: u16, dur: Duration) -> Option<ProxyHit> {
     let addr = format!("{}:{}", ip, port);
     let mut stream = crate::utils::network::tcp_connect(&addr, dur).await.ok()?;
-    let req = format!("CONNECT {}:80 HTTP/1.1\r\nHost: {}\r\n\r\n", CONNECT_HOST, CONNECT_HOST);
-    timeout(dur, stream.write_all(req.as_bytes())).await.ok()?.ok()?;
+    let req = format!(
+        "CONNECT {}:80 HTTP/1.1\r\nHost: {}\r\n\r\n",
+        CONNECT_HOST, CONNECT_HOST
+    );
+    timeout(dur, stream.write_all(req.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
     let mut buf = [0u8; 1024];
     let n = timeout(dur, stream.read(&mut buf)).await.ok()?.ok()?;
     let resp = String::from_utf8_lossy(&buf[..n]);
     if resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200") {
-        Some(ProxyHit { port, kind: "HTTP CONNECT", detail: "tunnel established".to_string() })
+        Some(ProxyHit {
+            port,
+            kind: "HTTP CONNECT",
+            detail: "tunnel established".to_string(),
+        })
     } else if resp.starts_with("HTTP/") && resp.contains("407") {
-        Some(ProxyHit { port, kind: "HTTP CONNECT (auth required)", detail: "proxy requires authentication".to_string() })
+        Some(ProxyHit {
+            port,
+            kind: "HTTP CONNECT (auth required)",
+            detail: "proxy requires authentication".to_string(),
+        })
     } else {
         None
     }
@@ -64,13 +78,26 @@ async fn check_socks5(ip: IpAddr, port: u16, dur: Duration) -> Option<ProxyHit> 
     let addr = format!("{}:{}", ip, port);
     let mut stream = crate::utils::network::tcp_connect(&addr, dur).await.ok()?;
     // Greeting: version 5, 2 methods (no-auth + user/pass)
-    timeout(dur, stream.write_all(&[0x05, 0x02, 0x00, 0x02])).await.ok()?.ok()?;
+    timeout(dur, stream.write_all(&[0x05, 0x02, 0x00, 0x02]))
+        .await
+        .ok()?
+        .ok()?;
     let mut buf = [0u8; 2];
     timeout(dur, stream.read_exact(&mut buf)).await.ok()?.ok()?;
-    if buf[0] != 0x05 { return None; }
+    if buf[0] != 0x05 {
+        return None;
+    }
     match buf[1] {
-        0x00 => Some(ProxyHit { port, kind: "SOCKS5", detail: "open, no auth required".to_string() }),
-        0x02 => Some(ProxyHit { port, kind: "SOCKS5 (auth required)", detail: "accepts user/pass auth".to_string() }),
+        0x00 => Some(ProxyHit {
+            port,
+            kind: "SOCKS5",
+            detail: "open, no auth required".to_string(),
+        }),
+        0x02 => Some(ProxyHit {
+            port,
+            kind: "SOCKS5 (auth required)",
+            detail: "accepts user/pass auth".to_string(),
+        }),
         _ => None,
     }
 }
@@ -87,9 +114,17 @@ async fn check_socks4(ip: IpAddr, port: u16, dur: Duration) -> Option<ProxyHit> 
     let mut buf = [0u8; 8];
     let n = timeout(dur, stream.read(&mut buf)).await.ok()?.ok()?;
     if n >= 2 && buf[1] == 0x5A {
-        Some(ProxyHit { port, kind: "SOCKS4", detail: "request granted".to_string() })
+        Some(ProxyHit {
+            port,
+            kind: "SOCKS4",
+            detail: "request granted".to_string(),
+        })
     } else if n >= 2 && buf[1] == 0x5B {
-        Some(ProxyHit { port, kind: "SOCKS4 (rejected)", detail: "request rejected".to_string() })
+        Some(ProxyHit {
+            port,
+            kind: "SOCKS4 (rejected)",
+            detail: "request rejected".to_string(),
+        })
     } else {
         None
     }
@@ -103,12 +138,19 @@ async fn check_http_forward(ip: IpAddr, port: u16, dur: Duration) -> Option<Prox
         "GET http://{}/ip HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         CONNECT_HOST, CONNECT_HOST
     );
-    timeout(dur, stream.write_all(req.as_bytes())).await.ok()?.ok()?;
+    timeout(dur, stream.write_all(req.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
     let mut buf = [0u8; 2048];
     let n = timeout(dur, stream.read(&mut buf)).await.ok()?.ok()?;
     let resp = String::from_utf8_lossy(&buf[..n]);
     if resp.starts_with("HTTP/") && resp.contains("200") && resp.contains("origin") {
-        Some(ProxyHit { port, kind: "HTTP Forward", detail: "transparent proxy (forwards requests)".to_string() })
+        Some(ProxyHit {
+            port,
+            kind: "HTTP Forward",
+            detail: "transparent proxy (forwards requests)".to_string(),
+        })
     } else {
         None
     }
@@ -118,13 +160,25 @@ async fn check_http_forward(ip: IpAddr, port: u16, dur: Duration) -> Option<Prox
 async fn probe_port(ip: IpAddr, port: u16, dur: Duration) -> Vec<ProxyHit> {
     let mut hits = Vec::new();
     // Try SOCKS5 first (fastest detection)
-    if let Some(h) = check_socks5(ip, port, dur).await { hits.push(h); return hits; }
+    if let Some(h) = check_socks5(ip, port, dur).await {
+        hits.push(h);
+        return hits;
+    }
     // SOCKS4
-    if let Some(h) = check_socks4(ip, port, dur).await { hits.push(h); return hits; }
+    if let Some(h) = check_socks4(ip, port, dur).await {
+        hits.push(h);
+        return hits;
+    }
     // HTTP CONNECT
-    if let Some(h) = check_http_connect(ip, port, dur).await { hits.push(h); return hits; }
+    if let Some(h) = check_http_connect(ip, port, dur).await {
+        hits.push(h);
+        return hits;
+    }
     // HTTP Forward
-    if let Some(h) = check_http_forward(ip, port, dur).await { hits.push(h); return hits; }
+    if let Some(h) = check_http_forward(ip, port, dur).await {
+        hits.push(h);
+        return hits;
+    }
     hits
 }
 
@@ -133,11 +187,25 @@ async fn probe_port(ip: IpAddr, port: u16, dur: Duration) -> Vec<ProxyHit> {
 // ============================================================================
 
 fn display_banner() {
-    if crate::utils::is_batch_mode() { return; }
-    crate::mprintln!("{}", "+=================================================================+".cyan());
-    crate::mprintln!("{}", "|              Open Proxy Scanner                                 |".cyan());
-    crate::mprintln!("{}", "|   HTTP CONNECT | SOCKS4 | SOCKS5 | HTTP Forward                |".cyan());
-    crate::mprintln!("{}", "+=================================================================+".cyan());
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "+=================================================================+".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "|              Open Proxy Scanner                                 |".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "|   HTTP CONNECT | SOCKS4 | SOCKS5 | HTTP Forward                |".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "+=================================================================+".cyan()
+    );
     crate::mprintln!();
 }
 
@@ -160,7 +228,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     // so a global `setg timeout 10` (= 10s elsewhere) became 10ms here —
     // every TCP probe timed out before it could connect and the scanner
     // reported "no proxy detected" for every host. Read seconds, floor at 1s.
-    let timeout_secs = cfg_prompt_int_range("timeout", "Timeout per probe (seconds)", 5, 1, 60).await? as u64;
+    let timeout_secs =
+        cfg_prompt_int_range("timeout", "Timeout per probe (seconds)", 5, 1, 60).await? as u64;
     let dur = Duration::from_secs(timeout_secs);
     let verbose = !crate::utils::is_batch_mode();
 
@@ -175,21 +244,31 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
     let mut found = Vec::new();
 
     for &port in &ports {
-        if ctx.is_cancelled() { break; }
+        if ctx.is_cancelled() {
+            break;
+        }
         if verbose {
             crate::mprintln!("[*] Probing {}:{}...", ip, port);
         }
         ctx.rate_limit(target).await;
         let hits = probe_port(ip, port, dur).await;
         if hits.is_empty() && verbose {
-            crate::mprintln!("  {}", format!("[-] {}:{} — no proxy detected", ip, port).dimmed());
+            crate::mprintln!(
+                "  {}",
+                format!("[-] {}:{} — no proxy detected", ip, port).dimmed()
+            );
         }
         for h in &hits {
             // Always print a found proxy, even under mass/batch scan — a live
             // open proxy is exactly the high-value event the operator is here
             // for, so it must never be suppressed alongside the routine
             // "probing/no proxy" noise (which IS gated by `verbose`).
-            crate::mprintln!("  {}", format!("[+] {}:{} — {} ({})", ip, h.port, h.kind, h.detail).green().bold());
+            crate::mprintln!(
+                "  {}",
+                format!("[+] {}:{} — {} ({})", ip, h.port, h.kind, h.detail)
+                    .green()
+                    .bold()
+            );
             outcome.findings.push(Finding {
                 target: ip.to_string(),
                 kind: FindingKind::Vulnerable,
@@ -210,9 +289,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         if found.is_empty() {
             crate::mprintln!("{}", "[-] No open proxies found.".yellow());
         } else {
-            crate::mprintln!("{}", format!("[+] {} proxy(ies) found:", found.len()).green().bold());
+            crate::mprintln!(
+                "{}",
+                format!("[+] {} proxy(ies) found:", found.len())
+                    .green()
+                    .bold()
+            );
             crate::mprintln!();
-            crate::mprintln!("  {:<8} {:<25} {}", "Port".bold(), "Type".bold(), "Detail".bold());
+            crate::mprintln!(
+                "  {:<8} {:<25} {}",
+                "Port".bold(),
+                "Type".bold(),
+                "Detail".bold()
+            );
             crate::mprintln!("  {}", "-".repeat(60).dimmed());
             for h in &found {
                 crate::mprintln!("  {:<8} {:<25} {}", h.port, h.kind.green(), h.detail);
@@ -224,16 +313,19 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 }
 
 fn parse_ports(input: &str) -> Vec<u16> {
-    input.split(',')
+    input
+        .split(',')
         .filter_map(|s| s.trim().parse::<u16>().ok())
         .filter(|&p| p > 0)
         .collect()
 }
 
 fn resolve_target(target: &str) -> Result<IpAddr> {
-    target.parse::<IpAddr>().or_else(|_| {
+    target.parse::<IpAddr>().or_else(|e| {
+        tracing::debug!("Proxy target parse failed ({e:#}), falling back to DNS");
         use std::net::ToSocketAddrs;
-        format!("{}:0", target).to_socket_addrs()
+        format!("{}:0", target)
+            .to_socket_addrs()
             .with_context(|| format!("Cannot resolve {}", target))?
             .next()
             .map(|sa| sa.ip())
