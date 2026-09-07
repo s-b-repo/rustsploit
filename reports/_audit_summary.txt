@@ -1,0 +1,4 @@
+TOTAL=0
+SEV={}
+CAT={}
+SLICES=

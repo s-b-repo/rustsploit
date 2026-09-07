@@ -1,0 +1,25 @@
+Shipped a major update to Rustsploit — a Rust offensive-security framework (one binary, ~389 modules, four interfaces: shell, CLI, a post-quantum-encrypted API, and an MCP server).
+
+What's new:
+
+🔌 Four upstream engines ported in (all permissively licensed):
+ • Official MCP Rust SDK (rmcp) — replaced a hand-rolled protocol server while keeping all 29 tools and 7 resources intact
+ • Recog (Rapid7) — real service / product / OS fingerprinting from network banners
+ • JARM + JA3/JA3S (Salesforce) — active TLS server fingerprinting
+ • SecLists — a checksum-pinned wordlist catalog
+
+⚡ Performance: framework-wide HTTP connection-pool reuse — one shared, cached client instead of rebuilding the TLS config and a fresh connection pool on every request.
+
+🛠️ A batch of mass-scan usability and correctness fixes.
+
+But the part I'm most proud of isn't a feature — it's what didn't ship.
+
+I used AI agents to accelerate the porting work, then ran the test suite they couldn't run themselves. Seven tests were failing: a few had fabricated test vectors (the code was right, the "expected" values were invented), and one exposed a genuine bug in the fingerprint matcher. All caught and fixed before release.
+
+And when an obvious "quick win" — swapping in a 1,000+ fingerprint upstream database — turned out to silently break matching end-to-end, I reverted it and documented the real fix instead of shipping something that merely looked done.
+
+Verified end state: clean build, zero warnings, 40/40 tests green.
+
+Automation gives you speed. Verification is what makes it shippable. The two are not the same thing, and treating them as if they were is how "done" becomes "broken in production."
+
+#RustLang #CyberSecurity #OffensiveSecurity #OpenSource #AppSec #SoftwareEngineering #AIcoding

@@ -1,0 +1,15 @@
+admin
+guest
+sysadmin@thingsboard.org
+admin
+emonpi
+mosquitto
+mqttuser
+admin
+homeassistant
+DVES_USER
+admin
+roger
+sub_client
+pub_client
+user

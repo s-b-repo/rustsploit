@@ -1,0 +1,56 @@
+# Rust build artifacts
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / credentials
+.env
+*.pem
+*.key
+~/.rustsploit/
+*.kate-swp
+.claude/
+
+# Engagement data — local only, never publish
+/hydra.restore
+/hydra_targets_*.txt
+/results*.csv
+/results*.txt
+/results_hydra_*.txt
+/creds.txt
+/za_targets_final.txt
+/za-target.txt
+/tellmebaby*.gnmap
+/xneelo
+/xneelo_mapp.txt
+/my_report.csv
+/my_report.html
+/slow_*.csv
+/slow_*.html
+/found_backend2026.csv
+/paused.conf
+/blocklist.conf
+/test.txt
+/todo.txt
+/template-api-commands.txt
+/reflect
+/should_not_exist2.bat
+
+# Local-only engagement reports (OPSEC — real targets; do not publish)
+/reports/FNB-Blackbox-Report.md
+/reports/Improvement-Plan.md
+/reports/arcticalopex_audit.md
+/reports/arcticalopex_audit_phase_a_b_d_summary.md
+/reports/arcticalopex_wiring_audit.md
+
+# Local-only auxiliary projects (NOT part of the rustsploit release)
+/addme/
+/arcticalopex/

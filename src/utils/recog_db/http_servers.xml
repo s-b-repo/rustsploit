@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Vendored from Rapid7 Recog (https://github.com/rapid7/recog), BSD-2-Clause.
+  Trimmed subset of xml/http_servers.xml for rustsploit's recog matcher.
+  Input is the value of the HTTP "Server:" response header.
+-->
+<fingerprints matches="http.server">
+
+  <fingerprint pattern="^Apache/([\d.]+)\s*\(([^)]+)\)">
+    <description>Apache httpd with OS detail in parentheses</description>
+    <example service.version="2.4.52" os.product="Ubuntu">Apache/2.4.52 (Ubuntu)</example>
+    <param pos="0" name="service.vendor" value="Apache"/>
+    <param pos="0" name="service.family" value="Apache"/>
+    <param pos="0" name="service.product" value="HTTP Server"/>
+    <param pos="1" name="service.version"/>
+    <param pos="2" name="os.product"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:apache:http_server:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^Apache/([\d.]+)$">
+    <description>Apache httpd with no OS detail</description>
+    <example service.version="2.4.41">Apache/2.4.41</example>
+    <param pos="0" name="service.vendor" value="Apache"/>
+    <param pos="0" name="service.family" value="Apache"/>
+    <param pos="0" name="service.product" value="HTTP Server"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:apache:http_server:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^nginx/([\d.]+)$">
+    <description>nginx web server</description>
+    <example service.version="1.18.0">nginx/1.18.0</example>
+    <param pos="0" name="service.vendor" value="Nginx"/>
+    <param pos="0" name="service.family" value="Nginx"/>
+    <param pos="0" name="service.product" value="nginx"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:nginx:nginx:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^nginx$">
+    <description>nginx web server with version suppressed</description>
+    <example>nginx</example>
+    <param pos="0" name="service.vendor" value="Nginx"/>
+    <param pos="0" name="service.family" value="Nginx"/>
+    <param pos="0" name="service.product" value="nginx"/>
+  </fingerprint>
+
+  <fingerprint pattern="^Microsoft-IIS/([\d.]+)$">
+    <description>Microsoft Internet Information Services</description>
+    <example service.version="10.0">Microsoft-IIS/10.0</example>
+    <param pos="0" name="service.vendor" value="Microsoft"/>
+    <param pos="0" name="service.family" value="IIS"/>
+    <param pos="0" name="service.product" value="IIS"/>
+    <param pos="1" name="service.version"/>
+    <param pos="0" name="os.vendor" value="Microsoft"/>
+    <param pos="0" name="os.family" value="Windows"/>
+    <param pos="0" name="os.product" value="Windows"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:microsoft:iis:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^lighttpd/([\d.]+)$">
+    <description>lighttpd web server</description>
+    <example service.version="1.4.59">lighttpd/1.4.59</example>
+    <param pos="0" name="service.vendor" value="lighttpd"/>
+    <param pos="0" name="service.family" value="lighttpd"/>
+    <param pos="0" name="service.product" value="lighttpd"/>
+    <param pos="1" name="service.version"/>
+    <param pos="1" name="service.cpe23" value="cpe:/a:lighttpd:lighttpd:{service.version}"/>
+  </fingerprint>
+
+  <fingerprint pattern="^Jetty\(([\d.]+\.v\d+)\)$">
+    <description>Eclipse Jetty servlet engine</description>
+    <example service.version="9.4.43.v20210629">Jetty(9.4.43.v20210629)</example>
+    <param pos="0" name="service.vendor" value="Eclipse"/>
+    <param pos="0" name="service.family" value="Jetty"/>
+    <param pos="0" name="service.product" value="Jetty"/>
+    <param pos="1" name="service.version"/>
+  </fingerprint>
+
+</fingerprints>

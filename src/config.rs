@@ -1,0 +1,488 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use anyhow::{Context, Result, anyhow};
+use ipnetwork::IpNetwork;
+use regex::Regex;
+
+/// Maximum length for target strings
+const MAX_TARGET_LENGTH: usize = 2048;
+
+/// Maximum length for hostname
+const MAX_HOSTNAME_LENGTH: usize = 253;
+
+/// Global configuration for the framework
+#[derive(Clone, Debug)]
+pub struct GlobalConfig {
+    /// Global target - can be a single IP or CIDR subnet
+    target: Arc<RwLock<Option<TargetConfig>>>,
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum TargetConfig {
+    /// Single IP address or hostname
+    Single(String),
+    /// CIDR subnet (e.g., "192.168.1.0/24")
+    Subnet(IpNetwork),
+    /// Comma-separated list of targets (IPs, hostnames, and/or CIDRs)
+    Multi(Vec<String>),
+}
+
+impl GlobalConfig {
+    /// Create a new global configuration
+    pub fn new() -> Self {
+        Self {
+            target: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Set the global target (IP, hostname, or CIDR subnet)
+    pub fn set_target(&self, target: &str) -> Result<()> {
+        let trimmed = target.trim();
+
+        // Basic validation
+        if trimmed.is_empty() {
+            return Err(anyhow!("Target cannot be empty"));
+        }
+
+        // Length check
+        if trimmed.len() > MAX_TARGET_LENGTH {
+            return Err(anyhow!(
+                "Target too long (max {} characters)",
+                MAX_TARGET_LENGTH
+            ));
+        }
+
+        // Check for control characters
+        if trimmed.chars().any(|c| c.is_control()) {
+            return Err(anyhow!("Target cannot contain control characters"));
+        }
+
+        // Mass scan keyword: "random" — store as-is. "0.0.0.0/0" is handled
+        // below as a CIDR subnet.
+        if trimmed == "random" {
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+            return Ok(());
+        }
+
+        // Bare "0.0.0.0" is an operator alias for the full-internet sweep
+        // "0.0.0.0/0" (== "random"), added 2026-06-09 (reverses the earlier M45
+        // single-host rule). Store it as the /0 subnet so every consumer treats
+        // it as a mass scan; the scheduler still shows an advisory + an
+        // interactive confirmation before it actually sweeps.
+        if trimmed == "0.0.0.0" {
+            let net: IpNetwork = "0.0.0.0/0"
+                .parse()
+                .map_err(|e| anyhow!("internal: failed to parse 0.0.0.0/0 as a network: {e}"))?;
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Subnet(net));
+            return Ok(());
+        }
+
+        // Sequential mass-scan keywords: `seq`/`sequential` (whole public range)
+        // or `seq:<ip>`/`sequential:<ip>` (explicit start). Stored verbatim;
+        // `module::Target::parse` turns it into `Target::Sequential`.
+        {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower == "seq"
+                || lower == "sequential"
+                || lower.starts_with("seq:")
+                || lower.starts_with("sequential:")
+            {
+                let mut target_guard = self
+                    .target
+                    .write()
+                    .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+                *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+                return Ok(());
+            }
+        }
+
+        // File-based target list: resolve canonical path to prevent traversal,
+        // then store if the file exists. This check must come before the ".."
+        // rejection so relative file paths like "../targets.txt" work.
+        let path = std::path::Path::new(trimmed);
+        if path.exists() && path.is_file() {
+            // Resolve to canonical path (eliminates .., symlinks, etc.)
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("Failed to resolve file path '{}'", trimmed))?;
+            let canonical_str = canonical.to_string_lossy().to_string();
+            if canonical_str.len() > MAX_TARGET_LENGTH {
+                return Err(anyhow!(
+                    "Canonical path too long (max {} characters)",
+                    MAX_TARGET_LENGTH
+                ));
+            }
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Single(canonical_str));
+            return Ok(());
+        }
+
+        // Check for path traversal attempts (only for non-file targets)
+        if trimmed.contains("..") || trimmed.contains("//") {
+            return Err(anyhow!(
+                "Target contains invalid characters (path traversal)"
+            ));
+        }
+
+        // Comma-separated multi-target: "10.0.0.1, 192.168.1.0/24, example.com"
+        if trimmed.contains(',') {
+            let targets: Vec<String> = trimmed
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if targets.is_empty() {
+                return Err(anyhow!("No valid targets in comma-separated list"));
+            }
+            if targets.len() == 1 {
+                // Single target after parsing — recurse without comma
+                return self.set_target(&targets[0]);
+            }
+            // Validate each individual target
+            const MASS_SCAN_KEYWORDS: &[&str] = &["random", "0.0.0.0/0"];
+            for t in &targets {
+                // Allow mass scan keywords, CIDRs, file paths, and hostnames/IPs
+                if MASS_SCAN_KEYWORDS.contains(&t.as_str()) {
+                    continue;
+                }
+                if std::path::Path::new(t.as_str()).is_file() {
+                    continue;
+                }
+                if t.parse::<IpNetwork>().is_err() {
+                    Self::validate_hostname_or_ip(t)?;
+                }
+            }
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Multi(targets));
+            return Ok(());
+        }
+
+        // Try to parse as CIDR subnet first — but ONLY when an explicit prefix
+        // is present. `IpNetwork::from_str` silently widens a bare address to a
+        // host route (`0.0.0.0` -> `0.0.0.0/32`, `10.0.0.1` -> `10.0.0.1/32`),
+        // which turned every single-IP target into a subnet: it surfaced as
+        // "Using target: 0.0.0.0/32", routed single hosts through CIDR fan-out,
+        // and tripped `is_mass_scan_target` (which then skips honeypot
+        // detection). A bare IP is a single host (M45) — require the '/' so it
+        // falls through to `TargetConfig::Single` below.
+        if trimmed.contains('/')
+            && let Ok(network) = trimmed.parse::<IpNetwork>()
+        {
+            // No size limit enforced here - user can set 0.0.0.0/0 if they want.
+            // Consumers (looping logic) must handle large subnets responsibly (e.g. via iterators).
+            let mut target_guard = self
+                .target
+                .write()
+                .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+            *target_guard = Some(TargetConfig::Subnet(network));
+            return Ok(());
+        }
+
+        // Validate hostname/IP format
+        Self::validate_hostname_or_ip(trimmed)?;
+
+        // Otherwise, treat as single IP or hostname
+        let mut target_guard = self
+            .target
+            .write()
+            .map_err(|e| anyhow!("Config lock poisoned: {e}"))?;
+        *target_guard = Some(TargetConfig::Single(trimmed.to_string()));
+        Ok(())
+    }
+
+    /// Validates a hostname or IP address format
+    fn validate_hostname_or_ip(target: &str) -> Result<()> {
+        // Length check for hostname
+        if target.len() > MAX_HOSTNAME_LENGTH {
+            return Err(anyhow!(
+                "Hostname too long (max {} characters)",
+                MAX_HOSTNAME_LENGTH
+            ));
+        }
+
+        // Check for valid characters
+        // Allow: a-z, A-Z, 0-9, '.', '-', '_', ':', '[', ']' (for IPv6)
+        // Use OnceCell::get_or_try_init so a (theoretically impossible)
+        // regex compile failure surfaces as a clean error instead of a
+        // panic on first input. The literal pattern is hardcoded and has
+        // never failed to compile in test, but proper plumbing matters.
+        static VALID_CHARS: once_cell::sync::OnceCell<Regex> = once_cell::sync::OnceCell::new();
+        let valid_chars = VALID_CHARS.get_or_try_init(|| {
+            Regex::new(r"^[a-zA-Z0-9.\-_:\[\]]+$")
+                .map_err(|e| anyhow!("internal error: VALID_CHARS regex failed to compile: {e}"))
+        })?;
+        if !valid_chars.is_match(target) {
+            return Err(anyhow!(
+                "Target contains invalid characters. Allowed: letters, numbers, '.', '-', '_', ':', '[', ']'"
+            ));
+        }
+
+        // Basic hostname format check (not starting/ending with special chars)
+        if target.starts_with('.') || target.starts_with('-') {
+            return Err(anyhow!("Target cannot start with '.' or '-'"));
+        }
+
+        // A single trailing dot (FQDN root label, e.g. "example.com.") is
+        // allowed implicitly; consecutive dots are rejected just below.
+        // Check for consecutive dots (invalid in hostnames)
+        if target.contains("..") {
+            return Err(anyhow!("Target cannot contain consecutive dots"));
+        }
+
+        Ok(())
+    }
+
+    /// Get the global target as a single string (for display)
+    pub fn get_target(&self) -> Option<String> {
+        let guard = self.target.read().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|t| match t {
+            TargetConfig::Single(ip) => ip.clone(),
+            TargetConfig::Subnet(net) => net.to_string(),
+            TargetConfig::Multi(targets) => targets.join(", "),
+        })
+    }
+
+    /// Check if global target is set
+    pub fn has_target(&self) -> bool {
+        // Recover from poisoning (same policy as get_target) instead of
+        // reporting "no target" — a poisoned lock must not silently make the
+        // framework forget the operator's target.
+        self.target
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Check if global target is a subnet
+    pub fn is_subnet(&self) -> bool {
+        self.target
+            .read()
+            .map(|g| {
+                matches!(
+                    g.as_ref(),
+                    Some(TargetConfig::Subnet(_)) | Some(TargetConfig::Multi(_))
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Get the size of the target (number of IPs)
+    /// For single IPs, returns 1
+    /// For subnets, returns the subnet size without expanding
+    pub fn get_target_size(&self) -> Option<u64> {
+        let target_guard = self.target.read().unwrap_or_else(|e| e.into_inner());
+        match target_guard.as_ref() {
+            Some(TargetConfig::Single(_)) => Some(1),
+            Some(TargetConfig::Subnet(net)) => Some(Self::network_size(net)),
+            Some(TargetConfig::Multi(targets)) => {
+                let mut total = 0u64;
+                for t in targets {
+                    if let Ok(net) = t.parse::<IpNetwork>() {
+                        total = total.saturating_add(Self::network_size(&net));
+                    } else if std::path::Path::new(t).is_file() {
+                        // A file member contributes its real target count (one per
+                        // non-empty, non-comment line), not a flat 1 — otherwise a
+                        // comma-list containing a host file wildly under-estimates
+                        // the scan size used for ETA/throttling.
+                        let lines = std::fs::read_to_string(t)
+                            .map(|s| {
+                                s.lines()
+                                    .filter(|l| {
+                                        let l = l.trim();
+                                        !l.is_empty() && !l.starts_with('#')
+                                    })
+                                    .count() as u64
+                            })
+                            .unwrap_or(1);
+                        total = total.saturating_add(lines.max(1));
+                    } else {
+                        total = total.saturating_add(1);
+                    }
+                }
+                Some(total)
+            }
+            None => None,
+        }
+    }
+
+    /// Calculate the number of IPs in a network
+    fn network_size(net: &IpNetwork) -> u64 {
+        match net {
+            IpNetwork::V4(net4) => {
+                let prefix = net4.prefix() as u32;
+                if prefix >= 32 {
+                    1u64
+                } else {
+                    2u64.pow(32 - prefix)
+                }
+            }
+            IpNetwork::V6(net6) => {
+                let prefix = net6.prefix() as u32;
+                if prefix >= 128 {
+                    1u64
+                } else {
+                    let exp = 128u32.saturating_sub(prefix);
+                    if exp > 63 { u64::MAX } else { 2u64.pow(exp) }
+                }
+            }
+        }
+    }
+
+    /// Clear the global target
+    pub fn clear_target(&self) {
+        *self.target.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Global configuration instance
+use once_cell::sync::Lazy;
+
+pub static GLOBAL_CONFIG: Lazy<GlobalConfig> = Lazy::new(GlobalConfig::new);
+
+/// Module-level configuration for API-driven execution
+/// This is set by the API before running a module and read by modules
+/// to get pre-configured values instead of prompting the user
+///
+/// # Unified Prompt Keys
+///
+/// These are the standardized `custom_prompts` keys used across all
+/// scanner modules (via `cfg_prompt_*` in utils.rs). Supply them in the
+/// JSON `"prompts"` object of an API `/api/run` request.
+///
+/// ## Common Keys (used by many modules)
+/// | Key               | Type   | Description                                    |
+/// |-------------------|--------|------------------------------------------------|
+/// | `port`            | u16    | Target service port                            |
+/// | `timeout`         | int    | Connection/request timeout (seconds or ms)     |
+/// | `verbose`         | y/n    | Verbose output                                 |
+/// | `save_results`    | y/n    | Save results to file                           |
+/// | `output_file`     | string | Output filename for results                    |
+/// | `concurrency`     | int    | Number of concurrent threads/tasks             |
+/// | `threads`         | int    | Alias for concurrency (some modules)           |
+/// | `wordlist`        | path   | Path to wordlist file                          |
+/// | `target_file`     | path   | Path to file containing targets                |
+/// | `additional_targets` | string | Comma-separated additional targets           |
+/// | `mode`            | string | Operation mode selector (1, 2, 3, etc.)        |
+///
+/// ## Scanner-Specific Keys
+///
+/// ### Port Scanner (`scanners/port_scanner`)
+/// `port_range`, `scan_method`, `show_only_open`, `ttl`, `source_port`, `data_length`
+///
+/// ### SSH Scanner (`scanners/ssh_scanner`)
+/// `load_from_file`, `target_file`
+///
+/// ### DNS Recursion (`scanners/dns_recursion`)
+/// `domain`, `record_type`
+///
+/// ### SMTP User Enum (`scanners/smtp_user_enum`)
+/// `timeout_ms`, `save_valid`, `valid_output`, `save_unknown`, `unknown_output`
+///
+/// ### Ping Sweep (`scanners/ping_sweep`)
+/// `add_manual_targets`, `manual_target`, `load_from_file`, `save_up_hosts`,
+/// `up_hosts_file`, `save_down_hosts`, `down_hosts_file`, `use_icmp`, `use_tcp`,
+/// `tcp_ports`, `use_syn`, `syn_ports`, `use_ack`, `ack_ports`
+///
+/// ### HTTP Title Scanner (`scanners/http_title_scanner`)
+/// `check_http`, `check_https`, `use_ports`, `ports`
+///
+/// ### HTTP Method Scanner (`scanners/http_method_scanner`)
+/// `scheme`, `use_ports`, `ports`
+///
+/// ### Dir Brute (`scanners/dir_brute`)
+/// `scan_mode`, `delay_ms`, `random_agent`, `custom_cookies`, `cookies`,
+/// `use_https`, `base_path`, `template_name`, `template_file`, `sort_by`
+///
+/// ### Sequential Fuzzer (`scanners/sequential_fuzzer`)
+/// `min_length`, `max_length`, `charset`, `custom_charset`, `encoding`,
+/// `add_cookies`, `cookies`, `append_slash`, `template_name`, `template_file`, `target_url`
+///
+/// ### API Endpoint Scanner (`scanners/api_endpoint_scanner`)
+/// `output_dir`, `use_spoofing`, `use_generic_payload`, `enable_delete`,
+/// `enable_extended_methods`, `modules`, `enum_mode`, `id_start`, `id_end`,
+/// `id_file`, `endpoint_source`, `base_path`, `endpoint_file`
+///
+/// ### IPMI Enum/Exploit (`scanners/ipmi_enum_exploit`)
+/// `cidr`, `target`, `test_cipher_zero`, `test_anonymous`, `test_default_creds`,
+/// `test_rakp_hash`, `continue_large_scan`, `destroy_confirm`
+///
+/// ### SSDP MSearch (`scanners/ssdp_msearch`)
+/// `retries`, `search_target`
+///
+/// ### Sample Scanner (`scanners/sample_scanner`)
+/// `check_http`, `check_https`
+#[derive(Clone, Debug, Default)]
+pub struct ModuleConfig {
+    pub custom_prompts: HashMap<String, String>,
+    pub api_mode: bool,
+}
+
+impl ModuleConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Global module config instance (API-provided configuration)
+pub static MODULE_CONFIG: Lazy<Arc<RwLock<ModuleConfig>>> =
+    Lazy::new(|| Arc::new(RwLock::new(ModuleConfig::new())));
+
+/// Get a clone of the current module config.
+/// Checks the task-local RunContext first (for concurrent API runs),
+/// then falls back to the global MODULE_CONFIG.
+pub fn get_module_config() -> ModuleConfig {
+    // Try task-local context first (set by API handler per-request)
+    let task_local = crate::context::RUN_CONTEXT.try_with(|ctx| ctx.config.clone());
+    if let Ok(config) = task_local {
+        return config;
+    }
+    // Fallback to global (for CLI/shell mode)
+    MODULE_CONFIG.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Get the per-request target from the task-local RunContext, if set.
+/// Returns `None` in shell/CLI mode or when no context is active.
+pub fn get_run_target() -> Option<String> {
+    crate::context::RUN_CONTEXT
+        .try_with(|ctx| ctx.target.clone())
+        .ok()
+        .flatten()
+}
+
+pub fn results_dir() -> std::path::PathBuf {
+    let dir = home::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".rustsploit")
+        .join("results");
+    if !dir.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Err(e) = std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+        {
+            eprintln!(
+                "[!] Failed to create results directory {}: {}",
+                dir.display(),
+                e
+            );
+        }
+    }
+    dir
+}

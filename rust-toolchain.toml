@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+# Rust 1.85+ required for edition 2024. Pinning to stable ensures
+# reproducible builds across developer machines and CI.
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

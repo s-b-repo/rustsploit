@@ -1,0 +1,212 @@
+[package]
+name = "rustsploit"
+version = "0.5.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Modular offensive tooling framework for embedded targets"
+repository = "https://github.com/s-b-repo/rustsploit"
+license = "MIT"
+
+[[bin]]
+name = "rustsploit"
+path = "src/main.rs"
+
+[dependencies]
+# Core / General
+anyhow = "1.0"
+colored = "3.1"                 # newer than 2.0
+rand = "0.10"
+rustyline = "18.0"
+
+# CLI & Async runtime
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1.51", features = ["full", "process", "fs", "io-std", "rt-multi-thread", "macros", "rt"] }
+tokio-util = { version = "0.7", default-features = false }
+# io_uring runtime driver — opt-in via the `io_uring` feature (Linux-only in
+# practice). When enabled, the top-level runtime becomes tokio-uring's
+# current-thread io_uring reactor; regular tokio::net/TLS/HTTP still run on top.
+tokio-uring = { version = "0.5", optional = true }
+
+# HTTP & Web
+reqwest = { version = "0.13", default-features = false, features = ["json", "cookies", "socks", "multipart", "form", "stream", "rustls-no-provider", "charset", "http2"] }
+h2 = "0.4"
+http = "1.4"
+bytes = "1.11.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+url = "2.5"
+quick-xml = "0.40"
+data-encoding = "2.10"
+semver = "1.0"
+
+# Crypto & Encoding
+aes = "0.9"
+cipher = "0.5"
+md5 = "0.8"
+flate2 = "1.1"
+base64 = "0.22"
+
+# Networking & Protocols
+socket2 = { version = "0.6", features = ["all"] }
+pnet_packet = "0.35"
+ipnetwork = "0.21"
+regex = "1.12"                  # newest listed
+which = "8.0"
+
+# FTP
+suppaftp = { version = "8.0", features = ["tokio-async-native-tls"] }
+# Vendored OpenSSL: builds from source and statically links so no host
+# libssl-dev is required (headless/embedded boxes).
+native-tls = { version = "0.2", features = ["vendored"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+
+# Telnet
+crossbeam-channel = "0.5"
+telnet = "0.2"
+
+# SSH
+libc = "0.2"
+
+# Resource limits (safe wrapper for getrlimit/setrlimit)
+rlimit = "0.11"
+rusqlite = { version = "0.34", optional = true, features = ["bundled"] }
+
+
+# Bluetooth
+btleplug = { version = "0.12", optional = true }
+# Classic (BR/EDR) support: BlueZ D-Bus. libc is already a non-optional dep.
+zbus = { version = "4", default-features = false, features = ["tokio"], optional = true }
+
+# WPair migrated from ratatui+crossterm TUI to rustyline REPL — deps removed.
+
+# RDP - removed unused dependency (module uses external xfreerdp/rdesktop commands)
+# rdp = "0.12"
+
+# WebSocket (Spotube exploit)
+tokio-tungstenite = "0.29"
+
+# Futures
+futures = "0.3"
+futures-util = "0.3"
+
+# JSON & Serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+# API Server (Axum)
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+# DNS
+hickory-client = { version = "0.26.0-alpha.1" }
+hickory-proto = "0.26.0-alpha.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc utilities
+once_cell = "1.21"
+home = "0.5"                   # updated for edition 2024 compatibility
+des = { version = "0.9", features = ["zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
+sha1 = "0.11"
+strsim = "0.11"
+# vendored-openssl pairs with native-tls/vendored above — one static OpenSSL for all.
+ssh2 = { version = "0.9.5", features = ["vendored-openssl"] }
+num_cpus = "1.17.0"
+
+# Compile-time module registry — every module self-registers via
+# `register_native_module!` at file scope; `inventory::iter` walks the registry.
+inventory = "0.3"
+async-trait = "0.1"
+
+
+# Constant-time comparison for security (timing attack prevention)
+subtle = "2.6"
+
+# Passphrase KDF for host key encryption at rest
+argon2 = "0.5"
+
+# Post-Quantum Encryption — triple hybrid: X25519 (classical) + ML-KEM-1024
+# (FIPS 203, lattice) + Classic McEliece 460896f (code-based), all chained into
+# the HKDF IKM, with ChaCha20-Poly1305 AEAD.
+ml-kem = "0.3.0-rc.2"
+# Classic McEliece (code-based KEM) — algorithmically independent of ML-KEM's
+# lattice assumption. The crate pins rand 0.8 for its RNG trait bounds, so we
+# also alias rand 0.8 purely to supply an OsRng to its encapsulate/keypair APIs.
+classic-mceliece-rust = { version = "3.1", features = ["mceliece460896f"] }
+rand08 = { package = "rand", version = "0.8" }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.11.0-rc.3"
+hkdf = "0.13"
+sha2 = "0.11"
+# Only the Bluetooth wpair modules use NIST P-256; gate it so builds with
+# `--no-default-features` don't carry an unused dependency.
+p256 = { version = "0.13", features = ["ecdh"], optional = true }
+hex = "0.4"
+
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-async-rw"] }
+# (ratatui 0.29 transitive advisories cleared when the TUI was replaced with rustyline.)
+
+# ============================================
+# Development profile: Fast incremental builds
+# ============================================
+[profile.dev]
+opt-level = 0                    # No optimization for fastest compile
+debug = "line-tables-only"       # Backtraces work; far less link time + disk than full debuginfo
+incremental = true               # Enable incremental compilation
+split-debuginfo = "unpacked"     # Faster link times
+codegen-units = 256              # Maximize parallelism for dev builds
+
+# Optimize dependencies in dev mode (they don't change often)
+[profile.dev.package."*"]
+opt-level = 2          # Deps are optimized but your code isn't
+
+# ============================================
+# Release profile: Maximum performance
+# ============================================
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# ============================================
+# Custom profile: Fast release builds for testing
+# Usage: cargo build --profile fast-release
+# ============================================
+[profile.fast-release]
+inherits = "release"
+lto = "thin"           # Faster than fat LTO
+codegen-units = 4      # Parallel codegen
+
+[features]
+default = ["bluetooth"]
+bluetooth = ["dep:btleplug", "dep:p256", "dep:zbus"]
+# io_uring: dedicated ring-thread pool (N = min(cores, 16), round-robin dispatch)
+# that accelerates all TCP connect probes + stream connects. The main runtime
+# stays multi-thread tokio; only the connect hot path routes through the rings.
+# Default build unchanged. See docs/perf/io_uring-baseline.md for benchmarks.
+io_uring = ["dep:tokio-uring"]
+db = ["dep:rusqlite"]
+
+# ============================================
+# Compile-time lint enforcement (per docs/BAD_PATTERNS.md)
+# ============================================
+[lints.rust]
+unused_crate_dependencies = "warn"
+unused_imports = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+unwrap_or_default = "warn"
+dbg_macro = "warn"
+todo = "warn"
+all = "warn"
+pedantic = { level = "allow", priority = -1 }

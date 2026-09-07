@@ -1,0 +1,3213 @@
+use std::io::{self, Write};
+
+use anyhow::{Context, Result};
+use colored::*;
+use ipnetwork::IpNetwork;
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Config, Editor, Helper};
+use url::Url;
+
+use crate::commands;
+use crate::config;
+use crate::utils;
+
+const MAX_INPUT_LENGTH: usize = 4096;
+/// Maximum number of `&` / `;` -separated commands in a single line.
+/// Sized for multi-stage chains like:
+///   `setg target 1.2.3.4 & use scanners/port_scanner & run & use exploits/... & run`
+const MAX_COMMAND_CHAIN_LENGTH: usize = 32;
+/// Characters that separate chained commands. `&` and `;` are equivalent.
+/// Note: `&` here is sequential (NOT the bash background operator); the
+/// shell does not support background commands.
+const CHAIN_SEPARATORS: &[char] = &['&', ';'];
+const MAX_URL_LENGTH: usize = 2048;
+
+const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
+
+/// Shell commands available for tab completion.
+const SHELL_COMMANDS: &[&str] = &[
+    "help",
+    "tommy",
+    "modules",
+    "find",
+    "use",
+    "set target",
+    "set subnet",
+    "set port",
+    "set source_port",
+    "set concurrency",
+    "set timeout",
+    "set threads",
+    "set wordlist",
+    "set verbose",
+    "show_target",
+    "clear_target",
+    "run",
+    "back",
+    "exit",
+    "quit",
+    "info",
+    "subnet",
+    "setg",
+    "unsetg",
+    "unset",
+    "save_profile",
+    "load_profile",
+    "db_import",
+    "show options",
+    "creds",
+    "creds add",
+    "creds search",
+    "creds delete",
+    "creds invalidate",
+    "creds validate",
+    "creds clear",
+    "spool",
+    "spool off",
+    "resource",
+    "makerc",
+    "hosts",
+    "hosts add",
+    "hosts delete",
+    "hosts clear",
+    "services",
+    "services add",
+    "services delete",
+    "services clear",
+    "sessions",
+    "socks",
+    "notes",
+    "workspace",
+    "loot",
+    "loot add",
+    "loot search",
+    "loot delete",
+    "loot clear",
+    "export json",
+    "export csv",
+    "export summary",
+    "jobs",
+    "jobs -k",
+    "jobs clean",
+];
+
+/// Tab-completion helper for the interactive shell.
+struct RsfCompleter {
+    module_paths: Vec<String>,
+}
+
+impl RsfCompleter {
+    fn new() -> Self {
+        // Use build-time registry for reliable module discovery
+        let modules = crate::commands::discover_modules();
+        Self {
+            module_paths: modules,
+        }
+    }
+}
+
+impl Completer for RsfCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // rustyline's cursor `pos` is a raw byte offset. Clamp it to the line
+        // length and snap it back to a UTF-8 char boundary before slicing — a
+        // cursor landing mid-multibyte-codepoint would otherwise panic here and
+        // crash the entire interactive shell. Byte 0 is always a boundary, so
+        // this terminates.
+        let mut pos = pos.min(line.len());
+        while pos > 0 && !line.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        let line_up_to_cursor = &line[..pos];
+
+        // After "use " or "u ", complete module paths
+        let module_prefix = if let Some(rest) = line_up_to_cursor.strip_prefix("use ") {
+            Some(rest)
+        } else if let Some(rest) = line_up_to_cursor.strip_prefix("u ") {
+            Some(rest)
+        } else if let Some(rest) = line_up_to_cursor.strip_prefix("info ") {
+            Some(rest)
+        } else {
+            None
+        };
+
+        if let Some(prefix) = module_prefix {
+            let start = pos - prefix.len();
+            let matches: Vec<Pair> = self
+                .module_paths
+                .iter()
+                .filter(|m| m.starts_with(prefix))
+                .map(|m| Pair {
+                    display: m.clone(),
+                    replacement: m.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // Otherwise complete commands
+        let matches: Vec<Pair> = SHELL_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(line_up_to_cursor))
+            .map(|cmd| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for RsfCompleter {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+        tracing::trace!("hint at pos {} (history len {})", pos, ctx.history().len());
+        if pos < line.len() {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // After "use " or "u ", hint module paths
+        let module_prefix = if let Some(rest) = trimmed.strip_prefix("use ") {
+            Some(rest)
+        } else {
+            trimmed.strip_prefix("u ")
+        };
+
+        if let Some(prefix) = module_prefix {
+            if let Some(m) = self
+                .module_paths
+                .iter()
+                .find(|m| m.starts_with(prefix) && *m != prefix)
+            {
+                return Some(m[prefix.len()..].to_string());
+            }
+            return None;
+        }
+
+        // Hint shell commands
+        if let Some(cmd) = SHELL_COMMANDS
+            .iter()
+            .find(|c| c.starts_with(trimmed) && **c != trimmed)
+        {
+            return Some(cmd[trimmed.len()..].to_string());
+        }
+
+        None
+    }
+}
+impl Highlighter for RsfCompleter {}
+impl Validator for RsfCompleter {}
+impl Helper for RsfCompleter {}
+
+/// Path to persistent command history file.
+fn history_path() -> std::path::PathBuf {
+    let dir = home::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".rustsploit");
+    use std::os::unix::fs::DirBuilderExt;
+    if let Err(e) = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&dir)
+    {
+        eprintln!(
+            "[!] Failed to create rustsploit config directory {}: {}",
+            dir.display(),
+            e
+        );
+    }
+    dir.join("history.txt")
+}
+
+/// Simple interactive shell context
+struct ShellContext {
+    current_module: Option<String>,
+    verbose: bool,
+    /// Current resource script nesting depth (prevents infinite recursion).
+    resource_depth: usize,
+}
+
+impl ShellContext {
+    fn new(verbose: bool) -> Self {
+        ShellContext {
+            current_module: None,
+            verbose,
+            resource_depth: 0,
+        }
+    }
+}
+
+pub async fn interactive_shell_with_resource(
+    verbose: bool,
+    resource_file: Option<&str>,
+) -> Result<()> {
+    interactive_shell_inner(verbose, resource_file).await
+}
+
+pub async fn interactive_shell(verbose: bool) -> Result<()> {
+    interactive_shell_inner(verbose, None).await
+}
+
+async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> Result<()> {
+    println!("Welcome to RustSploit Shell (inspired by RouterSploit)");
+    println!("Type 'help' for a list of commands. Type 'exit' or 'quit' to leave.");
+
+    // Show global target if set
+    if let Some(target_str) = config::GLOBAL_CONFIG.get_target() {
+        if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+            if size > 1 {
+                println!(
+                    "{}",
+                    format!("[*] Global target set: {} ({} IPs)", target_str, size).cyan()
+                );
+            } else {
+                println!(
+                    "{}",
+                    format!("[*] Global target set: {}", target_str).cyan()
+                );
+            }
+        } else {
+            println!(
+                "{}",
+                format!("[*] Global target set: {}", target_str).cyan()
+            );
+        }
+    }
+
+    // Check for third-party plugins
+    let n_plugins = crate::commands::plugin_count();
+    if n_plugins > 0 {
+        println!();
+        println!(
+            "{}",
+            "╔══════════════════════════════════════════════════════════════════════════╗".red()
+        );
+        println!(
+            "{}",
+            "║                  WARNING: THIRD-PARTY PLUGINS DETECTED                  ║"
+                .red()
+                .bold()
+        );
+        println!(
+            "{}",
+            "╠══════════════════════════════════════════════════════════════════════════╣".red()
+        );
+        println!(
+            "{}",
+            "║  This instance has loaded third-party plugin modules from the           ║".red()
+        );
+        println!(
+            "{}",
+            "║  plugins/ directory. These modules are NOT developed, maintained,       ║".red()
+        );
+        println!(
+            "{}",
+            "║  reviewed, or endorsed by the RustSploit project.                       ║".red()
+        );
+        println!(
+            "{}",
+            "║                                                                         ║".red()
+        );
+        println!(
+            "{}",
+            "║  DISCLAIMER:                                                            ║".red()
+        );
+        println!(
+            "{}",
+            "║  - Third-party plugins may contain malicious code, backdoors, or        ║".red()
+        );
+        println!(
+            "{}",
+            "║    vulnerabilities that could compromise your system or network.         ║".red()
+        );
+        println!(
+            "{}",
+            "║  - The RustSploit developers are NOT responsible or liable for any      ║".red()
+        );
+        println!(
+            "{}",
+            "║    damage, data loss, unauthorized access, legal consequences, or       ║".red()
+        );
+        println!(
+            "{}",
+            "║    other harm caused by third-party plugins.                            ║".red()
+        );
+        println!(
+            "{}",
+            "║  - Use third-party plugins entirely at your own risk.                   ║".red()
+        );
+        println!(
+            "{}",
+            "║  - Only install plugins from sources you trust and have audited.        ║".red()
+        );
+        println!(
+            "{}",
+            "║  - Plugins have full access to your system with the same privileges     ║".red()
+        );
+        println!(
+            "{}",
+            "║    as RustSploit itself.                                                ║".red()
+        );
+        println!("{}", format!("║  Loaded plugins: {:<56}║", n_plugins).red());
+        println!(
+            "{}",
+            "║  To disable: remove files from src/modules/plugins/ and rebuild.        ║".red()
+        );
+        println!(
+            "{}",
+            "╚══════════════════════════════════════════════════════════════════════════╝".red()
+        );
+        println!();
+    }
+
+    // Show global options count if any are set
+    let gopts = crate::global_options::GLOBAL_OPTIONS.all().await;
+    if !gopts.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "[*] {} global option(s) loaded (use 'show options' to view)",
+                gopts.len()
+            )
+            .cyan()
+        );
+    }
+
+    let mut ctx = ShellContext::new(verbose);
+
+    let rl_config = Config::builder()
+        .max_history_size(1000)
+        .context("Failed to configure shell history size")?
+        .auto_add_history(true)
+        .build();
+    let mut rl = Editor::with_config(rl_config)?;
+    rl.set_helper(Some(RsfCompleter::new()));
+    let hist = history_path();
+    if let Err(e) = rl.load_history(&hist) {
+        // A missing history file is normal on first run (or after a clean
+        // ~/.rustsploit) — don't alarm the operator. Only surface real failures
+        // (permissions, corruption) loudly.
+        if matches!(&e, rustyline::error::ReadlineError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+        {
+            tracing::debug!("no command history yet at {}", hist.display());
+        } else {
+            eprintln!("[!] Failed to load history: {}", e);
+        }
+    }
+
+    // Auto-load startup.rc if it exists
+    let startup_rc = home::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".rustsploit")
+        .join("startup.rc");
+    if startup_rc.exists() {
+        println!(
+            "{}",
+            format!("[*] Loading startup script: {}", startup_rc.display()).cyan()
+        );
+        execute_resource_file_inner(&mut ctx, &startup_rc.to_string_lossy(), 0).await;
+    }
+
+    // Execute CLI-provided resource file (-r flag)
+    if let Some(rc_file) = resource_file {
+        println!(
+            "{}",
+            format!("[*] Loading resource script: {}", rc_file).cyan()
+        );
+        execute_resource_file_inner(&mut ctx, rc_file, 0).await;
+    }
+
+    'main_loop: loop {
+        let raw_input = match rl.readline(&format!("{}", "rsf> ".cyan().bold())) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break 'main_loop,
+            Err(e) => return Err(e.into()),
+        };
+
+        if raw_input.len() > MAX_INPUT_LENGTH {
+            println!(
+                "{}",
+                format!(
+                    "[!] Input length exceeds {} characters and was ignored.",
+                    MAX_INPUT_LENGTH
+                )
+                .yellow()
+            );
+            continue;
+        }
+        let trimmed = raw_input.trim();
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Support command chaining: `&` and `;` are equivalent sequential
+        // separators. Each command runs in order; failures don't abort the
+        // chain (modules emit their own error messages). Chain depth is
+        // capped at MAX_COMMAND_CHAIN_LENGTH to bound runaway lines.
+        let raw_segments: Vec<&str> = trimmed
+            .split(|c: char| CHAIN_SEPARATORS.contains(&c))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let truncated = raw_segments.len() > MAX_COMMAND_CHAIN_LENGTH;
+        let commands: Vec<&str> = raw_segments
+            .into_iter()
+            .take(MAX_COMMAND_CHAIN_LENGTH)
+            .collect();
+
+        if truncated {
+            println!(
+                "{}",
+                format!(
+                    "[!] Command chain exceeds maximum length of {}. Truncating.",
+                    MAX_COMMAND_CHAIN_LENGTH
+                )
+                .yellow()
+            );
+        }
+
+        let chain_len = commands.len();
+        let is_chain = chain_len > 1;
+        for (idx, cmd_input) in commands.iter().enumerate() {
+            if cmd_input.is_empty() {
+                continue;
+            }
+
+            // For chains, surface a progress prefix so the operator can
+            // tell which segment is running and tie any error output back
+            // to its segment. Single-command lines stay quiet.
+            if is_chain {
+                println!(
+                    "{}",
+                    format!("[chain {}/{}] {}", idx + 1, chain_len, cmd_input).cyan()
+                );
+            }
+
+            let should_break = execute_single_command(&mut ctx, cmd_input).await;
+            // Spool the command
+            if let Err(e) = crate::spool::SPOOL.write_line(&format!("rsf> {}", cmd_input)) {
+                eprintln!("[!] Spool write error: {}", e);
+            }
+            if should_break {
+                break 'main_loop;
+            }
+        }
+    }
+
+    if let Err(e) = rl.save_history(&hist) {
+        eprintln!("[!] Failed to save history: {}", e);
+    }
+    Ok(())
+}
+
+/// Execute a single shell command. Returns true if the shell should exit.
+async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool {
+    // Normalize compound commands: "show options" → "show_options", "show target" → "show_target"
+    let normalized = if cmd_input.starts_with("show ") {
+        cmd_input.replacen("show ", "show_", 1)
+    } else if cmd_input.starts_with("clear ") {
+        cmd_input.replacen("clear ", "clear_", 1)
+    } else {
+        cmd_input.to_string()
+    };
+    let cmd_input = normalized.as_str();
+
+    match split_command(cmd_input) {
+        Some((cmd, rest)) => {
+            let command_key = resolve_command(&cmd);
+            match command_key.as_str() {
+                "exit" => {
+                    println!("Exiting...");
+                    return true;
+                }
+                "back" => {
+                    ctx.current_module = None;
+                    println!("{}", "Cleared current module.".green());
+                }
+                "show_target" | "target" => {
+                    if let Some(target_str) = config::GLOBAL_CONFIG.get_target() {
+                        let is_multi = target_str.contains(',');
+                        let is_subnet = config::GLOBAL_CONFIG.is_subnet() && !is_multi;
+                        if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+                            if is_multi {
+                                let count = target_str.split(',').count();
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "Target (multi): {} ({} entries, ~{} IPs)",
+                                        target_str, count, size
+                                    )
+                                    .green()
+                                );
+                            } else if size > 1 && is_subnet {
+                                println!(
+                                    "{}",
+                                    format!("Target (subnet): {} ({} IPs)", target_str, size)
+                                        .green()
+                                );
+                            } else {
+                                println!("{}", format!("Target: {}", target_str).green());
+                            }
+                        } else {
+                            println!("{}", format!("Target: {}", target_str).green());
+                        }
+                    } else {
+                        println!("{}", "No target set.".dimmed());
+                    }
+                    // Show port settings if set
+                    if let Some(port) = crate::global_options::GLOBAL_OPTIONS.get("port").await {
+                        println!("{}", format!("Port:        {}", port).green());
+                    }
+                    if let Some(sport) = crate::global_options::GLOBAL_OPTIONS
+                        .get("source_port")
+                        .await
+                    {
+                        println!("{}", format!("Source Port: {}", sport).green());
+                    }
+                }
+                "clear_target" => {
+                    config::GLOBAL_CONFIG.clear_target();
+                    println!("{}", "Cleared target.".green());
+                }
+                "help" => {
+                    if rest.is_empty() {
+                        render_help();
+                    } else {
+                        render_help_topic(&rest);
+                    }
+                }
+                "tommy" => {
+                    if let Err(e) = crate::tommy::run_guide() {
+                        println!("{} {}", "tommy:".red(), e);
+                    }
+                }
+                "modules" => utils::list_all_modules(),
+                "find" => {
+                    if rest.is_empty() {
+                        println!("{}", "Usage: find <keyword>".yellow());
+                    } else {
+                        utils::find_modules(&rest);
+                    }
+                }
+
+                "use" => {
+                    if rest.is_empty() {
+                        println!("{}", "Usage: use <module_path>".yellow());
+                    } else if let Some(safe_path) = sanitize_module_path(&rest) {
+                        if utils::module_exists(&safe_path) {
+                            ctx.current_module = Some(safe_path.clone());
+                            println!("{}", format!("Module '{}' selected.", safe_path).green());
+                        } else if let Some(canonical) =
+                            crate::commands::resolve_full_path(&safe_path)
+                        {
+                            // Accept a bare short name (e.g. `use proxy_scanner`),
+                            // matching what `run`/`-m` already resolve, instead of
+                            // requiring the full category/name path.
+                            ctx.current_module = Some(canonical.clone());
+                            println!("{}", format!("Module '{}' selected.", canonical).green());
+                        } else {
+                            println!("{}", format!("Module '{}' not found.", rest).red());
+                        }
+                    } else {
+                        println!(
+                            "{}",
+                            "Module path contains invalid characters or traversal attempts.".red()
+                        );
+                    }
+                }
+                "set" => {
+                    // Normalize Metasploit aliases to rustsploit keys
+                    let rest_normalized = normalize_option_alias(&rest);
+                    let rest_ref = rest_normalized.as_str();
+
+                    // Detect "set <key> <value>" for ANY option
+                    if let Some((raw_key, raw_val)) = rest_ref.split_once(char::is_whitespace) {
+                        let raw_key = raw_key.trim();
+                        let raw_val = raw_val.trim();
+
+                        // Route target/rhost/rhosts to the target-setter
+                        if raw_key == "target" || raw_key == "t" {
+                            handle_set_target(raw_val).await;
+                        } else if raw_val.is_empty() {
+                            println!("{}", format!("Usage: set {} <value>", raw_key).yellow());
+                        } else {
+                            match (
+                                crate::utils::sanitize::sanitize_string_input(raw_key),
+                                crate::utils::sanitize::sanitize_string_input(raw_val),
+                            ) {
+                                (Ok(skey), Ok(sval)) => {
+                                    if skey == "port" || skey == "source_port" {
+                                        match sval.parse::<u16>() {
+                                            Ok(p) if p > 0 => {
+                                                if crate::global_options::GLOBAL_OPTIONS
+                                                    .set(&skey, &sval)
+                                                    .await
+                                                {
+                                                    println!("{} => {}", skey.green(), sval);
+                                                } else {
+                                                    println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
+                                                }
+                                            }
+                                            _ if skey == "source_port"
+                                                && (sval == "0" || sval.is_empty()) =>
+                                            {
+                                                crate::global_options::GLOBAL_OPTIONS
+                                                    .unset("source_port")
+                                                    .await;
+                                                println!(
+                                                    "{}",
+                                                    "Source port cleared (will use OS-assigned)."
+                                                        .green()
+                                                );
+                                            }
+                                            _ => println!(
+                                                "{}",
+                                                format!("Invalid {}. Must be 1-65535.", skey)
+                                                    .yellow()
+                                            ),
+                                        }
+                                    } else if crate::global_options::GLOBAL_OPTIONS
+                                        .set(&skey, &sval)
+                                        .await
+                                    {
+                                        println!("{} => {}", skey.green(), sval);
+                                        if skey == "verbose" {
+                                            ctx.verbose = matches!(
+                                                sval.as_str(),
+                                                "y" | "yes" | "true" | "1" | "on"
+                                            );
+                                        }
+                                    } else {
+                                        println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
+                                    }
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    println!("{}", format!("[!] Invalid input: {}", e).red());
+                                }
+                            }
+                        }
+                    } else {
+                        // Bare "set" or "set <something>" without a value
+                        let bare = rest_ref.trim();
+                        if bare.is_empty() {
+                            println!("{}", "Usage: set <key> <value>".yellow());
+                            println!("{}", "  set target <ip/cidr/file>  — Set target".dimmed());
+                            println!(
+                                "{}",
+                                "  set port <1-65535>         — Set target port".dimmed()
+                            );
+                            println!(
+                                "{}",
+                                "  set source_port <val>      — Set source port (0=clear)".dimmed()
+                            );
+                            println!(
+                                "{}",
+                                "  set concurrency <N>        — Max concurrent tasks".dimmed()
+                            );
+                            println!(
+                                "{}",
+                                "  set timeout <secs>         — Per-module timeout".dimmed()
+                            );
+                            println!(
+                                "{}",
+                                "  set threads <N>            — Alias for concurrency".dimmed()
+                            );
+                            println!(
+                                "{}",
+                                "  set wordlist <path>        — Default wordlist".dimmed()
+                            );
+                            println!(
+                                "{}",
+                                "  set verbose y/n            — Verbose output".dimmed()
+                            );
+                            println!();
+                            println!("{}", "Metasploit aliases:".dimmed());
+                            println!("{}", "  RHOST/RHOSTS → target, RPORT → port".dimmed());
+                            println!(
+                                "{}",
+                                "  LPORT → source_port, THREADS → concurrency".dimmed()
+                            );
+                        } else if bare == "target" || bare == "t" {
+                            println!("{}", "Usage: set target <ip/cidr/file>".yellow());
+                        } else {
+                            println!("{}", format!("Usage: set {} <value>", bare).yellow());
+                        }
+                    }
+                }
+                "set_target" => {
+                    handle_set_target(&rest).await;
+                }
+                "set_subnet" => {
+                    // Handle shortcuts: "subnet <val>", "sn <val>", "set subnet <val>", "set sn <val>"
+                    let raw_value = if cmd == "subnet" || cmd == "sn" {
+                        &rest
+                    } else if let Some(val) = rest.strip_prefix("subnet ") {
+                        val
+                    } else {
+                        rest.strip_prefix("sn ").unwrap_or_default()
+                    };
+
+                    let raw_value = raw_value.trim();
+
+                    if raw_value.is_empty() {
+                        println!("{}", "Usage: set subnet <CIDR>".yellow());
+                        println!("{}", "  Shortcuts: sn <CIDR>, subnet <CIDR>".dimmed());
+                        println!("{}", "  Examples:".dimmed());
+                        println!("{}", "    sn 192.168.1.0/24".dimmed());
+                        println!("{}", "    set subnet 10.0.0.0/16".dimmed());
+                    } else {
+                        // Validate it's a CIDR subnet, not a plain IP
+                        if !raw_value.contains('/') {
+                            println!(
+                                "{}",
+                                "[!] Not a subnet. Use CIDR notation (e.g. 192.168.1.0/24)."
+                                    .yellow()
+                            );
+                            println!("{}", "    For single IPs, use: set target <IP>".dimmed());
+                        } else {
+                            match sanitize_target(raw_value) {
+                                Ok(valid_target) => {
+                                    // Verify it actually parses as CIDR
+                                    if valid_target.parse::<IpNetwork>().is_err() {
+                                        println!(
+                                            "{}",
+                                            format!("[!] Invalid CIDR notation: {}", valid_target)
+                                                .red()
+                                        );
+                                    } else {
+                                        match config::GLOBAL_CONFIG.set_target(&valid_target) {
+                                            Ok(_) => {
+                                                if let Some(size) =
+                                                    config::GLOBAL_CONFIG.get_target_size()
+                                                {
+                                                    println!(
+                                                        "{}",
+                                                        format!(
+                                                            "Subnet set to: {} ({} IPs)",
+                                                            valid_target, size
+                                                        )
+                                                        .green()
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "{}",
+                                                        format!("Subnet set to: {}", valid_target)
+                                                            .green()
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                println!(
+                                                    "{}",
+                                                    format!("[!] Failed to set subnet: {}", e)
+                                                        .red()
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(reason) => {
+                                    println!("{}", format!("[!] {}", reason).yellow());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // INFO command (Feature 1)
+                // ═══════════════════════════════════════════════
+                "info" => {
+                    let module_path = if !rest.is_empty() {
+                        Some(rest.clone())
+                    } else {
+                        ctx.current_module.clone()
+                    };
+
+                    if let Some(ref path) = module_path {
+                        if let Some(info) = commands::module_info(path) {
+                            crate::module_info::display_module_info(path, &info);
+                        } else {
+                            println!(
+                                "{}",
+                                format!("No metadata available for '{}'.", path).dimmed()
+                            );
+                            println!("{}", "Modules can provide metadata by adding a pub fn info() -> ModuleInfo function.".dimmed());
+                        }
+                    } else {
+                        println!("{}", "No module selected. Use 'info <module_path>' or select a module first.".yellow());
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // GLOBAL OPTIONS (Feature 2)
+                // ═══════════════════════════════════════════════
+                "setg" => {
+                    let rest_normalized = normalize_option_alias(&rest);
+                    if let Some((key, value)) = rest_normalized.split_once(char::is_whitespace) {
+                        let key = key.trim();
+                        let value = value.trim();
+                        if key.is_empty() || value.is_empty() {
+                            println!("{}", "Usage: setg <key> <value>".yellow());
+                        } else if key == "target" {
+                            handle_set_target(value).await;
+                        } else {
+                            match (
+                                crate::utils::sanitize::sanitize_string_input(key),
+                                crate::utils::sanitize::sanitize_string_input(value),
+                            ) {
+                                (Ok(skey), Ok(sval)) => {
+                                    if skey == "port" || skey == "source_port" {
+                                        match sval.parse::<u16>() {
+                                            Ok(p) if p > 0 => {
+                                                if crate::global_options::GLOBAL_OPTIONS
+                                                    .set(&skey, &sval)
+                                                    .await
+                                                {
+                                                    println!("{} => {}", skey.green(), sval);
+                                                } else {
+                                                    println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
+                                                }
+                                            }
+                                            // Mirror `set`: source_port 0/empty clears it.
+                                            _ if skey == "source_port"
+                                                && (sval == "0" || sval.is_empty()) =>
+                                            {
+                                                crate::global_options::GLOBAL_OPTIONS
+                                                    .unset("source_port")
+                                                    .await;
+                                                println!(
+                                                    "{}",
+                                                    "Source port cleared (will use OS-assigned)."
+                                                        .green()
+                                                );
+                                            }
+                                            _ => {
+                                                println!(
+                                                    "{}",
+                                                    format!("[!] Invalid port value: {}", sval)
+                                                        .red()
+                                                );
+                                            }
+                                        }
+                                    } else if crate::global_options::GLOBAL_OPTIONS
+                                        .set(&skey, &sval)
+                                        .await
+                                    {
+                                        println!("{} => {}", skey.green(), sval);
+                                        // Mirror `set`: keep the live shell verbose flag in sync.
+                                        if skey == "verbose" {
+                                            ctx.verbose = matches!(
+                                                sval.as_str(),
+                                                "y" | "yes" | "true" | "1" | "on"
+                                            );
+                                        }
+                                    } else {
+                                        println!("{}", format!("[!] Failed to set '{}': value too long or option limit reached", skey).red());
+                                    }
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    println!("{}", format!("[!] Invalid input: {}", e).red());
+                                }
+                            }
+                        }
+                    } else {
+                        println!("{}", "Usage: setg <key> <value>".yellow());
+                        println!("{}", "  Example: setg port 8080".dimmed());
+                    }
+                }
+                "unsetg" => {
+                    let key = rest.trim();
+                    let key = match key.to_uppercase().as_str() {
+                        "RPORT" => "port",
+                        "LPORT" => "source_port",
+                        "THREADS" => "concurrency",
+                        _ => key,
+                    };
+                    if key.is_empty() {
+                        println!("{}", "Usage: unsetg <key>".yellow());
+                    } else if crate::global_options::GLOBAL_OPTIONS.unset(key).await {
+                        println!("{}", format!("Unset global option '{}'", key).green());
+                    } else {
+                        println!(
+                            "{}",
+                            format!("Global option '{}' was not set.", key).dimmed()
+                        );
+                    }
+                }
+                "show_options" => {
+                    display_all_options(&ctx).await;
+                }
+                "load_profile" => {
+                    let path = rest.trim();
+                    if path.is_empty() {
+                        println!("{}", "Usage: load_profile <path>".yellow());
+                    } else {
+                        match crate::profiles::apply_profile(std::path::Path::new(path)).await {
+                            Ok(n) => println!(
+                                "{}",
+                                format!("Loaded {} option(s) from '{}'", n, path).green()
+                            ),
+                            Err(e) => println!(
+                                "{}",
+                                format!("[!] Load profile '{}' failed: {}", path, e).red()
+                            ),
+                        }
+                    }
+                }
+                "save_profile" => {
+                    let path = rest.trim();
+                    if path.is_empty() {
+                        println!("{}", "Usage: save_profile <path>".yellow());
+                    } else {
+                        match crate::profiles::save_profile(std::path::Path::new(path)).await {
+                            Ok(_) => println!("{}", format!("Saved options to '{}'", path).green()),
+                            Err(e) => println!(
+                                "{}",
+                                format!("[!] Save profile '{}' failed: {}", path, e).red()
+                            ),
+                        }
+                    }
+                }
+                "db_import" => {
+                    let path = rest.trim();
+                    if path.is_empty() {
+                        println!("{}", "Usage: db_import <nmap_xml_path>".yellow());
+                    } else {
+                        match crate::nmap_import::import_nmap_xml(std::path::Path::new(path)).await
+                        {
+                            Ok((hosts, services)) => println!(
+                                "{}",
+                                format!(
+                                    "Imported {} hosts and {} services from '{}'",
+                                    hosts, services, path
+                                )
+                                .green()
+                            ),
+                            Err(e) => {
+                                println!("{}", format!("[!] Import '{}' failed: {}", path, e).red())
+                            }
+                        }
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // CREDENTIALS (Feature 3)
+                // ═══════════════════════════════════════════════
+                "creds" => {
+                    if rest.is_empty() {
+                        crate::cred_store::CRED_STORE.display().await;
+                    } else if rest == "add" {
+                        // Interactive cred add
+                        let host = match utils::prompt_required("Host").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let port_str = match utils::prompt_default("Port", "0").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let port: u16 = match port_str.parse() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "[!] Invalid port '{}' (must be 0-65535): {e}",
+                                        port_str
+                                    )
+                                    .red()
+                                );
+                                return false;
+                            }
+                        };
+                        let service = match utils::prompt_default("Service", "unknown").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let username = match utils::prompt_required("Username").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let secret = match utils::prompt_required("Password/Hash/Key").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let ctype = match utils::prompt_default(
+                            "Type (password/hash/key/token)",
+                            "password",
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let cred_type = match ctype.as_str() {
+                            "hash" => crate::cred_store::CredType::Hash,
+                            "key" => crate::cred_store::CredType::Key,
+                            "token" => crate::cred_store::CredType::Token,
+                            _ => crate::cred_store::CredType::Password,
+                        };
+                        match crate::cred_store::CRED_STORE
+                            .add(crate::cred_store::NewCred {
+                                host: &host,
+                                port,
+                                service: &service,
+                                username: &username,
+                                secret: &secret,
+                                cred_type,
+                                source_module: "manual",
+                            })
+                            .await
+                        {
+                            Some(id) => println!(
+                                "{}",
+                                format!("[+] Credential stored (ID: {})", id).green()
+                            ),
+                            None => println!(
+                                "{}",
+                                "[!] Failed to store credential (validation failure)".red()
+                            ),
+                        }
+                    } else if let Some(query) = rest.strip_prefix("search ") {
+                        let results = crate::cred_store::CRED_STORE.search(query.trim()).await;
+                        crate::cred_store::CRED_STORE.display_results(&results);
+                    } else if let Some(id) = rest.strip_prefix("delete ") {
+                        if crate::cred_store::CRED_STORE.delete(id.trim()).await {
+                            println!(
+                                "{}",
+                                format!("[+] Credential '{}' deleted.", id.trim()).green()
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                format!("[-] Credential '{}' not found.", id.trim()).red()
+                            );
+                        }
+                    } else if let Some(id) = rest.strip_prefix("invalidate ") {
+                        if crate::cred_store::CRED_STORE
+                            .set_valid(id.trim(), false)
+                            .await
+                        {
+                            println!(
+                                "{}",
+                                format!("[+] Credential '{}' marked invalid.", id.trim()).green()
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                format!("[-] Credential '{}' not found.", id.trim()).red()
+                            );
+                        }
+                    } else if let Some(id) = rest.strip_prefix("validate ") {
+                        if crate::cred_store::CRED_STORE
+                            .set_valid(id.trim(), true)
+                            .await
+                        {
+                            println!(
+                                "{}",
+                                format!("[+] Credential '{}' marked valid.", id.trim()).green()
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                format!("[-] Credential '{}' not found.", id.trim()).red()
+                            );
+                        }
+                    } else if rest == "clear" {
+                        crate::cred_store::CRED_STORE.clear().await;
+                        println!("{}", "[+] All credentials cleared.".green());
+                    } else {
+                        println!("{}", "Usage: creds [add|search <query>|delete <id>|invalidate <id>|validate <id>|clear]".yellow());
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // SPOOL (Feature 4)
+                // ═══════════════════════════════════════════════
+                "spool" => {
+                    if rest.is_empty() {
+                        crate::spool::display_status();
+                    } else if rest == "off" {
+                        if let Some(name) = crate::spool::SPOOL.stop() {
+                            println!(
+                                "{}",
+                                format!("[+] Spool stopped. Output saved to '{}'", name).green()
+                            );
+                        } else {
+                            println!("{}", "Spool was not active.".dimmed());
+                        }
+                    } else {
+                        match crate::utils::sanitize::validate_safe_file_path(&rest) {
+                            Ok(safe_path) => match crate::spool::SPOOL.start(&safe_path, None) {
+                                Ok(()) => println!(
+                                    "{}",
+                                    format!("[+] Spooling output to '{}'", safe_path).green()
+                                ),
+                                Err(e) => println!(
+                                    "{}",
+                                    format!("[!] Failed to start spool: {}", e).red()
+                                ),
+                            },
+                            Err(e) => {
+                                println!("{}", format!("[!] Invalid spool path: {}", e).red())
+                            }
+                        }
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // RESOURCE SCRIPTS (Feature 5)
+                // ═══════════════════════════════════════════════
+                "resource" => {
+                    if rest.is_empty() {
+                        println!("{}", "Usage: resource <script_file>".yellow());
+                    } else {
+                        let depth = ctx.resource_depth;
+                        ctx.resource_depth += 1;
+                        execute_resource_file_inner(ctx, &rest, depth).await;
+                        ctx.resource_depth = depth;
+                    }
+                }
+                "makerc" => {
+                    if rest.is_empty() {
+                        println!("{}", "Usage: makerc <output_file>".yellow());
+                    } else {
+                        match crate::utils::sanitize::validate_safe_file_path(&rest) {
+                            Ok(safe_path) => {
+                                let hist_path = history_path();
+                                match tokio::fs::read_to_string(&hist_path).await {
+                                    Ok(contents) => {
+                                        match tokio::fs::write(&safe_path, &contents).await {
+                                            Ok(_) => println!(
+                                                "{}",
+                                                format!(
+                                                    "[+] Command history saved to '{}'",
+                                                    safe_path
+                                                )
+                                                .green()
+                                            ),
+                                            Err(e) => println!(
+                                                "{}",
+                                                format!("[!] Failed to write: {}", e).red()
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => println!(
+                                        "{}",
+                                        format!("[!] Failed to read history: {}", e).red()
+                                    ),
+                                }
+                            }
+                            Err(e) => {
+                                println!("{}", format!("[!] Invalid output path: {}", e).red())
+                            }
+                        }
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // HOSTS / SERVICES / WORKSPACE (Feature 7)
+                // ═══════════════════════════════════════════════
+                "hosts" => {
+                    if rest.is_empty() {
+                        crate::workspace::WORKSPACE.display_hosts().await;
+                    } else if let Some(ip) = rest.strip_prefix("add ") {
+                        let ip = ip.trim();
+                        if ip.is_empty() {
+                            println!("{}", "Usage: hosts add <ip>".yellow());
+                        } else if let Err(e) = sanitize_target(ip) {
+                            println!("{}", format!("[!] Invalid host: {}", e).red());
+                        } else {
+                            crate::workspace::WORKSPACE.add_host(ip, None, None).await;
+                            println!(
+                                "{}",
+                                format!("[+] Host '{}' added to workspace.", ip).green()
+                            );
+                        }
+                    } else if let Some(ip) = rest.strip_prefix("delete ") {
+                        let ip = ip.trim();
+                        if ip.is_empty() {
+                            println!("{}", "Usage: hosts delete <ip>".yellow());
+                        } else if crate::workspace::WORKSPACE.delete_host(ip).await {
+                            println!(
+                                "{}",
+                                format!("[+] Host '{}' and its services removed.", ip).green()
+                            );
+                        } else {
+                            println!("{}", format!("[-] Host '{}' not found.", ip).red());
+                        }
+                    } else if rest == "clear" {
+                        crate::workspace::WORKSPACE.clear_hosts().await;
+                        println!("{}", "[+] All hosts and services cleared.".green());
+                    } else {
+                        println!("{}", "Usage: hosts [add <ip>|delete <ip>|clear]".yellow());
+                    }
+                }
+                "services" => {
+                    if rest.is_empty() {
+                        crate::workspace::WORKSPACE.display_services().await;
+                    } else if rest == "add" {
+                        let host = match utils::prompt_required("Host IP").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        if let Err(e) = sanitize_target(&host) {
+                            println!("{}", format!("[!] Invalid host: {}", e).red());
+                            return false;
+                        }
+                        let port_str = match utils::prompt_required("Port").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let port: u16 = match port_str.parse() {
+                            Ok(p) if p > 0 => p,
+                            _ => {
+                                println!("{}", "[!] Invalid port. Must be 1-65535.".yellow());
+                                return false;
+                            }
+                        };
+                        let proto = match utils::prompt_default("Protocol", "tcp").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let svc = match utils::prompt_required("Service name").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let ver = match utils::prompt_default("Version", "").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let version = if ver.is_empty() {
+                            None
+                        } else {
+                            Some(ver.as_str())
+                        };
+                        crate::workspace::WORKSPACE
+                            .add_service(&host, port, &proto, &svc, version)
+                            .await;
+                        println!(
+                            "{}",
+                            format!("[+] Service {}:{}/{} added.", host, port, svc).green()
+                        );
+                    } else if let Some(args) = rest.strip_prefix("delete ") {
+                        let parts: Vec<&str> = args.split_whitespace().collect();
+                        if parts.len() < 2 {
+                            println!(
+                                "{}",
+                                "Usage: services delete <host> <port> [protocol]".yellow()
+                            );
+                        } else {
+                            let host = parts[0].trim();
+                            // Optional protocol scopes the delete to e.g. just tcp/80;
+                            // omit it to remove every protocol on the port.
+                            let protocol = parts.get(2).map(|s| s.trim());
+                            match parts[1].trim().parse::<u16>() {
+                                Ok(port) if port > 0 => {
+                                    if crate::workspace::WORKSPACE
+                                        .delete_service(host, port, protocol)
+                                        .await
+                                    {
+                                        println!(
+                                            "{}",
+                                            format!("[+] Service {}:{} removed.", host, port)
+                                                .green()
+                                        );
+                                    } else {
+                                        println!(
+                                            "{}",
+                                            format!("[-] Service {}:{} not found.", host, port)
+                                                .red()
+                                        );
+                                    }
+                                }
+                                _ => println!("{}", "Invalid port number.".yellow()),
+                            }
+                        }
+                    } else {
+                        println!(
+                            "{}",
+                            "Usage: services [add|delete <host> <port> [protocol]]".yellow()
+                        );
+                    }
+                }
+                "notes" => {
+                    if let Some((ip, note)) = rest.split_once(char::is_whitespace) {
+                        let ip = ip.trim();
+                        let note = note.trim();
+                        if ip.is_empty() || note.is_empty() {
+                            println!("{}", "Usage: notes <ip> <note text>".yellow());
+                        } else if crate::workspace::WORKSPACE.add_note(ip, note).await {
+                            println!("{}", format!("[+] Note added to host '{}'.", ip).green());
+                        } else {
+                            println!(
+                                "{}",
+                                format!(
+                                    "[-] Host '{}' not found. Add it first with 'hosts add {}'.",
+                                    ip, ip
+                                )
+                                .red()
+                            );
+                        }
+                    } else {
+                        println!("{}", "Usage: notes <ip> <note text>".yellow());
+                    }
+                }
+                "sessions" => {
+                    if rest.starts_with("start") {
+                        let port_str = rest.strip_prefix("start").unwrap_or("").trim();
+                        let port: u16 = port_str.parse().unwrap_or(4444);
+                        match crate::sessions::start_tcp_listener(&format!("0.0.0.0:{}", port))
+                            .await
+                        {
+                            Ok(p) => println!(
+                                "{}",
+                                format!(
+                                    "[+] TCP listener started on port {} (actual: {})",
+                                    port, p
+                                )
+                                .green()
+                            ),
+                            Err(e) => {
+                                println!("{}", format!("[!] Failed to start listener: {}", e).red())
+                            }
+                        }
+                    } else {
+                        let sessions = crate::sessions::list_sessions().await;
+                        if sessions.is_empty() {
+                            println!(
+                                "{}",
+                                "No active sessions. Use 'sessions start <port>' to begin."
+                                    .dimmed()
+                            );
+                        } else {
+                            for s in &sessions {
+                                println!(
+                                    "  {}  {}  {}:{}  {}  {} ({})",
+                                    s.id,
+                                    s.session_type,
+                                    s.target,
+                                    s.port,
+                                    s.info,
+                                    s.connected_at.format("%H:%M:%S"),
+                                    s.last_active.format("%H:%M:%S"),
+                                );
+                            }
+                        }
+                    }
+                }
+                "socks" => {
+                    let sessions = crate::socks::global_proxy().list().await;
+                    if sessions.is_empty() {
+                        println!(
+                            "{}",
+                            "No SOCKS sessions registered. Use 'sessions' first.".dimmed()
+                        );
+                    } else {
+                        for s in &sessions {
+                            println!(
+                                "  {} -> {}:{}",
+                                s.id,
+                                s.target,
+                                s.stream.lock().await.is_some()
+                            );
+                        }
+                    }
+                }
+                "workspace" => {
+                    if rest.is_empty() {
+                        let current = crate::workspace::WORKSPACE.current_name().await;
+                        let workspaces = crate::workspace::WORKSPACE.list_workspaces().await;
+                        println!();
+                        println!("{}", "Workspaces:".bold().underline());
+                        for ws in &workspaces {
+                            if *ws == current {
+                                println!("  {} {}", "*".green().bold(), ws.green().bold());
+                            } else {
+                                println!("    {}", ws);
+                            }
+                        }
+                        println!();
+                    } else {
+                        let name = rest.trim();
+                        if name.is_empty() || name.len() > 64 {
+                            println!("{}", "Workspace name must be 1-64 characters.".red());
+                        } else if name
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        {
+                            crate::workspace::WORKSPACE.switch(name).await;
+                            println!(
+                                "{}",
+                                format!("[+] Switched to workspace '{}'", name).green()
+                            );
+                            if ctx.current_module.is_some() || config::GLOBAL_CONFIG.has_target() {
+                                println!("{}", "[*] Note: current module and target are preserved from previous workspace".yellow());
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                "Workspace name must be alphanumeric (with _ and -).".red()
+                            );
+                        }
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // LOOT (Feature 8)
+                // ═══════════════════════════════════════════════
+                "loot" => {
+                    if rest.is_empty() {
+                        crate::loot::LOOT_STORE.display().await;
+                    } else if rest == "add" {
+                        let host = match utils::prompt_required("Host").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let ltype = match utils::prompt_default(
+                            "Type (config/password_file/firmware/hash/other)",
+                            "other",
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let desc = match utils::prompt_required("Description").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        let data = match utils::prompt_required("Data/content").await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::debug!("prompt cancelled: {e}");
+                                return false;
+                            }
+                        };
+                        if let Some(id) = crate::loot::LOOT_STORE
+                            .add_text(&host, &ltype, &desc, &data, "manual")
+                            .await
+                        {
+                            println!("{}", format!("[+] Loot stored (ID: {})", id).green());
+                        } else {
+                            println!("{}", "[!] Failed to store loot.".red());
+                        }
+                    } else if let Some(query) = rest.strip_prefix("search ") {
+                        let results = crate::loot::LOOT_STORE.search(query.trim()).await;
+                        if results.is_empty() {
+                            println!("{}", "No matching loot found.".dimmed());
+                        } else {
+                            for l in &results {
+                                println!(
+                                    "  [{}] {} ({}) from {} - {}",
+                                    l.id.yellow(),
+                                    l.loot_type,
+                                    l.host.green(),
+                                    l.source_module,
+                                    l.description
+                                );
+                            }
+                        }
+                    } else if let Some(id) = rest.strip_prefix("delete ") {
+                        let id = id.trim();
+                        if id.is_empty() {
+                            println!("{}", "Usage: loot delete <id>".yellow());
+                        } else if crate::loot::LOOT_STORE.delete(id).await {
+                            println!("{}", format!("[+] Loot '{}' deleted.", id).green());
+                        } else {
+                            println!("{}", format!("[-] Loot '{}' not found.", id).red());
+                        }
+                    } else if rest == "clear" {
+                        crate::loot::LOOT_STORE.clear().await;
+                        println!("{}", "[+] All loot cleared.".green());
+                    } else {
+                        println!(
+                            "{}",
+                            "Usage: loot [add|search <query>|delete <id>|clear]".yellow()
+                        );
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // EXPORT (Feature 9)
+                // ═══════════════════════════════════════════════
+                "export" => {
+                    if let Some((fmt, path)) = rest.split_once(char::is_whitespace) {
+                        let path = path.trim();
+                        if let Err(e) = crate::export::validate_export_path(path) {
+                            println!("{}", format!("[!] {}", e).red());
+                        } else {
+                            match fmt.trim() {
+                                "json" => {
+                                    if let Err(e) = crate::export::export_json(path).await {
+                                        println!("{}", format!("[!] Export failed: {}", e).red());
+                                    }
+                                }
+                                "csv" => {
+                                    if let Err(e) = crate::export::export_csv(path).await {
+                                        println!("{}", format!("[!] Export failed: {}", e).red());
+                                    }
+                                }
+                                "summary" => {
+                                    if let Err(e) = crate::export::export_summary(path).await {
+                                        println!("{}", format!("[!] Export failed: {}", e).red());
+                                    }
+                                }
+                                _ => println!(
+                                    "{}",
+                                    "Usage: export <json|csv|summary> <filename>".yellow()
+                                ),
+                            }
+                        }
+                    } else {
+                        println!("{}", "Usage: export <json|csv|summary> <filename>".yellow());
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // JOBS (Feature 10)
+                // ═══════════════════════════════════════════════
+                "jobs" => {
+                    if rest.is_empty() {
+                        crate::jobs::JOB_MANAGER.display();
+                    } else if let Some(id_str) = rest.strip_prefix("-k ") {
+                        if let Ok(id) = id_str.trim().parse::<u32>() {
+                            if crate::jobs::JOB_MANAGER.kill(id) {
+                                println!("{}", format!("[+] Job {} cancelled.", id).green());
+                            } else {
+                                println!("{}", format!("[-] Job {} not found.", id).red());
+                            }
+                        } else {
+                            println!("{}", "Usage: jobs -k <id>".yellow());
+                        }
+                    } else if rest == "clean" {
+                        crate::jobs::JOB_MANAGER.cleanup();
+                        println!("{}", "[+] Finished jobs cleaned up.".green());
+                    } else {
+                        println!("{}", "Usage: jobs [-k <id>|clean]".yellow());
+                    }
+                }
+
+                // ═══════════════════════════════════════════════
+                // RUN (with -j background support)
+                // ═══════════════════════════════════════════════
+                "run" => {
+                    let background = rest.trim() == "-j" || rest.trim() == "--job";
+
+                    if let Some(ref module_path) = ctx.current_module {
+                        // Get target from global config
+                        let target = if config::GLOBAL_CONFIG.has_target() {
+                            match config::GLOBAL_CONFIG.get_target() {
+                                Some(t) => {
+                                    println!("{}", format!("[*] Using target: {}", t).cyan());
+                                    Some(t)
+                                }
+                                None => {
+                                    println!("{}", "[!] Error getting target".red());
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Interactive prompt if no target is set
+                        let target = if target.is_none() {
+                            println!("{}", "[!] Warning: No target set.".yellow());
+
+                            match utils::prompt_yes_no(
+                                "Do you want to provide a target address?",
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(true) => {
+                                    match prompt_string_default("Enter target", "")
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("{}", e))
+                                    {
+                                        Ok(input) => match sanitize_target(&input) {
+                                            Ok(valid_target) => {
+                                                if let Err(e) =
+                                                    config::GLOBAL_CONFIG.set_target(&valid_target)
+                                                {
+                                                    println!(
+                                                        "{}",
+                                                        format!("[!] Failed to set target: {}", e)
+                                                            .red()
+                                                    );
+                                                    None
+                                                } else {
+                                                    println!(
+                                                        "{}",
+                                                        format!(
+                                                            "[*] Target set to '{}'",
+                                                            valid_target
+                                                        )
+                                                        .green()
+                                                    );
+                                                    Some(valid_target)
+                                                }
+                                            }
+                                            Err(e) => {
+                                                println!(
+                                                    "{}",
+                                                    format!("[!] Invalid target: {}", e).red()
+                                                );
+                                                None
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!(
+                                                "{}",
+                                                format!("[!] Error reading input: {}", e).red()
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                Ok(false) => {
+                                    match utils::prompt_yes_no(
+                                        "Continue with localhost (127.0.0.1)?",
+                                        false,
+                                    )
+                                    .await
+                                    {
+                                        Ok(true) => Some("127.0.0.1".to_string()),
+                                        _ => {
+                                            println!("{}", "[!] Execution aborted.".red());
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!("prompt error: {e}");
+                                    None
+                                }
+                            }
+                        } else {
+                            target
+                        };
+
+                        if let Some(ref t) = target {
+                            if background {
+                                match crate::jobs::JOB_MANAGER.spawn(
+                                    module_path.clone(),
+                                    t.clone(),
+                                    ctx.verbose,
+                                    // Run the backgrounded module in api_mode so its
+                                    // `cfg_prompt_*` calls resolve from global options /
+                                    // defaults instead of blocking on stdin from the
+                                    // detached task (which would race the foreground
+                                    // shell's readline and corrupt input). A module that
+                                    // lacks a required option now fails fast as a
+                                    // JobEvent::Failed rather than silently stealing
+                                    // stdin. The Some(_) config still installs a
+                                    // RUN_CONTEXT carrying the job's cancel token, so
+                                    // cooperative cancellation via `jobs -k <id>` is
+                                    // unchanged.
+                                    Some(crate::config::ModuleConfig {
+                                        api_mode: true,
+                                        ..Default::default()
+                                    }),
+                                ) {
+                                    Ok((job_id, _progress)) => {
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "[*] Job {} started: {} against {}",
+                                                job_id, module_path, t
+                                            )
+                                            .cyan()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "{}",
+                                            format!("[!] Failed to start job: {}", e).red()
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Normal foreground execution
+                                let is_mass_scan = crate::utils::is_mass_scan_target(t);
+
+                                // Honeypot detection — enabled by default. Note that
+                                // scheduler::fanout_single also checks; this provides
+                                // interactive confirmation before the module runs.
+                                let honeypot_on = crate::global_options::GLOBAL_OPTIONS
+                                    .try_get("honeypot_detection")
+                                    .map(|v| {
+                                        !matches!(
+                                            v.to_lowercase().as_str(),
+                                            "n" | "no" | "false" | "0" | "off" | "disabled"
+                                        )
+                                    })
+                                    .unwrap_or(true);
+
+                                let mut skip_target = false;
+                                if honeypot_on
+                                    && !is_mass_scan
+                                    && crate::utils::network::quick_honeypot_check(t).await
+                                {
+                                    println!("{}", format!(
+                                            "[!] Target {} appears to be a honeypot (11+ common ports open)",
+                                            t
+                                        ).red().bold());
+                                    let proceed = utils::prompt_yes_no("Skip this honeypot?", true)
+                                        .await
+                                        .unwrap_or(true);
+                                    if proceed {
+                                        println!("{}", "[*] Skipping honeypot target.".yellow());
+                                        skip_target = true;
+                                    }
+                                }
+
+                                if !skip_target {
+                                    println!(
+                                        "Running module '{}' against target '{}'",
+                                        module_path, t
+                                    );
+                                    if let Err(e) =
+                                        commands::run_module(module_path, t, ctx.verbose).await
+                                    {
+                                        eprintln!("[!] Module failed: {:?}", e);
+                                    }
+                                }
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                "No target set. Use 'set target <value>' (or 't <value>') first."
+                                    .yellow()
+                            );
+                            println!("{}", "  Examples:".dimmed());
+                            println!("{}", "    set target 192.168.1.1".dimmed());
+                            println!("{}", "    set target 192.168.1.0/24".dimmed());
+                        }
+                    } else {
+                        println!(
+                            "{}",
+                            "No module selected. Use 'use <module>' first.".yellow()
+                        );
+                    }
+                }
+                _ => {
+                    println!(
+                        "{}",
+                        format!(
+                            "Unknown command: '{}'. Type 'help' or '?' for usage.",
+                            cmd_input
+                        )
+                        .red()
+                    );
+                }
+            }
+        }
+        None => {
+            println!(
+                "{}",
+                format!(
+                    "Unknown command: '{}'. Type 'help' or '?' for usage.",
+                    cmd_input
+                )
+                .red()
+            );
+        }
+    }
+    false
+}
+
+/// Maximum resource script nesting depth to prevent infinite recursion.
+const MAX_RESOURCE_DEPTH: usize = 16;
+
+/// Execute commands from a resource script file.
+/// Uses Box::pin to handle async recursion (resource scripts can call resource).
+/// Depth parameter prevents infinite recursion from self-referencing scripts.
+fn execute_resource_file_inner<'a>(
+    ctx: &'a mut ShellContext,
+    path: &'a str,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        if depth >= MAX_RESOURCE_DEPTH {
+            println!("{}", format!("[!] Resource script nesting too deep (max {}). Aborting to prevent infinite recursion.", MAX_RESOURCE_DEPTH).red());
+            return;
+        }
+        let safe_path = match crate::utils::sanitize::validate_safe_file_path(path) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("{}", format!("[!] Invalid resource file path: {}", e).red());
+                return;
+            }
+        };
+        match tokio::fs::read_to_string(&safe_path).await {
+            Ok(contents) => {
+                let mut count = 0;
+                for line in contents.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    println!("{}", format!("[rc] {}", trimmed).dimmed());
+                    let should_exit = execute_single_command(ctx, trimmed).await;
+                    count += 1;
+                    if should_exit {
+                        break;
+                    }
+                }
+                println!(
+                    "{}",
+                    format!("[+] Resource script complete ({} commands executed)", count).green()
+                );
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    format!("[!] Failed to read resource file '{}': {}", path, e).red()
+                );
+            }
+        }
+    })
+}
+
+fn split_command(input: &str) -> Option<(String, String)> {
+    let mut parts = input.splitn(2, char::is_whitespace);
+    let cmd = parts.next()?.to_lowercase();
+    let rest = parts.next().unwrap_or("").trim().to_string();
+    Some((cmd, rest))
+}
+
+pub fn resolve_command(cmd: &str) -> String {
+    match cmd {
+        "?" | "help" | "h" => "help",
+        "tommy" | "guide" | "walkthrough" => "tommy",
+        "modules" | "list" | "ls" | "m" => "modules",
+        "find" | "search" | "f" | "f1" => "find",
+
+        "use" | "u" => "use",
+        "set" => "set",
+        "target" | "t" => "set_target",
+        "subnet" | "sn" => "set_subnet",
+        "show_target" | "showtarget" | "st" => "show_target",
+        "clear_target" | "cleartarget" | "ct" => "clear_target",
+        "run" | "go" | "exec" | "ra" => "run",
+        "back" | "b" | "clear" | "reset" => "back",
+        "exit" | "quit" | "q" => "exit",
+
+        // New commands
+        "info" | "i" => "info",
+        "setg" | "sg" => "setg",
+        "unsetg" | "ug" | "unset" => "unsetg",
+        "save_profile" | "sp" => "save_profile",
+        "load_profile" | "lp" => "load_profile",
+        "db_import" | "nmap_import" | "di" => "db_import",
+        "show_options" | "showoptions" | "so" => "show_options",
+        "creds" | "credentials" => "creds",
+        "spool" => "spool",
+        "resource" | "rc" => "resource",
+        "makerc" => "makerc",
+        "hosts" => "hosts",
+        "services" | "svcs" => "services",
+        "sessions" | "ss" => "sessions",
+        "socks" => "socks",
+        "notes" => "notes",
+        "workspace" | "ws" => "workspace",
+        "loot" => "loot",
+        "export" => "export",
+        "jobs" | "j" => "jobs",
+
+        other => other,
+    }
+    .to_string()
+}
+
+/// Display comprehensive options view: target state, global options, and
+/// scheduler-relevant defaults. When a module is selected, shows what that
+/// module's prompts will read.
+async fn display_all_options(ctx: &ShellContext) {
+    println!();
+    println!("{}", "═══ Current Configuration ═══".bold().cyan());
+    println!();
+
+    // Target
+    if let Some(t) = config::GLOBAL_CONFIG.get_target() {
+        let size = config::GLOBAL_CONFIG.get_target_size().unwrap_or(1);
+        if size > 1 {
+            println!(
+                "  {:<24} {} {} {}",
+                "target".green().bold(),
+                t,
+                format!("({} IPs)", size).dimmed(),
+                "(RHOST/RHOSTS)".dimmed()
+            );
+        } else {
+            println!(
+                "  {:<24} {} {}",
+                "target".green().bold(),
+                t,
+                "(RHOST)".dimmed()
+            );
+        }
+    } else {
+        println!("  {:<24} {}", "target".green().bold(), "<not set>".dimmed());
+    }
+
+    // Global options with human-readable descriptions
+    let opts = crate::global_options::GLOBAL_OPTIONS.all().await;
+    let known_keys: &[(&str, &str, &str)] = &[
+        ("port", "Target port for all modules", "RPORT"),
+        ("source_port", "Outgoing source port binding", "LPORT"),
+        (
+            "concurrency",
+            "Max concurrent tasks in mass scan",
+            "THREADS",
+        ),
+        ("timeout", "Per-module timeout (seconds)", ""),
+        ("module_timeout", "Alias for timeout", ""),
+        ("max_random_hosts", "Max IPs for random target", ""),
+        ("wordlist", "Default wordlist path", ""),
+        ("verbose", "Verbose output (y/n)", ""),
+        ("honeypot_detection", "Skip honeypot hosts (y/n)", ""),
+        ("prescan", "Pre-scan tool (auto/masscan/zmap/none)", ""),
+        ("scan_order", "Full-sweep order (random/sequential)", ""),
+        (
+            "exclusions",
+            "Extra networks to skip in mass scans (CIDR,CIDR,...)",
+            "",
+        ),
+        (
+            "block_internal",
+            "Block RFC1918/internal IPs in mass scans (on/off, shell-only)",
+            "",
+        ),
+        (
+            "target_rps",
+            "Per-target rate limit (req/s, 0 = unlimited)",
+            "",
+        ),
+        (
+            "module_rps",
+            "Global module rate limit (req/s, 0 = unlimited)",
+            "",
+        ),
+        ("username_wordlist", "Bruteforce username wordlist path", ""),
+        ("password_wordlist", "Bruteforce password wordlist path", ""),
+        (
+            "cred_extras",
+            "Bruteforce extra creds: hydra-style n/s/r (null/same/reversed), e.g. nsr",
+            "",
+        ),
+        (
+            "credential_file",
+            "Bruteforce user:pass combo file (hydra -C)",
+            "",
+        ),
+        (
+            "credential_file_only",
+            "Use ONLY credential_file, ignore wordlists (exact hydra -C) (y/n)",
+            "",
+        ),
+        (
+            "cred_stop_mode",
+            "Stop granularity on success: host / user / all (default host)",
+            "",
+        ),
+        (
+            "bruteforce_delay_ms",
+            "Per-attempt delay to dodge lockout (ms, hydra -w)",
+            "",
+        ),
+        (
+            "bruteforce_jitter_ms",
+            "Random extra delay added to bruteforce_delay_ms (ms)",
+            "",
+        ),
+        (
+            "bruteforce_mask",
+            "Mask brute (hydra -x) MIN:MAX:CHARSET, e.g. 1:4:a1",
+            "",
+        ),
+        (
+            "bruteforce_resume",
+            "Resume large streamed wordlist from last batch (y/n)",
+            "",
+        ),
+        (
+            "bruteforce_retries",
+            "Retries on transient/connection error per combo (medusa -r, default 1)",
+            "",
+        ),
+    ];
+
+    let mut displayed = std::collections::HashSet::new();
+    for &(key, desc, alias) in known_keys {
+        let val = opts.get(key).cloned().unwrap_or_default();
+        let mut suffix = String::new();
+        if !alias.is_empty() {
+            suffix.push_str(&format!(" ({})", alias));
+        }
+        if val.is_empty() {
+            suffix.push_str(&format!(" — {}", desc));
+        }
+        if val.is_empty() {
+            println!("  {:<24} {}", key.green(), suffix.dimmed());
+        } else {
+            println!("  {:<24} {} {}", key.green(), val, suffix.dimmed());
+        }
+        displayed.insert(key.to_string());
+    }
+
+    // Show any extra user-set options not in the known list
+    let mut extras: Vec<_> = opts
+        .keys()
+        .filter(|k| !displayed.contains(k.as_str()))
+        .collect();
+    extras.sort();
+    for key in extras {
+        if let Some(val) = opts.get(key) {
+            println!("  {:<24} {}", key.green(), val);
+        }
+    }
+
+    // Current module
+    println!();
+    if let Some(ref module) = ctx.current_module {
+        println!("  {:<24} {}", "module".cyan().bold(), module);
+    } else {
+        println!(
+            "  {:<24} {}",
+            "module".cyan().bold(),
+            "<none selected>".dimmed()
+        );
+    }
+
+    println!();
+    println!(
+        "{}",
+        "  Use 'set <key> <value>' or 'setg <key> <value>' to change.".dimmed()
+    );
+    println!(
+        "{}",
+        "  Use 'unsetg <key>' to remove a global option.".dimmed()
+    );
+    println!();
+}
+
+/// Normalize Metasploit-style aliases to rustsploit option keys.
+/// `set RPORT 8080` → `set port 8080`, `set THREADS 50` → `set concurrency 50`, etc.
+fn normalize_option_alias(input: &str) -> String {
+    if let Some((key, val)) = input.split_once(char::is_whitespace) {
+        let canonical = match key.to_uppercase().as_str() {
+            "RHOST" | "RHOSTS" => "target",
+            "RPORT" => "port",
+            "LPORT" => "source_port",
+            "LHOST" => "source_ip",
+            "THREADS" => "concurrency",
+            "MODULE_TIMEOUT" => "timeout",
+            _ => return input.to_string(),
+        };
+        format!("{} {}", canonical, val)
+    } else {
+        match input.trim().to_uppercase().as_str() {
+            "RHOST" | "RHOSTS" => "target".to_string(),
+            "RPORT" => "port".to_string(),
+            "LPORT" => "source_port".to_string(),
+            "LHOST" => "source_ip".to_string(),
+            "THREADS" => "concurrency".to_string(),
+            "MODULE_TIMEOUT" => "timeout".to_string(),
+            _ => input.to_string(),
+        }
+    }
+}
+
+/// Handle `set target <value>` (and aliases RHOST, RHOSTS, t).
+async fn handle_set_target(raw_value: &str) {
+    let raw_value = raw_value.trim();
+    if raw_value.is_empty() {
+        println!("{}", "Usage: set target <ip/cidr/file>".yellow());
+        return;
+    }
+    match sanitize_target(raw_value) {
+        Ok(valid_target) => {
+            let final_target = if !valid_target.contains(',') && utils::is_domain(&valid_target) {
+                match utils::prompt_domain_target(&valid_target).await {
+                    Ok((resolved, _url)) => resolved,
+                    Err(e) => {
+                        println!("{}", format!("[!] Domain targeting failed: {}", e).red());
+                        println!("{}", "[*] Falling back to raw target".yellow());
+                        valid_target.clone()
+                    }
+                }
+            } else {
+                valid_target.clone()
+            };
+
+            match config::GLOBAL_CONFIG.set_target(&final_target) {
+                Ok(_) => {
+                    if final_target.contains(',') {
+                        let count = final_target.split(',').count();
+                        if let Some(size) = config::GLOBAL_CONFIG.get_target_size() {
+                            println!(
+                                "{}",
+                                format!(
+                                    "Target set to: {} ({} entries, ~{} IPs)",
+                                    final_target, count, size
+                                )
+                                .green()
+                            );
+                        } else {
+                            println!(
+                                "{}",
+                                format!("Target set to: {} ({} entries)", final_target, count)
+                                    .green()
+                            );
+                        }
+                    } else if final_target.contains('/') {
+                        let ip_part = final_target.split('/').next().unwrap_or(&final_target);
+                        let prefix = final_target.split('/').nth(1).unwrap_or("");
+                        println!(
+                            "{}",
+                            format!("Target set to: {} (subnet: /{})", ip_part, prefix).green()
+                        );
+                    } else {
+                        println!("{}", format!("Target set to: {}", final_target).green());
+                    }
+                }
+                Err(e) => {
+                    println!("{}", format!("[!] Failed to set target: {}", e).red());
+                }
+            }
+            // `0.0.0.0` is an alias for the full-internet sweep `0.0.0.0/0`
+            // (== `random`). Flag it so the operator isn't surprised that a
+            // bare `0.0.0.0` now sweeps every public host; the scan itself asks
+            // for an explicit confirmation before fanning out.
+            //
+            // When the operator switches to a full sweep we auto-bump
+            // `max_random_hosts` to the actual count of reachable public
+            // IPv4 addresses (after the reserved-range filter). Without this,
+            // the scheduler default of 10_000 would silently cap a "scan
+            // everything" target at 10k hosts.
+            //
+            // We only do this when `max_random_hosts` is currently UNSET — if
+            // the operator already chose a value we leave it alone.
+            if matches!(final_target.as_str(), "0.0.0.0" | "0.0.0.0/0" | "random") {
+                println!(
+                    "{}",
+                    "    ⚠ Full-internet sweep (every public host). You'll be asked to confirm at run time."
+                        .yellow()
+                );
+
+                if crate::global_options::GLOBAL_OPTIONS
+                    .get("max_random_hosts")
+                    .await
+                    .is_none()
+                {
+                    let total = crate::utils::cyclic::total_public_ipv4_count();
+                    if crate::global_options::GLOBAL_OPTIONS
+                        .set("max_random_hosts", &total.to_string())
+                        .await
+                    {
+                        println!(
+                            "{}",
+                            format!(
+                                "    [+] max_random_hosts auto-set to {} (every reachable public IPv4 — \
+                                 RFC1918/multicast/127.0.0.0/8/.0/.255 excluded). \
+                                 `setg max_random_hosts <n>` to lower it.",
+                                total
+                            )
+                            .green()
+                        );
+                    } else {
+                        println!(
+                            "{}",
+                            format!(
+                                "    [!] could not persist max_random_hosts={} — falling back to scheduler default",
+                                total
+                            )
+                            .yellow()
+                        );
+                    }
+                } else {
+                    println!(
+                        "{}",
+                        "    [*] max_random_hosts already set — leaving operator value alone."
+                            .dimmed()
+                    );
+                }
+            }
+        }
+        Err(reason) => {
+            println!("{}", format!("[!] {}", reason).yellow());
+        }
+    }
+}
+
+pub fn sanitize_module_path(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("..") || trimmed.contains('\\') {
+        return None;
+    }
+    let valid = trimmed.chars().all(|c| {
+        matches!(
+            c,
+            'a'..='z'
+        | 'A'..='Z'
+        | '0'..='9'
+        | '/'
+        | '_'
+        | '-'
+        )
+    });
+    if valid {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Delegate to utils for consistent target validation across the codebase
+fn sanitize_target(input: &str) -> std::result::Result<String, &'static str> {
+    utils::sanitize_target_simple(input)
+}
+
+fn render_help() {
+    println!();
+    println!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════════════════╗".cyan()
+    );
+    println!(
+        "{}",
+        "║                      RustSploit Command Reference                       ║".cyan()
+    );
+    println!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════════════════╝".cyan()
+    );
+    println!();
+
+    // --- Navigation & Discovery ---
+    println!("  {}", "Navigation & Discovery".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} Show this screen",
+        "help".green(),
+        "h | ?".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Friendly walk-through guide (a/d to page)",
+        "tommy".green(),
+        "guide".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} List all available modules",
+        "modules".green(),
+        "ls | m".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Search modules by keyword",
+        "find <kw>".green(),
+        "f1 <kw>".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Select a module to load",
+        "use <path>".green(),
+        "u <path>".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Show module metadata (CVE, author, rank)",
+        "info [path]".green(),
+        "i".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Deselect the current module (target preserved)",
+        "back".green(),
+        "b | clear".dimmed()
+    );
+    println!();
+
+    // --- Targeting ---
+    println!("  {}", "Targeting".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} Set global target (IP, domain, CIDR, or comma-separated)",
+        "set target".green(),
+        "t <val>".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Set target to a CIDR subnet",
+        "set subnet".green(),
+        "sn <CIDR>".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Set target port for all modules",
+        "set port".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Set source port (0 to clear)",
+        "set source_port".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Display current targets",
+        "show_target".green(),
+        "st".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Clear all targets",
+        "clear_target".green(),
+        "ct".dimmed()
+    );
+    println!();
+
+    // --- Execution ---
+    println!("  {}", "Execution".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} Execute the selected module",
+        "run".green(),
+        "go, ra".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Run module as background job",
+        "run -j".green(),
+        "".dimmed()
+    );
+    println!();
+
+    // --- Global Options ---
+    println!("  {}", "Global Options".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} Set a global option (persists across modules)",
+        "setg <k> <v>".green(),
+        "sg".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Remove a global option",
+        "unsetg <key>".green(),
+        "ug".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Display all global options",
+        "show options".green(),
+        "so".dimmed()
+    );
+    println!();
+
+    // --- Data Management ---
+    println!("  {}", "Data Management".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} List stored credentials",
+        "creds".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Add a credential interactively",
+        "creds add".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Search credentials",
+        "creds search <q>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} List tracked hosts",
+        "hosts".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Add a host to workspace",
+        "hosts add <ip>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} List tracked services",
+        "services".green(),
+        "svcs".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Add a note to a host",
+        "notes <ip> <text>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} List collected loot",
+        "loot".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Show/switch workspaces",
+        "workspace [name]".green(),
+        "ws".dimmed()
+    );
+    println!();
+
+    // --- Automation & Export ---
+    println!("  {}", "Automation & Export".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} Execute a resource script",
+        "resource <file>".green(),
+        "rc".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Save command history to file",
+        "makerc <file>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Log console output to file",
+        "spool <file>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Stop console logging",
+        "spool off".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Export all data to JSON",
+        "export json <f>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Export all data to CSV",
+        "export csv <f>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Export human-readable report",
+        "export summary <f>".green(),
+        "".dimmed()
+    );
+    println!();
+
+    // --- Jobs ---
+    println!("  {}", "Background Jobs".bold().underline());
+    println!();
+    println!(
+        "    {:<20} {:<24} List background jobs",
+        "jobs".green(),
+        "j".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Kill a background job",
+        "jobs -k <id>".green(),
+        "".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Clean up finished jobs",
+        "jobs clean".green(),
+        "".dimmed()
+    );
+    println!();
+
+    // --- Other ---
+    println!(
+        "    {:<20} {:<24} Leave the shell",
+        "exit".green(),
+        "quit | q".dimmed()
+    );
+    println!();
+
+    // --- Tips ---
+    println!(
+        "{}",
+        "┌──────────────────────────────────────────────────────────────────────────┐".dimmed()
+    );
+    println!(
+        "{}",
+        "│  Tips                                                                    │".dimmed()
+    );
+    println!(
+        "{}",
+        "├──────────────────────────────────────────────────────────────────────────┤".dimmed()
+    );
+    println!(
+        "  {} Type {} for a man-style page with examples (e.g. {}).",
+        ">>".dimmed(),
+        "help <command>".cyan().bold(),
+        "help run".cyan()
+    );
+    println!(
+        "  {} Chain commands with {} or {}: {}",
+        ">>".dimmed(),
+        "&".cyan().bold(),
+        ";".cyan().bold(),
+        "set target 10.0.0.1 & use scanners/smtp_user_enum & run ; use exploits/... & run"
+            .to_string()
+            .cyan()
+    );
+    println!(
+        "  {} Use {} to set options that apply to all modules.",
+        ">>".dimmed(),
+        "setg".cyan().bold()
+    );
+    println!(
+        "  {} Use {} to save engagement data.",
+        ">>".dimmed(),
+        "export json report.json".cyan().bold()
+    );
+    println!(
+        "  {} Max {} chained commands per line.",
+        ">>".dimmed(),
+        MAX_COMMAND_CHAIN_LENGTH
+    );
+    println!(
+        "{}",
+        "└──────────────────────────────────────────────────────────────────────────┘".dimmed()
+    );
+    println!();
+    println!("  {} {}", "Topics:".bold(), "tommy use info run set setg target mass-scan jobs creds hosts services loot workspace resource spool export".dimmed());
+    println!();
+}
+
+/// man-style manual page for a single topic.
+fn render_help_topic(topic: &str) {
+    let key = topic.trim().to_lowercase();
+    let key = key.as_str();
+
+    let canonical: &str = match key {
+        "?" | "help" | "h" => "help",
+        "guide" | "walkthrough" => "tommy",
+        "u" => "use",
+        "i" => "info",
+        "ls" | "list" | "m" => "modules",
+        "f" | "f1" | "search" => "find",
+        "t" | "target" | "set_target" | "settarget" => "target",
+        "sn" => "subnet",
+        "st" | "show_target" => "show_target",
+        "ct" | "clear_target" => "clear_target",
+        "go" | "exec" => "run",
+        "ra" => "run",
+        "sg" => "setg",
+        "ug" => "unsetg",
+        "so" | "show_options" | "showoptions" => "show_options",
+        "svcs" => "services",
+        "ws" => "workspace",
+        "rc" => "resource",
+        "j" => "jobs",
+        "b" | "clear" | "reset" => "back",
+        "mass-scan" => "mass-scan",
+        other => other,
+    };
+
+    match canonical {
+        "use" => man_page(
+            "use",
+            "Select a module to work with.",
+            &[
+                "use <category>/<path>",
+                "use <short_name>   # fuzzy-match on final segment",
+            ],
+            "Loads the named module into the shell. The prompt changes to show the selected module. \
+             Subsequent `run` and `info` commands target it. Use `back` to deselect.",
+            &[
+                ("use scanners/proxy_scanner", "Load the open-proxy scanner"),
+                ("use proxy_scanner", "Same thing — short-name fuzzy match"),
+                ("u exploits/dos/slowloris", "Alias `u` works identically"),
+            ],
+            &["info", "modules", "find", "back", "run"],
+        ),
+        "info" => man_page(
+            "info",
+            "Print module metadata: description, CVE references, author, rank, disclosure date.",
+            &["info [<path>]"],
+            "With no argument, shows info for the currently-selected module. With a path, shows info \
+             for that module without selecting it.",
+            &[
+                ("info", "Info for the current module"),
+                (
+                    "info exploits/dos/slowloris",
+                    "Look up a module without loading it",
+                ),
+                ("i scanners/reflect_scanner", "Alias `i`"),
+            ],
+            &["use", "modules", "find"],
+        ),
+        "modules" => man_page(
+            "modules",
+            "List every available module, grouped by category.",
+            &["modules"],
+            "Walks the full module registry and prints each one under its category heading \
+             (scanners, exploits, creds, plugins).",
+            &[("modules", "List everything"), ("ls", "Alias")],
+            &["find", "use", "info"],
+        ),
+        "find" => man_page(
+            "find",
+            "Search the module registry by keyword.",
+            &["find <keyword>"],
+            "Case-insensitive substring match against module path, name, and description.",
+            &[
+                ("find ssh", "Everything mentioning ssh"),
+                ("f cve-2024", "CVE search"),
+                ("search proxy", "Alias `search`"),
+            ],
+            &["modules", "use"],
+        ),
+        "target" => man_page(
+            "target",
+            "Set the global scan target. Accepts a single IP, a hostname, a CIDR subnet, a comma-separated list, a file of targets, or a mass-scan keyword.",
+            &[
+                "set target <value>",
+                "t <value>                  # alias",
+                "target <value>             # alias",
+            ],
+            "The target persists across modules. Use `show_target` to view, `clear_target` to reset. \
+             Special values trigger mass-scan mode: `random` / `0.0.0.0` / `0.0.0.0/0` scan random \
+             public IPs; a CIDR scans the subnet; a file path reads one target per line.",
+            &[
+                ("t 10.0.0.5", "Single host"),
+                ("t example.com", "Hostname (resolved before probing)"),
+                ("t 10.0.0.0/24", "CIDR — fans out across the subnet"),
+                ("t 10.0.0.1,10.0.0.2,10.0.0.3", "Comma-separated list"),
+                ("t targets.txt", "One target per line from a file"),
+                ("t 0.0.0.0/0", "Internet-wide random-IP mass scan"),
+                ("t random", "Same as 0.0.0.0/0"),
+            ],
+            &["show_target", "clear_target", "subnet", "mass-scan", "run"],
+        ),
+        "subnet" => man_page(
+            "subnet",
+            "Shortcut to set the target to a CIDR subnet.",
+            &["set subnet <CIDR>", "sn <CIDR>"],
+            "Equivalent to `set target <CIDR>` but validates that the argument parses as a CIDR network.",
+            &[
+                ("sn 192.168.1.0/24", "Scan a /24"),
+                ("set subnet 2001:db8::/48", "IPv6 subnet"),
+            ],
+            &["target", "mass-scan", "run"],
+        ),
+        "show_target" => man_page(
+            "show_target",
+            "Print the current target and port settings.",
+            &["show_target", "st"],
+            "Shows what `run` will use. Also displays the global `port` and `source_port` values if set.",
+            &[("st", "Quick check")],
+            &["target", "clear_target"],
+        ),
+        "clear_target" => man_page(
+            "clear_target",
+            "Forget the current target.",
+            &["clear_target", "ct"],
+            "After clearing, `run` will require an explicit target or a module-specific prompt.",
+            &[("ct", "Reset")],
+            &["target"],
+        ),
+        "run" => man_page(
+            "run",
+            "Execute the selected module against the current target.",
+            &[
+                "run",
+                "run -j                     # run as background job",
+                "go                         # alias",
+            ],
+            "The framework dispatches the target to the module's `run()`. CIDR / file / random \
+             targets are automatically fanned out across `concurrency` workers. Every task runs under \
+             a shared prompt cache (you answer each prompt once) and a per-task `module_timeout` \
+             (default 60s) so a hung host cannot stall the scan.",
+            &[
+                ("run", "Run foreground"),
+                ("run -j", "Run as background job; see `jobs`"),
+                (
+                    "setg concurrency 200 & run",
+                    "Raise parallelism for the next run",
+                ),
+                ("setg module_timeout 30 & run", "Cap per-host time at 30s"),
+            ],
+            &["mass-scan", "jobs", "setg"],
+        ),
+        "set" => man_page(
+            "set",
+            "Set any option. Works for target, port, source_port, and all global options. \
+             Accepts Metasploit aliases (RHOST, RPORT, LPORT, THREADS).",
+            &["set <key> <value>", "set target <ip/cidr/file>"],
+            "The `set` and `setg` commands are interchangeable — both store values in the same \
+             global options store (~/.rustsploit/global_options.json). Values persist across modules \
+             and shell sessions. Every module prompt checks global options before prompting interactively.\n\n\
+             During mass scans (CIDR/file/multi-target), all per-host tasks share the same settings.\n\n\
+             Metasploit aliases: RHOST/RHOSTS→target, RPORT→port, LPORT→source_port, THREADS→concurrency.",
+            &[
+                ("set target 10.0.0.0/24", "Target a subnet"),
+                ("set port 8080", "All modules use port 8080"),
+                ("set source_port 53", "Bind outgoing TCP/UDP to port 53"),
+                ("set concurrency 200", "200 concurrent tasks in mass scan"),
+                ("set timeout 15", "15s per-module timeout"),
+                ("set threads 100", "Alias for concurrency"),
+                ("set RPORT 443", "Metasploit alias for port"),
+                (
+                    "set wordlist /path/to/list",
+                    "Default wordlist for brute-force",
+                ),
+            ],
+            &["setg", "unsetg", "show_options", "mass-scan"],
+        ),
+        "setg" => man_page(
+            "setg",
+            "Set a global option (identical to `set` — both persist to the same store).",
+            &["setg <key> <value>", "sg <key> <value>"],
+            "Values are stored in ~/.rustsploit/global_options.json. Consulted by every \
+             module prompt after per-run `custom_prompts` but before interactive stdin. \
+             Accepts Metasploit aliases (RHOST, RPORT, LPORT, THREADS).\n\n\
+             Key options: port, source_port, concurrency, timeout, max_random_hosts, \
+             honeypot_detection, prescan, wordlist, verbose.",
+            &[
+                ("setg concurrency 200", "Run 200 tasks in parallel"),
+                ("setg max_random_hosts 100000", "Scan up to 100k random IPs"),
+                ("setg timeout 30", "Per-task timeout (seconds)"),
+                (
+                    "setg honeypot_detection n",
+                    "Disable the pre-scan honeypot check",
+                ),
+                ("setg source_port 53", "Bind TCP/UDP connections to port 53"),
+                ("setg THREADS 100", "Metasploit alias for concurrency"),
+                (
+                    "setg wordlist /usr/share/wordlists/rockyou.txt",
+                    "Default wordlist for brute-force modules",
+                ),
+            ],
+            &["set", "unsetg", "show_options", "mass-scan"],
+        ),
+        "unsetg" => man_page(
+            "unsetg",
+            "Remove a global option. Also available as 'unset'.",
+            &["unsetg <key>", "unset <key>", "ug <key>"],
+            "Deletes the key from ~/.rustsploit/global_options.json. Accepts Metasploit aliases.",
+            &[
+                ("unsetg concurrency", "Revert to default concurrency (50)"),
+                ("unset RPORT", "Remove port override"),
+            ],
+            &["set", "setg", "show_options"],
+        ),
+        "show_options" => man_page(
+            "show_options",
+            "Display all current settings: target, port, source_port, concurrency, and more.",
+            &["show options", "show_options", "so"],
+            "Shows the complete configuration including target state, all global options, \
+             Metasploit alias mappings, and the currently selected module.",
+            &[("so", "Quick look at all settings")],
+            &["set", "setg", "unsetg"],
+        ),
+        "mass-scan" => man_page(
+            "mass-scan",
+            "How mass-scan mode works and how to tune it.",
+            &[
+                "set target 0.0.0.0/0       # internet-wide random IPs",
+                "set target random          # same",
+                "set target 10.0.0.0/16     # full subnet",
+                "set target targets.txt     # one IP or host per line",
+            ],
+            "When the target is `random`, `0.0.0.0[/0]`, a CIDR, or a readable file path, the \
+             framework enters batch mode: it enables a shared prompt cache (first task prompts, the \
+             rest read the cached answer), suppresses banners / per-host verbose output, and fans \
+             the module out across `concurrency` async tasks. Each task runs under a per-IP \
+             `module_timeout` — a slow or hung host cannot starve the scan. Honeypot IPs are skipped \
+             unless disabled. Hit lines (`[+] host:port ...`) still print; noise does not.",
+            &[
+                (
+                    "setg concurrency 200 & t 0.0.0.0/0 & use scanners/proxy_scanner & run",
+                    "Mass-scan proxies with 200 workers",
+                ),
+                (
+                    "setg max_random_hosts 50000 & t random & use scanners/reflect_scanner & run",
+                    "Sample 50k random public IPs for UDP amplifiers",
+                ),
+                (
+                    "t 10.0.0.0/16 & use scanners/ssh_scanner & ra",
+                    "Full /16 subnet sweep",
+                ),
+                (
+                    "setg module_timeout 20 & t targets.txt & use creds/generic/ssh_bruteforce & run",
+                    "File-based list with aggressive 20s per-host timeout",
+                ),
+                (
+                    "setg honeypot_detection n",
+                    "Skip the pre-scan honeypot probe (faster, noisier)",
+                ),
+            ],
+            &["target", "setg", "run", "jobs"],
+        ),
+        "jobs" => man_page(
+            "jobs",
+            "Manage background module runs (started with `run -j`).",
+            &["jobs", "jobs -k <id>", "jobs clean"],
+            "Lists running/completed jobs with their id, module, target, and status. `-k <id>` \
+             terminates a running job. `clean` drops finished ones from the table.",
+            &[
+                (
+                    "t 10.0.0.0/24 & use scanners/ping_sweep & run -j",
+                    "Kick off a background subnet sweep",
+                ),
+                ("j", "List jobs"),
+                ("jobs -k 3", "Kill job 3"),
+                ("jobs clean", "Tidy up"),
+            ],
+            &["run"],
+        ),
+        "creds" => man_page(
+            "creds",
+            "Manage captured credentials in the workspace.",
+            &["creds", "creds add", "creds search <query>"],
+            "Credentials collected by brute-force and auth-bypass modules land here automatically. \
+             Data lives in the active workspace (see `workspace`).",
+            &[
+                ("creds", "List everything"),
+                ("creds add", "Add one interactively"),
+                (
+                    "creds search admin",
+                    "Find creds whose user/pass/service matches",
+                ),
+            ],
+            &["workspace", "export"],
+        ),
+        "hosts" => man_page(
+            "hosts",
+            "Manage tracked hosts in the workspace.",
+            &["hosts", "hosts add <ip>"],
+            "Automatically populated by scanner modules; you can also add entries manually.",
+            &[
+                ("hosts", "List hosts"),
+                ("hosts add 10.0.0.5", "Track a host manually"),
+            ],
+            &["services", "notes", "workspace"],
+        ),
+        "services" => man_page(
+            "services",
+            "List services (ip, port, proto, banner) tracked in the workspace.",
+            &["services", "svcs"],
+            "Populated by port/service scanners. Filterable by column in interactive tables.",
+            &[("svcs", "List services")],
+            &["hosts", "workspace"],
+        ),
+        "notes" => man_page(
+            "notes",
+            "Attach a free-text note to a host.",
+            &["notes <ip> <text>"],
+            "Notes show up alongside the host in `hosts` and in JSON/CSV exports.",
+            &[(
+                "notes 10.0.0.5 owned via cve-2024-12345",
+                "Record the finding",
+            )],
+            &["hosts", "export"],
+        ),
+        "loot" => man_page(
+            "loot",
+            "List collected loot (file contents dumped from exploits).",
+            &["loot"],
+            "Loot is populated by modules that extract data (LFI, file-read, exfil). Each entry \
+             records source IP, path, mime type, and captured bytes.",
+            &[("loot", "Browse")],
+            &["export"],
+        ),
+        "workspace" => man_page(
+            "workspace",
+            "Show or switch the active workspace.",
+            &["workspace", "workspace <name>", "ws"],
+            "Each workspace has its own hosts/services/creds/loot store under ~/.rustsploit/workspaces.",
+            &[
+                ("ws", "Show current"),
+                (
+                    "workspace acme",
+                    "Switch to workspace 'acme' (created if absent)",
+                ),
+            ],
+            &["creds", "hosts", "export"],
+        ),
+        "resource" => man_page(
+            "resource",
+            "Execute commands from a resource-script file (one command per line).",
+            &["resource <file>", "rc <file>"],
+            "Behaves as if you typed each line at the prompt. Lines starting with `#` are comments. \
+             Use `makerc` to capture history into a new file.",
+            &[
+                ("rc scans/proxy_sweep.rc", "Replay a recorded session"),
+                ("makerc last_run.rc", "Save recent history"),
+            ],
+            &["makerc", "spool"],
+        ),
+        "makerc" => man_page(
+            "makerc",
+            "Save command history into a resource-script file.",
+            &["makerc <file>"],
+            "Pairs with `resource` to replay sessions.",
+            &[("makerc recon.rc", "Snapshot current session")],
+            &["resource"],
+        ),
+        "spool" => man_page(
+            "spool",
+            "Log all console output to a file.",
+            &["spool <file>", "spool off"],
+            "Writes a tee of everything the shell prints until you run `spool off`.",
+            &[
+                ("spool session.log", "Start spooling"),
+                ("spool off", "Stop"),
+            ],
+            &["export"],
+        ),
+        "export" => man_page(
+            "export",
+            "Export the current workspace (hosts, services, creds, loot, notes) to a file.",
+            &[
+                "export json <file>",
+                "export csv <file>",
+                "export summary <file>",
+            ],
+            "`json` is machine-readable; `csv` is per-table; `summary` is a human report.",
+            &[
+                ("export json report.json", "Full machine-readable dump"),
+                ("export csv findings.csv", "Flat CSV for spreadsheets"),
+                ("export summary report.md", "Human-readable markdown report"),
+            ],
+            &["creds", "hosts", "services", "loot", "workspace"],
+        ),
+        "back" => man_page(
+            "back",
+            "Deselect the current module (the target is preserved).",
+            &["back", "b", "clear", "reset"],
+            "Returns to the top-level prompt. The last-used target is preserved; use \
+             `clear_target` to drop it.",
+            &[("b", "Drop back to the root prompt")],
+            &["use", "clear_target"],
+        ),
+        "exit" => man_page(
+            "exit",
+            "Leave the rsf shell.",
+            &["exit", "quit", "q"],
+            "Active background jobs are cancelled; workspace data is persisted.",
+            &[("q", "Fastest way out")],
+            &[],
+        ),
+        "help" => man_page(
+            "help",
+            "Show command help. With no argument prints the full command list; with a topic prints a man-style page with examples.",
+            &["help", "help <topic>", "? <topic>"],
+            "Topics mirror command names and their aliases, plus the meta-topic `mass-scan`.",
+            &[
+                ("help", "Full command reference"),
+                ("help run", "Man page for `run`"),
+                ("help mass-scan", "How mass-scan mode works"),
+                ("? setg", "Alias"),
+            ],
+            &["mass-scan", "setg", "run", "tommy"],
+        ),
+        "tommy" => man_page(
+            "tommy",
+            "Friendly interactive walk-through guide for new users. Pages step you through every major rustsploit feature with examples you can copy and try.",
+            &["tommy", "guide", "walkthrough"],
+            "Navigate with single keys: `d` (or Enter) for the next page, `a` for the previous page, `q` to quit. Type a page number to jump directly to it. Type `h` inside the guide for the full key list. The guide is read-only — running it never changes any settings.",
+            &[("tommy", "Start at page 1"), ("guide", "Alias")],
+            &["help", "modules", "use", "run"],
+        ),
+        _ => {
+            println!();
+            println!("{}", format!("No help topic '{}'.", topic).yellow());
+            println!();
+            println!("{} {}",
+                "Available topics:".bold(),
+                "tommy use info modules find target subnet show_target clear_target run setg unsetg show_options mass-scan jobs creds hosts services notes loot workspace resource makerc spool export back exit help".dimmed());
+            println!();
+        }
+    }
+}
+
+/// Format a man-style manual page: NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / SEE ALSO.
+fn man_page(
+    name: &str,
+    tagline: &str,
+    synopsis: &[&str],
+    description: &str,
+    examples: &[(&str, &str)],
+    see_also: &[&str],
+) {
+    println!();
+    println!(
+        "{}",
+        format!(
+            "{}(1)                                                        RustSploit Manual",
+            name.to_uppercase()
+        )
+        .dimmed()
+    );
+    println!();
+    println!("{}", "NAME".bold());
+    println!("    {} — {}", name.green().bold(), tagline);
+    println!();
+    println!("{}", "SYNOPSIS".bold());
+    for line in synopsis {
+        println!("    {}", line.cyan());
+    }
+    println!();
+    println!("{}", "DESCRIPTION".bold());
+    for line in wrap_paragraph(description, 74) {
+        println!("    {}", line);
+    }
+    println!();
+    if !examples.is_empty() {
+        println!("{}", "EXAMPLES".bold());
+        for (cmd, note) in examples {
+            println!("    {}", format!("rsf> {}", cmd).cyan().bold());
+            println!("        {}", note.dimmed());
+            println!();
+        }
+    }
+    if !see_also.is_empty() {
+        println!("{}", "SEE ALSO".bold());
+        let list = see_also
+            .iter()
+            .map(|s| format!("help {}", s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("    {}", list.dimmed());
+        println!();
+    }
+}
+
+/// Wrap a paragraph to `width` columns on whitespace boundaries.
+fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.len() + 1 + word.len() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut line));
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+async fn prompt_string_default(message: &str, default: &str) -> io::Result<String> {
+    print!("{} [{}]: ", message, default);
+    io::stdout().flush()?;
+    let input = tokio::task::spawn_blocking(|| {
+        let mut s = String::new();
+        io::stdin().read_line(&mut s).map(|_| s)
+    })
+    .await
+    .map_err(io::Error::other)??;
+
+    // Length check
+    if input.len() > MAX_PROMPT_INPUT_LENGTH {
+        println!(
+            "{}",
+            format!(
+                "Input too long (max {} characters). Using default.",
+                MAX_PROMPT_INPUT_LENGTH
+            )
+            .yellow()
+        );
+        return Ok(default.to_string());
+    }
+
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        return Ok(default.to_string());
+    }
+
+    // Check for control characters
+    if trimmed.chars().any(|c| c.is_control()) {
+        println!(
+            "{}",
+            "Input cannot contain control characters. Using default.".yellow()
+        );
+        return Ok(default.to_string());
+    }
+
+    // If this looks like a URL, validate it
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        if trimmed.len() > MAX_URL_LENGTH {
+            println!(
+                "{}",
+                format!(
+                    "URL too long (max {} characters). Using default.",
+                    MAX_URL_LENGTH
+                )
+                .yellow()
+            );
+            return Ok(default.to_string());
+        }
+
+        if Url::parse(trimmed).is_err() {
+            println!("{}", "Invalid URL format. Using default.".yellow());
+            return Ok(default.to_string());
+        }
+    }
+
+    Ok(trimmed.to_string())
+}

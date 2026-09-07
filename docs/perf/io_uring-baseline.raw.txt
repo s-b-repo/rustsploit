@@ -1,0 +1,124 @@
+# Raw output — BEFORE baseline, 2026-06-27
+# Command:
+#   BENCH_RUN=1 cargo test --no-default-features --bin rustsploit \
+#       connect_bench -- --nocapture --test-threads=1
+# Host: i7-1355U (12c), Linux 6.19.14+kali-amd64, rustc 1.95.0, tokio multi_thread x12
+
+######## RUN 1 ########
+==== rustsploit connect-storm baseline (tokio multi_thread) ====
+runtime=tokio multi_thread worker_threads=12
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.266s  throughput=112738 conn/s
+  cpu_user=47j (0.47s)  cpu_sys=120j (1.20s)  peak_rss=49976 kB
+[open-port full handshake]
+  attempts=10000 opened=9192 concurrency=1000
+  elapsed=4.024s  throughput=2485 conn/s
+  cpu_user=26j (0.26s)  cpu_sys=109j (1.09s)  peak_rss=49976 kB
+================================================================
+
+######## RUN 2 ########
+==== rustsploit connect-storm baseline (tokio multi_thread) ====
+runtime=tokio multi_thread worker_threads=12
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.271s  throughput=110794 conn/s
+  cpu_user=43j (0.43s)  cpu_sys=128j (1.28s)  peak_rss=49140 kB
+[open-port full handshake]
+  attempts=10000 opened=9635 concurrency=1000
+  elapsed=2.010s  throughput=4974 conn/s
+  cpu_user=49j (0.49s)  cpu_sys=103j (1.03s)  peak_rss=49140 kB
+================================================================
+
+######## RUN 3 ########
+==== rustsploit connect-storm baseline (tokio multi_thread) ====
+runtime=tokio multi_thread worker_threads=12
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.277s  throughput=108237 conn/s
+  cpu_user=50j (0.50s)  cpu_sys=119j (1.19s)  peak_rss=49476 kB
+[open-port full handshake]
+  attempts=10000 opened=9668 concurrency=1000
+  elapsed=2.015s  throughput=4962 conn/s
+  cpu_user=34j (0.34s)  cpu_sys=84j (0.84s)  peak_rss=49476 kB
+================================================================
+
+
+# ============================================================
+# Raw output — AFTER (io_uring connect service), 2026-06-27
+# Command:
+#   BENCH_RUN=1 cargo test --no-default-features --features io_uring \
+#       --bin rustsploit connect_bench -- --nocapture --test-threads=1
+# ============================================================
+
+######## io_uring RUN 1 ########
+==== rustsploit connect-storm (tokio mt x12 + io_uring connect service) ====
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.506s  throughput=59294 conn/s
+  cpu_user=36j (0.36s)  cpu_sys=40j (0.40s)  peak_rss=55416 kB
+[open-port full handshake]
+  attempts=10000 opened=10000 concurrency=1000
+  elapsed=1.278s  throughput=7825 conn/s
+  cpu_user=20j (0.20s)  cpu_sys=56j (0.56s)  peak_rss=55416 kB
+================================================================
+
+######## io_uring RUN 2 ########
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.494s  throughput=60763 conn/s
+  cpu_user=30j (0.30s)  cpu_sys=44j (0.44s)  peak_rss=56016 kB
+[open-port full handshake]
+  attempts=10000 opened=10000 concurrency=1000
+  elapsed=1.143s  throughput=8750 conn/s
+  cpu_user=18j (0.18s)  cpu_sys=41j (0.41s)  peak_rss=56016 kB
+================================================================
+
+######## io_uring RUN 3 ########
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.572s  throughput=52415 conn/s
+  cpu_user=44j (0.44s)  cpu_sys=40j (0.40s)  peak_rss=55452 kB
+[open-port full handshake]
+  attempts=10000 opened=10000 concurrency=1000
+  elapsed=1.393s  throughput=7180 conn/s
+  cpu_user=34j (0.34s)  cpu_sys=54j (0.54s)  peak_rss=55452 kB
+================================================================
+
+
+# ============================================================
+# Raw output — AFTER sharded (io_uring x12 rings = hardware default), 2026-06-27
+# RUSTSPLOIT_URING_RINGS unset -> available_parallelism()=12
+# ============================================================
+
+######## sharded RUN 1 ########
+runtime=tokio mt x12 + io_uring x12 rings
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.294s  throughput=102012 conn/s
+  cpu_user=55j (0.55s)  cpu_sys=96j (0.96s)  peak_rss=57328 kB
+[open-port full handshake]  (acceptor-bound, not a clean signal)
+  attempts=10000 opened=9419 concurrency=1000
+  elapsed=2.019s  throughput=4953 conn/s
+  cpu_user=59j (0.59s)  cpu_sys=116j (1.16s)  peak_rss=57328 kB
+######## sharded RUN 2 ########
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.241s  throughput=124583 conn/s
+  cpu_user=53j (0.53s)  cpu_sys=93j (0.93s)  peak_rss=58500 kB
+######## sharded RUN 3 ########
+[closed-port ECONNREFUSED]
+  attempts=30000 opened=0 concurrency=1000
+  elapsed=0.244s  throughput=123187 conn/s
+  cpu_user=57j (0.57s)  cpu_sys=86j (0.86s)  peak_rss=57908 kB
+
+# Ring-count scaling sweep (closed-port, 30k attempts, 2 reps each):
+#   rings=1  : 36050 / 58625 c/s
+#   rings=2  : 81808 / 95394 c/s
+#   rings=4  : 100510 / 96360 c/s
+#   rings=6  : 92185 / 93813 c/s
+#   rings=8  : 117843 / 97251 c/s
+#   rings=12 : 110575 / 110892 c/s   (hardware default)
+#   rings=16 : 134304 / 146324 c/s   (peak, +~30% vs tokio baseline)
+#   rings=24 : 106911 / 111907 c/s   (oversubscribed)
+================================================================

