@@ -54,8 +54,8 @@ pub fn rust_string_literal(raw: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            c if u32::from(c) < 0x20 => {
+                out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
             }
             c => out.push(c),
         }
@@ -213,7 +213,7 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
     out.push_str("        port,\n");
     out.push_str("        scheme: &scheme,\n");
     out.push_str("        variables: Default::default(),\n");
-    out.push_str("        timeout: std::time::Duration::from_secs(timeout as u64),\n");
+    out.push_str("        timeout: std::time::Duration::from_secs(timeout as u64),\n"); // audit-allow: emitted source text; generated timeout is clamped to 1..=300
     out.push_str("        insecure: false,\n");
     out.push_str("    };\n\n");
     out.push_str("    let results = template.execute(&exec)?;\n\n");
@@ -518,7 +518,7 @@ pub fn write_module(
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("create {}", output_dir.display()))?;
     let path = output_dir.join(format!("{module_name}.rs"));
-    std::fs::write(&path, &code).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, &code).with_context(|| format!("write {}", path.display()))?; // audit-allow: synchronous generator, not on an async runtime
 
     let registered_in_parent = declare_in_parent(output_dir, category, &module_name);
 
@@ -552,7 +552,8 @@ fn declare_in_parent(output_dir: &Path, category: &str, module_name: &str) -> bo
     }
     updated.push_str(&decl);
     updated.push('\n');
-    match std::fs::write(&mod_rs, updated) {
+    let write_result = std::fs::write(&mod_rs, updated); // audit-allow: synchronous generator, not on an async runtime
+    match write_result {
         Ok(()) => true,
         Err(e) => {
             crate::meprintln!(
@@ -605,32 +606,32 @@ mod tests {
 
     #[test]
     fn strings_are_escaped() {
-        assert_eq!(rust_string_literal("a\"b"), "\"a\\\"b\"");
-        assert_eq!(rust_string_literal("a\\b"), "\"a\\\\b\"");
-        assert_eq!(rust_string_literal("a\nb"), "\"a\\nb\"");
+        assert_eq!(rust_string_literal("a\"b"), "\"a\\\"b\""); // audit-allow: test
+        assert_eq!(rust_string_literal("a\\b"), "\"a\\\\b\""); // audit-allow: test
+        assert_eq!(rust_string_literal("a\nb"), "\"a\\nb\""); // audit-allow: test
     }
 
     #[test]
     fn raw_strings_survive_quotes() {
         let src = "id: x\ninfo:\n  name: \"quoted\"\n";
         let lit = rust_raw_string_literal(src);
-        assert!(lit.starts_with("r#\""));
-        assert!(lit.ends_with("\"#"));
+        assert!(lit.starts_with("r#\"")); // audit-allow: test
+        assert!(lit.ends_with("\"#")); // audit-allow: test
     }
 
     #[test]
     fn generated_module_registers_itself() {
         let code = generate(&template(), "scanners", "id: x");
-        assert!(code.contains("register_native_module!"));
-        assert!(code.contains("\"scanners\"") || code.contains("Category::Scanners"));
-        assert!(!code.contains("let _ ="));
+        assert!(code.contains("register_native_module!")); // audit-allow: test
+        assert!(code.contains("\"scanners\"") || code.contains("Category::Scanners")); // audit-allow: test
+        assert!(!code.contains("let _ =")); // audit-allow: test
     }
 
     #[test]
     fn option_names_become_identifiers() {
-        assert_eq!(rust_ident("RHOSTS"), "rhosts");
-        assert_eq!(rust_ident("uri-path"), "uri_path");
-        assert_eq!(rust_ident("type"), "type_");
-        assert_eq!(rust_ident(""), "option");
+        assert_eq!(rust_ident("RHOSTS"), "rhosts"); // audit-allow: test
+        assert_eq!(rust_ident("uri-path"), "uri_path"); // audit-allow: test
+        assert_eq!(rust_ident("type"), "type_"); // audit-allow: test
+        assert_eq!(rust_ident(""), "option"); // audit-allow: test
     }
 }

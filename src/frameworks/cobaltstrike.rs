@@ -33,7 +33,7 @@ impl FrameworkAdapter for CobaltStrikeAdapter {
         &["cna"]
     }
 
-    fn sniff(&self, source: &str, _path: &Path) -> bool {
+    fn sniff(&self, source: &str, _: &Path) -> bool {
         let has_beacon = source.contains("on ready") || source.contains("on message_received");
         let has_squirrel = source.contains("set") || source.contains("data ");
         has_beacon && has_squirrel
@@ -131,15 +131,15 @@ mod tests {
     fn script_metadata_is_extracted() {
         let tmpl = COBALTSTRIKE
             .parse(SCRIPT, Path::new("demo.cna"))
-            .expect("aggressor script should parse");
-        assert_eq!(tmpl.name, "Demo Aggressor");
-        assert_eq!(tmpl.description, "Does a demo thing on beacon");
-        assert_eq!(tmpl.authors, vec!["operator".to_string()]);
+            .expect("aggressor script should parse"); // audit-allow: test
+        assert_eq!(tmpl.name, "Demo Aggressor"); // audit-allow: test
+        assert_eq!(tmpl.description, "Does a demo thing on beacon"); // audit-allow: test
+        assert_eq!(tmpl.authors, vec!["operator".to_string()]); // audit-allow: test
     }
 
     #[test]
     fn script_is_recognised() {
-        assert!(COBALTSTRIKE.sniff(SCRIPT, Path::new("x.cna")));
-        assert!(!COBALTSTRIKE.sniff("print(1)", Path::new("x.cna")));
+        assert!(COBALTSTRIKE.sniff(SCRIPT, Path::new("x.cna"))); // audit-allow: test
+        assert!(!COBALTSTRIKE.sniff("print(1)", Path::new("x.cna"))); // audit-allow: test
     }
 }

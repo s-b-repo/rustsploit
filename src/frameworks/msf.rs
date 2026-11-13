@@ -37,7 +37,7 @@ impl FrameworkAdapter for MsfAdapter {
         &["rb"]
     }
 
-    fn sniff(&self, source: &str, _path: &Path) -> bool {
+    fn sniff(&self, source: &str, _: &Path) -> bool {
         let has_class = source.contains("MetasploitModule") || source.contains("Msf::Exploit");
         let has_info = source.contains("'Name'") || source.contains("'Description'");
         has_class && has_info
@@ -210,7 +210,9 @@ fn extract_multiline_desc<'a>(
         if line.contains(delimiter) {
             // Last line — capture up to the delimiter
             if let Some(end) = line.find(delimiter) {
-                desc.push_str(&line[..end]);
+                if let Some(prefix) = line.get(..end) {
+                    desc.push_str(prefix);
+                }
                 break;
             }
         }
@@ -228,7 +230,7 @@ fn extract_array_strings(line: &str, key: &str) -> Option<Vec<String>> {
     let after_bracket = line.find('[')?;
     let content = &line[after_bracket + 1..];
     let end = content.rfind(']')?;
-    let inner = &content[..end];
+    let inner = content.get(..end)?;
     let mut authors = Vec::new();
     for part in inner.split(',') {
         let cleaned = part.trim().trim_matches('\'').trim_matches('"');
@@ -253,7 +255,9 @@ fn extract_references<'a>(
 
     // If there's content after the opening bracket on the first line
     if let Some(bracket) = trimmed.find('[') {
-        collector.push_str(&trimmed[bracket..]);
+        if let Some(rest) = trimmed.get(bracket..) {
+            collector.push_str(rest);
+        }
     }
 
     // Collect lines until we find the closing ]]
@@ -271,16 +275,16 @@ fn extract_references<'a>(
             .split(',')
             .map(|s| s.trim().trim_matches('\'').trim_matches('"'))
             .collect();
-        if parts.len() >= 2 {
-            let ref_type = parts[0].to_uppercase();
-            let value = parts[1];
-            match ref_type.as_str() {
-                "CVE" => refs.push(format!("CVE-{value}")),
-                "BID" => refs.push(format!("BID-{value}")),
-                "OSVDB" => refs.push(format!("OSVDB-{value}")),
-                "URL" => refs.push(value.to_string()),
-                _ => refs.push(format!("{ref_type}: {value}")),
-            }
+        let (Some(&ref_raw), Some(&value)) = (parts.first(), parts.get(1)) else {
+            continue;
+        };
+        let ref_type = ref_raw.to_uppercase();
+        match ref_type.as_str() {
+            "CVE" => refs.push(format!("CVE-{value}")),
+            "BID" => refs.push(format!("BID-{value}")),
+            "OSVDB" => refs.push(format!("OSVDB-{value}")),
+            "URL" => refs.push(value.to_string()),
+            _ => refs.push(format!("{ref_type}: {value}")),
         }
     }
     if refs.is_empty() { None } else { Some(refs) }
@@ -350,11 +354,12 @@ fn extract_options<'a>(
             .trim_matches('"');
         // Special-case known options
         match opt {
-            "RPORT" => {
-                if let Ok(port) = val.parse() {
-                    meta.default_port = Some(port);
+            "RPORT" => match val.parse::<u16>() {
+                Ok(port) => meta.default_port = Some(port),
+                Err(e) => {
+                    tracing::debug!(error = %e, default = val, "msf: ignoring non-numeric RPORT default")
                 }
-            }
+            },
             _ => {
                 meta.options.push(TemplateOption {
                     name: rustsploit_name(opt).to_string(),
@@ -432,34 +437,34 @@ end
     fn metadata_is_extracted() {
         let tmpl = MSF
             .parse(MODULE, Path::new("exploit.rb"))
-            .expect("msf module should parse");
-        assert_eq!(tmpl.name, "Example Webshell Upload");
-        assert_eq!(tmpl.authors, vec!["alice", "bob"]);
-        assert_eq!(tmpl.default_port, Some(8080));
-        assert_eq!(tmpl.disclosure_date.as_deref(), Some("2024-05-01"));
-        assert_eq!(tmpl.severity, Severity::Critical);
-        assert!(tmpl.references.iter().any(|r| r == "CVE-2024-12345"));
-        assert!(
-            tmpl.references
-                .iter()
-                .any(|r| r == "https://example.com/advisory")
-        );
+            .expect("msf module should parse"); // audit-allow: test
+        assert_eq!(tmpl.name, "Example Webshell Upload"); // audit-allow: test
+        assert_eq!(tmpl.authors, vec!["alice", "bob"]); // audit-allow: test
+        assert_eq!(tmpl.default_port, Some(8080)); // audit-allow: test
+        assert_eq!(tmpl.disclosure_date.as_deref(), Some("2024-05-01")); // audit-allow: test
+        assert_eq!(tmpl.severity, Severity::Critical); // audit-allow: test
+        assert!(tmpl.references.iter().any(|r| r == "CVE-2024-12345")); // audit-allow: test
+        let has_advisory_url = tmpl
+            .references
+            .iter()
+            .any(|r| r == "https://example.com/advisory");
+        assert!(has_advisory_url); // audit-allow: test
     }
 
     #[test]
     fn options_are_carried_over() {
         let tmpl = MSF
             .parse(MODULE, Path::new("exploit.rb"))
-            .expect("msf module should parse");
+            .expect("msf module should parse"); // audit-allow: test
         let names: Vec<&str> = tmpl.options.iter().map(|o| o.name.as_str()).collect();
-        assert!(names.contains(&"target"));
-        assert!(names.contains(&"concurrency"));
-        assert!(names.contains(&"custom"));
+        assert!(names.contains(&"target")); // audit-allow: test
+        assert!(names.contains(&"concurrency")); // audit-allow: test
+        assert!(names.contains(&"custom")); // audit-allow: test
     }
 
     #[test]
     fn a_module_is_recognised() {
-        assert!(MSF.sniff(MODULE, Path::new("exploit.rb")));
-        assert!(!MSF.sniff("print('hello')", Path::new("x.rb")));
+        assert!(MSF.sniff(MODULE, Path::new("exploit.rb"))); // audit-allow: test
+        assert!(!MSF.sniff("print('hello')", Path::new("x.rb"))); // audit-allow: test
     }
 }

@@ -57,6 +57,11 @@ pub struct Cli {
     #[arg(long)]
     pub list_frameworks: bool,
 
+    /// Run an external framework template directly against `-t <target>` (no
+    /// module generation), reporting matcher/extractor results, then exit.
+    #[arg(long, value_name = "FILE")]
+    pub run_template: Option<String>,
+
     /// List all on-disk scan checkpoints from `~/.rustsploit/checkpoints/`
     /// and exit. CIDR / random / file fan-outs are checkpointed
     /// automatically; rerunning the same `(module, target)` resumes.

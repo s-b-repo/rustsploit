@@ -33,7 +33,7 @@ impl FrameworkAdapter for EmpireAdapter {
         &["py"]
     }
 
-    fn sniff(&self, source: &str, _path: &Path) -> bool {
+    fn sniff(&self, source: &str, _: &Path) -> bool {
         let has_class = source.contains("class Invoke-") || source.contains("class Get-");
         let has_author = source.contains("Author") || source.contains("author");
         has_class && has_author
@@ -144,16 +144,16 @@ class Invoke-Shellcode:
     fn launcher_metadata_is_extracted() {
         let tmpl = EMPIRE
             .parse(LAUNCHER, Path::new("invoke_shellcode.py"))
-            .expect("empire module should parse");
-        assert_eq!(tmpl.name, "Invoke-Shellcode");
-        assert_eq!(tmpl.description, "Launches shellcode from a remote URL.");
-        assert_eq!(tmpl.authors, vec!["[@darklogin]".to_string()]);
-        assert_eq!(tmpl.references, vec!["https://example.com".to_string()]);
+            .expect("empire module should parse"); // audit-allow: test
+        assert_eq!(tmpl.name, "Invoke-Shellcode"); // audit-allow: test
+        assert_eq!(tmpl.description, "Launches shellcode from a remote URL."); // audit-allow: test
+        assert_eq!(tmpl.authors, vec!["[@darklogin]".to_string()]); // audit-allow: test
+        assert_eq!(tmpl.references, vec!["https://example.com".to_string()]); // audit-allow: test
     }
 
     #[test]
     fn launcher_is_recognised() {
-        assert!(EMPIRE.sniff(LAUNCHER, Path::new("x.py")));
-        assert!(!EMPIRE.sniff("import os", Path::new("x.py")));
+        assert!(EMPIRE.sniff(LAUNCHER, Path::new("x.py"))); // audit-allow: test
+        assert!(!EMPIRE.sniff("import os", Path::new("x.py"))); // audit-allow: test
     }
 }

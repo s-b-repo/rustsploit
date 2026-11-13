@@ -27,12 +27,12 @@ pub async fn probe_origin(
     port: u16,
     host_header: &str,
     timeout: Duration,
-) -> Result<reqwest::Response, String> {
+) -> anyhow::Result<reqwest::Response> {
     let url = format!("{}://{}:{}/", scheme, origin_ip, port);
     match tokio::time::timeout(timeout, client.get(&url).header("Host", host_header).send()).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(format!("{e}")),
-        Err(elapsed) => Err(format!("timed out after {timeout:?}: {elapsed}")),
+        Ok(Err(e)) => Err(anyhow::Error::from(e).context("origin request failed")),
+        Err(elapsed) => Err(anyhow::anyhow!("timed out after {timeout:?}: {elapsed}")),
     }
 }
 

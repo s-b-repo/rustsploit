@@ -210,10 +210,65 @@ async fn run() -> Result<()> {
             generated.path.display(),
             generated.qualified_name
         );
+        let opts = frameworks::generate::describe_options(&template.options);
+        if !opts.trim().is_empty() {
+            println!("  Options:\n{opts}");
+        }
         if generated.registered_in_parent {
             println!("  Registered in the category mod.rs — rebuild to use it.");
         } else {
             println!("  NOTE: add the `pub mod` line to the category mod.rs, then rebuild.");
+        }
+        return Ok(());
+    }
+
+    // Run an external framework template directly against a target.
+    if let Some(tpl_path) = &cli_args.run_template {
+        let source = tokio::fs::read_to_string(tpl_path)
+            .await
+            .with_context(|| format!("reading template {tpl_path}"))?;
+        let template = frameworks::Template::from_source(&source)
+            .with_context(|| format!("parsing template {tpl_path}"))?;
+        let target = cli_args
+            .target
+            .as_deref()
+            .context("--run-template requires a target: -t <host[:port]>")?;
+        let default_port = template.default_port.unwrap_or(443);
+        let (host, port) = crate::utils::creds_helper::parse_host_port(target, default_port)?;
+        let ctx = frameworks::ExecutionCtx {
+            host: &host,
+            port,
+            scheme: if port == 443 { "https" } else { "http" },
+            variables: std::collections::BTreeMap::new(),
+            timeout: std::time::Duration::from_secs(15),
+            insecure: true,
+        };
+        let results = template
+            .execute(&ctx)
+            .await
+            .context("running template against target")?;
+        println!(
+            "{} {} template '{}' vs {}:{} — {} result(s)",
+            "✓".green(),
+            template.framework,
+            template.name,
+            host,
+            port,
+            results.len()
+        );
+        for r in &results {
+            let tag = if r.matched {
+                "[+]".green().bold()
+            } else {
+                "[-]".dimmed()
+            };
+            println!("{} {} ({})", tag, r.message, r.severity.as_str());
+            if let Some(ev) = &r.evidence {
+                println!("    evidence: {ev}");
+            }
+            for (k, v) in &r.extracted {
+                println!("    {k} = {v}");
+            }
         }
         return Ok(());
     }
