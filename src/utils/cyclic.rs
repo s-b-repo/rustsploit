@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // 200k-iteration walk; ~ms/iter native but ~minutes under Miri
     fn early_prefix_has_no_repeats_and_is_in_range() {
         // A full 2^32 coverage test is infeasible, but the primitive-root
         // property guarantees full coverage; here we just confirm the first
