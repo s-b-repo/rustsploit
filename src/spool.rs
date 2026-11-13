@@ -72,6 +72,13 @@ impl SpoolState {
                 .write(true)
                 .create(true)
                 .truncate(true)
+                // The spool captures the ENTIRE console transcript, which
+                // routinely includes harvested credentials ("[+] Valid creds:
+                // admin:..."). Without an explicit mode the file is created
+                // 0644 (& ~umask) and world-readable. Every other
+                // secret-bearing store (loot, cred_store, export, workspace)
+                // sets 0600.
+                .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(resolved)
         };

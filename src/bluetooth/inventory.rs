@@ -177,8 +177,7 @@ fn persist_account_key_sidecar(mac: &str, hex_key: &str) -> Result<()> {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", path.display()))?
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
             std::collections::HashMap::new()
         }
@@ -199,9 +198,9 @@ pub fn lookup_account_key(mac: &str) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let map: std::collections::HashMap<String, String> = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(map.get(&mac.to_ascii_uppercase()).cloned())
 }

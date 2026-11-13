@@ -61,6 +61,24 @@ impl Default for SchedulerLimits {
     }
 }
 
+/// Effective concurrency for a fan-out.
+///
+/// A zero-permit semaphore never grants a permit, so `concurrency = 0` makes
+/// every mass scan hang forever with no output and no error — the producer
+/// loop never even reaches the first host. The cancel token is the only thing
+/// that can escape it, so the scan simply stops responding.
+///
+/// The operator picks the concurrency that fits their target set — there is no
+/// *policy* ceiling. The only cap is `tokio::sync::Semaphore::MAX_PERMITS`
+/// (`usize::MAX >> 3`): `Semaphore::new` asserts `permits <= MAX_PERMITS` and
+/// panics above it, so an absurd value such as `setg concurrency <usize::MAX>`
+/// would abort the process the moment any mass scan built its semaphore. Real
+/// scans are unaffected (no operator sets billions of permits); this only
+/// removes the crash on a physically impossible value.
+fn effective_concurrency(requested: usize) -> usize {
+    requested.clamp(1, tokio::sync::Semaphore::MAX_PERMITS)
+}
+
 impl SchedulerLimits {
     /// Pull defaults from the active tenant's `global_options`.
     pub fn from_global_options() -> Self {
@@ -72,7 +90,12 @@ impl SchedulerLimits {
             .or_else(|| opts.try_get("threads"))
             .and_then(|v| v.parse().ok())
         {
-            l.concurrency = v;
+            // A zero-permit semaphore never grants, so `concurrency = 0` hangs
+            // every mass scan forever with no output and no error. Enforce a
+            // floor of 1 permit. There is deliberately NO upper ceiling here:
+            // mass scanning is a legitimate research workflow and the operator
+            // picks the concurrency that fits their target set.
+            l.concurrency = effective_concurrency(v);
         }
         if let Some(v) = opts
             .try_get("module_timeout")
@@ -349,6 +372,64 @@ async fn run_with_limits_shared(
     // mass-scan host (single-target runs scope the real config and were
     // unaffected, which made the inconsistency hard to spot).
     let module_config = crate::config::get_module_config();
+
+    // A module that drives the LOCAL Bluetooth radio — or that works purely
+    // on local state — has no network host to attack: its target is a device
+    // address (or nothing at all). The framework must therefore
+    //   * never fan it out across a mass target. `0.0.0.0` is the operator's
+    //     alias for the full-internet sweep, so a radio module used to
+    //     answer "Random mass scan: 'WPair — Fast Pair Exploit' will probe
+    //     public hosts across the whole Internet" — a sweep over 3.6 billion
+    //     hosts for a module that never opens a socket, and for an
+    //     interactive one a REPL per host; and
+    //   * never hand it an IP address it can never connect to.
+    //
+    // This is enforced here, in the scheduler, so the shell, the CLI, the
+    // API and the MCP server all behave identically.
+    let target_kind = module.capabilities().target_kind;
+    let target = match target_kind {
+        crate::module::TargetKind::Network => target,
+        crate::module::TargetKind::Radio => {
+            if target.is_mass() {
+                anyhow::bail!(
+                    "'{}' drives the LOCAL Bluetooth radio and cannot be fanned out across a \
+                     mass target ({}). Target a single device instead — e.g. \
+                     'set target AA:BB:CC:DD:EE:FF' or 'setg target_mac <MAC>' — or run it \
+                     with no target to work on every device in range.",
+                    module.info().name,
+                    target.as_legacy_str()
+                );
+            }
+            let single = match target.as_single() {
+                Some(s) => s,
+                None => "",
+            };
+            if !single.is_empty() && !crate::utils::is_mac_addr(single) {
+                crate::meprintln!(
+                    "[!] '{}' targets a Bluetooth device — '{single}' is not a device address, \
+                     ignoring it. Use 'set target AA:BB:CC:DD:EE:FF' or 'setg target_mac <MAC>'.",
+                    module.info().name
+                );
+                crate::module::Target::Single(String::new())
+            } else {
+                target
+            }
+        }
+        crate::module::TargetKind::Local => {
+            // A local-state module has no target at all, so there is nothing
+            // to refuse: the target is simply dropped (a mass target included
+            // — "everything" is not a thing a capture file can be).
+            if let Some(single) = target.as_single()
+                && !single.is_empty()
+            {
+                crate::meprintln!(
+                    "[!] '{}' works on local state — ignoring network target '{single}'.",
+                    module.info().name
+                );
+            }
+            crate::module::Target::Single(String::new())
+        }
+    };
 
     // Interactive modules own their lifetime (REPL / long-lived session).
     // Fanning them out per-host across a mass target would run one REPL per
@@ -682,7 +763,13 @@ async fn fanout_single(params: FanoutParams, verbose: bool) -> Result<ModuleOutc
         config: _,
     } = params;
     let host = target.as_single().unwrap_or("").to_string();
-    if limits.honeypot_detection && crate::utils::network::quick_honeypot_check(&host).await {
+    // The honeypot probe is a TCP port scan. It is meaningless for a module
+    // that drives the local radio or works on local state: its "target" is a
+    // device address (or nothing), so every one of the 30 lookups would be a
+    // DNS miss against a name that does not exist.
+    let honeypot_probe =
+        limits.honeypot_detection && module.capabilities().target_kind.is_network();
+    if honeypot_probe && crate::utils::network::quick_honeypot_check(&host).await {
         crate::mprintln!(
             "{}",
             format!(
@@ -2282,5 +2369,110 @@ async fn route_findings(outcome: &ModuleOutcome, module: &dyn Module) {
             kind: kind_str.to_string(),
             message: f.message.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `concurrency = 0` used to build a zero-permit semaphore, which never
+    /// grants — the mass scan hung forever with no output and no error.
+    #[test]
+    fn zero_concurrency_is_raised_to_one() {
+        assert_eq!(effective_concurrency(0), 1); // audit-allow: test
+        assert_eq!(effective_concurrency(1), 1); // audit-allow: test
+        assert_eq!(effective_concurrency(50), 50); // audit-allow: test
+    }
+
+    /// There is no *policy* ceiling on concurrency — the operator chooses the
+    /// value that fits their target set. The only cap is the safety clamp to
+    /// `Semaphore::MAX_PERMITS`, which exists solely so an absurd request such
+    /// as `usize::MAX` cannot make `Semaphore::new` panic (the clamp in
+    /// `effective_concurrency` is intentional and must not be retuned).
+    #[test]
+    fn concurrency_is_clamped_to_semaphore_max() {
+        // A realistic operator value passes through untouched: no policy cap.
+        assert_eq!(effective_concurrency(100_000), 100_000); // audit-allow: test
+        // A physically impossible value is clamped to the semaphore ceiling
+        // (usize::MAX >> 3) so Semaphore::new cannot panic; this is a crash
+        // guard, NOT a policy ceiling on legitimate mass scans.
+        assert_eq!(effective_concurrency(usize::MAX), Semaphore::MAX_PERMITS); // audit-allow: test
+    }
+
+    /// A semaphore built from the effective concurrency must actually grant a
+    /// permit. This is the behaviour the zero-permit bug destroyed.
+    #[tokio::test]
+    async fn effective_concurrency_semaphore_grants() {
+        let sem = Semaphore::new(effective_concurrency(0));
+        let permit = sem.acquire().await;
+        assert!(permit.is_ok(), "semaphore must grant at least one permit"); // audit-allow: test
+    }
+
+    /// A module that drives the local Bluetooth radio must never be fanned
+    /// out across a mass target. `0.0.0.0` is the operator's alias for the
+    /// full-internet sweep, so a radio module used to answer "will probe
+    /// public hosts across the whole Internet" (3.6 billion hosts) for a
+    /// module that never opens a socket.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // from_global_options resolves the home dir (getpwuid_r); Miri blocks it
+    async fn radio_module_refuses_mass_target() {
+        struct RadioModule;
+
+        #[async_trait::async_trait]
+        impl crate::module::Module for RadioModule {
+            fn info(&self) -> crate::module_info::ModuleInfo {
+                crate::module_info::ModuleInfo {
+                    name: "test radio module".to_string(),
+                    description: "test".to_string(),
+                    authors: vec![],
+                    references: vec![],
+                    disclosure_date: None,
+                    rank: crate::module_info::ModuleRank::Normal,
+                    default_port: None,
+                }
+            }
+
+            fn capabilities(&self) -> crate::module::Capabilities {
+                crate::module::Capabilities {
+                    target_kind: crate::module::TargetKind::Radio,
+                    ..Default::default()
+                }
+            }
+
+            async fn run(
+                &self,
+                _ctx: &crate::module::ModuleCtx,
+            ) -> anyhow::Result<crate::module::ModuleOutcome> {
+                Ok(crate::module::ModuleOutcome::ok())
+            }
+        }
+
+        let module: Arc<dyn crate::module::Module> = Arc::new(RadioModule);
+        let err = run_with_limits(
+            module,
+            crate::module::Target::Random,
+            crate::module::ModuleOptions::default(),
+            false,
+            SchedulerLimits::from_global_options(),
+            "test/radio",
+        )
+        .await
+        .expect_err("a radio module must refuse a mass target"); // audit-allow: test
+        let msg = format!("{err:#}");
+        let explains_why = msg.contains("LOCAL Bluetooth radio");
+        assert!(explains_why, "error must explain why: {msg}"); // audit-allow: test
+    }
+
+    /// A device address IS a target: the radio modules address a peer by MAC.
+    /// The generic target parser used to claim it for IPv6 (five colons) and
+    /// reject it with "Invalid IPv6 address format", which made `set target
+    /// AA:BB:CC:DD:EE:FF` and `run -t AA:BB:CC:DD:EE:FF` unreachable.
+    #[test]
+    #[cfg_attr(miri, ignore)] // Target::parse stats the path (statx); Miri blocks that under isolation
+    fn device_address_parses_as_a_target() {
+        let target = crate::module::Target::parse("AA:BB:CC:DD:EE:FF").expect("MAC target"); // audit-allow: test
+        assert_eq!(target.as_single(), Some("AA:BB:CC:DD:EE:FF")); // audit-allow: test
+        assert!(!target.is_mass(), "a device address is not a mass target"); // audit-allow: test
     }
 }

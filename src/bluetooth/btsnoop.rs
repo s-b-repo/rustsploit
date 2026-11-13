@@ -203,7 +203,7 @@ pub fn extract_smp_addresses(records: &[BtsnoopRecord]) -> Result<SmpAddresses> 
         if status != 0 {
             continue;
         }
-let role = p[3];
+        let role = p[3];
         let peer_addr_type = p[4];
         let mut peer_addr = [0u8; 6];
         peer_addr.copy_from_slice(&p[5..11]);
@@ -254,7 +254,8 @@ mod tests {
         // One ACL record: handle 0x000B, 4-byte L2CAP header + 4-byte signal.
         let mut pkt = vec![HCI_ACL_PKT];
         pkt.extend_from_slice(&0x000Bu16.to_le_bytes()); // handle+flags
-        let mut l2 = vec![4u8, 0, 0x01, 0x00, 0x02, 0x07, 4, 0, 0x03, 0x00, 0x11, 0x00];
+        pkt.extend_from_slice(&12u16.to_le_bytes()); // ACL data total length (L2CAP pkt = 12 bytes)
+        let mut l2 = vec![8u8, 0, 0x01, 0x00, 0x02, 0x07, 4, 0, 0x03, 0x00, 0x11, 0x00];
         pkt.append(&mut l2);
         data.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
         data.extend_from_slice(&(pkt.len() as u32).to_be_bytes());

@@ -118,8 +118,7 @@ impl AirohaHandle {
 
     pub fn chip_reset(hci: &mut HciSocket) -> Result<()> {
         let opcode = vendor_opcode(AIROHA_OCF_CHIP_RESET);
-        hci.command(opcode, &[], Duration::from_secs(2))
-            .map(|_| ())
+        hci.command(opcode, &[], Duration::from_secs(2)).map(|_| ())
     }
 }
 
@@ -149,4 +148,3 @@ mod tests {
         assert_eq!(buf[4], 8);
     }
 }
-

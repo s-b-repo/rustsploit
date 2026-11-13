@@ -23,6 +23,7 @@ use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -41,6 +42,21 @@ enum RingRequest {
         addr: SocketAddr,
         timeout: Duration,
         reply: oneshot::Sender<io::Result<StdTcpStream>>,
+    },
+    /// Blocking-bridge variant of `Connect`.
+    ///
+    /// Uses a `std::sync::mpsc` channel instead of a tokio oneshot so the
+    /// caller can block on `recv()` WITHOUT a tokio runtime handle. A tokio
+    /// oneshot would require `Handle::block_on`, which PANICS with
+    /// "Cannot start a runtime from within a runtime" whenever the calling
+    /// thread is inside a tokio runtime context (which is the case for
+    /// every module that calls `blocking_tcp_connect` from an `async fn`).
+    /// With `panic = "abort"` in the release profile that aborts the whole
+    /// process, losing all scan state.
+    ConnectBlocking {
+        addr: SocketAddr,
+        timeout: Duration,
+        reply: std_mpsc::Sender<io::Result<StdTcpStream>>,
     },
 }
 
@@ -134,6 +150,21 @@ fn spawn_ring_thread(idx: usize) -> io::Result<mpsc::UnboundedSender<RingRequest
                                 let result = connect_stream_once(addr, timeout).await;
                                 if reply.send(result).is_err() {
                                     tracing::trace!(addr = %addr, "io_uring connect reply dropped");
+                                }
+                            });
+                        }
+                        RingRequest::ConnectBlocking {
+                            addr,
+                            timeout,
+                            reply,
+                        } => {
+                            tokio_uring::spawn(async move {
+                                let result = connect_stream_once(addr, timeout).await;
+                                if reply.send(result).is_err() {
+                                    tracing::trace!(
+                                        addr = %addr,
+                                        "io_uring blocking connect reply dropped"
+                                    );
                                 }
                             });
                         }
@@ -253,16 +284,21 @@ pub async fn connect(addr: SocketAddr, timeout: Duration) -> Option<io::Result<S
 // =========================================================================
 
 /// Blocking bridge: submit a Connect request to the io_uring ring pool and
-/// block the calling thread on the oneshot. Returns `None` if the ring service
+/// block the calling thread on the reply. Returns `None` if the ring service
 /// is unavailable (caller falls back to `std::net::TcpStream::connect_timeout`).
 ///
-/// Must only be called from a `spawn_blocking` thread (has a tokio runtime
-/// handle), never from a bare OS thread.
+/// Safe to call from ANY thread — including a thread that is currently
+/// inside a tokio runtime context. The reply travels over a
+/// `std::sync::mpsc` channel, so no `Handle::block_on` is involved. The
+/// previous implementation used a tokio oneshot plus `Handle::block_on`,
+/// which panicked with "Cannot start a runtime from within a runtime" for
+/// every module that called `blocking_tcp_connect` from inside an `async fn`
+/// (and, with `panic = "abort"`, killed the whole process).
 pub fn blocking_connect(addr: SocketAddr, timeout: Duration) -> Option<io::Result<StdTcpStream>> {
     let tx = pool()?.pick()?;
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let (reply_tx, reply_rx) = std_mpsc::channel::<io::Result<StdTcpStream>>();
     if tx
-        .send(RingRequest::Connect {
+        .send(RingRequest::ConnectBlocking {
             addr,
             timeout,
             reply: reply_tx,
@@ -272,19 +308,17 @@ pub fn blocking_connect(addr: SocketAddr, timeout: Duration) -> Option<io::Resul
         tracing::debug!(%addr, "io_uring ring stopped; falling back to blocking connect");
         return None;
     }
-    // Block the current spawn_blocking thread on the async oneshot.
-    // This is safe because the blocking thread pool is designed for blocking
-    // operations; the main runtime is unaffected.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => match handle.block_on(reply_rx) {
-            Ok(result) => Some(result),
-            Err(e) => {
-                tracing::debug!(%addr, "io_uring blocking connect reply lost ({e}); falling back");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::debug!(%addr, "no tokio runtime in blocking_connect ({e}); falling back");
+    // The connect itself is bounded by `timeout` inside `connect_stream_once`;
+    // the extra slack covers scheduling and the ring thread waking up.
+    let wait = timeout.saturating_add(Duration::from_secs(5));
+    match reply_rx.recv_timeout(wait) {
+        Ok(result) => Some(result),
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            tracing::debug!(%addr, "io_uring blocking connect reply timed out; falling back");
+            None
+        }
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::debug!(%addr, "io_uring blocking connect reply lost; falling back");
             None
         }
     }

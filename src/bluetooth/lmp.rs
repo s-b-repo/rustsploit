@@ -142,13 +142,27 @@ pub const L2CAP_INFO_EXTENDED_FEATURES: u16 = 0x0002;
 /// PSM values of interest for probing.
 pub const PSM_SDP: u16 = 0x0001;
 pub const PSM_RFCOMM: u16 = 0x0003;
+pub const PSM_BNEP: u16 = 0x000F;
 pub const PSM_HID_CONTROL: u16 = 0x0011;
 pub const PSM_HID_INTERRUPT: u16 = 0x0013;
+/// AVCTP control channel (Bluetooth AVRCP transport).
+pub const PSM_AVCTP: u16 = 0x0017;
 pub const PSM_AVDTP: u16 = 0x0019;
+/// AVCTP browsing channel — also the AVDTP media PSM in the Assigned
+/// Numbers; both 0x001B registrations exist in the wild, so both are
+/// probed.
+pub const PSM_AVCTP_BROWSING: u16 = 0x001B;
 pub const PSM_AVDTP_MEDIA: u16 = 0x001B;
-pub const PSM_BNEP: u16 = 0x000F;
-pub const PSM_L2CAP_DYNAMIC_START: u16 = 0x1001;
+/// GATT over BR/EDR. This is the channel the Android Fluoride GATT
+/// underflow (CVE-2023-40129) is reached over.
+pub const PSM_GATT: u16 = 0x001F;
 pub const PSM_A2MP: u16 = 0x0007;
+/// GAP (Generic Access Profile) service channels.
+pub const PSM_GAP_SVC: u16 = 0x1003;
+pub const PSM_GAP_GEN: u16 = 0x1005;
+pub const PSM_GAP: u16 = 0x1007;
+/// First dynamically-allocatable PSM.
+pub const PSM_L2CAP_DYNAMIC_START: u16 = 0x1001;
 
 // ---------------------------------------------------------------------------
 // LMP

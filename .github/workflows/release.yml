@@ -1,0 +1,274 @@
+name: Release
+
+# Tag-triggered release pipeline.
+#
+# Workers:
+#   notes     — generate the release notes from the commit log
+#   build     — one worker per target platform (matrix), each producing a
+#               signed-by-checksum archive
+#   checksums — collect every artifact and write a SHA256SUMS manifest
+#   release   — publish the GitHub Release with the notes and the artifacts
+#   changelog — commit the generated notes back into the repository
+#
+# The build matrix is the "worker pool": every platform compiles in parallel,
+# and the release job waits for all of them, so one slow platform does not
+# hold up the others.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.6.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_STRIP: "symbols"
+  # lld uses far less memory than GNU ld when linking this crate, and the
+  # link step is where the build OOMs on a small runner.
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=lld"
+
+jobs:
+  # ── Worker: release notes ─────────────────────────────────────────────
+  notes:
+    name: release notes
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      notes: ${{ steps.gen.outputs.notes_file }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          # On a tag push the ref is already the tag; on a manual dispatch we
+          # must check the requested tag out explicitly.
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Resolve the version
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${TAG} (version ${VERSION})"
+      - name: Generate the release notes
+        id: gen
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          # Start from the previous tag so the notes cover exactly what this
+          # release adds.
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            bash scripts/generate-release-notes.sh "$VERSION" --from "$PREV" \
+              > "RELEASE_NOTES_${VERSION}.md"
+          else
+            bash scripts/generate-release-notes.sh "$VERSION" > "RELEASE_NOTES_${VERSION}.md"
+          fi
+          echo "notes_file=RELEASE_NOTES_${VERSION}.md" >> "$GITHUB_OUTPUT"
+          echo "--- release notes ---"
+          cat "RELEASE_NOTES_${VERSION}.md"
+      - name: Upload the notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-notes
+          path: RELEASE_NOTES_*.md
+          retention-days: 30
+
+  # ── Worker: build matrix (one worker per platform) ────────────────────
+  build:
+    name: build ${{ matrix.name }}
+    needs: notes
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            cross: false
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            cross: false
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            cross: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+          key: release-${{ matrix.target }}
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev clang lld libdbus-1-dev cmake \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+      - name: Build
+        # The release profile uses fat LTO + codegen-units=1 + panic=abort, so
+        # this is the slow part of the pipeline by design.
+        #
+        # The aarch64 Linux build is cross-compiled through `cross`, which
+        # supplies its own sysroot; the Bluetooth feature needs libdbus
+        # headers that the cross image does not carry, so that target is
+        # built without default features.
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.notes.outputs.version }}"
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo install cross --locked
+            cross build --release --locked --target ${{ matrix.target }} --no-default-features
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+          mkdir -p "dist/rustsploit-${VERSION}"
+          cp "target/${{ matrix.target }}/release/rustsploit" "dist/rustsploit-${VERSION}/rustsploit"
+          cp README.md LICENSE "dist/rustsploit-${VERSION}/" 2>/dev/null || true
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.notes.outputs.version }}"
+          cd dist
+          tar -czf "rustsploit-${VERSION}-${{ matrix.name }}.tar.gz" "rustsploit-${VERSION}"
+          cd ..
+          ls -la dist/*.tar.gz
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: rustsploit-${{ matrix.name }}
+          path: dist/rustsploit-${{ needs.notes.outputs.version }}-${{ matrix.name }}.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Worker: checksum manifest ─────────────────────────────────────────
+  checksums:
+    name: checksums
+    needs: [notes, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752cd9
+        with:
+          name: checksums
+          path: artifacts/SHA256SUMS
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Worker: publish the release ───────────────────────────────────────
+  release:
+    name: publish release
+    needs: [notes, build, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # publish the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
+        with:
+          name: Rustsploit ${{ needs.notes.outputs.version }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body_path: artifacts/release-notes/*.md
+          draft: false
+          prerelease: ${{ contains(needs.notes.outputs.version, '-') }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  # ── Worker: commit the notes back into the repository ─────────────────
+  changelog:
+    name: changelog
+    needs: [notes, release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          # Commit back to the default branch, not the tag.
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Commit the release notes
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.notes.outputs.version }}"
+          mkdir -p changelogs/releases
+          cp artifacts/release-notes/*.md "changelogs/releases/RELEASE_NOTES_${VERSION}.md"
+          cp artifacts/release-notes/*.md "changelogs/changelog-latest.md"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add changelogs/
+          if git diff --cached --quiet; then
+            echo "Release notes already up to date."
+            exit 0
+          fi
+          git commit -m "docs(changelog): release notes for v${VERSION}"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}" || {
+            echo "::warning::Could not push the changelog commit (the branch may be protected)."
+          }

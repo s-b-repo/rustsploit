@@ -40,10 +40,9 @@ pub async fn ble_scan(ctx: &crate::module::ModuleCtx) -> Result<Vec<BtDevice>> {
     let manager = btleplug::platform::Manager::new()
         .await
         .map_err(|e| anyhow::anyhow!("btleplug manager init failed: {e}"))?;
-    let adapters = manager
-        .adapters()
-        .await
-        .map_err(|e| anyhow::anyhow!("listing Bluetooth adapters failed: {e}"))?;
+    let adapters = manager.adapters().await.map_err(|e| {
+        super::adapter_error(anyhow::anyhow!("listing Bluetooth adapters failed: {e}"))
+    })?;
     if adapters.is_empty() {
         anyhow::bail!("no BLE adapters found — power a controller with 'bluetoothctl power on'");
     }

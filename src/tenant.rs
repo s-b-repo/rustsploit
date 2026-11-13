@@ -153,12 +153,23 @@ tokio::task_local! {
     pub static CURRENT_TENANT: String;
 }
 
+/// Reduce a tenant id to a filesystem-safe key.
+///
+/// Case is deliberately PRESERVED. Case-folding collapsed two distinct
+/// enrolled clients ("Alice" and "alice") onto one registry key and one
+/// on-disk directory, so they shared a single `TenantData` — the same loot,
+/// credentials, workspace, options and jobs. That silently broke the
+/// multi-tenant isolation guarantee.
+///
+/// Only ASCII alphanumerics, '-' and '_' survive; everything else is
+/// dropped. Callers that accept an operator-supplied name must validate
+/// the charset upstream (see `pq_middleware`'s registration check) because
+/// dropping characters can map two distinct names onto the same key.
 fn sanitize_tenant_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(64)
         .collect::<String>()
-        .to_lowercase()
 }
 
 fn tenant_base_dir_sanitized(sanitized_name: &str) -> PathBuf {
@@ -253,4 +264,45 @@ pub fn resolve_for(tenant_id: &str) -> anyhow::Result<Stores> {
         .get_or_create(tenant_id)
         .with_context(|| format!("resolving tenant '{tenant_id}'"))?;
     Ok(Stores { tenant: Some(data) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two enrolled clients whose names differ only in case must be TWO
+    /// different tenants.
+    ///
+    /// The sanitiser used to case-fold, which collapsed "Alice" and "alice"
+    /// onto one registry key and one on-disk directory — so they shared the
+    /// same loot, credentials, workspace, options and jobs, breaking the
+    /// multi-tenant isolation guarantee.
+    #[test]
+    fn tenant_names_preserve_case() {
+        let a = sanitize_tenant_name("Alice");
+        let b = sanitize_tenant_name("alice");
+        assert_ne!(a, b, "tenant names must not be case-folded"); // audit-allow: test
+        assert_eq!(a, "Alice"); // audit-allow: test
+        assert_eq!(b, "alice"); // audit-allow: test
+    }
+
+    #[test]
+    fn tenant_name_is_filesystem_safe() {
+        assert_eq!(sanitize_tenant_name("acme-corp_1"), "acme-corp_1"); // audit-allow: test
+        // Path separators and traversal must be stripped, not passed through.
+        assert_eq!(sanitize_tenant_name("../../etc"), "etc"); // audit-allow: test
+        assert_eq!(sanitize_tenant_name("a/b"), "ab"); // audit-allow: test
+        // Over-long names are truncated.
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_tenant_name(&long).len(), 64); // audit-allow: test
+    }
+
+    /// The sanitiser drops characters, so two distinct names can map to the
+    /// same key. Registration validates the charset upstream; this test
+    /// documents that the sanitiser is NOT the charset validator.
+    #[test]
+    fn tenant_name_charset_is_validated_upstream_not_here() {
+        // "a.b" -> "ab" and "ab" -> "ab" collide.
+        assert_eq!(sanitize_tenant_name("a.b"), sanitize_tenant_name("ab")); // audit-allow: test
+    }
 }

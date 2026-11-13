@@ -1,0 +1,78 @@
+version: 2
+
+updates:
+  # Cargo dependencies. Grouped so a routine bump does not open 30 PRs.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:30"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Patch bumps are low risk — take them together.
+      cargo-patch:
+        applies-to: version-updates
+        update-types:
+          - "patch"
+      # Security-relevant crates are bumped on their own so the diff is
+      # reviewable: crypto, TLS, HTTP, and the SSH/FTP stacks.
+      cargo-security:
+        patterns:
+          - "rustls"
+          - "tokio-rustls"
+          - "ring"
+          - "chacha20poly1305"
+          - "hkdf"
+          - "sha2"
+          - "sha1"
+          - "md5"
+          - "aes"
+          - "des"
+          - "argon2"
+          - "subtle"
+          - "x25519-dalek"
+          - "p256"
+          - "ml-kem"
+          - "classic-mceliece-rust"
+          - "reqwest"
+          - "h2"
+          - "http"
+          - "native-tls"
+          - "ssh2"
+          - "suppaftp"
+          - "rustyline"
+        update-types:
+          - "minor"
+          - "patch"
+      # Everything else.
+      cargo-other:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions. The workflows pin actions by commit SHA, so Dependabot
+  # updates the SHA and the version comment together.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

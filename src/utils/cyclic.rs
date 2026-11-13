@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // 200k-iteration walk; ~ms/iter native but ~minutes under Miri
     fn early_prefix_has_no_repeats_and_is_in_range() {
         // A full 2^32 coverage test is infeasible, but the primitive-root
         // property guarantees full coverage; here we just confirm the first
@@ -248,6 +249,7 @@ mod tests {
     /// space — otherwise the constant we expose to operators would silently
     /// disagree with what the scanner actually iterates.
     #[test]
+    #[cfg_attr(miri, ignore)] // counts all 2^32 addresses; ~10s natively, far too slow under Miri
     fn total_public_ipv4_count_matches_filter() {
         let mut counted: u64 = 0;
         // Counting all 2^32 addresses in a Rust test takes ~10s on a laptop,

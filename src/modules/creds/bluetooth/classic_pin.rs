@@ -202,5 +202,6 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 crate::register_native_module!(
     crate::module::Category::Creds,
     "bluetooth/classic_pin",
-    native
+    native,
+    radio
 );

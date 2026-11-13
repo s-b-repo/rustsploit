@@ -78,8 +78,15 @@ impl JobProgress {
 
     pub fn push_line(&self, line: String) {
         let capped = if line.len() > MAX_LINE_BYTES {
+            // `String::truncate` panics when the cut lands inside a multi-byte
+            // UTF-8 sequence. Module output routinely contains box-drawing
+            // characters and emoji, so find the nearest char boundary first.
+            let mut cut = MAX_LINE_BYTES;
+            while cut > 0 && !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
             let mut t = line;
-            t.truncate(MAX_LINE_BYTES);
+            t.truncate(cut);
             t.push_str(" [truncated]");
             t
         } else {
@@ -704,3 +711,40 @@ impl JobManager {
 }
 
 pub static JOB_MANAGER: Lazy<JobManager> = Lazy::new(JobManager::new);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Truncating a line at a byte offset that lands inside a multi-byte
+    /// UTF-8 sequence used to panic (`String::truncate` panics on a non-char
+    /// boundary). Module output routinely contains box-drawing characters
+    /// and emoji, so this was reachable from ordinary scan output.
+    #[test]
+    fn push_line_truncates_on_a_char_boundary() {
+        let progress = JobProgress::new();
+        // 3-byte '✓' repeated so that byte 10_240 falls mid-character.
+        let line = "✓".repeat(10_000);
+        assert!(line.len() > MAX_LINE_BYTES); // audit-allow: test
+
+        progress.push_line(line);
+
+        let buf = progress.output.read().unwrap_or_else(|e| e.into_inner());
+        let stored = buf.front().expect("a line should have been stored"); // audit-allow: test
+        assert!(stored.len() <= MAX_LINE_BYTES + " [truncated]".len()); // audit-allow: test
+        assert!(stored.ends_with(" [truncated]")); // audit-allow: test
+        // The stored line must still be valid UTF-8 (i.e. the cut did not
+        // split a character).
+        let valid = std::str::from_utf8(stored.as_bytes()).is_ok();
+        assert!(valid, "truncated line must stay valid UTF-8"); // audit-allow: test
+    }
+
+    /// A short line must pass through untouched.
+    #[test]
+    fn push_line_keeps_short_lines_verbatim() {
+        let progress = JobProgress::new();
+        progress.push_line("hello".to_string());
+        let buf = progress.output.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(buf.front().map(String::as_str), Some("hello")); // audit-allow: test
+    }
+}

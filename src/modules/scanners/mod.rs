@@ -60,6 +60,7 @@ pub mod ssti_detector;
 pub mod stalkroute_full_traceroute;
 pub mod subdomain_scanner;
 pub mod subdomain_takeover_scanner;
+pub mod subdomain_wordlist;
 pub mod synology_dsm_disclosure;
 pub mod tech_stack_fingerprint;
 pub mod vnc_scanner;

@@ -76,22 +76,22 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
         None => {
             use colored::Colorize;
             crate::meprintln!("{}", format!("Unknown module '{}'.", module_path).red());
-            let all = discover_modules_cached();
-            let best = all
-                .iter()
-                .map(|m| (m, strsim::levenshtein(module_path, m)))
-                .min_by_key(|&(_, d)| d);
-            if let Some((suggestion, dist)) = best
-                && dist < 5
-            {
+            if let Some(suggestion) = suggest_module(module_path) {
                 crate::meprintln!("{}", format!("  Did you mean: {}?", suggestion).yellow());
             }
             return Err(anyhow::anyhow!("Module not found"));
         }
     };
 
+    let target_kind = module_box.capabilities().target_kind;
     let target_str = if raw_target.is_empty() {
-        if config::GLOBAL_CONFIG.has_target() {
+        if !target_kind.is_network() {
+            // A radio module (local Bluetooth radio) and a local-state module
+            // do NOT inherit the global target: that IP belongs to the last
+            // network module the operator ran and is meaningless for a
+            // module that never opens a socket.
+            String::new()
+        } else if config::GLOBAL_CONFIG.has_target() {
             match config::GLOBAL_CONFIG.get_target() {
                 Some(t) => {
                     crate::mprintln!("[*] Using global target: {}", t);
@@ -106,7 +106,14 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
         raw_target.to_string()
     };
 
-    let target = Target::parse(&target_str)?;
+    // An empty target is the "no target" state of a radio / local-state
+    // module: it works on whatever is in range (or on local state). Every
+    // other module needs a host, so an empty target is an error there.
+    let target = if target_str.is_empty() {
+        Target::Single(String::new())
+    } else {
+        Target::parse(&target_str)?
+    };
     let resolved_path = resolve_full_path(module_path).unwrap_or_else(|| module_path.to_string());
 
     crate::events::emit(crate::events::ModuleEvent::ModuleStarted {
@@ -192,16 +199,95 @@ pub fn module_info(module_path: &str) -> Option<crate::module_info::ModuleInfo> 
 // HELPERS
 // ============================================================
 
-/// Find the canonical `category/name` form of a module if the user supplied
-/// just the short name. Returns `None` for an unknown module.
+/// Find the canonical `category/name` form of a module from whatever the
+/// operator typed.
+///
+/// Accepts, in order of preference:
+///   - `category/name`      exact
+///   - `name/with/path`     exact entry name, any category
+///   - `name`               exact entry name
+///   - `leaf`               the final segment of the entry name
+///   - `category/leaf`      the final segment, restricted to one category
+///
+/// This mirrors `module::find`'s resolution so that `use` and `info` agree:
+/// `info ssh_bruteforce` already worked, `use ssh_bruteforce` did not.
+///
+/// Returns `None` for an unknown module.
 pub fn resolve_full_path(module_path: &str) -> Option<String> {
-    if module_path.contains('/') {
-        // Already qualified; verify it exists.
-        return module::registered()
-            .find(|e| format!("{}/{}", e.category.as_str(), e.name) == module_path)
-            .map(|e| format!("{}/{}", e.category.as_str(), e.name));
+    let path = module_path.trim();
+    if path.is_empty() {
+        return None;
     }
-    module::registered()
-        .find(|e| e.name == module_path)
-        .map(|e| format!("{}/{}", e.category.as_str(), e.name))
+    let canonical = |e: &module::ModuleEntry| format!("{}/{}", e.category.as_str(), e.name);
+
+    // 1. Exact `category/name`.
+    if let Some(e) = module::registered().find(|e| canonical(e) == path) {
+        return Some(canonical(e));
+    }
+    // 2. Exact entry name, any category (`generic/ssh_bruteforce`).
+    if let Some(e) = module::registered().find(|e| e.name == path) {
+        return Some(canonical(e));
+    }
+    // 3. Leaf match — the final segment of the entry name (`ssh_bruteforce`).
+    //    First match wins so the result is deterministic.
+    if let Some(e) =
+        module::registered().find(|e| e.name.rsplit('/').next().unwrap_or(e.name) == path)
+    {
+        return Some(canonical(e));
+    }
+    // 4. `category/leaf` — leaf match restricted to one category.
+    if let Some((cat, leaf)) = path.split_once('/')
+        && let Some(category) = module::Category::parse(cat)
+        && let Some(e) = module::registered()
+            .find(|e| e.category == category && e.name.rsplit('/').next().unwrap_or(e.name) == leaf)
+    {
+        return Some(canonical(e));
+    }
+    None
+}
+
+/// Suggest the module path closest to `input`.
+///
+/// Prefers a suffix match (`ssh` -> `creds/generic/ssh_bruteforce`) because
+/// that is what an operator typing a fragment almost always means, and falls
+/// back to a Levenshtein distance over the full path set.
+///
+/// Returns `None` when nothing is close enough to be worth suggesting.
+pub fn suggest_module(input: &str) -> Option<String> {
+    let needle = input.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    let all = discover_modules_cached();
+    if all.is_empty() {
+        return None;
+    }
+
+    // Suffix match: the input is the tail of a path, or the leaf of an
+    // entry name. Cheap, and far more likely to be right than an edit
+    // distance.
+    let lower = needle.to_ascii_lowercase();
+    let mut suffix_matches: Vec<&String> = all
+        .iter()
+        .filter(|m| {
+            let m_lower = m.to_ascii_lowercase();
+            m_lower.ends_with(&lower) || m_lower.contains(&format!("/{lower}"))
+        })
+        .collect();
+    suffix_matches.sort();
+    if let Some(first) = suffix_matches.first() {
+        return Some((*first).clone());
+    }
+
+    // Fall back to the closest edit distance. The threshold scales with the
+    // length of the input so a short typo still matches.
+    let threshold = if needle.len() <= 4 { 2 } else { 5 };
+    let best = all
+        .iter()
+        .map(|m| (m, strsim::levenshtein(needle, m)))
+        .min_by_key(|&(_, d)| d);
+    match best {
+        Some((suggestion, dist)) if dist < threshold => Some(suggestion.clone()),
+        _ => None,
+    }
 }
