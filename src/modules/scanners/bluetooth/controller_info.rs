@@ -46,8 +46,9 @@ const LE_FEATURE_LE_EXTENDED_ADVERTISING: u8 = 12;
 const LE_FEATURE_LE_PERIODIC_ADVERTISING: u8 = 13;
 
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
-pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> {
-    // audit-allow: local controller probe, ctx unused
+pub async fn run(_: &ModuleCtx) -> Result<ModuleOutcome> {
+    // The module target is intentionally unused here: this probes the LOCAL
+    // Bluetooth controller over its HCI socket, not a remote host.
     use crate::bluetooth::hci::HciSocket;
     use crate::module::{Finding, FindingKind};
 
