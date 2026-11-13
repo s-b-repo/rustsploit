@@ -14,8 +14,9 @@
 //! | length        | 2 bytes BE     |
 //! | headers       | variable       |
 //!
-//! Header ID (1) + length (2 BE) + value. `0x49` End-of-Body and `0xC0`
-//! SetPath carry no length (the value bytes follow inline).
+//! Header ID (1) + length (2 BE) + value. End-of-Body (`0x49`, HI high bits
+//! `0b01`) is a byte-sequence header WITH a 2-byte length prefix like any other
+//! (IrOBEX §2.1); only the inline SetPath flags byte carries no length.
 
 use std::time::Duration;
 
@@ -139,19 +140,17 @@ pub fn parse_response(data: &[u8]) -> Result<ObexResponse> {
     let mut i = 0usize;
     while i < body.len() {
         let id = body[i];
-        if id == hid::END_OF_BODY || id == hid::SETPATH_FLAGS {
-            // Single-byte or empty payloads.
+        if id == hid::SETPATH_FLAGS {
+            // SetPath flags are a single inline byte with no length prefix.
+            // End-of-Body (0x49, HI high bits 0b01) is a byte-sequence header
+            // WITH a 2-byte length prefix (IrOBEX §2.1), so it falls through to
+            // the general header decode below like any other value header.
             let v_start = i + 1;
-            if id == hid::SETPATH_FLAGS {
-                if v_start >= body.len() {
-                    return Err(anyhow!("OBEX: SETPATH flag byte missing"));
-                }
-                headers.push((id, vec![body[v_start]]));
-                i = v_start + 1;
-            } else {
-                headers.push((id, Vec::new()));
-                i = v_start;
+            if v_start >= body.len() {
+                return Err(anyhow!("OBEX: SETPATH flag byte missing"));
             }
+            headers.push((id, vec![body[v_start]]));
+            i = v_start + 1;
             continue;
         }
         if i + 2 >= body.len() {
@@ -400,7 +399,7 @@ mod tests {
         assert_eq!(p[0], opcode::CONNECT);
         assert_eq!(u16::from_be_bytes([p[1], p[2]]), 7);
         assert_eq!(p[3], 0x10); // OBEX version
-        assert_eq!(u16::from_be_bytes([p[4], p[5]]), 1024);
+        assert_eq!(u16::from_be_bytes([p[5], p[6]]), 1024); // max-packet sits after the flags byte (p[4])
     }
 
     #[test]
@@ -428,7 +427,7 @@ mod tests {
 
     #[test]
     fn parse_ok_response() {
-        let mut pdu = vec![opcode::OK, 0x00, 0x06];
+        let mut pdu = vec![opcode::OK, 0x00, 0x07];
         pdu.extend_from_slice(&[hid::LENGTH, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A]);
         let resp = parse_response(&pdu).expect("parse");
         assert_eq!(resp.opcode, opcode::OK);
@@ -438,8 +437,8 @@ mod tests {
 
     #[test]
     fn parse_end_of_body_header() {
-        let mut pdu = vec![opcode::OK, 0x00, 0x02];
-        pdu.extend_from_slice(&[hid::END_OF_BODY, 0xFF]);
+        let mut pdu = vec![opcode::OK, 0x00, 0x04];
+        pdu.extend_from_slice(&[hid::END_OF_BODY, 0x00, 0x01, 0xFF]);
         let resp = parse_response(&pdu).expect("parse");
         assert_eq!(resp.opcode, opcode::OK);
         assert_eq!(resp.headers[0].0, hid::END_OF_BODY);

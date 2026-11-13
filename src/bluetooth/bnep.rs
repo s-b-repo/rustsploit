@@ -69,7 +69,7 @@ pub fn build_no_ethernet_packet(payload: &[u8]) -> Vec<u8> {
 pub fn build_setup_request_2byte(src_uuid: u16, dst_uuid: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(7);
     out.push(BNEP_CMD_SETUP_REQ);
-    out.push(0x01); // UUID size = 2 bytes
+    out.push(0x02); // UUID size = 2 bytes
     out.extend_from_slice(&dst_uuid.to_be_bytes());
     out.extend_from_slice(&src_uuid.to_be_bytes());
     out
@@ -78,7 +78,7 @@ pub fn build_setup_request_2byte(src_uuid: u16, dst_uuid: u16) -> Vec<u8> {
 pub fn build_setup_request_4byte(src_uuid: u32, dst_uuid: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(11);
     out.push(BNEP_CMD_SETUP_REQ);
-    out.push(0x02); // UUID size = 4 bytes
+    out.push(0x04); // UUID size = 4 bytes
     out.extend_from_slice(&dst_uuid.to_be_bytes());
     out.extend_from_slice(&src_uuid.to_be_bytes());
     out

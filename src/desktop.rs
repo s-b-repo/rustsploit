@@ -265,7 +265,13 @@ mod tests {
     fn terminal_title_strips_control_characters() {
         // A title carrying an escape sequence must not be able to emit one.
         let title = terminal_title("scan\u{1b}[31mred\u{7}");
-        assert!(!title.contains('\u{1b}'));
+        // The output always opens with the OSC-2 introducer (ESC ]2;) and ends
+        // with BEL, so a whole-string ESC/BEL check is meaningless. What matters
+        // is that the caller's own ESC, BEL and other C0 controls were stripped:
+        // isolate the body between the framing and prove it carries no controls.
+        let body = title.trim_start_matches("\x1b]2;").trim_end_matches('\x07');
+        assert!(!body.chars().any(|c| c.is_control())); // audit-allow: test
+        assert_eq!(body, "scan[31mred"); // audit-allow: test
         assert!(title.starts_with("\x1b]2;"));
         assert!(title.ends_with('\x07'));
     }

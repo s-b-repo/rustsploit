@@ -67,6 +67,13 @@ mod tests {
             }
         });
 
+        // reqwest is built with the `rustls-no-provider` feature, so a raw
+        // `reqwest::Client::new()` needs the process-default rustls CryptoProvider
+        // installed first or rustls panics at build time with "No provider set".
+        // Production reaches this client through `utils::network::build_http_client*`,
+        // which installs the ring provider; a raw client in a test must install it
+        // itself (idempotent, guarded by a `std::sync::Once`).
+        crate::utils::network::ensure_crypto_provider();
         let client = reqwest::Client::new();
         let result = probe_origin(
             &client,
@@ -94,6 +101,11 @@ mod tests {
         // 9 (discard). Assert only that the probe COMPLETES inside its deadline
         // — the exact outcome varies (ECONNREFUSED, or a sandbox transparent
         // proxy answering) but it must never hang.
+        // See the sibling test: with the `rustls-no-provider` feature a raw
+        // `reqwest::Client::new()` panics at build time with "No provider set"
+        // unless the process-default rustls CryptoProvider is installed first.
+        // Idempotent (guarded by a `std::sync::Once`).
+        crate::utils::network::ensure_crypto_provider();
         let client = reqwest::Client::new();
         let started = std::time::Instant::now();
         let result = probe_origin(

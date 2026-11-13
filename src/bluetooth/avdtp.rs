@@ -114,29 +114,34 @@ impl SbcCodecInfo {
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        // A2DP v1.3.2 §4.3.2 Table 4.1: SBC Codec Specific Information is exactly
+        // 4 octets; the seven logical fields pack into bit-fields:
+        //   octet 0: sampling frequency (b7..4) | channel mode (b3..0)
+        //   octet 1: block length (b7..4) | subbands (b3..2) | allocation (b1..0)
+        //   octet 2: minimum bitpool    octet 3: maximum bitpool
         vec![
-            self.sampling_freq_bitmap,
-            self.channel_mode_bitmap,
-            self.block_length_bitmap,
-            self.subbands_bitmap,
-            self.allocation_bitmap,
+            ((self.sampling_freq_bitmap & 0x0F) << 4) | (self.channel_mode_bitmap & 0x0F),
+            ((self.block_length_bitmap & 0x0F) << 4)
+                | ((self.subbands_bitmap & 0x03) << 2)
+                | (self.allocation_bitmap & 0x03),
             self.min_bitpool,
             self.max_bitpool,
         ]
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 7 {
+        if bytes.len() < 4 {
             return Err(anyhow!("SBC codec info too short: {} bytes", bytes.len()));
         }
+        // Inverse of `encode`: unpack the 4 A2DP SBC octets into bit-fields.
         Ok(Self {
-            sampling_freq_bitmap: bytes[0],
-            channel_mode_bitmap: bytes[1],
-            block_length_bitmap: bytes[2],
-            subbands_bitmap: bytes[3],
-            allocation_bitmap: bytes[4],
-            min_bitpool: bytes[5],
-            max_bitpool: bytes[6],
+            sampling_freq_bitmap: (bytes[0] >> 4) & 0x0F,
+            channel_mode_bitmap: bytes[0] & 0x0F,
+            block_length_bitmap: (bytes[1] >> 4) & 0x0F,
+            subbands_bitmap: (bytes[1] >> 2) & 0x03,
+            allocation_bitmap: bytes[1] & 0x03,
+            min_bitpool: bytes[2],
+            max_bitpool: bytes[3],
         })
     }
 }
@@ -537,7 +542,7 @@ mod tests {
     #[test]
     fn discover_response_parses_two_endpoints() {
         // Accept, sig=DISCOVER, two endpoints: SEID=1 audio SBC, SEID=2 video.
-        let mut pkt = vec![0x10, 0x10];
+        let mut pkt = vec![0x14, 0x10];
         // Endpoint 1: SEID=1 (bits 7..2) | in_use=0 | rsp=1 → 0x06
         pkt.push(0x06);
         // media_type=audio (0) | codec=SBC (0) → 0x00

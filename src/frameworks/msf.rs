@@ -260,16 +260,27 @@ fn extract_references<'a>(
         }
     }
 
-    // Collect lines until we find the closing ]]
-    while !collector.contains("]]") {
+    // Collect lines until the outer array is balanced. In the standard MSF
+    // layout the last inner `]` and the outer `]` sit on separate lines, so a
+    // `"]]"` sentinel never appears once the lines are concatenated — count
+    // brackets instead, or extract_references eats the rest of the module.
+    while collector.matches('[').count() > collector.matches(']').count() {
         match lines.next() {
             Some(line) => collector.push_str(line),
             None => break,
         }
     }
 
+    // Drop the outer array bracket so the first inner pair isn't glued to it
+    // (otherwise `[   ['CVE', ...` yields ref type "['CVE" instead of "CVE").
+    let body = collector.trim();
+    let body = match body.strip_prefix('[') {
+        Some(inner) => inner,
+        None => body,
+    };
+
     // Parse [[TYPE, VALUE], ...] pairs
-    for pair in collector.split("],") {
+    for pair in body.split("],") {
         let clean = pair.trim().trim_start_matches('[').trim_end_matches(']');
         let parts: Vec<&str> = clean
             .split(',')

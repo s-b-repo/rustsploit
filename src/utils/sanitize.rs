@@ -267,8 +267,6 @@ pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
                         | ';'
                         | '>'
                         | '<'
-                        | '('
-                        | ')'
                         | '{'
                         | '}'
                         | '['

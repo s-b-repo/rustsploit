@@ -2385,12 +2385,19 @@ mod tests {
         assert_eq!(effective_concurrency(50), 50); // audit-allow: test
     }
 
-    /// The clamp must never impose an upper bound — mass scanning is a
-    /// legitimate research workflow and the operator chooses the concurrency.
+    /// There is no *policy* ceiling on concurrency — the operator chooses the
+    /// value that fits their target set. The only cap is the safety clamp to
+    /// `Semaphore::MAX_PERMITS`, which exists solely so an absurd request such
+    /// as `usize::MAX` cannot make `Semaphore::new` panic (the clamp in
+    /// `effective_concurrency` is intentional and must not be retuned).
     #[test]
-    fn concurrency_has_no_upper_bound() {
+    fn concurrency_is_clamped_to_semaphore_max() {
+        // A realistic operator value passes through untouched: no policy cap.
         assert_eq!(effective_concurrency(100_000), 100_000); // audit-allow: test
-        assert_eq!(effective_concurrency(usize::MAX), usize::MAX); // audit-allow: test
+        // A physically impossible value is clamped to the semaphore ceiling
+        // (usize::MAX >> 3) so Semaphore::new cannot panic; this is a crash
+        // guard, NOT a policy ceiling on legitimate mass scans.
+        assert_eq!(effective_concurrency(usize::MAX), Semaphore::MAX_PERMITS); // audit-allow: test
     }
 
     /// A semaphore built from the effective concurrency must actually grant a
@@ -2461,6 +2468,7 @@ mod tests {
     /// reject it with "Invalid IPv6 address format", which made `set target
     /// AA:BB:CC:DD:EE:FF` and `run -t AA:BB:CC:DD:EE:FF` unreachable.
     #[test]
+    #[cfg_attr(miri, ignore)] // Target::parse stats the path (statx); Miri blocks that under isolation
     fn device_address_parses_as_a_target() {
         let target = crate::module::Target::parse("AA:BB:CC:DD:EE:FF").expect("MAC target"); // audit-allow: test
         assert_eq!(target.as_single(), Some("AA:BB:CC:DD:EE:FF")); // audit-allow: test

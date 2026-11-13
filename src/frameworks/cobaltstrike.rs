@@ -35,7 +35,10 @@ impl FrameworkAdapter for CobaltStrikeAdapter {
 
     fn sniff(&self, source: &str, _: &Path) -> bool {
         let has_beacon = source.contains("on ready") || source.contains("on message_received");
-        let has_squirrel = source.contains("set") || source.contains("data ");
+        let has_squirrel = source.contains("println")
+            || source.contains("alias ")
+            || source.contains("command ")
+            || source.contains("beacon_");
         has_beacon && has_squirrel
     }
 

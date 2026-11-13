@@ -109,15 +109,19 @@ impl FrameworkAdapter for EmpireAdapter {
     }
 }
 
-/// Pull `Key = 'value'` / `Key: 'value'` out of a line.
+/// Pull `Key = 'value'` / `Key: 'value'` out of a line. The key may itself be
+/// quoted (`'Key'`) and the value may sit inside a `[ ... ]` list, as in a
+/// Python `self.info` dict — so locate the `:`/`=` separator first, then take
+/// the first quoted string after it.
 fn quoted_value(line: &str, key: &str) -> Option<String> {
     let idx = line.find(key)?;
-    let rest = &line[idx + key.len()..];
-    let rest = rest.trim_start();
-    let rest = rest.trim_start_matches(['=', ':']).trim_start();
-    let value = rest.trim_start_matches(['"', '\'']);
+    let rest = line.get(idx + key.len()..)?;
+    let sep = rest.find([':', '='])?;
+    let after_sep = rest.get(sep + 1..)?;
+    let open = after_sep.find(['"', '\''])?;
+    let value = after_sep.get(open + 1..)?;
     let end = value.find(['"', '\''])?;
-    let v = value[..end].trim();
+    let v = value.get(..end)?.trim();
     if v.is_empty() {
         None
     } else {

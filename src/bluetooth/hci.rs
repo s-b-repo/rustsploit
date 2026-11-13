@@ -788,18 +788,19 @@ fn parse_inquiry_result(params: &[u8], stride: usize) -> Option<InquiryResult> {
 }
 
 fn parse_ext_inquiry_result(params: &[u8]) -> Option<InquiryResult> {
-    // num(1) bdaddr(6) pscan(3) cod(3) clock(2) rssi(1) eir(240)
-    if params.len() < 16 {
+    // num(1) bdaddr(6) pscan(1) reserved(1) cod(3) clock(2) rssi(1) eir(240)
+    if params.len() < 15 {
         return None;
     }
     let mut addr = [0u8; 6];
     addr.copy_from_slice(&params[1..7]);
-    let cod = ((params[9] as u32) << 16) | ((params[10] as u32) << 8) | (params[11] as u32);
+    // Class_of_Device is 3 octets, little-endian (LSB first) on the HCI wire.
+    let cod = (params[9] as u32) | ((params[10] as u32) << 8) | ((params[11] as u32) << 16);
     Some(InquiryResult {
         bdaddr: addr,
         class_of_device: cod,
-        rssi: Some(params[12] as i8),
-        clock_offset: Some(u16::from_le_bytes([params[7], params[8]])),
+        rssi: Some(params[14] as i8),
+        clock_offset: Some(u16::from_le_bytes([params[12], params[13]])),
     })
 }
 
@@ -1047,7 +1048,7 @@ mod tests {
     fn inquiry_ext_parse() {
         let mut params = vec![1u8];
         params.extend_from_slice(&[0x65, 0x56, 0xC8, 0x11, 0x22, 0x33]);
-        params.extend_from_slice(&[0x01, 0x00, 0x00]); // pscan
+        params.extend_from_slice(&[0x01, 0x00]); // pscan(1) + reserved(1)
         params.extend_from_slice(&[0x04, 0x02, 0x0C]); // cod: phone
         params.extend_from_slice(&[0x34, 0x12]); // clock
         params.push(0xE4); // rssi -28

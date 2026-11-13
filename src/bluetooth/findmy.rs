@@ -48,25 +48,25 @@ impl FindMyStatus {
     }
 }
 
-/// 25-byte manufacturer-specific payload (subtype + status + 22-byte body).
+/// 24-byte manufacturer-specific payload (subtype + status + 22-byte body).
 pub fn build_findmy_advertisement(
     subtype: u8,
     status_byte: u8,
     payload_prefix: &[u8; 22],
-) -> [u8; 25] {
-    let mut out = [0u8; 25];
+) -> [u8; 24] {
+    let mut out = [0u8; 24];
     out[0] = subtype;
     out[1] = status_byte;
-    out[2..25].copy_from_slice(payload_prefix);
+    out[2..24].copy_from_slice(payload_prefix);
     out
 }
 
-/// Wrap the 25-byte payload into a full BLE advertisement data block:
-/// Flags(0x06) + Manufacturer Data(0xFF, length 27 = 25 payload + 2 cid).
+/// Wrap the 24-byte payload into a full BLE advertisement data block:
+/// Flags(0x06) + Manufacturer Data(0xFF, AD length 27 = 1 type + 2 cid + 24 payload).
 pub fn build_findmy_adv_data(subtype: u8, status_byte: u8, payload_prefix: &[u8; 22]) -> Vec<u8> {
     let mut out = Vec::with_capacity(31);
     out.extend_from_slice(&[0x02, 0x01, 0x06]);
-    out.push(0x03);
+    out.push(27); // manufacturer-specific AD length: 0xFF + 2-byte company id + 24-byte payload
     out.push(0xFF);
     out.push(APPLE_COMPANY_ID as u8);
     out.push((APPLE_COMPANY_ID >> 8) as u8);
@@ -78,7 +78,7 @@ pub fn build_findmy_adv_data(subtype: u8, status_byte: u8, payload_prefix: &[u8;
     out
 }
 
-pub fn build_airtag_clone_advertisement() -> [u8; 25] {
+pub fn build_airtag_clone_advertisement() -> [u8; 24] {
     let mut prefix = [0u8; 22];
     rand::rng().fill(&mut prefix[..]);
     let status = FindMyStatus {

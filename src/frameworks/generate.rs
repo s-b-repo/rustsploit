@@ -68,7 +68,7 @@ pub fn rust_string_literal(raw: &str) -> String {
 /// delimiter itself.
 pub fn rust_raw_string_literal(raw: &str) -> String {
     let mut hashes = String::new();
-    while raw.contains(&format!("\"{hashes}\"")) {
+    while raw.contains(&format!("\"{hashes}")) {
         hashes.push('#');
     }
     format!("r{hashes}\"{raw}\"{hashes}")

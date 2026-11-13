@@ -77,9 +77,13 @@ fn xor16(a: &mut [u8; 16], b: &[u8; 16]) {
 /// Left-shift one bit with the MSB folded into the final XOR (RFC 4493).
 fn shift_and_xor(mut v: [u8; 16]) -> [u8; 16] {
     let msb = v[0] & 0x80 != 0;
-    for i in (0..16).rev() {
+    // One-bit left shift of the 128-bit big-endian value. The bit shifted into
+    // byte `i` is the MSB of the next *less-significant* byte, `v[i + 1]`
+    // (RFC 4493 §2.3). Iterate low -> high so that neighbour is still its
+    // pre-shift value when it is read.
+    for i in 0..16 {
         v[i] <<= 1;
-        if i > 0 && v[i - 1] & 0x80 != 0 {
+        if i < 15 && v[i + 1] & 0x80 != 0 {
             v[i] |= 1;
         }
     }
@@ -159,7 +163,7 @@ mod tests {
     fn cmac_rfc4493_case3_multi_block() {
         // Mlen = 40 → dfa66747de9ae63030ca32611497c827
         let k = hex16("2b7e151628aed2a6abf7158809cf4f3c");
-        let m = hex16(
+        let m = hex_bytes(
             "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411",
         );
         let out = aes_cmac(&k, &m);
@@ -194,6 +198,13 @@ mod tests {
         let mut out = [0u8; 16];
         out.copy_from_slice(&bytes);
         out
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")) // audit-allow: test
+            .collect()
     }
 
     fn hex(b: &[u8]) -> String {

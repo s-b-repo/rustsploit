@@ -151,6 +151,17 @@ async fn run() -> Result<()> {
     // proxy-trust flag used by the handshake rate limiter.
     utils::network::set_global_strict_tls(cli_args.strict_tls);
     utils::network::set_global_trust_proxy(cli_args.trust_proxy);
+
+    // reqwest is built with `rustls-no-provider`, and the direct-rustls paths use
+    // `ClientConfig::builder()`; both require a process-default rustls
+    // CryptoProvider. Today it is installed only as a side effect of the first
+    // `build_http_client*` call, so a module that builds a TLS client/connector
+    // directly before any such call (e.g. `-m scanners/ssl_scanner`,
+    // `-m scanners/http_title_scanner`, the Tomcat catkiller exploit, or anything
+    // using `native::async_tls::make_dangerous_tls_connector`) panics with
+    // "No provider set". Install it once, up front, so every interface and module
+    // has it. Idempotent (guarded by a `std::sync::Once`).
+    utils::network::ensure_crypto_provider();
     if !cli_args.strict_tls {
         tracing::warn!(
             "TLS verification permissive by default for HTTPS exploit modules. \
