@@ -42,6 +42,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // real loopback socket + reqwest; Miri has no host sockets
     async fn probe_origin_hits_real_listener() {
         // Deterministic success path: an async loopback listener serves one
         // canned HTTP/1.1 200 and then returns. Every wait is bounded, so the
@@ -96,6 +97,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // real loopback socket + reqwest; Miri has no host sockets
     async fn probe_origin_closed_port_completes_within_timeout() {
         // Unreachable-origin path: nothing (deterministically) listens on port
         // 9 (discard). Assert only that the probe COMPLETES inside its deadline

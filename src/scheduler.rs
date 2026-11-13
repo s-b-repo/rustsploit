@@ -2415,6 +2415,7 @@ mod tests {
     /// public hosts across the whole Internet" (3.6 billion hosts) for a
     /// module that never opens a socket.
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // from_global_options resolves the home dir (getpwuid_r); Miri blocks it
     async fn radio_module_refuses_mass_target() {
         struct RadioModule;
 
