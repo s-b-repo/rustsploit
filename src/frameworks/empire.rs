@@ -118,7 +118,11 @@ fn quoted_value(line: &str, key: &str) -> Option<String> {
     let value = rest.trim_start_matches(['"', '\'']);
     let end = value.find(['"', '\''])?;
     let v = value[..end].trim();
-    if v.is_empty() { None } else { Some(v.to_string()) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
 }
 
 #[cfg(test)]

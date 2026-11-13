@@ -181,6 +181,43 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // List the framework template dialects the importer understands.
+    if cli_args.list_frameworks {
+        println!(
+            "{} Framework template dialects: {}",
+            "✓".green(),
+            frameworks::adapter_ids()
+        );
+        return Ok(());
+    }
+
+    // Import an external framework template and generate a native module.
+    if let Some(tpl_path) = &cli_args.import_template {
+        let source = tokio::fs::read_to_string(tpl_path)
+            .await
+            .with_context(|| format!("reading template {tpl_path}"))?;
+        let template = frameworks::Template::from_source(&source)
+            .with_context(|| format!("parsing template {tpl_path}"))?;
+        let category = cli_args.import_category.as_str();
+        let out_dir = frameworks::generate::default_output_dir(category);
+        let generated = frameworks::generate::write_module(&template, &source, &out_dir, category)
+            .context("generating module from template")?;
+        println!(
+            "{} Imported {} template '{}' -> {} ({})",
+            "✓".green(),
+            template.framework,
+            template.name,
+            generated.path.display(),
+            generated.qualified_name
+        );
+        if generated.registered_in_parent {
+            println!("  Registered in the category mod.rs — rebuild to use it.");
+        } else {
+            println!("  NOTE: add the `pub mod` line to the category mod.rs, then rebuild.");
+        }
+        return Ok(());
+    }
+
     // List on-disk scan checkpoints
     if cli_args.list_checkpoints {
         match checkpoint::list_checkpoints() {

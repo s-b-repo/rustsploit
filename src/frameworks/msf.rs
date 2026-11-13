@@ -439,7 +439,11 @@ end
         assert_eq!(tmpl.disclosure_date.as_deref(), Some("2024-05-01"));
         assert_eq!(tmpl.severity, Severity::Critical);
         assert!(tmpl.references.iter().any(|r| r == "CVE-2024-12345"));
-        assert!(tmpl.references.iter().any(|r| r == "https://example.com/advisory"));
+        assert!(
+            tmpl.references
+                .iter()
+                .any(|r| r == "https://example.com/advisory")
+        );
     }
 
     #[test]
