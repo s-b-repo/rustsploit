@@ -32,7 +32,7 @@ pub async fn probe_origin(
     match tokio::time::timeout(timeout, client.get(&url).header("Host", host_header).send()).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(format!("{e}")),
-        Err(_) => Err(format!("timed out after {timeout:?}")),
+        Err(elapsed) => Err(format!("timed out after {timeout:?}: {elapsed}")),
     }
 }
 
@@ -63,7 +63,7 @@ mod tests {
                         .unwrap_or_else(|e| tracing::debug!("test server flush failed: {e}"));
                 }
                 Ok(Err(e)) => tracing::debug!("test server accept failed: {e}"),
-                Err(_) => tracing::debug!("test server accept timed out"),
+                Err(elapsed) => tracing::debug!("test server accept timed out: {elapsed}"),
             }
         });
 
@@ -82,7 +82,7 @@ mod tests {
         match tokio::time::timeout(Duration::from_secs(5), server).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::debug!("server task error: {e}"),
-            Err(_) => tracing::debug!("server task join timed out"),
+            Err(elapsed) => tracing::debug!("server task join timed out: {elapsed}"),
         }
 
         assert_eq!(result.ok().map(|r| r.status().as_u16()), Some(200));

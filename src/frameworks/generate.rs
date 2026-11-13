@@ -102,8 +102,7 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
 
     out.push_str(&format!(
         "//! {} — translated from a {} template\n",
-        template.name,
-        template.framework
+        template.name, template.framework
     ));
     out.push_str("//!\n");
     if !template.description.is_empty() {
@@ -185,12 +184,8 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
     // run()
     out.push_str("pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {\n");
     out.push_str("    let target = ctx.target.as_single()\n");
-    out.push_str(
-        "        .context(\"this module requires a single-host target\")?;\n",
-    );
-    out.push_str(
-        "    let template = Template::from_source(TEMPLATE_SOURCE)\n",
-    );
+    out.push_str("        .context(\"this module requires a single-host target\")?;\n");
+    out.push_str("    let template = Template::from_source(TEMPLATE_SOURCE)\n");
     out.push_str("        .context(\"parse embedded template\")?;\n");
     let port = template.default_port.unwrap_or(443);
     out.push_str(&format!(
@@ -245,14 +240,15 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
     out.push_str("        });\n");
     out.push_str("    }\n");
     out.push_str("    if outcome.findings.is_empty() {\n");
-    out.push_str(
-        "        crate::mprintln!(\"{}\", \"[-] template did not match\".yellow());\n",
-    );
+    out.push_str("        crate::mprintln!(\"{}\", \"[-] template did not match\".yellow());\n");
     out.push_str("    }\n");
     out.push_str("    Ok(outcome)\n");
     out.push_str("}\n\n");
 
-    out.push_str(&registration(category, &module_name_from(Path::new(&template.name))));
+    out.push_str(&registration(
+        category,
+        &module_name_from(Path::new(&template.name)),
+    ));
     out
 }
 
@@ -344,9 +340,7 @@ fn generate_scaffold(template: &Template, category: &str) -> String {
     // run()
     out.push_str("pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {\n");
     out.push_str("    let target = ctx.target.as_single()\n");
-    out.push_str(
-        "        .context(\"this module requires a single-host target\")?;\n",
-    );
+    out.push_str("        .context(\"this module requires a single-host target\")?;\n");
     let port = template.default_port.unwrap_or(443);
     out.push_str(&format!(
         "    let port = crate::utils::cfg_prompt_port(\"port\", \"Target port\", {port}).await?;\n"
@@ -356,18 +350,12 @@ fn generate_scaffold(template: &Template, category: &str) -> String {
             "    let {} = crate::utils::cfg_prompt_default(\n",
             rust_ident(&opt.name)
         ));
-        out.push_str(&format!(
-            "        {},\n",
-            rust_string_literal(&opt.name)
-        ));
+        out.push_str(&format!("        {},\n", rust_string_literal(&opt.name)));
         out.push_str(&format!(
             "        {},\n",
             rust_string_literal(&opt.description)
         ));
-        out.push_str(&format!(
-            "        {},\n",
-            rust_string_literal(&opt.default)
-        ));
+        out.push_str(&format!("        {},\n", rust_string_literal(&opt.default)));
         out.push_str("    )\n");
         out.push_str("    .await?;\n");
     }
@@ -383,9 +371,7 @@ fn generate_scaffold(template: &Template, category: &str) -> String {
     out.push_str("        target: target.to_string(),\n");
     out.push_str("        kind: FindingKind::Note,\n");
     out.push_str("        message: format!(\n");
-    out.push_str(
-        "            \"translated from a {} template — port {} {}\",\n",
-    );
+    out.push_str("            \"translated from a {} template — port {} {}\",\n");
     out.push_str(&format!(
         "            {},\n",
         rust_string_literal(&template.framework)
@@ -403,7 +389,10 @@ fn generate_scaffold(template: &Template, category: &str) -> String {
     out.push_str("    Ok(outcome)\n");
     out.push_str("}\n\n");
 
-    out.push_str(&registration(category, &module_name_from(Path::new(&template.name))));
+    out.push_str(&registration(
+        category,
+        &module_name_from(Path::new(&template.name)),
+    ));
     out
 }
 
@@ -429,6 +418,7 @@ fn rank_variant(rank: crate::module_info::ModuleRank) -> &'static str {
         crate::module_info::ModuleRank::Great => "Great",
         crate::module_info::ModuleRank::Good => "Good",
         crate::module_info::ModuleRank::Normal => "Normal",
+        crate::module_info::ModuleRank::Low => "Low",
         crate::module_info::ModuleRank::Manual => "Manual",
     }
 }
@@ -451,12 +441,55 @@ fn rust_ident(name: &str) -> String {
     }
     if matches!(
         ident.as_str(),
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false"
-            | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
-            | "mut" | "pub" | "ref" | "return" | "self" | "static" | "struct" | "super" | "trait"
-            | "true" | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await"
-            | "dyn" | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override"
-            | "priv" | "typeof" | "unsized" | "virtual" | "yield" | "try"
+        "as" | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "async"
+            | "await"
+            | "dyn"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+            | "try"
     ) {
         ident.push('_');
     }
@@ -533,7 +566,9 @@ fn declare_in_parent(output_dir: &Path, category: &str, module_name: &str) -> bo
 
 /// The default output directory for a category.
 pub fn default_output_dir(category: &str) -> PathBuf {
-    PathBuf::from("src/modules").join(category).join("translated")
+    PathBuf::from("src/modules")
+        .join(category)
+        .join("translated")
 }
 
 /// Options of a template rendered as prompt lines (for reporting).

@@ -19,7 +19,7 @@ pub struct ModuleInfo {
 }
 
 /// Reliability/safety rank for modules (inspired by Metasploit ranking).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ModuleRank {
     /// Reliable, no crash risk

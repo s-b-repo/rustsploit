@@ -36,8 +36,9 @@ use crate::module_info::ModuleRank;
 /// Nuclei uses `info.severity`, Metasploit uses `Rank`, Empire/Cobalt Strike
 /// use free-text — they all collapse onto this scale so the findings the
 /// framework produces carry one comparable severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Severity {
+    #[default]
     Info,
     Low,
     Medium,
@@ -111,9 +112,10 @@ impl TemplateOption {
 /// `None` means the template carries no reproducible protocol (a Metasploit
 /// exploit body, an Empire launcher): it is metadata plus options, and the
 /// generator turns it into a module scaffold instead.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum Protocol {
     /// No reproducible protocol.
+    #[default]
     None,
     /// One or more HTTP request blocks with matchers (nuclei `http:`).
     Http(Vec<nuclei::HttpRequest>),
@@ -173,9 +175,8 @@ impl Template {
 
     /// Execute the template natively against a target.
     pub async fn execute(&self, ctx: &ExecutionCtx<'_>) -> Result<Vec<TemplateResult>> {
-        let adapter = adapter_by_id(&self.framework).ok_or_else(|| {
-            anyhow::anyhow!("no adapter for framework '{}'", self.framework)
-        })?;
+        let adapter = adapter_by_id(&self.framework)
+            .ok_or_else(|| anyhow::anyhow!("no adapter for framework '{}'", self.framework))?;
         adapter.execute(self, ctx).await
     }
 }
@@ -267,13 +268,16 @@ pub trait FrameworkAdapter: Send + Sync {
 
 /// Every adapter the framework knows about.
 pub fn adapters() -> &'static [&'static dyn FrameworkAdapter] {
-    &[
+    // A `static` so the slice has 'static storage; returning `&[...]` directly
+    // borrows a temporary array that does not live long enough.
+    static ADAPTERS: &[&dyn FrameworkAdapter] = &[
         &nuclei::NUCLEI,
         &msf::MSF,
         &empire::EMPIRE,
         &cobaltstrike::COBALTSTRIKE,
         &manifest::MANIFEST,
-    ]
+    ];
+    ADAPTERS
 }
 
 /// Look an adapter up by id (`nuclei`, `msf`, `empire`, `cobaltstrike`, `json`).
@@ -361,10 +365,7 @@ mod tests {
 
     #[test]
     fn adapter_lookup_by_id() {
-        assert_eq!(
-            adapter_by_id("nuclei").map(|a| a.id()),
-            Some("nuclei")
-        );
+        assert_eq!(adapter_by_id("nuclei").map(|a| a.id()), Some("nuclei"));
         assert_eq!(adapter_by_id("rb").map(|a| a.id()), Some("msf"));
         assert!(adapter_by_id("nope").is_none());
     }

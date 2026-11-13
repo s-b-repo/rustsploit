@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -66,8 +67,8 @@ impl FrameworkAdapter for NucleiAdapter {
     }
 
     fn parse(&self, source: &str, path: &Path) -> Result<Template> {
-        let doc: YamlTemplate =
-            serde_yaml_ng::from_str(source).with_context(|| format!("parse nuclei template {path:?}"))?;
+        let doc: YamlTemplate = serde_yaml_ng::from_str(source)
+            .with_context(|| format!("parse nuclei template {path:?}"))?;
 
         let info = doc.info.clone().unwrap_or_default();
         let name = match info.name {
@@ -99,10 +100,7 @@ impl FrameworkAdapter for NucleiAdapter {
             framework: "nuclei".to_string(),
             name,
             description: info.description.unwrap_or_default(),
-            authors: info
-                .author
-                .map(StringOrList::into_vec)
-                .unwrap_or_default(),
+            authors: info.author.map(StringOrList::into_vec).unwrap_or_default(),
             references: info
                 .reference
                 .map(StringOrList::into_vec)
@@ -295,9 +293,7 @@ struct YamlTemplate {
 impl YamlTemplate {
     /// Does the template carry an executable protocol block?
     fn has_protocol(&self) -> bool {
-        self.http
-            .as_ref()
-            .is_some_and(|b| !b.is_empty())
+        self.http.as_ref().is_some_and(|b| !b.is_empty())
             || self.requests.as_ref().is_some_and(|b| !b.is_empty())
             || self.dns.as_ref().is_some_and(|b| !b.is_empty())
             || self.tcp.as_ref().is_some_and(|b| !b.is_empty())
@@ -479,11 +475,7 @@ fn build_protocol(doc: &YamlTemplate) -> Protocol {
             .inputs
             .as_deref()
             .and_then(decode_hex)
-            .or_else(|| {
-                tcp.inputs
-                    .as_deref()
-                    .map(|s| s.as_bytes().to_vec())
-            });
+            .or_else(|| tcp.inputs.as_deref().map(|s| s.as_bytes().to_vec()));
         return Protocol::Tcp(TcpRequest {
             host: tcp.host.clone(),
             port: tcp.port,
@@ -497,9 +489,17 @@ fn build_protocol(doc: &YamlTemplate) -> Protocol {
 
 fn convert_matcher(m: &YamlMatcher) -> Matcher {
     let kind = m.kind.clone().unwrap_or_default().to_ascii_lowercase();
-    let inner_condition = m.condition.as_deref().map(Condition::parse).unwrap_or(Condition::Or);
+    let inner_condition = m
+        .condition
+        .as_deref()
+        .map(Condition::parse)
+        .unwrap_or(Condition::Or);
     let negative = m.negative.unwrap_or(false);
-    let part = m.part.as_deref().map(MatchPart::parse).unwrap_or(MatchPart::Body);
+    let part = m
+        .part
+        .as_deref()
+        .map(MatchPart::parse)
+        .unwrap_or(MatchPart::Body);
 
     let kind = match kind.as_str() {
         "word" => MatcherKind::Word(
@@ -679,7 +679,9 @@ fn eval_matcher(matcher: &Matcher, view: &ResponseView<'_>) -> bool {
     let fired = match &matcher.kind {
         MatcherKind::Word(words) => {
             let haystack = view.text(matcher.part).to_ascii_lowercase();
-            words.iter().any(|w| haystack.contains(&w.to_ascii_lowercase()))
+            words
+                .iter()
+                .any(|w| haystack.contains(&w.to_ascii_lowercase()))
         }
         MatcherKind::Regex(patterns) => {
             let haystack = view.text(matcher.part);
@@ -723,11 +725,7 @@ fn eval_matcher(matcher: &Matcher, view: &ResponseView<'_>) -> bool {
 }
 
 /// Evaluate a matcher set with the given combination.
-fn eval_matchers(
-    matchers: &[Matcher],
-    condition: Condition,
-    view: &ResponseView<'_>,
-) -> bool {
+fn eval_matchers(matchers: &[Matcher], condition: Condition, view: &ResponseView<'_>) -> bool {
     if matchers.is_empty() {
         return false;
     }
@@ -750,9 +748,7 @@ fn run_extractors(
                 continue;
             };
             for caps in re.captures_iter(&haystack) {
-                let captured = caps
-                    .get(extractor.group as usize)
-                    .or_else(|| caps.get(0));
+                let captured = caps.get(extractor.group as usize).or_else(|| caps.get(0));
                 if let Some(m) = captured {
                     let key = extractor
                         .name
@@ -872,7 +868,8 @@ async fn execute_dns(
         vars.insert(opt.name.clone(), opt.default.clone());
     }
     let name = interpolate(&spec.name, ctx, &vars);
-    let resolver = hickory_resolver::lookup(&name, &spec.query_type).await
+    let resolver = hickory_resolver::lookup(&name, &spec.query_type)
+        .await
         .context("resolve nuclei DNS template query")?;
     let body = String::from_utf8_lossy(&resolver).to_string();
     let headers = BTreeMap::new();
@@ -1096,8 +1093,14 @@ http:
 
     #[test]
     fn severity_drives_the_module_rank() {
-        assert_eq!(Severity::Critical.module_rank(), crate::module_info::ModuleRank::Excellent);
-        assert_eq!(Severity::Info.module_rank(), crate::module_info::ModuleRank::Normal);
+        assert_eq!(
+            Severity::Critical.module_rank(),
+            crate::module_info::ModuleRank::Excellent
+        );
+        assert_eq!(
+            Severity::Info.module_rank(),
+            crate::module_info::ModuleRank::Normal
+        );
         let _ = Template::default();
     }
 }
