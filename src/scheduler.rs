@@ -61,6 +61,20 @@ impl Default for SchedulerLimits {
     }
 }
 
+/// Effective concurrency for a fan-out.
+///
+/// A zero-permit semaphore never grants a permit, so `concurrency = 0` makes
+/// every mass scan hang forever with no output and no error — the producer
+/// loop never even reaches the first host. The cancel token is the only thing
+/// that can escape it, so the scan simply stops responding.
+///
+/// There is deliberately NO upper bound: mass scanning is a legitimate
+/// research workflow and the operator picks the concurrency that fits their
+/// target set.
+fn effective_concurrency(requested: usize) -> usize {
+    usize::max(requested, 1)
+}
+
 impl SchedulerLimits {
     /// Pull defaults from the active tenant's `global_options`.
     pub fn from_global_options() -> Self {
@@ -72,7 +86,12 @@ impl SchedulerLimits {
             .or_else(|| opts.try_get("threads"))
             .and_then(|v| v.parse().ok())
         {
-            l.concurrency = v;
+            // A zero-permit semaphore never grants, so `concurrency = 0` hangs
+            // every mass scan forever with no output and no error. Enforce a
+            // floor of 1 permit. There is deliberately NO upper ceiling here:
+            // mass scanning is a legitimate research workflow and the operator
+            // picks the concurrency that fits their target set.
+            l.concurrency = effective_concurrency(v);
         }
         if let Some(v) = opts
             .try_get("module_timeout")
@@ -2282,5 +2301,36 @@ async fn route_findings(outcome: &ModuleOutcome, module: &dyn Module) {
             kind: kind_str.to_string(),
             message: f.message.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `concurrency = 0` used to build a zero-permit semaphore, which never
+    /// grants — the mass scan hung forever with no output and no error.
+    #[test]
+    fn zero_concurrency_is_raised_to_one() {
+        assert_eq!(effective_concurrency(0), 1); // audit-allow: test
+        assert_eq!(effective_concurrency(1), 1); // audit-allow: test
+        assert_eq!(effective_concurrency(50), 50); // audit-allow: test
+    }
+
+    /// The clamp must never impose an upper bound — mass scanning is a
+    /// legitimate research workflow and the operator chooses the concurrency.
+    #[test]
+    fn concurrency_has_no_upper_bound() {
+        assert_eq!(effective_concurrency(100_000), 100_000); // audit-allow: test
+        assert_eq!(effective_concurrency(usize::MAX), usize::MAX); // audit-allow: test
+    }
+
+    /// A semaphore built from the effective concurrency must actually grant a
+    /// permit. This is the behaviour the zero-permit bug destroyed.
+    #[tokio::test]
+    async fn effective_concurrency_semaphore_grants() {
+        let sem = Semaphore::new(effective_concurrency(0));
+        let permit = sem.acquire().await;
+        assert!(permit.is_ok(), "semaphore must grant at least one permit"); // audit-allow: test
     }
 }

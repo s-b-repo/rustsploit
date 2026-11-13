@@ -8,6 +8,7 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
+use rustyline::history::FileHistory;
 use rustyline::{Config, Editor, Helper};
 use url::Url;
 
@@ -27,6 +28,13 @@ const CHAIN_SEPARATORS: &[char] = &['&', ';'];
 const MAX_URL_LENGTH: usize = 2048;
 
 const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
+
+/// Maximum number of completion candidates shown at once. The registry holds
+/// ~700 modules, so an uncapped list is unusable in a terminal.
+const MAX_COMPLETION_CANDIDATES: usize = 64;
+
+/// Maximum number of history entries shown by the `history` command.
+const MAX_HISTORY_SHOWN: usize = 200;
 
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
@@ -70,6 +78,8 @@ const SHELL_COMMANDS: &[&str] = &[
     "spool off",
     "resource",
     "makerc",
+    "history",
+    "desktop",
     "hosts",
     "hosts add",
     "hosts delete",
@@ -130,20 +140,20 @@ impl Completer for RsfCompleter {
         }
         let line_up_to_cursor = &line[..pos];
 
-        // After "use " or "u ", complete module paths
-        let module_prefix = if let Some(rest) = line_up_to_cursor.strip_prefix("use ") {
-            Some(rest)
-        } else if let Some(rest) = line_up_to_cursor.strip_prefix("u ") {
-            Some(rest)
-        } else if let Some(rest) = line_up_to_cursor.strip_prefix("info ") {
-            Some(rest)
-        } else {
-            None
-        };
+        // Module completion is available after `use `, `u `, `info ` and
+        // `run ` — the operator should not have to select a module before
+        // they can complete it.
+        let module_prefix = ["use ", "u ", "info ", "run "]
+            .iter()
+            .find_map(|trigger| line_up_to_cursor.strip_prefix(trigger));
 
         if let Some(prefix) = module_prefix {
             let start = pos - prefix.len();
-            let matches: Vec<Pair> = self
+            // A prefix ending in `/` is a category: offer the children of
+            // that category, so `use exploits/bluetooth/<TAB>` lists the
+            // bluetooth modules rather than every path that happens to share
+            // the prefix.
+            let mut matches: Vec<Pair> = self
                 .module_paths
                 .iter()
                 .filter(|m| m.starts_with(prefix))
@@ -152,19 +162,31 @@ impl Completer for RsfCompleter {
                     replacement: m.clone(),
                 })
                 .collect();
+            // Alphabetical order with the short leaf last would be nicer,
+            // but rustyline's List completion already sorts, so leave the
+            // order stable and let it sort.
+            matches.truncate(MAX_COMPLETION_CANDIDATES);
             return Ok((start, matches));
         }
 
-        // Otherwise complete commands
+        // Command completion: match the LAST whitespace-separated token, so
+        // `set tar<TAB>` completes the value rather than replacing the whole
+        // line. Replacing the whole line meant an accidental Tab at the
+        // start of an existing command destroyed it.
+        let token_start = line_up_to_cursor
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token = &line_up_to_cursor[token_start..];
         let matches: Vec<Pair> = SHELL_COMMANDS
             .iter()
-            .filter(|cmd| cmd.starts_with(line_up_to_cursor))
+            .filter(|cmd| cmd.starts_with(token))
             .map(|cmd| Pair {
                 display: cmd.to_string(),
                 replacement: cmd.to_string(),
             })
             .collect();
-        Ok((0, matches))
+        Ok((token_start, matches))
     }
 }
 
@@ -181,12 +203,10 @@ impl Hinter for RsfCompleter {
             return None;
         }
 
-        // After "use " or "u ", hint module paths
-        let module_prefix = if let Some(rest) = trimmed.strip_prefix("use ") {
-            Some(rest)
-        } else {
-            trimmed.strip_prefix("u ")
-        };
+        // After "use " / "u " / "info " / "run ", hint module paths.
+        let module_prefix = ["use ", "u ", "info ", "run "]
+            .iter()
+            .find_map(|trigger| trimmed.strip_prefix(trigger));
 
         if let Some(prefix) = module_prefix {
             if let Some(m) = self
@@ -394,6 +414,14 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         .max_history_size(1000)
         .context("Failed to configure shell history size")?
         .auto_add_history(true)
+        // Show the candidates as a LIST instead of cycling through them one
+        // at a time. The registry holds ~700 modules, so circular completion
+        // meant the operator had to press Tab dozens of times to reach the
+        // one they wanted.
+        .completion_type(rustyline::CompletionType::List)
+        // Cap the candidate list so a very short prefix (`use s<TAB>`) does
+        // not dump hundreds of paths into the terminal.
+        .completion_prompt_limit(MAX_COMPLETION_CANDIDATES)
         .build();
     let mut rl = Editor::with_config(rl_config)?;
     rl.set_helper(Some(RsfCompleter::new()));
@@ -433,10 +461,19 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
     }
 
     'main_loop: loop {
-        let raw_input = match rl.readline(&format!("{}", "rsf> ".cyan().bold())) {
+        // The prompt shows what `run` would act on: the selected module and
+        // the current target. Without it the operator has to remember which
+        // module is selected after a long `find`/`info` detour.
+        let prompt = build_prompt(&ctx);
+        let raw_input = match rl.readline(&prompt) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break 'main_loop,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // A readline failure still has to persist the history, or the
+                // session's commands are lost.
+                persist_history(&mut rl, &hist);
+                return Err(e.into());
+            }
         };
 
         if raw_input.len() > MAX_INPUT_LENGTH {
@@ -510,10 +547,80 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         }
     }
 
-    if let Err(e) = rl.save_history(&hist) {
+    persist_history(&mut rl, &hist);
+    Ok(())
+}
+
+/// Persist the shell history to disk.
+///
+/// Called on every exit path — including the abnormal one — so a session that
+/// ends in a readline error does not silently lose the operator's history.
+fn persist_history(rl: &mut Editor<RsfCompleter, FileHistory>, hist: &std::path::Path) {
+    if let Err(e) = rl.save_history(hist) {
         eprintln!("[!] Failed to save history: {}", e);
     }
-    Ok(())
+}
+
+/// Set the terminal window title.
+///
+/// Writes an OSC 2 sequence straight to the terminal, bypassing the output
+/// buffer so it never lands in the spool or the per-run results file. The
+/// sequence is ignored by a terminal that does not understand it.
+fn set_terminal_title(title: &str) {
+    use std::io::Write;
+    let seq = crate::desktop::terminal_title(title);
+    // A failed write is not worth interrupting the operator over — the title
+    // is a convenience, not a result.
+    if let Err(e) = io::stdout().write_all(seq.as_bytes()) {
+        tracing::debug!("terminal title not set: {e}");
+    }
+    let _ = io::stdout().flush();
+}
+
+/// Notify the desktop that a module finished.
+///
+/// Sends a freedesktop notification, which KDE Plasma and GNOME both render.
+/// A missing notification daemon is not an error worth interrupting the
+/// operator for — it is reported once at debug level.
+///
+/// `failed` selects the urgency: a completed run is `Low` (informational),
+/// a failed one is `Critical` so it stands out in the notification centre.
+async fn notify_desktop_findings(module_path: &str, target: &str, failed: bool) {
+    if !crate::desktop::detect().is_known() {
+        return;
+    }
+    let title = if failed {
+        format!("RustSploit: {module_path} failed")
+    } else {
+        format!("RustSploit: {module_path}")
+    };
+    let body = format!("Finished against {target}");
+    let urgency = if failed {
+        crate::desktop::Urgency::Critical
+    } else {
+        crate::desktop::Urgency::Low
+    };
+    match crate::desktop::notify(&title, &body, urgency).await {
+        Ok(()) => tracing::debug!("desktop notification sent for {module_path}"),
+        Err(e) => tracing::debug!("desktop notification not sent: {e}"),
+    }
+}
+
+/// Build the interactive prompt.
+/// Shows the selected module so the operator always knows what `run` is about
+/// to act on. Only the leaf is shown — the full path is too long for a
+/// prompt, and a prompt that wraps in an 80-column terminal is worse than
+/// no prompt at all.
+fn build_prompt(ctx: &ShellContext) -> String {
+    let mut prompt = String::from("rsf");
+    if let Some(module) = &ctx.current_module {
+        let leaf = module.rsplit('/').next().unwrap_or(module);
+        prompt.push('(');
+        prompt.push_str(leaf);
+        prompt.push(')');
+    }
+    prompt.push('>');
+    format!("{}", prompt.cyan().bold())
 }
 
 /// Execute a single shell command. Returns true if the shell should exit.
@@ -597,7 +704,13 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         println!("{} {}", "tommy:".red(), e);
                     }
                 }
-                "modules" => utils::list_all_modules(),
+                "modules" => {
+                    // `modules` lists everything; `modules <category>` narrows
+                    // it down. With ~700 modules an unfiltered dump is not
+                    // navigable.
+                    let filter = rest.split_whitespace().next().unwrap_or("");
+                    utils::list_all_modules(filter);
+                }
                 "find" => {
                     if rest.is_empty() {
                         println!("{}", "Usage: find <keyword>".yellow());
@@ -616,13 +729,26 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         } else if let Some(canonical) =
                             crate::commands::resolve_full_path(&safe_path)
                         {
-                            // Accept a bare short name (e.g. `use proxy_scanner`),
-                            // matching what `run`/`-m` already resolve, instead of
+                            // Accept a bare short name (e.g. `use proxy_scanner`)
+                            // or a leaf name (`use ssh_bruteforce`), matching what
+                            // `info` and `run` already resolve, instead of
                             // requiring the full category/name path.
                             ctx.current_module = Some(canonical.clone());
                             println!("{}", format!("Module '{}' selected.", canonical).green());
                         } else {
                             println!("{}", format!("Module '{}' not found.", rest).red());
+                            // "Did you mean" — the operator almost always has a
+                            // typo or a fragment, not a module that does not exist.
+                            if let Some(suggestion) = crate::commands::suggest_module(&safe_path) {
+                                println!(
+                                    "{}",
+                                    format!("  Did you mean: {}?", suggestion).yellow()
+                                );
+                                println!(
+                                    "{}",
+                                    "  (use it with: use <path>)".dimmed()
+                                );
+                            }
                         }
                     } else {
                         println!(
@@ -954,6 +1080,45 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 "show_options" => {
                     display_all_options(&ctx).await;
                 }
+                "desktop" => {
+                    // Desktop-environment integration: report what was
+                    // detected, and let the operator send a test
+                    // notification to confirm the daemon is reachable.
+                    let arg = rest.trim();
+                    if arg == "notify" {
+                        let message = rest
+                            .strip_prefix("notify")
+                            .map(str::trim)
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("RustSploit notification test");
+                        match crate::desktop::notify(
+                            "RustSploit",
+                            message,
+                            crate::desktop::Urgency::Normal,
+                        )
+                        .await
+                        {
+                            Ok(()) => println!(
+                                "{}",
+                                "[+] Notification sent.".green()
+                            ),
+                            Err(e) => println!(
+                                "{}",
+                                format!("[!] Notification failed: {}", e).red()
+                            ),
+                        }
+                    } else {
+                        let description = crate::desktop::describe().await;
+                        for line in description.lines() {
+                            println!("  {}", line);
+                        }
+                        println!();
+                        println!(
+                            "{}",
+                            "  `desktop notify <message>` sends a test notification.".dimmed()
+                        );
+                    }
+                }
                 "load_profile" => {
                     let path = rest.trim();
                     if path.is_empty() {
@@ -1201,6 +1366,35 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         ctx.resource_depth += 1;
                         execute_resource_file_inner(ctx, &rest, depth).await;
                         ctx.resource_depth = depth;
+                    }
+                }
+                "history" => {
+                    // Show the persisted command history. Ctrl-R searches it
+                    // interactively, but there was no way to just LOOK at it.
+                    match tokio::fs::read_to_string(&history_path()).await {
+                        Ok(contents) => {
+                            let lines: Vec<&str> = contents.lines().collect();
+                            let shown = lines.len().min(MAX_HISTORY_SHOWN);
+                            for (idx, line) in lines.iter().rev().take(shown).enumerate() {
+                                println!(
+                                    "{}",
+                                    format!("{:>5}  {}", lines.len() - idx, line).dimmed()
+                                );
+                            }
+                            if lines.len() > shown {
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "  … {} earlier entries (use `makerc` to export)",
+                                        lines.len() - shown
+                                    )
+                                    .dimmed()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("{}", format!("[!] No history available: {}", e).red())
+                        }
                     }
                 }
                 "makerc" => {
@@ -1827,10 +2021,24 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                         "Running module '{}' against target '{}'",
                                         module_path, t
                                     );
-                                    if let Err(e) =
-                                        commands::run_module(module_path, t, ctx.verbose).await
-                                    {
-                                        eprintln!("[!] Module failed: {:?}", e);
+                                    // Terminal title: shows the running module
+                                    // in the taskbar entry so an operator who
+                                    // alt-tabbed away knows what is going on.
+                                    set_terminal_title(&format!(
+                                        "rsf: {module_path} → {t}"
+                                    ));
+                                    let outcome =
+                                        commands::run_module(module_path, t, ctx.verbose).await;
+                                    match &outcome {
+                                        Ok(()) => {
+                                            set_terminal_title(&format!("rsf: {module_path} ✓"));
+                                            notify_desktop_findings(module_path, t, false).await;
+                                        }
+                                        Err(e) => {
+                                            set_terminal_title(&format!("rsf: {module_path} ✗"));
+                                            notify_desktop_findings(module_path, t, true).await;
+                                            eprintln!("[!] Module failed: {:?}", e);
+                                        }
                                     }
                                 }
                             }
@@ -1966,6 +2174,8 @@ pub fn resolve_command(cmd: &str) -> String {
         "spool" => "spool",
         "resource" | "rc" => "resource",
         "makerc" => "makerc",
+        "history" | "hist" => "history",
+        "desktop" | "de" => "desktop",
         "hosts" => "hosts",
         "services" | "svcs" => "services",
         "sessions" | "ss" => "sessions",
@@ -2368,7 +2578,12 @@ fn render_help() {
         "ls | m".dimmed()
     );
     println!(
-        "    {:<20} {:<24} Search modules by keyword",
+        "    {:<20} {:<24} List modules in one category",
+        "modules <cat>".green(),
+        "exploits | scanners".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Search modules by name, description or CVE",
         "find <kw>".green(),
         "f1 <kw>".dimmed()
     );
@@ -2381,6 +2596,11 @@ fn render_help() {
         "    {:<20} {:<24} Show module metadata (CVE, author, rank)",
         "info [path]".green(),
         "i".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Show the persisted command history",
+        "history".green(),
+        "hist".dimmed()
     );
     println!(
         "    {:<20} {:<24} Deselect the current module (target preserved)",
@@ -2665,13 +2885,16 @@ fn render_help_topic(topic: &str) {
             "Select a module to work with.",
             &[
                 "use <category>/<path>",
-                "use <short_name>   # fuzzy-match on final segment",
+                "use <short_name>   # matched on the final path segment",
+                "use <category>/<short_name>",
             ],
             "Loads the named module into the shell. The prompt changes to show the selected module. \
-             Subsequent `run` and `info` commands target it. Use `back` to deselect.",
+             Subsequent `run` and `info` commands target it. Use `back` to deselect. \
+             An unknown name produces a 'did you mean' suggestion.",
             &[
                 ("use scanners/proxy_scanner", "Load the open-proxy scanner"),
-                ("use proxy_scanner", "Same thing — short-name fuzzy match"),
+                ("use proxy_scanner", "Same thing — matched on the final segment"),
+                ("use exploits/bluetooth/knob_probe", "Bluetooth module, full path"),
                 ("u exploits/dos/slowloris", "Alias `u` works identically"),
             ],
             &["info", "modules", "find", "back", "run"],
@@ -3000,6 +3223,15 @@ fn render_help_topic(topic: &str) {
             "Pairs with `resource` to replay sessions.",
             &[("makerc recon.rc", "Snapshot current session")],
             &["resource"],
+        ),
+        "history" => man_page(
+            "history",
+            "Show the persisted command history, newest first.",
+            &["history"],
+            "The history lives in ~/.rustsploit/history.txt and survives across \
+             sessions. Ctrl-R searches it interactively while the shell is running.",
+            &[("history", "Show the last 200 commands")],
+            &["makerc", "resource"],
         ),
         "spool" => man_page(
             "spool",

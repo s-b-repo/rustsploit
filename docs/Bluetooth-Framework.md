@@ -1,7 +1,7 @@
 # Bluetooth Framework
 
-Rustsploit's Bluetooth stack: one binary (`rustsploit`) exposing ~26 Bluetooth
-modules — 3 scanners, 21 exploits, 2 credential modules — through its four
+Rustsploit's Bluetooth stack: one binary (`rustsploit`) exposing ~40 Bluetooth
+modules — 4 scanners, 34 exploits, 2 credential modules — through its four
 interfaces (interactive shell, CLI runner, PQ-encrypted REST/WebSocket API,
 MCP server), all converging on the same `commands::run_module` → `scheduler::run`
 dispatch path. Everything below is compiled behind the **`bluetooth` feature**
@@ -54,8 +54,11 @@ Every Bluetooth module is built on this layer:
 | `fastpair/db.rs` | Model-ID → device database (KU Leuven COSIC WhisperPair dataset, ~2,900 models embedded at compile time), Anti-Spoofing key resolution (global option / metadata URL / local cache at `~/.rustsploit/wpair_keys`) |
 | `fastpair/protocol.rs` | Key-Based Pairing message construction: 16-byte request block `[type][flags][addr 6B][salt 8B]`, verified against the Fast Pair spec and public reference PoCs |
 | `classic.rs` | BR/EDR discovery, pairing and transport over BlueZ D-Bus (`Adapter1.StartDiscovery`, `Device1.Pair`/`Connect` with explicit cancellation); object-path resolution |
-| `hci.rs` | Raw HCI socket (Linux, root/CAP_NET_RAW): classic inquiry, connection creation, remote name, `HCI_Read_Encryption_Key_Size` (KNOB), event parsing, `L2capChannel` |
-| `sdp.rs` | Minimal native SDP client over L2CAP PSM 1 — `ServiceSearchAttribute` transaction, no `sdptool` dependency |
+| `hci.rs` | Raw HCI socket (Linux, root/CAP_NET_RAW): classic inquiry, connection creation, remote name, `HCI_Read_Encryption_Key_Size` (KNOB), event parsing, `L2capChannel`; **ACL data TX/RX** (`write_acl`/`read_acl`) so LMP can be *sent*, not just read; **fixed-CID / LE-address-type** L2CAP addressing (`connect_cid`) so the ATT and SMP channels are reachable; controller capability queries (supported commands, BR/EDR and LE feature bitmaps, LE buffer sizes) |
+| `att.rs` | ATT/GATT wire codec (pure Rust, offline-testable): the full opcode table, **client-chosen MTU** exchange, Read By Group Type / Read By Type database walks, Read/Write requests, and the **Read Multiple Variable Request** with a controllable length field — the primitive behind CVE-2023-40129. Talking ATT directly (rather than through the kernel's GATT stack) is what makes a malformed request possible at all |
+| `hidp.rs` | Classic Bluetooth HID (HIDP 1.1) transaction codec: SET/GET_REPORT, SET/GET_PROTOCOL, suspend/resume, with report-type and protocol-mode decoding; the BR/EDR counterpart to the LE HID-over-GATT path |
+| `l2cap_ertm.rs` | L2CAP Enhanced Retransmission Mode codec: ERTM configuration request/response negotiation (MTU, flush timeout, transmit window, max transmit), the FCR header, SDU segmentation and reassembly. ERTM is what lets a sender push a LARGE SDU as a sequence of fragments — the primitive a heap-spray style attack needs |
+| `sdp.rs` | Minimal native SDP client over L2CAP PSM 1 — `ServiceSearchAttribute` transaction, no `sdptool` dependency; **continuation-state aware**, so a peer's record set that spans several PDUs is fully retrieved instead of being silently truncated. The data-element codec follows the specification's type/size tables (Vol 3, Part A, Tables 1.1/1.2) — the previous type table decoded every element into the wrong shape, and three of the codec's own unit tests were failing on `main`. |
 | `lmp.rs` | LMP and L2CAP wire codecs (pure Rust, offline-testable; parse functions never panic on malformed input) — used by KNOB/BIAS/BLUFFS/BrakTooth and the L2CAP probes |
 | `ll.rs` | BLE link-layer packet codecs (advert PDUs, LL control) used by the SweynTooth/InjectaBLE engines; offline-testable |
 | `btsnoop.rs` | btsnoop capture parser (Android HCI snoop / `btmon -w`): header + records; also extracts SMP Pairing Confirm/Random PDUs |
@@ -74,6 +77,7 @@ Every Bluetooth module is built on this layer:
 | `scanners/bluetooth/ble_scan` | BLE Scan & Classifier | LE reconnaissance: scans the selected adapter, classifies every advertisement (Fast Pair 0xFE2C, Apple Find My, iBeacon, Microsoft Swift Pair, Mesh Proxy, HID-over-GATT) and persists devices into the engagement inventory. Classification feeds the blueforge attack matrix. |
 | `scanners/bluetooth/gatt_enumerate` | GATT Enumerator | Connects to a BLE target and dumps its full GATT surface: services, characteristics, properties and handles. Performs safe bounded reads of every readable characteristic and flags writable ones — the write surface BLESA/whisper-class exploits abuse. |
 | `scanners/bluetooth/classic_scan` | Classic (BR/EDR) Scanner + SDP | Runs a BlueZ discovery window (D-Bus) and/or raw HCI inquiry, resolves friendly names, optionally browses each target's SDP records natively over L2CAP PSM 1 (SPP/A2DP/HID/…). Feeds the classic attack chain (KNOB/BIAS/BLUFFS/L2CAP). Requires Linux + BR/EDR adapter; SDP browsing needs root. |
+| `scanners/bluetooth/controller_info` | Controller Capability Enumerator | Queries the **local** controller for its supported HCI command bitmap, BR/EDR and LE feature bitmaps and LE buffer sizes, then reports which attack primitives the radio can actually service — LMP injection, LE Extended Advertising, encrypted-link creation. Tells the operator up front which chains are reachable on this host. No target: it probes the local radio. Needs root or CAP_NET_RAW. |
 
 ### Exploits (`Category::Exploits`)
 
@@ -100,6 +104,19 @@ Every Bluetooth module is built on this layer:
 | `exploits/bluetooth/braktooth` | BrakTooth — LMP/L2CAP Fuzzer | — (BrakTooth toolkit) | Generates the BrakTooth LMP fuzz corpus (host-connection floods, malformed extended-features, AES-CFB, truncated PDUs) and drives an L2CAP signalling fuzzer against reachable PSMs. Air-level LMP injection needs a vendor-capable controller. **Fuzzing is destructive.** |
 | `exploits/bluetooth/sweyntooth` | SweynTooth — BLE LL DoS Engine | — | Generates the SweynTooth LL control corpus (LL_PING floods, malformed DLE negotiation, degenerate connection-update, all-zero channel-map PDUs) for export to nRF52/ESP32-class radios. DTM mode (`sweyntooth_dtm=1`, root) exercises the **local** controller directly. |
 | `exploits/bluetooth/fp_rogue_beacon` | Fast Pair Rogue Beacon | — | Advertises a spoofed Google Fast Pair provider (0xFE2C) with an operator-chosen model ID (pairing-mode or SteadyState/account-key-filter form) and counts any Seeker that connects to the lure. For lure research, client fingerprinting and pairing DoS. |
+| `exploits/bluetooth/blueborne_full` | BlueBorne — BNEP Full Vector Set | CVE-2017-0781, CVE-2017-0784 | Sends the full set of malformed BNEP setup vectors over PSM 0x000F rather than the single probe in `blueborne_l2cap` — a wider crash surface for the same underlying BNEP parser bug. |
+| `exploits/bluetooth/bleedingtooth_full` | BleedingTooth — Full | CVE-2020-24490 | Extends `bleedingtooth` with the A2MP information-leak probe and the extended-advertising HCI event overflow (opcode 0x2037). |
+| `exploits/bluetooth/smp_invalid_curve` | SMP Invalid Curve — LE SC Probe | CVE-2018-5383 | Sends a malformed SMP Pairing Public Key on the fixed SMP CID 0x0006 to check whether the peer validates the curve point. |
+| `exploits/bluetooth/avdtp_hijack` | AVDTP Hijack — A2DP Stream Injector | CVE-2017-0785 (class) | Discovers, negotiates, opens and starts an AVDTP stream, then injects frames into it — the classic "play a sound on someone else's phone" primitive. |
+| `exploits/bluetooth/carwhisperer` | CarWhisperer — HFP Audio Injector | CVE-2017-0785 (class) | Drives the HFP AT command set (VGS/VGM/ATA/CHUP/VTS) over RFCOMM to inject calls and audio into a hands-free device. |
+| `exploits/bluetooth/bluebug_obex` | BlueBug — OBEX-FTP Probe | CVE-2005-0480, CVE-2004-0360 | OBEX PUT over RFCOMM to write a file to a phone that never paired — the original OBEX pairing-bypass. |
+| `exploits/bluetooth/bluesnarf_obex` | BlueSnarf — OBEX-FTP / PBAP Exfil | CVE-2017-0732 | Lists and pulls files over OBEX, and reads the phonebook over PBAP. |
+| `exploits/bluetooth/hid_gatt_server` | HID-over-GATT — Report Map Peripheral | CVE-2023-45866 | Advertises a rogue HIDoGATT server with a real report map, so a host that auto-trusts HID devices pairs with it. |
+| `exploits/bluetooth/findmy_clone` | Find My Clone — Rogue Find My Advertiser | — | Forges an Apple Find My advertisement, so a real AirTag owner is lured to the operator's location. |
+| `exploits/bluetooth/airoha_rce` | Airoha RCE — Vendor Diag Probe | CVE-2024-47875, CVE-2024-21743 | Airoha/MediaTek vendor HCI diagnostics (OGF 0x3F): firmware-version read and an opt-in vendor write-memory. |
+| `exploits/bluetooth/lmp_injector` | LMP Injector — Active ACL-Level LMP Probing | CVE-2019-9506, CVE-2020-10135 | Opens a real ACL link and **writes** LMP PDUs onto it — the primitive every air-level BR/EDR attack needs, and the piece the framework previously lacked because the HCI socket discarded ACL packets. Sends `LMP_features_req_ext` (the BIAS signal: the answer differs between an authenticated and an unauthenticated link) and, opt-in via `setg lmp_keysize_probe=1`, `LMP_encryption_key_size_req` with a 1-byte key size (the KNOB entropy downgrade). |
+| `exploits/bluetooth/hidp_classic` | Classic HID (HIDP) Surface Probe | — | Opens the **classic** HID control channel (PSM 0x0011) — the BR/EDR transport that the LE HID-over-GATT path does not cover — and interrogates the peer with GET_PROTOCOL and GET_REPORT. Read-only: it never sends SET_REPORT, so nothing is injected. |
+| `exploits/bluetooth/gatt_att_prober` | ATT GATT Prober (MTU control + malformed Read Multiple Variable) | CVE-2023-40129 | Speaks ATT **directly** over L2CAP (PSM 0x001F over BR/EDR, fixed CID 0x0004 over LE) instead of going through the kernel's GATT stack, which means a client-chosen MTU and a malformed request are both possible. The probe sends a `Read Multiple Variable Request` whose length field disagrees with the number of handles supplied — the integer-underflow primitive behind the Android Fluoride GATT bug. Reachability only by default; the crashing variant is opt-in via `setg gatt_underflow_payload=1`. |
 
 ### Credentials (`Category::Creds`)
 
@@ -142,6 +159,15 @@ All keys below live in the free-form `setg` store persisted to
 | `mesh_authwordlist` | `mesh_authvalue` | `setg mesh_authwordlist /tmp/authvalues.txt` | AuthValue candidate list |
 | `sdp_browse` | `classic_scan` | `setg sdp_browse 1` | enables native SDP browsing (root) |
 | `sweyntooth_dtm` | `sweyntooth` | `setg sweyntooth_dtm 1` | DTM mode against the local controller (root) |
+| `gatt_att_mtu` | `gatt_att_prober` | `setg gatt_att_mtu 517` | client-chosen ATT MTU; bounds the peer's response buffer (default: the maximum, 517) |
+| `gatt_underflow_payload` | `gatt_att_prober` | `setg gatt_underflow_payload 1` | sends the crashing variant of the malformed Read Multiple Variable Request (destructive) |
+| `bluebug_channel` | `bluebug_obex` | `setg bluebug_channel 3` | OBEX/RFCOMM channel to target on the phone |
+| `bt_obex_payload` | `bluebug_obex` | `setg bt_obex_payload /tmp/x.txt` | file the OBEX PUT writes |
+| `bluefrag_stage2` | `bluefrag` | `setg bluefrag_stage2 1` | enables the second-stage payload variant |
+| `airoha_write_mem` | `airoha_rce` | `setg airoha_write_mem 1` | enables the vendor write-memory operation (destructive) |
+| `airoha_target_addr` | `airoha_rce` | `setg airoha_target_addr 0x1234` | vendor memory address for the write |
+| `ctkd_active` | `ctkd_probe` | `setg ctkd_active 1` | enables the active cross-transport key overwrite probe (destructive) |
+| `lmp_keysize_probe` | `lmp_injector` | `setg lmp_keysize_probe 1` | sends the KNOB key-entropy downgrade (lowers the session's link-key entropy) |
 
 ---
 

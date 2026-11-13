@@ -327,10 +327,17 @@ pub fn h7(salt: &[u8; 16], mac: &[u8; 16]) -> [u8; 16] {
     aes_cmac(salt, mac)
 }
 
-pub async fn connect_le_smp(bdaddr: &str) -> Result<L2capChannel> {
+/// Open the LE Security Manager Protocol channel.
+///
+/// SMP rides on the FIXED L2CAP CID 0x0006, not on a PSM. Passing 0x0006 in
+/// the PSM field made the kernel look for a dynamic channel in the PSM
+/// range, which cannot succeed — so this path never connected on a stock
+/// kernel. The address type also matters: an LE peer is addressed as a
+/// public (1) or random (2) address, not as a BR/EDR address (0).
+pub async fn connect_le_smp(bdaddr: &str, addr_type: u8) -> Result<L2capChannel> {
     let owned = bdaddr.to_string();
     tokio::task::spawn_blocking(move || -> Result<L2capChannel> {
-        L2capChannel::connect(&owned, L2CAP_CID_SMP)
+        L2capChannel::connect_cid(&owned, L2CAP_CID_SMP, addr_type)
     })
     .await
     .map_err(|e| anyhow!("SMP L2CAP connect task: {e}"))?

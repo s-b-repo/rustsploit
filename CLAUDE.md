@@ -44,8 +44,103 @@ scripts/check-docs.sh                                             # docs link/st
 
 The only sanctioned exemption marker for the audit matrix is an inline `// audit-allow: <reason>` comment; `#[allow(...)]` attributes remain banned.
 
-## Architecture — the big picture
+### The audit script is BASELINED, not absolute
 
+The repository carries real legacy debt (md5 in fingerprinters, `"admin","admin"` in default credential lists, `as u32` casts, `Err(_)` in old modules). An absolute `--strict` gate over the whole tree is red on day one and therefore gets ignored. CI therefore runs the script in **baseline** mode:
+
+```bash
+# Aggregate gate — per-PATTERN counts for the whole tree.
+scripts/audit-bad-patterns.sh --baseline .github/bad-patterns.baseline
+
+# Per-file gate — per-FILE per-SECTION counts (catches "fix in A, add in B",
+# which nets to zero at the pattern level).
+scripts/audit-bad-patterns.sh --file-baseline .github/bad-patterns.files.baseline --strict-sections A,B,C
+
+# Focused report on the files a PR touched.
+scripts/audit-bad-patterns.sh --changed-from origin/main
+
+# Nightly drift report: which patterns went UP (regression) or DOWN (debt paid).
+scripts/audit-bad-patterns.sh --drift-report .github/bad-patterns.baseline
+
+# When you FIX a violation, lower the baseline so the gate stays honest.
+scripts/audit-bad-patterns.sh --update-baseline .github/bad-patterns.baseline
+scripts/audit-bad-patterns.sh --update-file-baseline .github/bad-patterns.files.baseline --strict-sections A,B,C
+```
+
+**Rule for contributors:** never add to a baseline to make a gate pass. Baselines only ever go *down*, as violations are fixed. New code must be clean in sections A (panics), B (swallowed errors) and C (lint suppression) — the CI gate enforces this per file.
+
+### Finding unwired / unused code
+
+`scripts/audit-deadcode.sh` finds code that exists but nothing can reach:
+
+- **uncompiled-file** — a `.rs` file that is not declared in its parent `mod.rs`. It is never compiled, so it never registers and the operator can never run it. (This is how `exploits/bluetooth/blueborne_l2cap` stayed invisible.)
+- **missing-file** — a `mod X;` declaration with no `X.rs`.
+- **unregistered-module** — a module file under `src/modules/` with `run()`/`info()` but no `register_native_module!`.
+- **dead-code** — items the compiler reports as never used.
+- **unused-dep** — crates in `Cargo.toml` that nothing imports (`cargo-machete`).
+
+```bash
+scripts/audit-deadcode.sh --no-cargo                       # fast, static checks only
+scripts/audit-deadcode.sh --baseline .github/deadcode.baseline
+scripts/audit-deadcode.sh --update-baseline .github/deadcode.baseline
+```
+
+Same rule as above: the baseline is the backlog. Wire the code up or delete it, then drop the entry.
+
+### Generating the module catalog
+
+`docs/Module-Catalog.md` is generated from the live registry by
+`rustsploit --gen-module-catalog`. Linking this crate needs a few GB of RAM,
+so `scripts/gen-module-catalog.py` parses the registrations straight out of
+the source instead. It is a **fallback, not the source of truth** — CI
+regenerates the catalog with the real binary and fails on any difference, so
+drift between the two is caught immediately.
+
+## CI/CD pipeline
+
+Workflows live in `.github/workflows/`. All third-party actions are pinned to a **commit SHA** (with the version in a trailing comment) so a compromised tag cannot inject code into a release pipeline.
+
+| Workflow | Workers | Purpose |
+| --- | --- | --- |
+| `ci.yml` | `fmt`, `fmt-repo`, `clippy`, `build`, `test`, `module-catalog`, `bad-patterns`, `bad-patterns-changed`, `deadcode`, `docs`, `gate` | Per-PR gate. `gate` aggregates the rest into the single required status check. |
+| `security.yml` | `cargo-audit`, `cargo-deny`, `gitleaks`, `codeql`, `sbom`, `dependency-review` | Independent security workers, run in parallel. |
+| `bug-hunt.yml` | `asan`, `miri`, `review` | Memory bugs and logic flaws. `asan` runs the test suite under AddressSanitizer (use-after-free, overflow, double-free, leaks); `miri` runs the pure-logic tests under the UB detector; `review` is a worker that reads the diff for inverted conditions, off-by-ones, leaked permits, TOCTOU and lock-order inversions. |
+| `code-quality.yml` | `audit` | In-place code-quality worker. Anchored to the audit scripts, not free-form opinion. `audit` mode reports; `fix` mode edits, commits and pushes. |
+| `release.yml` | `notes`, `build` (matrix), `checksums`, `release`, `changelog` | Tag-triggered release. One matrix worker per platform. |
+| `release-notes.yml` | `notes` | PR preview of the next release notes; refreshes `changelogs/changelog-latest.md` on `main`. |
+| `nightly.yml` | `baselines`, `docs-and-catalog`, `dependency-freshness`, `full-test` | Scheduled deep pass: advisory drift, baseline drift, catalog drift, `--all-features` tests. |
+
+Notes:
+
+- Heavy compile/test jobs run on a larger runner (`ubuntu-latest-8-cores`). Override with the `RUNNER_HEAVY` repository variable (e.g. `ubuntu-latest`) if the account has no larger runners. The crate has ~690 modules and links a vendored OpenSSL — a debug build with debuginfo OOMs a 7 GB runner, so CI sets `CARGO_PROFILE_DEV_DEBUG=0` and `RUSTFLAGS="-C debuginfo=0"`.
+- `fmt` gates only the files a PR touched (the repo is not rustfmt-clean end to end). `fmt-repo` reports the whole-repo drift without blocking.
+- `clippy` runs **without** `-D warnings`: the lint backlog is large and a hard gate would be permanently red. Warnings still surface as inline PR annotations.
+- Release notes come from `scripts/generate-release-notes.sh` (conventional-commit classification + `changelogs/fragments/*.md`). The PR preview and the published notes use the same script, so they cannot diverge.
+
+### Bluetooth transport capabilities
+
+The Bluetooth support layer (`src/bluetooth/`) is compiled behind the `bluetooth` feature (default on). Beyond the original HCI/L2CAP/GATT plumbing it now also provides:
+
+- **ACL data TX/RX** (`hci::write_acl` / `read_acl`) — the HCI socket used to *discard* ACL packets, so LMP could be read but never sent. This is the primitive every air-level BR/EDR attack needs.
+- **Fixed-CID and LE-address-type L2CAP** (`hci::L2capChannel::connect_cid`) — the ATT (0x0004) and SMP (0x0006) channels are addressed by CID, not PSM, and an LE peer needs a public (1) or random (2) address type.
+- **Raw ATT/GATT codec** (`bluetooth/att.rs`) — talks ATT directly instead of through the kernel's GATT stack, so a **client-chosen MTU** and a **malformed request** are both possible. The `Read Multiple Variable Request` builder is the primitive behind CVE-2023-40129.
+- **Classic HID (HIDP)** (`bluetooth/hidp.rs`) — the BR/EDR counterpart to the LE HID-over-GATT path.
+- **L2CAP ERTM** (`bluetooth/l2cap_ertm.rs`) — segmentation and flow control, so a large SDU can be pushed as a sequence of fragments.
+- **Controller capability queries** (`hci::read_supported_commands` / `read_supported_features` / `read_le_supported_features` / `read_le_buffer_size`) — tells the operator which attack primitives the *local* radio can service before they build a payload.
+- **A spec-correct SDP codec** (`bluetooth/sdp.rs`) — the data-element type/size tables now match Core Specification Vol 3, Part A, Tables 1.1/1.2. The previous table decoded every element into the wrong shape (type 1 read as a 128-bit integer, type 4 as a text string, type 6 as a sequence), and three of the codec's own unit tests were failing on `main`. The client is also continuation-state aware, so a peer whose record set spans several PDUs is fully enumerated.
+
+New modules must follow the three-part contract: the file, the `register_native_module!` call, **and** a `pub mod <name>;` line in the parent `mod.rs`. `scripts/audit-deadcode.sh` catches the case where that third step is forgotten — the module compiles away and the operator can never run it.
+
+### Desktop integration (KDE Plasma / GNOME)
+
+`src/desktop.rs` provides two channels that behave identically on Plasma and on GNOME:
+
+- **Freedesktop notifications** over the session bus (`org.freedesktop.Notifications`), which both `plasma-notification` and `gnome-shell` implement. Uses `zbus` directly rather than shelling out to `notify-send`, so it respects the user's notification settings and works under Wayland. Gated behind the `desktop` feature (default on).
+- **Terminal title** via an OSC 2 sequence, which Konsole and GNOME Terminal (VTE) both honour — the running module shows in the taskbar entry.
+
+The shell sends a notification when a module finishes and sets the title around a run. `desktop` reports what was detected; `desktop notify <msg>` sends a test notification. Everything degrades to a no-op on a headless box.
+
+## Architecture — the big picture
 ### One dispatch path for four interfaces
 Shell (`shell.rs`), CLI (`main.rs`/`cli.rs`), API (`api.rs` + `ws.rs`), and MCP (`mcp/`) all converge on **`commands::run_module(path, target, verbose)`** → **`scheduler::run(module, Target, opts, verbose)`**. Anything affecting how modules execute (target handling, options, timeouts, fan-out) belongs in the scheduler/commands layer so all four interfaces get it uniformly — don't special-case one transport.
 

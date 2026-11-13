@@ -38,6 +38,8 @@ pub mod adapter;
 #[cfg(feature = "bluetooth")]
 pub mod airoha;
 #[cfg(feature = "bluetooth")]
+pub mod att;
+#[cfg(feature = "bluetooth")]
 pub mod avdtp;
 #[cfg(feature = "bluetooth")]
 pub mod bnep;
@@ -60,7 +62,11 @@ pub mod hci;
 #[cfg(feature = "bluetooth")]
 pub mod hfp;
 #[cfg(feature = "bluetooth")]
+pub mod hidp;
+#[cfg(feature = "bluetooth")]
 pub mod inventory;
+#[cfg(feature = "bluetooth")]
+pub mod l2cap_ertm;
 #[cfg(feature = "bluetooth")]
 pub mod ll;
 #[cfg(feature = "bluetooth")]

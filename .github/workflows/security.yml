@@ -1,0 +1,186 @@
+name: Security
+
+# Independent security workers. Each answers one question:
+#   cargo-audit  -> "are any of our dependencies known-vulnerable?"
+#   cargo-deny   -> "are we shipping licenses / sources we agreed not to?"
+#   gitleaks     -> "did we commit a secret?"
+#   codeql       -> "does our own code contain a known vulnerability class?"
+#   sbom         -> "what exactly are we shipping?"
+#   dep-review   -> "does this PR introduce a new risky dependency?"
+#
+# They run in parallel so one slow worker never holds up the others, and a
+# failure in one is attributed to that worker alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 03:17 UTC daily — off the hour so the run does not pile onto the
+    # busiest scheduler minute.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # lld uses far less memory than GNU ld when linking this crate, and the
+  # link step is where the build OOMs on a small runner.
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=lld"
+
+jobs:
+  # ── Worker: known vulnerabilities in dependencies ──────────────────────
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        with:
+          tool: cargo-audit
+      - name: Audit the dependency tree
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # The lockfile is the source of truth; audit it rather than
+          # re-resolving, so the report matches what we actually build.
+          path: Cargo.lock
+          # Ignore advisories that do not affect our build (e.g. a yanked
+          # dev-only crate). Add with a reason, never blanket.
+          ignore: ""
+
+  # ── Worker: license / source policy ───────────────────────────────────
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        with:
+          tool: cargo-deny
+      - name: Check licenses, bans, advisories and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          command: check
+          args: >-
+            --all-features
+            --hide-inclusion-graph
+            --log-level warn
+
+  # ── Worker: secret scanning ───────────────────────────────────────────
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    # The framework legitimately ships default credential wordlists
+    # ("admin","admin", "root","root") as brute-force defaults, and the
+    # bad-pattern audit flags those too. Gitleaks is still worth running:
+    # it looks for high-entropy keys and provider-specific token formats
+    # rather than generic password pairs.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Scan history for leaked secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Do not fail the run: report findings as annotations instead, so a
+          # known-false-positive can be reviewed rather than blocking.
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+          GITLEAKS_NOTIFY_LARGE_COMMITS: false
+        with:
+          args: detect --source . --no-banner --redact --verbose
+
+  # ── Worker: static analysis of our own code ──────────────────────────
+  codeql:
+    name: codeql
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@52cf1852265d99e9bea071b03366fc777a602909
+        with:
+          languages: rust
+          queries: security-extended
+          # Building the crate is expensive; CodeQL's autobuild would have to
+          # rediscover the whole dependency graph. We build it ourselves in
+          # the analyze step instead.
+          build-mode: manual
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Build
+        run: cargo build --locked
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@52cf1852265d99e9bea071b03366fc777a602909
+        with:
+          category: "/language:rust"
+
+  # ── Worker: software bill of materials ────────────────────────────────
+  sbom:
+    name: sbom
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx --format json --all-features --outfile sbom.json
+          cargo cyclonedx --format xml  --all-features --outfile sbom.xml
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sbom
+          path: |
+            sbom.json
+            sbom.xml
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Worker: dependency review (PR only) ───────────────────────────────
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Dependency review
+        # Blocks a PR that adds a dependency with a known vulnerability,
+        # introduces a banned license, or drops the lockfile.
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure

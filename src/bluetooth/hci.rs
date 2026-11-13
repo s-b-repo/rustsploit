@@ -21,6 +21,20 @@ pub const HCI_CHANNEL_USER: u16 = 1;
 
 const HCI_COMMAND_PKT: u8 = 0x01;
 const HCI_EVENT_PKT: u8 = 0x04;
+/// HCI ACL data packet type.
+const HCI_ACL_PKT: u8 = 0x02;
+/// HCI SCO data packet type.
+const HCI_SCO_PKT: u8 = 0x03;
+
+/// Bluetooth address types for `sockaddr_l2.bdaddr_type`.
+pub const BD_ADDR_BREDR: u8 = 0;
+pub const BD_ADDR_LE_PUBLIC: u8 = 1;
+pub const BD_ADDR_LE_RANDOM: u8 = 2;
+
+/// Fixed L2CAP CIDs (Core Specification, Vol 3, Part A, 4.22).
+pub const ATT_CID: u16 = 0x0004;
+pub const LE_SIGNALING_CID: u16 = 0x0005;
+pub const SMP_CID: u16 = 0x0006;
 
 // Opcodes: OGF << 10 | OCF.
 const OGF_LINK_CTL: u16 = 0x01;
@@ -38,6 +52,10 @@ const HCI_OP_USER_CONFIRM_REPLY: u16 = (OGF_LINK_CTL << 10) | 0x002C;
 const HCI_OP_USER_PASSKEY_REPLY: u16 = (OGF_LINK_CTL << 10) | 0x002E;
 const HCI_OP_READ_LOCAL_VERSION: u16 = (OGF_INFO_PARAM << 10) | 0x0001;
 const HCI_OP_READ_ENC_KEY_SIZE: u16 = (OGF_STATUS_PARAM << 10) | 0x0008;
+const HCI_OP_READ_LOCAL_SUPPORTED_COMMANDS: u16 = (OGF_INFO_PARAM << 10) | 0x0002;
+const HCI_OP_READ_LOCAL_SUPPORTED_FEATURES: u16 = (OGF_INFO_PARAM << 10) | 0x0003;
+const HCI_OP_LE_READ_BUFFER_SIZE: u16 = (OGF_LE_CTL << 10) | 0x0002;
+const HCI_OP_LE_READ_LOCAL_SUPPORTED_FEATURES: u16 = (OGF_LE_CTL << 10) | 0x0003;
 
 // LE controller opcodes (OGF 0x08).
 const OGF_LE_CTL: u16 = 0x08;
@@ -163,6 +181,80 @@ impl HciSocket {
             code: header[0],
             params: body,
         })
+    }
+
+    /// Send an ACL data packet to a connected handle.
+    ///
+    /// This is the transport an air-level attack needs: LMP lives in ACL
+    /// data, not in HCI commands, so without this path the framework can
+    /// read banners but cannot inject a single L2CAP/LMP octet.
+    ///
+    /// On a `BTPROTO_HCI` socket the host writes the 4-byte ACL header
+    /// itself: `handle(2) | data_total_length(2)`. The handle's high bits
+    /// carry the packet boundary flags (PB = 0b10 for "first automatically
+    /// flushable"), which the kernel expects.
+    pub fn write_acl(&mut self, handle: u16, pb: u8, data: &[u8]) -> Result<usize> {
+        if data.len() > u16::MAX as usize {
+            return Err(anyhow!(
+                "ACL payload of {} bytes exceeds the 16-bit length field",
+                data.len()
+            ));
+        }
+        // PB occupies bits 12-13 of the handle field.
+        let handle_field = (handle & 0x0FFF) | ((pb as u16 & 0x3) << 12);
+        let mut pkt = Vec::with_capacity(4 + data.len());
+        pkt.push(handle_field.to_le_bytes()[0]);
+        pkt.push(handle_field.to_le_bytes()[1]);
+        pkt.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        pkt.extend_from_slice(data);
+        self.write_all(&pkt)?;
+        Ok(data.len())
+    }
+
+    /// Read the next ACL data packet, bounded by `timeout`.
+    ///
+    /// Returns `(handle, payload)`. Non-ACL packets are skipped, so this can
+    /// be called in a loop alongside the command/event path.
+    pub fn read_acl(&mut self, timeout: Duration) -> Result<(u16, Vec<u8>)> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| anyhow!("timeout waiting for ACL data"))?;
+            let mut ptype = [0u8; 1];
+            self.read_exact_bounded(&mut ptype, timeout)?;
+            match ptype[0] {
+                HCI_ACL_PKT => {
+                    let mut hdr = [0u8; 4];
+                    self.read_exact_bounded(&mut hdr, remaining)?;
+                    let handle = u16::from_le_bytes([hdr[0], hdr[1]]) & 0x0FFF;
+                    let len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+                    let mut payload = vec![0u8; len];
+                    self.read_exact_bounded(&mut payload, remaining)?;
+                    return Ok((handle, payload));
+                }
+                HCI_EVENT_PKT => {
+                    // Skip the event: header(2) + body.
+                    let mut header = [0u8; 2];
+                    self.read_exact_bounded(&mut header, remaining)?;
+                    let mut body = vec![0u8; header[1] as usize];
+                    self.read_exact_bounded(&mut body, remaining)?;
+                }
+                HCI_SCO_PKT => {
+                    // SCO: handle(2) + len(1) + data.
+                    let mut hdr = [0u8; 3];
+                    self.read_exact_bounded(&mut hdr, remaining)?;
+                    let mut sink = vec![0u8; hdr[2] as usize];
+                    self.read_exact_bounded(&mut sink, remaining)?;
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "unexpected HCI packet type 0x{:02X} while reading ACL",
+                        ptype[0]
+                    ));
+                }
+            }
+        }
     }
 
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
@@ -380,6 +472,83 @@ impl HciSocket {
         let manufacturer = u16::from_le_bytes([ev.params[5], ev.params[6]]);
         let lmp_subver = u16::from_le_bytes([ev.params[7], ev.params[8]]);
         Ok((u16::from(lmp_ver), manufacturer, lmp_subver))
+    }
+
+    /// Read the controller's supported-command bitmap.
+    ///
+    /// Returns the 64-byte bitmap from `Read_Local_Supported_Commands`. Bit
+    /// N of byte N/8 corresponds to opcode OGF/OCF = N.
+    pub fn read_supported_commands(&mut self) -> Result<[u8; 64]> {
+        let ev = self.command(
+            HCI_OP_READ_LOCAL_SUPPORTED_COMMANDS,
+            &[],
+            Duration::from_secs(3),
+        )?;
+        if ev.params.len() < 65 {
+            return Err(anyhow!(
+                "short Read_Local_Supported_Commands response ({} bytes)",
+                ev.params.len()
+            ));
+        }
+        let mut bitmap = [0u8; 64];
+        bitmap.copy_from_slice(&ev.params[1..65]);
+        Ok(bitmap)
+    }
+
+    /// Read the controller's BR/EDR feature bitmap.
+    pub fn read_supported_features(&mut self) -> Result<[u8; 8]> {
+        let ev = self.command(
+            HCI_OP_READ_LOCAL_SUPPORTED_FEATURES,
+            &[],
+            Duration::from_secs(3),
+        )?;
+        if ev.params.len() < 9 {
+            return Err(anyhow!(
+                "short Read_Local_Supported_Features response ({} bytes)",
+                ev.params.len()
+            ));
+        }
+        let mut bitmap = [0u8; 8];
+        bitmap.copy_from_slice(&ev.params[1..9]);
+        Ok(bitmap)
+    }
+
+    /// Read the controller's LE feature bitmap.
+    pub fn read_le_supported_features(&mut self) -> Result<[u8; 8]> {
+        let ev = self.command(
+            HCI_OP_LE_READ_LOCAL_SUPPORTED_FEATURES,
+            &[],
+            Duration::from_secs(3),
+        )?;
+        if ev.params.len() < 9 {
+            return Err(anyhow!(
+                "short LE_Read_Local_Supported_Features response ({} bytes)",
+                ev.params.len()
+            ));
+        }
+        let mut bitmap = [0u8; 8];
+        bitmap.copy_from_slice(&ev.params[1..9]);
+        Ok(bitmap)
+    }
+
+    /// Read the controller's LE buffer sizes.
+    ///
+    /// Returns `(le_acl_data_packet_length, num_supported_packets,
+    /// total_num_le_acl_data_packets)`. The first value is the largest ACL
+    /// payload the controller will accept on an LE connection — it bounds
+    /// every LE L2CAP COC segment the framework can send.
+    pub fn read_le_buffer_size(&mut self) -> Result<(u16, u8, u16)> {
+        let ev = self.command(HCI_OP_LE_READ_BUFFER_SIZE, &[], Duration::from_secs(3))?;
+        if ev.params.len() < 8 {
+            return Err(anyhow!(
+                "short LE_Read_Buffer_Size response ({} bytes)",
+                ev.params.len()
+            ));
+        }
+        let le_acl_len = u16::from_le_bytes([ev.params[1], ev.params[2]]);
+        let num_packets = ev.params[3];
+        let total_packets = u16::from_le_bytes([ev.params[5], ev.params[6]]);
+        Ok((le_acl_len, num_packets, total_packets))
     }
 
     /// Read the next event whose code is one of `codes` (others are skipped),
@@ -664,6 +833,32 @@ impl L2capChannel {
     /// Connect an L2CAP Basic Mode channel to `bdaddr` (display order) on
     /// `psm`. Requires root/CAP_NET_RAW.
     pub fn connect(bdaddr_display: &str, psm: u16) -> Result<Self> {
+        Self::connect_addr(bdaddr_display, psm, 0, BD_ADDR_BREDR)
+    }
+
+    /// Connect using a FIXED L2CAP CID instead of a PSM, with an explicit
+    /// address type.
+    ///
+    /// The fixed CIDs are the channels that carry the protocols a BLE peer
+    /// exposes without any setup:
+    ///   - `ATT_CID` (0x0004) — the Attribute Protocol
+    ///   - `SMP_CID` (0x0006) — the Security Manager Protocol
+    ///   - `LE_SIGNALING_CID` (0x0005) — the LE L2CAP signalling channel
+    ///
+    /// The address type matters for LE: `BD_ADDR_LE_PUBLIC` (1) and
+    /// `BD_ADDR_LE_RANDOM` (2) address the peer differently from a BR/EDR
+    /// address, and the kernel rejects a mismatch.
+    pub fn connect_cid(bdaddr_display: &str, cid: u16, addr_type: u8) -> Result<Self> {
+        Self::connect_addr(bdaddr_display, cid, cid, addr_type)
+    }
+
+    /// Open an L2CAP channel.
+    ///
+    /// `psm` is the PSM for a connection-oriented channel, or the fixed CID
+    /// when `cid` is non-zero. When `cid` is non-zero the PSM field carries
+    /// the CID instead, which is how the kernel addresses the ATT and SMP
+    /// channels.
+    fn connect_addr(bdaddr_display: &str, psm: u16, cid: u16, addr_type: u8) -> Result<Self> {
         let addr = crate::bluetooth::parse_mac(bdaddr_display)?;
         // sockaddr_l2 wants the address LSB-first.
         let mut reverse = addr;
@@ -689,6 +884,10 @@ impl L2capChannel {
         for (i, b) in reverse.iter().enumerate() {
             sa[4 + i] = *b;
         }
+        // The CID field is little-endian, unlike the PSM field above.
+        sa[10] = (cid & 0xFF) as u8;
+        sa[11] = (cid >> 8) as u8;
+        sa[14] = addr_type;
         let rc =
             unsafe { libc::connect(fd, sa.as_ptr() as *const libc::sockaddr, sa.len() as u32) };
         if rc != 0 {

@@ -135,6 +135,16 @@ pub async fn ws_upgrade(
     let pq_clone = pq.clone();
     ws.max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
+        .on_failed_upgrade(move |err| {
+            // The HTTP->WS upgrade failed (the client aborted the handshake),
+            // so `handle_ws` will never run and the slot claimed above must be
+            // released HERE. Without this, every aborted upgrade permanently
+            // burned one of the MAX_TOTAL_CONNECTIONS slots, and 100 aborted
+            // handshakes disabled the WebSocket API for every tenant until the
+            // daemon restarted.
+            tracing::debug!("WS upgrade failed; releasing connection slot: {}", err);
+            TOTAL_WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        })
         .on_upgrade(move |socket| {
             handle_ws(
                 socket,
@@ -856,13 +866,7 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
     if params
         .get("output_file")
         .and_then(|v| v.as_str())
-        .is_some_and(|of| {
-            of.contains("..")
-                || of.contains('/')
-                || of.contains('\\')
-                || of.contains('\0')
-                || of.starts_with('.')
-        })
+        .is_some_and(crate::api::is_unsafe_output_file)
     {
         // P2-X6: also reject leading-dot filenames so a client can't trick the
         // module into writing to `.bashrc`, `.ssh/...`, or other dotfile names
@@ -943,6 +947,45 @@ async fn rpc_run_module(params: &Value) -> RpcResult {
         custom_prompts
             .entry("combo_mode".into())
             .or_insert_with(|| cm.to_string());
+    }
+
+    // ---- Validate the MERGED prompt map -------------------------------
+    //
+    // `custom_prompts` has the highest precedence (custom_prompts >
+    // run_context > global options > stdin), so a value arriving via the
+    // `prompts` map OVERRIDES the equivalent top-level parameter and
+    // bypasses every guard that only inspected the top level. Re-apply the
+    // range/path checks to the merged map, plus the SSRF destination check.
+    if let Some(of) = custom_prompts.get("output_file")
+        && crate::api::is_unsafe_output_file(of)
+    {
+        return Err(rpc_err(
+            "INVALID_OUTPUT_FILE",
+            "Path traversal or dotfile in output_file",
+        ));
+    }
+    if let Some(p) = custom_prompts.get("port")
+        && let Ok(port) = p.parse::<u32>()
+        && !(1..=65535).contains(&port)
+    {
+        return Err(rpc_err("INVALID_PORT", "port must be 1..=65535"));
+    }
+    if let Some(c) = custom_prompts.get("concurrency")
+        && let Ok(conc) = c.parse::<u32>()
+        && (conc == 0 || conc > 4096)
+    {
+        return Err(rpc_err(
+            "INVALID_CONCURRENCY",
+            "concurrency must be 1..=4096",
+        ));
+    }
+    // SSRF guard for prompt-supplied destinations. Many modules read their
+    // real connection target from a prompt key other than `target`
+    // (`url`, `host`, `endpoint`, ...), so validating only `target` left the
+    // metadata/link-local/loopback filter trivially bypassable.
+    // Shared implementation with the MCP tool path.
+    if let Err((code, msg)) = crate::api::validate_prompt_destinations(&custom_prompts).await {
+        return Err(rpc_err(code, msg));
     }
 
     let module_config = crate::config::ModuleConfig {

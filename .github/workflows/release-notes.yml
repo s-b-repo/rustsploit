@@ -1,0 +1,118 @@
+name: Release Notes
+
+# Keeps release notes current between releases:
+#
+#   on PR   — posts (and keeps up to date) a "what this release would say"
+#             comment on the PR, so reviewers see the user-facing impact.
+#   on main — regenerates changelogs/changelog-latest.md and opens a PR with
+#             the result, so the notes never drift from the commit log.
+#
+# The notes come from scripts/generate-release-notes.sh — the same script the
+# release pipeline uses, so a preview and the published notes cannot differ.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-notes-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  notes:
+    name: release notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Determine the next version
+        id: ver
+        run: |
+          set -euo pipefail
+          # The next version is the current Cargo.toml version with the patch
+          # bumped, unless the working tree already says otherwise.
+          CURRENT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Current version: $CURRENT → next: $NEXT"
+
+      - name: Generate the notes
+        id: gen
+        run: |
+          set -euo pipefail
+          NEXT="${{ steps.ver.outputs.next }}"
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            bash scripts/generate-release-notes.sh "$NEXT" --from "$PREV" > notes.md
+          else
+            bash scripts/generate-release-notes.sh "$NEXT" > notes.md
+          fi
+          cat notes.md
+
+      # ── PR preview ────────────────────────────────────────────────────
+      - name: Comment the preview on the PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BODY=$(mktemp)
+          {
+            echo "### Release notes preview"
+            echo
+            echo "_What the next release notes would say for \`${{ steps.ver.outputs.next }}\`._"
+            echo
+            echo '<!-- release-notes-preview -->'
+            cat notes.md
+          } > "$BODY"
+          # Update the existing sticky comment instead of stacking new ones.
+          EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.type == "Bot") | select(.body | contains("<!-- release-notes-preview -->"))] | .[0].id' \
+            2>/dev/null || echo "")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" \
+              -f body="$(cat "$BODY")" >/dev/null
+            echo "Updated the existing preview comment."
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$(cat "$BODY")" >/dev/null
+            echo "Posted a new preview comment."
+          fi
+
+      # ── main-branch refresh ───────────────────────────────────────────
+      - name: Upload the notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: changelog-latest
+          path: notes.md
+          retention-days: 14
+
+      - name: Refresh changelogs/changelog-latest.md
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp notes.md changelogs/changelog-latest.md
+          if git diff --quiet -- changelogs/changelog-latest.md; then
+            echo "changelog-latest.md is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add changelogs/changelog-latest.md
+          git commit -m "docs(changelog): refresh changelog-latest from the commit log"
+          git push origin "HEAD:${GITHUB_REF_NAME}" || {
+            echo "::warning::Could not push (the branch may be protected)."
+          }

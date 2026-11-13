@@ -1422,11 +1422,15 @@ where
     let (tx, mut rx) = mpsc::channel::<String>(1024);
     let out = config.output_file.clone();
     let writer_handle = tokio::spawn(async move {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&out)
-            .await;
+        // This file receives plaintext credentials ("ip:port:user:pass"), so it
+        // must NOT be world-readable. Without an explicit mode the file is
+        // created 0644 (& ~umask), which leaks every harvested credential to
+        // any local user. Every other credential sink in the codebase
+        // (cred_store, loot, export) sets 0600 — this was the odd one out.
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        opts.mode(0o600);
+        let file = opts.open(&out).await;
         match file {
             Ok(mut f) => {
                 while let Some(line) = rx.recv().await {

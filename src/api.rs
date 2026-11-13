@@ -235,6 +235,158 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
         || o == [100, 100, 100, 200] // Alibaba metadata
 }
 
+/// Is this `output_file` value unsafe to hand to a module?
+///
+/// Rejects path traversal (`..`), any path separator, embedded NULs, and
+/// leading-dot filenames so a client can't trick a module into writing to
+/// `.bashrc`, `.ssh/...`, or an absolute path outside the operator's CWD.
+///
+/// Applied to BOTH the top-level `output_file` parameter and the
+/// `prompts["output_file"]` entry on every transport: the prompt map has the
+/// highest precedence, so validating only the top-level parameter left the
+/// guard trivially bypassable.
+pub(crate) fn is_unsafe_output_file(of: &str) -> bool {
+    of.contains("..")
+        || of.contains('/')
+        || of.contains('\\')
+        || of.contains('\0')
+        || of.starts_with('.')
+}
+
+/// Prompt keys whose value is the module's real network destination.
+/// These are always SSRF-checked, regardless of whether the value happens to
+/// look like a URL.
+const PROMPT_DESTINATION_KEYS: &[&str] = &[
+    "url",
+    "host",
+    "endpoint",
+    "lhost",
+    "rhost",
+    "remote_host",
+    "target_url",
+    "uri",
+];
+
+/// Reduce an attacker-supplied prompt value to a bare host suitable for the
+/// SSRF block-check chain (`is_blocked_target` / `ssrf_gate`), which expect an
+/// IP/hostname rather than a full URL. Returns None when the value can't yield
+/// a host to check.
+pub(crate) fn extract_ssrf_candidate(raw: &str) -> Option<String> {
+    let val = raw.trim();
+    if val.is_empty() {
+        return None;
+    }
+    // Strip a scheme (e.g. http://, https://, ftp://, gopher://) if present.
+    let after_scheme = match val.find("://") {
+        Some(idx) => &val[idx + 3..],
+        None => val,
+    };
+    // Strip any userinfo (user:pass@host).
+    let after_userinfo = match after_scheme.rsplit_once('@') {
+        Some((_, host_part)) => host_part,
+        None => after_scheme,
+    };
+    // Cut off path / query / fragment.
+    let authority = after_userinfo
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_userinfo);
+    // Strip a trailing :port. Handle bracketed IPv6 literals separately.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // [ipv6]:port or [ipv6]
+        stripped.split(']').next().unwrap_or(stripped)
+    } else if authority.matches(':').count() > 1 {
+        // Bare IPv6 literal (e.g. `::1`, `fe80::1`) — there is no port to strip;
+        // keep the whole authority. Without this, `rsplit_once(':')` on `::1`
+        // yields host `":"`, which sails past the loopback/link-local SSRF
+        // filters (mirrors the single-colon guard in api::is_blocked_target).
+        authority
+    } else if let Some((h, _port)) = authority.rsplit_once(':') {
+        // Only treat the suffix as a port if it is all digits; otherwise the
+        // colon is part of the host (shouldn't happen for unbracketed) — keep
+        // the whole authority.
+        let port_part = &authority[h.len() + 1..];
+        if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    } else {
+        authority
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Heuristic: does this prompt value look like a URL or a host:port pair?
+/// Used so we only apply the SSRF check to non-destination keys when the value
+/// is plausibly a network destination, avoiding false rejection of unrelated
+/// string options.
+pub(crate) fn looks_like_url_or_hostport(raw: &str) -> bool {
+    let val = raw.trim();
+    if val.is_empty() {
+        return false;
+    }
+    if val.contains("://") {
+        return true;
+    }
+    // host:port form (e.g. 169.254.169.254:80) — digits after the last colon.
+    if let Some((host, port)) = val.rsplit_once(':') {
+        if !host.is_empty()
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+            && !host.contains(' ')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate every prompt value that could carry a network destination.
+///
+/// Many modules read their real connection target from a prompt key other
+/// than `target` (`url`, `host`, `endpoint`, `lhost`, ...). Checking only the
+/// `target` field therefore leaves the SSRF filter trivially bypassable: a
+/// benign `target` plus `prompts:{"url":"http://169.254.169.254/..."}` reaches
+/// the cloud metadata endpoint.
+///
+/// This helper is the single implementation used by BOTH the REST/WS RPC path
+/// and the MCP tool path, so the two surfaces cannot drift apart again.
+///
+/// Returns `Err((code, message))` on the first offending key.
+pub(crate) async fn validate_prompt_destinations(
+    prompts: &std::collections::HashMap<String, String>,
+) -> Result<(), (&'static str, String)> {
+    for (key, raw) in prompts.iter() {
+        let lkey = key.to_ascii_lowercase();
+        let is_dest_key = PROMPT_DESTINATION_KEYS.contains(&lkey.as_str());
+        let Some(candidate) = extract_ssrf_candidate(raw) else {
+            continue;
+        };
+        // Always check explicit destination keys; for other keys only check
+        // values that actually parse as a URL or host:port to avoid false
+        // rejections of unrelated string options.
+        if !is_dest_key && !looks_like_url_or_hostport(raw) {
+            continue;
+        }
+        if is_blocked_target(&candidate) {
+            return Err((
+                "SSRF_BLOCKED",
+                format!("Prompt '{key}' targets a blocked address range"),
+            ));
+        }
+        if let Err((code, msg)) = ssrf_gate(&candidate).await {
+            return Err((code, format!("Prompt '{key}' [{code}]: {msg}")));
+        }
+    }
+    Ok(())
+}
+
 /// SSRF/resolution gate: resolve `target` and verify no resolved IP is blocked.
 /// On failure, distinguishes a genuine SSRF block from a mere DNS failure so
 /// callers don't report an unresolvable/slow host as a 403 SSRF block (which
@@ -1059,4 +1211,72 @@ pub async fn start_api_server(
     .context("API server error")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The `output_file` guard must reject path traversal, path separators,
+    /// NULs and leading-dot names.
+    #[test]
+    fn unsafe_output_file_is_rejected() {
+        for bad in [
+            "../escape",
+            "/etc/passwd",
+            "sub/dir.txt",
+            "back\\slash",
+            ".bashrc",
+            ".ssh/authorized_keys",
+        ] {
+            let rejected = is_unsafe_output_file(bad);
+            assert!(rejected, "{bad:?} should be rejected"); // audit-allow: test
+        }
+        for good in ["results.txt", "scan-2026-05-01.log", "out.csv"] {
+            let accepted = !is_unsafe_output_file(good);
+            assert!(accepted, "{good:?} should be accepted"); // audit-allow: test
+        }
+    }
+
+    /// The SSRF candidate extractor must pull a bare host out of every shape
+    /// a prompt value can take.
+    #[test]
+    fn ssrf_candidate_extraction() {
+        let meta = extract_ssrf_candidate("http://169.254.169.254/latest/meta-data/");
+        assert_eq!(meta.as_deref(), Some("169.254.169.254")); // audit-allow: test
+        let hostport = extract_ssrf_candidate("169.254.169.254:80");
+        assert_eq!(hostport.as_deref(), Some("169.254.169.254")); // audit-allow: test
+        let userinfo = extract_ssrf_candidate("http://user:pw@example.com/x");
+        assert_eq!(userinfo.as_deref(), Some("example.com")); // audit-allow: test
+        // A bare IPv6 literal must not be truncated to ":".
+        assert_eq!(extract_ssrf_candidate("::1").as_deref(), Some("::1")); // audit-allow: test
+        assert_eq!(extract_ssrf_candidate("[::1]:8080").as_deref(), Some("::1")); // audit-allow: test
+        assert_eq!(extract_ssrf_candidate("   ").as_deref(), None); // audit-allow: test
+    }
+
+    /// A prompt value carrying a blocked destination must be rejected — this
+    /// is the check the REST/WS path used to skip entirely.
+    #[tokio::test]
+    async fn prompt_destinations_are_ssf_checked() {
+        let mut prompts = HashMap::new();
+        prompts.insert(
+            "url".to_string(),
+            "http://169.254.169.254/latest/".to_string(),
+        );
+        let err = validate_prompt_destinations(&prompts)
+            .await
+            .expect_err("metadata endpoint must be blocked");
+        assert_eq!(err.0, "SSRF_BLOCKED"); // audit-allow: test
+
+        // Loopback is blocked too.
+        let mut prompts = HashMap::new();
+        prompts.insert("host".to_string(), "127.0.0.1".to_string());
+        assert!(validate_prompt_destinations(&prompts).await.is_err()); // audit-allow: test
+
+        // An unrelated, non-destination prompt value must NOT be rejected.
+        let mut prompts = HashMap::new();
+        prompts.insert("username".to_string(), "admin".to_string());
+        assert!(validate_prompt_destinations(&prompts).await.is_ok()); // audit-allow: test
+    }
 }

@@ -11,6 +11,7 @@ mod cli;
 mod commands;
 mod config;
 mod context;
+mod desktop;
 mod modules;
 mod native;
 
@@ -159,7 +160,7 @@ async fn run() -> Result<()> {
     // Handle list_modules flag
     if cli_args.list_modules {
         tracing::debug!("Listing all modules...");
-        utils::list_all_modules();
+        utils::list_all_modules("");
         return Ok(());
     }
 

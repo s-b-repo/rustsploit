@@ -121,8 +121,19 @@ pub fn normalize_target(raw: &str) -> Result<String> {
             )
         })?;
         let normalized_network = normalize_target(network)?;
-        let is_ipv6 =
-            normalized_network.starts_with('[') || normalized_network.matches(':').count() >= 2;
+        // `normalize_target` bracket-wraps bare IPv6 literals ("2001:db8::" ->
+        // "[2001:db8::]") because that is the correct form for a host:port
+        // target. A CIDR must keep the address UNBRACKETED: `ipnetwork`
+        // rejects "[2001:db8::]/64", so leaving the brackets in place made
+        // every IPv6 subnet scan fail with "Invalid CIDR".
+        let normalized_network = match normalized_network
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            Some(bare) => bare.to_string(),
+            None => normalized_network,
+        };
+        let is_ipv6 = normalized_network.matches(':').count() >= 2;
         if is_ipv6 {
             if prefix > 128 {
                 return Err(anyhow!("Invalid IPv6 CIDR prefix: {} (max 128)", prefix));
@@ -491,14 +502,17 @@ pub fn extract_ip_from_target(target: &str) -> Option<String> {
         }
         return Some(trimmed.trim_start_matches('[').to_string());
     }
+    // A bare IPv6 literal (e.g. "2001:db8::1") must never be split on its
+    // last colon: that treats the final hextet as a port and returns a
+    // truncated, unparseable address ("2001:db8:"). Only fall through to
+    // host:port splitting when the string is NOT a valid IPv6 address.
+    if trimmed.parse::<Ipv6Addr>().is_ok() {
+        return Some(trimmed.to_string());
+    }
     if let Some(colon_pos) = trimmed.rfind(':') {
         let before_colon = &trimmed[..colon_pos];
         let after_colon = &trimmed[colon_pos + 1..];
         if after_colon.chars().all(|c| c.is_ascii_digit()) && !after_colon.is_empty() {
-            let colon_count = before_colon.matches(':').count();
-            if colon_count >= 2 {
-                return Some(before_colon.to_string());
-            }
             return Some(before_colon.to_string());
         }
     }
@@ -507,4 +521,64 @@ pub fn extract_ip_from_target(target: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
     Some(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An IPv6 CIDR must keep the address UNBRACKETED.
+    ///
+    /// `normalize_target` bracket-wraps bare IPv6 literals because that is
+    /// the right form for a host:port target — but `ipnetwork` rejects
+    /// "[2001:db8::]/64", which made every IPv6 subnet scan fail to parse.
+    #[test]
+    fn ipv6_cidr_is_not_bracket_wrapped() {
+        let out = normalize_target("2001:db8::/64").expect("should normalize"); // audit-allow: test
+        assert_eq!(out, "2001:db8::/64"); // audit-allow: test
+        let has_bracket = out.contains('[');
+        assert!(!has_bracket, "must not be bracket-wrapped: {out}"); // audit-allow: test
+        // The result must be parseable as a network.
+        let net: ipnetwork::IpNetwork = out.parse().expect("should parse"); // audit-allow: test
+        assert!(net.is_ipv6()); // audit-allow: test
+    }
+
+    #[test]
+    fn bracketed_ipv6_cidr_is_normalized_to_bare_form() {
+        let out =
+            normalize_target("[2001:db8::]/64").expect("bracketed IPv6 CIDR should normalize"); // audit-allow: test
+        assert_eq!(out, "2001:db8::/64"); // audit-allow: test
+    }
+
+    #[test]
+    fn ipv4_cidr_still_normalizes() {
+        let out = normalize_target("10.0.0.0/24").expect("IPv4 CIDR should normalize"); // audit-allow: test
+        assert_eq!(out, "10.0.0.0/24"); // audit-allow: test
+    }
+
+    /// A bare IPv6 literal whose last hextet is decimal must not be split on
+    /// its last colon — that returned a truncated, unparseable address.
+    #[test]
+    fn extract_ip_keeps_bare_ipv6_intact() {
+        for input in ["2001:db8::1", "fe80::1", "2001:db8::100", "::1"] {
+            let got = extract_ip_from_target(input).expect("should extract"); // audit-allow: test
+            assert_eq!(got, input, "input {input} was mangled into {got}"); // audit-allow: test
+            let parses = got.parse::<Ipv6Addr>().is_ok();
+            assert!(parses, "extracted value {got} is not valid IPv6"); // audit-allow: test
+        }
+    }
+
+    #[test]
+    fn extract_ip_still_splits_host_and_port() {
+        let ip = extract_ip_from_target("10.0.0.1:8080");
+        assert_eq!(ip.as_deref(), Some("10.0.0.1")); // audit-allow: test
+        let host = extract_ip_from_target("example.com:443");
+        assert_eq!(host.as_deref(), Some("example.com")); // audit-allow: test
+    }
+
+    #[test]
+    fn extract_ip_handles_bracketed_ipv6() {
+        let got = extract_ip_from_target("[2001:db8::1]:443");
+        assert_eq!(got.as_deref(), Some("2001:db8::1")); // audit-allow: test
+    }
 }
