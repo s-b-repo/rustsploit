@@ -104,6 +104,11 @@ pub fn list_all_modules(filter: &str) {
 /// DESCRIPTION and the REFERENCES (which carry the CVE ids) — not just the
 /// path. Searching for `CVE-2021-44228` or `log4shell` used to return
 /// nothing because neither string appears in a module path.
+///
+/// Modules that do not attack a network host are tagged in the listing
+/// (`[radio]` / `[local]`): their target is a Bluetooth device address — or
+/// nothing at all — so the operator knows that `set target AA:BB:CC:DD:EE:FF`
+/// is what they need, not an IP.
 pub fn find_modules(keyword: &str) {
     if keyword.is_empty() {
         crate::mprintln!("{}", "Keyword cannot be empty.".red());
@@ -118,17 +123,21 @@ pub fn find_modules(keyword: &str) {
 
     let mut filtered: Vec<String> = Vec::new();
     let mut with_metadata: Vec<(String, String)> = Vec::new();
+    let mut kinds: std::collections::HashMap<String, crate::module::TargetKind> =
+        std::collections::HashMap::new();
     for m in modules {
-        if m.to_lowercase().contains(&keyword_lower) {
-            filtered.push(m);
-            continue;
-        }
+        let path_hit = m.to_lowercase().contains(&keyword_lower);
         // Fall back to the module's own metadata. `info()` is cheap (the
         // registry is compile-time) and this is what makes a CVE id
         // searchable.
-        let Some(info) = crate::commands::module_info(&m) else {
+        let Some(inst) = crate::module::find(&m) else {
+            if path_hit {
+                filtered.push(m);
+            }
             continue;
         };
+        let info = inst.info();
+        kinds.insert(m.clone(), inst.capabilities().target_kind);
         let haystack = format!(
             "{} {} {} {}",
             info.name,
@@ -137,6 +146,10 @@ pub fn find_modules(keyword: &str) {
             info.authors.join(" ")
         )
         .to_lowercase();
+        if path_hit {
+            filtered.push(m);
+            continue;
+        }
         if haystack.contains(&keyword_lower) {
             with_metadata.push((m.clone(), info.name));
             filtered.push(m);
@@ -185,10 +198,20 @@ pub fn find_modules(keyword: &str) {
             }
             last_subcategory = subcategory;
             // Show the human-readable name when the match came from the
-            // metadata rather than the path.
-            match with_metadata.iter().find(|(p, _)| *p == path) {
-                Some((_, title)) => crate::mprintln!("  - {path}  —  {title}"),
-                None => crate::mprintln!("  - {path}"),
+            // metadata rather than the path, and tag the modules that do
+            // not attack a network host.
+            let title = with_metadata
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, t)| t.as_str());
+            let kind_tag = match kinds.get(&path) {
+                Some(crate::module::TargetKind::Radio) => "  [radio]".dimmed(),
+                Some(crate::module::TargetKind::Local) => "  [local]".dimmed(),
+                _ => "".dimmed(),
+            };
+            match title {
+                Some(t) => crate::mprintln!("  - {path}  —  {t}{kind_tag}"),
+                None => crate::mprintln!("  - {path}{kind_tag}"),
             }
         }
     }

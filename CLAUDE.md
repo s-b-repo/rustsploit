@@ -163,6 +163,18 @@ A module's `run()` **only ever sees a `Target::Single`** — one host per invoca
 - Random sweeps use a **ported ZMap cyclic-group permutation** (`utils/cyclic.rs`, `CyclicIp`) — stateless, O(1) memory, no repeats — instead of sample-and-dedup.
 - The per-target deadline (`setg timeout`, default 60s) is a **mass-scan safeguard**, not a general limit. It is intentionally skipped for interactive console single-target runs (`!api_mode && stdin().is_terminal()`) and for `interactive` modules, so prompts and REPLs aren't killed mid-input. Keep that gate.
 
+### Target kinds — network / radio / local
+
+Not every module attacks a network host. `Capabilities.target_kind` (`module.rs`) says what a target *means* for a module, and the framework acts on it in the scheduler (so the shell, CLI, API and MCP behave identically):
+
+| Kind | Target | Framework behaviour |
+|------|--------|---------------------|
+| `Network` (default) | IP / hostname / CIDR / host file / random sweep | Normal: the scheduler fans out. |
+| `Radio` | A Bluetooth device address (`AA:BB:CC:DD:EE:FF`) | A non-MAC target is ignored with a warning; a mass target is **refused** (a `0.0.0.0` target must never start a full-internet sweep for a module that never opens a socket). The shell asks for a device address, not an IP. |
+| `Local` | Nothing — the module works on local state (a capture file, the local controller) | Any target is ignored; the module runs on its local state. |
+
+Declare it at registration: `register_native_module!(Category::X, "name", native, radio)` / `…, native, local` (combinable with `interactive` in either order). A device address is a valid target string — `normalize_target` accepts it, because it is a target for a radio module even though it is not an IPv6 literal.
+
 ### Runtime context & options
 `ModuleCtx` carries `target`, typed `ModuleOptions`, a `CancellationToken`, `batch_mode`, `tenant_id`, an optional shared `prompt_cache`, and the rate limiter. A task-local `context::RUN_CONTEXT` scopes the `ModuleConfig` (`api_mode`, `custom_prompts`), cancel token, and prompt cache around a run.
 

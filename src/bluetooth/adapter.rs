@@ -15,7 +15,7 @@ pub async fn open_adapter() -> Result<btleplug::platform::Adapter> {
     let adapters = manager
         .adapters()
         .await
-        .map_err(|e| anyhow!("listing Bluetooth adapters failed: {e}"))?;
+        .map_err(|e| super::adapter_error(anyhow!("listing Bluetooth adapters failed: {e}")))?;
     let count = adapters.len();
     if count == 0 {
         anyhow::bail!(

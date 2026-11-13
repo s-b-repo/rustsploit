@@ -83,8 +83,15 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
         }
     };
 
+    let target_kind = module_box.capabilities().target_kind;
     let target_str = if raw_target.is_empty() {
-        if config::GLOBAL_CONFIG.has_target() {
+        if !target_kind.is_network() {
+            // A radio module (local Bluetooth radio) and a local-state module
+            // do NOT inherit the global target: that IP belongs to the last
+            // network module the operator ran and is meaningless for a
+            // module that never opens a socket.
+            String::new()
+        } else if config::GLOBAL_CONFIG.has_target() {
             match config::GLOBAL_CONFIG.get_target() {
                 Some(t) => {
                     crate::mprintln!("[*] Using global target: {}", t);
@@ -99,7 +106,14 @@ pub async fn run_module(module_path: &str, raw_target: &str, verbose: bool) -> R
         raw_target.to_string()
     };
 
-    let target = Target::parse(&target_str)?;
+    // An empty target is the "no target" state of a radio / local-state
+    // module: it works on whatever is in range (or on local state). Every
+    // other module needs a host, so an empty target is an error there.
+    let target = if target_str.is_empty() {
+        Target::Single(String::new())
+    } else {
+        Target::parse(&target_str)?
+    };
     let resolved_path = resolve_full_path(module_path).unwrap_or_else(|| module_path.to_string());
 
     crate::events::emit(crate::events::ModuleEvent::ModuleStarted {

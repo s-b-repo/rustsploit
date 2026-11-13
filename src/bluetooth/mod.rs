@@ -215,40 +215,48 @@ impl BtDevice {
     }
 }
 
+/// Turn a low-level adapter-enumeration failure into an actionable one.
+///
+/// btleplug reports a stopped BlueZ as `Unit dbus-org.bluez.service not
+/// found`, which tells the operator nothing about what to do next — and it is
+/// the single most common reason a scan finds nothing on a fresh box.
+///
+/// The caller supplies the context ("listing Bluetooth adapters failed: …"),
+/// so only the remedy is added here.
+#[cfg(feature = "bluetooth")]
+pub(crate) fn adapter_error(e: anyhow::Error) -> anyhow::Error {
+    let msg = e.to_string();
+    if msg.contains("dbus-org.bluez.service") || msg.contains("org.bluez") {
+        anyhow::anyhow!(
+            "{msg} — the BlueZ service is not reachable. Start it with \
+             'sudo systemctl enable --now bluetooth' and make sure no other tool holds the \
+             controller, then retry."
+        )
+    } else {
+        e
+    }
+}
+
 /// Parse `AA:BB:CC:DD:EE:FF` (also `-` separated) into 6 bytes.
 #[cfg(feature = "bluetooth")]
 pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
-    let parts: Vec<&str> = s.split([':', '-']).collect();
-    if parts.len() != 6 {
-        anyhow::bail!("malformed MAC address: {s}");
-    }
-    let mut out = [0u8; 6];
-    for (i, p) in parts.iter().enumerate() {
-        out[i] = u8::from_str_radix(p, 16)
-            .map_err(|e| anyhow::anyhow!("bad MAC octet '{p}' in {s}: {e}"))?;
-    }
-    Ok(out)
+    crate::utils::mac::parse_mac(s)
 }
 
 /// Format 6 bytes as `AA:BB:CC:DD:EE:FF`.
 #[cfg(feature = "bluetooth")]
 pub fn mac_to_string(bytes: &[u8; 6]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02X}:"))
-        .collect::<String>()
-        .trim_end_matches(':')
-        .to_string()
+    crate::utils::mac::mac_to_string(bytes)
 }
 
 /// Loosely validate a Bluetooth MAC (`AA:BB:CC:DD:EE:FF`, also `-` separated).
+///
+/// Delegates to [`crate::utils::mac::is_mac_addr`] so the framework and the
+/// radio modules agree on what a device address looks like — the framework
+/// has to recognise one even in a build without Bluetooth support.
 #[cfg(feature = "bluetooth")]
 pub fn is_mac_addr(s: &str) -> bool {
-    let parts: Vec<&str> = s.split([':', '-']).collect();
-    parts.len() == 6
-        && parts
-            .iter()
-            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    crate::utils::mac::is_mac_addr(s)
 }
 
 #[cfg(feature = "bluetooth")]
@@ -294,14 +302,23 @@ pub(crate) fn banner(title: &str, subtitle: &str) {
 
 /// Refuse scheduler fan-out for radio modules — the local Bluetooth radio is
 /// not a per-host resource. Prints guidance at most once per process.
+///
+/// The framework already refuses to fan a radio module out (the scheduler
+/// rejects a mass target for a `TargetKind::Radio` module), so this is the
+/// belt-and-braces net for a path that bypasses it. It stays **quiet** on a
+/// normal, correctly targeted run: the warning used to print on every single
+/// radio-module invocation, which trained operators to ignore it.
 #[cfg(feature = "bluetooth")]
 pub(crate) fn warn_no_fanout_once(module: &str) {
+    if !crate::utils::is_batch_mode() {
+        return;
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         crate::meprintln!(
-            "[!] {module} drives the LOCAL Bluetooth radio and does not fan out per network host. \
-             Mass-scan targets are ignored — run the module with no target for an interactive session."
+            "[!] {module} drives the LOCAL Bluetooth radio and does not fan out per network host — \
+             the per-host copy of this run is a no-op."
         );
     }
 }

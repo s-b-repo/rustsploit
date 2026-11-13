@@ -150,6 +150,7 @@ p256 = { version = "0.13", features = ["ecdh"], optional = true }
 hex = "0.4"
 
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-async-rw"] }
+serde_yaml_ng = "0.10.0"
 # (ratatui 0.29 transitive advisories cleared when the TUI was replaced with rustyline.)
 
 # ============================================

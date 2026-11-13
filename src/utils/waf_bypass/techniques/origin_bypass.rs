@@ -1,73 +1,110 @@
-#[cfg(test)]
+//! Origin-server reachability probe for WAF/CDN bypass.
+//!
+//! [`probe_origin`] connects directly to a candidate origin IP with the real
+//! `Host` header and returns the HTTP response, bounded by an explicit
+//! timeout. It is the shared primitive behind origin-discovery modules such as
+//! `exploits/webapps/cloudflare_origin_bypass`, which walk a list of candidate
+//! IPs and check whether any serves the target's content directly — i.e.
+//! outside the CDN/WAF, which defeats the protection entirely.
+//!
+//! For authorized penetration testing only.
+
 use reqwest::Client;
-#[cfg(test)]
 use std::time::Duration;
 
-#[cfg(test)]
+/// Probe a candidate origin: `GET scheme://origin_ip:port/` carrying
+/// `host_header` as the `Host` header, bounded by `timeout`.
+///
+/// Returns the response (body left unread for the caller to consume) on
+/// success, or an error string on failure. A timeout is surfaced as a
+/// `"timed out …"` message so callers can categorise it the same way they
+/// categorise a transport error, without depending on the HTTP client having
+/// its own deadline configured.
 pub async fn probe_origin(
     client: &Client,
+    scheme: &str,
     origin_ip: &str,
     port: u16,
     host_header: &str,
     timeout: Duration,
-) -> Option<u16> {
-    // Tests create raw reqwest clients, bypassing the shared builders that
-    // normally install the rustls CryptoProvider; without it the first
-    // request panics with "No provider set".
-    crate::utils::network::ensure_crypto_provider();
-    let scheme = if port == 443 { "https" } else { "http" };
+) -> Result<reqwest::Response, String> {
     let url = format!("{}://{}:{}/", scheme, origin_ip, port);
     match tokio::time::timeout(timeout, client.get(&url).header("Host", host_header).send()).await {
-        Ok(Ok(resp)) => Some(resp.status().as_u16()),
-        _ => None,
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => Err(format!("timed out after {timeout:?}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn probe_origin_hits_real_listener() {
-        // Deterministic success path: serve one canned HTTP/1.1 200 from a
-        // loopback listener on an ephemeral port and expect Some(200).
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        // Deterministic success path: an async loopback listener serves one
+        // canned HTTP/1.1 200 and then returns. Every wait is bounded, so the
+        // test can never hang (the previous blocking-accept version could).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local_addr");
-        let server = tokio::task::spawn_blocking(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                std::io::Write::write_all(
-                    &mut sock,
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap_or_else(|e| tracing::debug!("test server response write failed: {e}"));
-                std::io::Write::flush(&mut sock)
-                    .unwrap_or_else(|e| tracing::debug!("test server response flush failed: {e}"));
+        let server = tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(5), listener.accept()).await {
+                Ok(Ok((mut sock, _))) => {
+                    sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap_or_else(|e| tracing::debug!("test server write failed: {e}"));
+                    sock.flush()
+                        .await
+                        .unwrap_or_else(|e| tracing::debug!("test server flush failed: {e}"));
+                }
+                Ok(Err(e)) => tracing::debug!("test server accept failed: {e}"),
+                Err(_) => tracing::debug!("test server accept timed out"),
             }
         });
+
         let client = reqwest::Client::new();
         let result = probe_origin(
             &client,
+            "http",
             &addr.ip().to_string(),
             addr.port(),
             "localhost",
             Duration::from_secs(5),
         )
         .await;
-        server.await.expect("server task");
-        assert_eq!(result, Some(200));
+
+        // Bound the join so a stuck server thread can never hang the test.
+        match tokio::time::timeout(Duration::from_secs(5), server).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!("server task error: {e}"),
+            Err(_) => tracing::debug!("server task join timed out"),
+        }
+
+        assert_eq!(result.ok().map(|r| r.status().as_u16()), Some(200));
     }
 
     #[tokio::test]
     async fn probe_origin_closed_port_completes_within_timeout() {
-        // Unreachable-origin path: nothing (deterministically) listens on
-        // port 9 (discard). Assert only that the probe COMPLETES inside the
-        // deadline and yields a well-formed result. It must not be pinned to
-        // `None`: sandboxed CI networks sometimes answer closed ports with a
-        // transparent-proxy error status, which is still a valid outcome.
+        // Unreachable-origin path: nothing (deterministically) listens on port
+        // 9 (discard). Assert only that the probe COMPLETES inside its deadline
+        // — the exact outcome varies (ECONNREFUSED, or a sandbox transparent
+        // proxy answering) but it must never hang.
         let client = reqwest::Client::new();
         let started = std::time::Instant::now();
-        let result =
-            probe_origin(&client, "127.0.0.1", 9, "localhost", Duration::from_secs(2)).await;
+        let result = probe_origin(
+            &client,
+            "http",
+            "127.0.0.1",
+            9,
+            "localhost",
+            Duration::from_secs(2),
+        )
+        .await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "probe must not hang"

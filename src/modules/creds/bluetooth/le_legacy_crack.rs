@@ -92,8 +92,8 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         .filter(|v| !v.is_empty())
     {
         tokio::task::spawn_blocking(move || -> Result<Vec<[u8; 16]>> {
-            let raw = std::fs::read_to_string(&wl)
-                .map_err(|e| anyhow::anyhow!("reading {wl}: {e}"))?;
+            let raw =
+                std::fs::read_to_string(&wl).map_err(|e| anyhow::anyhow!("reading {wl}: {e}"))?;
             Ok(raw
                 .lines()
                 .filter(|l| !l.trim().is_empty())
@@ -126,14 +126,7 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
         }
         let computed = match btsnoop::extract_smp_addresses(&records) {
             Ok(addr) => crypto_extra::smp_c1(
-                tk,
-                &random,
-                &pres,
-                &preq,
-                addr.iat,
-                &addr.ia,
-                addr.rat,
-                &addr.ra,
+                tk, &random, &pres, &preq, addr.iat, &addr.ia, addr.rat, &addr.ra,
             )?,
             Err(e) => {
                 tracing::debug!(
@@ -211,5 +204,6 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 crate::register_native_module!(
     crate::module::Category::Creds,
     "bluetooth/le_legacy_crack",
-    native
+    native,
+    local
 );

@@ -145,10 +145,25 @@ impl SbcCodecInfo {
 pub enum AvdtpCapability {
     MediaTransport,
     MediaCodecSbc(SbcCodecInfo),
-    MediaCodecMpeg12Audio { layer: u8, sampling_bitmap: u8, channels_bitmap: u8, bitrate: u16, mode: u8 },
-    MediaCodecUnknown { codec_type: u8, media_type: u8, bytes: Vec<u8> },
-    ContentProtection { cp_type: u16, bytes: Vec<u8> },
-    HeaderCompression { recovery: bool },
+    MediaCodecMpeg12Audio {
+        layer: u8,
+        sampling_bitmap: u8,
+        channels_bitmap: u8,
+        bitrate: u16,
+        mode: u8,
+    },
+    MediaCodecUnknown {
+        codec_type: u8,
+        media_type: u8,
+        bytes: Vec<u8>,
+    },
+    ContentProtection {
+        cp_type: u16,
+        bytes: Vec<u8>,
+    },
+    HeaderCompression {
+        recovery: bool,
+    },
     MultiplexingFragment,
     ReedSolomon,
 }
@@ -188,7 +203,12 @@ impl AvdtpCapability {
                 media_type,
                 bytes,
             } => {
-                let mut v = vec![capability::MEDIA_CODEC, (bytes.len() + 2) as u8, *media_type, *codec_type];
+                let mut v = vec![
+                    capability::MEDIA_CODEC,
+                    (bytes.len() + 2) as u8,
+                    *media_type,
+                    *codec_type,
+                ];
                 v.extend_from_slice(bytes);
                 v
             }
@@ -265,7 +285,9 @@ pub fn parse_capabilities(payload: &[u8]) -> Result<Vec<AvdtpCapability>> {
     let mut i = 0usize;
     while i < payload.len() {
         let cap = payload[i];
-        let len = *payload.get(i + 1).ok_or_else(|| anyhow!("AVDTP cap truncated"))? as usize;
+        let len = *payload
+            .get(i + 1)
+            .ok_or_else(|| anyhow!("AVDTP cap truncated"))? as usize;
         let body = payload
             .get(i + 2..i + 2 + len)
             .ok_or_else(|| anyhow!("AVDTP cap body truncated"))?;
@@ -280,7 +302,9 @@ pub fn parse_capabilities(payload: &[u8]) -> Result<Vec<AvdtpCapability>> {
                 let specific = &body[2..];
                 match (mt, ct) {
                     (media_type::AUDIO, codec::SBC) => {
-                        out.push(AvdtpCapability::MediaCodecSbc(SbcCodecInfo::decode(specific)?));
+                        out.push(AvdtpCapability::MediaCodecSbc(SbcCodecInfo::decode(
+                            specific,
+                        )?));
                     }
                     (media_type::AUDIO, codec::MPEG_1_2_AUDIO) => {
                         if specific.len() < 6 {
@@ -362,7 +386,10 @@ pub async fn discover(channel: Arc<Mutex<L2capChannel>>) -> Result<Vec<AvdtpEndp
     Ok(endpoints)
 }
 
-pub async fn get_capabilities(channel: Arc<Mutex<L2capChannel>>, seid: u8) -> Result<Vec<AvdtpCapability>> {
+pub async fn get_capabilities(
+    channel: Arc<Mutex<L2capChannel>>,
+    seid: u8,
+) -> Result<Vec<AvdtpCapability>> {
     let mut params = vec![0u8; 2];
     params[0] = 0x00;
     params[1] = (seid << 2) | 0x02;

@@ -26,21 +26,32 @@ use super::sanitize::{sanitize_string_input, validate_safe_file_path};
 /// - Strips null bytes and control characters.
 /// - Returns sanitized text (trimmed).
 ///
+/// Returns `None` at EOF (a closed / exhausted stdin). `read_line` reports
+/// EOF as a zero-length read, which is what tells a closed stdin apart from
+/// a line the operator left empty — a REPL that loops on input needs that
+/// distinction, otherwise it spins forever on a piped stdin.
+///
 /// The blocking `stdin().read_line()` call runs on a dedicated OS thread
 /// so the tokio runtime is free to drive other tasks.
-async fn read_safe_input() -> Result<String> {
+async fn read_safe_input() -> Result<Option<String>> {
     std::io::stdout()
         .flush()
         .context("Failed to flush stdout")?;
-    let raw = tokio::task::spawn_blocking(|| {
+    let raw = tokio::task::spawn_blocking(|| -> std::io::Result<Option<String>> {
         let mut s = String::new();
-        std::io::stdin().read_line(&mut s).map(|_| s)
+        let n = std::io::stdin().read_line(&mut s)?;
+        if n == 0 { Ok(None) } else { Ok(Some(s)) }
     })
     .await
     .context("Blocking task panicked")?
     .context("Failed to read input")?;
-    let trimmed = raw.trim().to_string();
-    sanitize_string_input(&trimmed)
+    match raw {
+        Some(line) => {
+            let trimmed = line.trim().to_string();
+            Ok(Some(sanitize_string_input(&trimmed)?))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Maximum number of times any interactive prompt will retry on invalid input
@@ -53,7 +64,9 @@ pub async fn prompt_required(msg: &str) -> Result<String> {
     // Bound the retry loop so a closed/looping stdin can't pin a worker.
     for _ in 0..MAX_PROMPT_RETRIES {
         print!("{}", format!("{}: ", msg).cyan().bold());
-        let input = read_safe_input().await?;
+        let Some(input) = read_safe_input().await? else {
+            return Err(anyhow!("stdin closed — cannot prompt for '{}'", msg));
+        };
         if !input.is_empty() {
             return Ok(input);
         }
@@ -68,7 +81,9 @@ pub async fn prompt_required(msg: &str) -> Result<String> {
 /// Prompts the user for input, using a default value if empty.
 pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
-    let input = read_safe_input().await?;
+    let Some(input) = read_safe_input().await? else {
+        return Ok(default.to_string());
+    };
     Ok(if input.is_empty() {
         default.to_string()
     } else {
@@ -76,12 +91,31 @@ pub async fn prompt_default(msg: &str, default: &str) -> Result<String> {
     })
 }
 
+/// Prompts the user for input and tells EOF apart from an empty line.
+///
+/// `prompt_default` cannot make that distinction: a closed stdin and an
+/// empty line both read as "". A REPL that treats an empty command as "show
+/// help" therefore spins forever when its stdin is closed or piped — it
+/// re-prints the help millions of times and never returns. This variant
+/// returns `None` at EOF so the caller can end its loop.
+///
+/// `Ok(Some(default))` is returned for an empty line, `Ok(None)` for EOF.
+pub async fn prompt_line_eof(msg: &str, default: &str) -> Result<Option<String>> {
+    print!("{}", format!("{} [{}]: ", msg, default).cyan().bold());
+    Ok(read_safe_input()
+        .await?
+        .map(|l| if l.is_empty() { default.to_string() } else { l }))
+}
+
 /// Prompts the user for a yes/no answer.
 pub async fn prompt_yes_no(msg: &str, default_yes: bool) -> Result<bool> {
     let default = if default_yes { "y" } else { "n" };
     for _ in 0..MAX_PROMPT_RETRIES {
         print!("{}", format!("{} (y/n) [{}]: ", msg, default).cyan().bold());
-        let input = read_safe_input().await?;
+        let Some(input) = read_safe_input().await? else {
+            // stdin closed — take the default instead of retrying forever.
+            return Ok(default_yes);
+        };
         match input.to_lowercase().as_str() {
             "" => return Ok(default_yes),
             "y" | "yes" => return Ok(true),

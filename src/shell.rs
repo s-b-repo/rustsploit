@@ -1838,101 +1838,37 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     let background = rest.trim() == "-j" || rest.trim() == "--job";
 
                     if let Some(ref module_path) = ctx.current_module {
-                        // Get target from global config
-                        let target = if config::GLOBAL_CONFIG.has_target() {
-                            match config::GLOBAL_CONFIG.get_target() {
-                                Some(t) => {
-                                    println!("{}", format!("[*] Using target: {}", t).cyan());
-                                    Some(t)
-                                }
-                                None => {
-                                    println!("{}", "[!] Error getting target".red());
-                                    None
-                                }
-                            }
+                        // What does a target *mean* for this module? A radio
+                        // module addresses a Bluetooth device; a local-state
+                        // module has no target at all; everything else
+                        // attacks a network host.
+                        let target_kind = crate::module::find(module_path)
+                            .map(|m| m.capabilities().target_kind)
+                            .unwrap_or(crate::module::TargetKind::Network);
+
+                        // Resolve the target for this run.
+                        let target = resolve_run_target(target_kind).await;
+
+                        // A radio module (local Bluetooth radio) and a
+                        // local-state module legitimately run WITHOUT a
+                        // target — the radio / the local capture file is what
+                        // they work on. Only a network module needs a host.
+                        if target.is_none() && target_kind.is_network() {
+                            println!(
+                                "{}",
+                                "No target set. Use 'set target <value>' (or 't <value>') first."
+                                    .yellow()
+                            );
+                            println!("{}", "  Examples:".dimmed());
+                            println!("{}", "    set target 192.168.1.1".dimmed());
+                            println!("{}", "    set target 192.168.1.0/24".dimmed());
                         } else {
-                            None
-                        };
-
-                        // Interactive prompt if no target is set
-                        let target = if target.is_none() {
-                            println!("{}", "[!] Warning: No target set.".yellow());
-
-                            match utils::prompt_yes_no(
-                                "Do you want to provide a target address?",
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    match prompt_string_default("Enter target", "")
-                                        .await
-                                        .map_err(|e| anyhow::anyhow!("{}", e))
-                                    {
-                                        Ok(input) => match sanitize_target(&input) {
-                                            Ok(valid_target) => {
-                                                if let Err(e) =
-                                                    config::GLOBAL_CONFIG.set_target(&valid_target)
-                                                {
-                                                    println!(
-                                                        "{}",
-                                                        format!("[!] Failed to set target: {}", e)
-                                                            .red()
-                                                    );
-                                                    None
-                                                } else {
-                                                    println!(
-                                                        "{}",
-                                                        format!(
-                                                            "[*] Target set to '{}'",
-                                                            valid_target
-                                                        )
-                                                        .green()
-                                                    );
-                                                    Some(valid_target)
-                                                }
-                                            }
-                                            Err(e) => {
-                                                println!(
-                                                    "{}",
-                                                    format!("[!] Invalid target: {}", e).red()
-                                                );
-                                                None
-                                            }
-                                        },
-                                        Err(e) => {
-                                            println!(
-                                                "{}",
-                                                format!("[!] Error reading input: {}", e).red()
-                                            );
-                                            None
-                                        }
-                                    }
-                                }
-                                Ok(false) => {
-                                    match utils::prompt_yes_no(
-                                        "Continue with localhost (127.0.0.1)?",
-                                        false,
-                                    )
-                                    .await
-                                    {
-                                        Ok(true) => Some("127.0.0.1".to_string()),
-                                        _ => {
-                                            println!("{}", "[!] Execution aborted.".red());
-                                            None
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!("prompt error: {e}");
-                                    None
-                                }
-                            }
-                        } else {
-                            target
-                        };
-
-                        if let Some(ref t) = target {
+                            // An empty target is legitimate for a radio /
+                            // local-state module — it means "no target".
+                            let t = match target.clone() {
+                                Some(t) => t,
+                                None => String::new(),
+                            };
                             if background {
                                 match crate::jobs::JOB_MANAGER.spawn(
                                     module_path.clone(),
@@ -1973,11 +1909,15 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 }
                             } else {
                                 // Normal foreground execution
-                                let is_mass_scan = crate::utils::is_mass_scan_target(t);
+                                let is_mass_scan = crate::utils::is_mass_scan_target(&t);
 
                                 // Honeypot detection — enabled by default. Note that
                                 // scheduler::fanout_single also checks; this provides
                                 // interactive confirmation before the module runs.
+                                //
+                                // Only meaningful for a network host: probing a
+                                // Bluetooth device address (or the local radio)
+                                // with a TCP port scan is nonsense.
                                 let honeypot_on = crate::global_options::GLOBAL_OPTIONS
                                     .try_get("honeypot_detection")
                                     .map(|v| {
@@ -1991,7 +1931,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 let mut skip_target = false;
                                 if honeypot_on
                                     && !is_mass_scan
-                                    && crate::utils::network::quick_honeypot_check(t).await
+                                    && target_kind.is_network()
+                                    && crate::utils::network::quick_honeypot_check(&t).await
                                 {
                                     println!("{}", format!(
                                             "[!] Target {} appears to be a honeypot (11+ common ports open)",
@@ -2007,38 +1948,81 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 }
 
                                 if !skip_target {
-                                    println!(
-                                        "Running module '{}' against target '{}'",
-                                        module_path, t
-                                    );
+                                    // Say what is actually being attacked: an IP
+                                    // host, a Bluetooth device, or nothing at
+                                    // all. The old wording claimed every module
+                                    // ran "against target '127.0.0.1'" even when
+                                    // it never touched it.
+                                    match target_kind {
+                                        crate::module::TargetKind::Network => {
+                                            println!(
+                                                "Running module '{}' against target '{}'",
+                                                module_path, t
+                                            );
+                                        }
+                                        crate::module::TargetKind::Radio => {
+                                            if t.is_empty() {
+                                                println!(
+                                                    "Running module '{}' on the local Bluetooth radio (all devices in range)",
+                                                    module_path
+                                                );
+                                            } else if crate::utils::is_mass_scan_target(&t) {
+                                                // The scheduler refuses a mass
+                                                // target for a radio module;
+                                                // say what is really being
+                                                // run, not what the mass
+                                                // target claims.
+                                                println!(
+                                                    "Running module '{}' on the local Bluetooth radio",
+                                                    module_path
+                                                );
+                                            } else {
+                                                println!(
+                                                    "Running module '{}' on the local Bluetooth radio (device {})",
+                                                    module_path, t
+                                                );
+                                            }
+                                        }
+                                        crate::module::TargetKind::Local => {
+                                            println!(
+                                                "Running module '{}' on local state",
+                                                module_path
+                                            );
+                                        }
+                                    }
                                     // Terminal title: shows the running module
                                     // in the taskbar entry so an operator who
                                     // alt-tabbed away knows what is going on.
-                                    set_terminal_title(&format!("rsf: {module_path} → {t}"));
+                                    let title_target = match target_kind {
+                                        crate::module::TargetKind::Network => t.clone(),
+                                        crate::module::TargetKind::Radio => {
+                                            if t.is_empty() || crate::utils::is_mass_scan_target(&t)
+                                            {
+                                                "radio".to_string()
+                                            } else {
+                                                t.clone()
+                                            }
+                                        }
+                                        crate::module::TargetKind::Local => "local".to_string(),
+                                    };
+                                    set_terminal_title(&format!(
+                                        "rsf: {module_path} → {title_target}"
+                                    ));
                                     let outcome =
-                                        commands::run_module(module_path, t, ctx.verbose).await;
+                                        commands::run_module(module_path, &t, ctx.verbose).await;
                                     match &outcome {
                                         Ok(()) => {
                                             set_terminal_title(&format!("rsf: {module_path} ✓"));
-                                            notify_desktop_findings(module_path, t, false).await;
+                                            notify_desktop_findings(module_path, &t, false).await;
                                         }
                                         Err(e) => {
                                             set_terminal_title(&format!("rsf: {module_path} ✗"));
-                                            notify_desktop_findings(module_path, t, true).await;
+                                            notify_desktop_findings(module_path, &t, true).await;
                                             eprintln!("[!] Module failed: {:?}", e);
                                         }
                                     }
                                 }
                             }
-                        } else {
-                            println!(
-                                "{}",
-                                "No target set. Use 'set target <value>' (or 't <value>') first."
-                                    .yellow()
-                            );
-                            println!("{}", "  Examples:".dimmed());
-                            println!("{}", "    set target 192.168.1.1".dimmed());
-                            println!("{}", "    set target 192.168.1.0/24".dimmed());
                         }
                     } else {
                         println!(
@@ -2529,6 +2513,157 @@ pub fn sanitize_module_path(input: &str) -> Option<String> {
 /// Delegate to utils for consistent target validation across the codebase
 fn sanitize_target(input: &str) -> std::result::Result<String, &'static str> {
     utils::sanitize_target_simple(input)
+}
+
+/// Resolve the target for a `run`.
+///
+/// `kind` says what a target *means* for the module being run:
+///
+/// * [`TargetKind::Network`] — an IP / hostname / CIDR. The operator is
+///   asked for one when none is set (with the classic "continue with
+///   localhost?" fallback).
+/// * [`TargetKind::Radio`] — a Bluetooth device address
+///   (`AA:BB:CC:DD:EE:FF`). The module drives the LOCAL radio and never
+///   opens a socket to the target, so asking for an IP address and then
+///   falling back to "localhost (127.0.0.1)" produced a run that claimed to
+///   attack 127.0.0.1 and touched nothing at all.
+/// * [`TargetKind::Local`] — no target at all; the module works on local
+///   state (a capture file, the local controller).
+///
+/// Returns `None` when the module should run without a target.
+async fn resolve_run_target(kind: crate::module::TargetKind) -> Option<String> {
+    match kind {
+        crate::module::TargetKind::Network => {
+            // Get target from global config
+            let target = if config::GLOBAL_CONFIG.has_target() {
+                match config::GLOBAL_CONFIG.get_target() {
+                    Some(t) => {
+                        println!("{}", format!("[*] Using target: {}", t).cyan());
+                        Some(t)
+                    }
+                    None => {
+                        println!("{}", "[!] Error getting target".red());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Interactive prompt if no target is set
+            if target.is_some() {
+                return target;
+            }
+            println!("{}", "[!] Warning: No target set.".yellow());
+
+            match utils::prompt_yes_no("Do you want to provide a target address?", true).await {
+                Ok(true) => {
+                    match prompt_string_default("Enter target", "")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                    {
+                        Ok(input) => match sanitize_target(&input) {
+                            Ok(valid_target) => {
+                                if let Err(e) = config::GLOBAL_CONFIG.set_target(&valid_target) {
+                                    println!(
+                                        "{}",
+                                        format!("[!] Failed to set target: {}", e).red()
+                                    );
+                                    None
+                                } else {
+                                    println!(
+                                        "{}",
+                                        format!("[*] Target set to '{}'", valid_target).green()
+                                    );
+                                    Some(valid_target)
+                                }
+                            }
+                            Err(e) => {
+                                println!("{}", format!("[!] Invalid target: {}", e).red());
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            println!("{}", format!("[!] Error reading input: {}", e).red());
+                            None
+                        }
+                    }
+                }
+                Ok(false) => {
+                    match utils::prompt_yes_no("Continue with localhost (127.0.0.1)?", false).await
+                    {
+                        Ok(true) => Some("127.0.0.1".to_string()),
+                        _ => {
+                            println!("{}", "[!] Execution aborted.".red());
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("prompt error: {e}");
+                    None
+                }
+            }
+        }
+        crate::module::TargetKind::Radio => {
+            // A global target is only usable when it is a device address —
+            // an IP left over from the last network module is meaningless
+            // here and must not be reported as this module's target.
+            match config::GLOBAL_CONFIG.get_target() {
+                Some(t) if !t.trim().is_empty() => {
+                    let t = t.trim();
+                    if utils::is_mac_addr(t) {
+                        println!("{}", format!("[*] Using Bluetooth device: {}", t).cyan());
+                        return Some(t.to_string());
+                    }
+                    // A mass target is passed through untouched: the scheduler
+                    // refuses it with a message that explains what to do
+                    // instead. Silently downgrading "sweep the internet" to
+                    // "work on every device in range" would be misleading.
+                    if crate::utils::is_mass_scan_target(t) {
+                        return Some(t.to_string());
+                    }
+                    println!(
+                        "{}",
+                        format!(
+                            "[!] Global target '{t}' is not a Bluetooth device address — ignoring it."
+                        )
+                        .yellow()
+                    );
+                }
+                _ => {}
+            }
+            println!("{}", "[!] Warning: No Bluetooth device set.".yellow());
+            match utils::prompt_yes_no("Target a specific Bluetooth device?", false).await {
+                Ok(true) => {
+                    match prompt_string_default("Device address (AA:BB:CC:DD:EE:FF)", "").await {
+                        Ok(input) => {
+                            let mac = input.trim();
+                            if mac.is_empty() {
+                                None
+                            } else if utils::is_mac_addr(mac) {
+                                println!("{}", format!("[*] Target set to '{}'", mac).green());
+                                Some(mac.to_string())
+                            } else {
+                                println!(
+                                    "{}",
+                                    format!("[!] '{}' is not a device address.", mac).red()
+                                );
+                                None
+                            }
+                        }
+                        Err(e) => {
+                            println!("{}", format!("[!] Error reading input: {}", e).red());
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+        // Local-state module: no target exists.
+        crate::module::TargetKind::Local => None,
+    }
 }
 
 fn render_help() {

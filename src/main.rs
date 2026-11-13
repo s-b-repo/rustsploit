@@ -12,6 +12,7 @@ mod commands;
 mod config;
 mod context;
 mod desktop;
+mod frameworks;
 mod modules;
 mod native;
 

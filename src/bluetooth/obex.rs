@@ -287,11 +287,7 @@ impl ObexClient {
             let is_last = end == body.len();
             let mut pdu_payload = Vec::with_capacity(header.len() + 3 + frag.len());
             pdu_payload.extend_from_slice(&header[3..]);
-            let hid = if is_last {
-                hid::END_OF_BODY
-            } else {
-                hid::BODY
-            };
+            let hid = if is_last { hid::END_OF_BODY } else { hid::BODY };
             if is_last {
                 pdu_payload.push(hid);
                 pdu_payload.extend_from_slice(frag);
@@ -302,10 +298,7 @@ impl ObexClient {
             let resp = self.exchange(&req).await?;
             if is_last {
                 if !resp.success() {
-                    anyhow::bail!(
-                        "OBEX Put final ack not OK: opcode 0x{:02X}",
-                        resp.opcode
-                    );
+                    anyhow::bail!("OBEX Put final ack not OK: opcode 0x{:02X}", resp.opcode);
                 }
             } else if !resp.continue_() {
                 anyhow::bail!(
@@ -363,8 +356,16 @@ impl ObexClient {
                     &v[j + 2..]
                 };
                 match tag {
-                    0x01 => listing.name = String::from_utf8_lossy(tv).trim_end_matches('\0').to_string(),
-                    0x02 => listing.type_ = String::from_utf8_lossy(tv).trim_end_matches('\0').to_string(),
+                    0x01 => {
+                        listing.name = String::from_utf8_lossy(tv)
+                            .trim_end_matches('\0')
+                            .to_string()
+                    }
+                    0x02 => {
+                        listing.type_ = String::from_utf8_lossy(tv)
+                            .trim_end_matches('\0')
+                            .to_string()
+                    }
                     0x03 => {
                         if tv.len() >= 4 {
                             listing.size = Some(u32::from_be_bytes([tv[0], tv[1], tv[2], tv[3]]));

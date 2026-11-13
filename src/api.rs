@@ -435,6 +435,16 @@ pub(crate) async fn resolve_and_check(target: &str) -> Result<Vec<std::net::Sock
         return Ok(vec![]);
     }
 
+    // A Bluetooth device address is NOT a network host: there is nothing to
+    // resolve and nothing to SSRF into — the radio modules use it to address
+    // a peer over the local radio. Running it through the resolver made
+    // every API / WS / MCP request that carried a device address fail with
+    // "DNS resolution failed", so a Bluetooth module was unreachable from
+    // every transport but the shell.
+    if crate::utils::is_mac_addr(target) {
+        return Ok(vec![]);
+    }
+
     if is_blocked_target(target) {
         return Err(anyhow::anyhow!("target blocked by SSRF filter"));
     }

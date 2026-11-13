@@ -39,6 +39,50 @@ Caveats from the code:
 
 ---
 
+## Targeting — a Bluetooth module has no IP address
+
+A Bluetooth module does **not** attack a network host. It drives the *local*
+radio and addresses a peer by device address (`AA:BB:CC:DD:EE:FF`), or it
+works on purely local state (a btsnoop capture, the local controller) and has
+no target at all.
+
+The framework knows this: every Bluetooth module declares its *target kind*
+at registration time, and the framework — shell, CLI, API and MCP alike —
+behaves accordingly:
+
+| Target kind | Meaning | Declared by | Target handling |
+|-------------|---------|--------------|-----------------|
+| `radio` | A local Bluetooth peer | `register_native_module!(…, native, radio)` | The target is a device address. A non-MAC target is ignored with a warning; a mass target (`0.0.0.0`, `random`, a CIDR, a host file) is **refused** instead of starting a full-internet sweep for a module that never opens a socket. |
+| `local` | Local state only — no target | `register_native_module!(…, native, local)` | Any target is ignored — the module works on local state (a capture file, the local controller) and there is nothing to sweep. |
+| `network` | A network host (default) | every other module | Unchanged: IP / hostname / CIDR / host file / random sweep, with the scheduler's fan-out. |
+
+Concretely:
+
+```
+set target AA:BB:CC:DD:EE:FF      # a device address IS a valid target
+use exploits/bluetooth/l2cap_probe
+run                               # runs against that device
+```
+
+A device address is accepted as a target because it is a valid *target* for a
+radio module — it is not an IPv6 literal, even though it has five colons. The
+generic target parser used to claim it for IPv6 and reject it with *"Invalid
+IPv6 address format"*, which made the per-run Bluetooth targeting documented
+below unreachable; `setg target_mac` was the only working path.
+
+Modules that need a device address but do not get one fall back to
+`setg target_mac <MAC>` (see the global-options table below) or pick the
+device in-session (`wpair`'s `select <MAC>`).
+
+The split as it stands today:
+
+| Kind | Modules |
+|------|---------|
+| `radio` — a device address is a meaningful target (the module addresses a peer, or filters its discovery by one) | `wpair`, `blueforge`, `l2cap_probe`, `knob_probe`, `bias`, `bleedingtooth`, `bleedingtooth_full`, `blueborne_l2cap`, `blueborne_full`, `bluefrag`, `braktooth`, `carwhisperer`, `ctkd_probe`, `mode_confusion`, `passkey_impersonation`, `smp_invalid_curve`, `invalid_curve`, `ble_reconn_spoof`, `gatt_att_prober`, `hidp_classic`, `lmp_injector`, `avdtp_hijack`, `bluebug_obex`, `bluesnarf_obex`, `classic_pin`, `ble_scan`, `classic_scan`, `gatt_enumerate`, `mesh_authvalue`, `bleedingbit` |
+| `local` — the module acts on the local controller / a local capture file and has no peer target | `bluffs`, `injectable`, `le_legacy_crack`, `airoha_rce`, `controller_info`, `findmy_clone`, `fp_rogue_beacon`, `hid_gatt_server`, `hid_injection`, `sweyntooth` |
+
+---
+
 ## Architecture — `src/bluetooth/` core layer
 
 Every Bluetooth module is built on this layer:
@@ -138,7 +182,7 @@ All keys below live in the free-form `setg` store persisted to
 |-----|-------------|---------|-------|
 | `adapter` | every btleplug/HCI radio module (via `adapter::adapter_index`) | `setg adapter 1` | 0-based index; alias `wpair_adapter`; default 0 |
 | `scan_secs` | `ble_scan`, `classic_scan`, blueforge scans | `setg scan_secs 30` | default 15, clamped 3–300 |
-| `target_mac` | all targeted modules (via `resolve_target_mac`) | `setg target_mac AA:BB:CC:DD:EE:FF` | also settable per-run via `set target` |
+| `target_mac` | all targeted modules (via `resolve_target_mac`) | `setg target_mac AA:BB:CC:DD:EE:FF` | also settable per-run via `set target AA:BB:CC:DD:EE:FF` (a device address is a valid target — see [Targeting](#targeting--a-bluetooth-module-has-no-ip-address)) |
 | `model_id` | `wpair` | `setg model_id 0x0582FD` | hex by convention; bare hex/decimal accepted; malformed values are warned, never ignored silently |
 | `antispoofing_key` | `wpair` (via `fastpair/db`) | `setg antispoofing_key <base64>` | overrides DB/metadata lookup of the provider's Anti-Spoofing public key |
 | `gfp_metadata_url` | `wpair` (via `fastpair/db`) | `setg gfp_metadata_url https://…/?ids={}` | metadata-fetch template for model-ID → key resolution |

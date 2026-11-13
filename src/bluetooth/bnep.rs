@@ -195,11 +195,16 @@ pub fn parse_control(data: &[u8]) -> Result<BnepControl> {
     }
     match data[0] {
         BNEP_CMD_NOT_UNDERSTOOD => {
-            let cmd = *data.get(1).ok_or_else(|| anyhow!("BNEP: not-understood truncated"))?;
+            let cmd = *data
+                .get(1)
+                .ok_or_else(|| anyhow!("BNEP: not-understood truncated"))?;
             Ok(BnepControl::NotUnderstood(cmd))
         }
         BNEP_CMD_SETUP_REQ => {
-            let size = *data.get(1).ok_or_else(|| anyhow!("BNEP: setup-req missing size"))? as usize;
+            let size = *data
+                .get(1)
+                .ok_or_else(|| anyhow!("BNEP: setup-req missing size"))?
+                as usize;
             let body = &data[2..];
             if body.len() < size * 2 {
                 return Err(anyhow!("BNEP: setup-req truncated"));
@@ -213,7 +218,10 @@ pub fn parse_control(data: &[u8]) -> Result<BnepControl> {
             })
         }
         BNEP_CMD_SETUP_RESP => {
-            let size = *data.get(1).ok_or_else(|| anyhow!("BNEP: setup-resp missing size"))? as usize;
+            let size = *data
+                .get(1)
+                .ok_or_else(|| anyhow!("BNEP: setup-resp missing size"))?
+                as usize;
             let body = &data[2..];
             if body.len() < 2 + size * 2 {
                 return Err(anyhow!("BNEP: setup-resp truncated"));
@@ -251,7 +259,10 @@ pub fn parse_control(data: &[u8]) -> Result<BnepControl> {
             })
         }
         BNEP_CMD_CONNECT_REQ => {
-            let size = *data.get(1).ok_or_else(|| anyhow!("BNEP: connect-req size missing"))? as usize;
+            let size = *data
+                .get(1)
+                .ok_or_else(|| anyhow!("BNEP: connect-req size missing"))?
+                as usize;
             let src = data.get(2..2 + size).unwrap_or(&[]).to_vec();
             Ok(BnepControl::Connect {
                 uuid_size: size as u8,
@@ -259,7 +270,10 @@ pub fn parse_control(data: &[u8]) -> Result<BnepControl> {
             })
         }
         BNEP_CMD_CONNECT_RESP => {
-            let size = *data.get(1).ok_or_else(|| anyhow!("BNEP: connect-resp size missing"))? as usize;
+            let size = *data
+                .get(1)
+                .ok_or_else(|| anyhow!("BNEP: connect-resp size missing"))?
+                as usize;
             if data.len() < 4 + size {
                 return Err(anyhow!("BNEP: connect-resp truncated"));
             }
@@ -275,7 +289,11 @@ pub fn parse_control(data: &[u8]) -> Result<BnepControl> {
     }
 }
 
-pub async fn setup_connection(channel: Arc<Mutex<L2capChannel>>, src_uuid: u16, dst_uuid: u16) -> Result<()> {
+pub async fn setup_connection(
+    channel: Arc<Mutex<L2capChannel>>,
+    src_uuid: u16,
+    dst_uuid: u16,
+) -> Result<()> {
     let req = build_setup_request_2byte(src_uuid, dst_uuid);
     let result = task::spawn_blocking(move || -> Result<u16> {
         let channel = channel.blocking_lock();
@@ -358,7 +376,8 @@ mod tests {
 
     #[test]
     fn setup_resp_success() {
-        let resp = build_setup_response_2byte(BNEP_SERVICE_PANU, BNEP_SERVICE_NAP, BNEP_SETUP_SUCCESS);
+        let resp =
+            build_setup_response_2byte(BNEP_SERVICE_PANU, BNEP_SERVICE_NAP, BNEP_SETUP_SUCCESS);
         let parsed = parse_control(&resp).expect("parse");
         match parsed {
             BnepControl::SetupResponse { code, .. } => assert_eq!(code, BNEP_SETUP_SUCCESS),

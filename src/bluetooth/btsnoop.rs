@@ -203,7 +203,7 @@ pub fn extract_smp_addresses(records: &[BtsnoopRecord]) -> Result<SmpAddresses> 
         if status != 0 {
             continue;
         }
-let role = p[3];
+        let role = p[3];
         let peer_addr_type = p[4];
         let mut peer_addr = [0u8; 6];
         peer_addr.copy_from_slice(&p[5..11]);

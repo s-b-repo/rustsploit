@@ -106,6 +106,17 @@ pub fn normalize_target(raw: &str) -> Result<String> {
         return Err(anyhow!("Target contains only invalid characters"));
     }
 
+    // A Bluetooth device address (`AA:BB:CC:DD:EE:FF`) is a legitimate
+    // target: the radio modules address a peer by MAC (`set target
+    // AA:BB:CC:DD:EE:FF`, `run -t AA:BB:CC:DD:EE:FF`, see
+    // docs/Bluetooth-Framework.md). It carries five colons, so the IPv6
+    // heuristic further down claimed it and rejected it with "Invalid IPv6
+    // address format" — the documented per-run Bluetooth targeting was
+    // unreachable and `setg target_mac` was the only working path.
+    if super::mac::is_mac_addr(&sanitized) {
+        return Ok(sanitized.to_string());
+    }
+
     // CIDR notation
     if sanitized.contains('/') {
         let parts: Vec<&str> = sanitized.split('/').collect();
@@ -574,6 +585,20 @@ mod tests {
         assert_eq!(ip.as_deref(), Some("10.0.0.1")); // audit-allow: test
         let host = extract_ip_from_target("example.com:443");
         assert_eq!(host.as_deref(), Some("example.com")); // audit-allow: test
+    }
+
+    /// A Bluetooth device address must survive target normalization.
+    ///
+    /// It has five colons, so the IPv6 heuristic used to claim it and reject
+    /// it with "Invalid IPv6 address format" — which made `set target
+    /// AA:BB:CC:DD:EE:FF` (documented in docs/Bluetooth-Framework.md) fail
+    /// before it ever reached a radio module.
+    #[test]
+    fn bluetooth_address_is_a_valid_target() {
+        let out = normalize_target("AA:BB:CC:DD:EE:FF").expect("MAC should normalize"); // audit-allow: test
+        assert_eq!(out, "AA:BB:CC:DD:EE:FF"); // audit-allow: test
+        let dashed = normalize_target("aa-bb-cc-dd-ee-ff").expect("dashed MAC should normalize"); // audit-allow: test
+        assert_eq!(dashed, "aa-bb-cc-dd-ee-ff"); // audit-allow: test
     }
 
     #[test]

@@ -49,7 +49,11 @@ impl FindMyStatus {
 }
 
 /// 25-byte manufacturer-specific payload (subtype + status + 22-byte body).
-pub fn build_findmy_advertisement(subtype: u8, status_byte: u8, payload_prefix: &[u8; 22]) -> [u8; 25] {
+pub fn build_findmy_advertisement(
+    subtype: u8,
+    status_byte: u8,
+    payload_prefix: &[u8; 22],
+) -> [u8; 25] {
     let mut out = [0u8; 25];
     out[0] = subtype;
     out[1] = status_byte;
@@ -89,7 +93,10 @@ pub fn build_airtag_clone_advertisement() -> [u8; 25] {
 
 pub fn parse_findmy_advertisement(payload: &[u8]) -> Result<(u8, u8, [u8; 22])> {
     if payload.len() < 24 {
-        return Err(anyhow!("Find My payload too short: {} bytes", payload.len()));
+        return Err(anyhow!(
+            "Find My payload too short: {} bytes",
+            payload.len()
+        ));
     }
     let subtype = payload[0];
     let status_byte = payload[1];
