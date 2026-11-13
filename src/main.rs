@@ -235,6 +235,15 @@ async fn run() -> Result<()> {
             .context("--run-template requires a target: -t <host[:port]>")?;
         let default_port = template.default_port.unwrap_or(443);
         let (host, port) = crate::utils::creds_helper::parse_host_port(target, default_port)?;
+        if !frameworks::adapter_by_id(&template.framework)
+            .map(|a| a.executable())
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "the '{}' dialect cannot be executed natively — use --import-template to generate a module instead",
+                template.framework
+            ));
+        }
         let ctx = frameworks::ExecutionCtx {
             host: &host,
             port,

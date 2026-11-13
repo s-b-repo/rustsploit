@@ -325,15 +325,6 @@ pub fn adapter_ids() -> String {
         .join(", ")
 }
 
-/// Split a comma / space separated option list into a vector.
-pub(crate) fn split_list(raw: &str) -> Vec<String> {
-    raw.split([',', '\n', ' '])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
