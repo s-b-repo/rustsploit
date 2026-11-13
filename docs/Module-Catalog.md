@@ -2,11 +2,11 @@
 
 > Auto-generated from the inventory registry by `rustsploit --gen-module-catalog`. Do not edit by hand.
 
-**Total registered modules: 482**
+**Total registered modules: 483**
 
 All modules support mass scan universally — `random` / CIDR / file targets / comma-separated lists fan out through `crate::scheduler::run` regardless of the module.
 
-## scanners (74)
+## scanners (75)
 
 | Module | Description | Rank |
 |---|---|---|
@@ -76,6 +76,7 @@ All modules support mass scan universally — `random` / CIDR / file targets / c
 | `scanners/stalkroute_full_traceroute` | Advanced traceroute with ICMP, TCP, and UDP probes, OS fingerprint spoofing, and decoy packet generation. | Normal |
 | `scanners/subdomain_scanner` | Brute-forces subdomains of a target domain using DNS resolution. Supports built-in wordlist or custom wordlist file. Uses concurrent asynchronous DNS lookups for fast enumeration. | Excellent |
 | `scanners/subdomain_takeover_scanner` | Resolves the CNAME chain for a host, identifies the cloud provider, and probes the live URL for the provider-specific 'unclaimed' fingerprint. Covers CloudFront, Heroku, GitHub Pages, Azure, Netlify, WPEngine, Surge, Pantheon, Fastly, Vercel, Shopify, Statuspage, Zendesk, and 18 more. | Excellent |
+| `scanners/subdomain_wordlist` | Dictionary-based subdomain enumeration fed from the checksum-pinned SecLists catalog (default 'subdomains-top5k', ~5,000 entries) or any catalog name / local wordlist path. Streams the wordlist and resolves each candidate via concurrent async DNS lookups, with wildcard-DNS detection to suppress false positives. | Excellent |
 | `scanners/synology_dsm_disclosure` | Probes Synology DiskStation Manager web APIs reachable without | Great |
 | `scanners/tech_stack_fingerprint` | Multi-signature technology detection: Wappalyzer-style header/body/cookie fingerprinting for CMS, frameworks, JS libraries, CDNs, analytics, and server software. | Great |
 | `scanners/vnc_scanner` | Scans VNC servers for protocol version and security type enumeration. Identifies servers with 'None' authentication (no password required) and reports all supported security mechanisms. | Excellent |
