@@ -72,8 +72,29 @@ jobs:
           fi
           echo "Changed Rust files:"
           echo "$FILES" | sed 's/^/  /'
+          # rustfmt follows `mod` declarations and descends into every
+          # submodule of a file it is handed, so touching one mod.rs would drag
+          # the whole legacy subtree into the check and fail on pre-existing
+          # drift. There is no stable flag to stop that (`--skip-children` is
+          # nightly-only). So: let it recurse, but fail ONLY when a diff lands
+          # in a file the PR actually changed — legacy drift pulled in by
+          # recursion is reported for context but does not fail the gate.
           # shellcheck disable=SC2086
-          rustfmt --edition 2024 --check $FILES
+          OUT=$(rustfmt --edition 2024 --check $FILES 2>&1 || true)
+          fail=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if printf '%s\n' "$OUT" | grep -qF "${f}:"; then
+              echo "::error file=${f}::not rustfmt-clean — run: rustfmt --edition 2024 ${f}"
+              fail=1
+            fi
+          done <<< "$FILES"
+          if [ "$fail" -ne 0 ]; then
+            echo "----- rustfmt diff (changed files flagged above; legacy noise included) -----"
+            printf '%s\n' "$OUT" | sed -n '1,300p'
+            exit 1
+          fi
+          echo "All changed Rust files are rustfmt-clean."
 
   # ── Worker: whole-repo formatting drift (informational) ───────────────
   fmt-repo:
@@ -124,12 +145,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
       - name: Run clippy
         # Lints are configured at "warn" level in Cargo.toml, so this job exits
-        # 0 on the existing warning backlog and surfaces every warning as an
-        # inline PR annotation. `-D warnings` is deliberately NOT used: the
-        # backlog (unwrap/expect across ~690 modules) would make the gate
-        # permanently red and therefore ignored.
+        # 0 on the existing warning backlog (warnings print to the job log).
+        # `-D warnings` is deliberately NOT used: the backlog (unwrap/expect
+        # across ~690 modules) would make the gate permanently red and therefore
+        # ignored. Clippy still fails on a real compile error, which is the
+        # signal this worker exists to surface.
+        #
+        # NB: cargo has no `github` message format (`--message-format` accepts
+        # human/short/json/...), so the previous `--message-format=github` made
+        # clippy abort on argument parsing before it ever linted.
         run: |
-          cargo clippy --all-targets --no-deps --message-format=github
+          cargo clippy --all-targets --no-deps
 
   # ── Worker: build (feature matrix) ────────────────────────────────────
   build:

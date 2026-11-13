@@ -216,17 +216,16 @@ pub fn resolve_full_path(module_path: &str) -> Option<String> {
     }
     // 3. Leaf match — the final segment of the entry name (`ssh_bruteforce`).
     //    First match wins so the result is deterministic.
-    if let Some(e) = module::registered()
-        .find(|e| e.name.rsplit('/').next().unwrap_or(e.name) == path)
+    if let Some(e) =
+        module::registered().find(|e| e.name.rsplit('/').next().unwrap_or(e.name) == path)
     {
         return Some(canonical(e));
     }
     // 4. `category/leaf` — leaf match restricted to one category.
     if let Some((cat, leaf)) = path.split_once('/')
         && let Some(category) = module::Category::parse(cat)
-        && let Some(e) = module::registered().find(|e| {
-            e.category == category && e.name.rsplit('/').next().unwrap_or(e.name) == leaf
-        })
+        && let Some(e) = module::registered()
+            .find(|e| e.category == category && e.name.rsplit('/').next().unwrap_or(e.name) == leaf)
     {
         return Some(canonical(e));
     }

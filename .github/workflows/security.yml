@@ -117,23 +117,10 @@ jobs:
         with:
           languages: rust
           queries: security-extended
-          # Building the crate is expensive; CodeQL's autobuild would have to
-          # rediscover the whole dependency graph. We build it ourselves in
-          # the analyze step instead.
-          build-mode: manual
-      - name: Install toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with:
-          workspaces: . -> target
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
-      - name: Build
-        run: cargo build --locked
+          # CodeQL's Rust extractor works from source and ONLY supports
+          # build-mode "none" (it rejects manual/autobuild for Rust), so there
+          # is no toolchain install or `cargo build` to do here.
+          build-mode: none
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@52cf1852265d99e9bea071b03366fc777a602909
         with:
@@ -152,16 +139,17 @@ jobs:
         with:
           tool: cargo-cyclonedx
       - name: Generate CycloneDX SBOM
+        # cargo-cyclonedx has no --outfile flag; --override-filename sets the
+        # output base name (writing sbom.json / sbom.xml, or sbom.cdx.*).
         run: |
-          cargo cyclonedx --format json --all-features --outfile sbom.json
-          cargo cyclonedx --format xml  --all-features --outfile sbom.xml
+          cargo cyclonedx --format json --all-features --override-filename sbom
+          cargo cyclonedx --format xml  --all-features --override-filename sbom
       - name: Upload SBOM
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: sbom
-          path: |
-            sbom.json
-            sbom.xml
+          path: sbom.*
+          if-no-files-found: warn
           retention-days: 30
           if-no-files-found: error
 

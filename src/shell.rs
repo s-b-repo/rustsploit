@@ -7,8 +7,8 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
-use rustyline::validate::Validator;
 use rustyline::history::FileHistory;
+use rustyline::validate::Validator;
 use rustyline::{Config, Editor, Helper};
 use url::Url;
 
@@ -740,14 +740,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                             // "Did you mean" — the operator almost always has a
                             // typo or a fragment, not a module that does not exist.
                             if let Some(suggestion) = crate::commands::suggest_module(&safe_path) {
-                                println!(
-                                    "{}",
-                                    format!("  Did you mean: {}?", suggestion).yellow()
-                                );
-                                println!(
-                                    "{}",
-                                    "  (use it with: use <path>)".dimmed()
-                                );
+                                println!("{}", format!("  Did you mean: {}?", suggestion).yellow());
+                                println!("{}", "  (use it with: use <path>)".dimmed());
                             }
                         }
                     } else {
@@ -1098,14 +1092,10 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         )
                         .await
                         {
-                            Ok(()) => println!(
-                                "{}",
-                                "[+] Notification sent.".green()
-                            ),
-                            Err(e) => println!(
-                                "{}",
-                                format!("[!] Notification failed: {}", e).red()
-                            ),
+                            Ok(()) => println!("{}", "[+] Notification sent.".green()),
+                            Err(e) => {
+                                println!("{}", format!("[!] Notification failed: {}", e).red())
+                            }
                         }
                     } else {
                         let description = crate::desktop::describe().await;
@@ -2024,9 +2014,7 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                     // Terminal title: shows the running module
                                     // in the taskbar entry so an operator who
                                     // alt-tabbed away knows what is going on.
-                                    set_terminal_title(&format!(
-                                        "rsf: {module_path} → {t}"
-                                    ));
+                                    set_terminal_title(&format!("rsf: {module_path} → {t}"));
                                     let outcome =
                                         commands::run_module(module_path, t, ctx.verbose).await;
                                     match &outcome {
@@ -2893,8 +2881,14 @@ fn render_help_topic(topic: &str) {
              An unknown name produces a 'did you mean' suggestion.",
             &[
                 ("use scanners/proxy_scanner", "Load the open-proxy scanner"),
-                ("use proxy_scanner", "Same thing — matched on the final segment"),
-                ("use exploits/bluetooth/knob_probe", "Bluetooth module, full path"),
+                (
+                    "use proxy_scanner",
+                    "Same thing — matched on the final segment",
+                ),
+                (
+                    "use exploits/bluetooth/knob_probe",
+                    "Bluetooth module, full path",
+                ),
                 ("u exploits/dos/slowloris", "Alias `u` works identically"),
             ],
             &["info", "modules", "find", "back", "run"],

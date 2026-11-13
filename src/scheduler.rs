@@ -68,11 +68,15 @@ impl Default for SchedulerLimits {
 /// loop never even reaches the first host. The cancel token is the only thing
 /// that can escape it, so the scan simply stops responding.
 ///
-/// There is deliberately NO upper bound: mass scanning is a legitimate
-/// research workflow and the operator picks the concurrency that fits their
-/// target set.
+/// The operator picks the concurrency that fits their target set — there is no
+/// *policy* ceiling. The only cap is `tokio::sync::Semaphore::MAX_PERMITS`
+/// (`usize::MAX >> 3`): `Semaphore::new` asserts `permits <= MAX_PERMITS` and
+/// panics above it, so an absurd value such as `setg concurrency <usize::MAX>`
+/// would abort the process the moment any mass scan built its semaphore. Real
+/// scans are unaffected (no operator sets billions of permits); this only
+/// removes the crash on a physically impossible value.
 fn effective_concurrency(requested: usize) -> usize {
-    usize::max(requested, 1)
+    requested.clamp(1, tokio::sync::Semaphore::MAX_PERMITS)
 }
 
 impl SchedulerLimits {

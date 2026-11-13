@@ -37,8 +37,9 @@ pub async fn atomic_write_json<T: Serialize>(path: &Path, data: &T) -> Result<()
         .await
         .context("writing temp file")?;
     // Flush to disk before the rename so a crash cannot leave the target
-    // pointing at a file whose contents were never persisted.
-    let _ = file.sync_all().await;
+    // pointing at a file whose contents were never persisted. If the flush
+    // fails we must NOT rename: propagate and leave the previous target intact.
+    file.sync_all().await.context("syncing temp file to disk")?;
     drop(file);
     tokio::fs::rename(&tmp, path)
         .await

@@ -111,8 +111,9 @@ pub enum Urgency {
 }
 
 impl Urgency {
-    /// The freedesktop urgency is a `u32` on the wire.
-    fn as_u32(self) -> u32 {
+    /// The freedesktop `urgency` hint is a BYTE (`y`), carried inside the
+    /// `Notify` `hints` dict — it is not a positional argument.
+    fn as_byte(self) -> u8 {
         match self {
             Urgency::Low => 0,
             Urgency::Normal => 1,
@@ -134,13 +135,7 @@ pub async fn notifications_available() -> bool {
         return false;
     };
     matches!(
-        zbus::Proxy::new(
-            &conn,
-            NOTIFY_BUS_NAME,
-            NOTIFY_OBJECT_PATH,
-            NOTIFY_INTERFACE
-        )
-        .await,
+        zbus::Proxy::new(&conn, NOTIFY_BUS_NAME, NOTIFY_OBJECT_PATH, NOTIFY_INTERFACE).await,
         Ok(_)
     )
 }
@@ -162,25 +157,31 @@ pub async fn notify(title: &str, body: &str, urgency: Urgency) -> anyhow::Result
     let conn = zbus::Connection::session()
         .await
         .map_err(|e| anyhow::anyhow!("session bus unavailable: {e}"))?;
-    let proxy = zbus::Proxy::new(
-        &conn,
-        NOTIFY_BUS_NAME,
-        NOTIFY_OBJECT_PATH,
-        NOTIFY_INTERFACE,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("notification service unavailable: {e}"))?;
+    let proxy = zbus::Proxy::new(&conn, NOTIFY_BUS_NAME, NOTIFY_OBJECT_PATH, NOTIFY_INTERFACE)
+        .await
+        .map_err(|e| anyhow::anyhow!("notification service unavailable: {e}"))?;
+
+    // org.freedesktop.Notifications.Notify has signature `susssasa{sv}i`:
+    // argument 7 is the `hints` dict (a{sv}), NOT a bare integer, and the
+    // urgency is a BYTE hint carried inside it. Passing a u32 in the hints
+    // slot yields signature `susssasui`, which no notification daemon
+    // exposes, so the call fails at runtime on both Plasma and GNOME.
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+
+    let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
+    hints.insert("urgency", Value::U8(urgency.as_byte()));
 
     // Owned Strings throughout: a tuple of `&str` borrows the session bus
     // lifetime and does not satisfy the D-Bus body type.
     let notification = (
         "rustsploit".to_string(), // app_name
-        0u32,                    // replaces_id
+        0u32,                     // replaces_id
         "rustsploit".to_string(), // app_icon
         title.to_string(),        // summary
         body.to_string(),         // body
-        vec![String::new()],      // actions
-        urgency.as_u32(),         // urgency
+        Vec::<String>::new(),     // actions (none)
+        hints,                    // hints: a{sv}, carries urgency as a byte
         0i32,                     // expire_timeout (0 = server default)
     );
     // `Proxy::call` is generic over the reply type; `Notify` returns the

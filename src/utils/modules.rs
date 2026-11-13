@@ -57,11 +57,7 @@ pub fn list_all_modules(filter: &str) {
             crate::mprintln!("{}", format!("No modules in category '{filter}'.").red());
             crate::mprintln!(
                 "{}",
-                format!(
-                    "Categories: {}",
-                    crate::commands::categories().join(", ")
-                )
-                .dimmed()
+                format!("Categories: {}", crate::commands::categories().join(", ")).dimmed()
             );
         }
         return;
@@ -96,7 +92,10 @@ pub fn list_all_modules(filter: &str) {
         }
         crate::mprintln!();
     }
-    crate::mprintln!("\n{}", format!("Total: {} modules", selected.len()).dimmed());
+    crate::mprintln!(
+        "\n{}",
+        format!("Total: {} modules", selected.len()).dimmed()
+    );
 }
 
 /// Finds and displays modules matching a keyword.
@@ -150,10 +149,7 @@ pub fn find_modules(keyword: &str) {
             format!("No modules found matching '{}'.", keyword).red()
         );
         if let Some(suggestion) = crate::commands::suggest_module(keyword) {
-            crate::mprintln!(
-                "{}",
-                format!("  Did you mean: {}?", suggestion).yellow()
-            );
+            crate::mprintln!("{}", format!("  Did you mean: {}?", suggestion).yellow());
         }
         return;
     }

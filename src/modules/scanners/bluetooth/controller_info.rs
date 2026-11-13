@@ -46,9 +46,8 @@ const LE_FEATURE_LE_EXTENDED_ADVERTISING: u8 = 12;
 const LE_FEATURE_LE_PERIODIC_ADVERTISING: u8 = 13;
 
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
-pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: local controller probe, ctx unused
-    use std::time::Duration;
-
+pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> {
+    // audit-allow: local controller probe, ctx unused
     use crate::bluetooth::hci::HciSocket;
     use crate::module::{Finding, FindingKind};
 
@@ -56,8 +55,11 @@ pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: lo
     let mut outcome = ModuleOutcome::ok();
 
     let dev_id = crate::bluetooth::adapter::adapter_index();
-    let mut sock = HciSocket::open(u16::try_from(dev_id).unwrap_or(0), crate::bluetooth::hci::HCI_CHANNEL_RAW)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut sock = HciSocket::open(
+        u16::try_from(dev_id).unwrap_or(0),
+        crate::bluetooth::hci::HCI_CHANNEL_RAW,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     crate::mprintln!("[*] Probing local controller (hci{dev_id}) ...");
 
@@ -98,7 +100,9 @@ pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: lo
         Ok(v) => {
             crate::mprintln!(
                 "[+] LE ACL payload {} bytes, {} packets (total {})",
-                v.0, v.1, v.2
+                v.0,
+                v.1,
+                v.2
             );
             le_buffer = Some(v);
         }
@@ -115,13 +119,25 @@ pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: lo
     // controller must also accept host ACL data, which the "Host Supported
     // Commands" bit and the BR/EDR feature set imply.
     capable.push("L2CAP/ACL-level probing (raw L2CAP sockets)");
-    if features.get(FEATURE_ENCRYPTION as usize).map(|b| b & 0x01 != 0) == Some(true) {
+    if features
+        .get(FEATURE_ENCRYPTION as usize)
+        .map(|b| b & 0x01 != 0)
+        == Some(true)
+    {
         capable.push("encrypted link creation (KNOB / BIAS surface)");
     }
-    if features.get(FEATURE_RSSI_WITH_INQUIRY as usize).map(|b| b & 0x01 != 0) == Some(true) {
+    if features
+        .get(FEATURE_RSSI_WITH_INQUIRY as usize)
+        .map(|b| b & 0x01 != 0)
+        == Some(true)
+    {
         capable.push("inquiry with RSSI");
     }
-    if features.get(FEATURE_EXTENDED_INQUIRY_RESPONSE as usize).map(|b| b & 0x01 != 0) == Some(true) {
+    if features
+        .get(FEATURE_EXTENDED_INQUIRY_RESPONSE as usize)
+        .map(|b| b & 0x01 != 0)
+        == Some(true)
+    {
         capable.push("extended inquiry response");
     }
     if le_supported {
@@ -131,17 +147,26 @@ pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: lo
     }
 
     if let Some(f) = le_features {
-        if f.get(LE_FEATURE_LE_EXTENDED_ADVERTISING as usize).map(|b| b & 0x01 != 0) == Some(true) {
+        if f.get(LE_FEATURE_LE_EXTENDED_ADVERTISING as usize)
+            .map(|b| b & 0x01 != 0)
+            == Some(true)
+        {
             capable.push("LE Extended Advertising (AUX_ADV_IND)");
         } else {
             incapable.push("LE Extended Advertising (AUX_ADV_IND)");
         }
-        if f.get(LE_FEATURE_LE_PERIODIC_ADVERTISING as usize).map(|b| b & 0x01 != 0) == Some(true) {
+        if f.get(LE_FEATURE_LE_PERIODIC_ADVERTISING as usize)
+            .map(|b| b & 0x01 != 0)
+            == Some(true)
+        {
             capable.push("LE Periodic Advertising");
         } else {
             incapable.push("LE Periodic Advertising");
         }
-        if f.get(LE_FEATURE_LE_ENCRYPTED_CONNECTION as usize).map(|b| b & 0x01 != 0) == Some(true) {
+        if f.get(LE_FEATURE_LE_ENCRYPTED_CONNECTION as usize)
+            .map(|b| b & 0x01 != 0)
+            == Some(true)
+        {
             capable.push("LE encrypted connections");
         }
     }
@@ -157,11 +182,10 @@ pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: lo
             crate::mprintln!("    [-] {c}");
         }
     }
-    if let Some((acl_len, num_packets, total_packets)) = le_buffer {
+    if let Some((acl_len, ..)) = le_buffer {
         crate::mprintln!(
             "[*] Largest LE ACL payload: {acl_len} bytes — bounds any LE L2CAP COC segment."
         );
-        let _ = (num_packets, total_packets);
     }
 
     outcome.findings.push(Finding {
@@ -193,7 +217,6 @@ pub async fn run(_ctx: &ModuleCtx) -> Result<ModuleOutcome> { // audit-allow: lo
 
     // Keep the socket alive until the reads are done.
     drop(sock);
-    let _ = Duration::from_millis(0);
     Ok(outcome)
 }
 

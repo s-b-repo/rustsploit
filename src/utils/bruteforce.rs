@@ -934,7 +934,9 @@ where
     let stop_mode = resolve_stop_mode(config.stop_on_success);
     let found_users: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
-    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
+    let semaphore = Arc::new(Semaphore::new(
+        config.concurrency.clamp(1, Semaphore::MAX_PERMITS),
+    ));
 
     // Progress reporter
     let stats_p = stats.clone();
@@ -1387,7 +1389,9 @@ where
         format!("[*] Subnet {} — {} hosts to scan", target, count).cyan()
     );
 
-    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
+    let semaphore = Arc::new(Semaphore::new(
+        config.concurrency.clamp(1, Semaphore::MAX_PERMITS),
+    ));
     let stats_checked = Arc::new(AtomicUsize::new(0));
     let stats_found = Arc::new(AtomicUsize::new(0));
     // Collect discovered (host, user, pass) hits so the caller can surface them

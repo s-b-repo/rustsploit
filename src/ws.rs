@@ -2159,7 +2159,9 @@ async fn rpc_list_results() -> RpcResult {
         .or_else(crate::context::current_tenant_id)
         .unwrap_or_default();
     let results_dir = crate::config::results_dir().join(&tenant_id);
-    if !results_dir.exists() {
+    // Async metadata probe instead of the blocking `Path::exists()`: an Err
+    // (missing dir or unreadable) means "no results", matching the old check.
+    if tokio::fs::metadata(&results_dir).await.is_err() {
         return Ok(json!({"files": [], "total": 0}));
     }
     let mut files = Vec::new();
@@ -2204,14 +2206,14 @@ async fn rpc_get_result(params: &Value) -> RpcResult {
     let tenant_results_dir = crate::config::results_dir().join(&tenant_id);
     let path = tenant_results_dir.join(filename);
     // Path traversal protection: verify resolved path stays within the tenant's results dir
-    let canonical_path = path.canonicalize().map_err(|e| {
+    let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|e| {
         rpc_err(
             "NOT_FOUND",
             format!("Result file '{}' not found: {}", filename, e),
         )
     })?;
-    let canonical_dir = tenant_results_dir
-        .canonicalize()
+    let canonical_dir = tokio::fs::canonicalize(&tenant_results_dir)
+        .await
         .map_err(|e| rpc_err("IO_ERROR", format!("Results directory error: {}", e)))?;
     if !canonical_path.starts_with(&canonical_dir) {
         return Err(rpc_err(
@@ -2219,7 +2221,9 @@ async fn rpc_get_result(params: &Value) -> RpcResult {
             "Path traversal detected in result filename",
         ));
     }
-    let meta = std::fs::symlink_metadata(&path).map_err(|e| rpc_err("IO_ERROR", e.to_string()))?;
+    let meta = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|e| rpc_err("IO_ERROR", e.to_string()))?;
     if meta.file_type().is_symlink() {
         return Err(rpc_err("SECURITY", "Symlink result files are not allowed"));
     }
