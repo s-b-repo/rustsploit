@@ -160,9 +160,21 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.notes.outputs.version }}"
           if [ "${{ matrix.cross }}" = "true" ]; then
+            # The cross container ships gcc, not the clang/lld that
+            # .cargo/config.toml pins, so override the host and target linkers to
+            # the container's gcc toolchain and drop the lld link-arg. These are
+            # forwarded into the container by Cross.toml's passthrough list.
             cargo install cross --locked
+            RUSTFLAGS="-C debuginfo=0" \
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
             cross build --release --locked --target ${{ matrix.target }} --no-default-features
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            # macOS ships clang + ld64 but not lld; build without the lld link-arg.
+            RUSTFLAGS="-C debuginfo=0" cargo build --release --locked --target ${{ matrix.target }}
           else
+            # Native Linux keeps clang + lld (installed above); lld's lower link
+            # memory avoids an OOM on the fat-LTO release link on a small runner.
             cargo build --release --locked --target ${{ matrix.target }}
           fi
           mkdir -p "dist/rustsploit-${VERSION}"

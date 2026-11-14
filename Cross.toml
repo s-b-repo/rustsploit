@@ -1,0 +1,15 @@
+# `cross` configuration for the release pipeline's cross-compiled targets
+# (currently aarch64-unknown-linux-gnu).
+#
+# The repository's `.cargo/config.toml` pins `linker = "clang"` for the Linux
+# targets, and the release workflow adds `-C link-arg=-fuse-ld=lld`. The cross
+# Docker image carries gcc, not clang/lld, so the release `build` job overrides
+# the host and target linkers (CARGO_TARGET_*_LINKER) to the container's gcc
+# toolchain and drops the lld link-arg (RUSTFLAGS). Those env vars must be
+# forwarded into the container, which is what this passthrough list does.
+[build.env]
+passthrough = [
+    "RUSTFLAGS",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+]
