@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# =============================================================================
+# generate-release-notes.sh — render release notes from the commit log
+#
+# Usage:
+#   scripts/generate-release-notes.sh <version> [--from <git-ref>]
+#
+#   <version>       the version being released, e.g. "0.6.0" or "v0.6.0"
+#   --from <ref>    the ref the release starts from. Defaults to the most
+#                   recent tag reachable from HEAD (so "what changed since
+#                   the last release").
+#
+# Output: markdown on stdout.
+#
+# Commits are classified by conventional-commit prefix:
+#   feat / fix / perf / refactor / docs / test / build / ci / chore / security
+# Anything else lands under "Other changes".
+#
+# Hand-written fragments in changelogs/fragments/*.md are appended verbatim
+# under "Notable changes" — use them for anything the commit subject cannot
+# express (migration steps, security advisories, breaking changes).
+# =============================================================================
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+VERSION="${1:-}"
+FROM_REF=""
+
+if [ -z "$VERSION" ]; then
+    echo "usage: $0 <version> [--from <git-ref>]" >&2
+    exit 2
+fi
+shift
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --from) FROM_REF="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '/^# /p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [ -z "$FROM_REF" ]; then
+    FROM_REF=$(git describe --tags --abbrev=0 2>/dev/null || true)
+fi
+
+# ----------------------------------------------------------------------------
+# Collect commits
+#
+# `-z` + a NUL terminator is essential: `git log` normally separates commits
+# with a NEWLINE, which would bleed into the next record and shift every
+# field by one. NUL cannot appear in a commit message, so it is unambiguous.
+# Fields inside a record are separated by \x1f (unit separator).
+#
+# The log is fed in through process substitution rather than a command
+# substitution: bash silently strips NUL bytes out of `$(...)`, which would
+# destroy the record framing. Process substitution also keeps the `while` loop
+# in the current shell, so the GROUP_ITEMS array survives.
+# ----------------------------------------------------------------------------
+LOG_ARGS=()
+if [ -n "$FROM_REF" ]; then
+    LOG_ARGS+=("${FROM_REF}..HEAD")
+fi
+
+if [ ${#LOG_ARGS[@]} -eq 0 ]; then
+    RANGE_DESC="(all commits)"
+else
+    RANGE_DESC="${FROM_REF}..HEAD"
+fi
+
+# ----------------------------------------------------------------------------
+# Classify
+# ----------------------------------------------------------------------------
+declare -A GROUP_TITLE=(
+    [feat]="Features"
+    [fix]="Fixes"
+    [perf]="Performance"
+    [refactor]="Refactoring"
+    [docs]="Documentation"
+    [test]="Tests"
+    [build]="Build"
+    [ci]="CI"
+    [chore]="Chores"
+    [security]="Security"
+)
+GROUP_ORDER=(security fix perf feat refactor docs test build ci chore other)
+
+declare -A GROUP_ITEMS
+
+while IFS= read -r -d $'\0' record; do
+    [ -z "$record" ] && continue
+    subject=$(printf '%s' "$record" | tr '\037' '\n' | sed -n '2p')
+    body=$(printf '%s' "$record" | tr '\037' '\n' | sed -n '3,$p')
+    [ -z "$subject" ] && continue
+    subject=$(printf '%s' "$subject" | sed 's/[[:space:]]*$//')
+
+    # Skip merge bookkeeping and version-bump commits.
+    case "$subject" in
+        "Merge "*|"Revert "*|"Bump version"*) continue ;;
+    esac
+
+    group="other"
+    if printf '%s' "$subject" | grep -qE '^[a-z]+(\([^)]*\))?!?: '; then
+        prefix=$(printf '%s' "$subject" | sed -E 's/^([a-z]+)(\([^)]*\))?!?:.*/\1/')
+        if [ -n "${GROUP_TITLE[$prefix]+x}" ]; then
+            group="$prefix"
+        fi
+    fi
+
+    # Strip the conventional-commit prefix from the rendered line.
+    clean=$(printf '%s' "$subject" | sed -E 's/^[a-z]+(\([^)]*\))?!?: //')
+
+    # Breaking change marker.
+    is_breaking=0
+    if printf '%s' "$subject" | grep -qE '^[a-z]+(\([^)]*\))?!: '; then
+        is_breaking=1
+    fi
+    if printf '%s\n%s' "$subject" "$body" | grep -qiE 'BREAKING[ -]CHANGE'; then
+        is_breaking=1
+    fi
+
+    scope=""
+    if printf '%s' "$subject" | grep -qE '^[a-z]+\([^)]+\)!?: '; then
+        scope=$(printf '%s' "$subject" | sed -E 's/^[a-z]+\(([^)]*)\)!?:.*/\1/')
+    fi
+
+    line="- ${clean}"
+    [ -n "$scope" ] && line="- **${scope}**: ${clean}"
+    [ "$is_breaking" -eq 1 ] && line="${line} **(breaking)**"
+
+    GROUP_ITEMS[$group]="${GROUP_ITEMS[$group]:-}${line}
+"
+done < <(git log -z --format='%H%x1f%s%x1f%b' --no-merges ${LOG_ARGS[@]+"${LOG_ARGS[@]}"})
+
+# ----------------------------------------------------------------------------
+# Render
+# ----------------------------------------------------------------------------
+DISPLAY_VERSION="$VERSION"
+case "$DISPLAY_VERSION" in
+    v*) ;;
+    *) DISPLAY_VERSION="v${DISPLAY_VERSION}" ;;
+esac
+
+echo "# Rustsploit ${DISPLAY_VERSION}"
+echo
+echo "## Highlights"
+echo
+echo "_Generated by \`scripts/generate-release-notes.sh\` from ${RANGE_DESC}._"
+echo
+
+TOTAL=0
+for g in "${GROUP_ORDER[@]}"; do
+    items="${GROUP_ITEMS[$g]:-}"
+    [ -z "$items" ] && continue
+    count=$(printf '%s' "$items" | grep -c '^' || true)
+    TOTAL=$((TOTAL + count))
+    title="${GROUP_TITLE[$g]:-Other changes}"
+    echo "### ${title}"
+    echo
+    printf '%s' "$items"
+    echo
+done
+
+if [ "$TOTAL" -eq 0 ]; then
+    echo "### Changes"
+    echo
+    echo "- No conventional-commit entries in this range."
+    echo
+fi
+
+# Hand-written fragments.
+if [ -d changelogs/fragments ]; then
+    shopt -s nullglob
+    # README.md explains the mechanism; it is not a release note.
+    fragments=()
+    for f in changelogs/fragments/*.md; do
+        [ "$(basename "$f")" = "README.md" ] && continue
+        fragments+=("$f")
+    done
+    shopt -u nullglob
+    if [ ${#fragments[@]} -gt 0 ]; then
+        echo "### Notable changes"
+        echo
+        for f in "${fragments[@]}"; do
+            # Strip a leading markdown H1 so the fragment does not nest a
+            # heading inside a heading.
+            sed '1{/^# /d;}' "$f"
+            echo
+        done
+    fi
+fi
+
+echo "---"
+echo
+echo "**Full changelog**: https://github.com/s-b-repo/rustsploit/compare/${FROM_REF:-HEAD}...${DISPLAY_VERSION}"

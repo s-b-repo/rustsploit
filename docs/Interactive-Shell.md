@@ -16,9 +16,13 @@ All commands are **case-insensitive** and support aliases:
 |---------|-----------|-------------|
 | `help` | `h`, `?` | Show command reference |
 | `modules` | `list`, `ls`, `m` | List all discovered modules |
-| `find <kw>` | `search`, `f`, `f1` | Search modules by keyword |
-| `use <path>` | `u <path>` | Select a module |
+| `modules <category>` | | List the modules in one category (`exploits`, `scanners`, `creds`, …) |
+| `find <kw>` | `search`, `f`, `f1` | Search modules by path, name, description or CVE id |
+| `use <path>` | `u <path>` | Select a module. Accepts a full path, a short name, or a leaf name (`use ssh_bruteforce`); an unknown name produces a "did you mean" suggestion |
 | `info [path]` | `i` | Show module metadata (CVE, author, rank) |
+| `history` | `hist` | Show the persisted command history, newest first (Ctrl-R searches it live) |
+| `desktop` | `de` | Show the detected desktop environment and whether desktop notifications are available |
+| `desktop notify <msg>` | | Send a test desktop notification (KDE Plasma / GNOME) |
 | `back` | `b`, `clear`, `reset` | Deselect current module and target |
 | `set target <val>` | `t <val>` | Set target (IPv4/IPv6/hostname/CIDR) |
 | `set subnet <CIDR>` | `sn <CIDR>` | Set target to a CIDR subnet |
@@ -303,6 +307,15 @@ Key details from `src/shell.rs`:
 - **`execute_single_command()`** — the command dispatcher, extracted as a standalone function for resource script support.
 - **`split_command` / `resolve_command`** — normalize shortcut aliases to canonical keys.
 - **`render_help()`** — prints the colorized command table.
-- **Selective persistence** — `global_options.json`, `creds.json`, workspace files, and loot are persisted across sessions in `~/.rustsploit/`. Transient shell state (selected module, current target, verbose flag) is reset on exit.
+- **`build_prompt()`** — the prompt shows the selected module's leaf name (`rsf(knob_probe)> `), so the operator always knows what `run` will act on.
+- **Selective persistence** — `global_options.json`, `creds.json`, workspace files, and loot are persisted across sessions in `~/.rustsploit/`. Transient shell state (selected module, current target, verbose flag) is reset on exit. The command history lives in `~/.rustsploit/history.txt` and is saved on **every** exit path, including an abnormal one.
+
+### Navigation
+
+- **Tab completion** shows a **list** rather than cycling through candidates one at a time — the registry holds ~700 modules, and circular completion meant pressing Tab dozens of times to reach the one you wanted. The candidate list is capped at 64 entries.
+- Module paths complete after `use `, `u `, `info ` and `run `; command names complete on the last whitespace-separated token, so `set tar<TAB>` completes the value instead of replacing the whole line.
+- **Short names work everywhere.** `use ssh_bruteforce`, `use creds/generic/ssh_bruteforce` and `use exploits/bluetooth/knob_probe` all resolve, and `use` and `info` agree on how a name is interpreted.
+- **A wrong name suggests the right one.** `use` and `run` both print a "did you mean" line, preferring a suffix match over an edit distance.
+- **`find` searches more than the path** — the module name, description and CVE references too, so `find CVE-2021-44228` or `find log4shell` finds something.
 
 Tab completion and command history are powered by `rustyline`.

@@ -240,6 +240,14 @@ pub fn escape_shell_command(cmd: &str) -> String {
 }
 
 /// Escapes command for JavaScript/Node.js execSync context.
+///
+/// The output is a JS **string literal body**, so it passes through two
+/// parsers: the JavaScript parser (which un-escapes it) and then the shell
+/// (which un-escapes it again). A single backslash only survives one layer:
+/// `\$` inside a JS string literal is an *identity escape* and evaluates to a
+/// bare `$`, which the shell then treats as command substitution. To make the
+/// shell see `\$`, the JS source must contain `\\$`, so the shell metachar
+/// escapes below emit **two** backslashes.
 pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
     let mut escaped = String::with_capacity(cmd.len().saturating_mul(2));
     for ch in cmd.chars() {
@@ -259,8 +267,6 @@ pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
                         | ';'
                         | '>'
                         | '<'
-                        | '('
-                        | ')'
                         | '{'
                         | '}'
                         | '['
@@ -272,7 +278,9 @@ pub fn escape_js_command(cmd: &str, escape_shell_meta: bool) -> String {
                         | '#'
                 ) =>
             {
-                escaped.push('\\');
+                // Two backslashes: one is consumed by the JS parser, the other
+                // survives into the shell, where it escapes the metachar.
+                escaped.push_str("\\\\");
                 escaped.push(ch);
             }
             _ => escaped.push(ch),
@@ -354,5 +362,48 @@ pub fn build_base_url(scheme: &str, host: &str, port: u16) -> String {
         format!("{}://{}", scheme, host)
     } else {
         format!("{}://{}:{}", scheme, host, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `escape_js_command` output is a JS **string literal body**, so it is
+    /// un-escaped twice: once by the JavaScript parser, once by the shell.
+    ///
+    /// A single backslash does not survive both layers: `\$` inside a JS
+    /// string literal is an identity escape and evaluates to a bare `$`,
+    /// which the shell then treats as command substitution. The shell escape
+    /// must therefore be doubled so the shell receives `\$`.
+    #[test]
+    fn js_shell_escape_survives_the_js_parser() {
+        let escaped = escape_js_command("echo $(id)", true);
+
+        // Step 1: the JS parser consumes one backslash level. `\\` -> `\`.
+        let after_js = escaped.replace("\\\\", "\\");
+        let carries = after_js.contains("\\$");
+        assert!(carries, "escaped dollar missing: {after_js}"); // audit-allow: test
+
+        // Step 2: the shell consumes the remaining backslash, yielding a
+        // literal `$` — NOT a command substitution.
+        let after_shell = after_js.replace("\\$", "$");
+        assert_eq!(after_shell, "echo $(id)"); // audit-allow: test
+        let bare = after_shell.contains("\\$");
+        assert!(!bare, "shell must not see an unescaped metachar"); // audit-allow: test
+    }
+
+    /// Without the shell escaping the command must pass through unchanged.
+    #[test]
+    fn js_escape_without_shell_meta_leaves_metachars_alone() {
+        let escaped = escape_js_command("echo $(id)", false);
+        assert_eq!(escaped, "echo $(id)"); // audit-allow: test
+    }
+
+    /// The double-quote and backslash escapes must keep working.
+    #[test]
+    fn js_escape_escapes_quotes_and_backslashes() {
+        let escaped = escape_js_command("say \"hi\"", false);
+        assert_eq!(escaped, "say \\\"hi\\\""); // audit-allow: test
     }
 }

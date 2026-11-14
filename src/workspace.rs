@@ -120,10 +120,15 @@ impl Workspace {
     }
 
     /// Load a workspace from disk (or create empty).
-    /// Updates name first, then data, so they stay consistent.
+    /// Updates name and data together so they stay consistent.
     /// On I/O failure, starts with empty data for the new workspace
     /// rather than leaving stale data from the old one.
     async fn load(&self, name: &str) {
+        // Serialize against concurrent saves: `save()` snapshots (name, data)
+        // and writes them to `file_path(name)`. If a save interleaves with
+        // this load's name/data swap, the old workspace's data can be written
+        // into the NEW workspace's file.
+        let _save_guard = self.save_mutex.lock().await;
         let path = self.file_path(name);
         let data = if path.exists() {
             match tokio::fs::read_to_string(&path).await {
@@ -159,10 +164,19 @@ impl Workspace {
         } else {
             WorkspaceData::default()
         };
-        // Update name and data together to maintain consistency.
-        // Name is updated AFTER data is successfully loaded/defaulted.
-        *self.name.write().await = name.to_string();
-        *self.data.write().await = data;
+        // Update name and data TOGETHER. The previous code took the two write
+        // guards in two separate statements, so the `name` guard was released
+        // before the `data` guard was acquired. In that window a concurrent
+        // `save()` could snapshot (new_name, OLD_data) and write the old
+        // workspace's hosts/services into the new workspace's file — silent
+        // engagement-data corruption with no error surfaced. Holding both
+        // guards at once closes the window.
+        {
+            let mut name_g = self.name.write().await;
+            let mut data_g = self.data.write().await;
+            *name_g = name.to_string();
+            *data_g = data;
+        }
     }
 
     /// Save current workspace to disk.

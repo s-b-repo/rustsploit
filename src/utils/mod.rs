@@ -7,6 +7,7 @@ pub mod creds_helper;
 pub mod cyclic;
 pub mod exploit_helper;
 pub mod http_ua;
+pub mod mac;
 pub mod modules;
 pub mod network;
 pub mod parallel;
@@ -86,6 +87,9 @@ pub use sanitize::{
 
 // --- target.rs ---
 pub use target::{is_domain, normalize_target, prompt_domain_target};
+
+// --- mac.rs ---
+pub use mac::is_mac_addr;
 
 // --- safe_io.rs ---
 pub use safe_io::read_http_body_capped;

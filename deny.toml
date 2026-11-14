@@ -1,0 +1,82 @@
+# cargo-deny policy for RustSploit.
+#
+# RustSploit is MIT licensed. Every dependency in the tree is under a
+# permissive, OSI-approved licence — no GPL, no AGPL, no proprietary terms.
+# This file makes that an enforced invariant rather than a convention: a
+# dependency that arrives under a copyleft or unknown licence fails the
+# `cargo deny check licenses` gate.
+#
+# Reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# The crate pulls in a vendored OpenSSL and a vendored libssh2; those build
+# scripts are noisy but harmless. Third-party crates are not vendored.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+all-features = true
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Do not silently ignore an advisory that matches our dependency tree. An
+# ignored advisory must carry a written reason and a removal date.
+ignore = []
+
+[licenses]
+version = 2
+# The project itself is MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD-1-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is file-level copyleft. Acceptable as a dependency, and it is
+    # what one transitive crate currently uses.
+    "MPL-2.0",
+    # LGPL-2.1-or-later appears only behind an "OR" in an existing
+    # MIT/Apache-2.0 expression, so it is never the licence actually chosen.
+    "LGPL-2.1-or-later",
+]
+confidence-threshold = 0.8
+# A licence we have not explicitly vetted must fail rather than warn.
+exceptions = []
+
+[bans]
+# Multiple versions of the same crate are tolerated for now: the crypto and
+# TLS stacks pull in overlapping versions, and unifying them is a deliberate
+# upgrade task rather than something to block a PR over.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # These have no business in an offensive-security tool.
+    { name = "openssl-sys", reason = "use the vendored native-tls / rustls stacks instead" },
+    { name = "libgit2-sys", reason = "no VCS access is needed at runtime" },
+    { name = "curl-sys", reason = "use reqwest" },
+    { name = "git2", reason = "no VCS access is needed at runtime" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Only crates.io. A dependency fetched from a random git URL is a supply-chain
+# hole, and this framework already ships a PQ-encrypted API — the dependency
+# chain deserves the same scrutiny.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -159,16 +159,27 @@ pub async fn discover_live(cidr: &IpNetwork, tool: Prescan) -> Result<Vec<String
             );
             Ok(Vec::new())
         }
+        Ok(CaptureResult::Truncated) => {
+            // The output was cut short, so the live-host list we collected is
+            // only a prefix of the range. An empty result makes the caller
+            // fall back to per-IP fan-out over the full range rather than
+            // silently scanning a subset.
+            Ok(Vec::new())
+        }
         Err(e) => Err(e.context("prescan tool exited with error")),
     }
 }
 
-/// Outcome of a capture run. `TimedOut` is kept distinct from
-/// `Completed(vec![])` so the caller can tell "scan hit the wall clock and was
-/// killed" apart from "scan finished and found nothing live".
+/// Outcome of a capture run. `TimedOut` and `Truncated` are kept distinct
+/// from `Completed(vec![])` so the caller can tell "scan hit the wall clock
+/// and was killed" and "scan output was cut short" apart from "scan finished
+/// and found nothing live". Both non-`Completed` states must make the caller
+/// fall back to per-IP fan-out — trusting a partial live-host list would
+/// silently scan only the hosts that happened to appear before the cut.
 enum CaptureResult {
     Completed(Vec<String>),
     TimedOut,
+    Truncated,
 }
 
 fn port_spec_from_options() -> String {
@@ -248,6 +259,44 @@ async fn run_capture_lines(
         .ok_or_else(|| anyhow::anyhow!("prescan stdout missing"))?;
     let mut reader = BufReader::new(stdout).lines();
 
+    // Drain stderr CONCURRENTLY with the stdout read loop.
+    //
+    // The child's stderr is a pipe with a ~64 KiB buffer. masscan/zmap write a
+    // progress line roughly once a second, so the pipe fills within a minute.
+    // If nobody is reading stderr while we read stdout, the child blocks in
+    // write(2), stops producing stdout, and our read loop blocks forever —
+    // the classic subprocess-pipe deadlock. The scan then hangs until the
+    // wall timeout, the child is killed, and the prescan silently degrades to
+    // a full per-IP fan-out (the operator sees "no live hosts" instead of an
+    // error).
+    //
+    // This task keeps draining until EOF, but stops ACCUMULATING past the cap
+    // so a chatty tool cannot OOM us.
+    const MAX_STDERR_CAPTURE: usize = 64 * 1024;
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf.len() < MAX_STDERR_CAPTURE {
+                            let take = std::cmp::min(n, MAX_STDERR_CAPTURE - buf.len());
+                            buf.extend_from_slice(&chunk[..take]);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::trace!("prescan stderr read error: {e}");
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+
     let mut ips: Vec<String> = Vec::new();
     let mut bytes_seen = 0usize;
     let mut truncated = false;
@@ -301,34 +350,33 @@ async fn run_capture_lines(
         if timed_out {
             return Ok(CaptureResult::TimedOut);
         }
-        // Truncated: return the partial live-host list we did manage to read.
-        ips.sort();
-        ips.dedup();
-        crate::mprintln!(
-            "[+] prescan: {} live host{} discovered (output truncated).",
-            ips.len(),
-            if ips.len() == 1 { "" } else { "s" }
+        // Truncated: the live-host list we managed to read is only a PREFIX
+        // of the range. Returning it as authoritative would mean the module
+        // only ever ran against the hosts seen before the cap — a silent
+        // partial scan. Report it as truncated so the caller falls back to
+        // per-IP fan-out over the whole range.
+        crate::meprintln!(
+            "[!] prescan output truncated — falling back to per-IP fan-out \
+             (the partial live-host list cannot be trusted as complete)."
         );
-        return Ok(CaptureResult::Completed(ips));
+        return Ok(CaptureResult::Truncated);
     }
 
-    // Capture stderr before waiting for exit
-    let stderr_output = if let Some(mut stderr) = child.stderr.take() {
-        let mut err_buf = String::new();
-        use tokio::io::AsyncReadExt;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stderr.read_to_string(&mut err_buf),
-        )
-        .await
-        {
-            Ok(Ok(n)) => tracing::trace!("Read {} bytes from prescan stderr", n),
-            Ok(Err(e)) => tracing::trace!("stderr read error: {e}"),
-            Err(e) => tracing::trace!("stderr read timed out: {e}"),
-        }
-        err_buf
-    } else {
-        String::new()
+    // Collect stderr captured by the concurrent drain task. The task reads to
+    // EOF, so it completes once the child exits (or the pipe closes).
+    let stderr_output = match stderr_task {
+        Some(task) => match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => {
+                tracing::trace!("prescan stderr task failed: {e}");
+                String::new()
+            }
+            Err(e) => {
+                tracing::trace!("prescan stderr collection timed out: {e}");
+                String::new()
+            }
+        },
+        None => String::new(),
     };
 
     let status = child.wait().await.context("wait for prescan")?;

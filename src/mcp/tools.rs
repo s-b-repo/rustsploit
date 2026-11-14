@@ -420,86 +420,6 @@ fn prompts_param(args: &Value) -> HashMap<String, String> {
     map
 }
 
-/// Reduce an attacker-supplied prompt value to a bare host suitable for the
-/// SSRF block-check chain (`is_blocked_target` / `ssrf_gate`), which expect an
-/// IP/hostname rather than a full URL. Returns None when the value can't yield
-/// a host to check.
-fn extract_ssrf_candidate(raw: &str) -> Option<String> {
-    let val = raw.trim();
-    if val.is_empty() {
-        return None;
-    }
-    // Strip a scheme (e.g. http://, https://, ftp://, gopher://) if present.
-    let after_scheme = match val.find("://") {
-        Some(idx) => &val[idx + 3..],
-        None => val,
-    };
-    // Strip any userinfo (user:pass@host).
-    let after_userinfo = match after_scheme.rsplit_once('@') {
-        Some((_, host_part)) => host_part,
-        None => after_scheme,
-    };
-    // Cut off path / query / fragment.
-    let authority = after_userinfo
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_userinfo);
-    // Strip a trailing :port. Handle bracketed IPv6 literals separately.
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        // [ipv6]:port or [ipv6]
-        stripped.split(']').next().unwrap_or(stripped)
-    } else if authority.matches(':').count() > 1 {
-        // Bare IPv6 literal (e.g. `::1`, `fe80::1`) — there is no port to strip;
-        // keep the whole authority. Without this, `rsplit_once(':')` on `::1`
-        // yields host `":"`, which sails past the loopback/link-local SSRF
-        // filters (mirrors the single-colon guard in api::is_blocked_target).
-        authority
-    } else if let Some((h, _port)) = authority.rsplit_once(':') {
-        // Only treat the suffix as a port if it is all digits; otherwise the
-        // colon is part of the host (shouldn't happen for unbracketed) — keep
-        // the whole authority.
-        let port_part = &authority[h.len() + 1..];
-        if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
-            h
-        } else {
-            authority
-        }
-    } else {
-        authority
-    };
-    let host = host.trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
-/// Heuristic: does this prompt value look like a URL or a host:port pair?
-/// Used so we only apply the SSRF check to non-destination keys when the value
-/// is plausibly a network destination, avoiding false rejection of unrelated
-/// string options.
-fn looks_like_url_or_hostport(raw: &str) -> bool {
-    let val = raw.trim();
-    if val.is_empty() {
-        return false;
-    }
-    if val.contains("://") {
-        return true;
-    }
-    // host:port form (e.g. 169.254.169.254:80) — digits after the last colon.
-    if let Some((host, port)) = val.rsplit_once(':') {
-        if !host.is_empty()
-            && !port.is_empty()
-            && port.chars().all(|c| c.is_ascii_digit())
-            && !host.contains(' ')
-        {
-            return true;
-        }
-    }
-    false
-}
-
 // ===========================================================================
 // Individual tool handlers
 // ===========================================================================
@@ -621,28 +541,37 @@ async fn handle_run_module(args: &Value) -> ToolResult {
     // same block-check chain we applied to `target` over every prompt value that
     // looks like a URL or host so a benign `target` can't be used to smuggle a
     // blocked metadata/link-local/loopback destination past the filter.
-    for (key, raw) in prompts.iter() {
-        let lkey = key.to_ascii_lowercase();
-        let is_dest_key = matches!(
-            lkey.as_str(),
-            "url" | "host" | "endpoint" | "lhost" | "rhost" | "remote_host" | "target_url" | "uri"
+    //
+    // Shared with the REST/WS RPC path (`api::validate_prompt_destinations`)
+    // so the two transports cannot drift apart and leave one of them
+    // unguarded.
+    if let Err((_code, msg)) = crate::api::validate_prompt_destinations(&prompts).await {
+        return ToolResult::error(msg);
+    }
+
+    // ---- Validate the MERGED prompt map -------------------------------
+    //
+    // `custom_prompts` has the highest precedence, so a value arriving via the
+    // `prompts` map OVERRIDES the equivalent top-level argument. Re-apply the
+    // range/path checks to the merged map.
+    if let Some(of) = prompts.get("output_file")
+        && crate::api::is_unsafe_output_file(of)
+    {
+        return ToolResult::error(
+            "Invalid 'output_file': path traversal or dotfile not permitted".into(),
         );
-        if let Some(candidate) = extract_ssrf_candidate(raw) {
-            // Always check explicit destination keys; for other keys only check
-            // values that actually parse as a URL or host:port to avoid false
-            // rejections of unrelated string options.
-            if is_dest_key || looks_like_url_or_hostport(raw) {
-                if crate::api::is_blocked_target(&candidate) {
-                    return ToolResult::error(format!(
-                        "Prompt '{}' targets a blocked address range",
-                        key
-                    ));
-                }
-                if let Err((code, msg)) = crate::api::ssrf_gate(&candidate).await {
-                    return ToolResult::error(format!("Prompt '{}' [{}]: {}", key, code, msg));
-                }
-            }
-        }
+    }
+    if let Some(p) = prompts.get("port")
+        && let Ok(port) = p.parse::<u32>()
+        && !(1..=65535).contains(&port)
+    {
+        return ToolResult::error("Invalid 'port': must be an integer 1-65535".into());
+    }
+    if let Some(c) = prompts.get("concurrency")
+        && let Ok(conc) = c.parse::<u32>()
+        && (conc == 0 || conc > 4096)
+    {
+        return ToolResult::error("Invalid 'concurrency': must be 1-4096".into());
     }
 
     // If caller supplied a per-call 'timeout' (seconds), push it into the

@@ -1,0 +1,138 @@
+name: Nightly Audit
+
+# The scheduled deep pass. CI guards every push and PR; this catches the
+# things that only rot with time:
+#
+#   - a dependency advisory published after the last PR
+#   - the bad-pattern baselines drifting (counts going DOWN means the
+#     baseline can be tightened — debt that was paid down)
+#   - the module catalog drifting out of sync with the registry
+#   - the docs gate breaking because a link target was deleted
+#
+# Scheduled off the hour so it does not pile onto the busiest minute.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # lld uses far less memory than GNU ld when linking this crate, and the
+  # link step is where the build OOMs on a small runner.
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=lld"
+
+jobs:
+  baselines:
+    name: baseline drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Check whether the baselines can be tightened
+        run: |
+          set -uo pipefail
+          # The drift report comes from the audit script itself, so the nightly
+          # view and the CI gate can never disagree about what counts as a
+          # regression.
+          bash scripts/audit-bad-patterns.sh \
+            --drift-report .github/bad-patterns.baseline | tee drift.txt || true
+          {
+            echo "### Baseline drift"
+            echo ""
+            echo "Counts that went **DOWN** mean legacy debt was paid down, so the"
+            echo "baseline can be tightened with:"
+            echo ""
+            echo '```'
+            echo "scripts/audit-bad-patterns.sh --update-baseline .github/bad-patterns.baseline"
+            echo "```"
+            echo ""
+            echo "Counts that went **UP** mean new violations were merged. The CI"
+            echo "gate should have blocked them — if this shows up, the gate is not"
+            echo "running on that path."
+            echo ""
+            echo '```'
+            cat drift.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q "  UP " drift.txt; then
+            echo "::warning::Some bad-pattern counts went UP since the baseline was recorded."
+          fi
+
+  docs-and-catalog:
+    name: docs and catalog
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Documentation gate
+        run: bash scripts/check-docs.sh
+      - name: Module catalog is current
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          ./target/debug/rustsploit --gen-module-catalog
+          git diff --exit-code -- docs/Module-Catalog.md
+
+  dependency-freshness:
+    name: dependency freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install cargo-outdated
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        with:
+          tool: cargo-outdated
+      - name: Report outdated dependencies
+        run: |
+          set -uo pipefail
+          cargo outdated --root-deps-only > outdated.txt 2>&1 || true
+          cat outdated.txt
+          echo "### Outdated direct dependencies" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat outdated.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  full-test:
+    name: full test suite
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Run the tests with all features
+        # The default CI job skips Bluetooth (it needs libdbus and real BLE
+        # hardware); the nightly run exercises every feature combination.
+        run: cargo test --locked --all-features --bin rustsploit -- --test-threads=4

@@ -172,14 +172,23 @@ pub enum SmpPdu {
     PairingConfirm([u8; 16]),
     PairingRandom([u8; 16]),
     PairingFailed(u8),
-    PairingPublicKey { x: [u8; 32], y: [u8; 32] },
+    PairingPublicKey {
+        x: [u8; 32],
+        y: [u8; 32],
+    },
     PairingDhKeyCheck([u8; 16]),
     SecurityRequest(u8),
     EncryptionInformation([u8; 16]),
-    MasterIdentification { ediv: u16, rand: [u8; 8] },
+    MasterIdentification {
+        ediv: u16,
+        rand: [u8; 8],
+    },
     SigningInformation([u8; 16]),
     KeypressNotification(u8),
-    Unknown { opcode: u8, params: Vec<u8> },
+    Unknown {
+        opcode: u8,
+        params: Vec<u8>,
+    },
 }
 
 pub fn parse_smp_pdu(data: &[u8]) -> Result<SmpPdu> {
@@ -191,7 +200,10 @@ pub fn parse_smp_pdu(data: &[u8]) -> Result<SmpPdu> {
     match op {
         opcode::PAIRING_REQUEST | opcode::PAIRING_RESPONSE => {
             if p.len() < 6 {
-                return Err(anyhow!("SMP: pairing req/resp too short: {} bytes", p.len()));
+                return Err(anyhow!(
+                    "SMP: pairing req/resp too short: {} bytes",
+                    p.len()
+                ));
             }
             let tup = (p[0], p[1], p[2], p[3], p[4], p[5]);
             Ok(if op == opcode::PAIRING_REQUEST {
@@ -216,8 +228,12 @@ pub fn parse_smp_pdu(data: &[u8]) -> Result<SmpPdu> {
                 }
             })
         }
-        opcode::PAIRING_CONFIRM => require_len(op, p, 16).map(|b| SmpPdu::PairingConfirm(to_array(b))),
-        opcode::PAIRING_RANDOM => require_len(op, p, 16).map(|b| SmpPdu::PairingRandom(to_array(b))),
+        opcode::PAIRING_CONFIRM => {
+            require_len(op, p, 16).map(|b| SmpPdu::PairingConfirm(to_array(b)))
+        }
+        opcode::PAIRING_RANDOM => {
+            require_len(op, p, 16).map(|b| SmpPdu::PairingRandom(to_array(b)))
+        }
         opcode::PAIRING_FAILED => require_len(op, p, 1).map(|b| SmpPdu::PairingFailed(b[0])),
         opcode::PAIRING_PUBLIC_KEY => require_len(op, p, 64).map(|b| {
             let mut x = [0u8; 32];
@@ -230,8 +246,9 @@ pub fn parse_smp_pdu(data: &[u8]) -> Result<SmpPdu> {
             require_len(op, p, 16).map(|b| SmpPdu::PairingDhKeyCheck(to_array(b)))
         }
         opcode::SECURITY_REQUEST => require_len(op, p, 1).map(|b| SmpPdu::SecurityRequest(b[0])),
-        opcode::ENCRYPTION_INFORMATION => require_len(op, p, 16)
-            .map(|b| SmpPdu::EncryptionInformation(to_array(b))),
+        opcode::ENCRYPTION_INFORMATION => {
+            require_len(op, p, 16).map(|b| SmpPdu::EncryptionInformation(to_array(b)))
+        }
         opcode::MASTER_IDENTIFICATION => require_len(op, p, 10).map(|b| {
             let ediv = u16::from_le_bytes([b[0], b[1]]);
             let mut rand = [0u8; 8];
@@ -253,7 +270,10 @@ pub fn parse_smp_pdu(data: &[u8]) -> Result<SmpPdu> {
 
 fn require_len<'a>(op: u8, p: &'a [u8], want: usize) -> Result<&'a [u8]> {
     if p.len() < want {
-        return Err(anyhow!("SMP opcode 0x{op:02X}: want {want} bytes, have {}", p.len()));
+        return Err(anyhow!(
+            "SMP opcode 0x{op:02X}: want {want} bytes, have {}",
+            p.len()
+        ));
     }
     Ok(&p[..want])
 }
@@ -327,10 +347,17 @@ pub fn h7(salt: &[u8; 16], mac: &[u8; 16]) -> [u8; 16] {
     aes_cmac(salt, mac)
 }
 
-pub async fn connect_le_smp(bdaddr: &str) -> Result<L2capChannel> {
+/// Open the LE Security Manager Protocol channel.
+///
+/// SMP rides on the FIXED L2CAP CID 0x0006, not on a PSM. Passing 0x0006 in
+/// the PSM field made the kernel look for a dynamic channel in the PSM
+/// range, which cannot succeed — so this path never connected on a stock
+/// kernel. The address type also matters: an LE peer is addressed as a
+/// public (1) or random (2) address, not as a BR/EDR address (0).
+pub async fn connect_le_smp(bdaddr: &str, addr_type: u8) -> Result<L2capChannel> {
     let owned = bdaddr.to_string();
     tokio::task::spawn_blocking(move || -> Result<L2capChannel> {
-        L2capChannel::connect(&owned, L2CAP_CID_SMP)
+        L2capChannel::connect_cid(&owned, L2CAP_CID_SMP, addr_type)
     })
     .await
     .map_err(|e| anyhow!("SMP L2CAP connect task: {e}"))?
@@ -338,7 +365,11 @@ pub async fn connect_le_smp(bdaddr: &str) -> Result<L2capChannel> {
 
 pub async fn send_via_btleplug(bdaddr: &str, pdu: &[u8]) -> Result<SmpPdu> {
     let inputs = (bdaddr, pdu);
-    tracing::debug!("send_via_btleplug stub: bdaddr={} pdu_len={}", (inputs.0), (inputs.1).len());
+    tracing::debug!(
+        "send_via_btleplug stub: bdaddr={} pdu_len={}",
+        (inputs.0),
+        (inputs.1).len()
+    );
     anyhow::bail!(
         "send_via_btleplug: SMP via GATT is rare on real peers — use a second radio or kernel-bypass controller for live LE SMP"
     )
@@ -350,7 +381,14 @@ mod tests {
 
     #[test]
     fn pairing_request_layout() {
-        let p = build_pairing_request(io_cap::DISPLAY_YES_NO, 0, auth_req::SC | auth_req::BONDING, 16, 0x07, 0x07);
+        let p = build_pairing_request(
+            io_cap::DISPLAY_YES_NO,
+            0,
+            auth_req::SC | auth_req::BONDING,
+            16,
+            0x07,
+            0x07,
+        );
         assert_eq!(p[0], opcode::PAIRING_REQUEST);
         assert_eq!(p[1], io_cap::DISPLAY_YES_NO);
         assert_eq!(p[3], auth_req::SC | auth_req::BONDING);
@@ -416,7 +454,10 @@ mod tests {
         let cap = [0u8; 7];
         let a1 = [0u8; 7];
         let a2 = [0u8; 7];
-        assert_eq!(f6(&w, &n1, &n2, &r, &cap, &a1, &a2), f6(&w, &n1, &n2, &r, &cap, &a1, &a2));
+        assert_eq!(
+            f6(&w, &n1, &n2, &r, &cap, &a1, &a2),
+            f6(&w, &n1, &n2, &r, &cap, &a1, &a2)
+        );
         assert_eq!(g2(&w, &n1, &n2), g2(&w, &n1, &n2));
         assert_eq!(h6(&w, &[0, 1, 2, 3]), h6(&w, &[0, 1, 2, 3]));
         assert_eq!(h7(&w, &n1), h7(&w, &n1));

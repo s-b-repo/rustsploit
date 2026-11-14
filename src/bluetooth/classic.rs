@@ -222,6 +222,155 @@ pub async fn connect_device(conn: &zbus::Connection, mac: &str) -> Result<()> {
         .map_err(|e| anyhow!("Connect {mac}: {e}"))
 }
 
+/// A service record as BlueZ reports it through `Device1.GetServices`.
+///
+/// This is the kernel's own view of the peer's SDP database, so it is far
+/// more complete than the framework's minimal SDP client (which only asks
+/// for the service-class list and the protocol descriptor list, and whose
+/// multi-PDU responses were historically truncated).
+#[derive(Debug, Clone, Default)]
+pub struct BluezService {
+    pub uuid: String,
+    pub primary: bool,
+    pub classes: Vec<String>,
+    pub profiles: Vec<String>,
+}
+
+/// Fetch the peer's full service list through BlueZ.
+///
+/// `Device1.GetServices` returns the record set the kernel already parsed
+/// from the peer's SDP responses, so it costs one D-Bus call and no radio
+/// time.
+pub async fn get_services(conn: &zbus::Connection, mac: &str) -> Result<Vec<BluezService>> {
+    let path = device_path_for(conn, mac).await?;
+    let proxy = zbus::Proxy::new(conn, BLUEZ_SERVICE, path, "org.bluez.Device1")
+        .await
+        .map_err(|e| anyhow!("Device1 proxy: {e}"))?;
+    let raw: zbus::zvariant::OwnedValue = proxy
+        .call("GetServices", &())
+        .await
+        .map_err(|e| anyhow!("GetServices {mac}: {e}"))?;
+    // `GetServices` returns a JSON string.
+    let text = <String as TryFrom<zbus::zvariant::OwnedValue>>::try_from(raw)
+        .map_err(|e| anyhow!("GetServices {mac}: {e}"))?;
+    parse_bluez_services(&text)
+}
+
+/// Parse the JSON that `Device1.GetServices` returns.
+///
+/// BlueZ serialises the record set as JSON; the framework parses it here
+/// rather than pulling in a JSON dependency for one call site.
+fn parse_bluez_services(json: &str) -> Result<Vec<BluezService>> {
+    let mut out = Vec::new();
+    // The payload is a JSON array of objects. Rather than pull in a JSON
+    // parser for this one call, walk the array and pull out the fields that
+    // matter: the service UUID, whether it is primary, and the profile
+    // class list.
+    let mut rest = json.trim();
+    if !rest.starts_with('[') {
+        return Err(anyhow!("GetServices did not return an array"));
+    }
+    rest = &rest[1..];
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let object = &after[..end];
+        rest = &after[end + 1..];
+
+        let uuid = json_string_field(object, "UUID").unwrap_or_default();
+        if uuid.is_empty() {
+            continue;
+        }
+        let primary = json_bool_field(object, "Primary").unwrap_or(false);
+        let classes = json_string_array_field(object, "Class");
+        let profiles = json_string_array_field(object, "ProtocolDescriptorList");
+        out.push(BluezService {
+            uuid,
+            primary,
+            classes,
+            profiles,
+        });
+    }
+    Ok(out)
+}
+
+/// Pull a quoted string field out of a JSON object fragment.
+fn json_string_field(object: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = object.find(&needle)?;
+    let after = &object[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let value = after[colon + 1..].trim_start();
+    let value = value.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(value[..end].to_string())
+}
+
+/// Pull a boolean field out of a JSON object fragment.
+fn json_bool_field(object: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let pos = object.find(&needle)?;
+    let after = &object[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let value = after[colon + 1..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Pull an array-of-strings field out of a JSON object fragment.
+fn json_string_array_field(object: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    let Some(pos) = object.find(&needle) else {
+        return Vec::new();
+    };
+    let after = &object[pos + needle.len()..];
+    let Some(colon) = after.find(':') else {
+        return Vec::new();
+    };
+    let value = after[colon + 1..].trim_start();
+    if !value.starts_with('[') {
+        return Vec::new();
+    }
+    let Some(end) = value.find(']') else {
+        return Vec::new();
+    };
+    let inner = &value[1..end];
+    let mut out = Vec::new();
+    let mut rest = inner;
+    while let Some(start) = rest.find('"') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('"') else {
+            break;
+        };
+        out.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// Connect a single profile of a device.
+///
+/// `Device1.ConnectProfile` lets the operator pick the profile rather than
+/// connecting everything, which is what a probe that must not disturb an
+/// existing connection needs.
+pub async fn connect_profile(conn: &zbus::Connection, mac: &str, profile: &str) -> Result<()> {
+    let path = device_path_for(conn, mac).await?;
+    let proxy = zbus::Proxy::new(conn, BLUEZ_SERVICE, path, "org.bluez.Device1")
+        .await
+        .map_err(|e| anyhow!("Device1 proxy: {e}"))?;
+    proxy
+        .call::<_, _, ()>("ConnectProfile", &profile)
+        .await
+        .map_err(|e| anyhow!("ConnectProfile {profile} on {mac}: {e}"))
+}
+
 /// Remove pairing/bonding info for a device.
 pub async fn remove_device(conn: &zbus::Connection, mac: &str) -> Result<()> {
     let path = device_path_for(conn, mac).await?;
@@ -276,5 +425,27 @@ mod tests {
     fn bluez_constants() {
         assert_eq!(BLUEZ_SERVICE, "org.bluez");
         assert_eq!(OBJECT_MANAGER_PATH, "/");
+    }
+
+    #[test]
+    fn bluez_service_list_is_parsed() {
+        let json = r#"[
+            {"UUID":"00001101-0000-1000-8000-00805f9b34fb","Primary":true,
+             "Class":["00001101-0000-1000-8000-00805f9b34fb"]},
+            {"UUID":"0000110e-0000-1000-8000-00805f9b34fb","Primary":false,
+             "Class":["0000110e-0000-1000-8000-00805f9b34fb"]}
+        ]"#;
+        let services = parse_bluez_services(json).expect("should parse");
+        assert_eq!(services.len(), 2);
+        assert!(services[0].primary);
+        assert!(!services[1].primary);
+        assert!(services[0].uuid.starts_with("00001101"));
+        assert_eq!(services[0].classes.len(), 1);
+    }
+
+    #[test]
+    fn bluez_service_list_rejects_non_arrays() {
+        assert!(parse_bluez_services("{}").is_err());
+        assert!(parse_bluez_services("null").is_err());
     }
 }

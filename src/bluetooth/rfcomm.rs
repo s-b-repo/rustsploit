@@ -97,12 +97,13 @@ fn address_byte(dlci: u8, cr: bool) -> u8 {
 
 fn encode_length(len: u16) -> Vec<u8> {
     if len <= RFCOMM_MAX_1B_LEN {
-        // EA=1, len in 7 bits.
-        vec![(len as u8) | 0x01]
+        // 1-octet form: length in bits 7..1, EA=1 in bit 0 (TS 07.10 §5.2.1.2).
+        vec![((len as u8) << 1) | 0x01]
     } else {
-        // EA=0 in low byte, then len big-endian.
-        let high = ((len >> 7) & 0x7F) as u8;
-        let low = (len & 0x7F) as u8;
+        // 2-octet form: octet 1 has EA=0 in bit 0 and the low 7 length bits in
+        // bits 7..1; octet 2 carries the high 8 length bits.
+        let low = ((len & 0x7F) as u8) << 1;
+        let high = ((len >> 7) & 0xFF) as u8;
         vec![low, high]
     }
 }

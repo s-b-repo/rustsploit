@@ -11,6 +11,8 @@ mod cli;
 mod commands;
 mod config;
 mod context;
+mod desktop;
+mod frameworks;
 mod modules;
 mod native;
 
@@ -149,6 +151,17 @@ async fn run() -> Result<()> {
     // proxy-trust flag used by the handshake rate limiter.
     utils::network::set_global_strict_tls(cli_args.strict_tls);
     utils::network::set_global_trust_proxy(cli_args.trust_proxy);
+
+    // reqwest is built with `rustls-no-provider`, and the direct-rustls paths use
+    // `ClientConfig::builder()`; both require a process-default rustls
+    // CryptoProvider. Today it is installed only as a side effect of the first
+    // `build_http_client*` call, so a module that builds a TLS client/connector
+    // directly before any such call (e.g. `-m scanners/ssl_scanner`,
+    // `-m scanners/http_title_scanner`, the Tomcat catkiller exploit, or anything
+    // using `native::async_tls::make_dangerous_tls_connector`) panics with
+    // "No provider set". Install it once, up front, so every interface and module
+    // has it. Idempotent (guarded by a `std::sync::Once`).
+    utils::network::ensure_crypto_provider();
     if !cli_args.strict_tls {
         tracing::warn!(
             "TLS verification permissive by default for HTTPS exploit modules. \
@@ -159,7 +172,7 @@ async fn run() -> Result<()> {
     // Handle list_modules flag
     if cli_args.list_modules {
         tracing::debug!("Listing all modules...");
-        utils::list_all_modules();
+        utils::list_all_modules("");
         return Ok(());
     }
 
@@ -176,6 +189,107 @@ async fn run() -> Result<()> {
             out.display(),
             module::count()
         );
+        return Ok(());
+    }
+
+    // List the framework template dialects the importer understands.
+    if cli_args.list_frameworks {
+        println!(
+            "{} Framework template dialects: {}",
+            "✓".green(),
+            frameworks::adapter_ids()
+        );
+        return Ok(());
+    }
+
+    // Import an external framework template and generate a native module.
+    if let Some(tpl_path) = &cli_args.import_template {
+        let source = tokio::fs::read_to_string(tpl_path)
+            .await
+            .with_context(|| format!("reading template {tpl_path}"))?;
+        let template = frameworks::Template::from_source(&source)
+            .with_context(|| format!("parsing template {tpl_path}"))?;
+        let category = cli_args.import_category.as_str();
+        let out_dir = frameworks::generate::default_output_dir(category);
+        let generated = frameworks::generate::write_module(&template, &source, &out_dir, category)
+            .context("generating module from template")?;
+        println!(
+            "{} Imported {} template '{}' -> {} ({})",
+            "✓".green(),
+            template.framework,
+            template.name,
+            generated.path.display(),
+            generated.qualified_name
+        );
+        let opts = frameworks::generate::describe_options(&template.options);
+        if !opts.trim().is_empty() {
+            println!("  Options:\n{opts}");
+        }
+        if generated.registered_in_parent {
+            println!("  Registered in the category mod.rs — rebuild to use it.");
+        } else {
+            println!("  NOTE: add the `pub mod` line to the category mod.rs, then rebuild.");
+        }
+        return Ok(());
+    }
+
+    // Run an external framework template directly against a target.
+    if let Some(tpl_path) = &cli_args.run_template {
+        let source = tokio::fs::read_to_string(tpl_path)
+            .await
+            .with_context(|| format!("reading template {tpl_path}"))?;
+        let template = frameworks::Template::from_source(&source)
+            .with_context(|| format!("parsing template {tpl_path}"))?;
+        let target = cli_args
+            .target
+            .as_deref()
+            .context("--run-template requires a target: -t <host[:port]>")?;
+        let default_port = template.default_port.unwrap_or(443);
+        let (host, port) = crate::utils::creds_helper::parse_host_port(target, default_port)?;
+        if !frameworks::adapter_by_id(&template.framework)
+            .map(|a| a.executable())
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "the '{}' dialect cannot be executed natively — use --import-template to generate a module instead",
+                template.framework
+            ));
+        }
+        let ctx = frameworks::ExecutionCtx {
+            host: &host,
+            port,
+            scheme: if port == 443 { "https" } else { "http" },
+            variables: std::collections::BTreeMap::new(),
+            timeout: std::time::Duration::from_secs(15),
+            insecure: true,
+        };
+        let results = template
+            .execute(&ctx)
+            .await
+            .context("running template against target")?;
+        println!(
+            "{} {} template '{}' vs {}:{} — {} result(s)",
+            "✓".green(),
+            template.framework,
+            template.name,
+            host,
+            port,
+            results.len()
+        );
+        for r in &results {
+            let tag = if r.matched {
+                "[+]".green().bold()
+            } else {
+                "[-]".dimmed()
+            };
+            println!("{} {} ({})", tag, r.message, r.severity.as_str());
+            if let Some(ev) = &r.evidence {
+                println!("    evidence: {ev}");
+            }
+            for (k, v) in &r.extracted {
+                println!("    {k} = {v}");
+            }
+        }
         return Ok(());
     }
 

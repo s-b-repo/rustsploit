@@ -116,5 +116,6 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 crate::register_native_module!(
     crate::module::Category::Scanners,
     "bluetooth/ble_scan",
-    native
+    native,
+    radio
 );

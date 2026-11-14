@@ -1,0 +1,481 @@
+name: CI
+
+# The CI pipeline is a set of INDEPENDENT workers. Each one owns one concern
+# and reports independently, so a failure in one does not hide the state of
+# the others. The `gate` job at the end aggregates them into the single
+# required status check that branch protection keys on.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: CI only needs to read the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crate has ~690 modules and links a vendored OpenSSL; a debug build
+  # with debug info on top of that OOMs a 7 GB runner. Strip debuginfo and
+  # disable incremental compilation — CI is a correctness gate, not a
+  # debugging session.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # lld uses far less memory than GNU ld when linking this crate, and the
+  # link step is where the build OOMs on a small runner.
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=lld"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ── Worker: formatting ────────────────────────────────────────────────
+  fmt:
+    name: fmt (changed files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Install rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - name: Check formatting of changed Rust files
+        # The repository is not rustfmt-clean end to end yet, so a
+        # whole-repo `cargo fmt --check` would fail on day one and block
+        # every PR. Gate on the files the PR actually touched instead —
+        # that still prevents new drift, which is what matters.
+        run: |
+          set -euo pipefail
+          BASE=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+            BASE=$(git rev-parse HEAD~1)
+          fi
+          if [ -z "$BASE" ]; then
+            echo "No base commit found — checking all sources."
+            FILES=$(git ls-files '*.rs')
+          else
+            FILES=$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.rs' || true)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "No Rust files changed — nothing to format-check."
+            exit 0
+          fi
+          echo "Changed Rust files:"
+          echo "$FILES" | sed 's/^/  /'
+          # rustfmt follows `mod` declarations and descends into every
+          # submodule of a file it is handed, so touching one mod.rs would drag
+          # the whole legacy subtree into the check and fail on pre-existing
+          # drift. There is no stable flag to stop that (`--skip-children` is
+          # nightly-only). So: let it recurse, but fail ONLY when a diff lands
+          # in a file the PR actually changed — legacy drift pulled in by
+          # recursion is reported for context but does not fail the gate.
+          # shellcheck disable=SC2086
+          OUT=$(rustfmt --edition 2024 --check $FILES 2>&1 || true)
+          fail=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if printf '%s\n' "$OUT" | grep -qF "${f}:"; then
+              echo "::error file=${f}::not rustfmt-clean — run: rustfmt --edition 2024 ${f}"
+              fail=1
+            fi
+          done <<< "$FILES"
+          if [ "$fail" -ne 0 ]; then
+            echo "----- rustfmt diff (changed files flagged above; legacy noise included) -----"
+            printf '%s\n' "$OUT" | sed -n '1,300p'
+            exit 1
+          fi
+          echo "All changed Rust files are rustfmt-clean."
+
+  # ── Worker: whole-repo formatting drift (informational) ───────────────
+  fmt-repo:
+    name: fmt (whole repo, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - name: Report whole-repo formatting drift
+        # Not a gate. It publishes how much drift is left so it can be paid
+        # down deliberately instead of blocking everyone's work.
+        run: |
+          set +e
+          cargo fmt --check > fmt-drift.txt 2>&1
+          status=$?
+          echo "### Whole-repo formatting drift" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ $status -eq 0 ]; then
+            echo "Clean — the whole repository is rustfmt-formatted." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Formatting drift detected (not a gate). Run 'cargo fmt' to fix." >> "$GITHUB_STEP_SUMMARY"
+            head -c 20000 fmt-drift.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+  # ── Worker: clippy ────────────────────────────────────────────────────
+  clippy:
+    name: clippy
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Run clippy
+        # Lints are configured at "warn" level in Cargo.toml, so this job exits
+        # 0 on the existing warning backlog (warnings print to the job log).
+        # `-D warnings` is deliberately NOT used: the backlog (unwrap/expect
+        # across ~690 modules) would make the gate permanently red and therefore
+        # ignored. Clippy still fails on a real compile error, which is the
+        # signal this worker exists to surface.
+        #
+        # NB: cargo has no `github` message format (`--message-format` accepts
+        # human/short/json/...), so the previous `--message-format=github` made
+        # clippy abort on argument parsing before it ever linted.
+        run: |
+          cargo clippy --all-targets --no-deps
+
+  # ── Worker: build (feature matrix) ────────────────────────────────────
+  build:
+    name: build (${{ matrix.features }})
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: "default"
+            extra: ""
+          - features: "no-default-features"
+            extra: "--no-default-features"
+          - features: "bluetooth"
+            extra: "--no-default-features --features bluetooth"
+          - features: "desktop"
+            extra: "--no-default-features --features desktop"
+          - features: "io_uring"
+            extra: "--features io_uring"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+          key: ${{ matrix.features }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Build
+        run: cargo build --locked ${{ matrix.extra }}
+      - name: Upload binary
+        if: matrix.features == 'default'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: rustsploit-binary
+          path: target/debug/rustsploit
+          retention-days: 3
+          if-no-files-found: error
+
+  # ── Worker: tests ─────────────────────────────────────────────────────
+  test:
+    name: test
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    # A hanging unit test (e.g. unbounded network I/O, or a BT socket op with
+    # no hardware) must fail the job fast, not sit until GitHub's 6h ceiling.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Run unit tests
+        # This is a binary crate: tests live in `#[cfg(test)]` modules and run
+        # through the bin target, not a lib target.
+        run: cargo test --locked --bin rustsploit -- --test-threads=4
+
+  # ── Worker: module catalog is up to date ──────────────────────────────
+  module-catalog:
+    name: module catalog
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Build binary
+        run: cargo build --locked
+      - name: Regenerate module catalog and diff
+        # docs/Module-Catalog.md is generated from the live module registry.
+        # If it drifts, the docs lie about which modules exist.
+        run: |
+          set -euo pipefail
+          ./target/debug/rustsploit --gen-module-catalog
+          if ! git diff --quiet -- docs/Module-Catalog.md; then
+            echo "::error::docs/Module-Catalog.md is stale — regenerate it with:"
+            echo "::error::  cargo run -- --gen-module-catalog"
+            git --no-pager diff -- docs/Module-Catalog.md | head -100
+            exit 1
+          fi
+          echo "Module catalog is up to date."
+      - name: Cross-check the fallback generator
+        # scripts/gen-module-catalog.py is a fallback for machines that cannot
+        # link the binary. It must agree with the real generator exactly, or
+        # it is a bug — the Rust generator is the source of truth.
+        run: |
+          set -uo pipefail
+          python3 scripts/gen-module-catalog.py . > /tmp/catalog-fallback.md
+          if ! diff -u docs/Module-Catalog.md /tmp/catalog-fallback.md > /tmp/catalog-drift.diff; then
+            echo "::error::scripts/gen-module-catalog.py disagrees with the real generator."
+            head -40 /tmp/catalog-drift.diff
+            exit 1
+          fi
+          echo "Fallback catalog generator agrees with the real one."
+
+  # ── Worker: bad-pattern quality gate ─────────────────────────────────
+  # Two layers, both driven by scripts/audit-bad-patterns.sh:
+  #
+  #  1. AGGREGATE baseline — per-PATTERN counts for the whole tree. Catches
+  #     any net increase in any of the 136 banned patterns.
+  #  2. PER-FILE baseline — per-FILE per-SECTION counts. Catches the case the
+  #     aggregate misses: fixing one violation in file A while adding one in
+  #     file B nets to zero at the pattern level but is still a regression.
+  #
+  # Both are green on day one because they are baselined against the current
+  # state, and both turn red the moment new debt is introduced.
+  bad-patterns:
+    name: bad-pattern audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Aggregate baseline gate
+        run: |
+          set -euo pipefail
+          bash scripts/audit-bad-patterns.sh --baseline .github/bad-patterns.baseline \
+            | tee audit-aggregate.txt
+      - name: Per-file baseline gate
+        run: |
+          set -euo pipefail
+          bash scripts/audit-bad-patterns.sh \
+            --file-baseline .github/bad-patterns.files.baseline \
+            --strict-sections A,B,C \
+            | tee audit-perfile.txt
+      - name: Collect the findings
+        run: |
+          set -uo pipefail
+          # Per-hit report: every banned pattern with its file, line and
+          # source text. This is what turns a count into something an
+          # operator can act on.
+          bash scripts/audit-bad-patterns.sh --report broken-patterns.tsv >/dev/null 2>&1 || true
+          wc -l < broken-patterns.tsv || echo 0
+      - name: Annotate the broken patterns
+        run: |
+          set -uo pipefail
+          # Every finding becomes an inline annotation on the pull-request
+          # diff. A hit in a strict section (A: panic, B: swallowed error,
+          # C: lint suppression) is an ERROR annotation — that code can
+          # crash, hide a failure, or silence a lint. Other sections are
+          # warnings.
+          bash scripts/annotate-findings.sh broken-patterns.tsv "BROKEN — banned patterns"
+      - name: Audit report
+        run: |
+          echo "### Bad-pattern audit" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Aggregate (whole tree, all 136 patterns) and per-file" >> "$GITHUB_STEP_SUMMARY"
+          echo "(sections A/B/C) baselines both passed." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -25 audit-aggregate.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Worker: audit the files a PR actually touched ─────────────────────
+  # A focused view of the same matrix, scoped to the diff. This is the
+  # report a reviewer wants: "what did THIS change introduce?". It is
+  # informational — the two baseline gates above are what block.
+  bad-patterns-changed:
+    name: bad-pattern audit (changed files)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Audit the changed Rust files
+        run: |
+          set -uo pipefail
+          BASE=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+            BASE=$(git rev-parse HEAD~1)
+          fi
+          if [ -z "$BASE" ]; then
+            echo "No base commit — skipping the changed-files audit."
+            exit 0
+          fi
+          bash scripts/audit-bad-patterns.sh --changed-from "$BASE" \
+            | tee changed-audit.txt
+          echo "### Bad-pattern audit — changed files" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat changed-audit.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Worker: documentation gate ────────────────────────────────────────
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Run the documentation gate
+        # Checks that relative links resolve, that removed APIs / machine
+        # paths / stale counts are gone from current docs, and that every
+        # wiki page is reachable.
+        run: bash scripts/check-docs.sh
+
+  # ── Worker: dead code / unwired modules ──────────────────────────────
+  # Finds code that exists but is not reachable:
+  #   - a .rs file that is never compiled (not declared in its parent mod.rs)
+  #   - a `mod X;` declaration with no X.rs
+  #   - a module file with run()/info() that never registers itself
+  #   - items the compiler reports as never used
+  #   - dependencies nothing imports
+  #
+  # Reported against a baseline, so it is green today and turns red the moment
+  # new unwired code lands. The baseline is expected to SHRINK.
+  deadcode:
+    name: dead code / wiring audit
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        with:
+          tool: cargo-machete
+      - name: Run the dead-code / wiring audit
+        run: |
+          set -uo pipefail
+          bash scripts/audit-deadcode.sh \
+            --baseline .github/deadcode.baseline \
+            | tee deadcode-output.txt
+      - name: Collect and annotate the findings
+        run: |
+          set -uo pipefail
+          bash scripts/audit-deadcode.sh --report broken-deadcode.tsv >/dev/null 2>&1 || true
+          # Unwired code is "broken" in the same sense a panic is: it is
+          # present in the tree but unreachable by the operator.
+          bash scripts/annotate-findings.sh broken-deadcode.tsv "BROKEN — unwired / unused code"
+      - name: Report the remaining backlog
+        # The baseline itself is the backlog. Show it so it can be worked
+        # down deliberately.
+        run: |
+          echo "### Dead code / unwired backlog" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The baseline is the list of known-unwired items. Each one should" >> "$GITHUB_STEP_SUMMARY"
+          echo "either be wired up or deleted, then removed from" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`.github/deadcode.baseline\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -v '^#' .github/deadcode.baseline 2>/dev/null | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Count: $(grep -cv '^#' .github/deadcode.baseline 2>/dev/null || echo 0)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Aggregate required check ──────────────────────────────────────────
+  gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - clippy
+      - build
+      - test
+      - module-catalog
+      - bad-patterns
+      - deadcode
+      - docs
+    if: always()
+    steps:
+      - name: Verify every worker succeeded
+        run: |
+          set -euo pipefail
+          echo "### CI worker results" >> "$GITHUB_STEP_SUMMARY"
+          echo "| worker | result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for job in fmt clippy build test module-catalog bad-patterns deadcode docs; do
+            result=""
+            case "$job" in
+              fmt) result="${{ needs.fmt.result }}" ;;
+              clippy) result="${{ needs.clippy.result }}" ;;
+              build) result="${{ needs.build.result }}" ;;
+              test) result="${{ needs.test.result }}" ;;
+              module-catalog) result="${{ needs.module-catalog.result }}" ;;
+              bad-patterns) result="${{ needs.bad-patterns.result }}" ;;
+              deadcode) result="${{ needs.deadcode.result }}" ;;
+              docs) result="${{ needs.docs.result }}" ;;
+            esac
+            echo "| $job | $result |" >> "$GITHUB_STEP_SUMMARY"
+            case "$result" in
+              success|skipped) ;;
+              *) failed=1 ;;
+            esac
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::At least one CI worker failed."
+            exit 1
+          fi
+          echo "All CI workers passed."

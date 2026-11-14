@@ -150,6 +150,7 @@ p256 = { version = "0.13", features = ["ecdh"], optional = true }
 hex = "0.4"
 
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-async-rw"] }
+serde_yaml_ng = "0.10.0"
 # (ratatui 0.29 transitive advisories cleared when the TUI was replaced with rustyline.)
 
 # ============================================
@@ -186,8 +187,12 @@ lto = "thin"           # Faster than fat LTO
 codegen-units = 4      # Parallel codegen
 
 [features]
-default = ["bluetooth"]
+default = ["bluetooth", "desktop"]
 bluetooth = ["dep:btleplug", "dep:p256", "dep:zbus"]
+# Desktop integration: freedesktop notifications over the session bus
+# (KDE Plasma and GNOME both implement org.freedesktop.Notifications) and
+# terminal-title updates. Shares the zbus dependency with `bluetooth`.
+desktop = ["dep:zbus"]
 # io_uring: dedicated ring-thread pool (N = min(cores, 16), round-robin dispatch)
 # that accelerates all TCP connect probes + stream connects. The main runtime
 # stays multi-thread tokio; only the connect hot path routes through the rings.

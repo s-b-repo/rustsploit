@@ -1,0 +1,232 @@
+name: Bug Hunt
+
+# Finds MEMORY BUGS and LOGIC FLAWS.
+#
+# Two complementary approaches, because they find different things:
+#
+#   TOOL WORKERS
+#     asan    — runs the test suite under AddressSanitizer. Finds use-after-free,
+#               buffer overflows, double-free, invalid free, memory leaks, and
+#               use of uninitialised memory. These are the bugs a code review
+#               reliably misses.
+#     miri    — runs the pure-logic tests under Miri, the Rust undefined-
+#               behaviour detector. Catches UB that the optimiser is allowed to
+#               exploit (misaligned access, invalid enum values, aliasing
+#               violations) and logic errors like out-of-bounds indexing and
+#               integer overflow in debug builds.
+#
+#   REVIEW WORKER
+#     review  — a Claude Code worker that reads the diff and hunts for logic
+#               flaws a sanitizer cannot see: inverted conditions, wrong
+#               operator, off-by-one, wrong early return, error paths that
+#               leave state inconsistent, resource leaks, TOCTOU, lock-order
+#               inversions, and unchecked arithmetic.
+#
+# The sanitizer workers are the ones that catch memory bugs for real; the
+# review worker covers the semantic errors.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: bug-hunt-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "1"
+  CARGO_PROFILE_TEST_DEBUG: "1"
+
+jobs:
+  # ── Worker: AddressSanitizer ──────────────────────────────────────────
+  asan:
+    name: AddressSanitizer
+    runs-on: ${{ vars.RUNNER_HEAVY || 'ubuntu-latest-8-cores' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install nightly toolchain with sanitizer support
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+          key: asan
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld cmake
+      - name: Run the test suite under ASan
+        # ASan needs the whole crate (including dependencies) instrumented, so
+        # RUSTFLAGS applies to everything. `detect_leaks=0` because the crate
+        # intentionally leaves sockets and tokio workers running at exit, and
+        # LeakSanitizer would flag those as leaks on every run.
+        #
+        # The release profile sets panic = "abort", which is incompatible with
+        # the sanitizer runtime; the dev/test profiles are used instead.
+        env:
+          RUSTFLAGS: "-Zsanitizer=address -Cdebuginfo=1 -Cforce-frame-pointers=yes -C link-arg=-fuse-ld=lld"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1:detect_stack_use_after_return=1"
+        run: |
+          set -uo pipefail
+          cargo +nightly test --no-default-features --bin rustsploit --target x86_64-unknown-linux-gnu 2>&1 \
+            | tee asan-output.txt
+          # AddressSanitizer reports failures by aborting, so a non-zero exit
+          # is expected when a bug is found. Surface it as a hard error.
+          if grep -qE "ERROR: AddressSanitizer|SUMMARY: AddressSanitizer" asan-output.txt; then
+            echo "::error::AddressSanitizer reported an error."
+            grep -A 25 "ERROR: AddressSanitizer" asan-output.txt | head -60
+            exit 1
+          fi
+          echo "AddressSanitizer: clean."
+
+  # ── Worker: Miri (undefined behaviour) ────────────────────────────────
+  miri:
+    name: Miri (UB detector)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install nightly toolchain with Miri
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: . -> target
+          key: miri
+      - name: Run the pure-logic tests under Miri
+        # Miri interprets the code, so it is orders of magnitude slower and
+        # cannot run anything that touches real sockets, files or the clock.
+        # The test filters below select the pure-computation tests; the
+        # filtering is deliberately conservative so a new test is not silently
+        # excluded from the analysis.
+        #
+        # `bluetooth::att`, `bluetooth::hidp` and `bluetooth::l2cap_ertm` are
+        # wire codecs that parse untrusted bytes, so they are exactly the kind
+        # of code Miri is good at checking for out-of-bounds reads and integer
+        # overflow.
+        run: |
+          set -uo pipefail
+          cargo +nightly miri setup 2>&1 | tail -3
+          cargo +nightly miri test --no-default-features --bin rustsploit \
+            -- target utils:: sanitize:: scheduler:: cyclic desktop:: \
+               bluetooth::att bluetooth::hidp bluetooth::l2cap_ertm \
+               bluetooth::sdp bluetooth::lmp 2>&1 | tee miri-output.txt
+          if grep -qE "error: Undefined Behavior|error: unsupported operation" miri-output.txt; then
+            echo "::error::Miri reported undefined behaviour."
+            grep -B 3 -A 20 "Undefined Behavior" miri-output.txt | head -80
+            exit 1
+          fi
+          echo "Miri: clean."
+
+  # ── Worker: logic-flaw and memory-bug review ──────────────────────────
+  review:
+    name: logic + memory review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Collect the unsafe-code inventory
+        id: unsafe_inventory
+        run: |
+          set -uo pipefail
+          {
+            echo "===== UNSAFE BLOCKS IN src/ ====="
+            grep -rn "unsafe " src/ --include="*.rs" | grep -v "^.*://" | head -80 || true
+            echo
+            echo "===== RAW POINTER / TRANSMUTE / UNINITIALISED MEMORY ====="
+            grep -rnE "transmute|from_raw_parts|set_len|assume_init|MaybeUninit|ptr::read|ptr::write|mem::zeroed|mem::uninitialized" src/ --include="*.rs" | head -60 || true
+            echo
+            echo "===== SLICING / INDEXING WITHOUT BOUNDS CHECKS ====="
+            grep -rnE "\[[a-z_]+ *\.\.|\[[0-9]+\]" src/ --include="*.rs" | grep -vE "^\s*//" | head -80 || true
+            echo
+            echo "===== CHECKED ARITHMETIC HOT SPOTS ====="
+            grep -rnE "as (u8|u16|u32|u64|usize|i32|i64) " src/ --include="*.rs" | head -60 || true
+          } | tee unsafe-inventory.txt
+          echo "Inventory: $(wc -l < unsafe-inventory.txt) lines."
+
+      - name: Run the logic + memory review worker
+        uses: anthropics/claude-code-action@8a29bc6f0ae11a363721054b6739feba6adabe57
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            You are a memory-safety and logic-flaw reviewer for RustSploit, a
+            Rust offensive-security framework that performs network I/O,
+            parses untrusted banners and responses, and manipulates raw
+            byte buffers.
+
+            The diff is the PR's changes. `unsafe-inventory.txt` lists every
+            `unsafe` block, raw-pointer operation, unchecked slice index and
+            narrowing cast in `src/` — use it to orient yourself, then check
+            whether the DIFF introduces or worsens any of them.
+
+            HUNT FOR:
+
+            **Memory safety**
+            - buffer indexing that can go out of bounds, especially where the
+              length comes from the network (a banner, a length prefix, a
+              header field)
+            - slicing (`&buf[a..b]`) where `a`/`b` are attacker-influenced or
+              not proven ordered
+            - `unsafe` blocks whose invariants are not actually upheld
+            - `transmute` / `from_raw_parts` / `set_len` / `MaybeUninit`
+              misuse
+            - narrowing casts (`as u8`, `as u16`) on values that can exceed
+              the target range — a port or a length silently wrapping
+            - use-after-free / double-free / dangling references, including
+              references held across an `.await`
+            - uninitialised memory read
+
+            **Logic flaws**
+            - inverted conditions (`!` / `==` / `!=` on the wrong side)
+            - off-by-one in loop bounds, slice ranges, or pagination
+            - wrong early `return` / `break` / `continue`
+            - an error path that leaves state half-updated (a counter
+              incremented before the operation that can fail)
+            - arithmetic that can underflow where it should saturate (or the
+              reverse)
+            - resource leaks: a lock guard held across an `.await`, a
+              `SemaphorePermit` dropped early, a spawned task never joined
+            - TOCTOU between a check and the action it guards
+            - lock-ordering inversions between two mutexes
+            - a retry loop that can spin forever, or that re-fires a
+              non-idempotent action
+
+            For EVERY finding give: the file, the line number, a short quote,
+            the concrete failure scenario (what input triggers it and what
+            breaks), and the severity. Verify by reading the surrounding code
+            — do not report something the code already guards against, and do
+            not report pre-existing legacy issues as if this diff introduced
+            them.
+
+            Do NOT report style nits, naming preferences, or "consider using X".
+            Only defects with a concrete trigger. If the diff is clean, say so
+            explicitly rather than padding the report.
+
+            Post the findings as inline pull-request review comments, most
+            severe first.

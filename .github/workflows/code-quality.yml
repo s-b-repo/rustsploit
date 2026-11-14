@@ -1,0 +1,153 @@
+name: Code Quality Audit
+
+# An in-place code-quality worker.
+#
+# Two modes, driven by the same worker:
+#
+#   audit  — read the diff, run the repository's OWN audit scripts, and post
+#            the findings as inline PR review comments. No source is modified.
+#   fix    — apply the fixes for real, commit them, and push to the PR branch
+#            (or open a follow-up PR). This is the "in place" half.
+#
+# The important property: the worker is ANCHORED to scripts/audit-bad-patterns.sh
+# and scripts/check-docs.sh. It does not free-associate about code style — it
+# runs the repository's own rule matrix and reports what the matrix found.
+# That keeps the audit reproducible and consistent with CI.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "audit (report only) or fix (apply fixes in place)"
+        required: true
+        default: audit
+        type: choice
+        options: [audit, fix]
+
+concurrency:
+  group: code-quality-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  audit:
+    name: code quality audit
+    # Skip drafts and dependabot PRs — neither benefits from a review.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.user.login != 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          # The fix mode needs push rights.
+          persist-credentials: true
+
+      - name: Determine mode
+        id: mode
+        run: |
+          set -euo pipefail
+          mode=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            mode="${{ inputs.mode }}"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            # /fix-code-quality in a comment switches to the fix path.
+            if printf '%s' "${{ github.event.comment.body }}" | grep -qi '/fix-code-quality'; then
+              mode="fix"
+            else
+              mode="audit"
+            fi
+          else
+            mode="audit"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Selected mode: $mode"
+
+      # ── Run the repository's own audit scripts FIRST ──────────────────
+      # The worker reads these results instead of re-deriving the rules, so
+      # its report matches exactly what CI will enforce.
+      - name: Run the repository audit scripts
+        id: audit
+        run: |
+          set -uo pipefail
+          {
+            echo "===== BAD-PATTERN AUDIT (changed files) ====="
+            BASE=""
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+            elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+              BASE=$(git rev-parse HEAD~1)
+            fi
+            if [ -n "$BASE" ]; then
+              bash scripts/audit-bad-patterns.sh --changed-from "$BASE" || true
+            else
+              bash scripts/audit-bad-patterns.sh || true
+            fi
+            echo
+            echo "===== DOCS GATE ====="
+            bash scripts/check-docs.sh || true
+          } | tee audit-context.txt
+          echo "Audit context captured ($(wc -l < audit-context.txt) lines)."
+
+      - name: Run the Claude Code worker
+        uses: anthropics/claude-code-action@8a29bc6f0ae11a363721054b6739feba6adabe57
+        with:
+          # Prefer an OAuth token; fall back to an API key. One of the two
+          # must be present as a repository secret.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            You are the in-place code-quality worker for RustSploit, a Rust
+            offensive-security framework.
+
+            MODE: ${{ steps.mode.outputs.mode }}
+
+            The repository's own audit output is in `audit-context.txt` (already
+            generated above) and the repository's rules live in
+            `docs/BAD_PATTERNS.md`. The audit scripts are the SOURCE OF TRUTH:
+            `scripts/audit-bad-patterns.sh` and `scripts/check-docs.sh`.
+
+            Do this:
+
+            1. Read `audit-context.txt` and `docs/BAD_PATTERNS.md`.
+            2. Read the diff (`git diff origin/${{ github.base_ref }}...HEAD` for
+               a PR, or `git diff HEAD~1..HEAD` otherwise).
+            3. Look for real defects introduced by THIS diff:
+               - panics reachable from untrusted input (indexing, unwrap,
+                 arithmetic overflow/underflow on parsed values)
+               - silently swallowed errors (`Err(_)`, `let _ =`, `.ok()`)
+               - lint suppression (`#[allow(...)]`, `#[deny(...)]`)
+               - security holes in the changed code path: auth/tenant bypass,
+                 SSRF, path traversal, command injection, weak crypto, secrets
+                 written world-readable, race conditions, unbounded resource
+                 growth
+               - blocking I/O inside async without `spawn_blocking`
+               - module-registration mistakes (a new module needs the file,
+                 the `register_native_module!` call, AND a `pub mod` line in
+                 the parent `mod.rs`)
+               For every finding, give the file, the line, and a concrete
+               failure scenario. No style nits, no "could be refactored".
+            4. Cross-check each finding against the audit output so you do not
+               report something the matrix already covers, and do not report
+               pre-existing legacy debt as if this diff introduced it.
+
+            ${{ steps.mode.outputs.mode == 'fix' && 'THEN: apply the fixes directly in the working tree. Keep each fix minimal and behaviour-preserving where the bug is not a crash or a security hole. After editing, run `cargo fmt` on the files you touched and `cargo check --no-default-features` to confirm it still compiles. Commit with a conventional-commit subject describing the fix.' || 'Report the findings as inline pull-request review comments, most severe first. If you find nothing, say so explicitly — do not invent findings to fill the report.' }}
+
+            If a finding matches a violation the audit matrix already flagged,
+            reference the matrix rule by its section letter and pattern rather
+            than re-explaining it.

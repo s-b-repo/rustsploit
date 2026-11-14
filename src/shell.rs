@@ -7,6 +7,7 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{Config, Editor, Helper};
 use url::Url;
@@ -27,6 +28,13 @@ const CHAIN_SEPARATORS: &[char] = &['&', ';'];
 const MAX_URL_LENGTH: usize = 2048;
 
 const MAX_PROMPT_INPUT_LENGTH: usize = 1024;
+
+/// Maximum number of completion candidates shown at once. The registry holds
+/// ~700 modules, so an uncapped list is unusable in a terminal.
+const MAX_COMPLETION_CANDIDATES: usize = 64;
+
+/// Maximum number of history entries shown by the `history` command.
+const MAX_HISTORY_SHOWN: usize = 200;
 
 /// Shell commands available for tab completion.
 const SHELL_COMMANDS: &[&str] = &[
@@ -70,6 +78,8 @@ const SHELL_COMMANDS: &[&str] = &[
     "spool off",
     "resource",
     "makerc",
+    "history",
+    "desktop",
     "hosts",
     "hosts add",
     "hosts delete",
@@ -130,20 +140,20 @@ impl Completer for RsfCompleter {
         }
         let line_up_to_cursor = &line[..pos];
 
-        // After "use " or "u ", complete module paths
-        let module_prefix = if let Some(rest) = line_up_to_cursor.strip_prefix("use ") {
-            Some(rest)
-        } else if let Some(rest) = line_up_to_cursor.strip_prefix("u ") {
-            Some(rest)
-        } else if let Some(rest) = line_up_to_cursor.strip_prefix("info ") {
-            Some(rest)
-        } else {
-            None
-        };
+        // Module completion is available after `use `, `u `, `info ` and
+        // `run ` — the operator should not have to select a module before
+        // they can complete it.
+        let module_prefix = ["use ", "u ", "info ", "run "]
+            .iter()
+            .find_map(|trigger| line_up_to_cursor.strip_prefix(trigger));
 
         if let Some(prefix) = module_prefix {
             let start = pos - prefix.len();
-            let matches: Vec<Pair> = self
+            // A prefix ending in `/` is a category: offer the children of
+            // that category, so `use exploits/bluetooth/<TAB>` lists the
+            // bluetooth modules rather than every path that happens to share
+            // the prefix.
+            let mut matches: Vec<Pair> = self
                 .module_paths
                 .iter()
                 .filter(|m| m.starts_with(prefix))
@@ -152,19 +162,31 @@ impl Completer for RsfCompleter {
                     replacement: m.clone(),
                 })
                 .collect();
+            // Alphabetical order with the short leaf last would be nicer,
+            // but rustyline's List completion already sorts, so leave the
+            // order stable and let it sort.
+            matches.truncate(MAX_COMPLETION_CANDIDATES);
             return Ok((start, matches));
         }
 
-        // Otherwise complete commands
+        // Command completion: match the LAST whitespace-separated token, so
+        // `set tar<TAB>` completes the value rather than replacing the whole
+        // line. Replacing the whole line meant an accidental Tab at the
+        // start of an existing command destroyed it.
+        let token_start = line_up_to_cursor
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let token = &line_up_to_cursor[token_start..];
         let matches: Vec<Pair> = SHELL_COMMANDS
             .iter()
-            .filter(|cmd| cmd.starts_with(line_up_to_cursor))
+            .filter(|cmd| cmd.starts_with(token))
             .map(|cmd| Pair {
                 display: cmd.to_string(),
                 replacement: cmd.to_string(),
             })
             .collect();
-        Ok((0, matches))
+        Ok((token_start, matches))
     }
 }
 
@@ -181,12 +203,10 @@ impl Hinter for RsfCompleter {
             return None;
         }
 
-        // After "use " or "u ", hint module paths
-        let module_prefix = if let Some(rest) = trimmed.strip_prefix("use ") {
-            Some(rest)
-        } else {
-            trimmed.strip_prefix("u ")
-        };
+        // After "use " / "u " / "info " / "run ", hint module paths.
+        let module_prefix = ["use ", "u ", "info ", "run "]
+            .iter()
+            .find_map(|trigger| trimmed.strip_prefix(trigger));
 
         if let Some(prefix) = module_prefix {
             if let Some(m) = self
@@ -394,6 +414,14 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         .max_history_size(1000)
         .context("Failed to configure shell history size")?
         .auto_add_history(true)
+        // Show the candidates as a LIST instead of cycling through them one
+        // at a time. The registry holds ~700 modules, so circular completion
+        // meant the operator had to press Tab dozens of times to reach the
+        // one they wanted.
+        .completion_type(rustyline::CompletionType::List)
+        // Cap the candidate list so a very short prefix (`use s<TAB>`) does
+        // not dump hundreds of paths into the terminal.
+        .completion_prompt_limit(MAX_COMPLETION_CANDIDATES)
         .build();
     let mut rl = Editor::with_config(rl_config)?;
     rl.set_helper(Some(RsfCompleter::new()));
@@ -433,10 +461,19 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
     }
 
     'main_loop: loop {
-        let raw_input = match rl.readline(&format!("{}", "rsf> ".cyan().bold())) {
+        // The prompt shows what `run` would act on: the selected module and
+        // the current target. Without it the operator has to remember which
+        // module is selected after a long `find`/`info` detour.
+        let prompt = build_prompt(&ctx);
+        let raw_input = match rl.readline(&prompt) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break 'main_loop,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // A readline failure still has to persist the history, or the
+                // session's commands are lost.
+                persist_history(&mut rl, &hist);
+                return Err(e.into());
+            }
         };
 
         if raw_input.len() > MAX_INPUT_LENGTH {
@@ -510,10 +547,80 @@ async fn interactive_shell_inner(verbose: bool, resource_file: Option<&str>) -> 
         }
     }
 
-    if let Err(e) = rl.save_history(&hist) {
+    persist_history(&mut rl, &hist);
+    Ok(())
+}
+
+/// Persist the shell history to disk.
+///
+/// Called on every exit path — including the abnormal one — so a session that
+/// ends in a readline error does not silently lose the operator's history.
+fn persist_history(rl: &mut Editor<RsfCompleter, FileHistory>, hist: &std::path::Path) {
+    if let Err(e) = rl.save_history(hist) {
         eprintln!("[!] Failed to save history: {}", e);
     }
-    Ok(())
+}
+
+/// Set the terminal window title.
+///
+/// Writes an OSC 2 sequence straight to the terminal, bypassing the output
+/// buffer so it never lands in the spool or the per-run results file. The
+/// sequence is ignored by a terminal that does not understand it.
+fn set_terminal_title(title: &str) {
+    use std::io::Write;
+    let seq = crate::desktop::terminal_title(title);
+    // A failed write is not worth interrupting the operator over — the title
+    // is a convenience, not a result.
+    if let Err(e) = io::stdout().write_all(seq.as_bytes()) {
+        tracing::debug!("terminal title not set: {e}");
+    }
+    let _ = io::stdout().flush();
+}
+
+/// Notify the desktop that a module finished.
+///
+/// Sends a freedesktop notification, which KDE Plasma and GNOME both render.
+/// A missing notification daemon is not an error worth interrupting the
+/// operator for — it is reported once at debug level.
+///
+/// `failed` selects the urgency: a completed run is `Low` (informational),
+/// a failed one is `Critical` so it stands out in the notification centre.
+async fn notify_desktop_findings(module_path: &str, target: &str, failed: bool) {
+    if !crate::desktop::detect().is_known() {
+        return;
+    }
+    let title = if failed {
+        format!("RustSploit: {module_path} failed")
+    } else {
+        format!("RustSploit: {module_path}")
+    };
+    let body = format!("Finished against {target}");
+    let urgency = if failed {
+        crate::desktop::Urgency::Critical
+    } else {
+        crate::desktop::Urgency::Low
+    };
+    match crate::desktop::notify(&title, &body, urgency).await {
+        Ok(()) => tracing::debug!("desktop notification sent for {module_path}"),
+        Err(e) => tracing::debug!("desktop notification not sent: {e}"),
+    }
+}
+
+/// Build the interactive prompt.
+/// Shows the selected module so the operator always knows what `run` is about
+/// to act on. Only the leaf is shown — the full path is too long for a
+/// prompt, and a prompt that wraps in an 80-column terminal is worse than
+/// no prompt at all.
+fn build_prompt(ctx: &ShellContext) -> String {
+    let mut prompt = String::from("rsf");
+    if let Some(module) = &ctx.current_module {
+        let leaf = module.rsplit('/').next().unwrap_or(module);
+        prompt.push('(');
+        prompt.push_str(leaf);
+        prompt.push(')');
+    }
+    prompt.push('>');
+    format!("{}", prompt.cyan().bold())
 }
 
 /// Execute a single shell command. Returns true if the shell should exit.
@@ -597,7 +704,13 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         println!("{} {}", "tommy:".red(), e);
                     }
                 }
-                "modules" => utils::list_all_modules(),
+                "modules" => {
+                    // `modules` lists everything; `modules <category>` narrows
+                    // it down. With ~700 modules an unfiltered dump is not
+                    // navigable.
+                    let filter = rest.split_whitespace().next().unwrap_or("");
+                    utils::list_all_modules(filter);
+                }
                 "find" => {
                     if rest.is_empty() {
                         println!("{}", "Usage: find <keyword>".yellow());
@@ -616,13 +729,20 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         } else if let Some(canonical) =
                             crate::commands::resolve_full_path(&safe_path)
                         {
-                            // Accept a bare short name (e.g. `use proxy_scanner`),
-                            // matching what `run`/`-m` already resolve, instead of
+                            // Accept a bare short name (e.g. `use proxy_scanner`)
+                            // or a leaf name (`use ssh_bruteforce`), matching what
+                            // `info` and `run` already resolve, instead of
                             // requiring the full category/name path.
                             ctx.current_module = Some(canonical.clone());
                             println!("{}", format!("Module '{}' selected.", canonical).green());
                         } else {
                             println!("{}", format!("Module '{}' not found.", rest).red());
+                            // "Did you mean" — the operator almost always has a
+                            // typo or a fragment, not a module that does not exist.
+                            if let Some(suggestion) = crate::commands::suggest_module(&safe_path) {
+                                println!("{}", format!("  Did you mean: {}?", suggestion).yellow());
+                                println!("{}", "  (use it with: use <path>)".dimmed());
+                            }
                         }
                     } else {
                         println!(
@@ -954,6 +1074,41 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                 "show_options" => {
                     display_all_options(&ctx).await;
                 }
+                "desktop" => {
+                    // Desktop-environment integration: report what was
+                    // detected, and let the operator send a test
+                    // notification to confirm the daemon is reachable.
+                    let arg = rest.trim();
+                    if arg == "notify" {
+                        let message = rest
+                            .strip_prefix("notify")
+                            .map(str::trim)
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("RustSploit notification test");
+                        match crate::desktop::notify(
+                            "RustSploit",
+                            message,
+                            crate::desktop::Urgency::Normal,
+                        )
+                        .await
+                        {
+                            Ok(()) => println!("{}", "[+] Notification sent.".green()),
+                            Err(e) => {
+                                println!("{}", format!("[!] Notification failed: {}", e).red())
+                            }
+                        }
+                    } else {
+                        let description = crate::desktop::describe().await;
+                        for line in description.lines() {
+                            println!("  {}", line);
+                        }
+                        println!();
+                        println!(
+                            "{}",
+                            "  `desktop notify <message>` sends a test notification.".dimmed()
+                        );
+                    }
+                }
                 "load_profile" => {
                     let path = rest.trim();
                     if path.is_empty() {
@@ -1201,6 +1356,35 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                         ctx.resource_depth += 1;
                         execute_resource_file_inner(ctx, &rest, depth).await;
                         ctx.resource_depth = depth;
+                    }
+                }
+                "history" => {
+                    // Show the persisted command history. Ctrl-R searches it
+                    // interactively, but there was no way to just LOOK at it.
+                    match tokio::fs::read_to_string(&history_path()).await {
+                        Ok(contents) => {
+                            let lines: Vec<&str> = contents.lines().collect();
+                            let shown = lines.len().min(MAX_HISTORY_SHOWN);
+                            for (idx, line) in lines.iter().rev().take(shown).enumerate() {
+                                println!(
+                                    "{}",
+                                    format!("{:>5}  {}", lines.len() - idx, line).dimmed()
+                                );
+                            }
+                            if lines.len() > shown {
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "  … {} earlier entries (use `makerc` to export)",
+                                        lines.len() - shown
+                                    )
+                                    .dimmed()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("{}", format!("[!] No history available: {}", e).red())
+                        }
                     }
                 }
                 "makerc" => {
@@ -1654,101 +1838,37 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                     let background = rest.trim() == "-j" || rest.trim() == "--job";
 
                     if let Some(ref module_path) = ctx.current_module {
-                        // Get target from global config
-                        let target = if config::GLOBAL_CONFIG.has_target() {
-                            match config::GLOBAL_CONFIG.get_target() {
-                                Some(t) => {
-                                    println!("{}", format!("[*] Using target: {}", t).cyan());
-                                    Some(t)
-                                }
-                                None => {
-                                    println!("{}", "[!] Error getting target".red());
-                                    None
-                                }
-                            }
+                        // What does a target *mean* for this module? A radio
+                        // module addresses a Bluetooth device; a local-state
+                        // module has no target at all; everything else
+                        // attacks a network host.
+                        let target_kind = crate::module::find(module_path)
+                            .map(|m| m.capabilities().target_kind)
+                            .unwrap_or(crate::module::TargetKind::Network);
+
+                        // Resolve the target for this run.
+                        let target = resolve_run_target(target_kind).await;
+
+                        // A radio module (local Bluetooth radio) and a
+                        // local-state module legitimately run WITHOUT a
+                        // target — the radio / the local capture file is what
+                        // they work on. Only a network module needs a host.
+                        if target.is_none() && target_kind.is_network() {
+                            println!(
+                                "{}",
+                                "No target set. Use 'set target <value>' (or 't <value>') first."
+                                    .yellow()
+                            );
+                            println!("{}", "  Examples:".dimmed());
+                            println!("{}", "    set target 192.168.1.1".dimmed());
+                            println!("{}", "    set target 192.168.1.0/24".dimmed());
                         } else {
-                            None
-                        };
-
-                        // Interactive prompt if no target is set
-                        let target = if target.is_none() {
-                            println!("{}", "[!] Warning: No target set.".yellow());
-
-                            match utils::prompt_yes_no(
-                                "Do you want to provide a target address?",
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    match prompt_string_default("Enter target", "")
-                                        .await
-                                        .map_err(|e| anyhow::anyhow!("{}", e))
-                                    {
-                                        Ok(input) => match sanitize_target(&input) {
-                                            Ok(valid_target) => {
-                                                if let Err(e) =
-                                                    config::GLOBAL_CONFIG.set_target(&valid_target)
-                                                {
-                                                    println!(
-                                                        "{}",
-                                                        format!("[!] Failed to set target: {}", e)
-                                                            .red()
-                                                    );
-                                                    None
-                                                } else {
-                                                    println!(
-                                                        "{}",
-                                                        format!(
-                                                            "[*] Target set to '{}'",
-                                                            valid_target
-                                                        )
-                                                        .green()
-                                                    );
-                                                    Some(valid_target)
-                                                }
-                                            }
-                                            Err(e) => {
-                                                println!(
-                                                    "{}",
-                                                    format!("[!] Invalid target: {}", e).red()
-                                                );
-                                                None
-                                            }
-                                        },
-                                        Err(e) => {
-                                            println!(
-                                                "{}",
-                                                format!("[!] Error reading input: {}", e).red()
-                                            );
-                                            None
-                                        }
-                                    }
-                                }
-                                Ok(false) => {
-                                    match utils::prompt_yes_no(
-                                        "Continue with localhost (127.0.0.1)?",
-                                        false,
-                                    )
-                                    .await
-                                    {
-                                        Ok(true) => Some("127.0.0.1".to_string()),
-                                        _ => {
-                                            println!("{}", "[!] Execution aborted.".red());
-                                            None
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!("prompt error: {e}");
-                                    None
-                                }
-                            }
-                        } else {
-                            target
-                        };
-
-                        if let Some(ref t) = target {
+                            // An empty target is legitimate for a radio /
+                            // local-state module — it means "no target".
+                            let t = match target.clone() {
+                                Some(t) => t,
+                                None => String::new(),
+                            };
                             if background {
                                 match crate::jobs::JOB_MANAGER.spawn(
                                     module_path.clone(),
@@ -1789,11 +1909,15 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 }
                             } else {
                                 // Normal foreground execution
-                                let is_mass_scan = crate::utils::is_mass_scan_target(t);
+                                let is_mass_scan = crate::utils::is_mass_scan_target(&t);
 
                                 // Honeypot detection — enabled by default. Note that
                                 // scheduler::fanout_single also checks; this provides
                                 // interactive confirmation before the module runs.
+                                //
+                                // Only meaningful for a network host: probing a
+                                // Bluetooth device address (or the local radio)
+                                // with a TCP port scan is nonsense.
                                 let honeypot_on = crate::global_options::GLOBAL_OPTIONS
                                     .try_get("honeypot_detection")
                                     .map(|v| {
@@ -1807,7 +1931,8 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 let mut skip_target = false;
                                 if honeypot_on
                                     && !is_mass_scan
-                                    && crate::utils::network::quick_honeypot_check(t).await
+                                    && target_kind.is_network()
+                                    && crate::utils::network::quick_honeypot_check(&t).await
                                 {
                                     println!("{}", format!(
                                             "[!] Target {} appears to be a honeypot (11+ common ports open)",
@@ -1823,26 +1948,81 @@ async fn execute_single_command(ctx: &mut ShellContext, cmd_input: &str) -> bool
                                 }
 
                                 if !skip_target {
-                                    println!(
-                                        "Running module '{}' against target '{}'",
-                                        module_path, t
-                                    );
-                                    if let Err(e) =
-                                        commands::run_module(module_path, t, ctx.verbose).await
-                                    {
-                                        eprintln!("[!] Module failed: {:?}", e);
+                                    // Say what is actually being attacked: an IP
+                                    // host, a Bluetooth device, or nothing at
+                                    // all. The old wording claimed every module
+                                    // ran "against target '127.0.0.1'" even when
+                                    // it never touched it.
+                                    match target_kind {
+                                        crate::module::TargetKind::Network => {
+                                            println!(
+                                                "Running module '{}' against target '{}'",
+                                                module_path, t
+                                            );
+                                        }
+                                        crate::module::TargetKind::Radio => {
+                                            if t.is_empty() {
+                                                println!(
+                                                    "Running module '{}' on the local Bluetooth radio (all devices in range)",
+                                                    module_path
+                                                );
+                                            } else if crate::utils::is_mass_scan_target(&t) {
+                                                // The scheduler refuses a mass
+                                                // target for a radio module;
+                                                // say what is really being
+                                                // run, not what the mass
+                                                // target claims.
+                                                println!(
+                                                    "Running module '{}' on the local Bluetooth radio",
+                                                    module_path
+                                                );
+                                            } else {
+                                                println!(
+                                                    "Running module '{}' on the local Bluetooth radio (device {})",
+                                                    module_path, t
+                                                );
+                                            }
+                                        }
+                                        crate::module::TargetKind::Local => {
+                                            println!(
+                                                "Running module '{}' on local state",
+                                                module_path
+                                            );
+                                        }
+                                    }
+                                    // Terminal title: shows the running module
+                                    // in the taskbar entry so an operator who
+                                    // alt-tabbed away knows what is going on.
+                                    let title_target = match target_kind {
+                                        crate::module::TargetKind::Network => t.clone(),
+                                        crate::module::TargetKind::Radio => {
+                                            if t.is_empty() || crate::utils::is_mass_scan_target(&t)
+                                            {
+                                                "radio".to_string()
+                                            } else {
+                                                t.clone()
+                                            }
+                                        }
+                                        crate::module::TargetKind::Local => "local".to_string(),
+                                    };
+                                    set_terminal_title(&format!(
+                                        "rsf: {module_path} → {title_target}"
+                                    ));
+                                    let outcome =
+                                        commands::run_module(module_path, &t, ctx.verbose).await;
+                                    match &outcome {
+                                        Ok(()) => {
+                                            set_terminal_title(&format!("rsf: {module_path} ✓"));
+                                            notify_desktop_findings(module_path, &t, false).await;
+                                        }
+                                        Err(e) => {
+                                            set_terminal_title(&format!("rsf: {module_path} ✗"));
+                                            notify_desktop_findings(module_path, &t, true).await;
+                                            eprintln!("[!] Module failed: {:?}", e);
+                                        }
                                     }
                                 }
                             }
-                        } else {
-                            println!(
-                                "{}",
-                                "No target set. Use 'set target <value>' (or 't <value>') first."
-                                    .yellow()
-                            );
-                            println!("{}", "  Examples:".dimmed());
-                            println!("{}", "    set target 192.168.1.1".dimmed());
-                            println!("{}", "    set target 192.168.1.0/24".dimmed());
                         }
                     } else {
                         println!(
@@ -1966,6 +2146,8 @@ pub fn resolve_command(cmd: &str) -> String {
         "spool" => "spool",
         "resource" | "rc" => "resource",
         "makerc" => "makerc",
+        "history" | "hist" => "history",
+        "desktop" | "de" => "desktop",
         "hosts" => "hosts",
         "services" | "svcs" => "services",
         "sessions" | "ss" => "sessions",
@@ -2333,6 +2515,157 @@ fn sanitize_target(input: &str) -> std::result::Result<String, &'static str> {
     utils::sanitize_target_simple(input)
 }
 
+/// Resolve the target for a `run`.
+///
+/// `kind` says what a target *means* for the module being run:
+///
+/// * [`TargetKind::Network`] — an IP / hostname / CIDR. The operator is
+///   asked for one when none is set (with the classic "continue with
+///   localhost?" fallback).
+/// * [`TargetKind::Radio`] — a Bluetooth device address
+///   (`AA:BB:CC:DD:EE:FF`). The module drives the LOCAL radio and never
+///   opens a socket to the target, so asking for an IP address and then
+///   falling back to "localhost (127.0.0.1)" produced a run that claimed to
+///   attack 127.0.0.1 and touched nothing at all.
+/// * [`TargetKind::Local`] — no target at all; the module works on local
+///   state (a capture file, the local controller).
+///
+/// Returns `None` when the module should run without a target.
+async fn resolve_run_target(kind: crate::module::TargetKind) -> Option<String> {
+    match kind {
+        crate::module::TargetKind::Network => {
+            // Get target from global config
+            let target = if config::GLOBAL_CONFIG.has_target() {
+                match config::GLOBAL_CONFIG.get_target() {
+                    Some(t) => {
+                        println!("{}", format!("[*] Using target: {}", t).cyan());
+                        Some(t)
+                    }
+                    None => {
+                        println!("{}", "[!] Error getting target".red());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Interactive prompt if no target is set
+            if target.is_some() {
+                return target;
+            }
+            println!("{}", "[!] Warning: No target set.".yellow());
+
+            match utils::prompt_yes_no("Do you want to provide a target address?", true).await {
+                Ok(true) => {
+                    match prompt_string_default("Enter target", "")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                    {
+                        Ok(input) => match sanitize_target(&input) {
+                            Ok(valid_target) => {
+                                if let Err(e) = config::GLOBAL_CONFIG.set_target(&valid_target) {
+                                    println!(
+                                        "{}",
+                                        format!("[!] Failed to set target: {}", e).red()
+                                    );
+                                    None
+                                } else {
+                                    println!(
+                                        "{}",
+                                        format!("[*] Target set to '{}'", valid_target).green()
+                                    );
+                                    Some(valid_target)
+                                }
+                            }
+                            Err(e) => {
+                                println!("{}", format!("[!] Invalid target: {}", e).red());
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            println!("{}", format!("[!] Error reading input: {}", e).red());
+                            None
+                        }
+                    }
+                }
+                Ok(false) => {
+                    match utils::prompt_yes_no("Continue with localhost (127.0.0.1)?", false).await
+                    {
+                        Ok(true) => Some("127.0.0.1".to_string()),
+                        _ => {
+                            println!("{}", "[!] Execution aborted.".red());
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("prompt error: {e}");
+                    None
+                }
+            }
+        }
+        crate::module::TargetKind::Radio => {
+            // A global target is only usable when it is a device address —
+            // an IP left over from the last network module is meaningless
+            // here and must not be reported as this module's target.
+            match config::GLOBAL_CONFIG.get_target() {
+                Some(t) if !t.trim().is_empty() => {
+                    let t = t.trim();
+                    if utils::is_mac_addr(t) {
+                        println!("{}", format!("[*] Using Bluetooth device: {}", t).cyan());
+                        return Some(t.to_string());
+                    }
+                    // A mass target is passed through untouched: the scheduler
+                    // refuses it with a message that explains what to do
+                    // instead. Silently downgrading "sweep the internet" to
+                    // "work on every device in range" would be misleading.
+                    if crate::utils::is_mass_scan_target(t) {
+                        return Some(t.to_string());
+                    }
+                    println!(
+                        "{}",
+                        format!(
+                            "[!] Global target '{t}' is not a Bluetooth device address — ignoring it."
+                        )
+                        .yellow()
+                    );
+                }
+                _ => {}
+            }
+            println!("{}", "[!] Warning: No Bluetooth device set.".yellow());
+            match utils::prompt_yes_no("Target a specific Bluetooth device?", false).await {
+                Ok(true) => {
+                    match prompt_string_default("Device address (AA:BB:CC:DD:EE:FF)", "").await {
+                        Ok(input) => {
+                            let mac = input.trim();
+                            if mac.is_empty() {
+                                None
+                            } else if utils::is_mac_addr(mac) {
+                                println!("{}", format!("[*] Target set to '{}'", mac).green());
+                                Some(mac.to_string())
+                            } else {
+                                println!(
+                                    "{}",
+                                    format!("[!] '{}' is not a device address.", mac).red()
+                                );
+                                None
+                            }
+                        }
+                        Err(e) => {
+                            println!("{}", format!("[!] Error reading input: {}", e).red());
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+        // Local-state module: no target exists.
+        crate::module::TargetKind::Local => None,
+    }
+}
+
 fn render_help() {
     println!();
     println!(
@@ -2368,7 +2701,12 @@ fn render_help() {
         "ls | m".dimmed()
     );
     println!(
-        "    {:<20} {:<24} Search modules by keyword",
+        "    {:<20} {:<24} List modules in one category",
+        "modules <cat>".green(),
+        "exploits | scanners".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Search modules by name, description or CVE",
         "find <kw>".green(),
         "f1 <kw>".dimmed()
     );
@@ -2381,6 +2719,11 @@ fn render_help() {
         "    {:<20} {:<24} Show module metadata (CVE, author, rank)",
         "info [path]".green(),
         "i".dimmed()
+    );
+    println!(
+        "    {:<20} {:<24} Show the persisted command history",
+        "history".green(),
+        "hist".dimmed()
     );
     println!(
         "    {:<20} {:<24} Deselect the current module (target preserved)",
@@ -2665,13 +3008,22 @@ fn render_help_topic(topic: &str) {
             "Select a module to work with.",
             &[
                 "use <category>/<path>",
-                "use <short_name>   # fuzzy-match on final segment",
+                "use <short_name>   # matched on the final path segment",
+                "use <category>/<short_name>",
             ],
             "Loads the named module into the shell. The prompt changes to show the selected module. \
-             Subsequent `run` and `info` commands target it. Use `back` to deselect.",
+             Subsequent `run` and `info` commands target it. Use `back` to deselect. \
+             An unknown name produces a 'did you mean' suggestion.",
             &[
                 ("use scanners/proxy_scanner", "Load the open-proxy scanner"),
-                ("use proxy_scanner", "Same thing — short-name fuzzy match"),
+                (
+                    "use proxy_scanner",
+                    "Same thing — matched on the final segment",
+                ),
+                (
+                    "use exploits/bluetooth/knob_probe",
+                    "Bluetooth module, full path",
+                ),
                 ("u exploits/dos/slowloris", "Alias `u` works identically"),
             ],
             &["info", "modules", "find", "back", "run"],
@@ -3000,6 +3352,15 @@ fn render_help_topic(topic: &str) {
             "Pairs with `resource` to replay sessions.",
             &[("makerc recon.rc", "Snapshot current session")],
             &["resource"],
+        ),
+        "history" => man_page(
+            "history",
+            "Show the persisted command history, newest first.",
+            &["history"],
+            "The history lives in ~/.rustsploit/history.txt and survives across \
+             sessions. Ctrl-R searches it interactively while the shell is running.",
+            &[("history", "Show the last 200 commands")],
+            &["makerc", "resource"],
         ),
         "spool" => man_page(
             "spool",

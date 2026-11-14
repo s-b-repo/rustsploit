@@ -263,11 +263,46 @@ impl ModuleOptions {
 // CAPABILITIES
 // ============================================================
 
+/// What a module's *target* refers to.
+///
+/// The scheduler and the shell need this to know what a target string means
+/// for a given module: an IP/hostname for a network module, a Bluetooth
+/// device address for a radio module, and nothing at all for a module that
+/// works purely on local state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A network host — IP, hostname, CIDR, host file or a random sweep.
+    /// This is the default: almost every module talks to a host over IP.
+    Network,
+    /// A local Bluetooth peer, addressed by MAC (`AA:BB:CC:DD:EE:FF`).
+    ///
+    /// The module drives the LOCAL radio; it never opens a TCP connection to
+    /// the target. A network target is therefore meaningless for it, and a
+    /// mass target would fan the attack out over millions of hosts.
+    Radio,
+    /// No target at all — the module works on local state (a btsnoop
+    /// capture, the local controller, a local corpus). Any target string is
+    /// ignored.
+    Local,
+}
+
+impl TargetKind {
+    /// True when the target is a network host the scheduler can fan out to.
+    pub fn is_network(self) -> bool {
+        matches!(self, TargetKind::Network)
+    }
+}
+
 /// Capabilities advertised by a module.
 ///
 /// Mass-scan fan-out is **universal** — handled by `crate::scheduler` for
 /// every module. There is no per-module mass-scan flag any more; modules
 /// only ever see `Target::Single` per invocation.
+///
+/// The one exception is the *kind* of target: a module that drives the local
+/// Bluetooth radio (or works purely on local state) declares it through
+/// `target_kind`, and the framework then refuses to fan it out across a mass
+/// target and does not ask the operator for an IP address.
 #[derive(Debug, Clone, Copy)]
 pub struct Capabilities {
     /// Module is rate-limit-friendly; safe to run with high concurrency.
@@ -281,6 +316,8 @@ pub struct Capabilities {
     /// Module runs an interactive / long-lived session and manages its own
     /// lifetime — the scheduler must NOT wrap it in the per-target timeout.
     pub interactive: bool,
+    /// What this module's target refers to.
+    pub target_kind: TargetKind,
 }
 
 impl Default for Capabilities {
@@ -291,6 +328,7 @@ impl Default for Capabilities {
             check_only: false,
             network: true,
             interactive: false,
+            target_kind: TargetKind::Network,
         }
     }
 }
@@ -671,18 +709,49 @@ pub fn render_catalog_markdown() -> String {
 ///
 /// Both shapes share `RunContext` scoping + `abort_all_spawned()` cleanup
 /// so `cfg_prompt_*` / `ctx.spawn(...)` / `is_cancelled()` work uniformly.
+///
+/// **Target kind** — a module that does not attack a network host declares
+/// what its target means, so the framework never asks for (or fans out to) an
+/// IP address it cannot use:
+///
+/// ```ignore
+/// // Local Bluetooth peer — target is a MAC, not an IP.
+/// crate::register_native_module!(Category::Exploits, "bluetooth/wpair", native, interactive, radio);
+/// // Works purely on local state (a btsnoop capture) — no target at all.
+/// crate::register_native_module!(Category::Exploits, "bluetooth/bluffs", native, local);
+/// ```
 #[macro_export]
 macro_rules! register_native_module {
     ($category:expr, $name:expr) => {
         $crate::__register_native_module_impl!(@no_check $category, $name);
     };
     ($category:expr, $name:expr, native) => {
-        $crate::__register_native_module_impl!(@native $category, $name, false);
+        $crate::__register_native_module_impl!(@native $category, $name, false, network);
     };
     // Interactive native module: the scheduler runs it without the per-target
     // timeout (it owns its own REPL / long-lived session lifetime).
     ($category:expr, $name:expr, native, interactive) => {
-        $crate::__register_native_module_impl!(@native $category, $name, true);
+        $crate::__register_native_module_impl!(@native $category, $name, true, network);
+    };
+    // Local-radio module: the target is a Bluetooth device address.
+    ($category:expr, $name:expr, native, radio) => {
+        $crate::__register_native_module_impl!(@native $category, $name, false, radio);
+    };
+    ($category:expr, $name:expr, native, interactive, radio) => {
+        $crate::__register_native_module_impl!(@native $category, $name, true, radio);
+    };
+    ($category:expr, $name:expr, native, radio, interactive) => {
+        $crate::__register_native_module_impl!(@native $category, $name, true, radio);
+    };
+    // Local-state module: no target at all.
+    ($category:expr, $name:expr, native, local) => {
+        $crate::__register_native_module_impl!(@native $category, $name, false, local);
+    };
+    ($category:expr, $name:expr, native, interactive, local) => {
+        $crate::__register_native_module_impl!(@native $category, $name, true, local);
+    };
+    ($category:expr, $name:expr, native, local, interactive) => {
+        $crate::__register_native_module_impl!(@native $category, $name, true, local);
     };
 }
 
@@ -729,7 +798,27 @@ macro_rules! __register_native_module_impl {
         }
     };
     // Native shape: `run(ctx) -> Result<ModuleOutcome>`.
-    (@native $category:expr, $name:expr, $interactive:expr) => {
+    //
+    // The target-kind token is matched literally (`radio` / `local` /
+    // `network`) and mapped onto the `TargetKind` variant here — a captured
+    // `$kind:expr` fragment can no longer be matched against a literal
+    // ident, so the mapping has to happen before the capture.
+    (@native $category:expr, $name:expr, $interactive:expr, radio) => {
+        $crate::__register_native_module_impl!(
+            @kind $category, $name, $interactive, $crate::module::TargetKind::Radio
+        );
+    };
+    (@native $category:expr, $name:expr, $interactive:expr, local) => {
+        $crate::__register_native_module_impl!(
+            @kind $category, $name, $interactive, $crate::module::TargetKind::Local
+        );
+    };
+    (@native $category:expr, $name:expr, $interactive:expr, network) => {
+        $crate::__register_native_module_impl!(
+            @kind $category, $name, $interactive, $crate::module::TargetKind::Network
+        );
+    };
+    (@kind $category:expr, $name:expr, $interactive:expr, $kind:expr) => {
         struct __ModuleImpl;
         impl ::std::default::Default for __ModuleImpl {
             fn default() -> Self {
@@ -744,6 +833,7 @@ macro_rules! __register_native_module_impl {
             fn capabilities(&self) -> $crate::module::Capabilities {
                 $crate::module::Capabilities {
                     interactive: $interactive,
+                    target_kind: $kind,
                     ..::core::default::Default::default()
                 }
             }

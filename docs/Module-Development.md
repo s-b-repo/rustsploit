@@ -155,11 +155,29 @@ pub async fn run(ctx: &ModuleCtx) -> Result<ModuleOutcome> {
 crate::register_native_module!(crate::module::Category::Exploits, "your_module", native);
 ```
 
-The macro has exactly three arms:
+The macro has three base arms, each with an optional target-kind suffix:
 
 - `register_native_module!(Cat::X, "name")` — legacy `run(target: &str)` shim; do not use for new modules
 - `register_native_module!(Cat::X, "name", native)` — native `run(&ModuleCtx) -> Result<ModuleOutcome>`
 - `register_native_module!(Cat::X, "name", native, interactive)` — native, and the scheduler skips the per-target deadline so long-lived REPLs/sessions are not killed mid-input
+
+and two optional **target-kind** flags, which say what a *target* means for
+the module:
+
+- `register_native_module!(Cat::X, "name", native, radio)` — the module drives
+  the local Bluetooth radio; its target is a device address (`AA:BB:CC:DD:EE:FF`),
+  not a network host
+- `register_native_module!(Cat::X, "name", native, local)` — the module works on
+  local state only (a capture file, the local controller); it has no target
+
+`interactive` and the target-kind flag combine in either order
+(`native, interactive, radio` / `native, radio, interactive`).
+
+A `radio` module is never fanned out: the scheduler **refuses** a mass target
+(`0.0.0.0`, `random`, a CIDR, a host file) instead of sweeping the Internet
+for a module that never opens a socket, and the shell asks for a device
+address — not an IP — when the operator runs one without a target. A `local`
+module ignores the target entirely; it works on local state.
 
 There is **no `has_check` arm**. Rustsploit is exploitation-only: modules run
 an exploit and report findings. Do not add a `check()` phase.
