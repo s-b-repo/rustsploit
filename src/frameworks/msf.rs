@@ -320,9 +320,16 @@ fn extract_default_port<'a>(
 
     // Look for RPORT => <number>
     for part in collector.split(',') {
+        // Take the first contiguous run of ASCII digits after `RPORT =>`, so a
+        // value wrapped in block/quote syntax (`{ 'RPORT' => 8080 }`) still reads.
         if let Some(rport) = part.split("RPORT").nth(1)
             && let Some(val) = rport.split("=>").nth(1)
-            && let Ok(port) = val.trim().trim_matches('\'').trim_matches('"').parse()
+            && let Ok(port) = val
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u16>()
         {
             return Some(port);
         }
@@ -350,19 +357,27 @@ fn extract_options<'a>(
         let Some(rest) = collector.split(&format!("Opt::{opt}")).nth(1) else {
             continue;
         };
-        let trimmed = rest.trim();
-        // Extract the default value in parentheses
-        let Some(paren_start) = trimmed.find('(') else {
-            continue;
+        let rest = rest.trim_start();
+        // Read the value from the form right after the option name:
+        //   `Opt::NAME(default)`                     -> the parenthesised default;
+        //   `Opt::NAME` with no default (`,`/`]`/`}`/EOL) -> empty default;
+        //   anything else is a prefix match (`Opt::RHOST` inside `Opt::RHOSTS`)
+        //   and must be skipped, or it emits a bogus duplicate option.
+        let val = match rest.chars().next() {
+            Some('(') => {
+                // `rest` starts with '('; take everything up to the matching ')'.
+                let Some(paren_end) = rest.find(')') else {
+                    continue;
+                };
+                rest.get(1..paren_end)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+            }
+            Some(',') | Some(']') | Some('}') | None => "",
+            _ => continue,
         };
-        let after_paren = &trimmed[paren_start + 1..];
-        let Some(paren_end) = after_paren.find(')') else {
-            continue;
-        };
-        let val = after_paren[..paren_end]
-            .trim()
-            .trim_matches('\'')
-            .trim_matches('"');
         // Special-case known options
         match opt {
             "RPORT" => match val.parse::<u16>() {
@@ -469,8 +484,20 @@ end
             .expect("msf module should parse"); // audit-allow: test
         let names: Vec<&str> = tmpl.options.iter().map(|o| o.name.as_str()).collect();
         assert!(names.contains(&"target")); // audit-allow: test
+        // RHOST is a prefix of RHOSTS; the split used to match both and emit a
+        // duplicate "target". There must be exactly one.
+        assert_eq!(names.iter().filter(|n| **n == "target").count(), 1); // audit-allow: test
         assert!(names.contains(&"concurrency")); // audit-allow: test
         assert!(names.contains(&"custom")); // audit-allow: test
+    }
+
+    #[test]
+    fn default_port_parses_brace_wrapped_value() {
+        // `'DefaultOptions' => { 'RPORT' => 8080 }` has trailing `}` syntax after
+        // the number; the parser must still read 8080.
+        let line = "'DefaultOptions' => { 'RPORT' => 8080 },";
+        let mut rest = std::iter::empty::<&str>().peekable();
+        assert_eq!(extract_default_port(line, &mut rest), Some(8080)); // audit-allow: test
     }
 
     #[test]
