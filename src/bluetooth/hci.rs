@@ -769,9 +769,10 @@ fn parse_inquiry_result(params: &[u8], stride: usize) -> Option<InquiryResult> {
     while off + stride <= params.len() {
         let mut addr = [0u8; 6];
         addr.copy_from_slice(&params[off..off + 6]);
-        let cod = ((params[off + 9] as u32) << 16)
+        // Class_of_Device is 3 octets, little-endian (LSB first) on the HCI wire.
+        let cod = (params[off + 9] as u32)
             | ((params[off + 10] as u32) << 8)
-            | (params[off + 11] as u32);
+            | ((params[off + 11] as u32) << 16);
         let rssi = if stride >= 15 {
             Some(params[off + 14] as i8)
         } else {
@@ -1056,5 +1057,20 @@ mod tests {
         assert_eq!(bdaddr_to_string(&r.bdaddr), "33:22:11:C8:56:65");
         assert_eq!(r.class_of_device, 0x0C0204);
         assert_eq!(r.rssi, Some(-28));
+    }
+
+    #[test]
+    fn inquiry_result_cod_is_little_endian() {
+        // Standard Inquiry Result (stride 14, no RSSI): num(1) then per response
+        // bdaddr(6) pscan(1) reserved(2) cod(3, LE) clock(2).
+        let mut params = vec![1u8];
+        params.extend_from_slice(&[0x65, 0x56, 0xC8, 0x11, 0x22, 0x33]);
+        params.extend_from_slice(&[0x00, 0x00, 0x00]); // pscan(1) + reserved(2)
+        params.extend_from_slice(&[0x04, 0x02, 0x0C]); // cod little-endian -> 0x0C0204
+        params.extend_from_slice(&[0x34, 0x12]); // clock
+        let r = parse_inquiry_result(&params, 14).expect("parse"); // audit-allow: test
+        assert_eq!(bdaddr_to_string(&r.bdaddr), "33:22:11:C8:56:65"); // audit-allow: test
+        assert_eq!(r.class_of_device, 0x0C0204); // audit-allow: test
+        assert_eq!(r.rssi, None); // audit-allow: test
     }
 }

@@ -286,13 +286,12 @@ impl ObexClient {
             let is_last = end == body.len();
             let mut pdu_payload = Vec::with_capacity(header.len() + 3 + frag.len());
             pdu_payload.extend_from_slice(&header[3..]);
+            // Both Body (0x48) and End-of-Body (0x49) are byte-sequence headers
+            // carrying a 2-byte length prefix (IrOBEX §2.1) — frame them the same
+            // way so the final chunk is not sent as a bare, unlengthed blob a
+            // spec-compliant server would mis-parse.
             let hid = if is_last { hid::END_OF_BODY } else { hid::BODY };
-            if is_last {
-                pdu_payload.push(hid);
-                pdu_payload.extend_from_slice(frag);
-            } else {
-                push_header(&mut pdu_payload, hid, frag);
-            }
+            push_header(&mut pdu_payload, hid, frag);
             let req = pdu(opcode::PUT, &pdu_payload);
             let resp = self.exchange(&req).await?;
             if is_last {
