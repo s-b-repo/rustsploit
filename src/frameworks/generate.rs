@@ -83,6 +83,18 @@ pub fn module_name_from(path: &Path) -> String {
         .to_lowercase()
 }
 
+/// Emit the `disclosure_date:` line for a generated `info()`, carrying over the
+/// source template's disclosure date when it states one.
+fn disclosure_date_field(template: &Template) -> String {
+    match &template.disclosure_date {
+        Some(d) => format!(
+            "        disclosure_date: Some({}.to_string()),\n",
+            rust_string_literal(d)
+        ),
+        None => "        disclosure_date: None,\n".to_string(),
+    }
+}
+
 /// Generate the RustSploit module source for a template.
 ///
 /// `source` is the original template file, embedded verbatim so the module
@@ -116,6 +128,9 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
             "//! Original authors: {}\n",
             template.authors.join(", ")
         ));
+    }
+    if !template.tags.is_empty() {
+        out.push_str(&format!("//! Tags: {}\n", template.tags.join(", ")));
     }
     out.push_str("//!\n");
     out.push_str(&format!(
@@ -169,7 +184,7 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    out.push_str("        disclosure_date: None,\n");
+    out.push_str(&disclosure_date_field(template));
     out.push_str(&format!(
         "        rank: ModuleRank::{},\n",
         rank_variant(template.severity.module_rank())
@@ -191,15 +206,24 @@ fn generate_executable(template: &Template, category: &str, source: &str) -> Str
     out.push_str(&format!(
         "    let port = crate::utils::cfg_prompt_port(\"port\", \"Target port\", {port}).await?;\n"
     ));
-    out.push_str("    let scheme = crate::utils::cfg_prompt_default(\n");
-    out.push_str("        \"scheme\",\n");
-    out.push_str("        \"Scheme (http/https)\",\n");
-    out.push_str(&format!(
-        "        \"{}\",\n",
-        if port == 80 { "http" } else { "https" }
-    ));
-    out.push_str("    )\n");
-    out.push_str("    .await?;\n");
+    if template.http_based {
+        out.push_str("    let scheme = crate::utils::cfg_prompt_default(\n");
+        out.push_str("        \"scheme\",\n");
+        out.push_str("        \"Scheme (http/https)\",\n");
+        out.push_str(&format!(
+            "        \"{}\",\n",
+            if port == 80 { "http" } else { "https" }
+        ));
+        out.push_str("    )\n");
+        out.push_str("    .await?;\n");
+    } else {
+        // DNS/TCP templates carry no HTTP scheme, but ExecutionCtx still needs
+        // the field — emit a fixed value instead of prompting for one.
+        out.push_str(&format!(
+            "    let scheme = \"{}\".to_string();\n",
+            if port == 80 { "http" } else { "https" }
+        ));
+    }
     out.push_str("    let timeout = crate::utils::cfg_prompt_int_range(\n");
     out.push_str("        \"timeout\",\n");
     out.push_str("        \"Request timeout in seconds\",\n");
@@ -273,6 +297,9 @@ fn generate_scaffold(template: &Template, category: &str) -> String {
             template.authors.join(", ")
         ));
     }
+    if !template.tags.is_empty() {
+        out.push_str(&format!("//! Tags: {}\n", template.tags.join(", ")));
+    }
     out.push_str("//!\n");
     out.push_str(&format!(
         "//! A {} body is {} — the metadata, the port default and the option\n\
@@ -325,7 +352,7 @@ fn generate_scaffold(template: &Template, category: &str) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    out.push_str("        disclosure_date: None,\n");
+    out.push_str(&disclosure_date_field(template));
     out.push_str(&format!(
         "        rank: ModuleRank::{},\n",
         rank_variant(template.severity.module_rank())
@@ -520,7 +547,7 @@ pub fn write_module(
     let path = output_dir.join(format!("{module_name}.rs"));
     std::fs::write(&path, &code).with_context(|| format!("write {}", path.display()))?; // audit-allow: synchronous generator, not on an async runtime
 
-    let registered_in_parent = declare_in_parent(output_dir, category, &module_name);
+    let registered_in_parent = declare_in_parent(output_dir, &module_name);
 
     Ok(GeneratedModule {
         path,
@@ -531,7 +558,7 @@ pub fn write_module(
 }
 
 /// Add `pub mod <name>;` to the category's `mod.rs` (idempotent).
-fn declare_in_parent(output_dir: &Path, category: &str, module_name: &str) -> bool {
+fn declare_in_parent(output_dir: &Path, module_name: &str) -> bool {
     // `output_dir` is `src/modules/<category>/<subdir>` in the common case and
     // `src/modules/<category>` itself in the flat case. The `mod.rs` that owns
     // the module is the parent of the directory the file was written into.
@@ -633,5 +660,24 @@ mod tests {
         assert_eq!(rust_ident("uri-path"), "uri_path"); // audit-allow: test
         assert_eq!(rust_ident("type"), "type_"); // audit-allow: test
         assert_eq!(rust_ident(""), "option"); // audit-allow: test
+    }
+
+    #[test]
+    fn disclosure_date_is_carried_over() {
+        let mut t = template();
+        t.disclosure_date = Some("2024-01-02".to_string());
+        let code = generate(&t, "scanners", "id: x");
+        assert!(code.contains("disclosure_date: Some(\"2024-01-02\"")); // audit-allow: test
+        t.disclosure_date = None;
+        let code = generate(&t, "scanners", "id: x");
+        assert!(code.contains("disclosure_date: None")); // audit-allow: test
+    }
+
+    #[test]
+    fn tags_appear_in_the_generated_doc_header() {
+        let mut t = template();
+        t.tags = vec!["cve".to_string(), "rce".to_string()];
+        let code = generate(&t, "scanners", "id: x");
+        assert!(code.contains("//! Tags: cve, rce")); // audit-allow: test
     }
 }

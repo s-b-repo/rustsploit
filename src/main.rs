@@ -209,7 +209,19 @@ async fn run() -> Result<()> {
             .with_context(|| format!("reading template {tpl_path}"))?;
         let template = frameworks::Template::from_source(&source)
             .with_context(|| format!("parsing template {tpl_path}"))?;
-        let category = cli_args.import_category.as_str();
+        // Fall back to the category the template itself suggests (and finally
+        // "exploits") when --import-category was not given.
+        let category = cli_args
+            .import_category
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| {
+                if template.category.trim().is_empty() {
+                    "exploits"
+                } else {
+                    template.category.as_str()
+                }
+            });
         let out_dir = frameworks::generate::default_output_dir(category);
         let generated = frameworks::generate::write_module(&template, &source, &out_dir, category)
             .context("generating module from template")?;
@@ -220,6 +232,10 @@ async fn run() -> Result<()> {
             template.name,
             generated.path.display(),
             generated.qualified_name
+        );
+        println!(
+            "  Generated {} lines of Rust.",
+            generated.code.lines().count()
         );
         let opts = frameworks::generate::describe_options(&template.options);
         if !opts.trim().is_empty() {

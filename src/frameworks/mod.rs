@@ -253,11 +253,7 @@ pub trait FrameworkAdapter: Send + Sync {
     ///
     /// Only called for adapters whose [`FrameworkAdapter::executable`] is
     /// true; the default refuses with an explanation instead of pretending.
-    async fn execute(
-        &self,
-        template: &Template,
-        ctx: &ExecutionCtx<'_>,
-    ) -> Result<Vec<TemplateResult>> {
+    async fn execute(&self, _: &Template, _: &ExecutionCtx<'_>) -> Result<Vec<TemplateResult>> {
         anyhow::bail!(
             "'{}' templates cannot be executed natively — generate a RustSploit module \
              from the template instead.",
