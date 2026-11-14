@@ -194,6 +194,10 @@ pub struct Matcher {
     pub negative: bool,
     /// Which part of the response is inspected.
     pub part: MatchPart,
+    /// Case-sensitive `word`/`regex`/`binary` matching. Nuclei matchers are
+    /// case-sensitive by default; a template sets `case_sensitive: false` to
+    /// fold ASCII case.
+    pub case_sensitive: bool,
 }
 
 /// The check a matcher performs.
@@ -211,14 +215,48 @@ pub enum MatcherKind {
     Binary(Vec<String>),
     /// Nested group of matchers.
     Group(Vec<Matcher>, Condition),
-    /// DSL matcher — not reproducible natively.
-    Dsl(Vec<String>),
+    /// DSL matcher — a minimal expression set (see `eval_dsl_expr`), combined
+    /// with the matcher's own `condition`.
+    Dsl(Vec<String>, Condition),
+}
+
+/// Which extraction strategy an extractor uses (nuclei `type:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractorKind {
+    /// Regular-expression capture (the nuclei default).
+    Regex,
+    /// Key/value lookup against response headers.
+    Kval,
+    /// JSON field lookup — degraded to regex capture in this bridge.
+    Json,
+    /// DSL expression — not reproduced natively for extractors.
+    Dsl,
+    /// XPath query — degraded to regex capture in this bridge.
+    Xpath,
+}
+
+impl ExtractorKind {
+    /// Map a nuclei extractor `type:` onto a strategy. Absent/unknown → `Regex`
+    /// (the nuclei default), so templates without a `type:` keep their current
+    /// behaviour.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("kval") => ExtractorKind::Kval,
+            Some("json") => ExtractorKind::Json,
+            Some("dsl") => ExtractorKind::Dsl,
+            Some("xpath") => ExtractorKind::Xpath,
+            _ => ExtractorKind::Regex,
+        }
+    }
 }
 
 /// A value extractor.
 #[derive(Debug, Clone)]
 pub struct Extractor {
-    /// Regular expressions to run against the response.
+    /// The extraction strategy (nuclei `type:`).
+    pub kind: ExtractorKind,
+    /// Regular expressions to run against the response — or, for `kval`, the
+    /// response-header keys to pull.
     pub regexes: Vec<String>,
     /// Capture group to keep (0 = whole match).
     pub group: u32,
@@ -507,6 +545,11 @@ fn convert_matcher(m: &YamlMatcher) -> Matcher {
         .as_deref()
         .map(MatchPart::parse)
         .unwrap_or(MatchPart::Body);
+    // Nuclei matchers are case-sensitive unless the template opts out.
+    let case_sensitive = match m.case_sensitive {
+        Some(cs) => cs,
+        None => true,
+    };
 
     let kind = match kind.as_str() {
         "word" => MatcherKind::Word(
@@ -534,6 +577,7 @@ fn convert_matcher(m: &YamlMatcher) -> Matcher {
                 .clone()
                 .map(StringOrList::into_vec)
                 .unwrap_or_else(Vec::new),
+            inner_condition,
         ),
         "and" | "or" => {
             // A matcher *group*: the sub-matchers combine with the group's own
@@ -550,18 +594,20 @@ fn convert_matcher(m: &YamlMatcher) -> Matcher {
             };
             MatcherKind::Group(subs, group_condition)
         }
-        _ => MatcherKind::Dsl(Vec::new()),
+        _ => MatcherKind::Dsl(Vec::new(), inner_condition),
     };
 
     Matcher {
         kind,
         negative,
         part,
+        case_sensitive,
     }
 }
 
 fn convert_extractor(e: &YamlExtractor) -> Extractor {
     Extractor {
+        kind: ExtractorKind::parse(e.kind.as_deref()),
         regexes: e
             .regex
             .clone()
@@ -592,6 +638,20 @@ fn decode_hex(raw: &str) -> Option<Vec<u8>> {
 }
 
 // ── Variable interpolation ──────────────────────────────────────────────
+
+/// Build the `{{var}}` substitution map for a run: template option defaults
+/// first, then operator-supplied `ctx.variables`, which override the defaults
+/// so a `setg`/API-supplied value wins over the template's baked-in default.
+fn run_vars(template: &Template, ctx: &ExecutionCtx<'_>) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    for opt in &template.options {
+        vars.insert(opt.name.clone(), opt.default.clone());
+    }
+    for (name, value) in &ctx.variables {
+        vars.insert(name.clone(), value.clone());
+    }
+    vars
+}
 
 /// Replace nuclei's `{{...}}` placeholders.
 ///
@@ -689,18 +749,31 @@ impl<'a> ResponseView<'a> {
 fn eval_matcher(matcher: &Matcher, view: &ResponseView<'_>) -> bool {
     let fired = match &matcher.kind {
         MatcherKind::Word(words) => {
-            let haystack = view.text(matcher.part).to_ascii_lowercase();
-            words
-                .iter()
-                .any(|w| haystack.contains(&w.to_ascii_lowercase()))
+            if matcher.case_sensitive {
+                let haystack = view.text(matcher.part);
+                words.iter().any(|w| haystack.contains(w))
+            } else {
+                let haystack = view.text(matcher.part).to_ascii_lowercase();
+                words
+                    .iter()
+                    .any(|w| haystack.contains(&w.to_ascii_lowercase()))
+            }
         }
         MatcherKind::Regex(patterns) => {
             let haystack = view.text(matcher.part);
-            patterns.iter().any(|p| match regex::Regex::new(p) {
-                Ok(re) => re.is_match(&haystack),
-                Err(e) => {
-                    tracing::debug!("nuclei: invalid regex '{p}': {e}");
-                    false
+            patterns.iter().any(|p| {
+                // Case-insensitive matchers compile with the inline `(?i)` flag.
+                let pattern = if matcher.case_sensitive {
+                    p.clone()
+                } else {
+                    format!("(?i){p}")
+                };
+                match regex::Regex::new(&pattern) {
+                    Ok(re) => re.is_match(&haystack),
+                    Err(e) => {
+                        tracing::debug!("nuclei: invalid regex '{p}': {e}");
+                        false
+                    }
                 }
             })
         }
@@ -713,26 +786,159 @@ fn eval_matcher(matcher: &Matcher, view: &ResponseView<'_>) -> bool {
             sizes.contains(&len)
         }
         MatcherKind::Binary(patterns) => {
-            let haystack = view.text(matcher.part).to_ascii_lowercase();
-            patterns.iter().any(|p| {
-                decode_hex(p)
-                    .map(|bytes| {
-                        let needle: String = bytes.iter().map(|b| *b as char).collect();
-                        haystack.contains(&needle.to_ascii_lowercase())
-                    })
-                    .unwrap_or(false)
+            let raw = view.text(matcher.part);
+            let haystack = if matcher.case_sensitive {
+                raw
+            } else {
+                raw.to_ascii_lowercase()
+            };
+            patterns.iter().any(|p| match decode_hex(p) {
+                Some(bytes) => {
+                    let needle: String = bytes.iter().map(|b| *b as char).collect();
+                    let needle = if matcher.case_sensitive {
+                        needle
+                    } else {
+                        needle.to_ascii_lowercase()
+                    };
+                    haystack.contains(&needle)
+                }
+                None => false,
             })
         }
         MatcherKind::Group(subs, condition) => match condition {
             Condition::And => subs.iter().all(|s| eval_matcher(s, view)),
             Condition::Or => subs.iter().any(|s| eval_matcher(s, view)),
         },
-        MatcherKind::Dsl(_) => {
-            tracing::debug!("nuclei: DSL matchers are not reproduced natively");
-            false
+        MatcherKind::Dsl(expressions, condition) => {
+            // Empty (also the fallback for an unknown matcher `type:`) never
+            // fires; otherwise combine each expression's verdict with the
+            // matcher's own `condition`.
+            if expressions.is_empty() {
+                false
+            } else {
+                match condition {
+                    Condition::And => expressions.iter().all(|e| eval_dsl_expr(e, view)),
+                    Condition::Or => expressions.iter().any(|e| eval_dsl_expr(e, view)),
+                }
+            }
         }
     };
     if matcher.negative { !fired } else { fired }
+}
+
+// ── Minimal nuclei-DSL matcher evaluator ─────────────────────────────────
+//
+// A full nuclei DSL engine (govaluate plus 200+ helpers) is out of scope for
+// a template bridge, so this reproduces only the handful of idioms the vast
+// majority of `type: dsl` matchers use. Anything it cannot parse evaluates to
+// `false` — conservative, never a false positive. Grammar, per expression:
+//
+//   expr   := or
+//   or     := and ("||" and)*
+//   and    := atom ("&&" atom)*
+//   atom   := "true" | "false"
+//           | "contains(" source "," STRING ")"
+//           | number_term CMP INT
+//   source := "body" | "tolower(body)"      (tolower folds the body only)
+//   number_term := "status_code" | "len(body)" | INT
+//   CMP    := "==" | "!=" | ">=" | "<=" | ">" | "<"
+//
+// Not supported (→ false): grouping parentheses, header/duration terms, regex
+// helpers and arithmetic. `&&`/`||` must not appear inside a string literal.
+
+/// Evaluate one DSL expression string against the response.
+fn eval_dsl_expr(expr: &str, view: &ResponseView<'_>) -> bool {
+    let expr = expr.trim();
+    if expr.contains("||") {
+        return expr.split("||").any(|part| eval_dsl_expr(part, view));
+    }
+    if expr.contains("&&") {
+        return expr.split("&&").all(|part| eval_dsl_expr(part, view));
+    }
+    eval_dsl_atom(expr, view)
+}
+
+/// Evaluate a single DSL atom (already split on `&&`/`||`).
+fn eval_dsl_atom(atom: &str, view: &ResponseView<'_>) -> bool {
+    let atom = atom.trim();
+    match atom {
+        "true" => return true,
+        "false" => return false,
+        _ => {}
+    }
+    if let Some(inner) = atom
+        .strip_prefix("contains(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        return eval_dsl_contains(inner, view);
+    }
+    // Longest operators first so `>=`/`<=`/`==`/`!=` win over `>`/`<`.
+    for op in ["==", "!=", ">=", "<=", ">", "<"] {
+        if let Some(idx) = atom.find(op) {
+            let (lhs, rhs) = match (atom.get(..idx), atom.get(idx + op.len()..)) {
+                (Some(l), Some(r)) => (l.trim(), r.trim()),
+                _ => continue,
+            };
+            return eval_dsl_compare(lhs, op, rhs, view);
+        }
+    }
+    false
+}
+
+/// Evaluate `contains(<source>, "<needle>")`.
+fn eval_dsl_contains(args: &str, view: &ResponseView<'_>) -> bool {
+    let Some(comma) = args.find(',') else {
+        return false;
+    };
+    let (source, needle_raw) = match (args.get(..comma), args.get(comma + 1..)) {
+        (Some(s), Some(n)) => (s.trim(), n.trim()),
+        _ => return false,
+    };
+    let Some(needle) = dsl_string_literal(needle_raw) else {
+        return false;
+    };
+    match source {
+        "tolower(body)" => view.body.to_ascii_lowercase().contains(&needle),
+        "body" => view.body.contains(&needle),
+        _ => false,
+    }
+}
+
+/// Resolve a DSL comparison `<number_term> <op> <int-literal>`.
+fn eval_dsl_compare(lhs: &str, op: &str, rhs: &str, view: &ResponseView<'_>) -> bool {
+    match (dsl_number_term(lhs, view), rhs.parse::<i64>()) {
+        (Some(l), Ok(r)) => match op {
+            "==" => l == r,
+            "!=" => l != r,
+            ">=" => l >= r,
+            "<=" => l <= r,
+            ">" => l > r,
+            "<" => l < r,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Resolve a DSL numeric term to an integer, or `None` when it isn't modelled.
+fn dsl_number_term(term: &str, view: &ResponseView<'_>) -> Option<i64> {
+    match term.trim() {
+        "status_code" => view.status.map(i64::from),
+        "len(body)" => i64::try_from(view.body.len()).ok(),
+        other => other.parse::<i64>().ok(),
+    }
+}
+
+/// Extract the contents of a single- or double-quoted string literal.
+fn dsl_string_literal(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let bytes = raw.as_bytes();
+    let first = bytes.first().copied()?;
+    let last = bytes.last().copied()?;
+    if raw.len() >= 2 && (first == b'"' || first == b'\'') && last == first {
+        return raw.get(1..raw.len() - 1).map(str::to_string);
+    }
+    None
 }
 
 /// Evaluate a matcher set with the given combination.
@@ -753,6 +959,26 @@ fn run_extractors(
     out: &mut BTreeMap<String, String>,
 ) {
     for (idx, extractor) in extractors.iter().enumerate() {
+        // `kval` reads response-header values by key (nuclei normalises `-` to
+        // `_`). The bridge models no separate key list, so the extractor's
+        // string list is reused as the header keys. Every other kind runs the
+        // regex engine: `regex` is native, `json`/`xpath` have no engine here
+        // and degrade to regex capture, and `dsl` carries no regex (→ nothing).
+        if extractor.kind == ExtractorKind::Kval {
+            for key in &extractor.regexes {
+                let want = key.trim().to_ascii_lowercase().replace('-', "_");
+                for (hk, hv) in view.headers.iter() {
+                    if hk.to_ascii_lowercase().replace('-', "_") == want {
+                        let name = match &extractor.name {
+                            Some(n) => n.clone(),
+                            None => key.clone(),
+                        };
+                        out.insert(name, hv.clone());
+                    }
+                }
+            }
+            continue;
+        }
         let haystack = view.text(MatchPart::All);
         for pattern in &extractor.regexes {
             let Ok(re) = regex::Regex::new(pattern) else {
@@ -781,12 +1007,20 @@ async fn execute_http(
     ctx: &ExecutionCtx<'_>,
 ) -> Result<Vec<TemplateResult>> {
     let mut results = Vec::new();
-    let mut vars = BTreeMap::new();
-    for opt in &template.options {
-        vars.insert(opt.name.clone(), opt.default.clone());
-    }
+    let vars = run_vars(template, ctx);
 
-    let client = crate::utils::build_http_client(ctx.timeout)
+    // `insecure` turns TLS verification fully off (invalid certs AND
+    // hostnames). permissive() already accepts invalid certs unless the
+    // operator launched with `--strict-tls`, so OR-ing `ctx.insecure` in leaves
+    // the non-insecure path identical to the old build_http_client() behaviour
+    // while letting a template run against a self-signed target on opt-in.
+    let mut opts = crate::utils::network::HttpClientOpts::permissive();
+    opts.accept_invalid_certs |= ctx.insecure;
+    opts.accept_invalid_hostnames |= ctx.insecure;
+    // Match build_http_client()'s shared-client idle timeout so a long sweep
+    // doesn't accumulate idle keep-alives across many distinct hosts.
+    opts.pool_idle_timeout = Some(Duration::from_secs(30));
+    let client = crate::utils::network::build_http_client_with(ctx.timeout, opts)
         .context("build HTTP client for nuclei template")?;
 
     for block in blocks {
@@ -881,10 +1115,7 @@ async fn execute_dns(
     spec: &DnsRequest,
     ctx: &ExecutionCtx<'_>,
 ) -> Result<Vec<TemplateResult>> {
-    let mut vars = BTreeMap::new();
-    for opt in &template.options {
-        vars.insert(opt.name.clone(), opt.default.clone());
-    }
+    let vars = run_vars(template, ctx);
     let name = interpolate(&spec.name, ctx, &vars);
     let resolver = hickory_resolver::lookup(&name, &spec.query_type)
         .await
@@ -911,10 +1142,7 @@ async fn execute_tcp(
     spec: &TcpRequest,
     ctx: &ExecutionCtx<'_>,
 ) -> Result<Vec<TemplateResult>> {
-    let mut vars = BTreeMap::new();
-    for opt in &template.options {
-        vars.insert(opt.name.clone(), opt.default.clone());
-    }
+    let vars = run_vars(template, ctx);
     let host = spec
         .host
         .as_deref()
@@ -1078,6 +1306,8 @@ http:
             kind: MatcherKind::Word(vec!["VULNERABLE".to_string()]),
             negative: false,
             part: MatchPart::Body,
+            // Folds case, so the upper-case needle still matches.
+            case_sensitive: false,
         };
         assert!(eval_matcher(&word, &view)); // audit-allow: test
 
@@ -1085,6 +1315,7 @@ http:
             kind: MatcherKind::Status(vec![200]),
             negative: false,
             part: MatchPart::Body,
+            case_sensitive: true,
         };
         assert!(eval_matcher(&status, &view)); // audit-allow: test
 
@@ -1092,6 +1323,7 @@ http:
             kind: MatcherKind::Word(vec!["patched".to_string()]),
             negative: true,
             part: MatchPart::Body,
+            case_sensitive: true,
         };
         assert!(eval_matcher(&negative, &view)); // audit-allow: test
     }
@@ -1116,5 +1348,114 @@ http:
         let info_rank = Severity::Info.module_rank();
         assert_eq!(info_rank, crate::module_info::ModuleRank::Normal); // audit-allow: test
         let _ = Template::default(); // audit-allow: test
+    }
+
+    #[test]
+    fn case_sensitivity_is_honored() {
+        let headers = BTreeMap::new();
+        let view = ResponseView {
+            status: Some(200),
+            body: "Server: Apache",
+            headers: &headers,
+        };
+        // Case-sensitive (the nuclei default): a different-case needle misses.
+        let sensitive = Matcher {
+            kind: MatcherKind::Word(vec!["apache".to_string()]),
+            negative: false,
+            part: MatchPart::Body,
+            case_sensitive: true,
+        };
+        assert!(!eval_matcher(&sensitive, &view)); // audit-allow: test
+        // Case-insensitive: it now matches.
+        let insensitive = Matcher {
+            kind: MatcherKind::Word(vec!["apache".to_string()]),
+            negative: false,
+            part: MatchPart::Body,
+            case_sensitive: false,
+        };
+        assert!(eval_matcher(&insensitive, &view)); // audit-allow: test
+    }
+
+    #[test]
+    fn extractor_kind_selects_strategy() {
+        let mut headers = BTreeMap::new();
+        headers.insert("Server".to_string(), "nginx".to_string());
+        let view = ResponseView {
+            status: Some(200),
+            body: "",
+            headers: &headers,
+        };
+        // `kval` pulls a header value by (normalised) key instead of regex.
+        let kval = Extractor {
+            kind: ExtractorKind::Kval,
+            regexes: vec!["server".to_string()],
+            group: 0,
+            name: Some("ct".to_string()),
+        };
+        let mut out = BTreeMap::new();
+        run_extractors(std::slice::from_ref(&kval), &view, &mut out);
+        assert_eq!(out.get("ct").map(String::as_str), Some("nginx")); // audit-allow: test
+        // A `type: kval` extractor converts to the Kval variant.
+        let yaml = YamlExtractor {
+            kind: Some("kval".to_string()),
+            regex: None,
+            group: None,
+            name: None,
+        };
+        assert_eq!(convert_extractor(&yaml).kind, ExtractorKind::Kval); // audit-allow: test
+    }
+
+    #[test]
+    fn dsl_matcher_is_evaluated() {
+        let headers = BTreeMap::new();
+        let view = ResponseView {
+            status: Some(200),
+            body: "welcome admin area",
+            headers: &headers,
+        };
+        let simple = Matcher {
+            kind: MatcherKind::Dsl(vec!["status_code == 200".to_string()], Condition::Or),
+            negative: false,
+            part: MatchPart::Body,
+            case_sensitive: true,
+        };
+        assert!(eval_matcher(&simple, &view)); // audit-allow: test
+        let combined = Matcher {
+            kind: MatcherKind::Dsl(
+                vec!["status_code == 200 && contains(body, \"admin\")".to_string()],
+                Condition::Or,
+            ),
+            negative: false,
+            part: MatchPart::Body,
+            case_sensitive: true,
+        };
+        assert!(eval_matcher(&combined, &view)); // audit-allow: test
+        let too_big = Matcher {
+            kind: MatcherKind::Dsl(vec!["len(body) > 1000".to_string()], Condition::Or),
+            negative: false,
+            part: MatchPart::Body,
+            case_sensitive: true,
+        };
+        assert!(!eval_matcher(&too_big, &view)); // audit-allow: test
+        // Anything the evaluator cannot parse is false, never a false positive.
+        let unknown = Matcher {
+            kind: MatcherKind::Dsl(vec!["mystery(body)".to_string()], Condition::Or),
+            negative: false,
+            part: MatchPart::Body,
+            case_sensitive: true,
+        };
+        assert!(!eval_matcher(&unknown, &view)); // audit-allow: test
+    }
+
+    #[test]
+    fn ctx_variables_are_substituted() {
+        let mut ctx = ctx();
+        ctx.variables
+            .insert("Token".to_string(), "abc123".to_string());
+        let tmpl = Template::default();
+        let vars = run_vars(&tmpl, &ctx);
+        assert_eq!(interpolate("id={{Token}}", &ctx, &vars), "id=abc123"); // audit-allow: test
+        // Case-insensitive fallback resolves `{{token}}` too.
+        assert_eq!(interpolate("{{token}}", &ctx, &vars), "abc123"); // audit-allow: test
     }
 }
