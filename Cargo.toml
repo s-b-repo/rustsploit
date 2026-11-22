@@ -34,7 +34,7 @@ http = "1.4"
 bytes = "1.11.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 url = "2.5"
-quick-xml = "0.40"
+quick-xml = "0.41"
 data-encoding = "2.10"
 semver = "1.0"
 
