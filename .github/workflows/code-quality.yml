@@ -103,7 +103,7 @@ jobs:
           echo "Audit context captured ($(wc -l < audit-context.txt) lines)."
 
       - name: Run the Claude Code worker
-        uses: anthropics/claude-code-action@8a29bc6f0ae11a363721054b6739feba6adabe57
+        uses: anthropics/claude-code-action@c84e279f859e2591391e95bd309286eb111c345f
         with:
           # Prefer an OAuth token; fall back to an API key. One of the two
           # must be present as a repository secret.
