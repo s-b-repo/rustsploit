@@ -402,7 +402,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev clang lld libdbus-1-dev cmake
       - name: Install cargo-machete
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f
         with:
           tool: cargo-machete
       - name: Run the dead-code / wiring audit

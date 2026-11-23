@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f
         with:
           tool: cargo-audit
       - name: Audit the dependency tree
@@ -66,11 +66,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f
         with:
           tool: cargo-deny
       - name: Check licenses, bans, advisories and sources
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd
         with:
           command: check
           args: >-
@@ -135,7 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f
         with:
           tool: cargo-cyclonedx
       - name: Generate CycloneDX SBOM
@@ -168,7 +168,7 @@ jobs:
       - name: Dependency review
         # Blocks a PR that adds a dependency with a known vulnerability,
         # introduces a banned license, or drops the lockfile.
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec
         with:
           fail-on-severity: moderate
           comment-summary-in-pr: on-failure
